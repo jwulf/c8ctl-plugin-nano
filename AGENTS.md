@@ -28,23 +28,38 @@ At runtime c8ctl injects `globalThis.c8ctl`. This plugin only uses
 
 - Each nanobpmn node is the single server binary, configured by env vars:
   `PORT`, `NANOBPMN_NODE_ID`, `NANOBPMN_NODES`, `NANOBPMN_PARTITIONS`,
-  `NANOBPMN_RF`, `NANOBPMN_RAFT` (when RF>1), `NANOBPMN_DATA_DIR`.
+  `NANOBPMN_RF`, `NANOBPMN_RAFT` (when RF>1), `NANOBPMN_DATA_DIR`,
+  `NANOBPMN_WORKSPACE_DIR`.
 - Nodes are spawned **detached + unref'd** so they outlive the CLI invocation.
-- A JSON state file (`cluster.json`) records `{ nodes:[{id,port,pid,url,dataDir,logFile}], partitions, rf, raft, binary, ... }`.
+- A JSON state file (`cluster.json`) records `{ nodes:[{id,port,pid,url,dataDir,logFile}], partitions, rf, raft, binary, workspaceDir, ... }`.
+- Persistent user settings live in `config.json` (`binary`, `workspaceDir`),
+  set via `nano set bin|model-dir` and shown via `nano config`.
 - Health is the binary's always-on `GET /v2/topology` (200 == reachable).
 - Liveness is `process.kill(pid, 0)` (ESRCH == dead, EPERM == alive).
 - Stop is SIGTERM → grace window → SIGKILL stragglers.
+
+## Persistent vs ephemeral storage
+
+- **Workspace** (`NANOBPMN_WORKSPACE_DIR`, default `<stateHome>/workspace`) holds
+  `models/` and `workers/`. Shared by all nodes; the authoring source of truth.
+- **Engine data** (`NANOBPMN_DATA_DIR`, `<stateHome>/data/node-<i>`) is per-node and
+  ephemeral (journal/snapshots/spill).
+- `nano clean` and `stop --purge` delete engine data; **neither touches the
+  workspace** (only `nano clean --workspace` does, explicitly).
 
 ## Invariants to preserve
 
 - `start` must refuse to run over a live cluster unless `--force`.
 - `start` must pre-flight that target ports are free.
+- `start` must point every node at the **same** workspace dir (shared models/workers).
 - `stop` must always clear the state file (even on partial failure) so a stale
   marker never permanently blocks future starts.
-- `stop` keeps `data/` unless `--purge` (engine data is separable from the
-  cluster lifecycle).
+- `stop` keeps `data/` unless `--purge`; the workspace is never removed by `stop`.
+- `clean` must refuse while any node is alive, and must preserve the workspace
+  unless `--workspace` is given.
 - Single-node (`nano start` with no count) must be byte-equivalent to a normal
-  single-node nanobpmn launch (no `NANOBPMN_NODES`, RF=1, no Raft).
+  single-node nanobpmn launch (no `NANOBPMN_NODES`, RF=1, no Raft) apart from the
+  managed data/workspace dirs.
 
 ## Local dev loop
 

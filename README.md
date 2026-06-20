@@ -6,7 +6,7 @@ stops a local [Nano BPM](https://github.com/jwulf/nano-bpm) (`nanobpmn`) cluster
 It adds a single `nano` command:
 
 ```bash
-c8ctl nano start|status|stop|logs|restart
+c8ctl nano start|status|stop|restart|logs|clean|set|config
 ```
 
 `nano start N` spawns **N** nanobpmn node processes wired to talk to each other
@@ -45,7 +45,60 @@ c8ctl nano stop --purge
 
 # Stop then start fresh
 c8ctl nano restart 3
+
+# Wipe journal/data + logs from disk (keeps models & workers)
+c8ctl nano clean
+
+# Persist settings
+c8ctl nano set bin   ~/workspace/nanobpmn/server/target/release/nanobpm-gateway-rest-server
+c8ctl nano set model-dir ~/bpmn-workspace
+
+# Show current configuration and on-disk locations
+c8ctl nano config
 ```
+
+## Persistent assets: models & workers
+
+Nano BPM separates **persistent authoring assets** (BPMN models and worker code)
+from **ephemeral engine data** (journal, snapshots, variable spill):
+
+- **Workspace** (`NANOBPMN_WORKSPACE_DIR`) — holds `models/` and `workers/`. It is
+  the authoring source of truth, **shared by every node**, and is **never** deleted
+  by `stop` or `clean`.
+- **Engine data** (`NANOBPMN_DATA_DIR`) — per-node journal/snapshots/spill. Ephemeral;
+  removed by `stop --purge` and `clean`.
+
+The plugin points every node at one shared workspace so a model deployed once is
+visible cluster-wide and survives restarts. By default it lives at
+`<state home>/workspace`; change it with:
+
+```bash
+c8ctl nano set model-dir ~/bpmn-workspace
+```
+
+This creates `~/bpmn-workspace/models/` and `~/bpmn-workspace/workers/`. Restart a
+running cluster for a workspace change to take effect.
+
+## Cleaning up disk
+
+```bash
+c8ctl nano clean              # remove engine data + logs (cluster must be stopped)
+c8ctl nano clean --workspace  # ALSO delete models & workers (destructive!)
+c8ctl nano stop --purge       # stop and remove engine data in one step
+```
+
+`clean` refuses to run while any node is alive.
+
+## Configuration (`set` / `config`)
+
+Persistent settings are stored in `<state home>/config.json`:
+
+| Setting             | Env mapping              | Set with                          |
+|---------------------|--------------------------|-----------------------------------|
+| Binary path         | (used to launch nodes)   | `c8ctl nano set bin <path>`       |
+| Workspace directory | `NANOBPMN_WORKSPACE_DIR` | `c8ctl nano set model-dir <path>` |
+
+Show the effective configuration and all on-disk locations with `c8ctl nano config`.
 
 ## How nodes are configured
 
@@ -64,6 +117,7 @@ Additionally every node gets:
 - `NANOBPMN_RF` — replication factor (default `1`)
 - `NANOBPMN_RAFT=1` — set automatically when `RF > 1` (or via `--raft`)
 - `NANOBPMN_DATA_DIR` — a per-node engine data directory
+- `NANOBPMN_WORKSPACE_DIR` — the shared workspace (models & workers)
 
 Partition ownership is deterministic (`partition_id % num_nodes`), so the nodes
 agree on the cluster map with no coordinator. With `RF=1` each partition lives on
@@ -75,9 +129,10 @@ across nodes.
 The plugin needs a built `nanobpmn` server binary. Resolution order:
 
 1. `--binary <path>`
-2. `NANOBPMN_BINARY=<path>`
-3. `release` build under the nanobpmn repo
-4. `debug` build under the nanobpmn repo
+2. configured path (`c8ctl nano set bin <path>`)
+3. `NANOBPMN_BINARY=<path>`
+4. `release` build under the nanobpmn repo
+5. `debug` build under the nanobpmn repo
 
 The repo root defaults to `~/workspace/nanobpmn` and can be overridden with
 `NANOBPMN_REPO`. Build a binary with:
@@ -90,33 +145,37 @@ cd ~/workspace/nanobpmn && make release            # includes the web console
 
 ## State & data locations
 
-State, logs, and per-node data live under a per-user directory (override with
-`C8CTL_NANO_HOME`):
+State, config, logs, per-node data, and the workspace live under a per-user
+directory (override with `C8CTL_NANO_HOME`):
 
 - **macOS**: `~/Library/Application Support/c8ctl-nano`
 - **Linux**: `$XDG_DATA_HOME/c8ctl-nano` (or `~/.local/share/c8ctl-nano`)
 - **Windows**: `%LOCALAPPDATA%\c8ctl-nano`
 
 ```
+<home>/config.json         # persistent settings (binary path, workspace dir)
 <home>/cluster.json        # tracked cluster: nodes, pids, ports, config
-<home>/data/node-<i>/      # per-node engine data (journal, spill, snapshots)
+<home>/data/node-<i>/      # per-node engine data (journal, spill, snapshots) — ephemeral
 <home>/logs/node-<i>.log   # per-node stdout/stderr
+<home>/workspace/          # default shared workspace (models/, workers/) — persistent
 ```
 
 `nano stop` removes the state file but keeps `data/` by default so you can stop a
-cluster and keep your journals; pass `--purge` to delete engine data too.
+cluster and keep your journals; pass `--purge` to delete engine data too. The
+workspace is never removed except by `nano clean --workspace`.
 
 ## Flags
 
 | Flag           | Applies to | Description                                              |
-|----------------|------------|---------------------------------------------------------|
+|----------------|------------|----------------------------------------------------------|
 | `--port`       | start      | Base HTTP port; node *i* listens on `basePort+i` (8080)  |
 | `--partitions` | start      | Total partitions across the cluster (default node count) |
 | `--rf`         | start      | Replication factor; `>1` enables Raft (default `1`)      |
 | `--raft`       | start      | Force Raft on (default: on iff `rf>1`)                   |
-| `--binary`     | start      | Path to the nanobpmn server binary                       |
+| `--binary`     | start      | Path to the nanobpmn server binary (overrides `set bin`) |
 | `--force`      | start      | Stop any existing cluster first                          |
 | `--purge`      | stop       | Also delete per-node engine data                         |
+| `--workspace`  | clean      | Also delete the workspace (models + workers)             |
 | `--follow`,`-f`| logs       | Stream log output (`tail -F`)                            |
 
 ## Installing

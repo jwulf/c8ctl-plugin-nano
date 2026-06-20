@@ -43,6 +43,7 @@ import { join, isAbsolute, resolve as resolvePath } from 'node:path';
 // ---------------------------------------------------------------------------
 
 const STATE_FILE = 'cluster.json';
+const CONFIG_FILE = 'config.json';
 const DEFAULT_BASE_PORT = 8080;
 const READINESS_TIMEOUT_MS = 60_000;
 const READINESS_POLL_MS = 500;
@@ -103,6 +104,55 @@ function getLogDir() {
   return join(getStateHome(), 'logs');
 }
 
+// ---------------------------------------------------------------------------
+// Persistent plugin config (config.json) — user settings that survive across
+// clusters: the binary path and the workspace (models/workers) location.
+// ---------------------------------------------------------------------------
+
+function getConfigFile() {
+  return join(getStateHome(), CONFIG_FILE);
+}
+
+function readConfig() {
+  const file = getConfigFile();
+  if (!existsSync(file)) return {};
+  try {
+    const cfg = JSON.parse(readFileSync(file, 'utf-8'));
+    return cfg && typeof cfg === 'object' ? cfg : {};
+  } catch {
+    return {};
+  }
+}
+
+function writeConfig(cfg) {
+  mkdirSync(getStateHome(), { recursive: true });
+  writeFileSync(getConfigFile(), JSON.stringify(cfg, null, 2));
+}
+
+/**
+ * The workspace root (NANOBPMN_WORKSPACE_DIR): the persistent authoring source
+ * of truth holding `models/` and `workers/`. Deliberately separate from the
+ * per-node engine data dir so "nano clean" never touches it.
+ *
+ * Resolution: configured `workspaceDir` → `<stateHome>/workspace` default.
+ */
+function getWorkspaceDir() {
+  const cfg = readConfig();
+  if (cfg.workspaceDir) {
+    const p = expandHome(String(cfg.workspaceDir));
+    return isAbsolute(p) ? p : resolvePath(process.cwd(), p);
+  }
+  return join(getStateHome(), 'workspace');
+}
+
+/** Ensure the workspace and its models/ and workers/ subdirectories exist. */
+function ensureWorkspace() {
+  const root = getWorkspaceDir();
+  mkdirSync(join(root, 'models'), { recursive: true });
+  mkdirSync(join(root, 'workers'), { recursive: true });
+  return root;
+}
+
 /** The nanobpmn source/checkout root used to locate a built binary. */
 function getRepoRoot() {
   return expandHome(process.env.NANOBPMN_REPO || join(homedir(), 'workspace', 'nanobpmn'));
@@ -111,17 +161,24 @@ function getRepoRoot() {
 /**
  * Locate the nanobpmn server binary. Resolution order:
  *   1. --binary flag
- *   2. NANOBPMN_BINARY env var
- *   3. release build under the nanobpmn repo
- *   4. debug build under the nanobpmn repo
+ *   2. configured binary path ("nano set bin <path>")
+ *   3. NANOBPMN_BINARY env var
+ *   4. release build under the nanobpmn repo
+ *   5. debug build under the nanobpmn repo
  */
 function findBinary(flags) {
-  const explicit = (flags?.binary && String(flags.binary)) || process.env.NANOBPMN_BINARY;
-  if (explicit) {
-    const p = expandHome(explicit);
+  const cfg = readConfig();
+  const sources = [
+    { val: flags?.binary && String(flags.binary), from: '--binary' },
+    { val: cfg.binary && String(cfg.binary), from: 'configured bin ("nano set bin")' },
+    { val: process.env.NANOBPMN_BINARY, from: 'NANOBPMN_BINARY' },
+  ];
+  for (const { val, from } of sources) {
+    if (!val) continue;
+    const p = expandHome(val);
     const abs = isAbsolute(p) ? p : resolvePath(process.cwd(), p);
     if (!existsSync(abs)) {
-      throw new Error(`Binary not found at ${abs} (from ${flags?.binary ? '--binary' : 'NANOBPMN_BINARY'})`);
+      throw new Error(`Binary not found at ${abs} (from ${from})`);
     }
     return abs;
   }
@@ -139,7 +196,7 @@ function findBinary(flags) {
     `Could not find the nanobpmn server binary.\n` +
       `Looked in:\n  ${candidates.join('\n  ')}\n` +
       `Build it with: (cd ${repo} && make release-gateway)\n` +
-      `Or point at one with --binary <path> or NANOBPMN_BINARY=<path>.`,
+      `Or set one with "c8ctl nano set bin <path>", --binary <path>, or NANOBPMN_BINARY=<path>.`,
   );
 }
 
@@ -147,7 +204,7 @@ function findBinary(flags) {
 // Argument parsing
 // ---------------------------------------------------------------------------
 
-const VALID_SUBCOMMANDS = ['start', 'stop', 'status', 'logs', 'log', 'restart'];
+const VALID_SUBCOMMANDS = ['start', 'stop', 'status', 'logs', 'log', 'restart', 'clean', 'set', 'config'];
 
 /**
  * Parse positional args + flags into a normalized request.
@@ -176,6 +233,7 @@ function parseRequest(args, flags) {
     follow: Boolean(flags?.follow),
     purge: Boolean(flags?.purge),
     force: Boolean(flags?.force),
+    workspace: Boolean(flags?.workspace),
     binary: flags?.binary,
   };
 }
@@ -301,12 +359,14 @@ async function startCluster(req) {
 
   mkdirSync(getDataDir(), { recursive: true });
   mkdirSync(getLogDir(), { recursive: true });
+  const workspaceDir = ensureWorkspace();
 
   logger.info(
     `Starting Nano BPM cluster: ${nodeCount} node(s), ${partitions} partition(s), ` +
       `RF=${rf}${raft ? ', Raft on' : ''}`,
   );
-  logger.info(`Binary: ${binary}`);
+  logger.info(`Binary:    ${binary}`);
+  logger.info(`Workspace: ${workspaceDir} (models/, workers/)`);
 
   const nodes = [];
   for (let id = 0; id < nodeCount; id++) {
@@ -323,6 +383,9 @@ async function startCluster(req) {
       NANOBPMN_PARTITIONS: String(partitions),
       NANOBPMN_RF: String(rf),
       NANOBPMN_DATA_DIR: dataDir,
+      // Shared, persistent authoring workspace (models + workers). Lives
+      // outside the per-node data dir so "nano clean" never wipes it.
+      NANOBPMN_WORKSPACE_DIR: workspaceDir,
     };
     if (raft) env.NANOBPMN_RAFT = '1';
 
@@ -355,6 +418,7 @@ async function startCluster(req) {
     version: 1,
     startedAt: new Date().toISOString(),
     binary,
+    workspaceDir,
     partitions,
     rf,
     raft,
@@ -405,6 +469,9 @@ function printSummary(state) {
   console.log(`  REST API     ${entry.url}/v2`);
   console.log(`  Topology     ${entry.url}/v2/topology`);
   console.log(`  Web console  ${entry.url}/console`);
+  if (state.workspaceDir) {
+    console.log(`  Workspace    ${state.workspaceDir} (models/, workers/)`);
+  }
   console.log('');
   console.log('  Inspect with: c8ctl nano status');
   console.log('  Stop with:    c8ctl nano stop');
@@ -512,7 +579,9 @@ async function statusCluster() {
     `  started: ${state.startedAt}   partitions: ${state.partitions}   RF: ${state.rf}` +
       `${state.raft ? '   raft: on' : ''}`,
   );
-  console.log(`  binary:  ${state.binary}`);
+  console.log(`  binary:    ${state.binary}`);
+  console.log(`  workspace: ${state.workspaceDir || getWorkspaceDir()}`);
+  console.log(`  data:      ${getDataDir()}`);
   console.log('');
   console.log('  NODE  PORT   PID       PROCESS   HEALTH    URL');
   for (const c of checks) {
@@ -574,6 +643,125 @@ function logsCluster(req) {
 }
 
 // ---------------------------------------------------------------------------
+// clean — wipe engine data (journal/snapshots/spill) + logs from disk. The
+// persistent workspace (models/workers) is deliberately preserved.
+// ---------------------------------------------------------------------------
+
+function cleanCluster(req) {
+  const logger = getLogger();
+  const state = readState();
+
+  if (state && liveNodeCount(state) > 0) {
+    logger.error(
+      `Refusing to clean while ${liveNodeCount(state)} node(s) are running. ` +
+        `Stop the cluster first: c8ctl nano stop`,
+    );
+    process.exit(1);
+  }
+
+  // Stopped cluster with leftover state — clear the stale marker too.
+  if (state) clearState();
+
+  const dataDir = getDataDir();
+  const logDir = getLogDir();
+  let removed = 0;
+
+  if (existsSync(dataDir)) {
+    rmSync(dataDir, { recursive: true, force: true });
+    logger.info(`Removed engine data: ${dataDir}`);
+    removed++;
+  }
+  if (existsSync(logDir)) {
+    rmSync(logDir, { recursive: true, force: true });
+    logger.info(`Removed logs: ${logDir}`);
+    removed++;
+  }
+
+  if (removed === 0) {
+    logger.info('Nothing to clean — no engine data or logs on disk.');
+  } else {
+    logger.info(`Workspace preserved: ${getWorkspaceDir()} (models/, workers/)`);
+  }
+
+  if (req.workspace) {
+    const ws = getWorkspaceDir();
+    if (existsSync(ws)) {
+      rmSync(ws, { recursive: true, force: true });
+      logger.warn(`Removed workspace (models + workers): ${ws}`);
+    }
+  }
+}
+
+// ---------------------------------------------------------------------------
+// set / config — persistent user settings (binary path, workspace location)
+// ---------------------------------------------------------------------------
+
+const SETTING_ALIASES = {
+  bin: 'binary',
+  binary: 'binary',
+  'model-dir': 'workspaceDir',
+  'models-dir': 'workspaceDir',
+  workspace: 'workspaceDir',
+  'workspace-dir': 'workspaceDir',
+};
+
+function setConfig(req) {
+  const logger = getLogger();
+  const key = req.positional[0];
+  const value = req.positional[1];
+
+  if (!key || !(key in SETTING_ALIASES)) {
+    logger.error('Usage: c8ctl nano set <bin|model-dir> <path>');
+    logger.info('Settings:');
+    logger.info('  bin <path>        Path to the nanobpmn server binary');
+    logger.info('  model-dir <path>  Workspace root holding models/ and workers/');
+    process.exit(1);
+  }
+  if (!value) {
+    logger.error(`Please provide a value: c8ctl nano set ${key} <path>`);
+    process.exit(1);
+  }
+
+  const field = SETTING_ALIASES[key];
+  const expanded = expandHome(value);
+  const abs = isAbsolute(expanded) ? expanded : resolvePath(process.cwd(), expanded);
+
+  if (field === 'binary' && !existsSync(abs)) {
+    logger.error(`Binary not found at ${abs}`);
+    process.exit(1);
+  }
+
+  const cfg = readConfig();
+  cfg[field] = abs;
+  writeConfig(cfg);
+
+  logger.info(`Set ${field} = ${abs}`);
+  if (field === 'workspaceDir') {
+    ensureWorkspace();
+    logger.info('Created models/ and workers/ subdirectories.');
+    const running = readState();
+    if (running && liveNodeCount(running) > 0) {
+      logger.warn('A cluster is running — restart it for the new workspace to take effect.');
+    }
+  }
+}
+
+function showConfig() {
+  const cfg = readConfig();
+  console.log('Nano plugin configuration:');
+  console.log('');
+  console.log(`  state home   ${getStateHome()}`);
+  console.log(`  binary       ${cfg.binary || '(auto-detect: $NANOBPMN_BINARY or repo build)'}`);
+  console.log(`  workspace    ${getWorkspaceDir()}${cfg.workspaceDir ? '' : '  (default)'}`);
+  console.log(`  data dir     ${getDataDir()}`);
+  console.log(`  log dir      ${getLogDir()}`);
+  console.log('');
+  console.log(`  config file  ${getConfigFile()}`);
+  console.log('');
+  console.log('  Change with: c8ctl nano set bin <path> | c8ctl nano set model-dir <path>');
+}
+
+// ---------------------------------------------------------------------------
 // metadata + commands
 // ---------------------------------------------------------------------------
 
@@ -595,6 +783,10 @@ export const metadata = {
         { command: 'c8ctl nano logs 1 --follow', description: "Stream node 1's log" },
         { command: 'c8ctl nano stop', description: 'Stop the running cluster (keep data)' },
         { command: 'c8ctl nano stop --purge', description: 'Stop the cluster and delete engine data' },
+        { command: 'c8ctl nano clean', description: 'Wipe journal/data + logs on disk (keeps models/workers)' },
+        { command: 'c8ctl nano set bin <path>', description: 'Set the nanobpmn server binary path' },
+        { command: 'c8ctl nano set model-dir <path>', description: 'Set the workspace dir (models + workers)' },
+        { command: 'c8ctl nano config', description: 'Show current plugin configuration and paths' },
       ],
     },
   },
@@ -611,6 +803,7 @@ export const commands = {
       follow: { type: 'boolean', description: 'logs: stream output (tail -F)', short: 'f' },
       purge: { type: 'boolean', description: 'stop: also delete per-node engine data' },
       force: { type: 'boolean', description: 'start: stop any existing cluster first' },
+      workspace: { type: 'boolean', description: 'clean: also delete the workspace (models + workers)' },
       binary: { type: 'string', description: 'Path to the nanobpmn server binary' },
     },
     handler: async (args, flags) => {
@@ -641,6 +834,15 @@ export const commands = {
             await stopCluster({ purge: false });
             await startCluster({ ...req, force: true });
             break;
+          case 'clean':
+            cleanCluster(req);
+            break;
+          case 'set':
+            setConfig(req);
+            break;
+          case 'config':
+            showConfig();
+            break;
         }
       } catch (error) {
         logger.error(`nano ${req.subcommand} failed: ${error instanceof Error ? error.message : error}`);
@@ -657,6 +859,9 @@ function printUsage() {
   console.log('  c8ctl nano stop [--purge]');
   console.log('  c8ctl nano logs [<nodeId>] [--follow]');
   console.log('  c8ctl nano restart [<nodes>] ...');
+  console.log('  c8ctl nano clean [--workspace]');
+  console.log('  c8ctl nano set <bin|model-dir> <path>');
+  console.log('  c8ctl nano config');
   console.log('');
   console.log('Subcommands:');
   console.log('  start    Spawn an N-node local cluster wired to talk to each other on localhost');
@@ -664,6 +869,9 @@ function printUsage() {
   console.log('  stop     Stop all nodes (add --purge to also delete engine data)');
   console.log('  logs     Show or follow node logs');
   console.log('  restart  Stop then start');
+  console.log('  clean    Wipe journal/data + logs on disk (keeps models/workers)');
+  console.log('  set      Persist a setting: "bin <path>" or "model-dir <path>"');
+  console.log('  config   Show current configuration and on-disk locations');
   console.log('');
   console.log('Options:');
   console.log('  <nodes>              Number of nodes to start (default 1)');
@@ -671,10 +879,16 @@ function printUsage() {
   console.log('  --partitions <n>     Total partitions across the cluster (default = node count)');
   console.log('  --rf <n>             Replication factor; >1 enables Raft (default 1)');
   console.log('  --raft               Force Raft on (default: on iff rf>1)');
-  console.log('  --binary <path>      Path to the nanobpmn server binary');
-  console.log('                       (default: $NANOBPMN_BINARY, else a build under $NANOBPMN_REPO)');
+  console.log('  --binary <path>      Path to the nanobpmn server binary (overrides "set bin")');
   console.log('  --purge              stop: also delete per-node engine data');
   console.log('  --force              start: stop any existing cluster first');
+  console.log('  --workspace          clean: also delete the workspace (models + workers)');
+  console.log('');
+  console.log('Persistent assets:');
+  console.log('  Models and workers live in the workspace dir (NANOBPMN_WORKSPACE_DIR),');
+  console.log('  shared by all nodes and never touched by "stop" or "clean". Engine data');
+  console.log('  (journal/snapshots/spill) is per-node and ephemeral. Set the workspace');
+  console.log('  location with "c8ctl nano set model-dir <path>"; see "c8ctl nano config".');
   console.log('');
   console.log('Examples:');
   console.log('  c8ctl nano start 3            # 3-node cluster on ports 8080..8082');
@@ -682,4 +896,7 @@ function printUsage() {
   console.log('  c8ctl nano status');
   console.log('  c8ctl nano logs 1 --follow');
   console.log('  c8ctl nano stop --purge');
+  console.log('  c8ctl nano clean             # free disk after stopping, keep models/workers');
+  console.log('  c8ctl nano set bin ~/workspace/nanobpmn/server/target/release/nanobpm-gateway-rest-server');
+  console.log('  c8ctl nano set model-dir ~/bpmn-workspace');
 }

@@ -294,6 +294,26 @@ async function probeHealthy(url) {
   }
 }
 
+/**
+ * Fetch and parse a node's GET /v2/topology, or null if unreachable / not a
+ * Nano BPM endpoint. The topology is the authoritative cluster view, so this
+ * lets `nano status` report on a cluster that c8ctl did not start.
+ */
+async function fetchTopology(url) {
+  const controller = new AbortController();
+  const timer = setTimeout(() => controller.abort(), HEALTH_TIMEOUT_MS);
+  try {
+    const res = await fetch(`${url}/v2/topology`, { signal: controller.signal });
+    if (!res.ok) return null;
+    const body = await res.json();
+    return body && Array.isArray(body.brokers) ? body : null;
+  } catch {
+    return null;
+  } finally {
+    clearTimeout(timer);
+  }
+}
+
 async function waitForHealthy(url, timeoutMs = READINESS_TIMEOUT_MS) {
   const start = Date.now();
   while (Date.now() - start < timeoutMs) {
@@ -554,13 +574,73 @@ function purgeData() {
 // status
 // ---------------------------------------------------------------------------
 
-async function statusCluster() {
+/**
+ * Render a cluster's live topology (brokers + partition roles) as reported by
+ * GET /v2/topology. Works for any reachable Nano BPM gateway, whether or not
+ * c8ctl started it.
+ */
+function printTopology(topo, endpoint) {
+  console.log(
+    `  cluster size: ${topo.clusterSize ?? topo.brokers.length}` +
+      `   partitions: ${topo.partitionsCount ?? '?'}` +
+      `   RF: ${topo.replicationFactor ?? '?'}` +
+      `${topo.gatewayVersion ? `   gateway: ${topo.gatewayVersion}` : ''}`,
+  );
+  console.log(`  endpoint:     ${endpoint}/v2/topology`);
+  console.log('');
+  console.log('  NODE  ADDRESS               PARTITIONS (role)            VERSION');
+  const sorted = [...topo.brokers].sort((a, b) => (a.nodeId ?? 0) - (b.nodeId ?? 0));
+  for (const b of sorted) {
+    const addr = `${b.host}:${b.port}`;
+    const parts = Array.isArray(b.partitions)
+      ? b.partitions.map((p) => `${p.partitionId}:${p.role ?? '?'}`).join(' ')
+      : '';
+    console.log(
+      `  ${String(b.nodeId ?? '?').padEnd(4)}  ${addr.padEnd(20)}  ${parts.padEnd(27)}  ${b.version ?? ''}`,
+    );
+  }
+  console.log('');
+}
+
+async function statusCluster(req) {
   const state = readState();
+
+  // Where to look for a live topology: the recorded cluster's nodes if we have
+  // them, otherwise a default localhost endpoint (overridable with --port).
+  const probePort = req?.basePort ?? state?.basePort ?? DEFAULT_BASE_PORT;
+  const probeUrls =
+    state && Array.isArray(state.nodes) && state.nodes.length > 0
+      ? state.nodes.map((n) => n.url)
+      : [`http://127.0.0.1:${probePort}`];
+
+  // Find the first node that answers /v2/topology — the authoritative view.
+  let topo = null;
+  let topoUrl = null;
+  for (const url of probeUrls) {
+    topo = await fetchTopology(url);
+    if (topo) {
+      topoUrl = url;
+      break;
+    }
+  }
+
+  // No cluster recorded by c8ctl: fall back entirely to the topology probe so
+  // status still works for an externally started cluster.
   if (!state || !Array.isArray(state.nodes) || state.nodes.length === 0) {
-    console.log('Nano cluster status: stopped (no cluster recorded)');
+    if (!topo) {
+      console.log(
+        `Nano cluster status: stopped (no cluster recorded; nothing answering at ` +
+          `http://127.0.0.1:${probePort}/v2/topology)`,
+      );
+      console.log('  Tip: point at a different port with "c8ctl nano status --port <port>".');
+      return;
+    }
+    console.log('Nano cluster status: running (external — not started by c8ctl)');
+    printTopology(topo, topoUrl);
     return;
   }
 
+  // c8ctl-managed cluster: report process liveness + per-node health.
   const checks = await Promise.all(
     state.nodes.map(async (n) => ({
       ...n,
@@ -593,6 +673,13 @@ async function statusCluster() {
     );
   }
   console.log('');
+
+  // Enrich with the live topology when reachable — the authoritative view of
+  // partition leadership across the cluster.
+  if (topo) {
+    console.log('  Live topology:');
+    printTopology(topo, topoUrl);
+  }
 
   if (overall === 'stopped') {
     console.log('  All recorded nodes are dead. Run "c8ctl nano stop" to clear stale state.');
@@ -796,7 +883,7 @@ export const commands = {
   nano: {
     flags: {
       nodes: { type: 'string', description: 'Number of nodes to start (alt to positional arg)' },
-      port: { type: 'string', description: 'Base HTTP port; node i listens on basePort+i (default 8080)' },
+      port: { type: 'string', description: 'start: base port (node i = basePort+i); status: endpoint port to probe (default 8080)' },
       partitions: { type: 'string', description: 'Total partitions across the cluster (default = node count)' },
       rf: { type: 'string', description: 'Replication factor; >1 enables Raft (default 1)' },
       raft: { type: 'boolean', description: 'Force per-partition Raft on/off (default: on when rf>1)' },
@@ -824,7 +911,7 @@ export const commands = {
             await stopCluster(req);
             break;
           case 'status':
-            await statusCluster();
+            await statusCluster(req);
             break;
           case 'log':
           case 'logs':
@@ -855,7 +942,7 @@ export const commands = {
 function printUsage() {
   console.log('Usage:');
   console.log('  c8ctl nano start [<nodes>] [--port <basePort>] [--partitions <n>] [--rf <n>] [--raft] [--binary <path>]');
-  console.log('  c8ctl nano status');
+  console.log('  c8ctl nano status [--port <port>]');
   console.log('  c8ctl nano stop [--purge]');
   console.log('  c8ctl nano logs [<nodeId>] [--follow]');
   console.log('  c8ctl nano restart [<nodes>] ...');
@@ -865,7 +952,7 @@ function printUsage() {
   console.log('');
   console.log('Subcommands:');
   console.log('  start    Spawn an N-node local cluster wired to talk to each other on localhost');
-  console.log('  status   Show whether the cluster is running and per-node health');
+  console.log('  status   Show cluster status; queries /v2/topology (works for any running node)');
   console.log('  stop     Stop all nodes (add --purge to also delete engine data)');
   console.log('  logs     Show or follow node logs');
   console.log('  restart  Stop then start');
@@ -875,7 +962,7 @@ function printUsage() {
   console.log('');
   console.log('Options:');
   console.log('  <nodes>              Number of nodes to start (default 1)');
-  console.log('  --port <basePort>    Base port; node i listens on basePort+i (default 8080)');
+  console.log('  --port <basePort>    start: base port (node i = basePort+i); status: port to probe (default 8080)');
   console.log('  --partitions <n>     Total partitions across the cluster (default = node count)');
   console.log('  --rf <n>             Replication factor; >1 enables Raft (default 1)');
   console.log('  --raft               Force Raft on (default: on iff rf>1)');

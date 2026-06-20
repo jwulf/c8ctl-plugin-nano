@@ -34,6 +34,9 @@ c8ctl nano start 3 --partitions 6
 # Show cluster status and per-node health
 c8ctl nano status
 
+# Inspect a cluster c8ctl did NOT start (queries /v2/topology on the given port)
+c8ctl nano status --port 8080
+
 # Tail a node's log (-f / --follow to stream)
 c8ctl nano logs 1 --follow
 
@@ -99,6 +102,26 @@ Persistent settings are stored in `<state home>/config.json`:
 | Workspace directory | `NANOBPMN_WORKSPACE_DIR` | `c8ctl nano set model-dir <path>` |
 
 Show the effective configuration and all on-disk locations with `c8ctl nano config`.
+
+## Checking status
+
+`c8ctl nano status` queries each node's always-on `GET /v2/topology`, which is the
+authoritative cluster view. Because of this it works in three situations:
+
+- **c8ctl-managed cluster** — shows per-node process liveness (PID), reachability,
+  and the live topology (partition leadership).
+- **External cluster** — a Nano BPM cluster started outside c8ctl (e.g. by hand,
+  a script, or another tool). With no recorded state, status probes
+  `http://127.0.0.1:<port>/v2/topology` and reports what it finds, labelled
+  `(external — not started by c8ctl)`.
+- **Nothing running** — reports `stopped`.
+
+Point status at a specific endpoint with `--port`:
+
+```bash
+c8ctl nano status            # default: managed cluster, else probe port 8080
+c8ctl nano status --port 9000
+```
 
 ## How nodes are configured
 

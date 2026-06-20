@@ -1,0 +1,22 @@
+{
+  "name": "c8ctl-plugin-nano",
+  "version": "0.1.0",
+  "type": "module",
+  "description": "c8ctl plugin to start, inspect, and stop a local Nano BPM (nanobpmn) cluster",
+  "keywords": [
+    "c8ctl",
+    "c8ctl-plugin",
+    "nano",
+    "nanobpmn",
+    "nano-bpm",
+    "camunda"
+  ],
+  "main": "c8ctl-plugin.js",
+  "license": "MIT",
+  "c8ctl": {
+    "defaults": {
+      "basePort": 8080,
+      "nanobpmnRepo": "~/workspace/nanobpmn"
+    }
+  }
+}

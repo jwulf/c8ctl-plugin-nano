@@ -222,6 +222,8 @@ Additionally every node gets:
 - `NANOBPMN_RF` — replication factor (default `1`)
 - `NANOBPMN_RAFT=1` — set automatically when `RF > 1` (or via `--raft`)
 - `NANOBPMN_DATA_DIR` — a per-node engine data directory
+- `NANOBPMN_DURABILITY=async` — set by default for throughput; override by
+  exporting `NANOBPMN_DURABILITY` (e.g. `sync`) before `nano start`
 - `NANOBPMN_WORKSPACE_DIR` — the shared workspace (models & workers)
 - `NANOBPMN_TRACE_STIMULI=1` — set on every node when `--capture` is passed
 

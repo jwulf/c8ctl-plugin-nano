@@ -461,6 +461,10 @@ async function startCluster(req) {
       NANOBPMN_PARTITIONS: String(partitions),
       NANOBPMN_RF: String(rf),
       NANOBPMN_DATA_DIR: dataDir,
+      // Default to async durability (group-commit) for throughput; the user can
+      // override per the spread of process.env above by exporting
+      // NANOBPMN_DURABILITY (e.g. "sync") before running.
+      NANOBPMN_DURABILITY: process.env.NANOBPMN_DURABILITY ?? 'async',
       // Shared, persistent authoring workspace (models + workers). Lives
       // outside the per-node data dir so "nano clean" never wipes it.
       NANOBPMN_WORKSPACE_DIR: workspaceDir,

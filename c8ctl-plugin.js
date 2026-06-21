@@ -204,7 +204,7 @@ function findBinary(flags) {
 // Argument parsing
 // ---------------------------------------------------------------------------
 
-const VALID_SUBCOMMANDS = ['start', 'stop', 'status', 'logs', 'log', 'restart', 'clean', 'set', 'config'];
+const VALID_SUBCOMMANDS = ['start', 'stop', 'status', 'logs', 'log', 'restart', 'pause', 'resume', 'clean', 'set', 'config'];
 
 /**
  * Parse positional args + flags into a normalized request.
@@ -523,9 +523,11 @@ async function stopCluster(req) {
 
   logger.info(`Stopping ${alive.length} nano node(s)...`);
 
-  // Phase 1: polite SIGTERM.
+  // Phase 1: polite SIGTERM. Continue any paused (SIGSTOP'd) node first, else
+  // the SIGTERM stays pending and the node can only be force-killed.
   for (const n of alive) {
     try {
+      if (n.paused) process.kill(n.pid, 'SIGCONT');
       process.kill(n.pid, 'SIGTERM');
     } catch {
       /* already gone */
@@ -665,8 +667,8 @@ async function statusCluster(req) {
   console.log('');
   console.log('  NODE  PORT   PID       PROCESS   HEALTH    URL');
   for (const c of checks) {
-    const proc = c.alive ? 'alive' : 'dead';
-    const health = c.healthy ? 'healthy' : c.alive ? 'unreachable' : '-';
+    const proc = c.alive ? (c.paused ? 'paused' : 'alive') : 'dead';
+    const health = c.healthy ? 'healthy' : c.paused ? 'paused' : c.alive ? 'unreachable' : '-';
     console.log(
       `  ${String(c.id).padEnd(4)}  ${String(c.port).padEnd(5)}  ${String(c.pid).padEnd(8)}  ` +
         `${proc.padEnd(8)}  ${health.padEnd(8)}  ${c.url}`,
@@ -685,6 +687,14 @@ async function statusCluster(req) {
     console.log('  All recorded nodes are dead. Run "c8ctl nano stop" to clear stale state.');
   } else if (overall === 'degraded') {
     console.log('  Some nodes are not healthy. Check logs in ' + getLogDir());
+  }
+
+  const paused = checks.filter((c) => c.paused && c.alive);
+  if (paused.length > 0) {
+    console.log(
+      `  Paused (SIGSTOP): node(s) ${paused.map((c) => c.id).join(', ')} — ` +
+        `resume with "c8ctl nano resume <nodeId>".`,
+    );
   }
 }
 
@@ -727,6 +737,70 @@ function logsCluster(req) {
     logger.error(`Failed to read logs: ${err.message}`);
     logger.info(`Log files:\n  ${files.join('\n  ')}`);
   });
+}
+
+// ---------------------------------------------------------------------------
+// pause / resume — freeze or resume a node to simulate a node failing and
+// coming back online. SIGSTOP halts the process (uncatchable, like a hang or
+// network partition); SIGCONT resumes it. The node keeps its PID and on-disk
+// state, so this exercises Raft failover/recovery without a real restart.
+// ---------------------------------------------------------------------------
+
+function controlNode(req, { signal, verb, paused }) {
+  const logger = getLogger();
+  const state = readState();
+
+  if (!state || !Array.isArray(state.nodes) || state.nodes.length === 0) {
+    logger.error('No c8ctl-managed cluster is running. Start one with "c8ctl nano start <nodes>".');
+    process.exit(1);
+  }
+
+  const nodeIds = state.nodes.map((n) => n.id).join(', ');
+  const idArg = req.positional[0];
+  if (idArg === undefined) {
+    logger.error(`Specify a node id, e.g. "c8ctl nano ${verb} 1". Nodes: ${nodeIds}`);
+    process.exit(1);
+  }
+
+  const id = Number.parseInt(idArg, 10);
+  const node = Number.isFinite(id) ? state.nodes.find((n) => n.id === id) : undefined;
+  if (!node) {
+    logger.error(`No node "${idArg}" in the running cluster. Nodes: ${nodeIds}`);
+    process.exit(1);
+  }
+
+  if (!isPidAlive(node.pid)) {
+    logger.error(`Node ${id} (pid ${node.pid}) is not running — cannot ${verb} it.`);
+    process.exit(1);
+  }
+
+  if (paused && node.paused) {
+    logger.warn(`Node ${id} is already paused.`);
+    return;
+  }
+  if (!paused && !node.paused) {
+    logger.warn(`Node ${id} is not paused — nothing to resume.`);
+    return;
+  }
+
+  try {
+    process.kill(node.pid, signal);
+  } catch (err) {
+    logger.error(`Failed to ${verb} node ${id} (pid ${node.pid}): ${err.message}`);
+    process.exit(1);
+  }
+
+  node.paused = paused;
+  writeState(state);
+
+  if (paused) {
+    logger.info(
+      `Paused node ${id} (pid ${node.pid}, ${node.url}) — sent SIGSTOP. ` +
+        `The process is frozen; resume it with "c8ctl nano resume ${id}".`,
+    );
+  } else {
+    logger.info(`Resumed node ${id} (pid ${node.pid}, ${node.url}) — sent SIGCONT.`);
+  }
 }
 
 // ---------------------------------------------------------------------------
@@ -867,6 +941,8 @@ export const metadata = {
         },
         { command: 'c8ctl nano start 3 --port 9000', description: 'Start 3 nodes on ports 9000..9002' },
         { command: 'c8ctl nano status', description: 'Show cluster status and per-node health' },
+        { command: 'c8ctl nano pause 1', description: 'Freeze node 1 (SIGSTOP) to simulate a node failure' },
+        { command: 'c8ctl nano resume 1', description: 'Resume node 1 (SIGCONT) to bring it back online' },
         { command: 'c8ctl nano logs 1 --follow', description: "Stream node 1's log" },
         { command: 'c8ctl nano stop', description: 'Stop the running cluster (keep data)' },
         { command: 'c8ctl nano stop --purge', description: 'Stop the cluster and delete engine data' },
@@ -921,6 +997,12 @@ export const commands = {
             await stopCluster({ purge: false });
             await startCluster({ ...req, force: true });
             break;
+          case 'pause':
+            controlNode(req, { signal: 'SIGSTOP', verb: 'pause', paused: true });
+            break;
+          case 'resume':
+            controlNode(req, { signal: 'SIGCONT', verb: 'resume', paused: false });
+            break;
           case 'clean':
             cleanCluster(req);
             break;
@@ -945,6 +1027,8 @@ function printUsage() {
   console.log('  c8ctl nano status [--port <port>]');
   console.log('  c8ctl nano stop [--purge]');
   console.log('  c8ctl nano logs [<nodeId>] [--follow]');
+  console.log('  c8ctl nano pause <nodeId>');
+  console.log('  c8ctl nano resume <nodeId>');
   console.log('  c8ctl nano restart [<nodes>] ...');
   console.log('  c8ctl nano clean [--workspace]');
   console.log('  c8ctl nano set <bin|model-dir> <path>');
@@ -955,6 +1039,8 @@ function printUsage() {
   console.log('  status   Show cluster status; queries /v2/topology (works for any running node)');
   console.log('  stop     Stop all nodes (add --purge to also delete engine data)');
   console.log('  logs     Show or follow node logs');
+  console.log('  pause    Freeze a node (SIGSTOP) to simulate it failing');
+  console.log('  resume   Resume a frozen node (SIGCONT) to bring it back online');
   console.log('  restart  Stop then start');
   console.log('  clean    Wipe journal/data + logs on disk (keeps models/workers)');
   console.log('  set      Persist a setting: "bin <path>" or "model-dir <path>"');
@@ -981,6 +1067,8 @@ function printUsage() {
   console.log('  c8ctl nano start 3            # 3-node cluster on ports 8080..8082');
   console.log('  c8ctl nano start 3 --rf 3     # 3-node Raft-replicated cluster');
   console.log('  c8ctl nano status');
+  console.log('  c8ctl nano pause 1            # freeze node 1 to simulate a failure');
+  console.log('  c8ctl nano resume 1          # bring node 1 back online');
   console.log('  c8ctl nano logs 1 --follow');
   console.log('  c8ctl nano stop --purge');
   console.log('  c8ctl nano clean             # free disk after stopping, keep models/workers');

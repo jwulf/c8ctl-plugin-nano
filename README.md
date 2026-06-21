@@ -40,6 +40,10 @@ c8ctl nano status --port 8080
 # Tail a node's log (-f / --follow to stream)
 c8ctl nano logs 1 --follow
 
+# Simulate a node failing (freeze it) and recovering (resume it)
+c8ctl nano pause 1
+c8ctl nano resume 1
+
 # Stop the cluster (engine data is retained)
 c8ctl nano stop
 
@@ -122,6 +126,28 @@ Point status at a specific endpoint with `--port`:
 c8ctl nano status            # default: managed cluster, else probe port 8080
 c8ctl nano status --port 9000
 ```
+
+## Fault injection: pause / resume a node
+
+`c8ctl nano pause <nodeId>` and `c8ctl nano resume <nodeId>` let you simulate a
+node failing and coming back online, to exercise Raft failover and recovery on a
+local cluster:
+
+```bash
+c8ctl nano start 3 --rf 3   # 3-node Raft-replicated cluster
+c8ctl nano pause 1          # freeze node 1 (SIGSTOP) — like a hang or partition
+c8ctl nano status           # node 1 shows "paused"; the cluster is "degraded"
+c8ctl nano resume 1         # unfreeze node 1 (SIGCONT) — it rejoins
+```
+
+- **pause** sends `SIGSTOP`, which halts the process instantly and *cannot be
+  caught or ignored* — so the node stops responding without losing its PID or its
+  on-disk state, faithfully mimicking a hung/partitioned node.
+- **resume** sends `SIGCONT`, and the process continues exactly where it left off.
+- A paused node is reported as `paused` in `c8ctl nano status` and counts as
+  unhealthy, so the cluster shows `degraded`.
+- `c8ctl nano stop` automatically resumes any paused node first, so it can shut
+  down gracefully rather than being force-killed.
 
 ## How nodes are configured
 

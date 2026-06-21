@@ -315,8 +315,43 @@ async function fetchTopology(url) {
   }
 }
 
-async function waitForHealthy(url, timeoutMs = READINESS_TIMEOUT_MS) {
-  const start = Date.now();
+/**
+ * Classify a parsed /v2/topology body as Nano BPM vs stock Camunda.
+ *
+ * Nano advertises itself with a `nano` object (`engine: "nanobpmn"`) in its
+ * topology — a superset of the Camunda Orchestration Cluster API. A stock
+ * Camunda gateway answers the same /v2/topology shape but without that object,
+ * so its absence is the discriminator.
+ */
+function classifyTopology(topo) {
+  const nano = topo && topo.nano;
+  if (nano && nano.engine) {
+    return {
+      product: 'nano',
+      label: 'Nano BPM',
+      engine: nano.engine,
+      version: nano.version ?? topo.gatewayVersion ?? null,
+    };
+  }
+  return {
+    product: 'camunda',
+    label: 'Camunda',
+    engine: null,
+    version: (topo && topo.gatewayVersion) ?? null,
+  };
+}
+
+/**
+ * Probe `url` and identify what is answering: returns the classification plus
+ * the raw topology, or null if nothing Camunda-compatible is listening.
+ */
+async function identifyEndpoint(url) {
+  const topo = await fetchTopology(url);
+  if (!topo) return null;
+  return { ...classifyTopology(topo), topo };
+}
+
+async function waitForHealthy(url, timeoutMs = READINESS_TIMEOUT_MS) {  const start = Date.now();
   while (Date.now() - start < timeoutMs) {
     if (await probeHealthy(url)) return true;
     await new Promise((r) => setTimeout(r, READINESS_POLL_MS));
@@ -367,10 +402,31 @@ async function startCluster(req) {
 
   const binary = findBinary(req);
 
-  // Pre-flight: make sure the chosen ports are free.
+  // Pre-flight: make sure the chosen ports are free, and tell the user exactly
+  // what is in the way (Camunda vs Nano vs some other HTTP server). We refuse to
+  // start on top of an existing gateway — pass a different --port to coexist
+  // (e.g. run Nano alongside a local Camunda on 8080).
   const ports = Array.from({ length: nodeCount }, (_, i) => basePort + i);
   for (const port of ports) {
-    if (await probeHealthy(`http://127.0.0.1:${port}`)) {
+    const url = `http://127.0.0.1:${port}`;
+    const found = await identifyEndpoint(url);
+    if (found) {
+      logger.error(
+        `Port ${port} is already serving a ${found.label} gateway` +
+          `${found.version ? ` (v${found.version})` : ''}.`,
+      );
+      if (found.product === 'camunda') {
+        logger.error('Refusing to start Nano on top of a running Camunda instance.');
+      } else {
+        logger.error('A Nano node appears to already be bound to this port.');
+      }
+      logger.info(
+        `Start on a free base port instead, e.g. ` +
+          `"c8ctl nano start ${nodeCount} --port ${basePort + 100}".`,
+      );
+      process.exit(1);
+    }
+    if (await probeHealthy(url)) {
       logger.error(`Port ${port} is already serving an HTTP endpoint. Choose another --port base.`);
       process.exit(1);
     }
@@ -592,6 +648,11 @@ function purgeData() {
  * c8ctl started it.
  */
 function printTopology(topo, endpoint) {
+  const id = classifyTopology(topo);
+  console.log(
+    `  product:      ${id.label}${id.engine ? ` (${id.engine})` : ''}` +
+      `${id.version ? ` ${id.version}` : ''}`,
+  );
   console.log(
     `  cluster size: ${topo.clusterSize ?? topo.brokers.length}` +
       `   partitions: ${topo.partitionsCount ?? '?'}` +
@@ -641,10 +702,17 @@ async function statusCluster(req) {
   if (!state || !Array.isArray(state.nodes) || state.nodes.length === 0) {
     if (!topo) {
       console.log(
-        `Nano cluster status: stopped (no cluster recorded; nothing answering at ` +
+        `Nano cluster status: stopped (no cluster recorded by c8ctl; nothing answering at ` +
           `http://127.0.0.1:${probePort}/v2/topology)`,
       );
       console.log('  Tip: point at a different port with "c8ctl nano status --port <port>".');
+      return;
+    }
+    const id = classifyTopology(topo);
+    if (id.product === 'camunda') {
+      console.log(`Detected a Camunda gateway (not Nano) at ${topoUrl}.`);
+      console.log('  This was not started by c8ctl nano; manage it with Camunda tooling.');
+      printTopology(topo, topoUrl);
       return;
     }
     console.log('Nano cluster status: running (external — not started by c8ctl)');

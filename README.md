@@ -127,6 +127,28 @@ c8ctl nano status            # default: managed cluster, else probe port 8080
 c8ctl nano status --port 9000
 ```
 
+### Camunda vs Nano detection
+
+Nano advertises itself in `GET /v2/topology` with a `nano` object
+(`engine: "nanobpmn"`) — a superset of the Camunda Orchestration Cluster API.
+A stock Camunda gateway answers the same endpoint without it, so `status` can
+tell the two apart and prints a `product:` line (`Nano BPM` or `Camunda`) with
+the version. If `status` finds a Camunda gateway on the probed port it says so
+explicitly rather than pretending it is a Nano cluster.
+
+For the same reason, `c8ctl nano start` refuses to launch on top of an existing
+gateway. If any chosen port is already serving a Camunda (or Nano) endpoint it
+reports exactly what is running and exits without starting:
+
+```
+✗ Port 8080 is already serving a Camunda gateway (v8.6.0).
+✗ Refusing to start Nano on top of a running Camunda instance.
+Start on a free base port instead, e.g. "c8ctl nano start 1 --port 8180".
+```
+
+To run Nano alongside a local Camunda, give it a different base port
+(`--port`); the collision check only applies to the ports Nano would bind.
+
 ## Fault injection: pause / resume a node
 
 `c8ctl nano pause <nodeId>` and `c8ctl nano resume <nodeId>` let you simulate a

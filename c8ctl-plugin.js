@@ -233,6 +233,7 @@ function parseRequest(args, flags) {
     follow: Boolean(flags?.follow),
     purge: Boolean(flags?.purge),
     force: Boolean(flags?.force),
+    capture: Boolean(flags?.capture),
     workspace: Boolean(flags?.workspace),
     binary: flags?.binary,
   };
@@ -352,6 +353,7 @@ async function startCluster(req) {
   const rf = Math.min(Math.max(1, req.rf ?? 1), nodeCount);
   // Raft is required for replication; auto-enable when RF > 1, allow override.
   const raft = req.raft === undefined ? rf > 1 : Boolean(req.raft);
+  const capture = Boolean(req.capture);
 
   if (partitions < nodeCount) {
     logger.warn(
@@ -383,7 +385,7 @@ async function startCluster(req) {
 
   logger.info(
     `Starting Nano BPM cluster: ${nodeCount} node(s), ${partitions} partition(s), ` +
-      `RF=${rf}${raft ? ', Raft on' : ''}`,
+      `RF=${rf}${raft ? ', Raft on' : ''}${capture ? ', trace capture on' : ''}`,
   );
   logger.info(`Binary:    ${binary}`);
   logger.info(`Workspace: ${workspaceDir} (models/, workers/)`);
@@ -408,6 +410,13 @@ async function startCluster(req) {
       NANOBPMN_WORKSPACE_DIR: workspaceDir,
     };
     if (raft) env.NANOBPMN_RAFT = '1';
+    // Trace capture: a single flag enables the Tier 2 recorded-input (stimuli)
+    // log AND auto-enables Tier 1 variable capture, so historical replay /
+    // analysis can reconstruct each instance. Must be set on every node — each
+    // node's TraceStore only sees instances on its own partitions. Optional
+    // tuning vars (NANOBPMN_TRACE_VARIABLES_MAX_BYTES / _STIMULI_MAX /
+    // _CAPACITY) pass through automatically from the environment if set.
+    if (capture) env.NANOBPMN_TRACE_STIMULI = '1';
 
     const out = openSync(logFile, 'a');
     const child = spawn(binary, [], {
@@ -442,6 +451,7 @@ async function startCluster(req) {
     partitions,
     rf,
     raft,
+    capture,
     basePort,
     nodes,
   };
@@ -659,7 +669,7 @@ async function statusCluster(req) {
   console.log(`Nano cluster status: ${overall}`);
   console.log(
     `  started: ${state.startedAt}   partitions: ${state.partitions}   RF: ${state.rf}` +
-      `${state.raft ? '   raft: on' : ''}`,
+      `${state.raft ? '   raft: on' : ''}${state.capture ? '   trace capture: on' : ''}`,
   );
   console.log(`  binary:    ${state.binary}`);
   console.log(`  workspace: ${state.workspaceDir || getWorkspaceDir()}`);
@@ -694,6 +704,13 @@ async function statusCluster(req) {
     console.log(
       `  Paused (SIGSTOP): node(s) ${paused.map((c) => c.id).join(', ')} — ` +
         `resume with "c8ctl nano resume <nodeId>".`,
+    );
+  }
+
+  if (state.capture) {
+    console.log(
+      '  Trace capture is ON (recorded-input replay). Read a trace with ' +
+        'GET /console/api/traces/{instanceKey} (creationVariables + stimuli[]).',
     );
   }
 }
@@ -940,6 +957,7 @@ export const metadata = {
           description: 'Start a 3-node Raft-replicated cluster (RF=3)',
         },
         { command: 'c8ctl nano start 3 --port 9000', description: 'Start 3 nodes on ports 9000..9002' },
+        { command: 'c8ctl nano start --capture', description: 'Start with trace capture for historical replay/analysis' },
         { command: 'c8ctl nano status', description: 'Show cluster status and per-node health' },
         { command: 'c8ctl nano pause 1', description: 'Freeze node 1 (SIGSTOP) to simulate a node failure' },
         { command: 'c8ctl nano resume 1', description: 'Resume node 1 (SIGCONT) to bring it back online' },
@@ -963,6 +981,7 @@ export const commands = {
       partitions: { type: 'string', description: 'Total partitions across the cluster (default = node count)' },
       rf: { type: 'string', description: 'Replication factor; >1 enables Raft (default 1)' },
       raft: { type: 'boolean', description: 'Force per-partition Raft on/off (default: on when rf>1)' },
+      capture: { type: 'boolean', description: 'start: enable trace capture (recorded-input replay) on every node' },
       follow: { type: 'boolean', description: 'logs: stream output (tail -F)', short: 'f' },
       purge: { type: 'boolean', description: 'stop: also delete per-node engine data' },
       force: { type: 'boolean', description: 'start: stop any existing cluster first' },
@@ -1023,7 +1042,7 @@ export const commands = {
 
 function printUsage() {
   console.log('Usage:');
-  console.log('  c8ctl nano start [<nodes>] [--port <basePort>] [--partitions <n>] [--rf <n>] [--raft] [--binary <path>]');
+  console.log('  c8ctl nano start [<nodes>] [--port <basePort>] [--partitions <n>] [--rf <n>] [--raft] [--capture] [--binary <path>]');
   console.log('  c8ctl nano status [--port <port>]');
   console.log('  c8ctl nano stop [--purge]');
   console.log('  c8ctl nano logs [<nodeId>] [--follow]');
@@ -1052,6 +1071,7 @@ function printUsage() {
   console.log('  --partitions <n>     Total partitions across the cluster (default = node count)');
   console.log('  --rf <n>             Replication factor; >1 enables Raft (default 1)');
   console.log('  --raft               Force Raft on (default: on iff rf>1)');
+  console.log('  --capture            start: enable trace capture (recorded-input replay) on every node');
   console.log('  --binary <path>      Path to the nanobpmn server binary (overrides "set bin")');
   console.log('  --purge              stop: also delete per-node engine data');
   console.log('  --force              start: stop any existing cluster first');
@@ -1063,9 +1083,18 @@ function printUsage() {
   console.log('  (journal/snapshots/spill) is per-node and ephemeral. Set the workspace');
   console.log('  location with "c8ctl nano set model-dir <path>"; see "c8ctl nano config".');
   console.log('');
+  console.log('Trace capture (--capture):');
+  console.log('  Sets NANOBPMN_TRACE_STIMULI=1 on every node, enabling the recorded-input');
+  console.log('  (stimuli) log plus variable capture for historical replay/analysis. Read a');
+  console.log('  trace with GET /console/api/traces/{instanceKey} (creationVariables +');
+  console.log('  stimuli[] + per-incident variables). Tune via env vars passed through from');
+  console.log('  your shell: NANOBPMN_TRACE_VARIABLES_MAX_BYTES (16384), NANOBPMN_TRACE_STIMULI_MAX');
+  console.log('  (1024), NANOBPMN_TRACE_CAPACITY (2000).');
+  console.log('');
   console.log('Examples:');
   console.log('  c8ctl nano start 3            # 3-node cluster on ports 8080..8082');
   console.log('  c8ctl nano start 3 --rf 3     # 3-node Raft-replicated cluster');
+  console.log('  c8ctl nano start --capture    # single node with trace capture for replay');
   console.log('  c8ctl nano status');
   console.log('  c8ctl nano pause 1            # freeze node 1 to simulate a failure');
   console.log('  c8ctl nano resume 1          # bring node 1 back online');

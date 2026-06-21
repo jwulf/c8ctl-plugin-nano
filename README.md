@@ -149,6 +149,40 @@ c8ctl nano resume 1         # unfreeze node 1 (SIGCONT) — it rejoins
 - `c8ctl nano stop` automatically resumes any paused node first, so it can shut
   down gracefully rather than being force-killed.
 
+## Trace capture for historical replay (`--capture`)
+
+Start a cluster with `--capture` to record every instance's inputs so runs can be
+replayed and analysed later:
+
+```bash
+c8ctl nano start 3 --capture
+c8ctl nano status            # shows "trace capture: on"
+```
+
+`--capture` sets `NANOBPMN_TRACE_STIMULI=1` on **every** node. That single flag
+enables the Tier 2 recorded-input (stimuli) log *and* auto-enables Tier 1 variable
+capture. It must be set on all nodes because each node's `TraceStore` only sees
+instances on its own partitions.
+
+Read a trace back from any node:
+
+```
+GET /console/api/traces/{instanceKey}
+  → { creationVariables, stimuli[], <per-incident variables> }
+```
+
+Optional tuning is done with environment variables, which pass through from your
+shell automatically (no dedicated flags):
+
+| Env var                            | Default | Purpose                              |
+|------------------------------------|---------|--------------------------------------|
+| `NANOBPMN_TRACE_VARIABLES_MAX_BYTES` | 16384 | Max captured variable payload bytes  |
+| `NANOBPMN_TRACE_STIMULI_MAX`         | 1024  | Max recorded stimuli per instance    |
+| `NANOBPMN_TRACE_CAPACITY`            | 2000  | Max traced instances retained        |
+
+> Setting `NANOBPMN_TRACE_VARIABLES=1` alone enables only Tier 1 (variables); use
+> `--capture` for full recorded-input replay.
+
 ## How nodes are configured
 
 Each node is the single `nanobpmn` server binary, configured entirely through
@@ -167,6 +201,7 @@ Additionally every node gets:
 - `NANOBPMN_RAFT=1` — set automatically when `RF > 1` (or via `--raft`)
 - `NANOBPMN_DATA_DIR` — a per-node engine data directory
 - `NANOBPMN_WORKSPACE_DIR` — the shared workspace (models & workers)
+- `NANOBPMN_TRACE_STIMULI=1` — set on every node when `--capture` is passed
 
 Partition ownership is deterministic (`partition_id % num_nodes`), so the nodes
 agree on the cluster map with no coordinator. With `RF=1` each partition lives on
@@ -221,6 +256,7 @@ workspace is never removed except by `nano clean --workspace`.
 | `--partitions` | start      | Total partitions across the cluster (default node count) |
 | `--rf`         | start      | Replication factor; `>1` enables Raft (default `1`)      |
 | `--raft`       | start      | Force Raft on (default: on iff `rf>1`)                   |
+| `--capture`    | start      | Enable trace capture (recorded-input replay) on every node |
 | `--binary`     | start      | Path to the nanobpmn server binary (overrides `set bin`) |
 | `--force`      | start      | Stop any existing cluster first                          |
 | `--purge`      | stop       | Also delete per-node engine data                         |

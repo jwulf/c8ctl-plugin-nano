@@ -89,6 +89,9 @@ const READINESS_TIMEOUT_MS = 60_000;
 const READINESS_POLL_MS = 500;
 const HEALTH_TIMEOUT_MS = 1_500;
 const STOP_GRACE_MS = 8_000;
+const PROCESSOS_STATE_FILE = 'processos.json';
+const PROCESSOS_DEFAULT_PORT = 8090;
+const DEFAULT_NANO_URL = 'http://localhost:8080';
 
 function getLogger() {
   if (globalThis.c8ctl) {
@@ -337,6 +340,24 @@ async function probeHealthy(url) {
   const timer = setTimeout(() => controller.abort(), HEALTH_TIMEOUT_MS);
   try {
     const res = await fetch(`${url}/v2/topology`, { signal: controller.signal });
+    return res.ok;
+  } catch {
+    return false;
+  } finally {
+    clearTimeout(timer);
+  }
+}
+
+/**
+ * Probe whether `path` on `url` answers with a 2xx. Used to detect whether this
+ * binary was built with the web console (which serves the landing page `/`,
+ * `/console`, and the `/docs` user guide); the API-only gateway 404s them.
+ */
+async function probePath(url, path) {
+  const controller = new AbortController();
+  const timer = setTimeout(() => controller.abort(), HEALTH_TIMEOUT_MS);
+  try {
+    const res = await fetch(`${url}${path}`, { signal: controller.signal });
     return res.ok;
   } catch {
     return false;
@@ -599,10 +620,10 @@ async function startCluster(req) {
     process.exit(1);
   }
 
-  printSummary(state);
+  await printSummary(state);
 }
 
-function printSummary(state) {
+async function printSummary(state) {
   console.log('');
   console.log(
     `Nano BPM cluster is up: ${state.nodes.length} node(s), ${state.partitions} partition(s), ` +
@@ -614,9 +635,18 @@ function printSummary(state) {
   }
   console.log('');
   const entry = state.nodes[0];
+  // The landing page (and the /docs user guide + /console) only exist in builds
+  // compiled with the web console; probe so we advertise the right entry point.
+  const hasConsole = await probePath(entry.url, '/');
+  if (hasConsole) {
+    console.log(`  Start here   ${entry.url}/          (landing: console, user guide & API docs)`);
+  }
   console.log(`  REST API     ${entry.url}/v2`);
   console.log(`  Topology     ${entry.url}/v2/topology`);
-  console.log(`  Web console  ${entry.url}/console`);
+  if (hasConsole) {
+    console.log(`  Web console  ${entry.url}/console`);
+    console.log(`  User guide   ${entry.url}/docs`);
+  }
   if (state.workspaceDir) {
     console.log(`  Workspace    ${state.workspaceDir} (models/, workers/)`);
   }
@@ -1077,8 +1107,481 @@ function showConfig() {
 }
 
 // ---------------------------------------------------------------------------
+// processos — manage a single local ProcessOS instance (the optimization-plane
+// server that analyses a running Nano BPM engine). Unlike nano, the ProcessOS
+// binary is not distributed via npm: the user downloads it and points the
+// plugin at it with "c8ctl processos set bin <path>".
+// ---------------------------------------------------------------------------
+
+const PROCESSOS_VALID_SUBCOMMANDS = ['start', 'stop', 'status', 'logs', 'log', 'restart', 'set', 'config'];
+
+function getProcessosStateFile() {
+  return join(getStateHome(), PROCESSOS_STATE_FILE);
+}
+
+function getProcessosLogFile() {
+  return join(getLogDir(), 'processos.log');
+}
+
+function readProcessosConfig() {
+  const cfg = readConfig();
+  return cfg.processos && typeof cfg.processos === 'object' ? cfg.processos : {};
+}
+
+function writeProcessosConfig(pcfg) {
+  const cfg = readConfig();
+  cfg.processos = pcfg;
+  writeConfig(cfg);
+}
+
+/** Resolve a user-supplied path to an absolute path, expanding a leading `~`. */
+function toAbsPath(p) {
+  const expanded = expandHome(String(p));
+  return isAbsolute(expanded) ? expanded : resolvePath(process.cwd(), expanded);
+}
+
+/** Engine data dir for ProcessOS (PROCESSOS_DATA_DIR). */
+function getProcessosDataDir() {
+  const cfg = readProcessosConfig();
+  if (cfg.dataDir) return toAbsPath(cfg.dataDir);
+  return join(getStateHome(), 'processos-data');
+}
+
+/** The target Nano BPM URL ProcessOS analyses (NANO_BASE_URL). */
+function getProcessosNanoUrl() {
+  const cfg = readProcessosConfig();
+  return cfg.nanoUrl || process.env.NANO_BASE_URL || DEFAULT_NANO_URL;
+}
+
+/** The listen port (flag overrides configured value, which overrides default). */
+function getProcessosPort(req) {
+  const cfg = readProcessosConfig();
+  if (Number.isFinite(req?.port)) return req.port;
+  if (Number.isFinite(cfg.port)) return cfg.port;
+  return PROCESSOS_DEFAULT_PORT;
+}
+
+function readProcessosState() {
+  const file = getProcessosStateFile();
+  if (!existsSync(file)) return null;
+  try {
+    return JSON.parse(readFileSync(file, 'utf-8'));
+  } catch {
+    return null;
+  }
+}
+
+function writeProcessosState(state) {
+  mkdirSync(getStateHome(), { recursive: true });
+  writeFileSync(getProcessosStateFile(), JSON.stringify(state, null, 2));
+}
+
+function clearProcessosState() {
+  const file = getProcessosStateFile();
+  if (existsSync(file)) rmSync(file);
+}
+
+/**
+ * Locate the ProcessOS binary. Resolution order:
+ *   1. --binary flag
+ *   2. configured path ("processos set bin <path>")
+ *   3. PROCESSOS_BINARY env var
+ *   4. release build under the nanobpmn repo
+ *   5. debug build under the nanobpmn repo
+ * The binary is not shipped via npm — it is downloaded manually.
+ */
+function findProcessosBinary(req) {
+  const cfg = readProcessosConfig();
+  const sources = [
+    { val: req?.binary && String(req.binary), from: '--binary' },
+    { val: cfg.binary && String(cfg.binary), from: 'configured bin ("processos set bin")' },
+    { val: process.env.PROCESSOS_BINARY, from: 'PROCESSOS_BINARY' },
+  ];
+  for (const { val, from } of sources) {
+    if (!val) continue;
+    const abs = toAbsPath(val);
+    if (!existsSync(abs)) {
+      throw new Error(`ProcessOS binary not found at ${abs} (from ${from})`);
+    }
+    return abs;
+  }
+
+  const repo = getRepoRoot();
+  const name = 'processos';
+  const candidates = [
+    join(repo, 'processos', 'target', 'release', name),
+    join(repo, 'processos', 'target', 'debug', name),
+  ];
+  for (const c of candidates) {
+    if (existsSync(c)) return c;
+  }
+  throw new Error(
+    `Could not find the ProcessOS binary.\n` +
+      `ProcessOS is not distributed via npm — download the binary for your platform, then point the plugin at it:\n` +
+      `  c8ctl processos set bin <path>   (or --binary <path>, or export PROCESSOS_BINARY)\n` +
+      `Alternatively build from source: (cd ${repo} && make processos-build-release)\n` +
+      `Looked for a local build in:\n  ${candidates.join('\n  ')}`,
+  );
+}
+
+/** Probe ProcessOS's GET /health endpoint for reachability. */
+async function probeProcessosHealthy(url) {
+  return probePath(url, '/health');
+}
+
+async function waitForProcessosHealthy(url, timeoutMs = READINESS_TIMEOUT_MS) {
+  const start = Date.now();
+  while (Date.now() - start < timeoutMs) {
+    if (await probeProcessosHealthy(url)) return true;
+    await new Promise((r) => setTimeout(r, READINESS_POLL_MS));
+  }
+  return false;
+}
+
+async function startProcessos(req) {
+  const logger = getLogger();
+
+  const existing = readProcessosState();
+  if (existing && isPidAlive(existing.pid)) {
+    if (!req.force) {
+      logger.error(
+        `ProcessOS is already running (pid ${existing.pid}) at ${existing.url}. ` +
+          `Use --force to restart, or "c8ctl processos stop".`,
+      );
+      process.exit(1);
+    }
+    await stopProcessos({});
+  }
+
+  const binary = findProcessosBinary(req);
+  const port = getProcessosPort(req);
+  const url = `http://127.0.0.1:${port}`;
+  const nanoUrl = req.nanoUrl || getProcessosNanoUrl();
+  const dataDir = getProcessosDataDir();
+
+  // Pre-flight: refuse if something is already serving this port.
+  if (await probeProcessosHealthy(url)) {
+    logger.error(`Port ${port} is already serving a ProcessOS health endpoint. Choose another --port.`);
+    process.exit(1);
+  }
+
+  mkdirSync(dataDir, { recursive: true });
+  mkdirSync(getLogDir(), { recursive: true });
+
+  if (!(await probeHealthy(nanoUrl))) {
+    logger.warn(
+      `Target Nano BPM at ${nanoUrl} is not reachable — ProcessOS will start but cannot analyse ` +
+        `an engine until one is up (set with "c8ctl processos set nano-url <url>").`,
+    );
+  }
+
+  const cfg = readProcessosConfig();
+  const env = {
+    ...process.env,
+    // Generic passthrough first so typed settings below always win.
+    ...(cfg.env && typeof cfg.env === 'object' ? cfg.env : {}),
+    PROCESSOS_PORT: String(port),
+    NANO_BASE_URL: nanoUrl,
+    PROCESSOS_DATA_DIR: dataDir,
+  };
+
+  logger.info('Starting ProcessOS...');
+  logger.info(`Binary:   ${binary}`);
+  logger.info(`Target:   ${nanoUrl}`);
+
+  const logFile = getProcessosLogFile();
+  const out = openSync(logFile, 'a');
+  const child = spawn(binary, [], { env, stdio: ['ignore', out, out], detached: true });
+  child.unref();
+
+  if (typeof child.pid !== 'number') {
+    logger.error('Failed to spawn ProcessOS.');
+    process.exit(1);
+  }
+
+  const state = {
+    pid: child.pid,
+    port,
+    url,
+    binary,
+    dataDir,
+    logFile,
+    nanoUrl,
+    startedAt: new Date().toISOString(),
+  };
+  writeProcessosState(state);
+
+  logger.info(`  pid ${child.pid} — waiting for ${url}/health ...`);
+  const ok = await waitForProcessosHealthy(url);
+  if (!ok) {
+    logger.error(
+      `ProcessOS did not become healthy at ${url}/health. Inspect logs with "c8ctl processos logs", ` +
+        `then "c8ctl processos stop".`,
+    );
+    process.exit(1);
+  }
+
+  printProcessosSummary(state);
+}
+
+async function stopProcessos(req) {
+  const logger = getLogger();
+  const state = readProcessosState();
+
+  if (!state) {
+    logger.warn('No ProcessOS instance state found — nothing to stop.');
+    return;
+  }
+  if (!isPidAlive(state.pid)) {
+    logger.warn('ProcessOS is not running (stale state). Cleaning up.');
+    clearProcessosState();
+    return;
+  }
+
+  logger.info(`Stopping ProcessOS (pid ${state.pid})...`);
+  try {
+    process.kill(state.pid, 'SIGTERM');
+  } catch {
+    /* already gone */
+  }
+
+  const deadline = Date.now() + STOP_GRACE_MS;
+  while (Date.now() < deadline) {
+    if (!isPidAlive(state.pid)) break;
+    await new Promise((r) => setTimeout(r, 200));
+  }
+
+  if (isPidAlive(state.pid)) {
+    logger.warn(`  ProcessOS (pid ${state.pid}) did not exit gracefully — sending SIGKILL.`);
+    try {
+      process.kill(state.pid, 'SIGKILL');
+    } catch {
+      /* ignore */
+    }
+  }
+
+  clearProcessosState();
+  logger.info('ProcessOS stopped.');
+}
+
+async function statusProcessos() {
+  const state = readProcessosState();
+  if (!state) {
+    console.log('ProcessOS: not running (no managed instance).');
+    console.log('  Start one with: c8ctl processos start');
+    return;
+  }
+
+  const alive = isPidAlive(state.pid);
+  const healthy = alive ? await probeProcessosHealthy(state.url) : false;
+
+  console.log('ProcessOS status:');
+  console.log('');
+  console.log(`  pid:       ${state.pid} ${alive ? '(alive)' : '(dead — stale state)'}`);
+  console.log(`  url:       ${state.url}`);
+  console.log(`  health:    ${healthy ? 'ok' : 'unreachable'}  (${state.url}/health)`);
+  console.log(`  target:    ${state.nanoUrl}`);
+  console.log(`  data dir:  ${state.dataDir}`);
+  console.log(`  binary:    ${state.binary}`);
+  console.log(`  started:   ${state.startedAt}`);
+  if (!alive) {
+    console.log('');
+    console.log('  The recorded process is gone. Run "c8ctl processos start" to start a fresh instance.');
+  }
+}
+
+function logsProcessos(req) {
+  const logger = getLogger();
+  const file = getProcessosLogFile();
+  if (!existsSync(file)) {
+    logger.warn(`No ProcessOS log file found at ${file}`);
+    return;
+  }
+  const tailArgs = req.follow ? ['-n', '+1', '-F', file] : ['-n', '200', file];
+  const proc = spawn('tail', tailArgs, { stdio: ['ignore', 'inherit', 'inherit'] });
+  proc.on('error', (err) => {
+    logger.error(`Failed to read logs: ${err.message}`);
+    logger.info(`Log file: ${file}`);
+  });
+}
+
+function printProcessosSummary(state) {
+  console.log('');
+  console.log(`ProcessOS is up (pid ${state.pid}).`);
+  console.log('');
+  console.log(`  Start here   ${state.url}/          (landing)`);
+  console.log(`  Cockpit      ${state.url}/cockpit`);
+  console.log(`  Health       ${state.url}/health`);
+  console.log(`  Target Nano  ${state.nanoUrl}`);
+  console.log('');
+  console.log('  Inspect with: c8ctl processos status');
+  console.log('  Stop with:    c8ctl processos stop');
+  console.log('');
+}
+
+const PROCESSOS_SET_FIELDS = {
+  bin: 'binary',
+  binary: 'binary',
+  port: 'port',
+  'nano-url': 'nanoUrl',
+  nanourl: 'nanoUrl',
+  'data-dir': 'dataDir',
+  datadir: 'dataDir',
+  env: 'env',
+};
+
+function printProcessosSetUsage() {
+  const logger = getLogger();
+  logger.info('Usage: c8ctl processos set <field> <value>');
+  logger.info('  bin <path>          Path to the downloaded ProcessOS binary');
+  logger.info('  port <n>            Listen port (default 8090)');
+  logger.info('  nano-url <url>      Target Nano BPM engine URL (default http://localhost:8080)');
+  logger.info('  data-dir <path>     ProcessOS data directory');
+  logger.info('  env KEY=VALUE       Set a passthrough env var (e.g. PROCESSOS_LLM_MODEL); KEY= unsets it');
+}
+
+function setProcessosConfig(req) {
+  const logger = getLogger();
+  const rawField = req.positional[0];
+  if (!rawField) {
+    printProcessosSetUsage();
+    process.exit(1);
+  }
+  const field = PROCESSOS_SET_FIELDS[String(rawField).toLowerCase()];
+  if (!field) {
+    logger.error(`Unknown ProcessOS setting "${rawField}".`);
+    printProcessosSetUsage();
+    process.exit(1);
+  }
+
+  const cfg = readProcessosConfig();
+
+  if (field === 'env') {
+    const arg = req.positional[1];
+    if (!arg || !arg.includes('=')) {
+      logger.error('Usage: c8ctl processos set env KEY=VALUE  (use "KEY=" to unset)');
+      process.exit(1);
+    }
+    const idx = arg.indexOf('=');
+    const key = arg.slice(0, idx);
+    const val = arg.slice(idx + 1);
+    if (!key) {
+      logger.error('Missing env var name. Usage: c8ctl processos set env KEY=VALUE');
+      process.exit(1);
+    }
+    cfg.env = cfg.env && typeof cfg.env === 'object' ? cfg.env : {};
+    if (val === '') {
+      delete cfg.env[key];
+      logger.info(`Unset env ${key}`);
+    } else {
+      cfg.env[key] = val;
+      logger.info(`Set env ${key}=${val}`);
+    }
+  } else if (field === 'binary') {
+    const val = req.positional[1];
+    if (!val) {
+      logger.error('Usage: c8ctl processos set bin <path>');
+      process.exit(1);
+    }
+    const abs = toAbsPath(val);
+    if (!existsSync(abs)) {
+      logger.error(`Binary not found at ${abs}`);
+      process.exit(1);
+    }
+    cfg.binary = abs;
+    logger.info(`Set binary = ${abs}`);
+  } else if (field === 'port') {
+    const n = Number.parseInt(String(req.positional[1]), 10);
+    if (!Number.isFinite(n) || n <= 0) {
+      logger.error('Usage: c8ctl processos set port <n>');
+      process.exit(1);
+    }
+    cfg.port = n;
+    logger.info(`Set port = ${n}`);
+  } else if (field === 'nanoUrl') {
+    const val = req.positional[1];
+    if (!val) {
+      logger.error('Usage: c8ctl processos set nano-url <url>');
+      process.exit(1);
+    }
+    cfg.nanoUrl = val;
+    logger.info(`Set nano-url = ${val}`);
+  } else if (field === 'dataDir') {
+    const val = req.positional[1];
+    if (!val) {
+      logger.error('Usage: c8ctl processos set data-dir <path>');
+      process.exit(1);
+    }
+    cfg.dataDir = toAbsPath(val);
+    logger.info(`Set data-dir = ${cfg.dataDir}`);
+  }
+
+  writeProcessosConfig(cfg);
+}
+
+function showProcessosConfig() {
+  const cfg = readProcessosConfig();
+  const nanoUrl = cfg.nanoUrl || process.env.NANO_BASE_URL || DEFAULT_NANO_URL;
+  console.log('ProcessOS configuration:');
+  console.log('');
+  console.log(`  binary     ${cfg.binary || '(not set — "processos set bin <path>", $PROCESSOS_BINARY, or repo build)'}`);
+  console.log(`  port       ${Number.isFinite(cfg.port) ? cfg.port : PROCESSOS_DEFAULT_PORT}${Number.isFinite(cfg.port) ? '' : '  (default)'}`);
+  console.log(`  nano-url   ${nanoUrl}${cfg.nanoUrl ? '' : '  (default)'}`);
+  console.log(`  data dir   ${getProcessosDataDir()}${cfg.dataDir ? '' : '  (default)'}`);
+  const env = cfg.env && typeof cfg.env === 'object' ? cfg.env : {};
+  const keys = Object.keys(env);
+  if (keys.length > 0) {
+    console.log('');
+    console.log('  env (passthrough):');
+    for (const k of keys.sort()) {
+      console.log(`    ${k}=${env[k]}`);
+    }
+  }
+  console.log('');
+  console.log(`  state file ${getProcessosStateFile()}`);
+  console.log(`  log file   ${getProcessosLogFile()}`);
+  console.log('');
+  console.log('  Change with: c8ctl processos set bin <path> | set port <n> | set nano-url <url> | set data-dir <path> | set env KEY=VALUE');
+}
+
+function printProcessosUsage() {
+  console.log('Manage a local ProcessOS instance (optimization-plane server for Nano BPM).');
+  console.log('');
+  console.log('Usage:');
+  console.log('  c8ctl processos start [--port <n>] [--nano-url <url>] [--binary <path>] [--force]');
+  console.log('  c8ctl processos status');
+  console.log('  c8ctl processos stop');
+  console.log('  c8ctl processos restart [...]');
+  console.log('  c8ctl processos logs [--follow]');
+  console.log('  c8ctl processos set bin <path> | port <n> | nano-url <url> | data-dir <path> | env KEY=VALUE');
+  console.log('  c8ctl processos config');
+  console.log('');
+  console.log('ProcessOS is downloaded manually; point the plugin at it with "c8ctl processos set bin <path>".');
+}
+
+function parseProcessosRequest(args, flags) {
+  const subcommand = args[0];
+  const positional = args.slice(1).filter((a) => !String(a).startsWith('-'));
+  const portRaw = flags?.port;
+  const port =
+    portRaw === undefined || portRaw === null || portRaw === ''
+      ? undefined
+      : Number.parseInt(String(portRaw), 10);
+  return {
+    subcommand,
+    positional,
+    port: Number.isFinite(port) ? port : undefined,
+    nanoUrl: flags?.['nano-url'] || flags?.nanoUrl,
+    binary: flags?.binary,
+    follow: Boolean(flags?.follow),
+    force: Boolean(flags?.force),
+  };
+}
+
+// ---------------------------------------------------------------------------
 // metadata + commands
 // ---------------------------------------------------------------------------
+
 
 export const metadata = {
   name: 'c8ctl-plugin-nano',
@@ -1105,6 +1608,21 @@ export const metadata = {
         { command: 'c8ctl nano set bin <path>', description: 'Set the nanobpmn server binary path' },
         { command: 'c8ctl nano set model-dir <path>', description: 'Set the workspace dir (models + workers)' },
         { command: 'c8ctl nano config', description: 'Show current plugin configuration and paths' },
+      ],
+    },
+    processos: {
+      description: 'Manage a local ProcessOS instance — start, status, stop, logs, config',
+      examples: [
+        { command: 'c8ctl processos set bin <path>', description: 'Point the plugin at the downloaded ProcessOS binary' },
+        { command: 'c8ctl processos start', description: 'Start ProcessOS against the local Nano BPM engine' },
+        { command: 'c8ctl processos start --nano-url http://localhost:8080', description: 'Start against a specific engine' },
+        { command: 'c8ctl processos status', description: 'Show ProcessOS status and health' },
+        { command: 'c8ctl processos logs --follow', description: "Stream ProcessOS's log" },
+        { command: 'c8ctl processos stop', description: 'Stop the running ProcessOS instance' },
+        { command: 'c8ctl processos set port 8090', description: 'Set the listen port' },
+        { command: 'c8ctl processos set nano-url <url>', description: 'Set the target Nano BPM engine URL' },
+        { command: 'c8ctl processos set env PROCESSOS_LLM_MODEL=...', description: 'Set a passthrough env var' },
+        { command: 'c8ctl processos config', description: 'Show current ProcessOS configuration and paths' },
       ],
     },
   },
@@ -1171,6 +1689,55 @@ export const commands = {
         }
       } catch (error) {
         logger.error(`nano ${req.subcommand} failed: ${error instanceof Error ? error.message : error}`);
+        process.exit(1);
+      }
+    },
+  },
+  processos: {
+    flags: {
+      port: { type: 'string', description: 'start: listen port (default 8090)' },
+      'nano-url': { type: 'string', description: 'start: target Nano BPM engine URL (default http://localhost:8080)' },
+      binary: { type: 'string', description: 'Path to the ProcessOS binary' },
+      follow: { type: 'boolean', description: 'logs: stream output (tail -F)', short: 'f' },
+      force: { type: 'boolean', description: 'start: stop any existing instance first' },
+    },
+    handler: async (args, flags) => {
+      const logger = getLogger();
+      const req = parseProcessosRequest(args, flags);
+
+      if (!req.subcommand || !PROCESSOS_VALID_SUBCOMMANDS.includes(req.subcommand)) {
+        printProcessosUsage();
+        return;
+      }
+
+      try {
+        switch (req.subcommand) {
+          case 'start':
+            await startProcessos(req);
+            break;
+          case 'stop':
+            await stopProcessos(req);
+            break;
+          case 'status':
+            await statusProcessos();
+            break;
+          case 'log':
+          case 'logs':
+            logsProcessos(req);
+            break;
+          case 'restart':
+            await stopProcessos({});
+            await startProcessos({ ...req, force: true });
+            break;
+          case 'set':
+            setProcessosConfig(req);
+            break;
+          case 'config':
+            showProcessosConfig();
+            break;
+        }
+      } catch (error) {
+        logger.error(`processos ${req.subcommand} failed: ${error instanceof Error ? error.message : error}`);
         process.exit(1);
       }
     },

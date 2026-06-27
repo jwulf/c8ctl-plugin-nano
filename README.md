@@ -297,6 +297,70 @@ workspace is never removed except by `nano clean --workspace`.
 | `--workspace`  | clean      | Also delete the workspace (models + workers)             |
 | `--follow`,`-f`| logs       | Stream log output (`tail -F`)                            |
 
+ProcessOS flags (`processos` command):
+
+| Flag           | Applies to | Description                                              |
+|----------------|------------|----------------------------------------------------------|
+| `--port`       | start      | ProcessOS listen port (default 8090)                     |
+| `--nano-url`   | start      | Target Nano BPM engine URL (default `http://localhost:8080`) |
+| `--binary`     | start      | Path to the ProcessOS binary (overrides `set bin`)       |
+| `--force`      | start      | Stop any existing ProcessOS instance first               |
+| `--follow`,`-f`| logs       | Stream log output (`tail -F`)                            |
+
+## Managing ProcessOS (`processos`)
+
+ProcessOS is the optimization-plane server that analyses a running Nano BPM
+engine. The plugin can manage a single local ProcessOS instance with the same
+start/stop/status/logs lifecycle as `nano`.
+
+Unlike the Nano BPM server binary (which is distributed via npm — see below),
+**the ProcessOS binary is downloaded manually**: grab the build for your
+platform, then point the plugin at it.
+
+```bash
+# One-time: tell the plugin where the binary is
+c8ctl processos set bin ~/Downloads/processos
+
+# Start ProcessOS against the local Nano BPM engine (http://localhost:8080)
+c8ctl processos start
+
+# Or against a specific engine, on a specific port
+c8ctl processos start --nano-url http://localhost:8080 --port 8090
+
+# Inspect / stream logs / stop
+c8ctl processos status
+c8ctl processos logs --follow
+c8ctl processos stop
+```
+
+On a successful `start` the summary leads with the landing page:
+
+```
+  Start here   http://127.0.0.1:8090/          (landing)
+  Cockpit      http://127.0.0.1:8090/cockpit
+  Health       http://127.0.0.1:8090/health
+  Target Nano  http://localhost:8080
+```
+
+### ProcessOS configuration
+
+Settings persist under a `processos` key in the same `config.json` as `nano`.
+
+```bash
+c8ctl processos set bin <path>          # path to the downloaded ProcessOS binary
+c8ctl processos set port <n>            # listen port (default 8090)
+c8ctl processos set nano-url <url>      # target Nano BPM engine (default http://localhost:8080)
+c8ctl processos set data-dir <path>     # PROCESSOS_DATA_DIR (default <stateHome>/processos-data)
+c8ctl processos set env KEY=VALUE       # set any passthrough env var (e.g. PROCESSOS_LLM_MODEL)
+c8ctl processos set env KEY=            # unset a passthrough env var
+c8ctl processos config                  # show current settings and on-disk paths
+```
+
+The binary is resolved in this order: `--binary` flag → `set bin` →
+`$PROCESSOS_BINARY` → a local `processos/target/{release,debug}/processos` build.
+Typed settings (`port`, `nano-url`, `data-dir`) always win over generic `env`
+passthrough values when launching.
+
 ## Installing
 
 ```bash

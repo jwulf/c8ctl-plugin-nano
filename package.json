@@ -18,6 +18,8 @@
   ],
   "files": [
     "c8ctl-plugin.js",
+    "platforms.mjs",
+    "nanobpmn-binary.json",
     "README.md"
   ],
   "scripts": {
@@ -38,6 +40,7 @@
     "@commitlint/cli": "^20.4.1",
     "@commitlint/config-conventional": "^20.4.1",
     "@semantic-release/changelog": "^6.0.3",
+    "@semantic-release/exec": "^7.1.0",
     "@semantic-release/git": "^10.0.1",
     "@semantic-release/github": "^12.0.6",
     "semantic-release": "^25.0.3"

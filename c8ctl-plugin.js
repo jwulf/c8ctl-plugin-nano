@@ -38,9 +38,28 @@ import {
 import { homedir, platform as osPlatform } from 'node:os';
 import { join, isAbsolute, resolve as resolvePath, dirname } from 'node:path';
 import { createRequire } from 'node:module';
+import { fileURLToPath } from 'node:url';
 import { platformForHost } from './platforms.mjs';
 
 const requireFromHere = createRequire(import.meta.url);
+const pluginDir = dirname(fileURLToPath(import.meta.url));
+
+/**
+ * Read the bundled-binary marker (nanobpmn-binary.json) written by the upstream
+ * release pipeline. Records which nanobpmn build the shipped binaries came from.
+ * Best-effort: returns undefined when absent or unset (e.g. local dev checkout).
+ */
+function readBundledBinaryInfo() {
+  try {
+    const p = join(pluginDir, 'nanobpmn-binary.json');
+    if (!existsSync(p)) return undefined;
+    const info = JSON.parse(readFileSync(p, 'utf8'));
+    if (!info || !info.version || info.version === '0.0.0-dev') return undefined;
+    return info;
+  } catch {
+    return undefined;
+  }
+}
 
 /**
  * Locate the nanobpmn binary shipped by the matching platform package
@@ -1043,6 +1062,11 @@ function showConfig() {
   console.log('');
   console.log(`  state home   ${getStateHome()}`);
   console.log(`  binary       ${cfg.binary || '(auto-detect: $NANOBPMN_BINARY or repo build)'}`);
+  const bundled = readBundledBinaryInfo();
+  if (bundled) {
+    const at = bundled.commit && bundled.commit !== 'unknown' ? ` (${bundled.commit})` : '';
+    console.log(`  bundled nano ${bundled.version}${at}`);
+  }
   console.log(`  workspace    ${getWorkspaceDir()}${cfg.workspaceDir ? '' : '  (default)'}`);
   console.log(`  data dir     ${getDataDir()}`);
   console.log(`  log dir      ${getLogDir()}`);

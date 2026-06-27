@@ -354,6 +354,24 @@ nanobpm-gateway-rest-server-win32-x64.exe
 The upstream job needs a token with `contents: write` on this repo and can upload
 with e.g. `gh release upload binaries <files> --clobber`.
 
+### What triggers a release
+
+The plugin's npm version is **decoupled** from the nanobpmn binary version, so
+uploading new binaries does **not** by itself publish a new npm version —
+`semantic-release` only releases on releasable commits to `main`.
+
+To make a binary update ship, the upstream pipeline (after uploading the assets)
+rewrites the tracked marker file **`nanobpmn-binary.json`** in this repo with the
+new nanobpmn version/commit and pushes it as a `fix(binary): …` commit. That
+commit triggers the release workflow, which downloads the just-uploaded binaries
+and publishes a patch release. The marker is surfaced to users in `nano config`
+(`bundled nano <version>`). The push is a no-op when the marker is unchanged.
+
+```json
+// nanobpmn-binary.json — overwritten by upstream CI; "0.0.0-dev" = local checkout
+{ "version": "v1.4.2", "commit": "cdeb390", "updated": "2026-06-27T11:00:00Z" }
+```
+
 ### OIDC / Trusted Publishing
 
 The workflow is set up for npm **Trusted Publishing** (OIDC, `id-token: write`)

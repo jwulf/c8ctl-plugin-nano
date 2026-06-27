@@ -321,7 +321,8 @@ ProcessOS flags (`processos` command):
 | `--port`       | start      | ProcessOS listen port (default 8090)                     |
 | `--nano-url`   | start      | Target Nano BPM engine URL (default `http://localhost:8080`) |
 | `--binary`     | start      | Path to the ProcessOS binary (overrides `set bin`)       |
-| `--spawn-nano` | start      | Have ProcessOS spawn its own Nano engine (auto-wires `PROCESSOS_NANO_BIN`) |
+| `--spawn-nano` | start      | Force spawning a pilot Nano engine (default on when a nano binary is available) |
+| `--no-spawn-nano` | start   | Don't spawn a pilot engine; reuse the `--nano-url` engine |
 | `--force`      | start      | Stop any existing ProcessOS instance first               |
 | `--follow`,`-f`| logs       | Stream log output (`tail -F`)                            |
 
@@ -360,30 +361,30 @@ On a successful `start` the summary leads with the landing page:
   Target Nano  http://localhost:8080
 ```
 
-### Letting ProcessOS run its own Nano engine
+### Pilot engine (spawned by default)
 
 ProcessOS uses a Nano engine in two roles: the **target** engine it analyses
 (read-only, set with `--nano-url`), and its **own** internal "pilot" engine where
-it runs experiments. By default the own engine is just the same URL. You can
-instead have ProcessOS **spawn its own Nano engine** as a child process:
+it runs experiments. **By default ProcessOS spawns its own pilot engine** as a
+child process, so it never disturbs the target:
 
 ```bash
-c8ctl processos start --spawn-nano
+c8ctl processos start                 # spawns a pilot engine automatically
+c8ctl processos start --no-spawn-nano # reuse the --nano-url engine for the pilot too
 ```
 
 ProcessOS spawns its pilot engine from a Nano gateway binary given in
-`PROCESSOS_NANO_BIN`. The plugin already knows where the nano binary is, so it
-**auto-wires `PROCESSOS_NANO_BIN`** from the same binary `c8ctl nano` uses
-(`--binary` / `nano set bin` / `$NANOBPMN_BINARY` / the platform package / a repo
-build). You can override it with `c8ctl processos set env PROCESSOS_NANO_BIN=<path>`.
-Spawn mode requires a console-enabled nano build — the npm-distributed binaries
-qualify. The spawned engine is torn down when ProcessOS stops.
+`PROCESSOS_NANO_BIN`. The plugin **auto-wires `PROCESSOS_NANO_BIN`** from the same
+binary `c8ctl nano` uses (`--binary` / `nano set bin` / `$NANOBPMN_BINARY` / the
+platform package / a repo build). A console-enabled nano build is required — the
+npm-distributed binaries qualify. The spawned engine is torn down when ProcessOS
+stops.
 
-You can also enable spawn mode persistently instead of per-invocation:
-
-```bash
-c8ctl processos set env PROCESSOS_SPAWN_NANO=true
-```
+If no nano binary can be found, ProcessOS falls back to `--no-spawn-nano`
+automatically (using the target engine as the pilot) and prints a warning. Force
+the behaviour explicitly with `--spawn-nano` / `--no-spawn-nano`, override the
+binary with `c8ctl processos set env PROCESSOS_NANO_BIN=<path>`, or set the mode
+persistently with `c8ctl processos set env PROCESSOS_SPAWN_NANO=false`.
 
 ### ProcessOS configuration
 

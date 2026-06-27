@@ -1285,10 +1285,10 @@ async function startProcessos(req) {
     PROCESSOS_DATA_DIR: dataDir,
   };
 
-  // ProcessOS can run its own internal "pilot" Nano engine, which it spawns as a
-  // child process. That needs the path to a Nano gateway binary (a console-enabled
-  // build) in PROCESSOS_NANO_BIN. The plugin already knows where the nano binary
-  // lives, so auto-wire it (unless the user set PROCESSOS_NANO_BIN explicitly).
+  // ProcessOS runs its own internal "pilot" Nano engine, which it spawns as a
+  // child process from a console-enabled gateway binary in PROCESSOS_NANO_BIN.
+  // The plugin already knows where the nano binary lives, so auto-wire it.
+  // Spawning the pilot engine is the DEFAULT; resolve the binary best-effort.
   let nanoBin;
   try {
     nanoBin = findBinary({});
@@ -1298,20 +1298,39 @@ async function startProcessos(req) {
   if (nanoBin && !env.PROCESSOS_NANO_BIN) {
     env.PROCESSOS_NANO_BIN = nanoBin;
   }
-  if (req.spawnNano) {
-    env.PROCESSOS_SPAWN_NANO = 'true';
-    if (!env.PROCESSOS_NANO_BIN) {
-      // Surface the nano resolver's rich "could not find binary" guidance.
-      findBinary({});
-    }
+
+  // Decide whether to spawn the pilot engine. Precedence:
+  //   --no-spawn-nano flag            -> off (explicit)
+  //   --spawn-nano flag               -> on  (explicit; hard-fail if no binary)
+  //   PROCESSOS_SPAWN_NANO env/config -> honor it (explicit)
+  //   otherwise                       -> on by default (soft; fall back to URL
+  //                                      mode with a warning if no binary)
+  let spawnNano;
+  if (req.noSpawnNano) {
+    spawnNano = false;
+  } else if (req.spawnNano) {
+    if (!env.PROCESSOS_NANO_BIN) findBinary({}); // surface the resolver's guidance
+    spawnNano = true;
+  } else if (env.PROCESSOS_SPAWN_NANO !== undefined && env.PROCESSOS_SPAWN_NANO !== '') {
+    spawnNano = ['1', 'true', 'yes', 'on'].includes(String(env.PROCESSOS_SPAWN_NANO).toLowerCase());
+    if (spawnNano && !env.PROCESSOS_NANO_BIN) findBinary({});
+  } else if (env.PROCESSOS_NANO_BIN) {
+    spawnNano = true; // default
+  } else {
+    spawnNano = false; // default intent, but no nano binary available
+    logger.warn(
+      'No nano binary found, so ProcessOS will not spawn its own pilot engine; it will use the ' +
+        `target engine (${nanoUrl}) for its pilot instead. Point the plugin at a nano binary ` +
+        '("c8ctl nano set bin <path>") to enable a dedicated pilot engine.',
+    );
   }
-  const spawnNano = ['1', 'true', 'yes', 'on'].includes(String(env.PROCESSOS_SPAWN_NANO || '').toLowerCase());
+  env.PROCESSOS_SPAWN_NANO = spawnNano ? 'true' : 'false';
 
   logger.info('Starting ProcessOS...');
   logger.info(`Binary:   ${binary}`);
   logger.info(`Target:   ${nanoUrl}`);
   if (spawnNano) {
-    logger.info(`Own Nano: spawning engine from ${env.PROCESSOS_NANO_BIN}`);
+    logger.info(`Own Nano: spawning pilot engine from ${env.PROCESSOS_NANO_BIN}`);
   }
 
   const logFile = getProcessosLogFile();
@@ -1578,7 +1597,7 @@ function printProcessosUsage() {
   console.log('Manage a local ProcessOS instance (optimization-plane server for Nano BPM).');
   console.log('');
   console.log('Usage:');
-  console.log('  c8ctl processos start [--port <n>] [--nano-url <url>] [--binary <path>] [--spawn-nano] [--force]');
+  console.log('  c8ctl processos start [--port <n>] [--nano-url <url>] [--binary <path>] [--no-spawn-nano] [--force]');
   console.log('  c8ctl processos status');
   console.log('  c8ctl processos stop');
   console.log('  c8ctl processos restart [...]');
@@ -1587,8 +1606,9 @@ function printProcessosUsage() {
   console.log('  c8ctl processos config');
   console.log('');
   console.log('ProcessOS is downloaded manually; point the plugin at it with "c8ctl processos set bin <path>".');
-  console.log('Use --spawn-nano to have ProcessOS run its own internal Nano engine (the plugin auto-wires');
-  console.log('the nano binary path into PROCESSOS_NANO_BIN). Otherwise --nano-url targets an existing engine.');
+  console.log('By default ProcessOS spawns its own internal pilot Nano engine (the plugin auto-wires the nano');
+  console.log('binary into PROCESSOS_NANO_BIN). Use --no-spawn-nano to instead use the --nano-url engine for');
+  console.log('the pilot too. If no nano binary is available, it falls back to --no-spawn-nano automatically.');
 }
 
 function parseProcessosRequest(args, flags) {
@@ -1606,6 +1626,7 @@ function parseProcessosRequest(args, flags) {
     nanoUrl: flags?.['nano-url'] || flags?.nanoUrl,
     binary: flags?.binary,
     spawnNano: Boolean(flags?.['spawn-nano'] || flags?.spawnNano),
+    noSpawnNano: Boolean(flags?.['no-spawn-nano'] || flags?.noSpawnNano),
     follow: Boolean(flags?.follow),
     force: Boolean(flags?.force),
   };
@@ -1731,7 +1752,8 @@ export const commands = {
       port: { type: 'string', description: 'start: listen port (default 8090)' },
       'nano-url': { type: 'string', description: 'start: target Nano BPM engine URL (default http://localhost:8080)' },
       binary: { type: 'string', description: 'Path to the ProcessOS binary' },
-      'spawn-nano': { type: 'boolean', description: 'start: have ProcessOS spawn its own internal Nano engine (auto-wires PROCESSOS_NANO_BIN)' },
+      'spawn-nano': { type: 'boolean', description: 'start: force ProcessOS to spawn its own pilot Nano engine (default on when a nano binary is available)' },
+      'no-spawn-nano': { type: 'boolean', description: 'start: do NOT spawn a pilot engine; use the --nano-url engine for the pilot too' },
       follow: { type: 'boolean', description: 'logs: stream output (tail -F)', short: 'f' },
       force: { type: 'boolean', description: 'start: stop any existing instance first' },
     },

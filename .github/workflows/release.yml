@@ -87,11 +87,14 @@ jobs:
       - name: Publish (semantic-release)
         env:
           GITHUB_TOKEN: ${{ secrets.GITHUB_TOKEN }}
-          # OIDC trusted publishing: no NPM_TOKEN needed once every package
-          # (root + 5 platform packages) has a trusted publisher configured on
-          # npmjs.com. For the initial bootstrap publish, set an NPM_TOKEN secret
-          # and it will be used automatically via the registry-url .npmrc above.
+          # Bootstrap auth: NPM_TOKEN is read by @semantic-release/npm (root pkg),
+          # and NODE_AUTH_TOKEN is consumed by the setup-node .npmrc so the plain
+          # `npm publish` calls for the 5 platform packages authenticate too. Once
+          # every package (root + 5 platform) has a trusted publisher configured on
+          # npmjs.com, delete the NPM_TOKEN secret: both vars become empty and npm
+          # (>=11.5.1) authenticates via OIDC (id-token: write) automatically.
           NPM_TOKEN: ${{ secrets.NPM_TOKEN }}
+          NODE_AUTH_TOKEN: ${{ secrets.NPM_TOKEN }}
           # Provenance requires this repo to be public + OIDC (id-token: write).
           NPM_CONFIG_PROVENANCE: true
         run: npx semantic-release

@@ -1,7 +1,7 @@
 # c8ctl-plugin-nano
 
 A [c8ctl](https://github.com/camunda/c8ctl) plugin that starts, inspects, and
-stops a local [Nano BPM](https://github.com/jwulf/nano-bpm) (`nanobpmn`) cluster.
+stops a local Nano BPM (`nanobpmn`) cluster.
 
 It adds a single `nano` command:
 
@@ -224,6 +224,11 @@ Additionally every node gets:
 - `NANOBPMN_DATA_DIR` — a per-node engine data directory
 - `NANOBPMN_DURABILITY=async` — set by default for throughput; override by
   exporting `NANOBPMN_DURABILITY` (e.g. `sync`) before `nano start`
+- `NANOBPMN_REPLICATE_ACTIVATION=digest` — set by default so activated-job
+  state is observable across the cluster; override by exporting
+  `NANOBPMN_REPLICATE_ACTIVATION` before `nano start`
+- `NANOBPMN_REPLICATION=leader-durable` — set by default; override by exporting
+  `NANOBPMN_REPLICATION` before `nano start`
 - `NANOBPMN_WORKSPACE_DIR` — the shared workspace (models & workers)
 - `NANOBPMN_TRACE_STIMULI=1` — set on every node when `--capture` is passed
 

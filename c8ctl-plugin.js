@@ -465,6 +465,14 @@ async function startCluster(req) {
       // override per the spread of process.env above by exporting
       // NANOBPMN_DURABILITY (e.g. "sync") before running.
       NANOBPMN_DURABILITY: process.env.NANOBPMN_DURABILITY ?? 'async',
+      // Replicate job activation as a digest by default so activated-job state
+      // is observable across the cluster; override by exporting
+      // NANOBPMN_REPLICATE_ACTIVATION (e.g. "off"/"full") before running.
+      NANOBPMN_REPLICATE_ACTIVATION:
+        process.env.NANOBPMN_REPLICATE_ACTIVATION ?? 'digest',
+      // Acknowledge writes once durable on the leader by default; override by
+      // exporting NANOBPMN_REPLICATION before running.
+      NANOBPMN_REPLICATION: process.env.NANOBPMN_REPLICATION ?? 'leader-durable',
       // Shared, persistent authoring workspace (models + workers). Lives
       // outside the per-node data dir so "nano clean" never wipes it.
       NANOBPMN_WORKSPACE_DIR: workspaceDir,
@@ -629,7 +637,9 @@ async function stopCluster(req) {
 
   logger.info('Nano cluster stopped.');
   if (!req.purge) {
-    logger.info(`Engine data retained under ${getDataDir()} (use "stop --purge" to delete).`);
+    logger.info(
+      `Engine data retained under ${getDataDir()} (run "c8ctl nano clean" to delete it now that the server is stopped).`,
+    );
   }
 }
 

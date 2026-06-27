@@ -64,13 +64,34 @@ jobs:
           registry-url: 'https://registry.npmjs.org'
           cache: 'npm'
 
+      - name: Upgrade npm for OIDC trusted publishing
+        run: npm install -g npm@latest
+
       - name: Install deps
         run: npm ci
+
+      - name: Download prebuilt binaries
+        env:
+          GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+        run: |
+          set -euo pipefail
+          mkdir -p binaries
+          # Binaries are uploaded to a rolling "binaries" release on this repo by
+          # the upstream cross-compile pipeline. Same-repo download, no external
+          # references and no extra secrets.
+          gh release download binaries \
+            --repo "${{ github.repository }}" \
+            --dir binaries \
+            --clobber
 
       - name: Publish (semantic-release)
         env:
           GITHUB_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+          # OIDC trusted publishing: no NPM_TOKEN needed once every package
+          # (root + 5 platform packages) has a trusted publisher configured on
+          # npmjs.com. For the initial bootstrap publish, set an NPM_TOKEN secret
+          # and it will be used automatically via the registry-url .npmrc above.
           NPM_TOKEN: ${{ secrets.NPM_TOKEN }}
-          # TODO: Enable provenance once the repo is public
-          # NPM_CONFIG_PROVENANCE: true
+          # Provenance requires this repo to be public + OIDC (id-token: write).
+          NPM_CONFIG_PROVENANCE: true
         run: npx semantic-release

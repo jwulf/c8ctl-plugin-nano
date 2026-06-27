@@ -1,0 +1,60 @@
+#!/usr/bin/env node
+/**
+ * Publish the staged per-platform packages to npm.
+ *
+ *   node scripts/publish-platform-packages.mjs <version>
+ *
+ * Run after build-platform-packages.mjs. Publishes each npm-platforms/<pkg> at
+ * <version>. Idempotent: if a package@version is already on the registry it is
+ * skipped (so a re-run after a partial failure is safe).
+ *
+ * Auth:
+ *   - OIDC / Trusted Publishing when run in GitHub Actions with id-token (each
+ *     platform package must be registered as a trusted publisher on npmjs.com).
+ *   - Otherwise falls back to whatever npm auth is configured (e.g. an
+ *     NPM_TOKEN-backed ~/.npmrc) for the initial bootstrap publish.
+ *
+ * Provenance is enabled via NPM_CONFIG_PROVENANCE in the workflow (requires a
+ * public repo).
+ */
+
+import { execFileSync } from 'node:child_process';
+import { existsSync } from 'node:fs';
+import { join, dirname, resolve } from 'node:path';
+import { fileURLToPath } from 'node:url';
+import { PLATFORMS } from '../platforms.mjs';
+
+const __dirname = dirname(fileURLToPath(import.meta.url));
+const repoRoot = resolve(__dirname, '..');
+const outRoot = join(repoRoot, 'npm-platforms');
+
+const version = process.argv[2];
+if (!version) {
+  console.error('usage: publish-platform-packages.mjs <version>');
+  process.exit(1);
+}
+
+function alreadyPublished(pkg) {
+  try {
+    execFileSync('npm', ['view', `${pkg}@${version}`, 'version'], { stdio: 'pipe' });
+    return true;
+  } catch {
+    return false;
+  }
+}
+
+for (const p of PLATFORMS) {
+  const dir = join(outRoot, p.pkg);
+  if (!existsSync(dir)) {
+    console.error(`staged package missing: ${dir} (run build-platform-packages.mjs first)`);
+    process.exit(1);
+  }
+  if (alreadyPublished(p.pkg)) {
+    console.log(`skip ${p.pkg}@${version} (already published)`);
+    continue;
+  }
+  console.log(`publishing ${p.pkg}@${version} ...`);
+  execFileSync('npm', ['publish', '--access', 'public'], { cwd: dir, stdio: 'inherit' });
+}
+
+console.log('platform packages published.');

@@ -36,7 +36,28 @@ import {
   readdirSync,
 } from 'node:fs';
 import { homedir, platform as osPlatform } from 'node:os';
-import { join, isAbsolute, resolve as resolvePath } from 'node:path';
+import { join, isAbsolute, resolve as resolvePath, dirname } from 'node:path';
+import { createRequire } from 'node:module';
+import { platformForHost } from './platforms.mjs';
+
+const requireFromHere = createRequire(import.meta.url);
+
+/**
+ * Locate the nanobpmn binary shipped by the matching platform package
+ * (an optionalDependency such as c8ctl-plugin-nano-darwin-arm64). Returns the
+ * absolute path, or undefined if the package isn't installed for this host.
+ */
+function findPlatformPackageBinary() {
+  const p = platformForHost();
+  if (!p) return undefined;
+  try {
+    const manifest = requireFromHere.resolve(`${p.pkg}/package.json`);
+    const bin = join(dirname(manifest), p.bin);
+    return existsSync(bin) ? bin : undefined;
+  } catch {
+    return undefined;
+  }
+}
 
 // ---------------------------------------------------------------------------
 // Configuration & paths
@@ -163,8 +184,9 @@ function getRepoRoot() {
  *   1. --binary flag
  *   2. configured binary path ("nano set bin <path>")
  *   3. NANOBPMN_BINARY env var
- *   4. release build under the nanobpmn repo
- *   5. debug build under the nanobpmn repo
+ *   4. matching platform package (optionalDependency), when installed via npm
+ *   5. release build under the nanobpmn repo
+ *   6. debug build under the nanobpmn repo
  */
 function findBinary(flags) {
   const cfg = readConfig();
@@ -183,6 +205,9 @@ function findBinary(flags) {
     return abs;
   }
 
+  const fromPackage = findPlatformPackageBinary();
+  if (fromPackage) return fromPackage;
+
   const repo = getRepoRoot();
   const name = 'nanobpm-gateway-rest-server';
   const candidates = [
@@ -192,9 +217,15 @@ function findBinary(flags) {
   for (const c of candidates) {
     if (existsSync(c)) return c;
   }
+  const host = `${process.platform}/${process.arch}`;
+  const expectedPkg = platformForHost()?.pkg;
   throw new Error(
     `Could not find the nanobpmn server binary.\n` +
-      `Looked in:\n  ${candidates.join('\n  ')}\n` +
+      (expectedPkg
+        ? `No platform package installed for ${host} (expected "${expectedPkg}").\n` +
+          `Reinstall the plugin so npm can fetch it, or build from source below.\n`
+        : `No prebuilt binary is published for this platform (${host}).\n`) +
+      `Looked for a local build in:\n  ${candidates.join('\n  ')}\n` +
       `Build it with: (cd ${repo} && make release-gateway)\n` +
       `Or set one with "c8ctl nano set bin <path>", --binary <path>, or NANOBPMN_BINARY=<path>.`,
   );

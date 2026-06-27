@@ -244,8 +244,13 @@ The plugin needs a built `nanobpmn` server binary. Resolution order:
 1. `--binary <path>`
 2. configured path (`c8ctl nano set bin <path>`)
 3. `NANOBPMN_BINARY=<path>`
-4. `release` build under the nanobpmn repo
-5. `debug` build under the nanobpmn repo
+4. the matching **platform package** (`c8ctl-plugin-nano-<os>-<arch>`), installed
+   automatically as an `optionalDependency` when you install the plugin from npm
+5. `release` build under the nanobpmn repo
+6. `debug` build under the nanobpmn repo
+
+Most users never need a local build: installing the plugin from npm pulls in the
+prebuilt binary for their platform (step 4). Steps 5–6 are the local-dev path.
 
 The repo root defaults to `~/workspace/nanobpmn` and can be overridden with
 `NANOBPMN_REPO`. Build a binary with:
@@ -303,3 +308,60 @@ Then verify it shows up:
 ```bash
 c8ctl help | grep nano
 ```
+
+## Distribution & releasing
+
+Releases are automated with **semantic-release** (`.github/workflows/release.yml`,
+`release.config.cjs`). Pushing conventional commits to `main` cuts a version,
+publishes to npm, and creates a GitHub Release.
+
+### Platform packages
+
+The server binary is shipped as a set of platform-specific npm packages, one per
+target, gated by npm's `os`/`cpu` fields:
+
+| package                          | os     | cpu   |
+|----------------------------------|--------|-------|
+| `c8ctl-plugin-nano-darwin-arm64` | darwin | arm64 |
+| `c8ctl-plugin-nano-darwin-x64`   | darwin | x64   |
+| `c8ctl-plugin-nano-linux-x64`    | linux  | x64   |
+| `c8ctl-plugin-nano-linux-arm64`  | linux  | arm64 |
+| `c8ctl-plugin-nano-win32-x64`    | win32  | x64   |
+
+The root `c8ctl-plugin-nano` lists all five as `optionalDependencies` (pinned to
+the exact release version, injected into the published tarball at release time).
+npm installs only the one matching the host, so each user downloads a single
+binary. The mapping lives in `platforms.mjs` — the single source of truth shared
+by the build/publish scripts and the plugin's runtime resolution.
+
+### Binary delivery contract (upstream CI)
+
+This repo never builds or references the private Nano BPM source. Instead, the
+upstream cross-compile pipeline uploads prebuilt binaries as assets on a rolling
+GitHub Release named **`binaries`** in this repo. The release workflow downloads
+them (`gh release download binaries`) and packs them into the platform packages.
+
+Each asset must be named exactly (see `PLATFORMS[].asset` in `platforms.mjs`):
+
+```
+nanobpm-gateway-rest-server-darwin-arm64
+nanobpm-gateway-rest-server-darwin-x64
+nanobpm-gateway-rest-server-linux-x64
+nanobpm-gateway-rest-server-linux-arm64
+nanobpm-gateway-rest-server-win32-x64.exe
+```
+
+The upstream job needs a token with `contents: write` on this repo and can upload
+with e.g. `gh release upload binaries <files> --clobber`.
+
+### OIDC / Trusted Publishing
+
+The workflow is set up for npm **Trusted Publishing** (OIDC, `id-token: write`)
+with provenance (`NPM_CONFIG_PROVENANCE: true`, requires this repo to be public).
+Trusted Publishing is per-package and requires the package to already exist, so:
+
+1. **Bootstrap** the first release with a granular-automation `NPM_TOKEN` secret —
+   it is used automatically and creates all six packages.
+2. On npmjs.com, add a **Trusted Publisher** (this repo + `release.yml`) for the
+   root package and each of the five platform packages.
+3. Remove the `NPM_TOKEN` secret; subsequent releases authenticate via OIDC.

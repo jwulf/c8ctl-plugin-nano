@@ -3,6 +3,23 @@
 A [c8ctl](https://github.com/camunda/c8ctl) plugin that starts, inspects, and
 stops a local Nano BPM (`nanobpmn`) cluster.
 
+## About Nano BPM
+
+**A Rust research engine exploring high-performance BPMN execution and Camunda 8
+compatibility.**
+
+Nano BPM (`nanobpmn`) is a single self-contained binary that runs BPMN processes
+behind a **Camunda 8-compatible v2 REST API**. It embeds a deterministic,
+event-sourced BPMN engine (`engine-core`), an append-only journal for crash
+durability, an SQLite-backed read model, optional multi-node Raft replication,
+and a built-in web console — all in one executable with no runtime dependencies.
+
+It is an advanced research prototype: a place to explore what a faster, smaller,
+faster-to-iterate-on process engine can do, while staying API-compatible with
+existing Camunda 8 clients and tooling. This plugin is the easiest way to run and
+manage it — single node or a whole cluster — shipping a prebuilt binary for your
+platform so there is nothing to compile.
+
 It adds a single `nano` command:
 
 ```bash

@@ -43,6 +43,7 @@ function alreadyPublished(pkg) {
   }
 }
 
+const deferred = [];
 for (const p of PLATFORMS) {
   const dir = join(outRoot, p.pkg);
   if (!existsSync(dir)) {
@@ -54,7 +55,40 @@ for (const p of PLATFORMS) {
     continue;
   }
   console.log(`publishing ${p.pkg}@${version} ...`);
-  execFileSync('npm', ['publish', '--access', 'public'], { cwd: dir, stdio: 'inherit' });
+  try {
+    const out = execFileSync('npm', ['publish', '--access', 'public'], {
+      cwd: dir,
+      encoding: 'utf8',
+      stdio: ['inherit', 'pipe', 'pipe'],
+    });
+    if (out) process.stdout.write(out);
+  } catch (err) {
+    const combined = `${err.stdout || ''}${err.stderr || ''}`;
+    if (combined) process.stdout.write(combined);
+    // npm's spam-detection heuristic (E403 "Package name triggered spam
+    // detection") blocks a brand-new package name pending a manual npm support
+    // review. Don't fail the whole release over it: publish the platforms npm
+    // accepted plus the meta-package, so the plugin works everywhere npm let us
+    // in. The meta-package lists every platform as an optionalDependency at this
+    // exact version, so once the name is cleared a re-run publishes the deferred
+    // package and installs pick it up automatically. Any other error is fatal.
+    if (/triggered spam detection/i.test(combined)) {
+      console.warn(
+        `::warning::deferring ${p.pkg}@${version}: npm rejected the package name (E403 spam detection). ` +
+          `Re-run this workflow after npm support clears the name to publish it at the same version.`,
+      );
+      deferred.push(p.pkg);
+      continue;
+    }
+    throw err;
+  }
 }
 
-console.log('platform packages published.');
+if (deferred.length) {
+  console.warn(
+    `platform packages published with ${deferred.length} deferred: ${deferred.join(', ')}. ` +
+      `Re-run after the npm name(s) are cleared.`,
+  );
+} else {
+  console.log('platform packages published.');
+}

@@ -4,6 +4,9 @@
   "type": "module",
   "description": "c8ctl plugin to start, inspect, and stop a local Nano BPM (nanobpmn) cluster",
   "main": "c8ctl-plugin.js",
+  "publishConfig": {
+    "access": "public"
+  },
   "repository": {
     "type": "git",
     "url": "https://github.com/jwulf/c8ctl-plugin-nano"

@@ -1,3 +1,10 @@
+## [1.3.3](https://github.com/jwulf/c8ctl-plugin-nano/compare/v1.3.2...v1.3.3) (2026-06-30)
+
+
+### Bug Fixes
+
+* **processos:** re-download newer builds on start; show versions in status ([1945bda](https://github.com/jwulf/c8ctl-plugin-nano/commit/1945bda2a647ee702fe4569b42815f0fbd55d3c7))
+
 ## [1.3.2](https://github.com/jwulf/c8ctl-plugin-nano/compare/v1.3.1...v1.3.2) (2026-06-30)
 
 

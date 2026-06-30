@@ -1,3 +1,11 @@
+# [1.2.0](https://github.com/jwulf/c8ctl-plugin-nano/compare/v1.1.0...v1.2.0) (2026-06-30)
+
+
+### Features
+
+* **nano:** notify once per day when a new release is available ([311cfb4](https://github.com/jwulf/c8ctl-plugin-nano/commit/311cfb4752c00d1b37387c1d56540b2405b31eda))
+* **processos:** closed-alpha gate, auto-download, and update notifier ([5e9a311](https://github.com/jwulf/c8ctl-plugin-nano/commit/5e9a311f29cc36034807c62f9966cae575c74b35))
+
 # [1.1.0](https://github.com/jwulf/c8ctl-plugin-nano/compare/v1.0.1...v1.1.0) (2026-06-30)
 
 

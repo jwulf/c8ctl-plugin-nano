@@ -63,8 +63,9 @@ function readBundledBinaryInfo() {
 
 /**
  * Locate the nanobpmn binary shipped by the matching platform package
- * (an optionalDependency such as c8ctl-plugin-nano-darwin-arm64). Returns the
- * absolute path, or undefined if the package isn't installed for this host.
+ * (an optionalDependency such as @nanobpm/c8ctl-plugin-nano-darwin-arm64).
+ * Returns the absolute path, or undefined if the package isn't installed for
+ * this host.
  */
 function findPlatformPackageBinary() {
   const p = platformForHost();

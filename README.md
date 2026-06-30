@@ -282,8 +282,9 @@ The plugin needs a built `nanobpmn` server binary. Resolution order:
 1. `--binary <path>`
 2. configured path (`c8ctl nano set bin <path>`)
 3. `NANOBPMN_BINARY=<path>`
-4. the matching **platform package** (`c8ctl-plugin-nano-<os>-<arch>`), installed
-   automatically as an `optionalDependency` when you install the plugin from npm
+4. the matching **platform package** (`@nanobpm/c8ctl-plugin-nano-<os>-<arch>`),
+   installed automatically as an `optionalDependency` when you install the plugin
+   from npm
 5. `release` build under the nanobpmn repo
 6. `debug` build under the nanobpmn repo
 
@@ -447,15 +448,16 @@ publishes to npm, and creates a GitHub Release.
 ### Platform packages
 
 The server binary is shipped as a set of platform-specific npm packages, one per
-target, gated by npm's `os`/`cpu` fields:
+target, gated by npm's `os`/`cpu` fields. They are **scoped under `@nanobpm`** (a
+scope we own) so the names can never be squatted or npm-security-held:
 
-| package                          | os     | cpu   |
-|----------------------------------|--------|-------|
-| `c8ctl-plugin-nano-darwin-arm64` | darwin | arm64 |
-| `c8ctl-plugin-nano-darwin-x64`   | darwin | x64   |
-| `c8ctl-plugin-nano-linux-x64`    | linux  | x64   |
-| `c8ctl-plugin-nano-linux-arm64`  | linux  | arm64 |
-| `c8ctl-plugin-nano-win32-x64`    | win32  | x64   |
+| package                                    | os     | cpu   |
+|--------------------------------------------|--------|-------|
+| `@nanobpm/c8ctl-plugin-nano-darwin-arm64`  | darwin | arm64 |
+| `@nanobpm/c8ctl-plugin-nano-darwin-x64`    | darwin | x64   |
+| `@nanobpm/c8ctl-plugin-nano-linux-x64`     | linux  | x64   |
+| `@nanobpm/c8ctl-plugin-nano-linux-arm64`   | linux  | arm64 |
+| `@nanobpm/c8ctl-plugin-nano-win32-x64`     | win32  | x64   |
 
 The root `c8ctl-plugin-nano` lists all five as `optionalDependencies` (pinned to
 the exact release version, injected into the published tarball at release time).
@@ -508,7 +510,14 @@ with provenance (`NPM_CONFIG_PROVENANCE: true`, requires this repo to be public)
 Trusted Publishing is per-package and requires the package to already exist, so:
 
 1. **Bootstrap** the first release with a granular-automation `NPM_TOKEN` secret —
-   it is used automatically and creates all six packages.
+   it is used automatically and creates all six packages. The token must have
+   **publish rights to the `@nanobpm` scope** (the platform packages are scoped).
 2. On npmjs.com, add a **Trusted Publisher** (this repo + `release.yml`) for the
-   root package and each of the five platform packages.
+   root package and each of the five `@nanobpm/c8ctl-plugin-nano-*` platform
+   packages.
 3. Remove the `NPM_TOKEN` secret; subsequent releases authenticate via OIDC.
+
+> Note: because the platform packages are **scoped** (`@nanobpm/…`), they sidestep
+> the unscoped-name squatting/`0.0.1-security` hold that previously blocked
+> `c8ctl-plugin-nano-win32-x64`. If you ever add a new platform, its scoped name is
+> yours to publish immediately.

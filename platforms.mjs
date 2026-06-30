@@ -2,7 +2,9 @@
  * Single source of truth for the platform-specific binary packages.
  *
  * Each entry maps a Node platform/arch pair to:
- *   - pkg:   the npm package name that carries the binary for that platform
+ *   - pkg:   the npm package name that carries the binary for that platform.
+ *            Scoped under @nanobpm (a scope we own) so the names can never be
+ *            squatted or npm-security-held the way an unscoped name can.
  *   - os:    the npm "os" field value (process.platform)
  *   - cpu:   the npm "cpu" field value (process.arch)
  *   - triple: the Rust target triple (informational; used by the Nano BPM CI)
@@ -19,7 +21,7 @@ export const BIN_BASENAME = 'nanobpm-gateway-rest-server';
 
 export const PLATFORMS = [
   {
-    pkg: 'c8ctl-plugin-nano-darwin-arm64',
+    pkg: '@nanobpm/c8ctl-plugin-nano-darwin-arm64',
     os: 'darwin',
     cpu: 'arm64',
     triple: 'aarch64-apple-darwin',
@@ -27,7 +29,7 @@ export const PLATFORMS = [
     bin: BIN_BASENAME,
   },
   {
-    pkg: 'c8ctl-plugin-nano-darwin-x64',
+    pkg: '@nanobpm/c8ctl-plugin-nano-darwin-x64',
     os: 'darwin',
     cpu: 'x64',
     triple: 'x86_64-apple-darwin',
@@ -35,7 +37,7 @@ export const PLATFORMS = [
     bin: BIN_BASENAME,
   },
   {
-    pkg: 'c8ctl-plugin-nano-linux-x64',
+    pkg: '@nanobpm/c8ctl-plugin-nano-linux-x64',
     os: 'linux',
     cpu: 'x64',
     triple: 'x86_64-unknown-linux-gnu',
@@ -43,7 +45,7 @@ export const PLATFORMS = [
     bin: BIN_BASENAME,
   },
   {
-    pkg: 'c8ctl-plugin-nano-linux-arm64',
+    pkg: '@nanobpm/c8ctl-plugin-nano-linux-arm64',
     os: 'linux',
     cpu: 'arm64',
     triple: 'aarch64-unknown-linux-gnu',
@@ -51,7 +53,7 @@ export const PLATFORMS = [
     bin: BIN_BASENAME,
   },
   {
-    pkg: 'c8ctl-plugin-nano-win32-x64',
+    pkg: '@nanobpm/c8ctl-plugin-nano-win32-x64',
     os: 'win32',
     cpu: 'x64',
     triple: 'x86_64-pc-windows-msvc',

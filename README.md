@@ -137,6 +137,35 @@ c8ctl nano stop --purge       # stop and remove engine data in one step
 
 `clean` refuses to run while any node is alive.
 
+### Stress / throughput runs: bounding disk and RAM
+
+The engine journal (`journal.jsonl`) is **append-only** — there is currently no
+compaction or rotation — and the read-model retains every terminal instance by
+default. Under sustained high load (tens of thousands of PI/s) this fills the
+disk quickly. Two `start` flags keep a long run bounded:
+
+```bash
+# Pure throughput: no journal / read-model on disk at all (in-memory engine).
+# State is lost on stop/restart, and instances live in RAM — so cap them.
+c8ctl nano start --in-memory --history-max 50000
+
+# Exercise the disk path but cap the read model's terminal-instance history.
+# (The journal still grows append-only; watch free space.)
+c8ctl nano start --history-max 50000
+```
+
+- `--in-memory` (alias `--no-journal`) routes the engine to an in-memory journal
+  and a `:memory:` read store — nothing is written under `NANOBPMN_DATA_DIR`.
+- `--history-max <n>` sets `NANOBPMN_HISTORY_MAX_INSTANCES`, continuously pruning
+  all but the most recent *n* terminal instances from the read model (`0`/unset =
+  unbounded). Works in both storage modes.
+
+`c8ctl nano status` reports the active storage mode (`in-memory` vs `on-disk`)
+and the history cap.
+
+> ⚠️ With `--in-memory`, restart recovers nothing, and Raft/replicated logs are
+> not persisted. Use it for stress/throughput testing, not durability testing.
+
 ## Configuration (`set` / `config`)
 
 Persistent settings are stored in `<state home>/config.json`:

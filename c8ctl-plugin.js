@@ -19,6 +19,7 @@
  *
  * Usage:
  *   c8ctl nano start [<nodes>] [--port <basePort>] [--partitions <n>] [--rf <n>]
+ *                    [--in-memory] [--history-max <n>]
  *   c8ctl nano status
  *   c8ctl nano stop [--purge]
  *   c8ctl nano logs [<nodeId>] [--follow]
@@ -322,6 +323,8 @@ function parseRequest(args, flags) {
     purge: Boolean(flags?.purge),
     force: Boolean(flags?.force),
     capture: Boolean(flags?.capture),
+    inMemory: Boolean(flags?.['in-memory'] || flags?.['no-journal']),
+    historyMax: intFlag('history-max'),
     workspace: Boolean(flags?.workspace),
     check: Boolean(flags?.check),
     binary: flags?.binary,
@@ -496,6 +499,8 @@ async function startCluster(req) {
   // Raft is required for replication; auto-enable when RF > 1, allow override.
   const raft = req.raft === undefined ? rf > 1 : Boolean(req.raft);
   const capture = Boolean(req.capture);
+  const inMemory = Boolean(req.inMemory);
+  const historyMax = req.historyMax;
 
   if (partitions < nodeCount) {
     logger.warn(
@@ -505,6 +510,21 @@ async function startCluster(req) {
   }
   if (req.rf && req.rf > nodeCount) {
     logger.warn(`--rf ${req.rf} clamped to node count (${nodeCount}).`);
+  }
+  if (inMemory) {
+    logger.warn(
+      'In-memory mode: no journal or read-model is written to disk. Engine state is ' +
+        'lost on stop/restart, and every retained instance lives in RAM' +
+        (historyMax === undefined
+          ? ' — pair with --history-max <N> to bound RAM under sustained load.'
+          : '.'),
+    );
+    if (raft || rf > 1) {
+      logger.warn(
+        'In-memory mode with Raft/replication: replicated logs are not persisted; ' +
+          'a restarted node recovers nothing.',
+      );
+    }
   }
 
   const binary = findBinary(req);
@@ -548,7 +568,9 @@ async function startCluster(req) {
 
   logger.info(
     `Starting Nano BPM cluster: ${nodeCount} node(s), ${partitions} partition(s), ` +
-      `RF=${rf}${raft ? ', Raft on' : ''}${capture ? ', trace capture on' : ''}`,
+      `RF=${rf}${raft ? ', Raft on' : ''}${capture ? ', trace capture on' : ''}` +
+      `${inMemory ? ', in-memory (no disk)' : ''}` +
+      `${historyMax !== undefined ? `, history-max=${historyMax}` : ''}`,
   );
   logger.info(`Binary:    ${binary}`);
   logger.info(`Workspace: ${workspaceDir} (models/, workers/)`);
@@ -558,7 +580,7 @@ async function startCluster(req) {
     const port = ports[id];
     const dataDir = join(getDataDir(), `node-${id}`);
     const logFile = join(getLogDir(), `node-${id}.log`);
-    mkdirSync(dataDir, { recursive: true });
+    if (!inMemory) mkdirSync(dataDir, { recursive: true });
 
     const env = {
       ...process.env,
@@ -567,7 +589,6 @@ async function startCluster(req) {
       NANOBPMN_NODES: nodesEnv,
       NANOBPMN_PARTITIONS: String(partitions),
       NANOBPMN_RF: String(rf),
-      NANOBPMN_DATA_DIR: dataDir,
       // Default to async durability (group-commit) for throughput; the user can
       // override per the spread of process.env above by exporting
       // NANOBPMN_DURABILITY (e.g. "sync") before running.
@@ -584,6 +605,22 @@ async function startCluster(req) {
       // outside the per-node data dir so "nano clean" never wipes it.
       NANOBPMN_WORKSPACE_DIR: workspaceDir,
     };
+    // Storage axis: an on-disk journal + read-model under the per-node data dir
+    // (default), or a fully in-memory engine (in-memory journal + :memory: read
+    // store) when --in-memory is set. In in-memory mode, scrub any inherited
+    // path vars so nothing leaks back to disk.
+    if (inMemory) {
+      delete env.NANOBPMN_DATA_DIR;
+      delete env.NANOBPMN_JOURNAL;
+      delete env.NANOBPMN_READ_DB;
+    } else {
+      env.NANOBPMN_DATA_DIR = dataDir;
+    }
+    // Bound retained terminal instances in the read model when requested. Works
+    // in both storage modes (caps disk growth on-disk; caps RAM in-memory).
+    if (historyMax !== undefined) {
+      env.NANOBPMN_HISTORY_MAX_INSTANCES = String(historyMax);
+    }
     if (raft) env.NANOBPMN_RAFT = '1';
     // Trace capture: a single flag enables the Tier 2 recorded-input (stimuli)
     // log AND auto-enables Tier 1 variable capture, so historical replay /
@@ -614,7 +651,7 @@ async function startCluster(req) {
       process.exit(1);
     }
 
-    nodes.push({ id, port, pid: child.pid, url: peers[id], dataDir, logFile });
+    nodes.push({ id, port, pid: child.pid, url: peers[id], dataDir: inMemory ? null : dataDir, logFile });
     logger.info(`  node ${id}: pid ${child.pid} → ${peers[id]} (log: ${logFile})`);
   }
 
@@ -627,6 +664,8 @@ async function startCluster(req) {
     rf,
     raft,
     capture,
+    inMemory,
+    historyMax: historyMax ?? null,
     basePort,
     nodes,
   };
@@ -663,7 +702,7 @@ async function printSummary(state) {
   console.log('');
   console.log(
     `Nano BPM cluster is up: ${state.nodes.length} node(s), ${state.partitions} partition(s), ` +
-      `RF=${state.rf}${state.raft ? ', Raft on' : ''}`,
+      `RF=${state.rf}${state.raft ? ', Raft on' : ''}${state.inMemory ? ', in-memory (no disk)' : ''}`,
   );
   console.log('');
   for (const n of state.nodes) {
@@ -872,7 +911,14 @@ async function statusCluster(req) {
   console.log(`  binary:    ${state.binary}`);
   console.log(`  version:   ${binaryVersion(state.binary) ?? 'unknown'}`);
   console.log(`  workspace: ${state.workspaceDir || getWorkspaceDir()}`);
-  console.log(`  data:      ${getDataDir()}`);
+  const historyNote =
+    state.historyMax != null ? `, history-max ${state.historyMax}` : '';
+  if (state.inMemory) {
+    console.log(`  storage:   in-memory (no journal/read-model on disk${historyNote})`);
+  } else {
+    console.log(`  storage:   on-disk${historyNote}`);
+    console.log(`  data:      ${getDataDir()}`);
+  }
   console.log('');
   console.log('  NODE  PORT   PID       PROCESS   HEALTH    URL');
   for (const c of checks) {
@@ -2311,6 +2357,7 @@ export const metadata = {
         },
         { command: 'c8ctl nano start 3 --port 9000', description: 'Start 3 nodes on ports 9000..9002' },
         { command: 'c8ctl nano start --capture', description: 'Start with trace capture for historical replay/analysis' },
+        { command: 'c8ctl nano start --in-memory --history-max 50000', description: 'Stress mode: no disk journal, cap retained instances in RAM' },
         { command: 'c8ctl nano status', description: 'Show cluster status and per-node health' },
         { command: 'c8ctl nano pause 1', description: 'Freeze node 1 (SIGSTOP) to simulate a node failure' },
         { command: 'c8ctl nano resume 1', description: 'Resume node 1 (SIGCONT) to bring it back online' },
@@ -2353,6 +2400,9 @@ export const commands = {
       rf: { type: 'string', description: 'Replication factor; >1 enables Raft (default 1)' },
       raft: { type: 'boolean', description: 'Force per-partition Raft on/off (default: on when rf>1)' },
       capture: { type: 'boolean', description: 'start: enable trace capture (recorded-input replay) on every node' },
+      'in-memory': { type: 'boolean', description: 'start: run with NO on-disk journal/read-model (in-memory engine; state lost on restart). Alias: --no-journal' },
+      'no-journal': { type: 'boolean', description: 'start: alias for --in-memory' },
+      'history-max': { type: 'string', description: 'start: cap retained terminal instances in the read model (NANOBPMN_HISTORY_MAX_INSTANCES; 0/unset = unbounded)' },
       follow: { type: 'boolean', description: 'logs: stream output (tail -F)', short: 'f' },
       purge: { type: 'boolean', description: 'stop: also delete per-node engine data' },
       force: { type: 'boolean', description: 'start: stop any existing cluster first' },
@@ -2484,7 +2534,7 @@ export const commands = {
 
 function printUsage() {
   console.log('Usage:');
-  console.log('  c8ctl nano start [<nodes>] [--port <basePort>] [--partitions <n>] [--rf <n>] [--raft] [--capture] [--binary <path>]');
+  console.log('  c8ctl nano start [<nodes>] [--port <basePort>] [--partitions <n>] [--rf <n>] [--raft] [--capture] [--in-memory] [--history-max <n>] [--binary <path>]');
   console.log('  c8ctl nano status [--port <port>]');
   console.log('  c8ctl nano stop [--purge]');
   console.log('  c8ctl nano logs [<nodeId>] [--follow]');
@@ -2516,6 +2566,8 @@ function printUsage() {
   console.log('  --rf <n>             Replication factor; >1 enables Raft (default 1)');
   console.log('  --raft               Force Raft on (default: on iff rf>1)');
   console.log('  --capture            start: enable trace capture (recorded-input replay) on every node');
+  console.log('  --in-memory          start: run with NO on-disk journal/read-model (alias --no-journal; state lost on restart)');
+  console.log('  --history-max <n>    start: cap retained terminal instances in the read model (0/unset = unbounded)');
   console.log('  --binary <path>      Path to the nanobpmn server binary (overrides "set bin")');
   console.log('  --purge              stop: also delete per-node engine data');
   console.log('  --force              start: stop any existing cluster first');

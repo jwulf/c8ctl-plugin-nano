@@ -1,3 +1,15 @@
+# [1.1.0](https://github.com/jwulf/c8ctl-plugin-nano/compare/v1.0.1...v1.1.0) (2026-06-30)
+
+
+### Bug Fixes
+
+* **release:** scope platform packages under [@nanobpm](https://github.com/nanobpm) to avoid name squatting ([536091d](https://github.com/jwulf/c8ctl-plugin-nano/commit/536091d89a5628822fa31132ce097bcf6b311faf))
+
+
+### Features
+
+* **nano:** add `nano update` to pull a new release on an existing install ([f261574](https://github.com/jwulf/c8ctl-plugin-nano/commit/f261574da4bfe0784e1e29b58bf5eef249b5e036))
+
 ## [1.0.1](https://github.com/jwulf/c8ctl-plugin-nano/compare/v1.0.0...v1.0.1) (2026-06-30)
 
 

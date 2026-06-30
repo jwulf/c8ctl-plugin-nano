@@ -1,3 +1,10 @@
+# [1.4.0](https://github.com/jwulf/c8ctl-plugin-nano/compare/v1.3.3...v1.4.0) (2026-06-30)
+
+
+### Features
+
+* **nano:** add --in-memory/--no-journal and --history-max to start ([45012c4](https://github.com/jwulf/c8ctl-plugin-nano/commit/45012c4eac7c4ddc39f24ae5e0db3487e6e2fbe4)), closes [hi#throughput](https://github.com/hi/issues/throughput)
+
 ## [1.3.3](https://github.com/jwulf/c8ctl-plugin-nano/compare/v1.3.2...v1.3.3) (2026-06-30)
 
 

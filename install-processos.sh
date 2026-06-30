@@ -89,18 +89,89 @@ else
   ok "c8ctl installed ($(c8ctl --version 2>/dev/null | head -n1))"
 fi
 
-# --- ensure the nano plugin ------------------------------------------------
-if c8ctl list plugins 2>/dev/null | grep -q "^${PLUGIN_PKG}[[:space:]]"; then
-  ok "${PLUGIN_PKG} already loaded"
-else
+# --- ensure the nano plugin is installed AND up to date --------------------
+# c8ctl keeps plugins in its own npm-managed dir, so an already-installed but
+# stale plugin must be upgraded (older versions lack `processos set download-url`
+# and the closed-alpha download support). Compare the installed version against
+# the latest on npm and upgrade when behind.
+plugin_installed_version() {
+  c8ctl list plugins 2>/dev/null | awk -F'|' '
+    { n=$1; gsub(/^[ \t]+|[ \t]+$/,"",n) }
+    n=="'"${PLUGIN_PKG}"'" { v=$2; gsub(/[ \t]/,"",v); print v; exit }'
+}
+
+LATEST_PLUGIN="$(npm view "${PLUGIN_PKG}" version 2>/dev/null | tr -d '[:space:]' || true)"
+CUR_PLUGIN="$(plugin_installed_version || true)"
+
+if [ -z "${CUR_PLUGIN}" ]; then
   say "Loading the ${PLUGIN_PKG} plugin from npm…"
   c8ctl load plugin "${PLUGIN_PKG}" || die "Failed to load the ${PLUGIN_PKG} plugin. Check your network and retry."
-  ok "${PLUGIN_PKG} loaded"
+  ok "${PLUGIN_PKG} loaded ($(plugin_installed_version))"
+elif [ -n "${LATEST_PLUGIN}" ] && [ "${CUR_PLUGIN}" != "${LATEST_PLUGIN}" ]; then
+  say "Updating ${PLUGIN_PKG} ${CUR_PLUGIN} → ${LATEST_PLUGIN}…"
+  if c8ctl upgrade plugin "${PLUGIN_PKG}" "${LATEST_PLUGIN}" || c8ctl sync plugin; then
+    ok "${PLUGIN_PKG} updated ($(plugin_installed_version))"
+  else
+    die "Failed to update ${PLUGIN_PKG} from ${CUR_PLUGIN} to ${LATEST_PLUGIN}. Try 'c8ctl upgrade plugin ${PLUGIN_PKG}' manually."
+  fi
+else
+  ok "${PLUGIN_PKG} up to date (${CUR_PLUGIN})"
+fi
+
+# --- ensure the Nano BPM server binary is downloaded -----------------------
+# The nano gateway binary ships as the host's @nanobpm platform package, an npm
+# optionalDependency of the plugin. A normal (re)install pulls it, but if a
+# prior install skipped optional deps it can be missing — ProcessOS needs it to
+# spawn its pilot engine. Probe for it and force a reinstall if absent.
+host_pkg_suffix() {
+  local os arch
+  case "$(uname -s)" in
+    Darwin) os=darwin ;;
+    Linux)  os=linux ;;
+    MINGW*|MSYS*|CYGWIN*|Windows_NT) os=win32 ;;
+    *)      os="$(uname -s)" ;;
+  esac
+  case "$(uname -m)" in
+    arm64|aarch64) arch=arm64 ;;
+    x86_64|amd64)  arch=x64 ;;
+    *)             arch="$(uname -m)" ;;
+  esac
+  printf '%s-%s' "$os" "$arch"
+}
+
+c8ctl_config_dir() {
+  case "$(uname -s)" in
+    Darwin) printf '%s' "${HOME}/Library/Application Support/c8ctl" ;;
+    Linux)  printf '%s' "${XDG_CONFIG_HOME:-${HOME}/.config}/c8ctl" ;;
+    MINGW*|MSYS*|CYGWIN*|Windows_NT) printf '%s' "${APPDATA:-${HOME}/AppData/Roaming}/c8ctl" ;;
+    *)      printf '%s' "${HOME}/.config/c8ctl" ;;
+  esac
+}
+
+nano_binary_present() {
+  local dir
+  dir="$(c8ctl_config_dir)/plugins/node_modules/@nanobpm/c8ctl-plugin-nano-$(host_pkg_suffix)"
+  [ -d "$dir" ] && ls "$dir"/nanobpm-gateway-rest-server* >/dev/null 2>&1
+}
+
+if nano_binary_present; then
+  ok "Nano BPM server binary present"
+else
+  say "Downloading the Nano BPM server binary (npm optional dependency)…"
+  c8ctl sync plugin >/dev/null 2>&1 || c8ctl upgrade plugin "${PLUGIN_PKG}" "${LATEST_PLUGIN:-}" >/dev/null 2>&1 || true
+  if nano_binary_present; then
+    ok "Nano BPM server binary installed"
+  else
+    warn "Could not confirm the Nano BPM server binary for $(host_pkg_suffix)."
+    warn "ProcessOS will still run, falling back to a pilot-less engine. To fix, run: c8ctl sync plugin"
+  fi
 fi
 
 # --- configure the ProcessOS download URL ----------------------------------
 say "Configuring the ProcessOS download URL…"
-c8ctl processos set download-url "${DOWNLOAD_URL}" || die "Failed to persist the download URL."
+c8ctl processos set download-url "${DOWNLOAD_URL}" || die "Failed to persist the download URL.
+Your ${PLUGIN_PKG} may be too old; update it with 'c8ctl upgrade plugin ${PLUGIN_PKG}',
+or set PROCESSOS_DOWNLOAD_URL=\"${DOWNLOAD_URL}\" in your shell as a fallback."
 ok "ProcessOS download URL configured"
 
 # --- done ------------------------------------------------------------------

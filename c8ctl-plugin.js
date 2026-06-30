@@ -25,7 +25,7 @@
  *   c8ctl nano restart [<nodes>] ...
  */
 
-import { spawn } from 'node:child_process';
+import { spawn, spawnSync } from 'node:child_process';
 import {
   existsSync,
   mkdirSync,
@@ -257,7 +257,7 @@ function findBinary(flags) {
 // Argument parsing
 // ---------------------------------------------------------------------------
 
-const VALID_SUBCOMMANDS = ['start', 'stop', 'status', 'logs', 'log', 'restart', 'pause', 'resume', 'clean', 'set', 'config'];
+const VALID_SUBCOMMANDS = ['start', 'stop', 'status', 'logs', 'log', 'restart', 'pause', 'resume', 'clean', 'set', 'config', 'update'];
 
 /**
  * Parse positional args + flags into a normalized request.
@@ -288,6 +288,7 @@ function parseRequest(args, flags) {
     force: Boolean(flags?.force),
     capture: Boolean(flags?.capture),
     workspace: Boolean(flags?.workspace),
+    check: Boolean(flags?.check),
     binary: flags?.binary,
   };
 }
@@ -1107,6 +1108,119 @@ function showConfig() {
 }
 
 // ---------------------------------------------------------------------------
+// update — pull a new nanobpmn release onto a machine with an existing install.
+// The plugin (and the bundled server binary, shipped via the matching platform
+// package) is distributed on npm as c8ctl-plugin-nano, so a release is pulled by
+// reinstalling the package globally. We only ever drive npm here — never touch
+// the private upstream source — so this works for any npm-installed user.
+// ---------------------------------------------------------------------------
+
+/** This plugin package's identity, read from its own package.json. */
+function pluginPackage() {
+  try {
+    const pkg = JSON.parse(readFileSync(join(pluginDir, 'package.json'), 'utf8'));
+    return { name: pkg.name || 'c8ctl-plugin-nano', version: pkg.version || null };
+  } catch {
+    return { name: 'c8ctl-plugin-nano', version: null };
+  }
+}
+
+/**
+ * Numeric semver comparison (major.minor.patch), ignoring any pre-release/build
+ * suffix. Returns -1 if a<b, 0 if equal, 1 if a>b.
+ */
+function compareSemver(a, b) {
+  const norm = (v) =>
+    String(v)
+      .replace(/^v/, '')
+      .split(/[-+]/)[0]
+      .split('.')
+      .map((n) => Number.parseInt(n, 10) || 0);
+  const av = norm(a);
+  const bv = norm(b);
+  for (let i = 0; i < 3; i++) {
+    const x = av[i] || 0;
+    const y = bv[i] || 0;
+    if (x !== y) return x < y ? -1 : 1;
+  }
+  return 0;
+}
+
+/** Latest published version of `name` per the npm registry (throws on failure). */
+function npmLatestVersion(name) {
+  const res = spawnSync('npm', ['view', name, 'version'], { encoding: 'utf8' });
+  if (res.error) throw new Error(res.error.message);
+  if (res.status !== 0) {
+    throw new Error((res.stderr || '').trim() || `npm view exited ${res.status}`);
+  }
+  return res.stdout.trim();
+}
+
+/** True when this plugin lives under npm's global node_modules (so `-g` updates it). */
+function isGlobalInstall() {
+  const res = spawnSync('npm', ['root', '-g'], { encoding: 'utf8' });
+  if (res.status !== 0) return false;
+  const root = res.stdout.trim();
+  return Boolean(root) && pluginDir.startsWith(root);
+}
+
+function updatePlugin(req) {
+  const { name, version: current } = pluginPackage();
+  const bundled = readBundledBinaryInfo();
+  const nanoNote = bundled ? `  (bundled nano ${bundled.version})` : '';
+  const manual = `  npm install -g ${name}@latest`;
+
+  console.log(`Installed: ${name} v${current ?? '?'}${nanoNote}`);
+
+  let latest;
+  try {
+    latest = npmLatestVersion(name);
+  } catch (err) {
+    console.log(`Could not check npm for updates: ${err.message}`);
+    console.log('Pull the latest release manually with:');
+    console.log(manual);
+    return;
+  }
+  console.log(`Latest:    ${name} v${latest}  (npm)`);
+  console.log('');
+
+  if (current && compareSemver(current, latest) >= 0) {
+    console.log('Already on the latest release — nothing to do.');
+    return;
+  }
+
+  console.log(`Update available: v${current ?? '?'} -> v${latest}`);
+
+  if (req.check) {
+    console.log('Run `c8ctl nano update` to pull it (or manually):');
+    console.log(manual);
+    return;
+  }
+
+  if (!isGlobalInstall()) {
+    console.log('This plugin is not a global npm install, so it cannot self-update in place.');
+    console.log('Pull the latest release with:');
+    console.log(manual);
+    console.log('(or, for a local checkout, `git pull` then reload the plugin).');
+    return;
+  }
+
+  console.log(`Pulling ${name}@${latest} via npm...`);
+  console.log('');
+  const res = spawnSync('npm', ['install', '-g', `${name}@${latest}`], { stdio: 'inherit' });
+  if (res.error) throw new Error(res.error.message);
+  if (res.status !== 0) {
+    throw new Error(
+      `npm install -g ${name}@${latest} failed (exit ${res.status}). ` +
+        `You may need elevated permissions: sudo ${manual.trim()}`,
+    );
+  }
+  console.log('');
+  console.log(`Updated to v${latest}. Restart any running cluster to use the new binary:`);
+  console.log('  c8ctl nano restart');
+}
+
+// ---------------------------------------------------------------------------
 // processos — manage a single local ProcessOS instance (the optimization-plane
 // server that analyses a running Nano BPM engine). Unlike nano, the ProcessOS
 // binary is not distributed via npm: the user downloads it and points the
@@ -1662,6 +1776,8 @@ export const metadata = {
         { command: 'c8ctl nano set bin <path>', description: 'Set the nanobpmn server binary path' },
         { command: 'c8ctl nano set model-dir <path>', description: 'Set the workspace dir (models + workers)' },
         { command: 'c8ctl nano config', description: 'Show current plugin configuration and paths' },
+        { command: 'c8ctl nano update', description: 'Pull the latest published nano release (re-installs via npm)' },
+        { command: 'c8ctl nano update --check', description: 'Check whether a newer nano release is available' },
       ],
     },
     processos: {
@@ -1695,6 +1811,7 @@ export const commands = {
       purge: { type: 'boolean', description: 'stop: also delete per-node engine data' },
       force: { type: 'boolean', description: 'start: stop any existing cluster first' },
       workspace: { type: 'boolean', description: 'clean: also delete the workspace (models + workers)' },
+      check: { type: 'boolean', description: 'update: only report whether a new release is available; do not install' },
       binary: { type: 'string', description: 'Path to the nanobpmn server binary' },
     },
     handler: async (args, flags) => {
@@ -1739,6 +1856,9 @@ export const commands = {
             break;
           case 'config':
             showConfig();
+            break;
+          case 'update':
+            updatePlugin(req);
             break;
         }
       } catch (error) {
@@ -1812,6 +1932,7 @@ function printUsage() {
   console.log('  c8ctl nano clean [--workspace]');
   console.log('  c8ctl nano set <bin|model-dir> <path>');
   console.log('  c8ctl nano config');
+  console.log('  c8ctl nano update [--check]');
   console.log('');
   console.log('Subcommands:');
   console.log('  start    Spawn an N-node local cluster wired to talk to each other on localhost');
@@ -1824,6 +1945,7 @@ function printUsage() {
   console.log('  clean    Wipe journal/data + logs on disk (keeps models/workers)');
   console.log('  set      Persist a setting: "bin <path>" or "model-dir <path>"');
   console.log('  config   Show current configuration and on-disk locations');
+  console.log('  update   Pull the latest published nano release (--check to only report)');
   console.log('');
   console.log('Options:');
   console.log('  <nodes>              Number of nodes to start (default 1)');

@@ -124,6 +124,27 @@ Persistent settings are stored in `<state home>/config.json`:
 
 Show the effective configuration and all on-disk locations with `c8ctl nano config`.
 
+## Updating to a new release (`update`)
+
+The plugin and the bundled server binary (delivered via the matching platform
+package) ship together on npm as `c8ctl-plugin-nano`. To pull a new nanobpmn
+release onto a machine that already has nano installed:
+
+```bash
+c8ctl nano update          # check npm for a newer release and install it
+c8ctl nano update --check  # only report whether an update is available
+```
+
+`update` compares the installed plugin version against the latest published on
+npm. When a newer release exists it reinstalls the package globally
+(`npm install -g c8ctl-plugin-nano@latest`), which brings the new server binary
+with it. It only ever drives npm — it never touches the private upstream source —
+so it works for any npm-installed user. After updating, restart any running
+cluster (`c8ctl nano restart`) so it picks up the new binary.
+
+If the plugin is running from a local checkout rather than a global npm install,
+`update` prints the manual command instead of reinstalling in place.
+
 ## Checking status
 
 `c8ctl nano status` queries each node's always-on `GET /v2/topology`, which is the

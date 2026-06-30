@@ -34,6 +34,8 @@ import {
   writeFileSync,
   rmSync,
   readdirSync,
+  chmodSync,
+  renameSync,
 } from 'node:fs';
 import { homedir, platform as osPlatform } from 'node:os';
 import { join, isAbsolute, resolve as resolvePath, dirname } from 'node:path';
@@ -101,6 +103,15 @@ const DEFAULT_NANO_URL = 'http://localhost:8080';
 const UPDATE_CACHE_FILE = 'update-check.json';
 const UPDATE_CHECK_TTL_MS = 24 * 60 * 60 * 1000;
 const UPDATE_NOTIFY_TTL_MS = 24 * 60 * 60 * 1000;
+
+// ProcessOS is a closed alpha distributed out-of-band: the binary lives in an
+// S3 bucket whose base URL is handed to enabled users via PROCESSOS_DOWNLOAD_URL.
+// `<base>/processos-<os>-<arch>[.exe]` is the per-platform binary and
+// `<base>/version.json` is the {version,commit,updated} metadata the CI writes
+// next to it (the analogue of npm's latest-version lookup for the nano plugin).
+const PROCESSOS_VERSION_META = 'version.json';
+const PROCESSOS_BINARY_META_FILE = 'processos-binary.json';
+const PROCESSOS_UPDATE_CACHE_FILE = 'processos-update-check.json';
 
 function getLogger() {
   if (globalThis.c8ctl) {
@@ -1418,15 +1429,17 @@ function clearProcessosState() {
 }
 
 /**
- * Locate the ProcessOS binary. Resolution order:
+ * Locate a ProcessOS binary the user already has, WITHOUT downloading. Order:
  *   1. --binary flag
  *   2. configured path ("processos set bin <path>")
  *   3. PROCESSOS_BINARY env var
- *   4. release build under the nanobpmn repo
- *   5. debug build under the nanobpmn repo
- * The binary is not shipped via npm — it is downloaded manually.
+ *   4. a previously auto-downloaded binary cached under the state home
+ *   5. release / debug build under the nanobpmn repo (local dev)
+ * Returns an absolute path, or null when nothing is configured/present. Throws
+ * only when an *explicitly* configured source points at a missing file (so the
+ * user gets an actionable error rather than a silent fallthrough).
  */
-function findProcessosBinary(req) {
+function findConfiguredProcessosBinary(req) {
   const cfg = readProcessosConfig();
   const sources = [
     { val: req?.binary && String(req.binary), from: '--binary' },
@@ -1442,22 +1455,329 @@ function findProcessosBinary(req) {
     return abs;
   }
 
-  const repo = getRepoRoot();
-  const name = 'processos';
-  const candidates = [
-    join(repo, 'processos', 'target', 'release', name),
-    join(repo, 'processos', 'target', 'debug', name),
-  ];
-  for (const c of candidates) {
-    if (existsSync(c)) return c;
+  const cached = getProcessosCachedBinaryPath();
+  if (existsSync(cached)) return cached;
+
+  let repo = null;
+  try {
+    repo = getRepoRoot();
+  } catch {
+    repo = null;
   }
+  if (repo) {
+    const candidates = [
+      join(repo, 'processos', 'target', 'release', 'processos'),
+      join(repo, 'processos', 'target', 'debug', 'processos'),
+    ];
+    for (const c of candidates) {
+      if (existsSync(c)) return c;
+    }
+  }
+  return null;
+}
+
+/** The state-home directory that holds an auto-downloaded ProcessOS binary. */
+function getProcessosBinDir() {
+  return join(getStateHome(), 'bin');
+}
+
+function getProcessosCachedBinaryPath() {
+  const name = process.platform === 'win32' ? 'processos.exe' : 'processos';
+  return join(getProcessosBinDir(), name);
+}
+
+/** Sidecar recording the version of the auto-downloaded binary (for update checks). */
+function getProcessosBinaryMetaPath() {
+  return join(getProcessosBinDir(), PROCESSOS_BINARY_META_FILE);
+}
+
+function readProcessosBinaryMeta() {
+  try {
+    return JSON.parse(readFileSync(getProcessosBinaryMetaPath(), 'utf8'));
+  } catch {
+    return {};
+  }
+}
+
+/**
+ * The S3 asset name for the host platform, matching the names the nanobpmn CI
+ * uploads (`processos-<os>-<arch>`, `.exe` on Windows). Null on an unsupported
+ * platform.
+ */
+function processosAssetName(platform = process.platform, arch = process.arch) {
+  const map = {
+    'darwin:arm64': 'processos-darwin-arm64',
+    'darwin:x64': 'processos-darwin-x64',
+    'linux:x64': 'processos-linux-x64',
+    'linux:arm64': 'processos-linux-arm64',
+    'win32:x64': 'processos-win32-x64.exe',
+  };
+  return map[`${platform}:${arch}`] || null;
+}
+
+/**
+ * Join a PROCESSOS_DOWNLOAD_URL base with a leaf (`processos-<arch>` or
+ * `version.json`). The base is normally a directory/prefix (e.g. the S3
+ * `.../processos/latest/` URL); if it already points straight at a binary
+ * asset, we treat its parent directory as the base so siblings resolve too.
+ */
+function processosDownloadBase(rawUrl) {
+  const t = String(rawUrl || '').trim();
+  if (!t) return '';
+  if (t.endsWith('/')) return t.slice(0, -1);
+  const lastSeg = t.split('/').pop();
+  // A direct link to a binary asset -> use its parent as the base.
+  if (lastSeg.startsWith('processos-') || lastSeg === 'processos' || lastSeg.endsWith('.exe')) {
+    return t.slice(0, t.length - lastSeg.length - 1);
+  }
+  return t;
+}
+
+function processosBinaryUrl(rawUrl) {
+  const asset = processosAssetName();
+  if (!asset) {
+    throw new Error(
+      `No prebuilt ProcessOS binary is published for this platform (${process.platform}/${process.arch}).`,
+    );
+  }
+  return `${processosDownloadBase(rawUrl)}/${asset}`;
+}
+
+function processosVersionMetaUrl(rawUrl) {
+  return `${processosDownloadBase(rawUrl)}/${PROCESSOS_VERSION_META}`;
+}
+
+/** Fetch and parse the remote version.json (best-effort; null on any failure). */
+async function fetchProcessosVersionMeta(rawUrl, timeoutMs = 4000) {
+  try {
+    const ctrl = new AbortController();
+    const t = setTimeout(() => ctrl.abort(), timeoutMs);
+    const res = await fetch(processosVersionMetaUrl(rawUrl), { redirect: 'follow', signal: ctrl.signal });
+    clearTimeout(t);
+    if (!res.ok) return null;
+    const j = await res.json();
+    return j && typeof j === 'object' ? j : null;
+  } catch {
+    return null;
+  }
+}
+
+/** Download a binary to `dest` (atomic via temp + rename; +x on unix). */
+async function downloadProcessosBinary(url, dest) {
+  const logger = getLogger();
+  logger.info(`Downloading ProcessOS for ${process.platform}/${process.arch} from ${url} ...`);
+  const res = await fetch(url, { redirect: 'follow' });
+  if (!res.ok) {
+    throw new Error(`ProcessOS download failed: HTTP ${res.status} ${res.statusText} for ${url}`);
+  }
+  const buf = Buffer.from(await res.arrayBuffer());
+  mkdirSync(getProcessosBinDir(), { recursive: true });
+  const tmp = `${dest}.download`;
+  writeFileSync(tmp, buf);
+  if (process.platform !== 'win32') chmodSync(tmp, 0o755);
+  renameSync(tmp, dest);
+  logger.info(`Saved ProcessOS to ${dest} (${(buf.length / 1_000_000).toFixed(1)} MB).`);
+  return dest;
+}
+
+/**
+ * Resolve the ProcessOS binary to run, downloading it on demand when the user
+ * has a PROCESSOS_DOWNLOAD_URL but no local copy yet. Resolution:
+ *   configured/local binary -> cached download -> fresh download -> error.
+ */
+async function resolveProcessosBinary(req) {
+  const configured = findConfiguredProcessosBinary(req); // may throw on a missing configured path
+  if (configured) return configured;
+
+  const dlUrl = process.env.PROCESSOS_DOWNLOAD_URL;
+  if (dlUrl) {
+    const dest = getProcessosCachedBinaryPath();
+    const meta = await fetchProcessosVersionMeta(dlUrl);
+    await downloadProcessosBinary(processosBinaryUrl(dlUrl), dest);
+    // Record what we fetched so the update notifier can compare later.
+    try {
+      mkdirSync(getProcessosBinDir(), { recursive: true });
+      writeFileSync(
+        getProcessosBinaryMetaPath(),
+        JSON.stringify({
+          version: meta?.version ?? null,
+          commit: meta?.commit ?? null,
+          updated: meta?.updated ?? null,
+          source: processosDownloadBase(dlUrl),
+          downloaded: new Date().toISOString(),
+        }),
+      );
+    } catch {
+      /* sidecar is best-effort */
+    }
+    return dest;
+  }
+
   throw new Error(
-    `Could not find the ProcessOS binary.\n` +
-      `ProcessOS is not distributed via npm — download the binary for your platform, then point the plugin at it:\n` +
-      `  c8ctl processos set bin <path>   (or --binary <path>, or export PROCESSOS_BINARY)\n` +
-      `Alternatively build from source: (cd ${repo} && make processos-build-release)\n` +
-      `Looked for a local build in:\n  ${candidates.join('\n  ')}`,
+    `Could not find or download the ProcessOS binary.\n` +
+      `Set the download URL you were given (PROCESSOS_DOWNLOAD_URL), point the plugin at a\n` +
+      `local binary ("c8ctl processos set bin <path>" / --binary / PROCESSOS_BINARY), or build\n` +
+      `from source under the nanobpmn repo.`,
   );
+}
+
+/**
+ * Whether ProcessOS is enabled for this user. It is a closed alpha, so the
+ * operational commands stay locked until the user either has the binary on
+ * their system (configured path / cached download / local build) or has been
+ * given a PROCESSOS_DOWNLOAD_URL to fetch it from.
+ */
+function processosEnabled(req) {
+  if (process.env.PROCESSOS_DOWNLOAD_URL) return true;
+  try {
+    if (findConfiguredProcessosBinary(req)) return true;
+  } catch {
+    // A configured-but-missing path still means the user opted in; let the real
+    // not-found error surface from the command rather than the closed-alpha gate.
+    return true;
+  }
+  return false;
+}
+
+function printProcessosClosedAlpha() {
+  const logger = getLogger();
+  logger.error(
+    'ProcessOS is in closed alpha and is not available yet.\n' +
+      '\n' +
+      'To enable it, set the download URL you were given by the Nano BPM team:\n' +
+      '  export PROCESSOS_DOWNLOAD_URL=<url>\n' +
+      '  c8ctl processos start            # downloads + runs the matching binary\n' +
+      '\n' +
+      'or, if you already have the binary, point the plugin at it:\n' +
+      '  c8ctl processos set bin <path>',
+  );
+}
+
+// --- ProcessOS update notifier ---------------------------------------------
+// Mirrors the nano plugin notifier, but the "latest version" comes from the
+// version.json the nanobpmn CI publishes next to the S3 binaries rather than
+// from npm. Throttled to one background fetch + one notice per day.
+
+function getProcessosUpdateCacheFile() {
+  return join(getStateHome(), PROCESSOS_UPDATE_CACHE_FILE);
+}
+
+function readProcessosUpdateCache() {
+  try {
+    return JSON.parse(readFileSync(getProcessosUpdateCacheFile(), 'utf8'));
+  } catch {
+    return {};
+  }
+}
+
+function writeProcessosUpdateCache(obj) {
+  try {
+    mkdirSync(getStateHome(), { recursive: true });
+    writeFileSync(getProcessosUpdateCacheFile(), JSON.stringify(obj));
+  } catch {
+    /* best-effort */
+  }
+}
+
+/**
+ * The installed ProcessOS version: the recorded version of an auto-downloaded
+ * binary, else `processos --version` against the resolved binary. Null when no
+ * binary is present or it can't report a version.
+ */
+function getInstalledProcessosVersion(req) {
+  const meta = readProcessosBinaryMeta();
+  if (meta.version) return String(meta.version);
+  let binary = null;
+  try {
+    binary = findConfiguredProcessosBinary(req);
+  } catch {
+    binary = null;
+  }
+  if (!binary) return null;
+  try {
+    const res = spawnSync(binary, ['--version'], { encoding: 'utf8', timeout: 3000 });
+    if (res.status === 0) {
+      const m = String(res.stdout || '').match(/(\d+\.\d+\.\d+[^\s]*)/);
+      if (m) return m[1];
+    }
+  } catch {
+    /* ignore */
+  }
+  return null;
+}
+
+/**
+ * Refresh the cached latest ProcessOS version in a detached background process
+ * (fetches version.json), so the current command never waits on the network.
+ */
+function spawnProcessosVersionRefresh(metaUrl, cacheFile) {
+  const script =
+    'const{readFileSync,writeFileSync}=require("fs");' +
+    `let prev={};try{prev=JSON.parse(readFileSync(${JSON.stringify(cacheFile)},"utf8"))}catch{}` +
+    'const out=Object.assign({},prev,{lastCheck:Date.now()});' +
+    'const ac=new AbortController();const t=setTimeout(()=>ac.abort(),5000);' +
+    `fetch(${JSON.stringify(metaUrl)},{redirect:"follow",signal:ac.signal})` +
+    '.then(r=>r.ok?r.json():null).then(j=>{clearTimeout(t);' +
+    'if(j&&j.version){out.latest=String(j.version);out.commit=j.commit||null}' +
+    `try{writeFileSync(${JSON.stringify(cacheFile)},JSON.stringify(out))}catch{}})` +
+    `.catch(()=>{try{writeFileSync(${JSON.stringify(cacheFile)},JSON.stringify(out))}catch{}});`;
+  try {
+    const child = spawn(process.execPath, ['-e', script], { detached: true, stdio: 'ignore' });
+    child.unref();
+  } catch {
+    /* skip this cycle */
+  }
+}
+
+function printProcessosUpdateNotice(current, latest) {
+  const lines = [
+    '',
+    `╭─ ProcessOS update available: v${current ?? '?'} → v${latest}`,
+    '│  A newer ProcessOS build is published.',
+    '│  Get it:  c8ctl processos stop && c8ctl processos start',
+    '│           (a configured binary updates itself; a downloaded one re-fetches)',
+    '╰─ Pin a specific build instead with: c8ctl processos set bin <path>',
+    '',
+  ];
+  for (const l of lines) console.error(l);
+}
+
+/**
+ * Best-effort, non-blocking ProcessOS update check. Triggers a background
+ * version.json fetch when the cache is stale and prints a notice (at most once
+ * per day) when the published version is newer than the installed one. Only
+ * meaningful when a download URL is configured (the closed-alpha channel).
+ */
+function maybeNotifyProcessosUpdate(req) {
+  try {
+    if (updateNotifierDisabled()) return;
+    const dlUrl = process.env.PROCESSOS_DOWNLOAD_URL;
+    if (!dlUrl) return; // no published channel to compare against
+    const current = getInstalledProcessosVersion(req);
+    if (!current) return;
+
+    const cacheFile = getProcessosUpdateCacheFile();
+    const cache = readProcessosUpdateCache();
+    const now = Date.now();
+
+    if (!cache.lastCheck || now - cache.lastCheck > UPDATE_CHECK_TTL_MS) {
+      try {
+        mkdirSync(getStateHome(), { recursive: true });
+      } catch {
+        /* ignore */
+      }
+      spawnProcessosVersionRefresh(processosVersionMetaUrl(dlUrl), cacheFile);
+    }
+
+    const latest = cache.latest;
+    if (!latest || compareSemver(current, latest) >= 0) return;
+    if (cache.lastNotified && now - cache.lastNotified <= UPDATE_NOTIFY_TTL_MS) return;
+
+    printProcessosUpdateNotice(current, latest);
+    writeProcessosUpdateCache({ ...cache, lastNotified: now });
+  } catch {
+    /* never break a command over the notifier */
+  }
 }
 
 /** Probe ProcessOS's GET /health endpoint for reachability. */
@@ -1489,7 +1809,7 @@ async function startProcessos(req) {
     await stopProcessos({});
   }
 
-  const binary = findProcessosBinary(req);
+  const binary = await resolveProcessosBinary(req);
   const port = getProcessosPort(req);
   const url = `http://127.0.0.1:${port}`;
   const nanoUrl = req.nanoUrl || getProcessosNanoUrl();
@@ -1823,6 +2143,15 @@ function showProcessosConfig() {
     }
   }
   console.log('');
+  console.log('  closed-alpha channel:');
+  console.log(`    download url   ${process.env.PROCESSOS_DOWNLOAD_URL || '(not set — ProcessOS is a closed alpha; set PROCESSOS_DOWNLOAD_URL to enable)'}`);
+  const cached = getProcessosCachedBinaryPath();
+  const meta = readProcessosBinaryMeta();
+  console.log(`    cached binary  ${existsSync(cached) ? cached : '(none — downloaded on first "processos start")'}`);
+  if (meta.version || meta.commit) {
+    console.log(`    version        ${meta.version || '?'}${meta.commit ? ` (${String(meta.commit).slice(0, 8)})` : ''}${meta.downloaded ? `  downloaded ${meta.downloaded}` : ''}`);
+  }
+  console.log('');
   console.log(`  state file ${getProcessosStateFile()}`);
   console.log(`  log file   ${getProcessosLogFile()}`);
   console.log('');
@@ -1841,7 +2170,9 @@ function printProcessosUsage() {
   console.log('  c8ctl processos set bin <path> | port <n> | nano-url <url> | data-dir <path> | env KEY=VALUE');
   console.log('  c8ctl processos config');
   console.log('');
-  console.log('ProcessOS is downloaded manually; point the plugin at it with "c8ctl processos set bin <path>".');
+  console.log('ProcessOS is a closed alpha. Enable it with the download URL you were given:');
+  console.log('  export PROCESSOS_DOWNLOAD_URL=<url>   # plugin downloads + runs the matching binary');
+  console.log('or point the plugin at a binary you already have: "c8ctl processos set bin <path>".');
   console.log('By default ProcessOS spawns its own internal pilot Nano engine (the plugin auto-wires the nano');
   console.log('binary into PROCESSOS_NANO_BIN). Use --no-spawn-nano to instead use the --nano-url engine for');
   console.log('the pilot too. If no nano binary is available, it falls back to --no-spawn-nano automatically.');
@@ -1905,7 +2236,8 @@ export const metadata = {
     processos: {
       description: 'Manage a local ProcessOS instance — start, status, stop, logs, config',
       examples: [
-        { command: 'c8ctl processos set bin <path>', description: 'Point the plugin at the downloaded ProcessOS binary' },
+        { command: 'export PROCESSOS_DOWNLOAD_URL=<url>', description: 'Enable the closed alpha + auto-download the matching binary' },
+        { command: 'c8ctl processos set bin <path>', description: 'Point the plugin at a ProcessOS binary you already have' },
         { command: 'c8ctl processos start', description: 'Start ProcessOS against the local Nano BPM engine' },
         { command: 'c8ctl processos start --nano-url http://localhost:8080', description: 'Start against a specific engine' },
         { command: 'c8ctl processos status', description: 'Show ProcessOS status and health' },
@@ -2011,6 +2343,15 @@ export const commands = {
         return;
       }
 
+      // ProcessOS is a closed alpha: gate the operational commands until the
+      // user has opted in (download URL set or a binary on their system).
+      // `set`/`config` stay open so users can configure/inspect at any time.
+      const ungated = req.subcommand === 'set' || req.subcommand === 'config';
+      if (!ungated && !processosEnabled(req)) {
+        printProcessosClosedAlpha();
+        process.exit(1);
+      }
+
       let failed = false;
       try {
         switch (req.subcommand) {
@@ -2043,6 +2384,7 @@ export const commands = {
         failed = true;
       }
       maybeNotifyUpdate(req.subcommand);
+      maybeNotifyProcessosUpdate(req);
       if (failed) process.exit(1);
     },
   },

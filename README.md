@@ -370,14 +370,29 @@ ProcessOS is the optimization-plane server that analyses a running Nano BPM
 engine. The plugin can manage a single local ProcessOS instance with the same
 start/stop/status/logs lifecycle as `nano`.
 
-Unlike the Nano BPM server binary (which is distributed via npm — see below),
-**the ProcessOS binary is downloaded manually**: grab the build for your
-platform, then point the plugin at it.
+> **ProcessOS is a closed alpha.** The operational commands (`start`, `stop`,
+> `status`, `logs`, `restart`) stay locked with a *"not available yet"* notice
+> until you opt in. Only `set` and `config` work before then. Opt in either by
+> setting the download URL you were given by the Nano BPM team, or by pointing
+> the plugin at a binary you already have.
 
 ```bash
-# One-time: tell the plugin where the binary is
-c8ctl processos set bin ~/Downloads/processos
+# Closed-alpha channel: the plugin downloads + caches the matching binary
+export PROCESSOS_DOWNLOAD_URL=<url you were given>
+c8ctl processos start            # fetches processos-<os>-<arch> on first run
 
+# …or point the plugin at a binary you already have
+c8ctl processos set bin ~/Downloads/processos
+c8ctl processos start
+```
+
+`PROCESSOS_DOWNLOAD_URL` is the prefix the release binaries live under (e.g. the
+`…/processos/latest/` bucket URL). The plugin appends the per-platform asset name
+(`processos-darwin-arm64`, `processos-linux-x64`, `processos-win32-x64.exe`, …),
+downloads it to `<stateHome>/bin/`, marks it executable, and runs it. The cached
+download is reused on subsequent starts.
+
+```bash
 # Start ProcessOS against the local Nano BPM engine (http://localhost:8080)
 c8ctl processos start
 
@@ -389,6 +404,18 @@ c8ctl processos status
 c8ctl processos logs --follow
 c8ctl processos stop
 ```
+
+### Automatic update notice
+
+When you're on the closed-alpha channel (`PROCESSOS_DOWNLOAD_URL` set), the
+plugin checks for newer ProcessOS builds in the background and prints a short
+one-line notice (at most **once per day**) when the published version is newer
+than the one you're running. It compares your installed binary's version against
+the `version.json` the release pipeline publishes next to the binaries, never
+blocks the command (the check runs detached), and is suppressed on
+non-interactive shells, in CI, and when `NO_UPDATE_NOTIFIER` /
+`NANO_NO_UPDATE_NOTIFIER` is set. To update, stop and start ProcessOS again — a
+downloaded binary re-fetches the latest build; a `set bin` binary updates itself.
 
 On a successful `start` the summary leads with the landing page:
 
@@ -439,9 +466,10 @@ c8ctl processos config                  # show current settings and on-disk path
 ```
 
 The binary is resolved in this order: `--binary` flag → `set bin` →
-`$PROCESSOS_BINARY` → a local `processos/target/{release,debug}/processos` build.
-Typed settings (`port`, `nano-url`, `data-dir`) always win over generic `env`
-passthrough values when launching.
+`$PROCESSOS_BINARY` → a cached download under `<stateHome>/bin/` → a local
+`processos/target/{release,debug}/processos` build → a fresh download from
+`PROCESSOS_DOWNLOAD_URL`. Typed settings (`port`, `nano-url`, `data-dir`) always
+win over generic `env` passthrough values when launching.
 
 ## Installing
 

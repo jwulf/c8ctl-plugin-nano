@@ -1,3 +1,10 @@
+## [1.3.2](https://github.com/jwulf/c8ctl-plugin-nano/compare/v1.3.1...v1.3.2) (2026-06-30)
+
+
+### Bug Fixes
+
+* **install:** upgrade stale plugin and provision nano binary ([61bdc23](https://github.com/jwulf/c8ctl-plugin-nano/commit/61bdc238ae6e2d225cfd3a7a24a5a569cca4581f))
+
 ## [1.3.1](https://github.com/jwulf/c8ctl-plugin-nano/compare/v1.3.0...v1.3.1) (2026-06-30)
 
 

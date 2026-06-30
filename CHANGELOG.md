@@ -1,3 +1,10 @@
+# [1.3.0](https://github.com/jwulf/c8ctl-plugin-nano/compare/v1.2.0...v1.3.0) (2026-06-30)
+
+
+### Features
+
+* **processos:** persist the closed-alpha download URL via `set download-url` ([5266bbb](https://github.com/jwulf/c8ctl-plugin-nano/commit/5266bbb7616699c11332eaeed5ed2d8de3bf7bbb))
+
 # [1.2.0](https://github.com/jwulf/c8ctl-plugin-nano/compare/v1.1.0...v1.2.0) (2026-06-30)
 
 

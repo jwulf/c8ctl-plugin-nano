@@ -1400,6 +1400,18 @@ function getProcessosNanoUrl() {
   return cfg.nanoUrl || process.env.NANO_BASE_URL || DEFAULT_NANO_URL;
 }
 
+/**
+ * The closed-alpha download URL: env var (PROCESSOS_DOWNLOAD_URL) wins, then the
+ * persisted `processos set download-url` config value. Null when neither is set.
+ */
+function getProcessosDownloadUrl() {
+  const fromEnv = process.env.PROCESSOS_DOWNLOAD_URL;
+  if (fromEnv && String(fromEnv).trim()) return String(fromEnv).trim();
+  const cfg = readProcessosConfig();
+  if (cfg.downloadUrl && String(cfg.downloadUrl).trim()) return String(cfg.downloadUrl).trim();
+  return null;
+}
+
 /** The listen port (flag overrides configured value, which overrides default). */
 function getProcessosPort(req) {
   const cfg = readProcessosConfig();
@@ -1589,7 +1601,7 @@ async function resolveProcessosBinary(req) {
   const configured = findConfiguredProcessosBinary(req); // may throw on a missing configured path
   if (configured) return configured;
 
-  const dlUrl = process.env.PROCESSOS_DOWNLOAD_URL;
+  const dlUrl = getProcessosDownloadUrl();
   if (dlUrl) {
     const dest = getProcessosCachedBinaryPath();
     const meta = await fetchProcessosVersionMeta(dlUrl);
@@ -1628,7 +1640,7 @@ async function resolveProcessosBinary(req) {
  * given a PROCESSOS_DOWNLOAD_URL to fetch it from.
  */
 function processosEnabled(req) {
-  if (process.env.PROCESSOS_DOWNLOAD_URL) return true;
+  if (getProcessosDownloadUrl()) return true;
   try {
     if (findConfiguredProcessosBinary(req)) return true;
   } catch {
@@ -1645,8 +1657,10 @@ function printProcessosClosedAlpha() {
     'ProcessOS is in closed alpha and is not available yet.\n' +
       '\n' +
       'To enable it, set the download URL you were given by the Nano BPM team:\n' +
-      '  export PROCESSOS_DOWNLOAD_URL=<url>\n' +
-      '  c8ctl processos start            # downloads + runs the matching binary\n' +
+      '  c8ctl processos set download-url <url>   # persists it for this machine\n' +
+      '  c8ctl processos start                    # downloads + runs the matching binary\n' +
+      '\n' +
+      '(or set PROCESSOS_DOWNLOAD_URL in your environment for the same effect)\n' +
       '\n' +
       'or, if you already have the binary, point the plugin at it:\n' +
       '  c8ctl processos set bin <path>',
@@ -1751,7 +1765,7 @@ function printProcessosUpdateNotice(current, latest) {
 function maybeNotifyProcessosUpdate(req) {
   try {
     if (updateNotifierDisabled()) return;
-    const dlUrl = process.env.PROCESSOS_DOWNLOAD_URL;
+    const dlUrl = getProcessosDownloadUrl();
     if (!dlUrl) return; // no published channel to compare against
     const current = getInstalledProcessosVersion(req);
     if (!current) return;
@@ -2030,6 +2044,8 @@ const PROCESSOS_SET_FIELDS = {
   port: 'port',
   'nano-url': 'nanoUrl',
   nanourl: 'nanoUrl',
+  'download-url': 'downloadUrl',
+  downloadurl: 'downloadUrl',
   'data-dir': 'dataDir',
   datadir: 'dataDir',
   env: 'env',
@@ -2039,6 +2055,7 @@ function printProcessosSetUsage() {
   const logger = getLogger();
   logger.info('Usage: c8ctl processos set <field> <value>');
   logger.info('  bin <path>          Path to the downloaded ProcessOS binary');
+  logger.info('  download-url <url>  Closed-alpha binary download URL (enables ProcessOS)');
   logger.info('  port <n>            Listen port (default 8090)');
   logger.info('  nano-url <url>      Target Nano BPM engine URL (default http://localhost:8080)');
   logger.info('  data-dir <path>     ProcessOS data directory');
@@ -2111,6 +2128,16 @@ function setProcessosConfig(req) {
     }
     cfg.nanoUrl = val;
     logger.info(`Set nano-url = ${val}`);
+  } else if (field === 'downloadUrl') {
+    const val = req.positional[1];
+    if (val === undefined || val === '') {
+      // Allow clearing with an empty value: c8ctl processos set download-url ""
+      delete cfg.downloadUrl;
+      logger.info('Cleared download-url');
+    } else {
+      cfg.downloadUrl = String(val).trim();
+      logger.info(`Set download-url = ${cfg.downloadUrl}`);
+    }
   } else if (field === 'dataDir') {
     const val = req.positional[1];
     if (!val) {
@@ -2144,7 +2171,13 @@ function showProcessosConfig() {
   }
   console.log('');
   console.log('  closed-alpha channel:');
-  console.log(`    download url   ${process.env.PROCESSOS_DOWNLOAD_URL || '(not set — ProcessOS is a closed alpha; set PROCESSOS_DOWNLOAD_URL to enable)'}`);
+  const dlUrl = getProcessosDownloadUrl();
+  const dlSource = process.env.PROCESSOS_DOWNLOAD_URL && String(process.env.PROCESSOS_DOWNLOAD_URL).trim()
+    ? '  (from $PROCESSOS_DOWNLOAD_URL)'
+    : cfg.downloadUrl
+      ? '  (from "processos set download-url")'
+      : '';
+  console.log(`    download url   ${dlUrl ? dlUrl + dlSource : '(not set — ProcessOS is a closed alpha; "c8ctl processos set download-url <url>" to enable)'}`);
   const cached = getProcessosCachedBinaryPath();
   const meta = readProcessosBinaryMeta();
   console.log(`    cached binary  ${existsSync(cached) ? cached : '(none — downloaded on first "processos start")'}`);
@@ -2155,7 +2188,7 @@ function showProcessosConfig() {
   console.log(`  state file ${getProcessosStateFile()}`);
   console.log(`  log file   ${getProcessosLogFile()}`);
   console.log('');
-  console.log('  Change with: c8ctl processos set bin <path> | set port <n> | set nano-url <url> | set data-dir <path> | set env KEY=VALUE');
+  console.log('  Change with: c8ctl processos set bin <path> | set download-url <url> | set port <n> | set nano-url <url> | set data-dir <path> | set env KEY=VALUE');
 }
 
 function printProcessosUsage() {
@@ -2167,11 +2200,11 @@ function printProcessosUsage() {
   console.log('  c8ctl processos stop');
   console.log('  c8ctl processos restart [...]');
   console.log('  c8ctl processos logs [--follow]');
-  console.log('  c8ctl processos set bin <path> | port <n> | nano-url <url> | data-dir <path> | env KEY=VALUE');
+  console.log('  c8ctl processos set bin <path> | download-url <url> | port <n> | nano-url <url> | data-dir <path> | env KEY=VALUE');
   console.log('  c8ctl processos config');
   console.log('');
   console.log('ProcessOS is a closed alpha. Enable it with the download URL you were given:');
-  console.log('  export PROCESSOS_DOWNLOAD_URL=<url>   # plugin downloads + runs the matching binary');
+  console.log('  c8ctl processos set download-url <url>   # plugin downloads + runs the matching binary');
   console.log('or point the plugin at a binary you already have: "c8ctl processos set bin <path>".');
   console.log('By default ProcessOS spawns its own internal pilot Nano engine (the plugin auto-wires the nano');
   console.log('binary into PROCESSOS_NANO_BIN). Use --no-spawn-nano to instead use the --nano-url engine for');
@@ -2236,7 +2269,7 @@ export const metadata = {
     processos: {
       description: 'Manage a local ProcessOS instance — start, status, stop, logs, config',
       examples: [
-        { command: 'export PROCESSOS_DOWNLOAD_URL=<url>', description: 'Enable the closed alpha + auto-download the matching binary' },
+        { command: 'c8ctl processos set download-url <url>', description: 'Enable the closed alpha + auto-download the matching binary' },
         { command: 'c8ctl processos set bin <path>', description: 'Point the plugin at a ProcessOS binary you already have' },
         { command: 'c8ctl processos start', description: 'Start ProcessOS against the local Nano BPM engine' },
         { command: 'c8ctl processos start --nano-url http://localhost:8080', description: 'Start against a specific engine' },

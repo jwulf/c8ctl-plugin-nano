@@ -377,8 +377,8 @@ start/stop/status/logs lifecycle as `nano`.
 > the plugin at a binary you already have.
 
 ```bash
-# Closed-alpha channel: the plugin downloads + caches the matching binary
-export PROCESSOS_DOWNLOAD_URL=<url you were given>
+# Closed-alpha channel: persist the download URL, then start
+c8ctl processos set download-url <url you were given>
 c8ctl processos start            # fetches processos-<os>-<arch> on first run
 
 # …or point the plugin at a binary you already have
@@ -386,8 +386,10 @@ c8ctl processos set bin ~/Downloads/processos
 c8ctl processos start
 ```
 
-`PROCESSOS_DOWNLOAD_URL` is the prefix the release binaries live under (e.g. the
-`…/processos/latest/` bucket URL). The plugin appends the per-platform asset name
+The download URL is the prefix the release binaries live under (e.g. the
+`…/processos/latest/` bucket URL). Persist it with `c8ctl processos set
+download-url <url>`, or set `PROCESSOS_DOWNLOAD_URL` in your environment (the env
+var wins when both are present). The plugin appends the per-platform asset name
 (`processos-darwin-arm64`, `processos-linux-x64`, `processos-win32-x64.exe`, …),
 downloads it to `<stateHome>/bin/`, marks it executable, and runs it. The cached
 download is reused on subsequent starts.
@@ -407,7 +409,7 @@ c8ctl processos stop
 
 ### Automatic update notice
 
-When you're on the closed-alpha channel (`PROCESSOS_DOWNLOAD_URL` set), the
+When you're on the closed-alpha channel (download URL configured), the
 plugin checks for newer ProcessOS builds in the background and prints a short
 one-line notice (at most **once per day**) when the published version is newer
 than the one you're running. It compares your installed binary's version against
@@ -457,6 +459,7 @@ Settings persist under a `processos` key in the same `config.json` as `nano`.
 
 ```bash
 c8ctl processos set bin <path>          # path to the downloaded ProcessOS binary
+c8ctl processos set download-url <url>  # closed-alpha binary download URL (enables ProcessOS)
 c8ctl processos set port <n>            # listen port (default 8090)
 c8ctl processos set nano-url <url>      # target Nano BPM engine (default http://localhost:8080)
 c8ctl processos set data-dir <path>     # PROCESSOS_DATA_DIR (default <stateHome>/processos-data)
@@ -467,8 +470,9 @@ c8ctl processos config                  # show current settings and on-disk path
 
 The binary is resolved in this order: `--binary` flag → `set bin` →
 `$PROCESSOS_BINARY` → a cached download under `<stateHome>/bin/` → a local
-`processos/target/{release,debug}/processos` build → a fresh download from
-`PROCESSOS_DOWNLOAD_URL`. Typed settings (`port`, `nano-url`, `data-dir`) always
+`processos/target/{release,debug}/processos` build → a fresh download from the
+configured download URL (`set download-url` / `$PROCESSOS_DOWNLOAD_URL`). Typed
+settings (`port`, `nano-url`, `data-dir`) always
 win over generic `env` passthrough values when launching.
 
 ## Installing

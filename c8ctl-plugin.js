@@ -63,6 +63,21 @@ function readBundledBinaryInfo() {
   }
 }
 
+/** Run `<binary> --version` and extract a semver-ish token. Null on failure. */
+function binaryVersion(binary) {
+  if (!binary) return null;
+  try {
+    const res = spawnSync(binary, ['--version'], { encoding: 'utf8', timeout: 3000 });
+    if (res.status === 0) {
+      const m = String(res.stdout || res.stderr || '').match(/(\d+\.\d+\.\d+[^\s]*)/);
+      if (m) return m[1];
+    }
+  } catch {
+    /* ignore */
+  }
+  return null;
+}
+
 /**
  * Locate the nanobpmn binary shipped by the matching platform package
  * (an optionalDependency such as @nanobpm/c8ctl-plugin-nano-darwin-arm64).
@@ -855,6 +870,7 @@ async function statusCluster(req) {
       `${state.raft ? '   raft: on' : ''}${state.capture ? '   trace capture: on' : ''}`,
   );
   console.log(`  binary:    ${state.binary}`);
+  console.log(`  version:   ${binaryVersion(state.binary) ?? 'unknown'}`);
   console.log(`  workspace: ${state.workspaceDir || getWorkspaceDir()}`);
   console.log(`  data:      ${getDataDir()}`);
   console.log('');
@@ -1186,8 +1202,22 @@ function isGlobalInstall() {
 
 function updatePlugin(req) {
   const { name, version: current } = pluginPackage();
+
+  // The nano server binary ships with the plugin as its platform package
+  // (an optionalDependency pinned to the plugin version), so a plugin update is
+  // what delivers a new server. Surface the resolved binary's version, and flag
+  // it when the platform package isn't installed for this host.
+  let nanoBin = null;
+  try {
+    nanoBin = findBinary({});
+  } catch {
+    nanoBin = null;
+  }
   const bundled = readBundledBinaryInfo();
-  const nanoNote = bundled ? `  (bundled nano ${bundled.version})` : '';
+  const nanoVer = nanoBin ? binaryVersion(nanoBin) : null;
+  const nanoNote = nanoBin
+    ? `  (nano server ${nanoVer ?? bundled?.version ?? 'present'})`
+    : '  (nano server: not installed for this platform)';
   const manual = `  npm install -g ${name}@latest`;
 
   console.log(`Installed: ${name} v${current ?? '?'}${nanoNote}`);
@@ -1205,6 +1235,13 @@ function updatePlugin(req) {
   console.log('');
 
   if (current && compareSemver(current, latest) >= 0) {
+    if (!nanoBin) {
+      // Plugin is current but npm never fetched the matching server binary.
+      console.log('Plugin is current, but the nano server binary is not installed for this platform.');
+      console.log('Provision it by reinstalling the plugin so npm fetches the platform package:');
+      console.log('  c8ctl sync plugin');
+      return;
+    }
     console.log('Already on the latest release — nothing to do.');
     return;
   }
@@ -1451,7 +1488,7 @@ function clearProcessosState() {
  * only when an *explicitly* configured source points at a missing file (so the
  * user gets an actionable error rather than a silent fallthrough).
  */
-function findConfiguredProcessosBinary(req) {
+function findConfiguredProcessosBinary(req, { includeCached = true } = {}) {
   const cfg = readProcessosConfig();
   const sources = [
     { val: req?.binary && String(req.binary), from: '--binary' },
@@ -1467,9 +1504,7 @@ function findConfiguredProcessosBinary(req) {
     return abs;
   }
 
-  const cached = getProcessosCachedBinaryPath();
-  if (existsSync(cached)) return cached;
-
+  // A local source build wins over a downloaded copy for developers in the repo.
   let repo = null;
   try {
     repo = getRepoRoot();
@@ -1484,6 +1519,14 @@ function findConfiguredProcessosBinary(req) {
     for (const c of candidates) {
       if (existsSync(c)) return c;
     }
+  }
+
+  // The auto-downloaded copy. The resolver skips it (includeCached:false) so it
+  // can manage that copy with a version check and re-fetch newer published
+  // builds; all other callers still see it as the installed binary.
+  if (includeCached) {
+    const cached = getProcessosCachedBinaryPath();
+    if (existsSync(cached)) return cached;
   }
   return null;
 }
@@ -1598,32 +1641,54 @@ async function downloadProcessosBinary(url, dest) {
  *   configured/local binary -> cached download -> fresh download -> error.
  */
 async function resolveProcessosBinary(req) {
-  const configured = findConfiguredProcessosBinary(req); // may throw on a missing configured path
+  // An explicitly configured or local source build wins and is used as-is (no
+  // auto-update). The auto-downloaded copy is handled below with a version
+  // check so `start` can pull a newer published build.
+  const configured = findConfiguredProcessosBinary(req, { includeCached: false });
   if (configured) return configured;
 
   const dlUrl = getProcessosDownloadUrl();
+  const cached = getProcessosCachedBinaryPath();
+
   if (dlUrl) {
-    const dest = getProcessosCachedBinaryPath();
     const meta = await fetchProcessosVersionMeta(dlUrl);
-    await downloadProcessosBinary(processosBinaryUrl(dlUrl), dest);
-    // Record what we fetched so the update notifier can compare later.
-    try {
-      mkdirSync(getProcessosBinDir(), { recursive: true });
-      writeFileSync(
-        getProcessosBinaryMetaPath(),
-        JSON.stringify({
-          version: meta?.version ?? null,
-          commit: meta?.commit ?? null,
-          updated: meta?.updated ?? null,
-          source: processosDownloadBase(dlUrl),
-          downloaded: new Date().toISOString(),
-        }),
-      );
-    } catch {
-      /* sidecar is best-effort */
+    const have = readProcessosBinaryMeta();
+    const remoteVer = meta?.version ?? null;
+    const haveVer = have?.version ?? null;
+    const haveCached = existsSync(cached);
+
+    // Download when there is no cached copy, or when the published version.json
+    // reports a version different from the one recorded for the cached copy.
+    // This also covers binaries cached before version tracking (no haveVer).
+    const needDownload = !haveCached || (remoteVer && remoteVer !== haveVer);
+    if (needDownload) {
+      const logger = getLogger();
+      if (haveCached && remoteVer) {
+        logger.info(`Updating ProcessOS ${haveVer ?? '?'} -> ${remoteVer} ...`);
+      }
+      await downloadProcessosBinary(processosBinaryUrl(dlUrl), cached);
+      // Record what we fetched so the update notifier/status can compare later.
+      try {
+        mkdirSync(getProcessosBinDir(), { recursive: true });
+        writeFileSync(
+          getProcessosBinaryMetaPath(),
+          JSON.stringify({
+            version: meta?.version ?? null,
+            commit: meta?.commit ?? null,
+            updated: meta?.updated ?? null,
+            source: processosDownloadBase(dlUrl),
+            downloaded: new Date().toISOString(),
+          }),
+        );
+      } catch {
+        /* sidecar is best-effort */
+      }
     }
-    return dest;
+    if (existsSync(cached)) return cached;
   }
+
+  // A previously downloaded copy still runs even if the URL is now unset.
+  if (existsSync(cached)) return cached;
 
   throw new Error(
     `Could not find or download the ProcessOS binary.\n` +
@@ -1707,17 +1772,7 @@ function getInstalledProcessosVersion(req) {
   } catch {
     binary = null;
   }
-  if (!binary) return null;
-  try {
-    const res = spawnSync(binary, ['--version'], { encoding: 'utf8', timeout: 3000 });
-    if (res.status === 0) {
-      const m = String(res.stdout || '').match(/(\d+\.\d+\.\d+[^\s]*)/);
-      if (m) return m[1];
-    }
-  } catch {
-    /* ignore */
-  }
-  return null;
+  return binaryVersion(binary);
 }
 
 /**
@@ -1990,10 +2045,14 @@ async function statusProcessos() {
 
   const alive = isPidAlive(state.pid);
   const healthy = alive ? await probeProcessosHealthy(state.url) : false;
+  // Prefer the actual running binary's reported version; fall back to the
+  // recorded download metadata if the binary can't be probed.
+  const version = binaryVersion(state.binary) ?? getInstalledProcessosVersion() ?? 'unknown';
 
   console.log('ProcessOS status:');
   console.log('');
   console.log(`  pid:       ${state.pid} ${alive ? '(alive)' : '(dead — stale state)'}`);
+  console.log(`  version:   ${version}`);
   console.log(`  url:       ${state.url}`);
   console.log(`  health:    ${healthy ? 'ok' : 'unreachable'}  (${state.url}/health)`);
   console.log(`  target:    ${state.nanoUrl}`);

@@ -376,6 +376,20 @@ start/stop/status/logs lifecycle as `nano`.
 > setting the download URL you were given by the Nano BPM team, or by pointing
 > the plugin at a binary you already have.
 
+### Quick install (closed-alpha invitees)
+
+If you were given a ProcessOS download URL, this one-liner installs the Camunda 8
+CLI (`@camunda8/cli`) and this plugin, then configures the download URL:
+
+```bash
+curl -fsSL https://gist.githubusercontent.com/jwulf/9015a7c660b274c568d80e85c3914161/raw/install-processos.sh \
+  | bash -s -- "<the download URL you were given>"
+```
+
+(Requires Node.js 18+. The canonical script lives at
+[`install-processos.sh`](./install-processos.sh).) Then run `c8ctl processos start`.
+
+
 ```bash
 # Closed-alpha channel: persist the download URL, then start
 c8ctl processos set download-url <url you were given>

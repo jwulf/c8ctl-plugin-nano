@@ -94,6 +94,14 @@ const PROCESSOS_STATE_FILE = 'processos.json';
 const PROCESSOS_DEFAULT_PORT = 8090;
 const DEFAULT_NANO_URL = 'http://localhost:8080';
 
+// Passive update notifier (npm-style): refresh the latest published version
+// from the registry in a detached background process at most once per day, and
+// surface a one-line "update available" notice at most once per day. Never
+// blocks a command and never fails one.
+const UPDATE_CACHE_FILE = 'update-check.json';
+const UPDATE_CHECK_TTL_MS = 24 * 60 * 60 * 1000;
+const UPDATE_NOTIFY_TTL_MS = 24 * 60 * 60 * 1000;
+
 function getLogger() {
   if (globalThis.c8ctl) {
     return globalThis.c8ctl.getLogger();
@@ -1222,6 +1230,119 @@ function updatePlugin(req) {
 }
 
 // ---------------------------------------------------------------------------
+// Passive "update available" notice. Modelled on npm's update-notifier: the
+// actual registry lookup runs in a detached background process (so a command is
+// never slowed), and we only print a notice — at most once per day — from a
+// cached result. The explicit `c8ctl nano update[ --check]` path is unchanged.
+// ---------------------------------------------------------------------------
+
+function getUpdateCacheFile() {
+  return join(getStateHome(), UPDATE_CACHE_FILE);
+}
+
+function readUpdateCache() {
+  try {
+    return JSON.parse(readFileSync(getUpdateCacheFile(), 'utf8'));
+  } catch {
+    return {};
+  }
+}
+
+function writeUpdateCache(obj) {
+  try {
+    mkdirSync(getStateHome(), { recursive: true });
+    writeFileSync(getUpdateCacheFile(), JSON.stringify(obj));
+  } catch {
+    /* a best-effort cache; ignore write failures */
+  }
+}
+
+/**
+ * True when the notifier should stay silent: an explicit opt-out, CI, or a
+ * non-interactive stdout (piped/scripted), so we never pollute machine-read
+ * output or nag in automation.
+ */
+function updateNotifierDisabled() {
+  if (process.env.NANO_NO_UPDATE_NOTIFIER || process.env.NO_UPDATE_NOTIFIER) return true;
+  if (process.env.CI) return true;
+  if (!process.stdout.isTTY) return true;
+  return false;
+}
+
+/**
+ * Refresh the cached latest version in the background. Spawns a detached Node
+ * process that runs `npm view <name> version` and writes the result to the
+ * cache file, then exits — the current command does not wait on it, so the
+ * fresh result is used on the *next* invocation.
+ */
+function spawnUpdateRefresh(name, cacheFile) {
+  const script =
+    'const{spawnSync}=require("child_process");' +
+    'const{readFileSync,writeFileSync}=require("fs");' +
+    `let prev={};try{prev=JSON.parse(readFileSync(${JSON.stringify(cacheFile)},"utf8"))}catch{}` +
+    'const out=Object.assign({},prev,{lastCheck:Date.now()});' +
+    `const r=spawnSync("npm",["view",${JSON.stringify(name)},"version"],{encoding:"utf8"});` +
+    'if(r.status===0){out.latest=String(r.stdout||"").trim()}' +
+    `try{writeFileSync(${JSON.stringify(cacheFile)},JSON.stringify(out))}catch{}`;
+  try {
+    const child = spawn(process.execPath, ['-e', script], { detached: true, stdio: 'ignore' });
+    child.unref();
+  } catch {
+    /* if we can't spawn, just skip this cycle */
+  }
+}
+
+function printUpdateNotice(name, current, latest) {
+  const lines = [
+    '',
+    `╭─ Update available: ${name} v${current} → v${latest}`,
+    '│  A newer nano release (plugin + bundled server) is published on npm.',
+    '│  Install it:  c8ctl nano update',
+    `│  Or manually: npm install -g ${name}@latest`,
+    '╰─ Then restart any running cluster: c8ctl nano restart',
+    '',
+  ];
+  // stderr so it never corrupts parseable stdout.
+  for (const l of lines) console.error(l);
+}
+
+/**
+ * Best-effort, non-blocking update check run at the end of a command. Triggers
+ * a background registry refresh when the cache is stale, and prints a notice
+ * (at most once per day) when the cached latest version is newer than installed.
+ */
+function maybeNotifyUpdate(subcommand) {
+  try {
+    if (updateNotifierDisabled()) return;
+    if (subcommand === 'update') return; // the explicit command reports its own state
+    const { name, version: current } = pluginPackage();
+    if (!current || current === '0.0.0-dev') return;
+
+    const cacheFile = getUpdateCacheFile();
+    const cache = readUpdateCache();
+    const now = Date.now();
+
+    if (!cache.lastCheck || now - cache.lastCheck > UPDATE_CHECK_TTL_MS) {
+      try {
+        mkdirSync(getStateHome(), { recursive: true });
+      } catch {
+        /* ignore */
+      }
+      spawnUpdateRefresh(name, cacheFile);
+    }
+
+    const latest = cache.latest;
+    if (!latest || compareSemver(current, latest) >= 0) return;
+    if (cache.lastNotified && now - cache.lastNotified <= UPDATE_NOTIFY_TTL_MS) return;
+
+    printUpdateNotice(name, current, latest);
+    writeUpdateCache({ ...cache, lastNotified: now });
+  } catch {
+    /* the notifier must never break a command */
+  }
+}
+
+// ---------------------------------------------------------------------------
 // processos — manage a single local ProcessOS instance (the optimization-plane
 // server that analyses a running Nano BPM engine). Unlike nano, the ProcessOS
 // binary is not distributed via npm: the user downloads it and points the
@@ -1824,6 +1945,7 @@ export const commands = {
         return;
       }
 
+      let failed = false;
       try {
         switch (req.subcommand) {
           case 'start':
@@ -1864,8 +1986,10 @@ export const commands = {
         }
       } catch (error) {
         logger.error(`nano ${req.subcommand} failed: ${error instanceof Error ? error.message : error}`);
-        process.exit(1);
+        failed = true;
       }
+      maybeNotifyUpdate(req.subcommand);
+      if (failed) process.exit(1);
     },
   },
   processos: {
@@ -1887,6 +2011,7 @@ export const commands = {
         return;
       }
 
+      let failed = false;
       try {
         switch (req.subcommand) {
           case 'start':
@@ -1915,8 +2040,10 @@ export const commands = {
         }
       } catch (error) {
         logger.error(`processos ${req.subcommand} failed: ${error instanceof Error ? error.message : error}`);
-        process.exit(1);
+        failed = true;
       }
+      maybeNotifyUpdate(req.subcommand);
+      if (failed) process.exit(1);
     },
   },
 };

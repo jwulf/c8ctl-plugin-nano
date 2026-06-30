@@ -145,6 +145,22 @@ cluster (`c8ctl nano restart`) so it picks up the new binary.
 If the plugin is running from a local checkout rather than a global npm install,
 `update` prints the manual command instead of reinstalling in place.
 
+### Automatic "update available" notice
+
+You don't have to remember to run `update --check`: any `nano` or `processos`
+command also surfaces a one-line notice when a newer release is published. It is
+deliberately unobtrusive:
+
+- The registry lookup runs in a **detached background process**, so a command is
+  never slowed down — the fresh result is used on the next invocation.
+- npm is queried at most **once per day**, and the notice is shown at most **once
+  per day** (state is cached under the plugin's state home in `update-check.json`).
+- The notice prints to **stderr**, so it never corrupts machine-readable stdout,
+  and is suppressed when stdout is not a TTY (piped/scripted) or when `CI` is set.
+
+To turn it off entirely, set `NANO_NO_UPDATE_NOTIFIER=1` (or the conventional
+`NO_UPDATE_NOTIFIER=1`). The explicit `c8ctl nano update` command is unaffected.
+
 ## Checking status
 
 `c8ctl nano status` queries each node's always-on `GET /v2/topology`, which is the

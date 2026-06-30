@@ -30,6 +30,30 @@ c8ctl nano start|status|stop|restart|logs|clean|set|config
 on `localhost` (round-robin partition ownership), tracks them in a state file,
 and waits until every node is reachable.
 
+## Installation
+
+This is a plugin for the [Camunda 8 CLI](https://www.npmjs.com/package/@camunda8/cli)
+(`c8ctl`). Install the CLI, then load the plugin from npm:
+
+```bash
+# 1. Install the Camunda 8 CLI (once); requires Node.js 18+
+npm install -g @camunda8/cli
+
+# 2. Load this plugin from the npm registry
+c8ctl load plugin c8ctl-plugin-nano
+
+# 3. Verify it's available
+c8ctl nano --help
+```
+
+The prebuilt Nano BPM server binary for your platform is pulled in automatically
+as an npm `optionalDependency`, so there is nothing to compile. To pull a newer
+release later, run `c8ctl nano update` (see
+[Updating to a new release](#updating-to-a-new-release-update)).
+
+> Loading from a local checkout instead? Use
+> `c8ctl load plugin --from file:///path/to/c8ctl-nano`.
+
 ## Usage
 
 ```bash
@@ -370,13 +394,13 @@ ProcessOS is the optimization-plane server that analyses a running Nano BPM
 engine. The plugin can manage a single local ProcessOS instance with the same
 start/stop/status/logs lifecycle as `nano`.
 
-> **ProcessOS is a closed alpha.** The operational commands (`start`, `stop`,
+> **ProcessOS is a closed beta.** The operational commands (`start`, `stop`,
 > `status`, `logs`, `restart`) stay locked with a *"not available yet"* notice
 > until you opt in. Only `set` and `config` work before then. Opt in either by
 > setting the download URL you were given by the Nano BPM team, or by pointing
 > the plugin at a binary you already have.
 
-### Quick install (closed-alpha invitees)
+### Quick install (closed-beta invitees)
 
 If you were given a ProcessOS download URL, this one-liner installs the Camunda 8
 CLI (`@camunda8/cli`) and this plugin, then configures the download URL:
@@ -391,7 +415,7 @@ curl -fsSL https://gist.githubusercontent.com/jwulf/9015a7c660b274c568d80e85c391
 
 
 ```bash
-# Closed-alpha channel: persist the download URL, then start
+# Closed-beta channel: persist the download URL, then start
 c8ctl processos set download-url <url you were given>
 c8ctl processos start            # fetches processos-<os>-<arch> on first run
 
@@ -423,7 +447,7 @@ c8ctl processos stop
 
 ### Automatic update notice
 
-When you're on the closed-alpha channel (download URL configured), the
+When you're on the closed-beta channel (download URL configured), the
 plugin checks for newer ProcessOS builds in the background and prints a short
 one-line notice (at most **once per day**) when the published version is newer
 than the one you're running. It compares your installed binary's version against
@@ -473,7 +497,7 @@ Settings persist under a `processos` key in the same `config.json` as `nano`.
 
 ```bash
 c8ctl processos set bin <path>          # path to the downloaded ProcessOS binary
-c8ctl processos set download-url <url>  # closed-alpha binary download URL (enables ProcessOS)
+c8ctl processos set download-url <url>  # closed-beta binary download URL (enables ProcessOS)
 c8ctl processos set port <n>            # listen port (default 8090)
 c8ctl processos set nano-url <url>      # target Nano BPM engine (default http://localhost:8080)
 c8ctl processos set data-dir <path>     # PROCESSOS_DATA_DIR (default <stateHome>/processos-data)
@@ -489,7 +513,7 @@ configured download URL (`set download-url` / `$PROCESSOS_DOWNLOAD_URL`). Typed
 settings (`port`, `nano-url`, `data-dir`) always
 win over generic `env` passthrough values when launching.
 
-## Installing
+## Installing from a local checkout (development)
 
 ```bash
 c8ctl load plugin --from file:///path/to/c8ctl-nano
@@ -500,6 +524,8 @@ Then verify it shows up:
 ```bash
 c8ctl help | grep nano
 ```
+
+For the normal npm install, see [Installation](#installation) above.
 
 ## Distribution & releasing
 

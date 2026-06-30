@@ -1,6 +1,6 @@
 #!/usr/bin/env bash
 #
-# ProcessOS (closed alpha) one-line installer.
+# ProcessOS (closed beta) one-line installer.
 #
 # Ensures the Camunda 8 CLI (c8ctl) and the c8ctl-plugin-nano plugin are
 # installed, then configures the ProcessOS download URL you were given so you
@@ -42,7 +42,7 @@ Pass the URL you were given by the Nano BPM team, e.g.:
 or set PROCESSOS_DOWNLOAD_URL in your environment first."
 fi
 
-say "Installing ProcessOS (closed alpha)…"
+say "Installing ProcessOS (closed beta)…"
 printf '%s\n' "${DIM}  download url: ${DOWNLOAD_URL}${RST}"
 
 # --- prerequisites: Node.js + npm ------------------------------------------
@@ -92,7 +92,7 @@ fi
 # --- ensure the nano plugin is installed AND up to date --------------------
 # c8ctl keeps plugins in its own npm-managed dir, so an already-installed but
 # stale plugin must be upgraded (older versions lack `processos set download-url`
-# and the closed-alpha download support). Compare the installed version against
+# and the closed-beta download support). Compare the installed version against
 # the latest on npm and upgrade when behind.
 plugin_installed_version() {
   c8ctl list plugins 2>/dev/null | awk -F'|' '

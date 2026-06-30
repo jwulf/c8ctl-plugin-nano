@@ -119,7 +119,7 @@ const UPDATE_CACHE_FILE = 'update-check.json';
 const UPDATE_CHECK_TTL_MS = 24 * 60 * 60 * 1000;
 const UPDATE_NOTIFY_TTL_MS = 24 * 60 * 60 * 1000;
 
-// ProcessOS is a closed alpha distributed out-of-band: the binary lives in an
+// ProcessOS is a closed beta distributed out-of-band: the binary lives in an
 // S3 bucket whose base URL is handed to enabled users via PROCESSOS_DOWNLOAD_URL.
 // `<base>/processos-<os>-<arch>[.exe]` is the per-platform binary and
 // `<base>/version.json` is the {version,commit,updated} metadata the CI writes
@@ -1438,7 +1438,7 @@ function getProcessosNanoUrl() {
 }
 
 /**
- * The closed-alpha download URL: env var (PROCESSOS_DOWNLOAD_URL) wins, then the
+ * The closed-beta download URL: env var (PROCESSOS_DOWNLOAD_URL) wins, then the
  * persisted `processos set download-url` config value. Null when neither is set.
  */
 function getProcessosDownloadUrl() {
@@ -1699,7 +1699,7 @@ async function resolveProcessosBinary(req) {
 }
 
 /**
- * Whether ProcessOS is enabled for this user. It is a closed alpha, so the
+ * Whether ProcessOS is enabled for this user. It is a closed beta, so the
  * operational commands stay locked until the user either has the binary on
  * their system (configured path / cached download / local build) or has been
  * given a PROCESSOS_DOWNLOAD_URL to fetch it from.
@@ -1710,16 +1710,16 @@ function processosEnabled(req) {
     if (findConfiguredProcessosBinary(req)) return true;
   } catch {
     // A configured-but-missing path still means the user opted in; let the real
-    // not-found error surface from the command rather than the closed-alpha gate.
+    // not-found error surface from the command rather than the closed-beta gate.
     return true;
   }
   return false;
 }
 
-function printProcessosClosedAlpha() {
+function printProcessosClosedBeta() {
   const logger = getLogger();
   logger.error(
-    'ProcessOS is in closed alpha and is not available yet.\n' +
+    'ProcessOS is in closed beta and is not available yet.\n' +
       '\n' +
       'To enable it, set the download URL you were given by the Nano BPM team:\n' +
       '  c8ctl processos set download-url <url>   # persists it for this machine\n' +
@@ -1815,7 +1815,7 @@ function printProcessosUpdateNotice(current, latest) {
  * Best-effort, non-blocking ProcessOS update check. Triggers a background
  * version.json fetch when the cache is stale and prints a notice (at most once
  * per day) when the published version is newer than the installed one. Only
- * meaningful when a download URL is configured (the closed-alpha channel).
+ * meaningful when a download URL is configured (the closed-beta channel).
  */
 function maybeNotifyProcessosUpdate(req) {
   try {
@@ -2114,7 +2114,7 @@ function printProcessosSetUsage() {
   const logger = getLogger();
   logger.info('Usage: c8ctl processos set <field> <value>');
   logger.info('  bin <path>          Path to the downloaded ProcessOS binary');
-  logger.info('  download-url <url>  Closed-alpha binary download URL (enables ProcessOS)');
+  logger.info('  download-url <url>  Closed-beta binary download URL (enables ProcessOS)');
   logger.info('  port <n>            Listen port (default 8090)');
   logger.info('  nano-url <url>      Target Nano BPM engine URL (default http://localhost:8080)');
   logger.info('  data-dir <path>     ProcessOS data directory');
@@ -2229,14 +2229,14 @@ function showProcessosConfig() {
     }
   }
   console.log('');
-  console.log('  closed-alpha channel:');
+  console.log('  closed-beta channel:');
   const dlUrl = getProcessosDownloadUrl();
   const dlSource = process.env.PROCESSOS_DOWNLOAD_URL && String(process.env.PROCESSOS_DOWNLOAD_URL).trim()
     ? '  (from $PROCESSOS_DOWNLOAD_URL)'
     : cfg.downloadUrl
       ? '  (from "processos set download-url")'
       : '';
-  console.log(`    download url   ${dlUrl ? dlUrl + dlSource : '(not set — ProcessOS is a closed alpha; "c8ctl processos set download-url <url>" to enable)'}`);
+  console.log(`    download url   ${dlUrl ? dlUrl + dlSource : '(not set — ProcessOS is a closed beta; "c8ctl processos set download-url <url>" to enable)'}`);
   const cached = getProcessosCachedBinaryPath();
   const meta = readProcessosBinaryMeta();
   console.log(`    cached binary  ${existsSync(cached) ? cached : '(none — downloaded on first "processos start")'}`);
@@ -2262,7 +2262,7 @@ function printProcessosUsage() {
   console.log('  c8ctl processos set bin <path> | download-url <url> | port <n> | nano-url <url> | data-dir <path> | env KEY=VALUE');
   console.log('  c8ctl processos config');
   console.log('');
-  console.log('ProcessOS is a closed alpha. Enable it with the download URL you were given:');
+  console.log('ProcessOS is a closed beta. Enable it with the download URL you were given:');
   console.log('  c8ctl processos set download-url <url>   # plugin downloads + runs the matching binary');
   console.log('or point the plugin at a binary you already have: "c8ctl processos set bin <path>".');
   console.log('By default ProcessOS spawns its own internal pilot Nano engine (the plugin auto-wires the nano');
@@ -2328,7 +2328,7 @@ export const metadata = {
     processos: {
       description: 'Manage a local ProcessOS instance — start, status, stop, logs, config',
       examples: [
-        { command: 'c8ctl processos set download-url <url>', description: 'Enable the closed alpha + auto-download the matching binary' },
+        { command: 'c8ctl processos set download-url <url>', description: 'Enable the closed beta + auto-download the matching binary' },
         { command: 'c8ctl processos set bin <path>', description: 'Point the plugin at a ProcessOS binary you already have' },
         { command: 'c8ctl processos start', description: 'Start ProcessOS against the local Nano BPM engine' },
         { command: 'c8ctl processos start --nano-url http://localhost:8080', description: 'Start against a specific engine' },
@@ -2435,12 +2435,12 @@ export const commands = {
         return;
       }
 
-      // ProcessOS is a closed alpha: gate the operational commands until the
+      // ProcessOS is a closed beta: gate the operational commands until the
       // user has opted in (download URL set or a binary on their system).
       // `set`/`config` stay open so users can configure/inspect at any time.
       const ungated = req.subcommand === 'set' || req.subcommand === 'config';
       if (!ungated && !processosEnabled(req)) {
-        printProcessosClosedAlpha();
+        printProcessosClosedBeta();
         process.exit(1);
       }
 

@@ -23,7 +23,7 @@
  *   c8ctl nano status
  *   c8ctl nano stop [--purge]
  *   c8ctl nano logs [<nodeId>] [--follow]
- *   c8ctl nano restart [<nodes>] ...
+ *   c8ctl nano restart [<nodes>] [--purge] ...
  */
 
 import { spawn, spawnSync } from 'node:child_process';
@@ -2364,6 +2364,8 @@ export const metadata = {
         { command: 'c8ctl nano logs 1 --follow', description: "Stream node 1's log" },
         { command: 'c8ctl nano stop', description: 'Stop the running cluster (keep data)' },
         { command: 'c8ctl nano stop --purge', description: 'Stop the cluster and delete engine data' },
+        { command: 'c8ctl nano restart', description: 'Stop and start the cluster (keep data)' },
+        { command: 'c8ctl nano restart --purge', description: 'Restart the cluster from a clean slate (delete engine data)' },
         { command: 'c8ctl nano clean', description: 'Wipe journal/data + logs on disk (keeps models/workers)' },
         { command: 'c8ctl nano set bin <path>', description: 'Set the nanobpmn server binary path' },
         { command: 'c8ctl nano set model-dir <path>', description: 'Set the workspace dir (models + workers)' },
@@ -2404,7 +2406,7 @@ export const commands = {
       'no-journal': { type: 'boolean', description: 'start: alias for --in-memory' },
       'history-max': { type: 'string', description: 'start: cap retained terminal instances in the read model (NANOBPMN_HISTORY_MAX_INSTANCES; 0/unset = unbounded)' },
       follow: { type: 'boolean', description: 'logs: stream output (tail -F)', short: 'f' },
-      purge: { type: 'boolean', description: 'stop: also delete per-node engine data' },
+      purge: { type: 'boolean', description: 'stop/restart: also delete per-node engine data' },
       force: { type: 'boolean', description: 'start: stop any existing cluster first' },
       workspace: { type: 'boolean', description: 'clean: also delete the workspace (models + workers)' },
       check: { type: 'boolean', description: 'update: only report whether a new release is available; do not install' },
@@ -2436,7 +2438,7 @@ export const commands = {
             logsCluster(req);
             break;
           case 'restart':
-            await stopCluster({ purge: false });
+            await stopCluster({ purge: req.purge });
             await startCluster({ ...req, force: true });
             break;
           case 'pause':
@@ -2540,7 +2542,7 @@ function printUsage() {
   console.log('  c8ctl nano logs [<nodeId>] [--follow]');
   console.log('  c8ctl nano pause <nodeId>');
   console.log('  c8ctl nano resume <nodeId>');
-  console.log('  c8ctl nano restart [<nodes>] ...');
+  console.log('  c8ctl nano restart [<nodes>] [--purge] ...');
   console.log('  c8ctl nano clean [--workspace]');
   console.log('  c8ctl nano set <bin|model-dir> <path>');
   console.log('  c8ctl nano config');

@@ -94,6 +94,9 @@ c8ctl nano stop --purge
 # Stop then start fresh
 c8ctl nano restart 3
 
+# Restart from a clean slate (delete engine data, keep models & workers)
+c8ctl nano restart --purge
+
 # Wipe journal/data + logs from disk (keeps models & workers)
 c8ctl nano clean
 

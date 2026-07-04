@@ -1,3 +1,10 @@
+# [1.5.0](https://github.com/jwulf/c8ctl-plugin-nano/compare/v1.4.1...v1.5.0) (2026-07-04)
+
+
+### Features
+
+* **nano:** honor --purge on restart ([94a5e8b](https://github.com/jwulf/c8ctl-plugin-nano/commit/94a5e8b91fafc2b4a39bafa83203738e8c0ba833))
+
 ## [1.4.1](https://github.com/jwulf/c8ctl-plugin-nano/compare/v1.4.0...v1.4.1) (2026-07-03)
 
 

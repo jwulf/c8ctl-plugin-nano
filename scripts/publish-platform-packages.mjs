@@ -62,18 +62,18 @@ async function githubIdToken(audience) {
 
 async function npmOidcToken(pkgName) {
   const idToken = await githubIdToken('npm:registry.npmjs.org');
-  if (!idToken) return undefined;
+  if (!idToken) return { mode: 'ambient' };
   const res = await fetch(
     `${OFFICIAL_REGISTRY}-/npm/v1/oidc/token/exchange/package/${encodeURIComponent(pkgName)}`,
     { method: 'POST', headers: { Authorization: `Bearer ${idToken}` } },
   );
   const body = await res.json().catch(() => ({}));
-  if (res.ok && body.token) return body.token;
+  if (res.ok && body.token) return { mode: 'oidc', token: body.token };
   console.warn(
     `::warning::OIDC token exchange failed for ${pkgName}: ${res.status} ${body.message || ''}. ` +
       `Ensure a Trusted Publisher is configured for ${pkgName} on npmjs.com (repo + release.yml).`,
   );
-  return undefined;
+  return { mode: 'missing', status: res.status };
 }
 
 function npmrcPath() {
@@ -101,6 +101,7 @@ function alreadyPublished(pkg) {
 }
 
 const deferred = [];
+const missingTrustedPublisher = [];
 for (const p of PLATFORMS) {
   const dir = join(outRoot, p.pkg);
   if (!existsSync(dir)) {
@@ -111,10 +112,17 @@ for (const p of PLATFORMS) {
     console.log(`skip ${p.pkg}@${version} (already published)`);
     continue;
   }
+  const auth = await npmOidcToken(p.pkg);
+  if (auth.mode === 'missing') {
+    // No Trusted Publisher for this package yet. Don't die on the first one:
+    // record it and keep going so a single run surfaces every package that
+    // still needs configuring (and publishes the ones that are ready).
+    missingTrustedPublisher.push(p.pkg);
+    continue;
+  }
   console.log(`publishing ${p.pkg}@${version} ...`);
-  const oidcToken = await npmOidcToken(p.pkg);
-  if (oidcToken) {
-    setAuthToken(oidcToken);
+  if (auth.mode === 'oidc') {
+    setAuthToken(auth.token);
     console.log(`  authenticated ${p.pkg} via OIDC trusted publishing`);
   }
   try {
@@ -144,6 +152,18 @@ for (const p of PLATFORMS) {
     }
     throw err;
   }
+}
+
+if (missingTrustedPublisher.length) {
+  console.error(
+    `::error::No npm Trusted Publisher configured for ${missingTrustedPublisher.length} package(s): ` +
+      `${missingTrustedPublisher.join(', ')}. Configure each on npmjs.com ` +
+      `(repo jwulf/c8ctl-plugin-nano, workflow release.yml) and re-run this release. ` +
+      `Packages that were ready have already been published at ${version}.`,
+  );
+  // Fail the run so semantic-release does NOT publish the root meta-package or
+  // create a GitHub release while some platform packages are still missing.
+  process.exitCode = 1;
 }
 
 if (deferred.length) {

@@ -19,7 +19,7 @@
  */
 
 import { execFileSync } from 'node:child_process';
-import { existsSync } from 'node:fs';
+import { existsSync, readFileSync, writeFileSync } from 'node:fs';
 import { join, dirname, resolve } from 'node:path';
 import { fileURLToPath } from 'node:url';
 import { PLATFORMS } from '../platforms.mjs';
@@ -34,6 +34,27 @@ if (!version) {
   process.exit(1);
 }
 
+// Trusted publishing (OIDC): npm (>=11.5.1) only authenticates via the workflow
+// id-token when NO `_authToken` is configured for the registry. `actions/setup-node`
+// (registry-url) writes a placeholder `_authToken` line, and @semantic-release/npm
+// can write a root-package-scoped OIDC token into the same .npmrc during its own
+// flow — either would make these plain `npm publish` calls reuse the wrong/absent
+// credential instead of doing a per-package OIDC exchange. Strip any `_authToken`
+// line here so each platform publish authenticates via OIDC. No-op locally.
+function stripNpmAuthToken() {
+  const npmrc = process.env.NPM_CONFIG_USERCONFIG;
+  if (!npmrc || !existsSync(npmrc)) return;
+  const before = readFileSync(npmrc, 'utf8');
+  const after = before
+    .split('\n')
+    .filter((line) => !/_authToken/.test(line))
+    .join('\n');
+  if (after !== before) {
+    writeFileSync(npmrc, after);
+    console.log(`stripped _authToken from ${npmrc} for OIDC trusted publishing`);
+  }
+}
+
 function alreadyPublished(pkg) {
   try {
     execFileSync('npm', ['view', `${pkg}@${version}`, 'version'], { stdio: 'pipe' });
@@ -44,6 +65,7 @@ function alreadyPublished(pkg) {
 }
 
 const deferred = [];
+stripNpmAuthToken();
 for (const p of PLATFORMS) {
   const dir = join(outRoot, p.pkg);
   if (!existsSync(dir)) {

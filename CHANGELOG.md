@@ -1,3 +1,10 @@
+## [1.6.2](https://github.com/jwulf/c8ctl-plugin-nano/compare/v1.6.1...v1.6.2) (2026-07-22)
+
+
+### Bug Fixes
+
+* **binary:** bundle nanobpmn 0.0.9 (1d5ad2e) ([33fd0e0](https://github.com/jwulf/c8ctl-plugin-nano/commit/33fd0e067d1da1c652410ad5fa08a3808dab975b))
+
 ## [1.6.1](https://github.com/jwulf/c8ctl-plugin-nano/compare/v1.6.0...v1.6.1) (2026-07-22)
 
 

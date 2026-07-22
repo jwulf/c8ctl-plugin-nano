@@ -238,42 +238,66 @@ function getRepoRoot() {
 }
 
 /**
- * Locate the nanobpmn server binary. Resolution order:
- *   1. --binary flag
- *   2. configured binary path ("nano set bin <path>")
- *   3. NANOBPMN_BINARY env var
- *   4. matching platform package (optionalDependency), when installed via npm
- *   5. release build under the nanobpmn repo
- *   6. debug build under the nanobpmn repo
+ * Locate the nanobpmn server binary AND report its provenance. Resolution order:
+ *   1. --binary flag                         -> source 'flag'        (self-managed)
+ *   2. configured binary path ("nano set bin") -> source 'configured' (self-managed)
+ *   3. NANOBPMN_BINARY env var               -> source 'configured'  (self-managed)
+ *   4. matching platform package (npm)       -> source 'managed-npm' (managed)
+ *   5. release build under the nanobpmn repo -> source 'repo-release'(self-managed)
+ *   6. debug build under the nanobpmn repo   -> source 'repo-debug'  (self-managed)
+ *
+ * Returns `{ path, source, from, channel?, updatePkg? }`. Only the npm platform
+ * package (source 4) is a plugin-owned "managed" binary the plugin may update in
+ * place; for it we also report `channel:'npm'` and `updatePkg` (the plugin
+ * package the console/server should `npm view` for the latest version — the
+ * update unit, since the platform binary ships pinned to the plugin release).
+ * Every other source is a user-configured or dev/repo build: self-managed, so
+ * the console must disable self-update and suppress "update available" nags.
+ *
+ * Throws (with actionable guidance) when no binary can be found.
  */
-function findBinary(flags) {
+function resolveBinary(flags) {
   const cfg = readConfig();
   const sources = [
-    { val: flags?.binary && String(flags.binary), from: '--binary' },
-    { val: cfg.binary && String(cfg.binary), from: 'configured bin ("nano set bin")' },
-    { val: process.env.NANOBPMN_BINARY, from: 'NANOBPMN_BINARY' },
+    { val: flags?.binary && String(flags.binary), from: '--binary', source: 'flag' },
+    {
+      val: cfg.binary && String(cfg.binary),
+      from: 'configured bin ("nano set bin")',
+      source: 'configured',
+    },
+    { val: process.env.NANOBPMN_BINARY, from: 'NANOBPMN_BINARY', source: 'configured' },
   ];
-  for (const { val, from } of sources) {
+  for (const { val, from, source } of sources) {
     if (!val) continue;
     const p = expandHome(val);
     const abs = isAbsolute(p) ? p : resolvePath(process.cwd(), p);
     if (!existsSync(abs)) {
       throw new Error(`Binary not found at ${abs} (from ${from})`);
     }
-    return abs;
+    return { path: abs, source, from };
   }
 
   const fromPackage = findPlatformPackageBinary();
-  if (fromPackage) return fromPackage;
+  if (fromPackage) {
+    return {
+      path: fromPackage,
+      source: 'managed-npm',
+      from: 'platform package (npm)',
+      channel: 'npm',
+      // The update unit is the plugin meta-package: the platform binary ships
+      // pinned to it, so `npm view <plugin> version` is the server's "latest".
+      updatePkg: pluginPackage().name,
+    };
+  }
 
   const repo = getRepoRoot();
   const name = 'nanobpm-gateway-rest-server';
   const candidates = [
-    join(repo, 'server', 'target', 'release', name),
-    join(repo, 'server', 'target', 'debug', name),
+    { path: join(repo, 'server', 'target', 'release', name), source: 'repo-release' },
+    { path: join(repo, 'server', 'target', 'debug', name), source: 'repo-debug' },
   ];
   for (const c of candidates) {
-    if (existsSync(c)) return c;
+    if (existsSync(c.path)) return { path: c.path, source: c.source, from: `repo build (${c.source})` };
   }
   const host = `${process.platform}/${process.arch}`;
   const expectedPkg = platformForHost()?.pkg;
@@ -283,10 +307,41 @@ function findBinary(flags) {
         ? `No platform package installed for ${host} (expected "${expectedPkg}").\n` +
           `Reinstall the plugin so npm can fetch it, or build from source below.\n`
         : `No prebuilt binary is published for this platform (${host}).\n`) +
-      `Looked for a local build in:\n  ${candidates.join('\n  ')}\n` +
+      `Looked for a local build in:\n  ${candidates.map((c) => c.path).join('\n  ')}\n` +
       `Build it with: (cd ${repo} && make release-gateway)\n` +
       `Or set one with "c8ctl nano set bin <path>", --binary <path>, or NANOBPMN_BINARY=<path>.`,
   );
+}
+
+/**
+ * Locate the nanobpmn server binary (absolute path). Thin wrapper over
+ * [`resolveBinary`] for the many call sites that only need the path.
+ */
+function findBinary(flags) {
+  return resolveBinary(flags).path;
+}
+
+/**
+ * Launcher-identity + binary-provenance env markers stamped onto every server
+ * process this plugin spawns, so the running server (and its console UI) can
+ * tell it was launched by us and whether its binary is plugin-managed
+ * (self-updatable) vs. self-managed/dev (update disabled, nags suppressed).
+ *
+ * `resolved` is a [`resolveBinary`] descriptor. Safe to call with `undefined`
+ * (e.g. when the binary could not be resolved) — it still stamps the launcher
+ * identity, and the server treats an absent source as self-managed/unknown.
+ */
+function launcherEnvMarkers(resolved) {
+  const markers = { NANOBPMN_LAUNCHER: 'c8ctl-plugin-nano' };
+  const { version } = pluginPackage();
+  // The plugin version is the update unit's "current" in the npm channel's
+  // version space (same space as `npm view <plugin> version` -> latest), so the
+  // server compares like-for-like instead of against its own git-describe build.
+  if (version) markers.NANOBPMN_LAUNCHER_VERSION = version;
+  if (resolved?.source) markers.NANOBPMN_BINARY_SOURCE = resolved.source;
+  if (resolved?.channel) markers.NANOBPMN_UPDATE_CHANNEL = resolved.channel;
+  if (resolved?.updatePkg) markers.NANOBPMN_UPDATE_PKG = resolved.updatePkg;
+  return markers;
 }
 
 // ---------------------------------------------------------------------------
@@ -527,7 +582,11 @@ async function startCluster(req) {
     }
   }
 
-  const binary = findBinary(req);
+  const resolvedBinary = resolveBinary(req);
+  const binary = resolvedBinary.path;
+  // Launcher-identity + binary-provenance markers, stamped on every node so the
+  // server's console can offer (or suppress) a self-update. Computed once here.
+  const launcherMarkers = launcherEnvMarkers(resolvedBinary);
 
   // Pre-flight: make sure the chosen ports are free, and tell the user exactly
   // what is in the way (Camunda vs Nano vs some other HTTP server). We refuse to
@@ -584,6 +643,9 @@ async function startCluster(req) {
 
     const env = {
       ...process.env,
+      // Launcher-identity + binary-provenance markers (after the process.env
+      // spread so the launcher's own values win over any inherited stale ones).
+      ...launcherMarkers,
       PORT: String(port),
       NANOBPMN_NODE_ID: String(id),
       NANOBPMN_NODES: nodesEnv,
@@ -1961,14 +2023,20 @@ async function startProcessos(req) {
   // The plugin already knows where the nano binary lives, so auto-wire it.
   // Spawning the pilot engine is the DEFAULT; resolve the binary best-effort.
   let nanoBin;
+  let resolvedPilot;
   try {
-    nanoBin = findBinary({});
+    resolvedPilot = resolveBinary({});
+    nanoBin = resolvedPilot.path;
   } catch {
     nanoBin = undefined;
   }
   if (nanoBin && !env.PROCESSOS_NANO_BIN) {
     env.PROCESSOS_NANO_BIN = nanoBin;
   }
+  // Stamp launcher-identity + provenance markers so the pilot nano gateway
+  // (spawned by ProcessOS from this env) can offer/suppress console self-update
+  // the same way a directly-launched `nano start` node does.
+  Object.assign(env, launcherEnvMarkers(resolvedPilot));
 
   // Decide whether to spawn the pilot engine. Precedence:
   //   --no-spawn-nano flag            -> off (explicit)
@@ -2341,6 +2409,9 @@ function parseProcessosRequest(args, flags) {
 // metadata + commands
 // ---------------------------------------------------------------------------
 
+// Internal helpers exported for tests/tooling only. c8ctl consumes just
+// `metadata` and `commands`; these named exports are inert to it.
+export { resolveBinary, findBinary, launcherEnvMarkers };
 
 export const metadata = {
   name: 'c8ctl-plugin-nano',

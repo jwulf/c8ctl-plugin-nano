@@ -70,6 +70,20 @@ jobs:
       - name: Install deps
         run: npm ci
 
+      - name: Use OIDC for plain npm publish (drop setup-node placeholder token)
+        run: |
+          set -euo pipefail
+          # `actions/setup-node` with `registry-url` writes
+          # `//registry.npmjs.org/:_authToken=${NODE_AUTH_TOKEN}` into the job
+          # .npmrc and exports a placeholder `NODE_AUTH_TOKEN`. @semantic-release/npm
+          # runs its own OIDC exchange for the root package and ignores it, but the
+          # platform packages publish via a plain `npm publish` subprocess that would
+          # otherwise authenticate with that fake token (E404) instead of OIDC.
+          # Remove the token line and clear the env so npm (>=11.5.1) uses the
+          # workflow id-token (trusted publishing) for those publishes too.
+          npm config delete //registry.npmjs.org/:_authToken || true
+          echo "NODE_AUTH_TOKEN=" >> "$GITHUB_ENV"
+
       - name: Download prebuilt binaries
         env:
           GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}

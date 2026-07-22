@@ -87,14 +87,14 @@ jobs:
       - name: Publish (semantic-release)
         env:
           GITHUB_TOKEN: ${{ secrets.GITHUB_TOKEN }}
-          # Bootstrap auth: NPM_TOKEN is read by @semantic-release/npm (root pkg),
-          # and NODE_AUTH_TOKEN is consumed by the setup-node .npmrc so the plain
-          # `npm publish` calls for the 5 platform packages authenticate too. Once
-          # every package (root + 5 platform) has a trusted publisher configured on
-          # npmjs.com, delete the NPM_TOKEN secret: both vars become empty and npm
-          # (>=11.5.1) authenticates via OIDC (id-token: write) automatically.
-          NPM_TOKEN: ${{ secrets.NPM_TOKEN }}
-          NODE_AUTH_TOKEN: ${{ secrets.NPM_TOKEN }}
+          # Trusted publishing (OIDC): no npm token is provided, so npm (>=11.5.1)
+          # exchanges the workflow's id-token (id-token: write) for a short-lived
+          # publish credential. This authenticates BOTH @semantic-release/npm (the
+          # root c8ctl-plugin-nano package) and the plain `npm publish` calls for
+          # the platform packages. Every package (root + platforms) must have a
+          # trusted publisher registered on npmjs.com pointing at this repo's
+          # release.yml workflow, otherwise the OIDC exchange returns 404.
+          #
           # Provenance requires this repo to be public + OIDC (id-token: write).
           NPM_CONFIG_PROVENANCE: true
         run: npx semantic-release

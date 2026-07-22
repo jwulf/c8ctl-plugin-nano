@@ -54,10 +54,13 @@ for (const p of PLATFORMS) {
   const dir = join(outRoot, p.pkg);
   mkdirSync(dir, { recursive: true });
 
+  // armv6 and armv7 share os/cpu ("linux"/"arm"); label them distinctly.
+  const label = p.armVersion ? `${p.os}/${p.cpu}v${p.armVersion}` : `${p.os}/${p.cpu}`;
+
   const manifest = {
     name: p.pkg,
     version,
-    description: `Prebuilt nanobpmn server binary for ${p.os}/${p.cpu} (used by ${ROOT_PKG}).`,
+    description: `Prebuilt nanobpmn server binary for ${label} (used by ${ROOT_PKG}).`,
     repository: pkgJson.repository,
     license: pkgJson.license,
     os: [p.os],
@@ -71,7 +74,7 @@ for (const p of PLATFORMS) {
   if (p.os !== 'win32') chmodSync(join(dir, p.bin), 0o755);
   writeFileSync(join(dir, 'package.json'), JSON.stringify(manifest, null, 2) + '\n');
 
-  console.log(`built ${p.pkg}@${version} (${p.os}/${p.cpu})`);
+  console.log(`built ${p.pkg}@${version} (${label})`);
 }
 
 console.log(`\nplatform packages staged under ${outRoot}`);

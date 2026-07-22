@@ -577,13 +577,18 @@ scope we own) so the names can never be squatted or npm-security-held:
 | `@nanobpm/c8ctl-plugin-nano-darwin-x64`    | darwin | x64   |
 | `@nanobpm/c8ctl-plugin-nano-linux-x64`     | linux  | x64   |
 | `@nanobpm/c8ctl-plugin-nano-linux-arm64`   | linux  | arm64 |
+| `@nanobpm/c8ctl-plugin-nano-linux-armv7`   | linux  | arm (v7) |
+| `@nanobpm/c8ctl-plugin-nano-linux-armv6`   | linux  | arm (v6) |
 | `@nanobpm/c8ctl-plugin-nano-win32-x64`     | win32  | x64   |
 
-The root `c8ctl-plugin-nano` lists all five as `optionalDependencies` (pinned to
-the exact release version, injected into the published tarball at release time).
-npm installs only the one matching the host, so each user downloads a single
-binary. The mapping lives in `platforms.mjs` — the single source of truth shared
-by the build/publish scripts and the plugin's runtime resolution.
+The root `c8ctl-plugin-nano` lists all of these as `optionalDependencies` (pinned
+to the exact release version, injected into the published tarball at release
+time). npm installs only those matching the host, so each user downloads a single
+binary — **except on 32-bit ARM**, where npm's `cpu` field is just `arm` for both
+armv6 and armv7, so both install and `platformForHost` picks the right one at
+runtime via the host's `arm_version` (falling back to the armv6 build, which also
+runs on armv7). The mapping lives in `platforms.mjs` — the single source of truth
+shared by the build/publish scripts and the plugin's runtime resolution.
 
 ### Binary delivery contract (upstream CI)
 
@@ -599,6 +604,8 @@ nanobpm-gateway-rest-server-darwin-arm64
 nanobpm-gateway-rest-server-darwin-x64
 nanobpm-gateway-rest-server-linux-x64
 nanobpm-gateway-rest-server-linux-arm64
+nanobpm-gateway-rest-server-linux-armv7
+nanobpm-gateway-rest-server-linux-armv6
 nanobpm-gateway-rest-server-win32-x64.exe
 ```
 

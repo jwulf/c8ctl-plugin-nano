@@ -73,6 +73,39 @@ c8ctl nano stop --purge                            # clean up
 
 Requires a built nanobpmn binary (see README "Locating the binary").
 
+## Platform binary packages
+
+The server binary ships per platform as `@nanobpm/c8ctl-plugin-nano-<os>-<arch>`
+(optionalDependencies of the root meta-package). `platforms.mjs` is the single
+source of truth; `scripts/{build,stamp-optional-deps,publish}-platform-packages.mjs`
+and runtime resolution (`platformForHost`) all read it, so adding a target is a
+one-row edit there plus a matching cross-compile leg in the Nano BPM CI that
+uploads an asset named exactly `PLATFORMS[].asset`.
+
+- **32-bit ARM caveat:** `process.arch` is `'arm'` for *both* armv6 and armv7,
+  so those two packages share `os:linux`/`cpu:arm` and npm installs both on any
+  ARM32 host. `platformForHost` disambiguates at runtime via the host ARM
+  version (`process.config.variables.arm_version`), preferring the exact build
+  and falling back to armv6 (which also runs on armv7) when unknown.
+- **Bootstrapping a NEW platform package (one-time):** OIDC trusted publishing
+  needs the package to already exist on npm, so a brand-new package name must be
+  published once with a token before CI can take over. From a clean checkout
+  with the real binary assets in `./binaries` (download the rolling `binaries`
+  release, which only carries the new assets after the Nano BPM CI has run a
+  tagged release):
+  ```bash
+  npm whoami                                     # be logged in (token/2FA)
+  node scripts/build-platform-packages.mjs <version> ./binaries
+  cd npm-platforms/@nanobpm/c8ctl-plugin-nano-linux-armv7 && npm publish --access public && cd -
+  cd npm-platforms/@nanobpm/c8ctl-plugin-nano-linux-armv6 && npm publish --access public && cd -
+  ```
+  Then on npmjs.com add a **Trusted Publisher** for each new package pointing at
+  `jwulf/c8ctl-plugin-nano` → `release.yml`. After that, `release.yml` publishes
+  them via OIDC like every other package. Until the Trusted Publisher exists,
+  `publish-platform-packages.mjs` records the package as missing and fails the
+  run *without* publishing the root meta-package (so installs never point at a
+  version whose platform packages are absent).
+
 ## Quality bar before considering work done
 
 - `node --check c8ctl-plugin.js` passes.

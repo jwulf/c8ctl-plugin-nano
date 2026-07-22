@@ -1,3 +1,10 @@
+# [1.7.0](https://github.com/jwulf/c8ctl-plugin-nano/compare/v1.6.2...v1.7.0) (2026-07-22)
+
+
+### Features
+
+* add linux armv7 + armv6 platform packages ([#4](https://github.com/jwulf/c8ctl-plugin-nano/issues/4)) ([44a56ab](https://github.com/jwulf/c8ctl-plugin-nano/commit/44a56ab0eb2dada4a61406fffe493a7aa27d58fa))
+
 ## [1.6.2](https://github.com/jwulf/c8ctl-plugin-nano/compare/v1.6.1...v1.6.2) (2026-07-22)
 
 

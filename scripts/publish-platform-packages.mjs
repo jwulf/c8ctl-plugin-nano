@@ -20,6 +20,7 @@
 
 import { execFileSync } from 'node:child_process';
 import { existsSync, readFileSync, writeFileSync } from 'node:fs';
+import { homedir } from 'node:os';
 import { join, dirname, resolve } from 'node:path';
 import { fileURLToPath } from 'node:url';
 import { PLATFORMS } from '../platforms.mjs';
@@ -27,6 +28,7 @@ import { PLATFORMS } from '../platforms.mjs';
 const __dirname = dirname(fileURLToPath(import.meta.url));
 const repoRoot = resolve(__dirname, '..');
 const outRoot = join(repoRoot, 'npm-platforms');
+const OFFICIAL_REGISTRY = 'https://registry.npmjs.org/';
 
 const version = process.argv[2];
 if (!version) {
@@ -34,25 +36,59 @@ if (!version) {
   process.exit(1);
 }
 
-// Trusted publishing (OIDC): npm (>=11.5.1) only authenticates via the workflow
-// id-token when NO `_authToken` is configured for the registry. `actions/setup-node`
-// (registry-url) writes a placeholder `_authToken` line, and @semantic-release/npm
-// can write a root-package-scoped OIDC token into the same .npmrc during its own
-// flow — either would make these plain `npm publish` calls reuse the wrong/absent
-// credential instead of doing a per-package OIDC exchange. Strip any `_authToken`
-// line here so each platform publish authenticates via OIDC. No-op locally.
-function stripNpmAuthToken() {
-  const npmrc = process.env.NPM_CONFIG_USERCONFIG;
-  if (!npmrc || !existsSync(npmrc)) return;
-  const before = readFileSync(npmrc, 'utf8');
-  const after = before
-    .split('\n')
-    .filter((line) => !/_authToken/.test(line))
-    .join('\n');
-  if (after !== before) {
-    writeFileSync(npmrc, after);
-    console.log(`stripped _authToken from ${npmrc} for OIDC trusted publishing`);
+// Trusted publishing (OIDC): npm's built-in auto-OIDC does not fire for these
+// plain `npm publish` subprocesses (they exit ENEEDAUTH even with no token and a
+// recent npm), so — exactly like @semantic-release/npm does for the root package
+// — perform the OIDC token exchange explicitly per platform package: fetch a
+// GitHub Actions OIDC JWT for the npm audience, exchange it at the npm registry
+// for a short-lived package-scoped publish token, and hand that to `npm publish`.
+// Requires `id-token: write` (sets ACTIONS_ID_TOKEN_REQUEST_*) and a Trusted
+// Publisher configured for each package on npmjs.com. Returns undefined outside a
+// GitHub OIDC context (e.g. local runs), so publishing falls back to ambient auth.
+async function githubIdToken(audience) {
+  const url = process.env.ACTIONS_ID_TOKEN_REQUEST_URL;
+  const requestToken = process.env.ACTIONS_ID_TOKEN_REQUEST_TOKEN;
+  if (!url || !requestToken) return undefined;
+  const res = await fetch(`${url}&audience=${encodeURIComponent(audience)}`, {
+    headers: { Authorization: `Bearer ${requestToken}` },
+  });
+  if (!res.ok) {
+    console.warn(`::warning::GitHub OIDC id-token request failed: ${res.status}`);
+    return undefined;
   }
+  const body = await res.json();
+  return body.value;
+}
+
+async function npmOidcToken(pkgName) {
+  const idToken = await githubIdToken('npm:registry.npmjs.org');
+  if (!idToken) return undefined;
+  const res = await fetch(
+    `${OFFICIAL_REGISTRY}-/npm/v1/oidc/token/exchange/package/${encodeURIComponent(pkgName)}`,
+    { method: 'POST', headers: { Authorization: `Bearer ${idToken}` } },
+  );
+  const body = await res.json().catch(() => ({}));
+  if (res.ok && body.token) return body.token;
+  console.warn(
+    `::warning::OIDC token exchange failed for ${pkgName}: ${res.status} ${body.message || ''}. ` +
+      `Ensure a Trusted Publisher is configured for ${pkgName} on npmjs.com (repo + release.yml).`,
+  );
+  return undefined;
+}
+
+function npmrcPath() {
+  return process.env.NPM_CONFIG_USERCONFIG || join(homedir(), '.npmrc');
+}
+
+// Write exactly one `_authToken` line (dropping any prior one) so the next
+// `npm publish` authenticates with this package's freshly exchanged OIDC token.
+function setAuthToken(token) {
+  const npmrc = npmrcPath();
+  const lines = existsSync(npmrc)
+    ? readFileSync(npmrc, 'utf8').split('\n').filter((l) => !/_authToken/.test(l))
+    : [];
+  lines.push(`//registry.npmjs.org/:_authToken=${token}`);
+  writeFileSync(npmrc, lines.filter((l) => l !== '').join('\n') + '\n');
 }
 
 function alreadyPublished(pkg) {
@@ -65,7 +101,6 @@ function alreadyPublished(pkg) {
 }
 
 const deferred = [];
-stripNpmAuthToken();
 for (const p of PLATFORMS) {
   const dir = join(outRoot, p.pkg);
   if (!existsSync(dir)) {
@@ -77,6 +112,11 @@ for (const p of PLATFORMS) {
     continue;
   }
   console.log(`publishing ${p.pkg}@${version} ...`);
+  const oidcToken = await npmOidcToken(p.pkg);
+  if (oidcToken) {
+    setAuthToken(oidcToken);
+    console.log(`  authenticated ${p.pkg} via OIDC trusted publishing`);
+  }
   try {
     const out = execFileSync('npm', ['publish', '--access', 'public'], {
       cwd: dir,

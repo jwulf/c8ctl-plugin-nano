@@ -1,3 +1,15 @@
+# [1.6.0](https://github.com/jwulf/c8ctl-plugin-nano/compare/v1.5.2...v1.6.0) (2026-07-22)
+
+
+### Bug Fixes
+
+* **binary:** bundle nanobpmn 0.0.7 (aa669bd) ([f99718d](https://github.com/jwulf/c8ctl-plugin-nano/commit/f99718d483db20bc4074afd6f17bff6a2d0cbe54))
+
+
+### Features
+
+* **server:** emit launcher-identity + binary-provenance env markers ([#3](https://github.com/jwulf/c8ctl-plugin-nano/issues/3)) ([8e49a60](https://github.com/jwulf/c8ctl-plugin-nano/commit/8e49a6046f85f208cd72296bfe4687f11004b133)), closes [Magikcraft/nano-bpm#192](https://github.com/Magikcraft/nano-bpm/issues/192) [#2](https://github.com/jwulf/c8ctl-plugin-nano/issues/2)
+
 ## [1.5.2](https://github.com/jwulf/c8ctl-plugin-nano/compare/v1.5.1...v1.5.2) (2026-07-05)
 
 

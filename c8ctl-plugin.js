@@ -13,13 +13,15 @@
  *   NANOBPMN_RF        replication factor (1 = single-homed, no Raft)
  *   NANOBPMN_RAFT      set when RF > 1 to enable per-partition Raft
  *   NANOBPMN_DATA_DIR  this node's engine data directory
+ *   NANOBPMN_CONSOLE   runtime console profile (off | observe | studio)
+ *   NANOBPMN_NODE_BIN  Node path for the server's worker fallback runtime
  *
  * This plugin spawns N detached node processes wired to talk to each other on
  * localhost, tracks them in a state file, and stops them on request.
  *
  * Usage:
  *   c8ctl nano start [<nodes>] [--port <basePort>] [--partitions <n>] [--rf <n>]
- *                    [--in-memory] [--history-max <n>]
+ *                    [--in-memory] [--history-max <n>] [--console <profile>]
  *   c8ctl nano status
  *   c8ctl nano stop [--purge]
  *   c8ctl nano logs [<nodeId>] [--follow]
@@ -334,6 +336,18 @@ function findBinary(flags) {
  */
 function launcherEnvMarkers(resolved) {
   const markers = { NANOBPMN_LAUNCHER: 'c8ctl-plugin-nano' };
+
+  // This launcher IS a Node runtime, so hand the server a known-good Node path
+  // for its worker fallback (Deno-preferred, Node >= 22.6). Avoid pinning an
+  // older Node runtime (the plugin supports Node >=18) so the server can still
+  // fall back to a newer Node on PATH when available.
+  const [nodeMajor, nodeMinor, nodePatch] = process.versions.node
+    .split('.')
+    .map((n) => Number.parseInt(n, 10));
+  const nodeOk =
+    nodeMajor > 22 ||
+    (nodeMajor === 22 && (nodeMinor > 6 || (nodeMinor === 6 && nodePatch >= 0)));
+  if (nodeOk) markers.NANOBPMN_NODE_BIN = process.execPath;
   const { version } = pluginPackage();
   // The plugin version is the update unit's "current" in the npm channel's
   // version space (same space as `npm view <plugin> version` -> latest), so the
@@ -381,6 +395,7 @@ function parseRequest(args, flags) {
     capture: Boolean(flags?.capture),
     inMemory: Boolean(flags?.['in-memory'] || flags?.['no-journal']),
     historyMax: intFlag('history-max'),
+    console: flags?.console ?? flags?.profile,
     workspace: Boolean(flags?.workspace),
     check: Boolean(flags?.check),
     binary: flags?.binary,
@@ -529,6 +544,26 @@ async function waitForHealthy(url, timeoutMs = READINESS_TIMEOUT_MS) {  const st
 // start
 // ---------------------------------------------------------------------------
 
+/** Runtime console profiles the server understands (nano-bpm ADR 0035 §C). */
+const CONSOLE_PROFILES = ['off', 'observe', 'studio'];
+
+/**
+ * Resolves the runtime console profile to pass through as NANOBPMN_CONSOLE.
+ * Precedence: --console/--profile flag > inherited NANOBPMN_CONSOLE env >
+ * 'studio' (the full IDE, our default). Unknown values are rejected so a typo
+ * fails fast here rather than silently degrading the console in the server.
+ */
+function resolveConsoleProfile(reqConsole) {
+  const raw = reqConsole ?? process.env.NANOBPMN_CONSOLE ?? 'studio';
+  const profile = String(raw).trim().toLowerCase();
+  if (!CONSOLE_PROFILES.includes(profile)) {
+    throw new Error(
+      `invalid console profile "${raw}" (use one of: ${CONSOLE_PROFILES.join(', ')})`,
+    );
+  }
+  return profile;
+}
+
 async function startCluster(req) {
   const logger = getLogger();
 
@@ -557,6 +592,7 @@ async function startCluster(req) {
   const capture = Boolean(req.capture);
   const inMemory = Boolean(req.inMemory);
   const historyMax = req.historyMax;
+  const consoleProfile = resolveConsoleProfile(req.console);
 
   if (partitions < nodeCount) {
     logger.warn(
@@ -630,7 +666,8 @@ async function startCluster(req) {
     `Starting Nano BPM cluster: ${nodeCount} node(s), ${partitions} partition(s), ` +
       `RF=${rf}${raft ? ', Raft on' : ''}${capture ? ', trace capture on' : ''}` +
       `${inMemory ? ', in-memory (no disk)' : ''}` +
-      `${historyMax !== undefined ? `, history-max=${historyMax}` : ''}`,
+      `${historyMax !== undefined ? `, history-max=${historyMax}` : ''}` +
+      `${consoleProfile !== 'studio' ? `, console=${consoleProfile}` : ''}`,
   );
   logger.info(`Binary:    ${binary}`);
   logger.info(`Workspace: ${workspaceDir} (models/, workers/)`);
@@ -667,6 +704,10 @@ async function startCluster(req) {
       // Shared, persistent authoring workspace (models + workers). Lives
       // outside the per-node data dir so "nano clean" never wipes it.
       NANOBPMN_WORKSPACE_DIR: workspaceDir,
+      // Runtime console profile (off | observe | studio). Default studio (full
+      // IDE); pass-through so --console/--profile or an inherited NANOBPMN_CONSOLE
+      // picks the observability-only or headless surface. See nano-bpm ADR 0035 §C.
+      NANOBPMN_CONSOLE: consoleProfile,
     };
     // Storage axis: an on-disk journal + read-model under the per-node data dir
     // (default), or a fully in-memory engine (in-memory journal + :memory: read
@@ -2540,6 +2581,8 @@ export const commands = {
       'in-memory': { type: 'boolean', description: 'start: run with NO on-disk journal/read-model (in-memory engine; state lost on restart). Alias: --no-journal' },
       'no-journal': { type: 'boolean', description: 'start: alias for --in-memory' },
       'history-max': { type: 'string', description: 'start: cap retained terminal instances in the read model (NANOBPMN_HISTORY_MAX_INSTANCES; 0/unset = unbounded)' },
+      console: { type: 'string', description: 'start: runtime console profile off|observe|studio (NANOBPMN_CONSOLE; default studio). Alias: --profile' },
+      profile: { type: 'string', description: 'start: alias for --console (off|observe|studio; default studio)' },
       follow: { type: 'boolean', description: 'logs: stream output (tail -F)', short: 'f' },
       purge: { type: 'boolean', description: 'stop/restart: also delete per-node engine data' },
       force: { type: 'boolean', description: 'start: stop any existing cluster first' },
@@ -2671,7 +2714,7 @@ export const commands = {
 
 function printUsage() {
   console.log('Usage:');
-  console.log('  c8ctl nano start [<nodes>] [--port <basePort>] [--partitions <n>] [--rf <n>] [--raft] [--capture] [--in-memory] [--history-max <n>] [--binary <path>]');
+  console.log('  c8ctl nano start [<nodes>] [--port <basePort>] [--partitions <n>] [--rf <n>] [--raft] [--capture] [--in-memory] [--history-max <n>] [--console <profile>] [--binary <path>]');
   console.log('  c8ctl nano status [--port <port>]');
   console.log('  c8ctl nano stop [--purge]');
   console.log('  c8ctl nano logs [<nodeId>] [--follow]');
@@ -2705,6 +2748,7 @@ function printUsage() {
   console.log('  --capture            start: enable trace capture (recorded-input replay) on every node');
   console.log('  --in-memory          start: run with NO on-disk journal/read-model (alias --no-journal; state lost on restart)');
   console.log('  --history-max <n>    start: cap retained terminal instances in the read model (0/unset = unbounded)');
+  console.log('  --console <profile>  start: runtime console profile off|observe|studio (alias --profile; default studio)');
   console.log('  --binary <path>      Path to the nanobpmn server binary (overrides "set bin")');
   console.log('  --purge              stop: also delete per-node engine data');
   console.log('  --force              start: stop any existing cluster first');

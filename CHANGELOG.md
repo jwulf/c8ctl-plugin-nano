@@ -1,3 +1,10 @@
+# [1.8.0](https://github.com/jwulf/c8ctl-plugin-nano/compare/v1.7.2...v1.8.0) (2026-07-23)
+
+
+### Features
+
+* pass NANOBPMN_NODE_BIN + runtime console profile to the server ([#5](https://github.com/jwulf/c8ctl-plugin-nano/issues/5)) ([df05cd6](https://github.com/jwulf/c8ctl-plugin-nano/commit/df05cd6b464bdf9c20fc915f8ed7d7634c24c3cc))
+
 ## [1.7.2](https://github.com/jwulf/c8ctl-plugin-nano/compare/v1.7.1...v1.7.2) (2026-07-23)
 
 

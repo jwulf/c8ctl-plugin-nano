@@ -1426,10 +1426,14 @@ function updatePlugin(req) {
   const res = spawnSync('npm', installArgs, { stdio: 'inherit' });
   if (res.error) throw new Error(res.error.message);
   if (res.status !== 0) {
-    const hint =
-      info.mode === 'managed'
-        ? `You can also run:${manual}`
-        : `You may need elevated permissions: sudo ${manual.trim()}`;
+    let hint;
+    if (info.mode === 'managed') {
+      hint = `You can also run:\n${manual}`;
+    } else if (osPlatform() === 'win32') {
+      hint = `You may need to run this command in an elevated terminal (Administrator): ${manual.trim()}`;
+    } else {
+      hint = `You may need elevated permissions: sudo ${manual.trim()}`;
+    }
     throw new Error(
       `npm ${installArgs.join(' ')} failed (exit ${res.status}). ${hint}`,
     );

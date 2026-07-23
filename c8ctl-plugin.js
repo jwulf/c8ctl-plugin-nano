@@ -1412,7 +1412,7 @@ function updatePlugin(req) {
   if (info.mode === 'local') {
     console.log('This plugin runs from a local checkout, so it cannot self-update in place.');
     console.log('Update it with:');
-    console.log('  git pull   # then reload the plugin');
+    console.log(manual);
     return;
   }
 

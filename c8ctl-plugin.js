@@ -334,14 +334,19 @@ function findBinary(flags) {
  * identity, and the server treats an absent source as self-managed/unknown.
  */
 function launcherEnvMarkers(resolved) {
-  const markers = {
-    NANOBPMN_LAUNCHER: 'c8ctl-plugin-nano',
-    // This launcher IS a Node runtime, so hand the server a known-good Node path
-    // for its worker fallback (Deno-preferred, Node >= 22.6). On hosts with no
-    // Deno build (e.g. 32-bit ARM) this is what actually runs TypeScript workers,
-    // and it spares the server a PATH probe. See nano-bpm ADR 0036.
-    NANOBPMN_NODE_BIN: process.execPath,
-  };
+  const markers = { NANOBPMN_LAUNCHER: 'c8ctl-plugin-nano' };
+
+  // This launcher IS a Node runtime, so hand the server a known-good Node path
+  // for its worker fallback (Deno-preferred, Node >= 22.6). Avoid pinning an
+  // older Node runtime (the plugin supports Node >=18) so the server can still
+  // fall back to a newer Node on PATH when available.
+  const [nodeMajor, nodeMinor, nodePatch] = process.versions.node
+    .split('.')
+    .map((n) => Number.parseInt(n, 10));
+  const nodeOk =
+    nodeMajor > 22 ||
+    (nodeMajor === 22 && (nodeMinor > 6 || (nodeMinor === 6 && nodePatch >= 0)));
+  if (nodeOk) markers.NANOBPMN_NODE_BIN = process.execPath;
   const { version } = pluginPackage();
   // The plugin version is the update unit's "current" in the npm channel's
   // version space (same space as `npm view <plugin> version` -> latest), so the

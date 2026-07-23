@@ -37,9 +37,10 @@ import {
   readdirSync,
   chmodSync,
   renameSync,
+  realpathSync,
 } from 'node:fs';
 import { homedir, platform as osPlatform } from 'node:os';
-import { join, isAbsolute, resolve as resolvePath, dirname } from 'node:path';
+import { join, isAbsolute, resolve as resolvePath, dirname, sep } from 'node:path';
 import { createRequire } from 'node:module';
 import { fileURLToPath } from 'node:url';
 import { platformForHost } from './platforms.mjs';
@@ -1308,6 +1309,51 @@ function isGlobalInstall() {
   return Boolean(root) && pluginDir.startsWith(root);
 }
 
+/**
+ * How this plugin is installed, which decides how `nano update` self-updates:
+ *   - 'managed': under c8ctl's own plugin store (…/c8ctl/plugins/node_modules),
+ *       where `c8ctl load plugin` installed it. Self-update in place by
+ *       reinstalling into that same npm --prefix. This is the norm for the
+ *       integrated c8ctl plugin architecture, so it takes precedence over a
+ *       coincidental global install of the same name.
+ *   - 'global': under `npm root -g` (a plain `npm install -g`).
+ *   - 'local':  a checkout / `npm link` — self-update isn't safe; tell the user.
+ */
+function pluginInstallInfo() {
+  const rt = globalThis.c8ctl;
+  if (rt && typeof rt.getUserDataDir === 'function') {
+    try {
+      // Node resolves symlinks when computing this module's path, so realpath
+      // both sides before comparing (e.g. macOS /var → /private/var, or a
+      // C8CTL_DATA_DIR that isn't canonicalized) to avoid a false 'local'.
+      const real = (p) => {
+        try {
+          return realpathSync(p);
+        } catch {
+          return p;
+        }
+      };
+      const pluginsDir = join(rt.getUserDataDir(), 'plugins');
+      const nm = real(join(pluginsDir, 'node_modules'));
+      const self = real(pluginDir);
+      if (self === nm || self.startsWith(nm + sep)) {
+        return { mode: 'managed', prefix: real(pluginsDir) };
+      }
+    } catch {
+      /* fall through to the global/local probes */
+    }
+  }
+  if (isGlobalInstall()) return { mode: 'global' };
+  return { mode: 'local' };
+}
+
+/** The copy-pasteable command that matches how this plugin is installed. */
+function manualUpdateCommand(name, info) {
+  if (info.mode === 'managed') return `  c8ctl load plugin ${name}@latest`;
+  if (info.mode === 'local') return '  git pull   # in your checkout, then reload the plugin';
+  return `  npm install -g ${name}@latest`;
+}
+
 function updatePlugin(req) {
   const { name, version: current } = pluginPackage();
 
@@ -1326,7 +1372,8 @@ function updatePlugin(req) {
   const nanoNote = nanoBin
     ? `  (nano server ${nanoVer ?? bundled?.version ?? 'present'})`
     : '  (nano server: not installed for this platform)';
-  const manual = `  npm install -g ${name}@latest`;
+  const info = pluginInstallInfo();
+  const manual = manualUpdateCommand(name, info);
 
   console.log(`Installed: ${name} v${current ?? '?'}${nanoNote}`);
 
@@ -1362,26 +1409,38 @@ function updatePlugin(req) {
     return;
   }
 
-  if (!isGlobalInstall()) {
-    console.log('This plugin is not a global npm install, so it cannot self-update in place.');
-    console.log('Pull the latest release with:');
-    console.log(manual);
-    console.log('(or, for a local checkout, `git pull` then reload the plugin).');
+  if (info.mode === 'local') {
+    console.log('This plugin runs from a local checkout, so it cannot self-update in place.');
+    console.log('Update it with:');
+    console.log('  git pull   # then reload the plugin');
     return;
   }
 
-  console.log(`Pulling ${name}@${latest} via npm...`);
+  const installArgs =
+    info.mode === 'managed'
+      ? ['install', `${name}@${latest}`, '--prefix', info.prefix]
+      : ['install', '-g', `${name}@${latest}`];
+  const where = info.mode === 'managed' ? 'the c8ctl plugin store' : "npm's global prefix";
+  console.log(`Pulling ${name}@${latest} into ${where}...`);
   console.log('');
-  const res = spawnSync('npm', ['install', '-g', `${name}@${latest}`], { stdio: 'inherit' });
+  const res = spawnSync('npm', installArgs, { stdio: 'inherit' });
   if (res.error) throw new Error(res.error.message);
   if (res.status !== 0) {
+    const hint =
+      info.mode === 'managed'
+        ? `You can also run:${manual}`
+        : `You may need elevated permissions: sudo ${manual.trim()}`;
     throw new Error(
-      `npm install -g ${name}@${latest} failed (exit ${res.status}). ` +
-        `You may need elevated permissions: sudo ${manual.trim()}`,
+      `npm ${installArgs.join(' ')} failed (exit ${res.status}). ${hint}`,
     );
   }
   console.log('');
-  console.log(`Updated to v${latest}. Restart any running cluster to use the new binary:`);
+  if (info.mode === 'managed') {
+    console.log(`Updated to v${latest}. The new plugin and bundled nano server load on your next c8ctl command.`);
+  } else {
+    console.log(`Updated to v${latest}.`);
+  }
+  console.log('Restart any running cluster to use the new server binary:');
   console.log('  c8ctl nano restart');
 }
 
@@ -1449,12 +1508,13 @@ function spawnUpdateRefresh(name, cacheFile) {
 }
 
 function printUpdateNotice(name, current, latest) {
+  const manual = manualUpdateCommand(name, pluginInstallInfo()).trim();
   const lines = [
     '',
     `╭─ Update available: ${name} v${current} → v${latest}`,
     '│  A newer nano release (plugin + bundled server) is published on npm.',
     '│  Install it:  c8ctl nano update',
-    `│  Or manually: npm install -g ${name}@latest`,
+    `│  Or manually: ${manual}`,
     '╰─ Then restart any running cluster: c8ctl nano restart',
     '',
   ];

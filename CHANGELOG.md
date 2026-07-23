@@ -1,3 +1,10 @@
+## [1.7.2](https://github.com/jwulf/c8ctl-plugin-nano/compare/v1.7.1...v1.7.2) (2026-07-23)
+
+
+### Bug Fixes
+
+* **update:** self-update in place from the c8ctl-managed plugin store ([#6](https://github.com/jwulf/c8ctl-plugin-nano/issues/6)) ([48f44db](https://github.com/jwulf/c8ctl-plugin-nano/commit/48f44dbeb5ddb1494dd904d9409526d20f408cef))
+
 ## [1.7.1](https://github.com/jwulf/c8ctl-plugin-nano/compare/v1.7.0...v1.7.1) (2026-07-23)
 
 

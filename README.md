@@ -169,6 +169,21 @@ and the history cap.
 > ⚠️ With `--in-memory`, restart recovers nothing, and Raft/replicated logs are
 > not persisted. Use it for stress/throughput testing, not durability testing.
 
+## Console profile (`--console` / `--profile`)
+
+The server ships a browser console. Pick how much of it is exposed at runtime:
+
+```bash
+c8ctl nano start                      # studio (default): full IDE + authoring API
+c8ctl nano start --console observe    # observability views only; authoring refused (403)
+c8ctl nano start --console off        # headless: no console router at all
+```
+
+- Values: `studio` (default), `observe`, `off`. `--profile` is an alias for
+  `--console`, and an inherited `NANOBPMN_CONSOLE` env var is honored when neither
+  flag is passed. The plugin passes the choice through as `NANOBPMN_CONSOLE` on
+  every node.
+
 ## Configuration (`set` / `config`)
 
 Persistent settings are stored in `<state home>/config.json`:

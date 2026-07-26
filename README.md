@@ -184,9 +184,18 @@ serialized to JSON and piped to the CLI's **stdin** —
 
 and the profile/model are also exported as `AGENT_PROFILE`, `AGENT_RANK`,
 `AGENT_MODEL`, `AGENT_CAPABILITIES`, `AGENT_JOB_TYPE` env vars. On exit `0` the
-job is **completed** with `{ output: <stdout>, exitCode: 0 }`; any other exit
-**fails** the job with a decremented retry count. Profiles are stored in the
-plugin's `config.json` (see `c8ctl nano config`).
+job is **completed** with `{ output: <stdout>, exitCode: 0 }` (captured output is
+capped at 1 MiB, with a `truncated` flag when exceeded); any other exit **fails**
+the job with a decremented retry count, and a job that outlives `--job-timeout`
+is killed. Profiles are stored in the plugin's `config.json` (see `c8ctl nano
+config`).
+
+> **Trust boundary.** The profile `command` is run through a shell so you can
+> write a full invocation (args, pipes, multi-word commands). It is
+> **operator-authored** — only what you put in your own `config.json` is
+> shell-interpreted. Untrusted job data reaches the harness solely as stdin JSON
+> and `AGENT_*` env vars, never interpolated into the command line, so process
+> variables cannot inject shell commands.
 
 ## Cleaning up disk
 

@@ -1339,15 +1339,45 @@ function jobTypeMatrix(rank, capabilities) {
 /** All persisted hire profiles, keyed by name. */
 function readHires() {
   const cfg = readConfig();
-  return cfg.hires && typeof cfg.hires === 'object' ? cfg.hires : {};
+  // A JSON array is `typeof === 'object'` but drops string-keyed writes on
+  // JSON.stringify, so treat only plain objects as a valid hires map.
+  return cfg.hires && typeof cfg.hires === 'object' && !Array.isArray(cfg.hires) ? cfg.hires : {};
 }
 
 /** Persist a single hire profile into config.json under `hires`. */
 function writeHire(profile) {
   const cfg = readConfig();
-  if (!cfg.hires || typeof cfg.hires !== 'object') cfg.hires = {};
+  if (!cfg.hires || typeof cfg.hires !== 'object' || Array.isArray(cfg.hires)) cfg.hires = {};
   cfg.hires[profile.name] = profile;
   writeConfig(cfg);
+}
+
+/**
+ * Validate and normalize a stored profile before use so a hand-edited or
+ * version-skewed config.json can't produce undefined job types or an invalid
+ * spawn. Returns the normalized profile, or a { error } describing the problem.
+ */
+function normalizeStoredProfile(name, profile) {
+  if (!profile || typeof profile !== 'object' || Array.isArray(profile)) {
+    return { error: `profile "${name}" is not an object` };
+  }
+  const rank = String(profile.rank || '').trim().toLowerCase();
+  if (!RANKS.includes(rank)) {
+    return { error: `profile "${name}" has an invalid rank "${profile.rank}" (expected one of: ${RANKS.join(', ')})` };
+  }
+  const command = String(profile.command || '').trim();
+  if (!command) {
+    return { error: `profile "${name}" has no command to run` };
+  }
+  return {
+    profile: {
+      name,
+      rank,
+      command,
+      model: typeof profile.model === 'string' ? profile.model.trim() : '',
+      capabilities: normalizeCapabilities(profile.capabilities),
+    },
+  };
 }
 
 /**
@@ -1625,11 +1655,17 @@ async function workAgent(req, flags) {
     process.exit(1);
   }
 
-  const profile = readHires()[name];
-  if (!profile) {
+  const stored = readHires()[name];
+  if (!stored) {
     logger.error(`No hire named "${name}". List profiles with: c8ctl nano hire --list`);
     process.exit(1);
   }
+  const normalized = normalizeStoredProfile(name, stored);
+  if (normalized.error) {
+    logger.error(`Cannot work "${name}": ${normalized.error}. Re-create it with: c8ctl nano hire`);
+    process.exit(1);
+  }
+  const profile = normalized.profile;
 
   if (!globalThis.c8ctl || typeof globalThis.c8ctl.createClient !== 'function') {
     logger.error('work requires the c8ctl runtime (createClient). Run it via the c8ctl CLI.');

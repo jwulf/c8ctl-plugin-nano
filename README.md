@@ -220,7 +220,7 @@ them into a nested object and coerces `"true"/"false"` → bool and numeric
 strings → int. The normalized shape is
 `{ schemaVersion, repository{provider,url,ref,depth,submodules,authRef}, branch{base,create,push}, setup{commands,env,secretRefs}, task{prompt,promptFile,maxIterations,timeoutMs,allowPr,prBase} }`.
 On completion the plugin writes an **output envelope** back under
-`io.nanobpm.agentResult` (`{status, sandbox, image, output, exitCode, signal, truncated, error}`).
+`io.nanobpm.agentResult` (`{schemaVersion, status, sandbox, image, output, truncated, stderrTruncated, exitCode, signal, error}`).
 
 **Sandbox.** By default the command runs on the host (`--sandbox none`). Pass
 `--sandbox docker` (or `podman`) with an `--image` to run **each job in a

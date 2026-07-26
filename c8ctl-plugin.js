@@ -1571,6 +1571,9 @@ function killTree(child) {
 const AGENT_TASK_NS = 'io.nanobpm.agentTask';
 const AGENT_RESULT_KEY = 'io.nanobpm.agentResult';
 const TASK_ENVELOPE_SCHEMA_VERSION = 1;
+// The result-envelope version is intentionally independent of the task-envelope
+// version so the two contracts can evolve separately without silently coupling.
+const RESULT_ENVELOPE_SCHEMA_VERSION = 1;
 const SANDBOXES = ['none', 'docker', 'podman'];
 // Only container-based sandboxes need an image / disk hygiene / a runtime bin.
 const CONTAINER_SANDBOXES = new Set(['docker', 'podman']);
@@ -1646,7 +1649,9 @@ function normalizeTaskEnvelope(customHeaders, variables) {
   const raw = deepMerge(collectEnvelopeFrom(customHeaders), collectEnvelopeFrom(variables));
   const str = (v) => (v == null ? undefined : String(v));
   const env = {
-    schemaVersion: coerceInt(raw.schemaVersion, TASK_ENVELOPE_SCHEMA_VERSION),
+    // Normalization always emits the v1 shape, so the version is forced to v1
+    // (the raw input version is only a hint about how the author authored it).
+    schemaVersion: TASK_ENVELOPE_SCHEMA_VERSION,
   };
 
   const repo = raw.repository;
@@ -1962,7 +1967,7 @@ function runAgentJob(profile, job, opts = {}) {
 function buildResultEnvelope(result, { sandbox, image }) {
   const status = result.ok ? 'completed' : (result.timedOut ? 'timedOut' : 'failed');
   return {
-    schemaVersion: TASK_ENVELOPE_SCHEMA_VERSION,
+    schemaVersion: RESULT_ENVELOPE_SCHEMA_VERSION,
     status,
     sandbox,
     image: image || null,
@@ -2055,7 +2060,10 @@ async function workAgent(req, flags) {
       logger.error(`--sandbox ${sandbox} selected but "${sandbox}" is not available/running on this host.`);
       process.exit(1);
     }
-    const initial = reapAgentContainers(sandbox, { maxAgeMs: 0, liveRunIds });
+    // Age-gate the startup sweep too (not maxAgeMs:0): on a shared host other
+    // worker processes may have just-created containers not yet in liveRunIds,
+    // so only reap ones older than --reap-age, matching the interval reaper.
+    const initial = reapAgentContainers(sandbox, { maxAgeMs: reapAgeMs, liveRunIds });
     if (initial.reaped > 0) logger.info(`Reaped ${initial.reaped} leftover agent container(s) at startup.`);
     if (initial.error) logger.warn(`Startup reap warning: ${initial.error}`);
     reaperTimer = setInterval(() => {

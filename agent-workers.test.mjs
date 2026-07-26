@@ -175,6 +175,11 @@ test('normalizeStoredProfile validates sandbox + image', () => {
   assert.equal(good.profile.image, 'busybox');
 });
 
+test('normalizeTaskEnvelope forces schemaVersion to v1 regardless of input', () => {
+  const env = normalizeTaskEnvelope({ 'io.nanobpm.agentTask.schemaVersion': '9' }, {});
+  assert.equal(env.schemaVersion, 1);
+});
+
 test('SANDBOXES exposes the expected set', () => {
   assert.deepEqual(SANDBOXES, ['none', 'docker', 'podman']);
 });

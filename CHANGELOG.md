@@ -1,3 +1,10 @@
+# [1.9.0](https://github.com/jwulf/c8ctl-plugin-nano/compare/v1.8.0...v1.9.0) (2026-07-26)
+
+
+### Features
+
+* **nano:** hire and work — CLI agent harness workers ([#7](https://github.com/jwulf/c8ctl-plugin-nano/issues/7)) ([7fbf067](https://github.com/jwulf/c8ctl-plugin-nano/commit/7fbf067b8d919844210bf7738db50ac9e8bc4a50))
+
 # [1.8.0](https://github.com/jwulf/c8ctl-plugin-nano/compare/v1.7.2...v1.8.0) (2026-07-23)
 
 

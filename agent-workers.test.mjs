@@ -179,8 +179,14 @@ test('SANDBOXES exposes the expected set', () => {
   assert.deepEqual(SANDBOXES, ['none', 'docker', 'podman']);
 });
 
-// --- Docker-gated integration: only runs when docker is actually available ---
-const dockerOk = (() => {
+// --- Docker-gated integration tests -----------------------------------------
+// Opt-in: these pull a real image (busybox) and run a container, so they need
+// BOTH a working Docker daemon AND an explicit opt-in. Gating on the env flag
+// keeps them out of CI (release.yml's `test` job), where anonymous Docker Hub
+// pulls rate-limit and flake. Run locally with:
+//   C8CTL_NANO_DOCKER_TESTS=1 npm test
+const dockerOptIn = process.env.C8CTL_NANO_DOCKER_TESTS === '1';
+const dockerOk = dockerOptIn && (() => {
   try {
     return spawnSync('docker', ['version', '--format', '{{.Server.Version}}'], { timeout: 10_000 }).status === 0;
   } catch { return false; }

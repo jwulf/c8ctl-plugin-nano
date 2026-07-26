@@ -6,7 +6,7 @@ Implementation contract for coding agents working on this plugin.
 
 A [c8ctl](https://github.com/camunda/c8ctl) plugin that manages a local
 [nanobpmn](https://github.com/jwulf/nano-bpm) cluster via a single `nano`
-command (`start|status|stop|logs|restart|hire|work`).
+command (includes `start|status|stop|logs|restart|hire|work`).
 
 ## Plugin contract
 

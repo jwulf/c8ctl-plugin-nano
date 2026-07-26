@@ -1399,7 +1399,7 @@ async function hireWorker(req, flags) {
     logger.info('Hired agent profiles:');
     for (const name of names.sort()) {
       const p = hires[name];
-      logger.info(`  ${name}  [${p.rank}]  ${p.command}  (model: ${p.model || '-'}; caps: ${(p.capabilities || []).join(', ') || '-'})`);
+      logger.info(`  ${name}  [${p.rank}]  ${p.command}  (model: ${p.model || '-'}; caps: ${normalizeCapabilities(p.capabilities).join(', ') || '-'})`);
     }
     logger.info('');
     logger.info('Put one to work with: c8ctl nano work <name>');
@@ -3049,7 +3049,7 @@ export const commands = {
       capabilities: { type: 'string', description: 'hire: comma-separated capability list' },
       list: { type: 'boolean', description: 'hire: list existing agent profiles instead of creating one' },
       'max-parallel': { type: 'string', description: 'work: max concurrent jobs per worker (default 1)' },
-      'job-timeout': { type: 'string', description: 'work: job activation timeout in ms (default 300000)' },
+      'job-timeout': { type: 'string', description: 'work: max harness runtime per job in ms; the spawned process is killed past this (default 300000)' },
     },
     handler: async (args, flags) => {
       const logger = getLogger();

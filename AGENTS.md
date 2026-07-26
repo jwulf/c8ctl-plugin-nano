@@ -28,6 +28,25 @@ outside c8ctl. The `work` command additionally uses
 SDK client (job workers) — do **not** add the SDK as a dependency or use raw
 `fetch`; the client comes from the host runtime.
 
+## CLI agent workers (`hire` / `work`)
+
+- `hire` persists an agent profile (name, rank, command, model, capabilities,
+  and optional `sandbox`/`image`) to `config.json`; `work` registers one job
+  worker per token in the rank×capability matrix.
+- Each job runs the profile `command` one-shot with the job serialized to
+  **stdin** (never interpolated into argv — the trust boundary). The reserved
+  **task envelope** (`io.nanobpm.agentTask`, headers=defaults ← variables=overrides,
+  coerced/normalized to schema v1) rides in the payload as `task`; the result is
+  written back under `io.nanobpm.agentResult`. These envelope field names are a
+  **frozen contract** (the nano-ide element-template pack targets them) — extend,
+  don't rename.
+- Sandboxes: `none` runs on the host; `docker`/`podman` run each job in a
+  throwaway `--rm` container labelled `nano.managed=1`/`nano.worker`/`nano.jobKey`/
+  `nano.run`, log-capped, force-removed on timeout. Cleanup is **label-scoped**
+  (never `system prune`), age-gated, and skips in-flight run ids. Secrets are
+  resolved by **name** (pluggable resolver; `host` only) and forwarded as
+  `-e NAME` so values never hit argv/`docker inspect`.
+
 ## How a cluster is modelled
 
 - Each nanobpmn node is the single server binary, configured by env vars:

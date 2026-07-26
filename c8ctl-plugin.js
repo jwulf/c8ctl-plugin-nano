@@ -40,7 +40,9 @@ import {
   chmodSync,
   renameSync,
   realpathSync,
+  statfsSync,
 } from 'node:fs';
+import { randomUUID } from 'node:crypto';
 import { homedir, platform as osPlatform } from 'node:os';
 import { join, isAbsolute, resolve as resolvePath, dirname, sep } from 'node:path';
 import { createRequire } from 'node:module';
@@ -1369,6 +1371,14 @@ function normalizeStoredProfile(name, profile) {
   if (!command) {
     return { error: `profile "${name}" has no command to run` };
   }
+  const sandbox = String(profile.sandbox || 'none').trim().toLowerCase();
+  if (!SANDBOXES.includes(sandbox)) {
+    return { error: `profile "${name}" has an invalid sandbox "${profile.sandbox}" (expected one of: ${SANDBOXES.join(', ')})` };
+  }
+  const image = typeof profile.image === 'string' ? profile.image.trim() : '';
+  if (CONTAINER_SANDBOXES.has(sandbox) && !image) {
+    return { error: `profile "${name}" uses sandbox "${sandbox}" but has no image` };
+  }
   return {
     profile: {
       name,
@@ -1376,6 +1386,8 @@ function normalizeStoredProfile(name, profile) {
       command,
       model: typeof profile.model === 'string' ? profile.model.trim() : '',
       capabilities: normalizeCapabilities(profile.capabilities),
+      sandbox,
+      image,
     },
   };
 }
@@ -1413,6 +1425,8 @@ async function hireWorker(req, flags) {
   let command = flags?.command !== undefined ? String(flags.command).trim() : undefined;
   let model = flags?.model !== undefined ? String(flags.model).trim() : undefined;
   let capabilities = flags?.capabilities !== undefined ? flags.capabilities : undefined;
+  let sandbox = flags?.sandbox !== undefined ? String(flags.sandbox).trim().toLowerCase() : undefined;
+  let image = flags?.image !== undefined ? String(flags.image).trim() : undefined;
 
   const missingRequired = !name || !rank || !command;
   const missingOptional = model === undefined || capabilities === undefined;
@@ -1461,6 +1475,17 @@ async function hireWorker(req, flags) {
   // Optional fields default to empty when omitted (e.g. scripted invocations).
   if (model === undefined) model = '';
   if (capabilities === undefined) capabilities = '';
+  if (sandbox === undefined || sandbox === '') sandbox = 'none';
+  if (image === undefined) image = '';
+
+  if (!SANDBOXES.includes(sandbox)) {
+    logger.error(`Invalid --sandbox "${sandbox}". Use one of: ${SANDBOXES.join(', ')}`);
+    process.exit(1);
+  }
+  if (CONTAINER_SANDBOXES.has(sandbox) && !image) {
+    logger.error(`--sandbox ${sandbox} requires --image <ref> (the container image the agent runs in).`);
+    process.exit(1);
+  }
 
   if (!isValidProfileName(name)) {
     logger.error(`Invalid profile name "${name}". Use letters, digits, dot, dash or underscore.`);
@@ -1482,6 +1507,8 @@ async function hireWorker(req, flags) {
     command,
     model: model || '',
     capabilities: normalizeCapabilities(capabilities),
+    sandbox,
+    image: image || '',
     createdAt: new Date().toISOString(),
   };
   writeHire(profile);
@@ -1490,6 +1517,7 @@ async function hireWorker(req, flags) {
   logger.info(`${existed ? 'Updated' : 'Hired'} "${name}" [${profile.rank}] → ${profile.command}`);
   logger.info(`  model: ${profile.model || '(none)'}`);
   logger.info(`  capabilities: ${profile.capabilities.join(', ') || '(none)'}`);
+  logger.info(`  sandbox: ${profile.sandbox}${CONTAINER_SANDBOXES.has(profile.sandbox) ? ` (image ${profile.image})` : ''}`);
   logger.info(`  job types (${matrix.length}): ${matrix.join('  ')}`);
   logger.info(`Put it to work with: c8ctl nano work ${name}`);
 }
@@ -1532,51 +1560,255 @@ function killTree(child) {
   try { child.kill('SIGKILL'); } catch { /* already gone */ }
 }
 
-/**
- * Run a single activated job through the profile's CLI command (one-shot):
- * spawn the command fresh, pipe the job as JSON on stdin, capture stdout, and
- * resolve to a job action. Exit 0 → complete with { output, exitCode }; any
- * other exit (or spawn failure) → fail with a decremented retry count.
- * A child that outlives `timeoutMs` is killed and reported as a failure so it
- * never leaks a worker slot.
- */
-function runAgentJob(profile, job, timeoutMs) {
-  return new Promise((resolve) => {
-    const variables = job.variables && typeof job.variables === 'object' ? job.variables : {};
-    const payload = {
-      jobKey: job.jobKey,
-      jobType: job.type,
-      processInstanceKey: job.processInstanceKey ?? null,
-      elementInstanceKey: job.elementInstanceKey ?? null,
-      elementId: job.elementId ?? null,
-      bpmnProcessId: job.bpmnProcessId ?? job.processDefinitionId ?? null,
-      prompt: variables.prompt ?? variables.task ?? null,
-      variables,
-      customHeaders: job.customHeaders ?? {},
-      profile: {
-        name: profile.name,
-        rank: profile.rank,
-        model: profile.model,
-        capabilities: profile.capabilities,
-      },
+// ===========================================================================
+// Agent task envelope + sandboxed execution (issue #8, increment 1)
+// ===========================================================================
+
+// Reserved namespaces. The INPUT envelope is assembled from the job's static
+// customHeaders (model-authored defaults) deep-merged with per-instance
+// variables (overrides win), then normalized/coerced to schema v1. The OUTPUT
+// envelope is written back on the job's completion variables.
+const AGENT_TASK_NS = 'io.nanobpm.agentTask';
+const AGENT_RESULT_KEY = 'io.nanobpm.agentResult';
+const TASK_ENVELOPE_SCHEMA_VERSION = 1;
+// The result-envelope version is intentionally independent of the task-envelope
+// version so the two contracts can evolve separately without silently coupling.
+const RESULT_ENVELOPE_SCHEMA_VERSION = 1;
+const SANDBOXES = ['none', 'docker', 'podman'];
+// Only container-based sandboxes need an image / disk hygiene / a runtime bin.
+const CONTAINER_SANDBOXES = new Set(['docker', 'podman']);
+
+function coerceBool(v, dflt = false) {
+  if (typeof v === 'boolean') return v;
+  if (v == null) return dflt;
+  const s = String(v).trim().toLowerCase();
+  if (['true', '1', 'yes', 'on'].includes(s)) return true;
+  if (['false', '0', 'no', 'off', ''].includes(s)) return false;
+  return dflt;
+}
+
+function coerceInt(v, dflt) {
+  if (v == null || v === '') return dflt;
+  const n = Number.parseInt(String(v), 10);
+  return Number.isFinite(n) ? n : dflt;
+}
+
+function isPlainObject(v) {
+  return v != null && typeof v === 'object' && !Array.isArray(v);
+}
+
+function deepMerge(base, over) {
+  if (!isPlainObject(base)) return isPlainObject(over) ? deepMerge({}, over) : over;
+  const out = { ...base };
+  if (!isPlainObject(over)) return out;
+  for (const [k, v] of Object.entries(over)) {
+    if (v === undefined) continue;
+    out[k] = isPlainObject(v) && isPlainObject(out[k]) ? deepMerge(out[k], v) : v;
+  }
+  return out;
+}
+
+function setPath(obj, path, value) {
+  let cur = obj;
+  for (let i = 0; i < path.length - 1; i++) {
+    const k = path[i];
+    if (!isPlainObject(cur[k])) cur[k] = {};
+    cur = cur[k];
+  }
+  cur[path[path.length - 1]] = value;
+}
+
+// Collect the reserved namespace out of a flat key→value map (customHeaders or
+// variables). Supports both a single `io.nanobpm.agentTask` key whose value is
+// a JSON string/object, AND flattened dotpath keys like
+// `io.nanobpm.agentTask.repository.ref` (element templates emit the latter).
+function collectEnvelopeFrom(source) {
+  const out = {};
+  if (!isPlainObject(source)) return out;
+  const whole = source[AGENT_TASK_NS];
+  if (whole != null) {
+    let val = whole;
+    if (typeof whole === 'string') {
+      try { val = JSON.parse(whole); } catch { val = undefined; }
+    }
+    if (isPlainObject(val)) Object.assign(out, deepMerge(out, val));
+  }
+  const prefix = `${AGENT_TASK_NS}.`;
+  for (const [key, value] of Object.entries(source)) {
+    if (!key.startsWith(prefix)) continue;
+    const rest = key.slice(prefix.length);
+    if (!rest) continue;
+    setPath(out, rest.split('.'), value);
+  }
+  return out;
+}
+
+// Normalize the assembled envelope to schema v1, coercing header string values
+// (element templates write everything as strings) into bool/int as needed.
+function normalizeTaskEnvelope(customHeaders, variables) {
+  const raw = deepMerge(collectEnvelopeFrom(customHeaders), collectEnvelopeFrom(variables));
+  const str = (v) => (v == null ? undefined : String(v));
+  const env = {
+    // Normalization always emits the v1 shape, so the version is forced to v1
+    // (the raw input version is only a hint about how the author authored it).
+    schemaVersion: TASK_ENVELOPE_SCHEMA_VERSION,
+  };
+
+  const repo = raw.repository;
+  if (isPlainObject(repo) && str(repo.url)) {
+    env.repository = {
+      provider: str(repo.provider) || 'github',
+      url: str(repo.url),
+      ref: str(repo.ref),
+      depth: coerceInt(repo.depth, undefined),
+      submodules: coerceBool(repo.submodules, false),
+      authRef: str(repo.authRef),
     };
+  }
 
-    const child = spawn(profile.command, {
-      shell: true,
-      // Run the shell in its own process group so the timeout handler can kill
-      // the whole tree (shell + harness), not just the shell wrapper PID.
-      detached: process.platform !== 'win32',
-      stdio: ['pipe', 'pipe', 'pipe'],
-      env: {
-        ...process.env,
-        AGENT_PROFILE: profile.name,
-        AGENT_RANK: profile.rank,
-        AGENT_MODEL: profile.model || '',
-        AGENT_CAPABILITIES: (profile.capabilities || []).join(','),
-        AGENT_JOB_TYPE: String(job.type ?? ''),
-      },
-    });
+  const branch = isPlainObject(raw.branch) ? raw.branch : {};
+  env.branch = {
+    base: str(branch.base),
+    create: str(branch.create),
+    push: coerceBool(branch.push, true),
+  };
 
+  const setup = isPlainObject(raw.setup) ? raw.setup : {};
+  env.setup = {
+    commands: Array.isArray(setup.commands) ? setup.commands.map(String) : [],
+    env: isPlainObject(setup.env) ? setup.env : {},
+    secretRefs: Array.isArray(setup.secretRefs) ? setup.secretRefs.map(String) : [],
+  };
+
+  const task = isPlainObject(raw.task) ? raw.task : {};
+  env.task = {
+    prompt: str(task.prompt) ?? str(variables?.prompt) ?? str(variables?.task),
+    promptFile: str(task.promptFile),
+    maxIterations: coerceInt(task.maxIterations, undefined),
+    timeoutMs: coerceInt(task.timeoutMs, undefined),
+    allowPr: coerceBool(task.allowPr, false),
+    prBase: str(task.prBase),
+  };
+
+  return env;
+}
+
+// ---- Secret resolution (pluggable; only host-env implemented for now) ------
+// Secrets are referenced by NAME, never by value, in the model. A resolver maps
+// a name → value at run time. The wrapper injects them into the child ENV, so
+// values never appear in argv or `docker inspect`.
+const hostEnvSecretResolver = {
+  kind: 'host',
+  resolve(name) {
+    const v = process.env[name];
+    return v == null || v === '' ? undefined : v;
+  },
+};
+
+function makeSecretResolver(kind) {
+  const k = (kind || 'host').trim().toLowerCase();
+  if (k === 'host' || k === '') return hostEnvSecretResolver;
+  return null; // unknown → caller reports a clear error
+}
+
+// Resolve the names a job needs (setup.secretRefs, plus the repo/PR credential
+// when allowPr). Returns resolved values + a list of names that were missing so
+// the caller can fail the job with a clear provisioning error.
+function resolveJobSecrets(resolver, envelope) {
+  const names = new Set();
+  for (const n of envelope.setup?.secretRefs || []) if (n) names.add(n);
+  if (envelope.task?.allowPr) {
+    const provider = envelope.repository?.provider || 'github';
+    const authRef = envelope.repository?.authRef || (provider === 'github' ? 'GITHUB_TOKEN' : undefined);
+    if (authRef) names.add(authRef);
+  }
+  const resolved = {};
+  const missing = [];
+  for (const name of names) {
+    const v = resolver.resolve(name);
+    if (v === undefined) missing.push(name);
+    else resolved[name] = v;
+  }
+  return { resolved, missing, names: [...names] };
+}
+
+// ---- Disk hygiene (container sandboxes only) -------------------------------
+const CONTAINER_LABEL = 'nano.managed=1';
+
+function containerEngineAvailable(engine) {
+  try {
+    const r = spawnSync(engine, ['version', '--format', '{{.Server.Version}}'], { encoding: 'utf8', timeout: 10_000 });
+    return r.status === 0;
+  } catch {
+    return false;
+  }
+}
+
+// Resolve the container engine's data root. Returns null when it can't be
+// determined so the caller can fail OPEN (never fall back to an unrelated path
+// like the OS temp dir, which would shed on the wrong filesystem's free space).
+function dockerRootDir(engine) {
+  try {
+    const r = spawnSync(engine, ['info', '-f', '{{.DockerRootDir}}'], { encoding: 'utf8', timeout: 10_000 });
+    const dir = (r.stdout || '').trim();
+    if (r.status === 0 && dir) return dir;
+  } catch { /* fall through */ }
+  return null;
+}
+
+// Fail-open disk-budget check: shed work when free space on the engine's data
+// root drops below the configured floor (mirrors nano's admission-shed pattern).
+function diskBudgetOk(engine, minFreeBytes) {
+  if (!minFreeBytes || minFreeBytes <= 0) return { ok: true, free: null };
+  try {
+    if (typeof statfsSync !== 'function') return { ok: true, free: null };
+    const root = dockerRootDir(engine);
+    if (!root) return { ok: true, free: null }; // can't resolve the real root → fail open
+    const st = statfsSync(root);
+    const free = st.bavail * st.bsize;
+    return { ok: free >= minFreeBytes, free };
+  } catch {
+    return { ok: true, free: null }; // never block work on a stat failure
+  }
+}
+
+// Reap our own leaked/finished containers. Label-scoped (never touches anything
+// we didn't create — safe on shared hosts, NEVER `system prune -a`), age-gated,
+// and skips any run id still in flight.
+function reapAgentContainers(engine, { maxAgeMs = 0, liveRunIds = new Set() } = {}) {
+  let reaped = 0;
+  try {
+    const fmt = '{{.ID}}\t{{.Label "nano.run"}}\t{{.State}}\t{{.CreatedAt}}';
+    const r = spawnSync(engine, ['ps', '-a', '--filter', `label=${CONTAINER_LABEL}`, '--format', fmt], { encoding: 'utf8', timeout: 15_000 });
+    if (r.status !== 0) return { reaped, error: (r.stderr || '').trim() || 'ps failed' };
+    const now = Date.now();
+    for (const line of (r.stdout || '').split('\n')) {
+      if (!line.trim()) continue;
+      const [id, run, state, created] = line.split('\t');
+      if (run && liveRunIds.has(run)) continue; // in-flight; leave it
+      if (!/exited|dead|created/i.test(state || '')) continue; // only finished/stuck
+      if (maxAgeMs > 0) {
+        const createdMs = Date.parse(created || '');
+        if (Number.isFinite(createdMs) && now - createdMs < maxAgeMs) continue;
+      }
+      const rm = spawnSync(engine, ['rm', '-f', id], { timeout: 15_000 });
+      if (rm.status === 0) reaped++;
+    }
+  } catch (err) {
+    return { reaped, error: err.message };
+  }
+  return { reaped };
+}
+
+// ---- One-shot capture (shared by host + container executors) ---------------
+const MAX_CAPTURE_BYTES = 1_048_576; // 1 MiB per stream
+
+// Spawn a child, pipe `stdinData`, capture byte-capped stdout/stderr, enforce a
+// timeout (invoking `onTimeout(child)` to tear the child down), and resolve to a
+// uniform result. Used by both the host and container executors.
+function spawnCaptureOneShot({ command, args = [], shell = false, detached = false, env, stdinData, timeoutMs, onTimeout }) {
+  return new Promise((resolve) => {
+    let child;
     const stdoutChunks = [];
     const stderrChunks = [];
     let stdoutBytes = 0;
@@ -1584,9 +1816,8 @@ function runAgentJob(profile, job, timeoutMs) {
     let stdoutTruncated = false;
     let stderrTruncated = false;
     let settled = false;
-    // Bound captured output (by BYTES, not string length) so a noisy/runaway
-    // harness can't grow memory without limit and crash the worker.
-    const MAX_CAPTURE_BYTES = 1_048_576; // 1 MiB per stream
+    let timer = null;
+
     const finish = (result) => {
       if (settled) return;
       settled = true;
@@ -1594,12 +1825,17 @@ function runAgentJob(profile, job, timeoutMs) {
       resolve(result);
     };
 
-    // Kill (and fail) a child that runs longer than the job's timeout so it can
-    // never permanently hold a worker slot or leak the process.
-    const timer = timeoutMs && timeoutMs > 0
+    try {
+      child = spawn(command, args, { shell, detached, stdio: ['pipe', 'pipe', 'pipe'], env });
+    } catch (err) {
+      finish({ ok: false, exitCode: null, stdout: '', stderr: '', error: err.message, truncated: false, stderrTruncated: false });
+      return;
+    }
+
+    timer = timeoutMs && timeoutMs > 0
       ? setTimeout(() => {
-          killTree(child);
-          finish({ ok: false, exitCode: null, stdout: joinCapped(stdoutChunks), stderr: joinCapped(stderrChunks), error: `timed out after ${timeoutMs}ms`, truncated: stdoutTruncated, stderrTruncated });
+          try { if (onTimeout) onTimeout(child); } catch { /* best effort */ }
+          finish({ ok: false, exitCode: null, stdout: joinCapped(stdoutChunks), stderr: joinCapped(stderrChunks), error: `timed out after ${timeoutMs}ms`, timedOut: true, truncated: stdoutTruncated, stderrTruncated });
         }, timeoutMs)
       : null;
 
@@ -1625,17 +1861,128 @@ function runAgentJob(profile, job, timeoutMs) {
       finish({ ok: code === 0, exitCode: code, signal: signal ?? null, stdout: joinCapped(stdoutChunks), stderr: joinCapped(stderrChunks), truncated: stdoutTruncated, stderrTruncated });
     });
 
-    // The child may exit before reading stdin; swallow the async EPIPE so it
-    // doesn't crash the whole worker process (only the `child` close/error
-    // handlers above decide the job outcome).
     child.stdin.on('error', () => {});
     try {
-      child.stdin.write(JSON.stringify(payload));
+      if (stdinData != null) child.stdin.write(stdinData);
       child.stdin.end();
-    } catch {
-      // 'error' handler above resolves the promise on spawn failure.
-    }
+    } catch { /* 'error' handler resolves on failure */ }
   });
+}
+
+function buildAgentPayload(profile, job, envelope) {
+  const variables = job.variables && typeof job.variables === 'object' ? job.variables : {};
+  return {
+    jobKey: job.jobKey,
+    jobType: job.type,
+    processInstanceKey: job.processInstanceKey ?? null,
+    elementInstanceKey: job.elementInstanceKey ?? null,
+    elementId: job.elementId ?? null,
+    bpmnProcessId: job.bpmnProcessId ?? job.processDefinitionId ?? null,
+    prompt: envelope?.task?.prompt ?? variables.prompt ?? variables.task ?? null,
+    task: envelope || null,
+    variables,
+    customHeaders: job.customHeaders ?? {},
+    profile: {
+      name: profile.name,
+      rank: profile.rank,
+      model: profile.model,
+      capabilities: profile.capabilities,
+    },
+  };
+}
+
+function baseAgentEnv(profile, job) {
+  return {
+    AGENT_PROFILE: profile.name,
+    AGENT_RANK: profile.rank,
+    AGENT_MODEL: profile.model || '',
+    AGENT_CAPABILITIES: (profile.capabilities || []).join(','),
+    AGENT_JOB_TYPE: String(job.type ?? ''),
+  };
+}
+
+/**
+ * Run a single activated job through the profile's CLI command (one-shot),
+ * dispatching on the profile's sandbox:
+ *   - none            → spawn the command on the host (legacy behaviour).
+ *   - docker | podman → `run --rm` a labelled, log-capped container, piping the
+ *                       task envelope on stdin; a run that outlives the timeout
+ *                       is force-removed so it never leaks a slot or disk.
+ * Both paths resolve to the same result contract.
+ */
+function runAgentJob(profile, job, opts = {}) {
+  const { timeoutMs, envelope, sandbox = 'none', image, runId, secretEnv = {}, passThroughSecretNames = [] } = opts;
+  const payload = JSON.stringify(buildAgentPayload(profile, job, envelope));
+  const agentEnv = baseAgentEnv(profile, job);
+
+  if (!CONTAINER_SANDBOXES.has(sandbox)) {
+    return spawnCaptureOneShot({
+      command: profile.command,
+      shell: true,
+      // Own process group so the timeout handler can kill the whole tree.
+      detached: process.platform !== 'win32',
+      env: { ...process.env, ...agentEnv, ...secretEnv },
+      stdinData: payload,
+      timeoutMs,
+      onTimeout: (child) => killTree(child),
+    });
+  }
+
+  const engine = sandbox;
+  const containerName = `nano-${runId}`;
+  // Forward env by NAME only (`-e NAME`) so secret VALUES stay out of argv and
+  // `docker inspect`; docker reads the value from our child's environment.
+  const envArgs = [];
+  for (const k of Object.keys(agentEnv)) envArgs.push('-e', k);
+  for (const n of passThroughSecretNames) envArgs.push('-e', n);
+  const setupEnv = isPlainObject(envelope?.setup?.env) ? envelope.setup.env : {};
+  const setupEnvValues = {};
+  for (const [k, v] of Object.entries(setupEnv)) { envArgs.push('-e', k); setupEnvValues[k] = String(v); }
+
+  const args = [
+    'run', '--rm', '-i',
+    '--name', containerName,
+    '--label', CONTAINER_LABEL,
+    '--label', `nano.worker=${profile.name}`,
+    '--label', `nano.jobKey=${job.jobKey}`,
+    '--label', `nano.run=${runId}`,
+    '--log-opt', 'max-size=10m',
+    '--log-opt', 'max-file=3',
+    ...envArgs,
+    image,
+    'sh', '-c', profile.command,
+  ];
+
+  return spawnCaptureOneShot({
+    command: engine,
+    args,
+    shell: false,
+    env: { ...process.env, ...agentEnv, ...secretEnv, ...setupEnvValues },
+    stdinData: payload,
+    timeoutMs,
+    onTimeout: (child) => {
+      try { spawnSync(engine, ['rm', '-f', containerName], { timeout: 15_000 }); } catch { /* best effort */ }
+      try { killTree(child); } catch { /* best effort */ }
+    },
+  });
+}
+
+// Shape the io.nanobpm.agentResult output envelope. branch/commits/pr are
+// reserved for increment 2 (git provisioning); increment 1 reports execution.
+function buildResultEnvelope(result, { sandbox, image }) {
+  const status = result.ok ? 'completed' : (result.timedOut ? 'timedOut' : 'failed');
+  return {
+    schemaVersion: RESULT_ENVELOPE_SCHEMA_VERSION,
+    status,
+    sandbox,
+    image: image || null,
+    output: result.stdout ?? '',
+    truncated: !!result.truncated,
+    stderrTruncated: !!result.stderrTruncated,
+    exitCode: result.exitCode ?? null,
+    signal: result.signal ?? null,
+    error: result.error ?? null,
+  };
 }
 
 /**
@@ -1680,11 +2027,63 @@ async function workAgent(req, flags) {
   const maxParallelJobs = intFlag(flags?.['max-parallel'], 1);
   const jobTimeoutMs = intFlag(flags?.['job-timeout'], 5 * 60_000);
 
+  // Sandbox: flag overrides the stored profile default. `none` runs on the host
+  // (legacy); `docker`/`podman` run each job in a throwaway labelled container.
+  const sandbox = String(flags?.sandbox ?? profile.sandbox ?? 'none').trim().toLowerCase();
+  if (!SANDBOXES.includes(sandbox)) {
+    logger.error(`Invalid --sandbox "${sandbox}". Use one of: ${SANDBOXES.join(', ')}`);
+    process.exit(1);
+  }
+  const image = flags?.image ? String(flags.image).trim() : (profile.image || '');
+  const isContainer = CONTAINER_SANDBOXES.has(sandbox);
+  if (isContainer && !image) {
+    logger.error(`--sandbox ${sandbox} requires an --image (or hire the profile with --image).`);
+    process.exit(1);
+  }
+
+  const secretResolver = makeSecretResolver(flags?.['secret-resolver']);
+  if (!secretResolver) {
+    logger.error(`Unknown --secret-resolver "${flags?.['secret-resolver']}". Only "host" is supported.`);
+    process.exit(1);
+  }
+
+  // Disk-hygiene knobs (container sandboxes only). Reaper age + interval and the
+  // free-space admission floor mirror nano's own disk-budget/reaper patterns.
+  const reapAgeMs = intFlag(flags?.['reap-age'], 60 * 60_000); // 1h
+  const reapIntervalMs = intFlag(flags?.['reap-interval'], 5 * 60_000); // 5m
+  const minFreeBytes = flags?.['min-free-mb'] != null
+    ? Math.max(0, intFlag(flags['min-free-mb'], 0)) * 1_048_576
+    : 1_073_741_824; // 1 GiB default floor
+
+  // Tracks run ids currently executing so the reaper never removes a live
+  // container out from under an in-flight job.
+  const liveRunIds = new Set();
+  let reaperTimer = null;
+
+  if (isContainer) {
+    if (!containerEngineAvailable(sandbox)) {
+      logger.error(`--sandbox ${sandbox} selected but "${sandbox}" is not available/running on this host.`);
+      process.exit(1);
+    }
+    // Age-gate the startup sweep too (not maxAgeMs:0): on a shared host other
+    // worker processes may have just-created containers not yet in liveRunIds,
+    // so only reap ones older than --reap-age, matching the interval reaper.
+    const initial = reapAgentContainers(sandbox, { maxAgeMs: reapAgeMs, liveRunIds });
+    if (initial.reaped > 0) logger.info(`Reaped ${initial.reaped} leftover agent container(s) at startup.`);
+    if (initial.error) logger.warn(`Startup reap warning: ${initial.error}`);
+    reaperTimer = setInterval(() => {
+      const r = reapAgentContainers(sandbox, { maxAgeMs: reapAgeMs, liveRunIds });
+      if (r.reaped > 0) logger.info(`Reaper removed ${r.reaped} finished agent container(s).`);
+    }, reapIntervalMs);
+    if (typeof reaperTimer.unref === 'function') reaperTimer.unref();
+  }
+
   const matrix = jobTypeMatrix(profile.rank, profile.capabilities);
   const camunda = globalThis.c8ctl.createClient();
 
   logger.info(`Putting "${name}" [${profile.rank}] to work → ${profile.command}`);
   logger.info(`  model: ${profile.model || '(none)'}; capabilities: ${profile.capabilities.join(', ') || '(none)'}`);
+  logger.info(`  sandbox: ${sandbox}${isContainer ? ` (image ${image})` : ''}`);
   logger.info(`  listening on ${matrix.length} job type(s): ${matrix.join('  ')}`);
   logger.info(`  max parallel: ${maxParallelJobs}; job timeout: ${jobTimeoutMs}ms`);
   logger.info('Polling for work — press Ctrl-C to stop.');
@@ -1697,10 +2096,58 @@ async function workAgent(req, flags) {
       jobTimeoutMs,
       jobHandler: async (job) => {
         logger.info(`[${jobType}] job ${job.jobKey} (instance ${job.processInstanceKey ?? '-'}) → ${profile.command}`);
-        const result = await runAgentJob(profile, job, jobTimeoutMs);
+
+        // Disk-budget admission shed: if the engine data root is below the free
+        // floor, don't start a container — fail (retryable) so work sheds until
+        // the reaper/host frees space.
+        if (isContainer) {
+          const budget = diskBudgetOk(sandbox, minFreeBytes);
+          if (!budget.ok) {
+            const freeMb = budget.free != null ? Math.round(budget.free / 1_048_576) : '?';
+            const retries = Math.max(0, (Number(job.retries) || 1) - 1);
+            logger.warn(`[${jobType}] job ${job.jobKey} shed — low disk (${freeMb}MB free); retries left ${retries}`);
+            return job.fail({ errorMessage: `disk budget exceeded (only ${freeMb}MB free)`, retries, retryBackOff: 30_000 });
+          }
+        }
+
+        // Assemble + normalize the task envelope from headers (defaults) and
+        // variables (overrides), then resolve any secrets it references.
+        const envelope = normalizeTaskEnvelope(job.customHeaders ?? {}, job.variables ?? {});
+        const { resolved, missing, names } = resolveJobSecrets(secretResolver, envelope);
+        if (missing.length > 0) {
+          const retries = Math.max(0, (Number(job.retries) || 1) - 1);
+          const msg = `missing secret(s): ${missing.join(', ')} (resolver: ${secretResolver.kind})`;
+          logger.warn(`[${jobType}] job ${job.jobKey} not provisioned — ${msg}; retries left ${retries}`);
+          return job.fail({ errorMessage: msg, retries });
+        }
+
+        const runId = randomUUID();
+        if (isContainer) liveRunIds.add(runId);
+        let result;
+        try {
+          result = await runAgentJob(profile, job, {
+            timeoutMs: jobTimeoutMs,
+            envelope,
+            sandbox,
+            image,
+            runId,
+            secretEnv: resolved,
+            passThroughSecretNames: names,
+          });
+        } finally {
+          if (isContainer) liveRunIds.delete(runId);
+        }
+
+        const resultEnvelope = buildResultEnvelope(result, { sandbox, image });
         if (result.ok) {
           logger.info(`[${jobType}] job ${job.jobKey} complete (exit 0)${result.truncated ? ' [output truncated]' : ''}`);
-          return job.complete({ output: result.stdout, exitCode: 0, agent: profile.name, truncated: Boolean(result.truncated) });
+          return job.complete({
+            [AGENT_RESULT_KEY]: resultEnvelope,
+            output: result.stdout,
+            exitCode: 0,
+            agent: profile.name,
+            truncated: Boolean(result.truncated),
+          });
         }
         const retries = Math.max(0, (Number(job.retries) || 1) - 1);
         const detail = result.error
@@ -1710,6 +2157,7 @@ async function workAgent(req, flags) {
         return job.fail({
           errorMessage: `agent "${profile.name}" failed: ${detail}`.slice(0, 2000),
           retries,
+          variables: { [AGENT_RESULT_KEY]: resultEnvelope },
         });
       },
     }),
@@ -1722,6 +2170,7 @@ async function workAgent(req, flags) {
       if (stopping) return;
       stopping = true;
       logger.info(`Received ${signal} — stopping ${workers.length} worker(s)...`);
+      if (reaperTimer) clearInterval(reaperTimer);
       let stopFailures = 0;
       await Promise.all(
         workers.map(async (w) => {
@@ -2973,6 +3422,27 @@ function parseProcessosRequest(args, flags) {
 // Internal helpers exported for tests/tooling only. c8ctl consumes just
 // `metadata` and `commands`; these named exports are inert to it.
 export { resolveBinary, findBinary, launcherEnvMarkers };
+export {
+  normalizeTaskEnvelope,
+  collectEnvelopeFrom,
+  coerceBool,
+  coerceInt,
+  deepMerge,
+  resolveJobSecrets,
+  makeSecretResolver,
+  hostEnvSecretResolver,
+  buildAgentPayload,
+  buildResultEnvelope,
+  reapAgentContainers,
+  diskBudgetOk,
+  containerEngineAvailable,
+  runAgentJob,
+  normalizeStoredProfile,
+  jobTypeMatrix,
+  AGENT_TASK_NS,
+  AGENT_RESULT_KEY,
+  SANDBOXES,
+};
 
 export const metadata = {
   name: 'c8ctl-plugin-nano',
@@ -3007,7 +3477,9 @@ export const metadata = {
         { command: 'c8ctl nano hire', description: 'Interactively create a CLI agent worker profile (name, rank, command, model, capabilities)' },
         { command: 'c8ctl nano hire --name reviewer --rank senior --command copilot --model gpt-5 --capabilities code-review,testing', description: 'Create a profile non-interactively' },
         { command: 'c8ctl nano hire --list', description: 'List hired agent profiles' },
+        { command: 'c8ctl nano hire --name coder --rank senior --command "agent-harness" --sandbox docker --image ghcr.io/acme/agent:1', description: 'Create a profile that runs each job in a throwaway Docker container' },
         { command: 'c8ctl nano work reviewer', description: 'Spawn Nano job workers for the "reviewer" profile and poll for work' },
+        { command: 'c8ctl nano work coder --sandbox docker --image ghcr.io/acme/agent:1', description: 'Run jobs in isolated containers with disk-hygiene reaping' },
       ],
     },
     processos: {
@@ -3054,6 +3526,12 @@ export const commands = {
       command: { type: 'string', description: 'hire: CLI command that runs the agent harness (e.g. copilot, claude, pi)' },
       model: { type: 'string', description: 'hire: model name passed to the harness (AGENT_MODEL)' },
       capabilities: { type: 'string', description: 'hire: comma-separated capability list' },
+      sandbox: { type: 'string', description: 'hire/work: execution sandbox none|docker|podman (default none). Containers isolate each job.' },
+      image: { type: 'string', description: 'hire/work: container image the agent runs in (required for --sandbox docker|podman)' },
+      'secret-resolver': { type: 'string', description: 'work: secret resolver for task secretRefs (host = process env; default host)' },
+      'reap-age': { type: 'string', description: 'work: age in ms before a finished agent container is reaped (default 3600000)' },
+      'reap-interval': { type: 'string', description: 'work: how often to sweep finished agent containers in ms (default 300000)' },
+      'min-free-mb': { type: 'string', description: 'work: shed jobs when the engine data root has less than this many MB free (default 1024)' },
       list: { type: 'boolean', description: 'hire: list existing agent profiles instead of creating one' },
       'max-parallel': { type: 'string', description: 'work: max concurrent jobs per worker (default 1)' },
       'job-timeout': { type: 'string', description: 'work: max harness runtime per job in ms; the spawned process is killed past this (default 300000)' },
@@ -3199,8 +3677,8 @@ function printUsage() {
   console.log('  c8ctl nano set <bin|model-dir> <path>');
   console.log('  c8ctl nano config');
   console.log('  c8ctl nano update [--check]');
-  console.log('  c8ctl nano hire [--name <n>] [--rank <r>] [--command <c>] [--model <m>] [--capabilities <a,b>] [--list]');
-  console.log('  c8ctl nano work <profileName> [--max-parallel <n>] [--job-timeout <ms>]');
+  console.log('  c8ctl nano hire [--name <n>] [--rank <r>] [--command <c>] [--model <m>] [--capabilities <a,b>] [--sandbox none|docker|podman] [--image <ref>] [--list]');
+  console.log('  c8ctl nano work <profileName> [--max-parallel <n>] [--job-timeout <ms>] [--sandbox none|docker|podman] [--image <ref>] [--secret-resolver host] [--min-free-mb <n>]');
   console.log('');
   console.log('Subcommands:');
   console.log('  start    Spawn an N-node local cluster wired to talk to each other on localhost');
@@ -3231,6 +3709,20 @@ function printUsage() {
   console.log('  --purge              stop: also delete per-node engine data');
   console.log('  --force              start: stop any existing cluster first');
   console.log('  --workspace          clean: also delete the workspace (models + workers)');
+  console.log('  --name <n>           hire/work: agent profile name (alt to positional arg)');
+  console.log('  --rank <r>           hire: agent rank (principal|senior|junior|decider)');
+  console.log('  --command <c>        hire: CLI command that runs the agent harness');
+  console.log('  --model <m>          hire: model name passed to the harness (AGENT_MODEL)');
+  console.log('  --capabilities <a,b> hire: comma-separated capability list');
+  console.log('  --sandbox <s>        hire/work: execution sandbox none|docker|podman (default none)');
+  console.log('  --image <ref>        hire/work: container image the agent runs in (required for docker|podman)');
+  console.log('  --list               hire: list existing agent profiles instead of creating one');
+  console.log('  --max-parallel <n>   work: max concurrent jobs per worker (default 1)');
+  console.log('  --job-timeout <ms>   work: max harness runtime per job in ms (default 300000)');
+  console.log('  --secret-resolver <r> work: secret resolver for task secretRefs (host; default host)');
+  console.log('  --reap-age <ms>      work: age before a finished agent container is reaped (default 3600000)');
+  console.log('  --reap-interval <ms> work: how often to sweep finished agent containers (default 300000)');
+  console.log('  --min-free-mb <n>    work: shed jobs when the engine data root has < this many MB free (default 1024)');
   console.log('');
   console.log('Persistent assets:');
   console.log('  Models and workers live in the workspace dir (NANOBPMN_WORKSPACE_DIR),');

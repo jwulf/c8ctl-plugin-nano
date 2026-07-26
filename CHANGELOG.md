@@ -1,3 +1,10 @@
+# [1.10.0](https://github.com/jwulf/c8ctl-plugin-nano/compare/v1.9.0...v1.10.0) (2026-07-26)
+
+
+### Features
+
+* **nano:** sandboxed agentic job workers — task envelope + Docker executor + disk hygiene ([#9](https://github.com/jwulf/c8ctl-plugin-nano/issues/9)) ([dbfb04d](https://github.com/jwulf/c8ctl-plugin-nano/commit/dbfb04d97df517137f404a3acfa4654ff3389be0)), closes [nano-ide#37](https://github.com/nano-ide/issues/37)
+
 # [1.9.0](https://github.com/jwulf/c8ctl-plugin-nano/compare/v1.8.0...v1.9.0) (2026-07-26)
 
 

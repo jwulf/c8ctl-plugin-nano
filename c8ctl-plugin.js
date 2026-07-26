@@ -1620,8 +1620,8 @@ function runAgentJob(profile, job, timeoutMs) {
     child.on('error', (err) => {
       finish({ ok: false, exitCode: null, stdout: joinCapped(stdoutChunks), stderr: joinCapped(stderrChunks), error: err.message, truncated: stdoutTruncated });
     });
-    child.on('close', (code) => {
-      finish({ ok: code === 0, exitCode: code, stdout: joinCapped(stdoutChunks), stderr: joinCapped(stderrChunks), truncated: stdoutTruncated });
+    child.on('close', (code, signal) => {
+      finish({ ok: code === 0, exitCode: code, signal: signal ?? null, stdout: joinCapped(stdoutChunks), stderr: joinCapped(stderrChunks), truncated: stdoutTruncated });
     });
 
     // The child may exit before reading stdin; swallow the async EPIPE so it
@@ -1702,7 +1702,9 @@ async function workAgent(req, flags) {
           return job.complete({ output: result.stdout, exitCode: 0, agent: profile.name, truncated: Boolean(result.truncated) });
         }
         const retries = Math.max(0, (Number(job.retries) || 1) - 1);
-        const detail = result.error || (result.stderr || '').trim() || `exit code ${result.exitCode}`;
+        const detail = result.error
+          || (result.stderr || '').trim()
+          || (result.signal ? `terminated by signal ${result.signal}` : `exit code ${result.exitCode}`);
         logger.warn(`[${jobType}] job ${job.jobKey} failed (${detail}); retries left ${retries}`);
         return job.fail({
           errorMessage: `agent "${profile.name}" failed: ${detail}`.slice(0, 2000),

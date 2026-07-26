@@ -1383,16 +1383,20 @@ async function hireWorker(req, flags) {
   let model = flags?.model !== undefined ? String(flags.model) : undefined;
   let capabilities = flags?.capabilities !== undefined ? flags.capabilities : undefined;
 
-  const needsPrompt = !name || !rank || !command || model === undefined || capabilities === undefined;
+  const missingRequired = !name || !rank || !command;
+  const missingOptional = model === undefined || capabilities === undefined;
   const interactive = process.stdin.isTTY && process.stdout.isTTY;
 
-  if (needsPrompt && !interactive) {
-    logger.error('Non-interactive: provide --name, --rank, --command, --model and --capabilities.');
+  // Non-interactively only name/rank/command are required; model and
+  // capabilities are optional (they default to empty), matching how the
+  // interactive prompts label them.
+  if (missingRequired && !interactive) {
+    logger.error('Non-interactive: provide at least --name, --rank and --command.');
     logger.info('Example: c8ctl nano hire --name reviewer --rank senior --command copilot --model gpt-5 --capabilities code-review,testing');
     process.exit(1);
   }
 
-  if (needsPrompt) {
+  if (interactive && (missingRequired || missingOptional)) {
     const rl = createInterface({ input: process.stdin, output: process.stdout });
     try {
       console.log('Hire a CLI agent worker. Press Ctrl-C to cancel.');
@@ -1422,6 +1426,10 @@ async function hireWorker(req, flags) {
       rl.close();
     }
   }
+
+  // Optional fields default to empty when omitted (e.g. scripted invocations).
+  if (model === undefined) model = '';
+  if (capabilities === undefined) capabilities = '';
 
   if (!isValidProfileName(name)) {
     logger.error(`Invalid profile name "${name}". Use letters, digits, dot, dash or underscore.`);
@@ -1499,7 +1507,11 @@ function runAgentJob(profile, job, timeoutMs) {
 
     let stdout = '';
     let stderr = '';
+    let stdoutTruncated = false;
     let settled = false;
+    // Bound captured output so a noisy/runaway harness can't grow memory
+    // without limit and crash the worker.
+    const MAX_CAPTURE_BYTES = 1_048_576; // 1 MiB per stream
     const finish = (result) => {
       if (settled) return;
       settled = true;
@@ -1516,14 +1528,25 @@ function runAgentJob(profile, job, timeoutMs) {
         }, timeoutMs)
       : null;
 
-    child.stdout.on('data', (d) => { stdout += d.toString(); });
-    child.stderr.on('data', (d) => { stderr += d.toString(); });
+    child.stdout.on('data', (d) => {
+      if (stdout.length >= MAX_CAPTURE_BYTES) { stdoutTruncated = true; return; }
+      stdout += d.toString();
+      if (stdout.length > MAX_CAPTURE_BYTES) {
+        stdout = stdout.slice(0, MAX_CAPTURE_BYTES);
+        stdoutTruncated = true;
+      }
+    });
+    child.stderr.on('data', (d) => {
+      if (stderr.length >= MAX_CAPTURE_BYTES) return;
+      stderr += d.toString();
+      if (stderr.length > MAX_CAPTURE_BYTES) stderr = stderr.slice(0, MAX_CAPTURE_BYTES);
+    });
 
     child.on('error', (err) => {
-      finish({ ok: false, exitCode: null, stdout, stderr, error: err.message });
+      finish({ ok: false, exitCode: null, stdout, stderr, error: err.message, truncated: stdoutTruncated });
     });
     child.on('close', (code) => {
-      finish({ ok: code === 0, exitCode: code, stdout, stderr });
+      finish({ ok: code === 0, exitCode: code, stdout, stderr, truncated: stdoutTruncated });
     });
 
     // The child may exit before reading stdin; swallow the async EPIPE so it
@@ -1594,8 +1617,8 @@ async function workAgent(req, flags) {
         logger.info(`[${jobType}] job ${job.jobKey} (instance ${job.processInstanceKey ?? '-'}) → ${profile.command}`);
         const result = await runAgentJob(profile, job, jobTimeoutMs);
         if (result.ok) {
-          logger.info(`[${jobType}] job ${job.jobKey} complete (exit 0)`);
-          return job.complete({ output: result.stdout, exitCode: 0, agent: profile.name });
+          logger.info(`[${jobType}] job ${job.jobKey} complete (exit 0)${result.truncated ? ' [output truncated]' : ''}`);
+          return job.complete({ output: result.stdout, exitCode: 0, agent: profile.name, truncated: Boolean(result.truncated) });
         }
         const retries = Math.max(0, (Number(job.retries) || 1) - 1);
         const detail = result.error || (result.stderr || '').trim() || `exit code ${result.exitCode}`;

@@ -1489,6 +1489,20 @@ function joinCapped(chunks) {
 }
 
 /**
+ * Kill a spawned child and its whole process tree. With `detached: true` on
+ * POSIX the child leads its own process group, so a negative PID signals every
+ * process in that group (shell wrapper + the actual harness command). Falls
+ * back to a plain child.kill() on Windows or if the group signal fails.
+ */
+function killTree(child) {
+  const pid = child.pid;
+  if (process.platform !== 'win32' && typeof pid === 'number') {
+    try { process.kill(-pid, 'SIGKILL'); return; } catch { /* fall through */ }
+  }
+  try { child.kill('SIGKILL'); } catch { /* already gone */ }
+}
+
+/**
  * Run a single activated job through the profile's CLI command (one-shot):
  * spawn the command fresh, pipe the job as JSON on stdin, capture stdout, and
  * resolve to a job action. Exit 0 → complete with { output, exitCode }; any
@@ -1519,6 +1533,9 @@ function runAgentJob(profile, job, timeoutMs) {
 
     const child = spawn(profile.command, {
       shell: true,
+      // Run the shell in its own process group so the timeout handler can kill
+      // the whole tree (shell + harness), not just the shell wrapper PID.
+      detached: process.platform !== 'win32',
       stdio: ['pipe', 'pipe', 'pipe'],
       env: {
         ...process.env,
@@ -1550,7 +1567,7 @@ function runAgentJob(profile, job, timeoutMs) {
     // never permanently hold a worker slot or leak the process.
     const timer = timeoutMs && timeoutMs > 0
       ? setTimeout(() => {
-          try { child.kill('SIGKILL'); } catch { /* already gone */ }
+          killTree(child);
           finish({ ok: false, exitCode: null, stdout: joinCapped(stdoutChunks), stderr: joinCapped(stderrChunks), error: `timed out after ${timeoutMs}ms`, truncated: stdoutTruncated });
         }, timeoutMs)
       : null;
@@ -1627,7 +1644,7 @@ async function workAgent(req, flags) {
   const jobTimeoutMs = intFlag(flags?.['job-timeout'], 5 * 60_000);
 
   const matrix = jobTypeMatrix(profile.rank, profile.capabilities);
-  const camunda = globalThis.c8ctl.createClient(flags?.profile);
+  const camunda = globalThis.c8ctl.createClient();
 
   logger.info(`Putting "${name}" [${profile.rank}] to work → ${profile.command}`);
   logger.info(`  model: ${profile.model || '(none)'}; capabilities: ${profile.capabilities.join(', ') || '(none)'}`);

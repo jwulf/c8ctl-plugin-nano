@@ -1460,8 +1460,10 @@ async function hireWorker(req, flags) {
  * spawn the command fresh, pipe the job as JSON on stdin, capture stdout, and
  * resolve to a job action. Exit 0 → complete with { output, exitCode }; any
  * other exit (or spawn failure) → fail with a decremented retry count.
+ * A child that outlives `timeoutMs` is killed and reported as a failure so it
+ * never leaks a worker slot.
  */
-function runAgentJob(profile, job) {
+function runAgentJob(profile, job, timeoutMs) {
   return new Promise((resolve) => {
     const variables = job.variables && typeof job.variables === 'object' ? job.variables : {};
     const payload = {
@@ -1497,16 +1499,37 @@ function runAgentJob(profile, job) {
 
     let stdout = '';
     let stderr = '';
+    let settled = false;
+    const finish = (result) => {
+      if (settled) return;
+      settled = true;
+      if (timer) clearTimeout(timer);
+      resolve(result);
+    };
+
+    // Kill (and fail) a child that runs longer than the job's timeout so it can
+    // never permanently hold a worker slot or leak the process.
+    const timer = timeoutMs && timeoutMs > 0
+      ? setTimeout(() => {
+          try { child.kill('SIGKILL'); } catch { /* already gone */ }
+          finish({ ok: false, exitCode: null, stdout, stderr, error: `timed out after ${timeoutMs}ms` });
+        }, timeoutMs)
+      : null;
+
     child.stdout.on('data', (d) => { stdout += d.toString(); });
     child.stderr.on('data', (d) => { stderr += d.toString(); });
 
     child.on('error', (err) => {
-      resolve({ ok: false, exitCode: null, stdout, stderr, error: err.message });
+      finish({ ok: false, exitCode: null, stdout, stderr, error: err.message });
     });
     child.on('close', (code) => {
-      resolve({ ok: code === 0, exitCode: code, stdout, stderr });
+      finish({ ok: code === 0, exitCode: code, stdout, stderr });
     });
 
+    // The child may exit before reading stdin; swallow the async EPIPE so it
+    // doesn't crash the whole worker process (only the `child` close/error
+    // handlers above decide the job outcome).
+    child.stdin.on('error', () => {});
     try {
       child.stdin.write(JSON.stringify(payload));
       child.stdin.end();
@@ -1569,7 +1592,7 @@ async function workAgent(req, flags) {
       jobTimeoutMs,
       jobHandler: async (job) => {
         logger.info(`[${jobType}] job ${job.jobKey} (instance ${job.processInstanceKey ?? '-'}) → ${profile.command}`);
-        const result = await runAgentJob(profile, job);
+        const result = await runAgentJob(profile, job, jobTimeoutMs);
         if (result.ok) {
           logger.info(`[${jobType}] job ${job.jobKey} complete (exit 0)`);
           return job.complete({ output: result.stdout, exitCode: 0, agent: profile.name });

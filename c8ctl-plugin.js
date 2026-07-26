@@ -364,7 +364,7 @@ function launcherEnvMarkers(resolved) {
 // Argument parsing
 // ---------------------------------------------------------------------------
 
-const VALID_SUBCOMMANDS = ['start', 'stop', 'status', 'logs', 'log', 'restart', 'pause', 'resume', 'clean', 'set', 'config', 'update', 'hire', 'recruit'];
+const VALID_SUBCOMMANDS = ['start', 'stop', 'status', 'logs', 'log', 'restart', 'pause', 'resume', 'clean', 'set', 'config', 'update', 'hire', 'work'];
 
 /**
  * Parse positional args + flags into a normalized request.
@@ -1295,10 +1295,10 @@ function showConfig() {
 }
 
 // ---------------------------------------------------------------------------
-// hire / recruit — CLI agent harness workers.
+// hire / work — CLI agent harness workers.
 //
 // A "hire" is a persisted agent profile (name, rank, CLI command, model,
-// capabilities). "recruit <name>" turns that profile into a set of Nano job
+// capabilities). "work <name>" turns that profile into a set of Nano job
 // workers: one per job-type in the rank×capability matrix. When a job is
 // activated, the profile's CLI command is spawned fresh (one-shot), fed the job
 // as JSON on stdin, and its stdout is returned as the job's `output` variable.
@@ -1320,7 +1320,7 @@ function isValidProfileName(name) {
 }
 
 /**
- * The job-type matrix a recruited worker subscribes to, from a profile's rank
+ * The job-type matrix a worker subscribes to, from a profile's rank
  * and sorted capabilities [c1, c2, ...]:
  *   - `rank`                 (rank alone)
  *   - `rank:c1`, `rank:c2`   (rank + a single capability, "spread")
@@ -1372,7 +1372,7 @@ async function hireWorker(req, flags) {
       console.log(`  ${name}  [${p.rank}]  ${p.command}  (model: ${p.model || '-'}; caps: ${(p.capabilities || []).join(', ') || '-'})`);
     }
     console.log('');
-    console.log('Recruit one with: c8ctl nano recruit <name>');
+    console.log('Put one to work with: c8ctl nano work <name>');
     return;
   }
 
@@ -1452,7 +1452,7 @@ async function hireWorker(req, flags) {
   logger.info(`  model: ${profile.model || '(none)'}`);
   logger.info(`  capabilities: ${profile.capabilities.join(', ') || '(none)'}`);
   logger.info(`  job types (${matrix.length}): ${matrix.join('  ')}`);
-  logger.info(`Recruit it with: c8ctl nano recruit ${name}`);
+  logger.info(`Put it to work with: c8ctl nano work ${name}`);
 }
 
 /**
@@ -1517,18 +1517,18 @@ function runAgentJob(profile, job) {
 }
 
 /**
- * recruit — turn a hire profile into live Nano job workers (one per job-type in
+ * work — turn a hire profile into live Nano job workers (one per job-type in
  * the rank×capability matrix) and poll for work in the foreground until Ctrl-C.
  * Uses the c8ctl-provided SDK client (globalThis.c8ctl.createClient()).
  */
-async function recruitWorker(req, flags) {
+async function workAgent(req, flags) {
   const logger = getLogger();
   const name = flags?.name ? String(flags.name).trim() : req.positional[0];
 
   if (!name) {
     const hires = readHires();
     const names = Object.keys(hires).sort();
-    logger.error('Usage: c8ctl nano recruit <profileName>');
+    logger.error('Usage: c8ctl nano work <profileName>');
     if (names.length > 0) logger.info(`Profiles: ${names.join(', ')}`);
     else logger.info('No hires yet. Create one with: c8ctl nano hire');
     process.exit(1);
@@ -1541,7 +1541,7 @@ async function recruitWorker(req, flags) {
   }
 
   if (!globalThis.c8ctl || typeof globalThis.c8ctl.createClient !== 'function') {
-    logger.error('recruit requires the c8ctl runtime (createClient). Run it via the c8ctl CLI.');
+    logger.error('work requires the c8ctl runtime (createClient). Run it via the c8ctl CLI.');
     process.exit(1);
   }
 
@@ -1555,7 +1555,7 @@ async function recruitWorker(req, flags) {
   const matrix = jobTypeMatrix(profile.rank, profile.capabilities);
   const camunda = globalThis.c8ctl.createClient(flags?.profile);
 
-  logger.info(`Recruiting "${name}" [${profile.rank}] → ${profile.command}`);
+  logger.info(`Putting "${name}" [${profile.rank}] to work → ${profile.command}`);
   logger.info(`  model: ${profile.model || '(none)'}; capabilities: ${profile.capabilities.join(', ') || '(none)'}`);
   logger.info(`  listening on ${matrix.length} job type(s): ${matrix.join('  ')}`);
   logger.info(`  max parallel: ${maxParallelJobs}; job timeout: ${jobTimeoutMs}ms`);
@@ -2865,7 +2865,7 @@ export const metadata = {
         { command: 'c8ctl nano hire', description: 'Interactively create a CLI agent worker profile (name, rank, command, model, capabilities)' },
         { command: 'c8ctl nano hire --name reviewer --rank senior --command copilot --model gpt-5 --capabilities code-review,testing', description: 'Create a profile non-interactively' },
         { command: 'c8ctl nano hire --list', description: 'List hired agent profiles' },
-        { command: 'c8ctl nano recruit reviewer', description: 'Spawn Nano job workers for the "reviewer" profile and poll for work' },
+        { command: 'c8ctl nano work reviewer', description: 'Spawn Nano job workers for the "reviewer" profile and poll for work' },
       ],
     },
     processos: {
@@ -2907,14 +2907,14 @@ export const commands = {
       workspace: { type: 'boolean', description: 'clean: also delete the workspace (models + workers)' },
       check: { type: 'boolean', description: 'update: only report whether a new release is available; do not install' },
       binary: { type: 'string', description: 'Path to the nanobpmn server binary' },
-      name: { type: 'string', description: 'hire/recruit: agent profile name (alt to positional arg)' },
+      name: { type: 'string', description: 'hire/work: agent profile name (alt to positional arg)' },
       rank: { type: 'string', description: 'hire: agent rank (principal|senior|junior|decider)' },
       command: { type: 'string', description: 'hire: CLI command that runs the agent harness (e.g. copilot, claude, pi)' },
       model: { type: 'string', description: 'hire: model name passed to the harness (AGENT_MODEL)' },
       capabilities: { type: 'string', description: 'hire: comma-separated capability list' },
       list: { type: 'boolean', description: 'hire: list existing agent profiles instead of creating one' },
-      'max-parallel': { type: 'string', description: 'recruit: max concurrent jobs per worker (default 1)' },
-      'job-timeout': { type: 'string', description: 'recruit: job activation timeout in ms (default 300000)' },
+      'max-parallel': { type: 'string', description: 'work: max concurrent jobs per worker (default 1)' },
+      'job-timeout': { type: 'string', description: 'work: job activation timeout in ms (default 300000)' },
     },
     handler: async (args, flags) => {
       const logger = getLogger();
@@ -2966,8 +2966,8 @@ export const commands = {
           case 'hire':
             await hireWorker(req, flags);
             break;
-          case 'recruit':
-            await recruitWorker(req, flags);
+          case 'work':
+            await workAgent(req, flags);
             break;
         }
       } catch (error) {
@@ -3058,7 +3058,7 @@ function printUsage() {
   console.log('  c8ctl nano config');
   console.log('  c8ctl nano update [--check]');
   console.log('  c8ctl nano hire [--name <n>] [--rank <r>] [--command <c>] [--model <m>] [--capabilities <a,b>] [--list]');
-  console.log('  c8ctl nano recruit <profileName> [--max-parallel <n>] [--job-timeout <ms>]');
+  console.log('  c8ctl nano work <profileName> [--max-parallel <n>] [--job-timeout <ms>]');
   console.log('');
   console.log('Subcommands:');
   console.log('  start    Spawn an N-node local cluster wired to talk to each other on localhost');
@@ -3073,7 +3073,7 @@ function printUsage() {
   console.log('  config   Show current configuration and on-disk locations');
   console.log('  update   Pull the latest published nano release (--check to only report)');
   console.log('  hire     Create a CLI agent worker profile (rank + capabilities → job-type matrix)');
-  console.log('  recruit  Run a hired profile as Nano job workers, polling for work until Ctrl-C');
+  console.log('  work     Run a hired profile as Nano job workers, polling for work until Ctrl-C');
   console.log('');
   console.log('Options:');
   console.log('  <nodes>              Number of nodes to start (default 1)');

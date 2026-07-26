@@ -130,7 +130,7 @@ c8ctl nano set model-dir ~/bpmn-workspace
 This creates `~/bpmn-workspace/models/` and `~/bpmn-workspace/workers/`. Restart a
 running cluster for a workspace change to take effect.
 
-## CLI agent workers: `hire` / `recruit`
+## CLI agent workers: `hire` / `work`
 
 Beyond BPMN service-task workers (code in the workspace `workers/` dir), the
 plugin can turn an interactive **CLI agent harness** (Copilot CLI, Claude CLI,
@@ -152,7 +152,7 @@ c8ctl nano hire --name reviewer --rank senior --command copilot \
 c8ctl nano hire --list
 ```
 
-**`recruit <name>`** loads the profile, connects with the c8ctl SDK client, and
+**`work <name>`** loads the profile, connects with the c8ctl SDK client, and
 registers one job worker per token in the **rank × capability matrix**, then
 polls for work in the foreground until Ctrl-C. For rank `senior` and
 capabilities `code-review, testing` the matrix is:
@@ -168,8 +168,8 @@ so a BPMN service task can target a worker at any granularity by setting its job
 type to the matching token.
 
 ```bash
-c8ctl nano recruit reviewer                     # poll for work until Ctrl-C
-c8ctl nano recruit reviewer --max-parallel 2 --job-timeout 600000
+c8ctl nano work reviewer                     # poll for work until Ctrl-C
+c8ctl nano work reviewer --max-parallel 2 --job-timeout 600000
 ```
 
 Each activated job runs the profile's command **once** (one-shot): the job is

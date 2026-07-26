@@ -176,8 +176,8 @@ Each activated job runs the profile's command **once** (one-shot): the job is
 serialized to JSON and piped to the CLI's **stdin** —
 
 ```json
-{ "jobKey": "…", "jobType": "senior:code-review", "processInstanceKey": "…",
-  "prompt": "<variables.prompt ?? variables.task>", "variables": { … },
+{ "jobKey": "...", "jobType": "senior:code-review", "processInstanceKey": "...",
+  "prompt": "<variables.prompt ?? variables.task>", "variables": {},
   "profile": { "name": "reviewer", "rank": "senior", "model": "gpt-5",
                "capabilities": ["code-review", "testing"] } }
 ```

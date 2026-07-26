@@ -197,6 +197,67 @@ config`).
 > and `AGENT_*` env vars, never interpolated into the command line, so process
 > variables cannot inject shell commands.
 
+### Task envelope, sandboxes & disk hygiene
+
+For **agentic** jobs (an agent that clones a repo, works a task, pushes a
+branch) the job carries a structured **task envelope** under the reserved
+`io.nanobpm.agentTask` namespace. It is assembled from the job's static
+`customHeaders` (model-authored defaults) deep-merged with per-instance
+`variables` (**overrides win**), then normalized to schema v1 and included in the
+stdin payload as `task`:
+
+```jsonc
+{
+  "io.nanobpm.agentTask.repository.url": "https://github.com/o/r.git", // header
+  "io.nanobpm.agentTask.repository.ref": "main",
+  "io.nanobpm.agentTask.branch.push":    "true",
+  "io.nanobpm.agentTask.task.allowPr":   "false"
+}
+```
+
+Element templates emit flat dotpath header keys (strings); the plugin expands
+them into a nested object and coerces `"true"/"false"` → bool and numeric
+strings → int. The normalized shape is
+`{ schemaVersion, repository{provider,url,ref,depth,submodules,authRef}, branch{base,create,push}, setup{commands,env,secretRefs}, task{prompt,promptFile,maxIterations,timeoutMs,allowPr,prBase} }`.
+On completion the plugin writes an **output envelope** back under
+`io.nanobpm.agentResult` (`{status, sandbox, image, output, exitCode, signal, truncated, error}`).
+
+**Sandbox.** By default the command runs on the host (`--sandbox none`). Pass
+`--sandbox docker` (or `podman`) with an `--image` to run **each job in a
+throwaway container** instead:
+
+```bash
+c8ctl nano hire --name coder --rank senior --command "agent-harness" \
+  --sandbox docker --image ghcr.io/acme/agent:1
+c8ctl nano work coder                 # uses the profile's sandbox/image
+c8ctl nano work coder --sandbox docker --image ghcr.io/acme/agent:1   # or override
+```
+
+Containers are labelled (`nano.managed=1`, `nano.worker`, `nano.jobKey`,
+`nano.run=<uuid>`), log-capped (`max-size=10m max-file=3`), run with `--rm`, and
+a run that outlives `--job-timeout` is force-removed. The envelope is piped on
+the container's stdin exactly as on the host.
+
+**Secrets.** Secrets are referenced by **name**, never value. `setup.secretRefs`
+(and the repo/PR credential when `task.allowPr` is set — defaulting to
+`GITHUB_TOKEN` for GitHub) are resolved via a pluggable `--secret-resolver`
+(only `host`, reading `process.env`, is implemented) and forwarded into the
+container by name (`-e NAME`) so values never appear in argv or `docker inspect`.
+A missing required secret fails the job with a clear provisioning message.
+
+**Disk hygiene.** Container sandboxes get automatic cleanup so leaked
+containers can't fill the disk: a **label-scoped** reaper runs at worker startup
+and on an interval (`--reap-interval`, default 5m), removing finished/`exited`
+containers older than `--reap-age` (default 1h) while **skipping any run still
+in flight** — it never touches containers it didn't create and never
+`system prune`s. A **disk-budget admission shed** fails (retryable) new jobs when
+the engine data root has less than `--min-free-mb` free (default 1024).
+
+> Git provisioning (clone/branch/push), agent-opened PRs, and the
+> Vercel/Sandcastle provider are **increment 2** — the envelope names above are
+> frozen so the [nano-ide element-template pack](https://github.com/jwulf/nano-ide/issues/37)
+> can be built against this contract.
+
 ## Cleaning up disk
 
 ```bash

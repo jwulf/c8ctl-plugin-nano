@@ -27,7 +27,7 @@
   ],
   "scripts": {
     "lint": "node --check c8ctl-plugin.js",
-    "test": "node --check c8ctl-plugin.js"
+    "test": "node --check c8ctl-plugin.js && node --test"
   },
   "license": "MIT",
   "engines": {

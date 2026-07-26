@@ -1366,21 +1366,22 @@ async function hireWorker(req, flags) {
       logger.info('No hires yet. Create one with: c8ctl nano hire');
       return;
     }
-    console.log('Hired agent profiles:');
+    logger.info('Hired agent profiles:');
     for (const name of names.sort()) {
       const p = hires[name];
-      console.log(`  ${name}  [${p.rank}]  ${p.command}  (model: ${p.model || '-'}; caps: ${(p.capabilities || []).join(', ') || '-'})`);
+      logger.info(`  ${name}  [${p.rank}]  ${p.command}  (model: ${p.model || '-'}; caps: ${(p.capabilities || []).join(', ') || '-'})`);
     }
-    console.log('');
-    console.log('Put one to work with: c8ctl nano work <name>');
+    logger.info('');
+    logger.info('Put one to work with: c8ctl nano work <name>');
     return;
   }
 
-  // Seed from flags; prompt for anything still missing.
+  // Seed from flags; prompt for anything still missing. Trim string flags so a
+  // stray space can't be persisted into config.json or the spawned command.
   let name = flags?.name ? String(flags.name).trim() : req.positional[0];
   let rank = flags?.rank ? String(flags.rank).trim().toLowerCase() : undefined;
-  let command = flags?.command ? String(flags.command) : undefined;
-  let model = flags?.model !== undefined ? String(flags.model) : undefined;
+  let command = flags?.command !== undefined ? String(flags.command).trim() : undefined;
+  let model = flags?.model !== undefined ? String(flags.model).trim() : undefined;
   let capabilities = flags?.capabilities !== undefined ? flags.capabilities : undefined;
 
   const missingRequired = !name || !rank || !command;
@@ -1464,6 +1465,30 @@ async function hireWorker(req, flags) {
 }
 
 /**
+ * Concatenate captured Buffer chunks into a UTF-8 string, dropping a trailing
+ * incomplete multibyte sequence (which the byte cap may have split) so decoding
+ * never emits a replacement char or pushes the string over the byte cap.
+ */
+function joinCapped(chunks) {
+  if (!chunks.length) return '';
+  let buf = Buffer.concat(chunks);
+  let i = buf.length - 1;
+  let cont = 0;
+  while (i >= 0 && (buf[i] & 0xc0) === 0x80 && cont < 3) { i -= 1; cont += 1; }
+  if (i >= 0) {
+    const lead = buf[i];
+    let needed;
+    if ((lead & 0x80) === 0x00) needed = 0;
+    else if ((lead & 0xe0) === 0xc0) needed = 1;
+    else if ((lead & 0xf0) === 0xe0) needed = 2;
+    else if ((lead & 0xf8) === 0xf0) needed = 3;
+    else needed = -1;
+    if (needed > 0 && cont < needed) buf = buf.subarray(0, i);
+  }
+  return buf.toString('utf8');
+}
+
+/**
  * Run a single activated job through the profile's CLI command (one-shot):
  * spawn the command fresh, pipe the job as JSON on stdin, capture stdout, and
  * resolve to a job action. Exit 0 → complete with { output, exitCode }; any
@@ -1505,12 +1530,14 @@ function runAgentJob(profile, job, timeoutMs) {
       },
     });
 
-    let stdout = '';
-    let stderr = '';
+    const stdoutChunks = [];
+    const stderrChunks = [];
+    let stdoutBytes = 0;
+    let stderrBytes = 0;
     let stdoutTruncated = false;
     let settled = false;
-    // Bound captured output so a noisy/runaway harness can't grow memory
-    // without limit and crash the worker.
+    // Bound captured output (by BYTES, not string length) so a noisy/runaway
+    // harness can't grow memory without limit and crash the worker.
     const MAX_CAPTURE_BYTES = 1_048_576; // 1 MiB per stream
     const finish = (result) => {
       if (settled) return;
@@ -1524,29 +1551,30 @@ function runAgentJob(profile, job, timeoutMs) {
     const timer = timeoutMs && timeoutMs > 0
       ? setTimeout(() => {
           try { child.kill('SIGKILL'); } catch { /* already gone */ }
-          finish({ ok: false, exitCode: null, stdout, stderr, error: `timed out after ${timeoutMs}ms` });
+          finish({ ok: false, exitCode: null, stdout: joinCapped(stdoutChunks), stderr: joinCapped(stderrChunks), error: `timed out after ${timeoutMs}ms`, truncated: stdoutTruncated });
         }, timeoutMs)
       : null;
 
     child.stdout.on('data', (d) => {
-      if (stdout.length >= MAX_CAPTURE_BYTES) { stdoutTruncated = true; return; }
-      stdout += d.toString();
-      if (stdout.length > MAX_CAPTURE_BYTES) {
-        stdout = stdout.slice(0, MAX_CAPTURE_BYTES);
-        stdoutTruncated = true;
-      }
+      const buf = Buffer.isBuffer(d) ? d : Buffer.from(d);
+      const remaining = MAX_CAPTURE_BYTES - stdoutBytes;
+      if (remaining <= 0) { stdoutTruncated = true; return; }
+      if (buf.length > remaining) { stdoutChunks.push(buf.subarray(0, remaining)); stdoutBytes = MAX_CAPTURE_BYTES; stdoutTruncated = true; }
+      else { stdoutChunks.push(buf); stdoutBytes += buf.length; }
     });
     child.stderr.on('data', (d) => {
-      if (stderr.length >= MAX_CAPTURE_BYTES) return;
-      stderr += d.toString();
-      if (stderr.length > MAX_CAPTURE_BYTES) stderr = stderr.slice(0, MAX_CAPTURE_BYTES);
+      const buf = Buffer.isBuffer(d) ? d : Buffer.from(d);
+      const remaining = MAX_CAPTURE_BYTES - stderrBytes;
+      if (remaining <= 0) return;
+      if (buf.length > remaining) { stderrChunks.push(buf.subarray(0, remaining)); stderrBytes = MAX_CAPTURE_BYTES; }
+      else { stderrChunks.push(buf); stderrBytes += buf.length; }
     });
 
     child.on('error', (err) => {
-      finish({ ok: false, exitCode: null, stdout, stderr, error: err.message, truncated: stdoutTruncated });
+      finish({ ok: false, exitCode: null, stdout: joinCapped(stdoutChunks), stderr: joinCapped(stderrChunks), error: err.message, truncated: stdoutTruncated });
     });
     child.on('close', (code) => {
-      finish({ ok: code === 0, exitCode: code, stdout, stderr, truncated: stdoutTruncated });
+      finish({ ok: code === 0, exitCode: code, stdout: joinCapped(stdoutChunks), stderr: joinCapped(stderrChunks), truncated: stdoutTruncated });
     });
 
     // The child may exit before reading stdin; swallow the async EPIPE so it
@@ -1639,11 +1667,17 @@ async function workAgent(req, flags) {
       stopping = true;
       logger.info(`Received ${signal} — stopping ${workers.length} worker(s)...`);
       await Promise.all(
-        workers.map((w) =>
-          typeof w.stopGracefully === 'function'
-            ? w.stopGracefully({ waitUpToMs: STOP_GRACE_MS }).catch(() => {})
-            : Promise.resolve(w.stop && w.stop()),
-        ),
+        workers.map(async (w) => {
+          try {
+            if (typeof w.stopGracefully === 'function') {
+              await w.stopGracefully({ waitUpToMs: STOP_GRACE_MS });
+            } else if (typeof w.stop === 'function') {
+              await w.stop();
+            }
+          } catch {
+            // best-effort: never let one worker's stop failure hang shutdown
+          }
+        }),
       );
       logger.info('All workers stopped.');
       resolve();

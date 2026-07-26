@@ -1582,6 +1582,7 @@ function runAgentJob(profile, job, timeoutMs) {
     let stdoutBytes = 0;
     let stderrBytes = 0;
     let stdoutTruncated = false;
+    let stderrTruncated = false;
     let settled = false;
     // Bound captured output (by BYTES, not string length) so a noisy/runaway
     // harness can't grow memory without limit and crash the worker.
@@ -1598,7 +1599,7 @@ function runAgentJob(profile, job, timeoutMs) {
     const timer = timeoutMs && timeoutMs > 0
       ? setTimeout(() => {
           killTree(child);
-          finish({ ok: false, exitCode: null, stdout: joinCapped(stdoutChunks), stderr: joinCapped(stderrChunks), error: `timed out after ${timeoutMs}ms`, truncated: stdoutTruncated });
+          finish({ ok: false, exitCode: null, stdout: joinCapped(stdoutChunks), stderr: joinCapped(stderrChunks), error: `timed out after ${timeoutMs}ms`, truncated: stdoutTruncated, stderrTruncated });
         }, timeoutMs)
       : null;
 
@@ -1612,16 +1613,16 @@ function runAgentJob(profile, job, timeoutMs) {
     child.stderr.on('data', (d) => {
       const buf = Buffer.isBuffer(d) ? d : Buffer.from(d);
       const remaining = MAX_CAPTURE_BYTES - stderrBytes;
-      if (remaining <= 0) return;
-      if (buf.length > remaining) { stderrChunks.push(buf.subarray(0, remaining)); stderrBytes = MAX_CAPTURE_BYTES; }
+      if (remaining <= 0) { stderrTruncated = true; return; }
+      if (buf.length > remaining) { stderrChunks.push(buf.subarray(0, remaining)); stderrBytes = MAX_CAPTURE_BYTES; stderrTruncated = true; }
       else { stderrChunks.push(buf); stderrBytes += buf.length; }
     });
 
     child.on('error', (err) => {
-      finish({ ok: false, exitCode: null, stdout: joinCapped(stdoutChunks), stderr: joinCapped(stderrChunks), error: err.message, truncated: stdoutTruncated });
+      finish({ ok: false, exitCode: null, stdout: joinCapped(stdoutChunks), stderr: joinCapped(stderrChunks), error: err.message, truncated: stdoutTruncated, stderrTruncated });
     });
     child.on('close', (code, signal) => {
-      finish({ ok: code === 0, exitCode: code, signal: signal ?? null, stdout: joinCapped(stdoutChunks), stderr: joinCapped(stderrChunks), truncated: stdoutTruncated });
+      finish({ ok: code === 0, exitCode: code, signal: signal ?? null, stdout: joinCapped(stdoutChunks), stderr: joinCapped(stderrChunks), truncated: stdoutTruncated, stderrTruncated });
     });
 
     // The child may exit before reading stdin; swallow the async EPIPE so it
@@ -1703,7 +1704,7 @@ async function workAgent(req, flags) {
         }
         const retries = Math.max(0, (Number(job.retries) || 1) - 1);
         const detail = result.error
-          || (result.stderr || '').trim()
+          || (result.stderr || '').trim() + (result.stderrTruncated && (result.stderr || '').trim() ? ' [stderr truncated]' : '')
           || (result.signal ? `terminated by signal ${result.signal}` : `exit code ${result.exitCode}`);
         logger.warn(`[${jobType}] job ${job.jobKey} failed (${detail}); retries left ${retries}`);
         return job.fail({
@@ -1721,6 +1722,7 @@ async function workAgent(req, flags) {
       if (stopping) return;
       stopping = true;
       logger.info(`Received ${signal} — stopping ${workers.length} worker(s)...`);
+      let stopFailures = 0;
       await Promise.all(
         workers.map(async (w) => {
           try {
@@ -1731,10 +1733,15 @@ async function workAgent(req, flags) {
             }
           } catch {
             // best-effort: never let one worker's stop failure hang shutdown
+            stopFailures += 1;
           }
         }),
       );
-      logger.info('All workers stopped.');
+      if (stopFailures > 0) {
+        logger.warn(`${stopFailures} of ${workers.length} worker(s) did not stop cleanly; some connections may still be open.`);
+      } else {
+        logger.info('All workers stopped.');
+      }
       resolve();
     };
     process.once('SIGINT', () => { stop('SIGINT'); });

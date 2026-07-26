@@ -6,7 +6,7 @@ Implementation contract for coding agents working on this plugin.
 
 A [c8ctl](https://github.com/camunda/c8ctl) plugin that manages a local
 [nanobpmn](https://github.com/jwulf/nano-bpm) cluster via a single `nano`
-command (`start|status|stop|logs|restart`).
+command (includes `start|status|stop|logs|restart|hire|work`).
 
 ## Plugin contract
 
@@ -20,9 +20,13 @@ command (`start|status|stop|logs|restart`).
 
 ## Runtime APIs
 
-At runtime c8ctl injects `globalThis.c8ctl`. This plugin only uses
-`globalThis.c8ctl.getLogger()` (output-mode aware). Always go through the local
-`getLogger()` helper, which falls back to `console` when run outside c8ctl.
+At runtime c8ctl injects `globalThis.c8ctl`. This plugin uses
+`globalThis.c8ctl.getLogger()` (output-mode aware) for all output — always go
+through the local `getLogger()` helper, which falls back to `console` when run
+outside c8ctl. The `work` command additionally uses
+`globalThis.c8ctl.createClient()` to obtain the bundled `@camunda8/orchestration-cluster-api`
+SDK client (job workers) — do **not** add the SDK as a dependency or use raw
+`fetch`; the client comes from the host runtime.
 
 ## How a cluster is modelled
 

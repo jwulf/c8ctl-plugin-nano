@@ -45,6 +45,7 @@ import { homedir, platform as osPlatform } from 'node:os';
 import { join, isAbsolute, resolve as resolvePath, dirname, sep } from 'node:path';
 import { createRequire } from 'node:module';
 import { fileURLToPath } from 'node:url';
+import { createInterface } from 'node:readline/promises';
 import { platformForHost } from './platforms.mjs';
 
 const requireFromHere = createRequire(import.meta.url);
@@ -363,7 +364,7 @@ function launcherEnvMarkers(resolved) {
 // Argument parsing
 // ---------------------------------------------------------------------------
 
-const VALID_SUBCOMMANDS = ['start', 'stop', 'status', 'logs', 'log', 'restart', 'pause', 'resume', 'clean', 'set', 'config', 'update'];
+const VALID_SUBCOMMANDS = ['start', 'stop', 'status', 'logs', 'log', 'restart', 'pause', 'resume', 'clean', 'set', 'config', 'update', 'hire', 'work'];
 
 /**
  * Parse positional args + flags into a normalized request.
@@ -1291,6 +1292,461 @@ function showConfig() {
   console.log(`  config file  ${getConfigFile()}`);
   console.log('');
   console.log('  Change with: c8ctl nano set bin <path> | c8ctl nano set model-dir <path>');
+}
+
+// ---------------------------------------------------------------------------
+// hire / work — CLI agent harness workers.
+//
+// A "hire" is a persisted agent profile (name, rank, CLI command, model,
+// capabilities). "work <name>" turns that profile into a set of Nano job
+// workers: one per job-type in the rank×capability matrix. When a job is
+// activated, the profile's CLI command is spawned fresh (one-shot), fed the job
+// as JSON on stdin, and its stdout is returned as the job's `output` variable.
+// ---------------------------------------------------------------------------
+
+const RANKS = ['principal', 'senior', 'junior', 'decider'];
+
+/** Normalize a capability list: trim, drop empties, de-dupe, sort (canonical). */
+function normalizeCapabilities(input) {
+  const raw = Array.isArray(input)
+    ? input
+    : String(input || '').split(',');
+  return [...new Set(raw.map((c) => String(c).trim().toLowerCase()).filter(Boolean))].sort();
+}
+
+/** A profile name must be a safe, filesystem/token-friendly slug. */
+function isValidProfileName(name) {
+  return typeof name === 'string' && /^[a-z0-9][a-z0-9._-]*$/i.test(name);
+}
+
+/**
+ * The job-type matrix a worker subscribes to, from a profile's rank
+ * and sorted capabilities [c1, c2, ...]:
+ *   - `rank`                 (rank alone)
+ *   - `rank:c1`, `rank:c2`   (rank + a single capability, "spread")
+ *   - `rank:c1+c2+...`       (rank + all capabilities combined; only when >1 cap)
+ * Delimiters: `:` separates rank from capabilities, `+` joins combined caps.
+ * Capabilities are sorted so the combined token is canonical/predictable.
+ */
+function jobTypeMatrix(rank, capabilities) {
+  const caps = normalizeCapabilities(capabilities);
+  const tokens = [rank];
+  for (const c of caps) tokens.push(`${rank}:${c}`);
+  if (caps.length > 1) tokens.push(`${rank}:${caps.join('+')}`);
+  return [...new Set(tokens)];
+}
+
+/** All persisted hire profiles, keyed by name. */
+function readHires() {
+  const cfg = readConfig();
+  // A JSON array is `typeof === 'object'` but drops string-keyed writes on
+  // JSON.stringify, so treat only plain objects as a valid hires map.
+  return cfg.hires && typeof cfg.hires === 'object' && !Array.isArray(cfg.hires) ? cfg.hires : {};
+}
+
+/** Persist a single hire profile into config.json under `hires`. */
+function writeHire(profile) {
+  const cfg = readConfig();
+  if (!cfg.hires || typeof cfg.hires !== 'object' || Array.isArray(cfg.hires)) cfg.hires = {};
+  cfg.hires[profile.name] = profile;
+  writeConfig(cfg);
+}
+
+/**
+ * Validate and normalize a stored profile before use so a hand-edited or
+ * version-skewed config.json can't produce undefined job types or an invalid
+ * spawn. Returns the normalized profile, or a { error } describing the problem.
+ */
+function normalizeStoredProfile(name, profile) {
+  if (!profile || typeof profile !== 'object' || Array.isArray(profile)) {
+    return { error: `profile "${name}" is not an object` };
+  }
+  const rank = String(profile.rank || '').trim().toLowerCase();
+  if (!RANKS.includes(rank)) {
+    return { error: `profile "${name}" has an invalid rank "${profile.rank}" (expected one of: ${RANKS.join(', ')})` };
+  }
+  const command = String(profile.command || '').trim();
+  if (!command) {
+    return { error: `profile "${name}" has no command to run` };
+  }
+  return {
+    profile: {
+      name,
+      rank,
+      command,
+      model: typeof profile.model === 'string' ? profile.model.trim() : '',
+      capabilities: normalizeCapabilities(profile.capabilities),
+    },
+  };
+}
+
+/**
+ * hire — create (or overwrite) an agent profile. Interactive by default; every
+ * field can also be supplied via a flag (--name/--rank/--command/--model/
+ * --capabilities) for scripting. Prompts only for the fields still missing.
+ * `--list` prints existing profiles instead.
+ */
+async function hireWorker(req, flags) {
+  const logger = getLogger();
+
+  if (flags?.list) {
+    const hires = readHires();
+    const names = Object.keys(hires);
+    if (names.length === 0) {
+      logger.info('No hires yet. Create one with: c8ctl nano hire');
+      return;
+    }
+    logger.info('Hired agent profiles:');
+    for (const name of names.sort()) {
+      const p = hires[name];
+      logger.info(`  ${name}  [${p.rank}]  ${p.command}  (model: ${p.model || '-'}; caps: ${normalizeCapabilities(p.capabilities).join(', ') || '-'})`);
+    }
+    logger.info('');
+    logger.info('Put one to work with: c8ctl nano work <name>');
+    return;
+  }
+
+  // Seed from flags; prompt for anything still missing. Trim string flags so a
+  // stray space can't be persisted into config.json or the spawned command.
+  let name = flags?.name ? String(flags.name).trim() : req.positional[0];
+  let rank = flags?.rank ? String(flags.rank).trim().toLowerCase() : undefined;
+  let command = flags?.command !== undefined ? String(flags.command).trim() : undefined;
+  let model = flags?.model !== undefined ? String(flags.model).trim() : undefined;
+  let capabilities = flags?.capabilities !== undefined ? flags.capabilities : undefined;
+
+  const missingRequired = !name || !rank || !command;
+  const missingOptional = model === undefined || capabilities === undefined;
+  const interactive = process.stdin.isTTY && process.stdout.isTTY;
+
+  // Non-interactively only name/rank/command are required; model and
+  // capabilities are optional (they default to empty), matching how the
+  // interactive prompts label them.
+  if (missingRequired && !interactive) {
+    logger.error('Non-interactive: provide at least --name, --rank and --command.');
+    logger.info('Example: c8ctl nano hire --name reviewer --rank senior --command copilot --model gpt-5 --capabilities code-review,testing');
+    process.exit(1);
+  }
+
+  if (interactive && (missingRequired || missingOptional)) {
+    const rl = createInterface({ input: process.stdin, output: process.stdout });
+    try {
+      console.log('Hire a CLI agent worker. Press Ctrl-C to cancel.');
+      console.log('');
+      while (!name) {
+        const ans = (await rl.question('Profile name: ')).trim();
+        if (isValidProfileName(ans)) { name = ans; break; }
+        console.log('  Please use letters, digits, dot, dash or underscore.');
+      }
+      while (!rank) {
+        const ans = (await rl.question(`Rank (${RANKS.join('|')}): `)).trim().toLowerCase();
+        if (RANKS.includes(ans)) { rank = ans; break; }
+        console.log(`  Rank must be one of: ${RANKS.join(', ')}`);
+      }
+      while (!command) {
+        const ans = (await rl.question('CLI command (e.g. copilot, claude, pi): ')).trim();
+        if (ans) { command = ans; break; }
+        console.log('  A command is required.');
+      }
+      if (model === undefined) {
+        model = (await rl.question('Model name (optional): ')).trim();
+      }
+      if (capabilities === undefined) {
+        capabilities = (await rl.question('Capabilities (comma-separated, optional): ')).trim();
+      }
+    } finally {
+      rl.close();
+    }
+  }
+
+  // Optional fields default to empty when omitted (e.g. scripted invocations).
+  if (model === undefined) model = '';
+  if (capabilities === undefined) capabilities = '';
+
+  if (!isValidProfileName(name)) {
+    logger.error(`Invalid profile name "${name}". Use letters, digits, dot, dash or underscore.`);
+    process.exit(1);
+  }
+  if (!RANKS.includes(rank)) {
+    logger.error(`Invalid rank "${rank}". Must be one of: ${RANKS.join(', ')}`);
+    process.exit(1);
+  }
+  if (!command) {
+    logger.error('A CLI command is required.');
+    process.exit(1);
+  }
+
+  const existed = Boolean(readHires()[name]);
+  const profile = {
+    name,
+    rank,
+    command,
+    model: model || '',
+    capabilities: normalizeCapabilities(capabilities),
+    createdAt: new Date().toISOString(),
+  };
+  writeHire(profile);
+
+  const matrix = jobTypeMatrix(profile.rank, profile.capabilities);
+  logger.info(`${existed ? 'Updated' : 'Hired'} "${name}" [${profile.rank}] → ${profile.command}`);
+  logger.info(`  model: ${profile.model || '(none)'}`);
+  logger.info(`  capabilities: ${profile.capabilities.join(', ') || '(none)'}`);
+  logger.info(`  job types (${matrix.length}): ${matrix.join('  ')}`);
+  logger.info(`Put it to work with: c8ctl nano work ${name}`);
+}
+
+/**
+ * Concatenate captured Buffer chunks into a UTF-8 string, dropping a trailing
+ * incomplete multibyte sequence (which the byte cap may have split) so decoding
+ * never emits a replacement char or pushes the string over the byte cap.
+ */
+function joinCapped(chunks) {
+  if (!chunks.length) return '';
+  let buf = Buffer.concat(chunks);
+  let i = buf.length - 1;
+  let cont = 0;
+  while (i >= 0 && (buf[i] & 0xc0) === 0x80 && cont < 3) { i -= 1; cont += 1; }
+  if (i >= 0) {
+    const lead = buf[i];
+    let needed;
+    if ((lead & 0x80) === 0x00) needed = 0;
+    else if ((lead & 0xe0) === 0xc0) needed = 1;
+    else if ((lead & 0xf0) === 0xe0) needed = 2;
+    else if ((lead & 0xf8) === 0xf0) needed = 3;
+    else needed = -1;
+    if (needed > 0 && cont < needed) buf = buf.subarray(0, i);
+  }
+  return buf.toString('utf8');
+}
+
+/**
+ * Kill a spawned child and its whole process tree. With `detached: true` on
+ * POSIX the child leads its own process group, so a negative PID signals every
+ * process in that group (shell wrapper + the actual harness command). Falls
+ * back to a plain child.kill() on Windows or if the group signal fails.
+ */
+function killTree(child) {
+  const pid = child.pid;
+  if (process.platform !== 'win32' && typeof pid === 'number') {
+    try { process.kill(-pid, 'SIGKILL'); return; } catch { /* fall through */ }
+  }
+  try { child.kill('SIGKILL'); } catch { /* already gone */ }
+}
+
+/**
+ * Run a single activated job through the profile's CLI command (one-shot):
+ * spawn the command fresh, pipe the job as JSON on stdin, capture stdout, and
+ * resolve to a job action. Exit 0 → complete with { output, exitCode }; any
+ * other exit (or spawn failure) → fail with a decremented retry count.
+ * A child that outlives `timeoutMs` is killed and reported as a failure so it
+ * never leaks a worker slot.
+ */
+function runAgentJob(profile, job, timeoutMs) {
+  return new Promise((resolve) => {
+    const variables = job.variables && typeof job.variables === 'object' ? job.variables : {};
+    const payload = {
+      jobKey: job.jobKey,
+      jobType: job.type,
+      processInstanceKey: job.processInstanceKey ?? null,
+      elementInstanceKey: job.elementInstanceKey ?? null,
+      elementId: job.elementId ?? null,
+      bpmnProcessId: job.bpmnProcessId ?? job.processDefinitionId ?? null,
+      prompt: variables.prompt ?? variables.task ?? null,
+      variables,
+      customHeaders: job.customHeaders ?? {},
+      profile: {
+        name: profile.name,
+        rank: profile.rank,
+        model: profile.model,
+        capabilities: profile.capabilities,
+      },
+    };
+
+    const child = spawn(profile.command, {
+      shell: true,
+      // Run the shell in its own process group so the timeout handler can kill
+      // the whole tree (shell + harness), not just the shell wrapper PID.
+      detached: process.platform !== 'win32',
+      stdio: ['pipe', 'pipe', 'pipe'],
+      env: {
+        ...process.env,
+        AGENT_PROFILE: profile.name,
+        AGENT_RANK: profile.rank,
+        AGENT_MODEL: profile.model || '',
+        AGENT_CAPABILITIES: (profile.capabilities || []).join(','),
+        AGENT_JOB_TYPE: String(job.type ?? ''),
+      },
+    });
+
+    const stdoutChunks = [];
+    const stderrChunks = [];
+    let stdoutBytes = 0;
+    let stderrBytes = 0;
+    let stdoutTruncated = false;
+    let stderrTruncated = false;
+    let settled = false;
+    // Bound captured output (by BYTES, not string length) so a noisy/runaway
+    // harness can't grow memory without limit and crash the worker.
+    const MAX_CAPTURE_BYTES = 1_048_576; // 1 MiB per stream
+    const finish = (result) => {
+      if (settled) return;
+      settled = true;
+      if (timer) clearTimeout(timer);
+      resolve(result);
+    };
+
+    // Kill (and fail) a child that runs longer than the job's timeout so it can
+    // never permanently hold a worker slot or leak the process.
+    const timer = timeoutMs && timeoutMs > 0
+      ? setTimeout(() => {
+          killTree(child);
+          finish({ ok: false, exitCode: null, stdout: joinCapped(stdoutChunks), stderr: joinCapped(stderrChunks), error: `timed out after ${timeoutMs}ms`, truncated: stdoutTruncated, stderrTruncated });
+        }, timeoutMs)
+      : null;
+
+    child.stdout.on('data', (d) => {
+      const buf = Buffer.isBuffer(d) ? d : Buffer.from(d);
+      const remaining = MAX_CAPTURE_BYTES - stdoutBytes;
+      if (remaining <= 0) { stdoutTruncated = true; return; }
+      if (buf.length > remaining) { stdoutChunks.push(buf.subarray(0, remaining)); stdoutBytes = MAX_CAPTURE_BYTES; stdoutTruncated = true; }
+      else { stdoutChunks.push(buf); stdoutBytes += buf.length; }
+    });
+    child.stderr.on('data', (d) => {
+      const buf = Buffer.isBuffer(d) ? d : Buffer.from(d);
+      const remaining = MAX_CAPTURE_BYTES - stderrBytes;
+      if (remaining <= 0) { stderrTruncated = true; return; }
+      if (buf.length > remaining) { stderrChunks.push(buf.subarray(0, remaining)); stderrBytes = MAX_CAPTURE_BYTES; stderrTruncated = true; }
+      else { stderrChunks.push(buf); stderrBytes += buf.length; }
+    });
+
+    child.on('error', (err) => {
+      finish({ ok: false, exitCode: null, stdout: joinCapped(stdoutChunks), stderr: joinCapped(stderrChunks), error: err.message, truncated: stdoutTruncated, stderrTruncated });
+    });
+    child.on('close', (code, signal) => {
+      finish({ ok: code === 0, exitCode: code, signal: signal ?? null, stdout: joinCapped(stdoutChunks), stderr: joinCapped(stderrChunks), truncated: stdoutTruncated, stderrTruncated });
+    });
+
+    // The child may exit before reading stdin; swallow the async EPIPE so it
+    // doesn't crash the whole worker process (only the `child` close/error
+    // handlers above decide the job outcome).
+    child.stdin.on('error', () => {});
+    try {
+      child.stdin.write(JSON.stringify(payload));
+      child.stdin.end();
+    } catch {
+      // 'error' handler above resolves the promise on spawn failure.
+    }
+  });
+}
+
+/**
+ * work — turn a hire profile into live Nano job workers (one per job-type in
+ * the rank×capability matrix) and poll for work in the foreground until Ctrl-C.
+ * Uses the c8ctl-provided SDK client (globalThis.c8ctl.createClient()).
+ */
+async function workAgent(req, flags) {
+  const logger = getLogger();
+  const name = flags?.name ? String(flags.name).trim() : req.positional[0];
+
+  if (!name) {
+    const hires = readHires();
+    const names = Object.keys(hires).sort();
+    logger.error('Usage: c8ctl nano work <profileName>');
+    if (names.length > 0) logger.info(`Profiles: ${names.join(', ')}`);
+    else logger.info('No hires yet. Create one with: c8ctl nano hire');
+    process.exit(1);
+  }
+
+  const stored = readHires()[name];
+  if (!stored) {
+    logger.error(`No hire named "${name}". List profiles with: c8ctl nano hire --list`);
+    process.exit(1);
+  }
+  const normalized = normalizeStoredProfile(name, stored);
+  if (normalized.error) {
+    logger.error(`Cannot work "${name}": ${normalized.error}. Re-create it with: c8ctl nano hire`);
+    process.exit(1);
+  }
+  const profile = normalized.profile;
+
+  if (!globalThis.c8ctl || typeof globalThis.c8ctl.createClient !== 'function') {
+    logger.error('work requires the c8ctl runtime (createClient). Run it via the c8ctl CLI.');
+    process.exit(1);
+  }
+
+  const intFlag = (v, dflt) => {
+    const n = Number.parseInt(String(v ?? ''), 10);
+    return Number.isFinite(n) && n > 0 ? n : dflt;
+  };
+  const maxParallelJobs = intFlag(flags?.['max-parallel'], 1);
+  const jobTimeoutMs = intFlag(flags?.['job-timeout'], 5 * 60_000);
+
+  const matrix = jobTypeMatrix(profile.rank, profile.capabilities);
+  const camunda = globalThis.c8ctl.createClient();
+
+  logger.info(`Putting "${name}" [${profile.rank}] to work → ${profile.command}`);
+  logger.info(`  model: ${profile.model || '(none)'}; capabilities: ${profile.capabilities.join(', ') || '(none)'}`);
+  logger.info(`  listening on ${matrix.length} job type(s): ${matrix.join('  ')}`);
+  logger.info(`  max parallel: ${maxParallelJobs}; job timeout: ${jobTimeoutMs}ms`);
+  logger.info('Polling for work — press Ctrl-C to stop.');
+
+  const workers = matrix.map((jobType) =>
+    camunda.createJobWorker({
+      jobType,
+      workerName: `${name}:${jobType}`,
+      maxParallelJobs,
+      jobTimeoutMs,
+      jobHandler: async (job) => {
+        logger.info(`[${jobType}] job ${job.jobKey} (instance ${job.processInstanceKey ?? '-'}) → ${profile.command}`);
+        const result = await runAgentJob(profile, job, jobTimeoutMs);
+        if (result.ok) {
+          logger.info(`[${jobType}] job ${job.jobKey} complete (exit 0)${result.truncated ? ' [output truncated]' : ''}`);
+          return job.complete({ output: result.stdout, exitCode: 0, agent: profile.name, truncated: Boolean(result.truncated) });
+        }
+        const retries = Math.max(0, (Number(job.retries) || 1) - 1);
+        const detail = result.error
+          || (result.stderr || '').trim() + (result.stderrTruncated && (result.stderr || '').trim() ? ' [stderr truncated]' : '')
+          || (result.signal ? `terminated by signal ${result.signal}` : `exit code ${result.exitCode}`);
+        logger.warn(`[${jobType}] job ${job.jobKey} failed (${detail}); retries left ${retries}`);
+        return job.fail({
+          errorMessage: `agent "${profile.name}" failed: ${detail}`.slice(0, 2000),
+          retries,
+        });
+      },
+    }),
+  );
+
+  // Keep the process alive until a stop signal, then drain gracefully.
+  await new Promise((resolve) => {
+    let stopping = false;
+    const stop = async (signal) => {
+      if (stopping) return;
+      stopping = true;
+      logger.info(`Received ${signal} — stopping ${workers.length} worker(s)...`);
+      let stopFailures = 0;
+      await Promise.all(
+        workers.map(async (w) => {
+          try {
+            if (typeof w.stopGracefully === 'function') {
+              await w.stopGracefully({ waitUpToMs: STOP_GRACE_MS });
+            } else if (typeof w.stop === 'function') {
+              await w.stop();
+            }
+          } catch {
+            // best-effort: never let one worker's stop failure hang shutdown
+            stopFailures += 1;
+          }
+        }),
+      );
+      if (stopFailures > 0) {
+        logger.warn(`${stopFailures} of ${workers.length} worker(s) did not stop cleanly; some connections may still be open.`);
+      } else {
+        logger.info('All workers stopped.');
+      }
+      resolve();
+    };
+    process.once('SIGINT', () => { stop('SIGINT'); });
+    process.once('SIGTERM', () => { stop('SIGTERM'); });
+  });
 }
 
 // ---------------------------------------------------------------------------
@@ -2548,6 +3004,10 @@ export const metadata = {
         { command: 'c8ctl nano config', description: 'Show current plugin configuration and paths' },
         { command: 'c8ctl nano update', description: 'Pull the latest published nano release (re-installs via npm)' },
         { command: 'c8ctl nano update --check', description: 'Check whether a newer nano release is available' },
+        { command: 'c8ctl nano hire', description: 'Interactively create a CLI agent worker profile (name, rank, command, model, capabilities)' },
+        { command: 'c8ctl nano hire --name reviewer --rank senior --command copilot --model gpt-5 --capabilities code-review,testing', description: 'Create a profile non-interactively' },
+        { command: 'c8ctl nano hire --list', description: 'List hired agent profiles' },
+        { command: 'c8ctl nano work reviewer', description: 'Spawn Nano job workers for the "reviewer" profile and poll for work' },
       ],
     },
     processos: {
@@ -2589,6 +3049,14 @@ export const commands = {
       workspace: { type: 'boolean', description: 'clean: also delete the workspace (models + workers)' },
       check: { type: 'boolean', description: 'update: only report whether a new release is available; do not install' },
       binary: { type: 'string', description: 'Path to the nanobpmn server binary' },
+      name: { type: 'string', description: 'hire/work: agent profile name (alt to positional arg)' },
+      rank: { type: 'string', description: 'hire: agent rank (principal|senior|junior|decider)' },
+      command: { type: 'string', description: 'hire: CLI command that runs the agent harness (e.g. copilot, claude, pi)' },
+      model: { type: 'string', description: 'hire: model name passed to the harness (AGENT_MODEL)' },
+      capabilities: { type: 'string', description: 'hire: comma-separated capability list' },
+      list: { type: 'boolean', description: 'hire: list existing agent profiles instead of creating one' },
+      'max-parallel': { type: 'string', description: 'work: max concurrent jobs per worker (default 1)' },
+      'job-timeout': { type: 'string', description: 'work: max harness runtime per job in ms; the spawned process is killed past this (default 300000)' },
     },
     handler: async (args, flags) => {
       const logger = getLogger();
@@ -2636,6 +3104,12 @@ export const commands = {
             break;
           case 'update':
             updatePlugin(req);
+            break;
+          case 'hire':
+            await hireWorker(req, flags);
+            break;
+          case 'work':
+            await workAgent(req, flags);
             break;
         }
       } catch (error) {
@@ -2725,6 +3199,8 @@ function printUsage() {
   console.log('  c8ctl nano set <bin|model-dir> <path>');
   console.log('  c8ctl nano config');
   console.log('  c8ctl nano update [--check]');
+  console.log('  c8ctl nano hire [--name <n>] [--rank <r>] [--command <c>] [--model <m>] [--capabilities <a,b>] [--list]');
+  console.log('  c8ctl nano work <profileName> [--max-parallel <n>] [--job-timeout <ms>]');
   console.log('');
   console.log('Subcommands:');
   console.log('  start    Spawn an N-node local cluster wired to talk to each other on localhost');
@@ -2738,6 +3214,8 @@ function printUsage() {
   console.log('  set      Persist a setting: "bin <path>" or "model-dir <path>"');
   console.log('  config   Show current configuration and on-disk locations');
   console.log('  update   Pull the latest published nano release (--check to only report)');
+  console.log('  hire     Create a CLI agent worker profile (rank + capabilities → job-type matrix)');
+  console.log('  work     Run a hired profile as Nano job workers, polling for work until Ctrl-C');
   console.log('');
   console.log('Options:');
   console.log('  <nodes>              Number of nodes to start (default 1)');

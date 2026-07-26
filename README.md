@@ -247,11 +247,12 @@ A missing required secret fails the job with a clear provisioning message.
 
 **Disk hygiene.** Container sandboxes get automatic cleanup so leaked
 containers can't fill the disk: a **label-scoped** reaper runs at worker startup
-and on an interval (`--reap-interval`, default 5m), removing finished/`exited`
-containers older than `--reap-age` (default 1h) while **skipping any run still
-in flight** — it never touches containers it didn't create and never
-`system prune`s. A **disk-budget admission shed** fails (retryable) new jobs when
-the engine data root has less than `--min-free-mb` free (default 1024).
+and on an interval (`--reap-interval`, **milliseconds**, default `300000` = 5m),
+removing finished/`exited` containers older than `--reap-age` (**milliseconds**,
+default `3600000` = 1h) while **skipping any run still in flight** — it never
+touches containers it didn't create and never `system prune`s. A **disk-budget
+admission shed** fails (retryable) new jobs when the engine data root has less
+than `--min-free-mb` MB free (default `1024`).
 
 > Git provisioning (clone/branch/push), agent-opened PRs, and the
 > Vercel/Sandcastle provider are **increment 2** — the envelope names above are

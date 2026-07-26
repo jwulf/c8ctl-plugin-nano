@@ -16,6 +16,7 @@ import {
   buildAgentPayload,
   buildResultEnvelope,
   reapAgentContainers,
+  diskBudgetOk,
   normalizeStoredProfile,
   containerEngineAvailable,
   runAgentJob,
@@ -182,6 +183,14 @@ test('normalizeTaskEnvelope forces schemaVersion to v1 regardless of input', () 
 
 test('SANDBOXES exposes the expected set', () => {
   assert.deepEqual(SANDBOXES, ['none', 'docker', 'podman']);
+});
+
+test('diskBudgetOk fails open when the engine root cannot be resolved', () => {
+  // A bogus engine binary makes dockerRootDir() return null → must NOT shed
+  // (and must never statfs an unrelated path like the OS temp dir).
+  const r = diskBudgetOk('definitely-not-a-real-engine-xyz', 1_073_741_824);
+  assert.equal(r.ok, true);
+  assert.equal(r.free, null);
 });
 
 // --- Docker-gated integration tests -----------------------------------------

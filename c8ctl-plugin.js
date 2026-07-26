@@ -43,7 +43,7 @@ import {
   statfsSync,
 } from 'node:fs';
 import { randomUUID } from 'node:crypto';
-import { homedir, platform as osPlatform, tmpdir } from 'node:os';
+import { homedir, platform as osPlatform } from 'node:os';
 import { join, isAbsolute, resolve as resolvePath, dirname, sep } from 'node:path';
 import { createRequire } from 'node:module';
 import { fileURLToPath } from 'node:url';
@@ -1744,13 +1744,16 @@ function containerEngineAvailable(engine) {
   }
 }
 
+// Resolve the container engine's data root. Returns null when it can't be
+// determined so the caller can fail OPEN (never fall back to an unrelated path
+// like the OS temp dir, which would shed on the wrong filesystem's free space).
 function dockerRootDir(engine) {
   try {
     const r = spawnSync(engine, ['info', '-f', '{{.DockerRootDir}}'], { encoding: 'utf8', timeout: 10_000 });
     const dir = (r.stdout || '').trim();
     if (r.status === 0 && dir) return dir;
   } catch { /* fall through */ }
-  return tmpdir();
+  return null;
 }
 
 // Fail-open disk-budget check: shed work when free space on the engine's data
@@ -1759,7 +1762,9 @@ function diskBudgetOk(engine, minFreeBytes) {
   if (!minFreeBytes || minFreeBytes <= 0) return { ok: true, free: null };
   try {
     if (typeof statfsSync !== 'function') return { ok: true, free: null };
-    const st = statfsSync(dockerRootDir(engine));
+    const root = dockerRootDir(engine);
+    if (!root) return { ok: true, free: null }; // can't resolve the real root → fail open
+    const st = statfsSync(root);
     const free = st.bavail * st.bsize;
     return { ok: free >= minFreeBytes, free };
   } catch {
@@ -3704,6 +3709,20 @@ function printUsage() {
   console.log('  --purge              stop: also delete per-node engine data');
   console.log('  --force              start: stop any existing cluster first');
   console.log('  --workspace          clean: also delete the workspace (models + workers)');
+  console.log('  --name <n>           hire/work: agent profile name (alt to positional arg)');
+  console.log('  --rank <r>           hire: agent rank (principal|senior|junior|decider)');
+  console.log('  --command <c>        hire: CLI command that runs the agent harness');
+  console.log('  --model <m>          hire: model name passed to the harness (AGENT_MODEL)');
+  console.log('  --capabilities <a,b> hire: comma-separated capability list');
+  console.log('  --sandbox <s>        hire/work: execution sandbox none|docker|podman (default none)');
+  console.log('  --image <ref>        hire/work: container image the agent runs in (required for docker|podman)');
+  console.log('  --list               hire: list existing agent profiles instead of creating one');
+  console.log('  --max-parallel <n>   work: max concurrent jobs per worker (default 1)');
+  console.log('  --job-timeout <ms>   work: max harness runtime per job in ms (default 300000)');
+  console.log('  --secret-resolver <r> work: secret resolver for task secretRefs (host; default host)');
+  console.log('  --reap-age <ms>      work: age before a finished agent container is reaped (default 3600000)');
+  console.log('  --reap-interval <ms> work: how often to sweep finished agent containers (default 300000)');
+  console.log('  --min-free-mb <n>    work: shed jobs when the engine data root has < this many MB free (default 1024)');
   console.log('');
   console.log('Persistent assets:');
   console.log('  Models and workers live in the workspace dir (NANOBPMN_WORKSPACE_DIR),');

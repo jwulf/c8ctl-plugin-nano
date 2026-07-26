@@ -130,6 +130,64 @@ c8ctl nano set model-dir ~/bpmn-workspace
 This creates `~/bpmn-workspace/models/` and `~/bpmn-workspace/workers/`. Restart a
 running cluster for a workspace change to take effect.
 
+## CLI agent workers: `hire` / `recruit`
+
+Beyond BPMN service-task workers (code in the workspace `workers/` dir), the
+plugin can turn an interactive **CLI agent harness** (Copilot CLI, Claude CLI,
+`pi`, "little coder", …) into a Nano job worker.
+
+**`hire`** persists an agent *profile* — a name, a **rank**
+(`principal|senior|junior|decider`), the **command** that starts the CLI, a
+**model** name, and a list of **capabilities**:
+
+```bash
+# Interactive
+c8ctl nano hire
+
+# Or non-interactively
+c8ctl nano hire --name reviewer --rank senior --command copilot \
+  --model gpt-5 --capabilities code-review,testing
+
+# List profiles
+c8ctl nano hire --list
+```
+
+**`recruit <name>`** loads the profile, connects with the c8ctl SDK client, and
+registers one job worker per token in the **rank × capability matrix**, then
+polls for work in the foreground until Ctrl-C. For rank `senior` and
+capabilities `code-review, testing` the matrix is:
+
+| Token | Meaning |
+| --- | --- |
+| `senior` | rank alone |
+| `senior:code-review` | rank + one capability (spread) |
+| `senior:testing` | rank + one capability (spread) |
+| `senior:code-review+testing` | rank + all capabilities, sorted (combined) |
+
+so a BPMN service task can target a worker at any granularity by setting its job
+type to the matching token.
+
+```bash
+c8ctl nano recruit reviewer                     # poll for work until Ctrl-C
+c8ctl nano recruit reviewer --max-parallel 2 --job-timeout 600000
+```
+
+Each activated job runs the profile's command **once** (one-shot): the job is
+serialized to JSON and piped to the CLI's **stdin** —
+
+```json
+{ "jobKey": "…", "jobType": "senior:code-review", "processInstanceKey": "…",
+  "prompt": "<variables.prompt ?? variables.task>", "variables": { … },
+  "profile": { "name": "reviewer", "rank": "senior", "model": "gpt-5",
+               "capabilities": ["code-review", "testing"] } }
+```
+
+and the profile/model are also exported as `AGENT_PROFILE`, `AGENT_RANK`,
+`AGENT_MODEL`, `AGENT_CAPABILITIES`, `AGENT_JOB_TYPE` env vars. On exit `0` the
+job is **completed** with `{ output: <stdout>, exitCode: 0 }`; any other exit
+**fails** the job with a decremented retry count. Profiles are stored in the
+plugin's `config.json` (see `c8ctl nano config`).
+
 ## Cleaning up disk
 
 ```bash

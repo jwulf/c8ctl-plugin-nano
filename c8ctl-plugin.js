@@ -45,6 +45,7 @@ import { homedir, platform as osPlatform } from 'node:os';
 import { join, isAbsolute, resolve as resolvePath, dirname, sep } from 'node:path';
 import { createRequire } from 'node:module';
 import { fileURLToPath } from 'node:url';
+import { createInterface } from 'node:readline/promises';
 import { platformForHost } from './platforms.mjs';
 
 const requireFromHere = createRequire(import.meta.url);
@@ -363,7 +364,7 @@ function launcherEnvMarkers(resolved) {
 // Argument parsing
 // ---------------------------------------------------------------------------
 
-const VALID_SUBCOMMANDS = ['start', 'stop', 'status', 'logs', 'log', 'restart', 'pause', 'resume', 'clean', 'set', 'config', 'update'];
+const VALID_SUBCOMMANDS = ['start', 'stop', 'status', 'logs', 'log', 'restart', 'pause', 'resume', 'clean', 'set', 'config', 'update', 'hire', 'recruit'];
 
 /**
  * Parse positional args + flags into a normalized request.
@@ -1291,6 +1292,319 @@ function showConfig() {
   console.log(`  config file  ${getConfigFile()}`);
   console.log('');
   console.log('  Change with: c8ctl nano set bin <path> | c8ctl nano set model-dir <path>');
+}
+
+// ---------------------------------------------------------------------------
+// hire / recruit — CLI agent harness workers.
+//
+// A "hire" is a persisted agent profile (name, rank, CLI command, model,
+// capabilities). "recruit <name>" turns that profile into a set of Nano job
+// workers: one per job-type in the rank×capability matrix. When a job is
+// activated, the profile's CLI command is spawned fresh (one-shot), fed the job
+// as JSON on stdin, and its stdout is returned as the job's `output` variable.
+// ---------------------------------------------------------------------------
+
+const RANKS = ['principal', 'senior', 'junior', 'decider'];
+
+/** Normalize a capability list: trim, drop empties, de-dupe, sort (canonical). */
+function normalizeCapabilities(input) {
+  const raw = Array.isArray(input)
+    ? input
+    : String(input || '').split(',');
+  return [...new Set(raw.map((c) => String(c).trim().toLowerCase()).filter(Boolean))].sort();
+}
+
+/** A profile name must be a safe, filesystem/token-friendly slug. */
+function isValidProfileName(name) {
+  return typeof name === 'string' && /^[a-z0-9][a-z0-9._-]*$/i.test(name);
+}
+
+/**
+ * The job-type matrix a recruited worker subscribes to, from a profile's rank
+ * and sorted capabilities [c1, c2, ...]:
+ *   - `rank`                 (rank alone)
+ *   - `rank:c1`, `rank:c2`   (rank + a single capability, "spread")
+ *   - `rank:c1+c2+...`       (rank + all capabilities combined; only when >1 cap)
+ * Delimiters: `:` separates rank from capabilities, `+` joins combined caps.
+ * Capabilities are sorted so the combined token is canonical/predictable.
+ */
+function jobTypeMatrix(rank, capabilities) {
+  const caps = normalizeCapabilities(capabilities);
+  const tokens = [rank];
+  for (const c of caps) tokens.push(`${rank}:${c}`);
+  if (caps.length > 1) tokens.push(`${rank}:${caps.join('+')}`);
+  return [...new Set(tokens)];
+}
+
+/** All persisted hire profiles, keyed by name. */
+function readHires() {
+  const cfg = readConfig();
+  return cfg.hires && typeof cfg.hires === 'object' ? cfg.hires : {};
+}
+
+/** Persist a single hire profile into config.json under `hires`. */
+function writeHire(profile) {
+  const cfg = readConfig();
+  if (!cfg.hires || typeof cfg.hires !== 'object') cfg.hires = {};
+  cfg.hires[profile.name] = profile;
+  writeConfig(cfg);
+}
+
+/**
+ * hire — create (or overwrite) an agent profile. Interactive by default; every
+ * field can also be supplied via a flag (--name/--rank/--command/--model/
+ * --capabilities) for scripting. Prompts only for the fields still missing.
+ * `--list` prints existing profiles instead.
+ */
+async function hireWorker(req, flags) {
+  const logger = getLogger();
+
+  if (flags?.list) {
+    const hires = readHires();
+    const names = Object.keys(hires);
+    if (names.length === 0) {
+      logger.info('No hires yet. Create one with: c8ctl nano hire');
+      return;
+    }
+    console.log('Hired agent profiles:');
+    for (const name of names.sort()) {
+      const p = hires[name];
+      console.log(`  ${name}  [${p.rank}]  ${p.command}  (model: ${p.model || '-'}; caps: ${(p.capabilities || []).join(', ') || '-'})`);
+    }
+    console.log('');
+    console.log('Recruit one with: c8ctl nano recruit <name>');
+    return;
+  }
+
+  // Seed from flags; prompt for anything still missing.
+  let name = flags?.name ? String(flags.name).trim() : req.positional[0];
+  let rank = flags?.rank ? String(flags.rank).trim().toLowerCase() : undefined;
+  let command = flags?.command ? String(flags.command) : undefined;
+  let model = flags?.model !== undefined ? String(flags.model) : undefined;
+  let capabilities = flags?.capabilities !== undefined ? flags.capabilities : undefined;
+
+  const needsPrompt = !name || !rank || !command || model === undefined || capabilities === undefined;
+  const interactive = process.stdin.isTTY && process.stdout.isTTY;
+
+  if (needsPrompt && !interactive) {
+    logger.error('Non-interactive: provide --name, --rank, --command, --model and --capabilities.');
+    logger.info('Example: c8ctl nano hire --name reviewer --rank senior --command copilot --model gpt-5 --capabilities code-review,testing');
+    process.exit(1);
+  }
+
+  if (needsPrompt) {
+    const rl = createInterface({ input: process.stdin, output: process.stdout });
+    try {
+      console.log('Hire a CLI agent worker. Press Ctrl-C to cancel.');
+      console.log('');
+      while (!name) {
+        const ans = (await rl.question('Profile name: ')).trim();
+        if (isValidProfileName(ans)) { name = ans; break; }
+        console.log('  Please use letters, digits, dot, dash or underscore.');
+      }
+      while (!rank) {
+        const ans = (await rl.question(`Rank (${RANKS.join('|')}): `)).trim().toLowerCase();
+        if (RANKS.includes(ans)) { rank = ans; break; }
+        console.log(`  Rank must be one of: ${RANKS.join(', ')}`);
+      }
+      while (!command) {
+        const ans = (await rl.question('CLI command (e.g. copilot, claude, pi): ')).trim();
+        if (ans) { command = ans; break; }
+        console.log('  A command is required.');
+      }
+      if (model === undefined) {
+        model = (await rl.question('Model name (optional): ')).trim();
+      }
+      if (capabilities === undefined) {
+        capabilities = (await rl.question('Capabilities (comma-separated, optional): ')).trim();
+      }
+    } finally {
+      rl.close();
+    }
+  }
+
+  if (!isValidProfileName(name)) {
+    logger.error(`Invalid profile name "${name}". Use letters, digits, dot, dash or underscore.`);
+    process.exit(1);
+  }
+  if (!RANKS.includes(rank)) {
+    logger.error(`Invalid rank "${rank}". Must be one of: ${RANKS.join(', ')}`);
+    process.exit(1);
+  }
+  if (!command) {
+    logger.error('A CLI command is required.');
+    process.exit(1);
+  }
+
+  const existed = Boolean(readHires()[name]);
+  const profile = {
+    name,
+    rank,
+    command,
+    model: model || '',
+    capabilities: normalizeCapabilities(capabilities),
+    createdAt: new Date().toISOString(),
+  };
+  writeHire(profile);
+
+  const matrix = jobTypeMatrix(profile.rank, profile.capabilities);
+  logger.info(`${existed ? 'Updated' : 'Hired'} "${name}" [${profile.rank}] → ${profile.command}`);
+  logger.info(`  model: ${profile.model || '(none)'}`);
+  logger.info(`  capabilities: ${profile.capabilities.join(', ') || '(none)'}`);
+  logger.info(`  job types (${matrix.length}): ${matrix.join('  ')}`);
+  logger.info(`Recruit it with: c8ctl nano recruit ${name}`);
+}
+
+/**
+ * Run a single activated job through the profile's CLI command (one-shot):
+ * spawn the command fresh, pipe the job as JSON on stdin, capture stdout, and
+ * resolve to a job action. Exit 0 → complete with { output, exitCode }; any
+ * other exit (or spawn failure) → fail with a decremented retry count.
+ */
+function runAgentJob(profile, job) {
+  return new Promise((resolve) => {
+    const variables = job.variables && typeof job.variables === 'object' ? job.variables : {};
+    const payload = {
+      jobKey: job.jobKey,
+      jobType: job.type,
+      processInstanceKey: job.processInstanceKey ?? null,
+      elementInstanceKey: job.elementInstanceKey ?? null,
+      elementId: job.elementId ?? null,
+      bpmnProcessId: job.bpmnProcessId ?? job.processDefinitionId ?? null,
+      prompt: variables.prompt ?? variables.task ?? null,
+      variables,
+      customHeaders: job.customHeaders ?? {},
+      profile: {
+        name: profile.name,
+        rank: profile.rank,
+        model: profile.model,
+        capabilities: profile.capabilities,
+      },
+    };
+
+    const child = spawn(profile.command, {
+      shell: true,
+      stdio: ['pipe', 'pipe', 'pipe'],
+      env: {
+        ...process.env,
+        AGENT_PROFILE: profile.name,
+        AGENT_RANK: profile.rank,
+        AGENT_MODEL: profile.model || '',
+        AGENT_CAPABILITIES: (profile.capabilities || []).join(','),
+        AGENT_JOB_TYPE: String(job.type ?? ''),
+      },
+    });
+
+    let stdout = '';
+    let stderr = '';
+    child.stdout.on('data', (d) => { stdout += d.toString(); });
+    child.stderr.on('data', (d) => { stderr += d.toString(); });
+
+    child.on('error', (err) => {
+      resolve({ ok: false, exitCode: null, stdout, stderr, error: err.message });
+    });
+    child.on('close', (code) => {
+      resolve({ ok: code === 0, exitCode: code, stdout, stderr });
+    });
+
+    try {
+      child.stdin.write(JSON.stringify(payload));
+      child.stdin.end();
+    } catch {
+      // 'error' handler above resolves the promise on spawn failure.
+    }
+  });
+}
+
+/**
+ * recruit — turn a hire profile into live Nano job workers (one per job-type in
+ * the rank×capability matrix) and poll for work in the foreground until Ctrl-C.
+ * Uses the c8ctl-provided SDK client (globalThis.c8ctl.createClient()).
+ */
+async function recruitWorker(req, flags) {
+  const logger = getLogger();
+  const name = flags?.name ? String(flags.name).trim() : req.positional[0];
+
+  if (!name) {
+    const hires = readHires();
+    const names = Object.keys(hires).sort();
+    logger.error('Usage: c8ctl nano recruit <profileName>');
+    if (names.length > 0) logger.info(`Profiles: ${names.join(', ')}`);
+    else logger.info('No hires yet. Create one with: c8ctl nano hire');
+    process.exit(1);
+  }
+
+  const profile = readHires()[name];
+  if (!profile) {
+    logger.error(`No hire named "${name}". List profiles with: c8ctl nano hire --list`);
+    process.exit(1);
+  }
+
+  if (!globalThis.c8ctl || typeof globalThis.c8ctl.createClient !== 'function') {
+    logger.error('recruit requires the c8ctl runtime (createClient). Run it via the c8ctl CLI.');
+    process.exit(1);
+  }
+
+  const intFlag = (v, dflt) => {
+    const n = Number.parseInt(String(v ?? ''), 10);
+    return Number.isFinite(n) && n > 0 ? n : dflt;
+  };
+  const maxParallelJobs = intFlag(flags?.['max-parallel'], 1);
+  const jobTimeoutMs = intFlag(flags?.['job-timeout'], 5 * 60_000);
+
+  const matrix = jobTypeMatrix(profile.rank, profile.capabilities);
+  const camunda = globalThis.c8ctl.createClient(flags?.profile);
+
+  logger.info(`Recruiting "${name}" [${profile.rank}] → ${profile.command}`);
+  logger.info(`  model: ${profile.model || '(none)'}; capabilities: ${profile.capabilities.join(', ') || '(none)'}`);
+  logger.info(`  listening on ${matrix.length} job type(s): ${matrix.join('  ')}`);
+  logger.info(`  max parallel: ${maxParallelJobs}; job timeout: ${jobTimeoutMs}ms`);
+  logger.info('Polling for work — press Ctrl-C to stop.');
+
+  const workers = matrix.map((jobType) =>
+    camunda.createJobWorker({
+      jobType,
+      workerName: `${name}:${jobType}`,
+      maxParallelJobs,
+      jobTimeoutMs,
+      jobHandler: async (job) => {
+        logger.info(`[${jobType}] job ${job.jobKey} (instance ${job.processInstanceKey ?? '-'}) → ${profile.command}`);
+        const result = await runAgentJob(profile, job);
+        if (result.ok) {
+          logger.info(`[${jobType}] job ${job.jobKey} complete (exit 0)`);
+          return job.complete({ output: result.stdout, exitCode: 0, agent: profile.name });
+        }
+        const retries = Math.max(0, (Number(job.retries) || 1) - 1);
+        const detail = result.error || (result.stderr || '').trim() || `exit code ${result.exitCode}`;
+        logger.warn(`[${jobType}] job ${job.jobKey} failed (${detail}); retries left ${retries}`);
+        return job.fail({
+          errorMessage: `agent "${profile.name}" failed: ${detail}`.slice(0, 2000),
+          retries,
+        });
+      },
+    }),
+  );
+
+  // Keep the process alive until a stop signal, then drain gracefully.
+  await new Promise((resolve) => {
+    let stopping = false;
+    const stop = async (signal) => {
+      if (stopping) return;
+      stopping = true;
+      logger.info(`Received ${signal} — stopping ${workers.length} worker(s)...`);
+      await Promise.all(
+        workers.map((w) =>
+          typeof w.stopGracefully === 'function'
+            ? w.stopGracefully({ waitUpToMs: STOP_GRACE_MS }).catch(() => {})
+            : Promise.resolve(w.stop && w.stop()),
+        ),
+      );
+      logger.info('All workers stopped.');
+      resolve();
+    };
+    process.once('SIGINT', () => { stop('SIGINT'); });
+    process.once('SIGTERM', () => { stop('SIGTERM'); });
+  });
 }
 
 // ---------------------------------------------------------------------------
@@ -2548,6 +2862,10 @@ export const metadata = {
         { command: 'c8ctl nano config', description: 'Show current plugin configuration and paths' },
         { command: 'c8ctl nano update', description: 'Pull the latest published nano release (re-installs via npm)' },
         { command: 'c8ctl nano update --check', description: 'Check whether a newer nano release is available' },
+        { command: 'c8ctl nano hire', description: 'Interactively create a CLI agent worker profile (name, rank, command, model, capabilities)' },
+        { command: 'c8ctl nano hire --name reviewer --rank senior --command copilot --model gpt-5 --capabilities code-review,testing', description: 'Create a profile non-interactively' },
+        { command: 'c8ctl nano hire --list', description: 'List hired agent profiles' },
+        { command: 'c8ctl nano recruit reviewer', description: 'Spawn Nano job workers for the "reviewer" profile and poll for work' },
       ],
     },
     processos: {
@@ -2589,6 +2907,14 @@ export const commands = {
       workspace: { type: 'boolean', description: 'clean: also delete the workspace (models + workers)' },
       check: { type: 'boolean', description: 'update: only report whether a new release is available; do not install' },
       binary: { type: 'string', description: 'Path to the nanobpmn server binary' },
+      name: { type: 'string', description: 'hire/recruit: agent profile name (alt to positional arg)' },
+      rank: { type: 'string', description: 'hire: agent rank (principal|senior|junior|decider)' },
+      command: { type: 'string', description: 'hire: CLI command that runs the agent harness (e.g. copilot, claude, pi)' },
+      model: { type: 'string', description: 'hire: model name passed to the harness (AGENT_MODEL)' },
+      capabilities: { type: 'string', description: 'hire: comma-separated capability list' },
+      list: { type: 'boolean', description: 'hire: list existing agent profiles instead of creating one' },
+      'max-parallel': { type: 'string', description: 'recruit: max concurrent jobs per worker (default 1)' },
+      'job-timeout': { type: 'string', description: 'recruit: job activation timeout in ms (default 300000)' },
     },
     handler: async (args, flags) => {
       const logger = getLogger();
@@ -2636,6 +2962,12 @@ export const commands = {
             break;
           case 'update':
             updatePlugin(req);
+            break;
+          case 'hire':
+            await hireWorker(req, flags);
+            break;
+          case 'recruit':
+            await recruitWorker(req, flags);
             break;
         }
       } catch (error) {
@@ -2725,6 +3057,8 @@ function printUsage() {
   console.log('  c8ctl nano set <bin|model-dir> <path>');
   console.log('  c8ctl nano config');
   console.log('  c8ctl nano update [--check]');
+  console.log('  c8ctl nano hire [--name <n>] [--rank <r>] [--command <c>] [--model <m>] [--capabilities <a,b>] [--list]');
+  console.log('  c8ctl nano recruit <profileName> [--max-parallel <n>] [--job-timeout <ms>]');
   console.log('');
   console.log('Subcommands:');
   console.log('  start    Spawn an N-node local cluster wired to talk to each other on localhost');
@@ -2738,6 +3072,8 @@ function printUsage() {
   console.log('  set      Persist a setting: "bin <path>" or "model-dir <path>"');
   console.log('  config   Show current configuration and on-disk locations');
   console.log('  update   Pull the latest published nano release (--check to only report)');
+  console.log('  hire     Create a CLI agent worker profile (rank + capabilities → job-type matrix)');
+  console.log('  recruit  Run a hired profile as Nano job workers, polling for work until Ctrl-C');
   console.log('');
   console.log('Options:');
   console.log('  <nodes>              Number of nodes to start (default 1)');

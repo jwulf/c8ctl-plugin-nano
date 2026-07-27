@@ -1318,6 +1318,40 @@ function normalizeCapabilities(input) {
   return [...new Set(raw.map((c) => String(c).trim().toLowerCase()).filter(Boolean))].sort();
 }
 
+// A conventional (POSIX-ish) environment variable name.
+const ENV_NAME_RE = /^[A-Za-z_][A-Za-z0-9_]*$/;
+
+// Normalize a stored/model env map into a clean { NAME: "value" } object:
+// drops entries with an invalid name, coerces values to strings. Used for the
+// profile's static env and the per-job envelope's setup.env.
+function normalizeEnvMap(input) {
+  const out = {};
+  if (!isPlainObject(input)) return out;
+  for (const [k, v] of Object.entries(input)) {
+    if (!ENV_NAME_RE.test(k)) continue;
+    if (v == null) continue;
+    out[k] = String(v);
+  }
+  return out;
+}
+
+// Parse repeatable `--env NAME=VALUE` CLI input (string | string[]) into a map.
+// The value may contain `=`; only the first `=` splits. Returns { env, errors }.
+function parseEnvPairs(input) {
+  const list = input == null ? [] : (Array.isArray(input) ? input : [input]);
+  const env = {};
+  const errors = [];
+  for (const item of list) {
+    const s = String(item);
+    const eq = s.indexOf('=');
+    if (eq <= 0) { errors.push(`--env "${s}" must be NAME=VALUE`); continue; }
+    const name = s.slice(0, eq);
+    if (!ENV_NAME_RE.test(name)) { errors.push(`--env "${s}" has an invalid variable name`); continue; }
+    env[name] = s.slice(eq + 1);
+  }
+  return { env, errors };
+}
+
 /** A profile name must be a safe, filesystem/token-friendly slug. */
 function isValidProfileName(name) {
   return typeof name === 'string' && /^[a-z0-9][a-z0-9._-]*$/i.test(name);
@@ -1390,6 +1424,7 @@ function normalizeStoredProfile(name, profile) {
       capabilities: normalizeCapabilities(profile.capabilities),
       sandbox,
       image,
+      env: normalizeEnvMap(profile.env),
     },
   };
 }
@@ -1429,6 +1464,12 @@ async function hireWorker(req, flags) {
   let capabilities = flags?.capabilities !== undefined ? flags.capabilities : undefined;
   let sandbox = flags?.sandbox !== undefined ? String(flags.sandbox).trim().toLowerCase() : undefined;
   let image = flags?.image !== undefined ? String(flags.image).trim() : undefined;
+  const { env: profileEnv, errors: envErrors } = parseEnvPairs(flags?.env);
+  if (envErrors.length > 0) {
+    logger.error(envErrors.join('; '));
+    logger.info('Example: c8ctl nano hire --name coder --rank senior --command copilot --env COPILOT_ENABLE_ALL_TOOLS=1 --env FOO=bar');
+    process.exit(1);
+  }
 
   const missingRequired = !name || !rank || !command;
   const missingOptional = model === undefined || capabilities === undefined;
@@ -1511,6 +1552,7 @@ async function hireWorker(req, flags) {
     capabilities: normalizeCapabilities(capabilities),
     sandbox,
     image: image || '',
+    env: profileEnv,
     createdAt: new Date().toISOString(),
   };
   writeHire(profile);
@@ -1520,6 +1562,8 @@ async function hireWorker(req, flags) {
   logger.info(`  model: ${profile.model || '(none)'}`);
   logger.info(`  capabilities: ${profile.capabilities.join(', ') || '(none)'}`);
   logger.info(`  sandbox: ${profile.sandbox}${CONTAINER_SANDBOXES.has(profile.sandbox) ? ` (image ${profile.image})` : ''}`);
+  const envKeys = Object.keys(profile.env);
+  if (envKeys.length > 0) logger.info(`  env: ${envKeys.join(', ')}`);
   logger.info(`  job types (${matrix.length}): ${matrix.join('  ')}`);
   logger.info(`Put it to work with: c8ctl nano work ${name}`);
 }
@@ -2087,9 +2131,14 @@ function baseAgentEnv(profile, job) {
  * Both paths resolve to the same result contract.
  */
 function runAgentJob(profile, job, opts = {}) {
-  const { timeoutMs, envelope, sandbox = 'none', image, runId, secretEnv = {}, passThroughSecretNames = [], cwd, extraEnv = {} } = opts;
+  const { timeoutMs, envelope, sandbox = 'none', image, runId, secretEnv = {}, passThroughSecretNames = [], cwd, extraEnv = {}, profileEnv = {} } = opts;
   const payload = JSON.stringify(buildAgentPayload(profile, job, envelope));
   const agentEnv = baseAgentEnv(profile, job);
+  // Static, non-secret env for the harness: the worker/profile's env (e.g. a
+  // harness's permission toggles) plus the per-job envelope's setup.env
+  // (job-specific tuning wins over the profile default). Reserved AGENT_* and
+  // resolved secrets are layered on top so user env can never shadow them.
+  const staticEnv = { ...normalizeEnvMap(profileEnv), ...normalizeEnvMap(envelope?.setup?.env) };
 
   if (!CONTAINER_SANDBOXES.has(sandbox)) {
     return spawnCaptureOneShot({
@@ -2099,7 +2148,7 @@ function runAgentJob(profile, job, opts = {}) {
       detached: process.platform !== 'win32',
       // When a repository was provisioned, run the harness IN the workspace.
       cwd,
-      env: { ...process.env, ...agentEnv, ...extraEnv, ...secretEnv },
+      env: { ...process.env, ...staticEnv, ...agentEnv, ...extraEnv, ...secretEnv },
       stdinData: payload,
       timeoutMs,
       onTimeout: (child) => killTree(child),
@@ -2113,9 +2162,7 @@ function runAgentJob(profile, job, opts = {}) {
   const envArgs = [];
   for (const k of Object.keys(agentEnv)) envArgs.push('-e', k);
   for (const n of passThroughSecretNames) envArgs.push('-e', n);
-  const setupEnv = isPlainObject(envelope?.setup?.env) ? envelope.setup.env : {};
-  const setupEnvValues = {};
-  for (const [k, v] of Object.entries(setupEnv)) { envArgs.push('-e', k); setupEnvValues[k] = String(v); }
+  for (const k of Object.keys(staticEnv)) envArgs.push('-e', k);
 
   const args = [
     'run', '--rm', '-i',
@@ -2135,7 +2182,7 @@ function runAgentJob(profile, job, opts = {}) {
     command: engine,
     args,
     shell: false,
-    env: { ...process.env, ...agentEnv, ...secretEnv, ...setupEnvValues },
+    env: { ...process.env, ...staticEnv, ...agentEnv, ...secretEnv },
     stdinData: payload,
     timeoutMs,
     onTimeout: (child) => {
@@ -2209,6 +2256,16 @@ async function workAgent(req, flags) {
     logger.error('work requires the c8ctl runtime (createClient). Run it via the c8ctl CLI.');
     process.exit(1);
   }
+
+  // Static env for the harness: the profile's persisted env, extended/overridden
+  // by any work-time `--env NAME=VALUE` (repeatable). These carry harness startup
+  // config such as permission toggles (e.g. a coder CLI started with tools enabled).
+  const { env: workEnv, errors: workEnvErrors } = parseEnvPairs(flags?.env);
+  if (workEnvErrors.length > 0) {
+    logger.error(workEnvErrors.join('; '));
+    process.exit(1);
+  }
+  const profileEnv = { ...profile.env, ...workEnv };
 
   const intFlag = (v, dflt) => {
     const n = Number.parseInt(String(v ?? ''), 10);
@@ -2295,6 +2352,8 @@ async function workAgent(req, flags) {
   logger.info(`Putting "${name}" [${profile.rank}] to work → ${profile.command}`);
   logger.info(`  model: ${profile.model || '(none)'}; capabilities: ${profile.capabilities.join(', ') || '(none)'}`);
   logger.info(`  sandbox: ${sandbox}${isContainer ? ` (image ${image})` : ''}`);
+  const profileEnvKeys = Object.keys(profileEnv);
+  if (profileEnvKeys.length > 0) logger.info(`  harness env: ${profileEnvKeys.join(', ')}`);
   logger.info(`  listening on ${matrix.length} job type(s): ${matrix.join('  ')}`);
   logger.info(`  max parallel: ${maxParallelJobs}; job timeout: ${jobTimeoutMs}ms`);
   logger.info('Polling for work — press Ctrl-C to stop.');
@@ -2383,6 +2442,7 @@ async function workAgent(req, flags) {
             passThroughSecretNames: names,
             cwd,
             extraEnv,
+            profileEnv,
           });
 
           // Finalize git only when the harness succeeded — never push a
@@ -3712,6 +3772,8 @@ export {
   hostEnvSecretResolver,
   buildAgentPayload,
   buildResultEnvelope,
+  parseEnvPairs,
+  normalizeEnvMap,
   reapAgentContainers,
   diskBudgetOk,
   containerEngineAvailable,
@@ -3763,6 +3825,7 @@ export const metadata = {
         { command: 'c8ctl nano update --check', description: 'Check whether a newer nano release is available' },
         { command: 'c8ctl nano hire', description: 'Interactively create a CLI agent worker profile (name, rank, command, model, capabilities)' },
         { command: 'c8ctl nano hire --name reviewer --rank senior --command copilot --model gpt-5 --capabilities code-review,testing', description: 'Create a profile non-interactively' },
+        { command: 'c8ctl nano hire --name coder --rank senior --command copilot --env COPILOT_ENABLE_ALL_TOOLS=1', description: 'Persist a harness startup env var (e.g. permissions) on the profile' },
         { command: 'c8ctl nano hire --list', description: 'List hired agent profiles' },
         { command: 'c8ctl nano hire --name coder --rank senior --command "agent-harness" --sandbox docker --image ghcr.io/acme/agent:1', description: 'Create a profile that runs each job in a throwaway Docker container' },
         { command: 'c8ctl nano work reviewer', description: 'Spawn Nano job workers for the "reviewer" profile and poll for work' },
@@ -3815,6 +3878,7 @@ export const commands = {
       capabilities: { type: 'string', description: 'hire: comma-separated capability list' },
       sandbox: { type: 'string', description: 'hire/work: execution sandbox none|docker|podman (default none). Containers isolate each job.' },
       image: { type: 'string', description: 'hire/work: container image the agent runs in (required for --sandbox docker|podman)' },
+      env: { type: 'string', multiple: true, description: 'hire/work: static env var for the harness as NAME=VALUE (repeatable); persisted on hire, work extends/overrides. E.g. permission toggles.' },
       'secret-resolver': { type: 'string', description: 'work: secret resolver for task secretRefs (host = process env; default host)' },
       'reap-age': { type: 'string', description: 'work: age in ms before a finished agent container is reaped (default 3600000)' },
       'reap-interval': { type: 'string', description: 'work: how often to sweep finished agent containers in ms (default 300000)' },
@@ -3966,8 +4030,8 @@ function printUsage() {
   console.log('  c8ctl nano set <bin|model-dir> <path>');
   console.log('  c8ctl nano config');
   console.log('  c8ctl nano update [--check]');
-  console.log('  c8ctl nano hire [--name <n>] [--rank <r>] [--command <c>] [--model <m>] [--capabilities <a,b>] [--sandbox none|docker|podman] [--image <ref>] [--list]');
-  console.log('  c8ctl nano work <profileName> [--max-parallel <n>] [--job-timeout <ms>] [--sandbox none|docker|podman] [--image <ref>] [--secret-resolver host] [--min-free-mb <n>] [--clone-timeout <ms>] [--keep-runs]');
+  console.log('  c8ctl nano hire [--name <n>] [--rank <r>] [--command <c>] [--model <m>] [--capabilities <a,b>] [--sandbox none|docker|podman] [--image <ref>] [--env NAME=VALUE ...] [--list]');
+  console.log('  c8ctl nano work <profileName> [--max-parallel <n>] [--job-timeout <ms>] [--sandbox none|docker|podman] [--image <ref>] [--env NAME=VALUE ...] [--secret-resolver host] [--min-free-mb <n>] [--clone-timeout <ms>] [--keep-runs]');
   console.log('');
   console.log('Subcommands:');
   console.log('  start    Spawn an N-node local cluster wired to talk to each other on localhost');
@@ -4005,6 +4069,7 @@ function printUsage() {
   console.log('  --capabilities <a,b> hire: comma-separated capability list');
   console.log('  --sandbox <s>        hire/work: execution sandbox none|docker|podman (default none)');
   console.log('  --image <ref>        hire/work: container image the agent runs in (required for docker|podman)');
+  console.log('  --env NAME=VALUE     hire/work: static env var for the harness (repeatable); persisted on hire, work extends/overrides');
   console.log('  --list               hire: list existing agent profiles instead of creating one');
   console.log('  --max-parallel <n>   work: max concurrent jobs per worker (default 1)');
   console.log('  --job-timeout <ms>   work: max harness runtime per job in ms (default 300000)');

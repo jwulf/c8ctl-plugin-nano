@@ -275,6 +275,21 @@ strong isolation — is a later increment; container jobs don't clone yet.)
 container by name (`-e NAME`) so values never appear in argv or `docker inspect`.
 A missing required secret fails the job with a clear provisioning message.
 
+**Harness env (non-secret).** A harness often needs static startup configuration
+— e.g. a permission toggle to start a coding CLI with its tools enabled. Persist
+these on the profile at hire time and/or add them at work time (repeatable
+`--env NAME=VALUE`); work-time values extend/override the profile's:
+
+```bash
+c8ctl nano hire --name coder --rank senior --command copilot --env COPILOT_ENABLE_ALL_TOOLS=1
+c8ctl nano work coder --env EXTRA_FLAG=on          # extends/overrides the profile env
+```
+
+They apply on both the host and container paths. Per-job `setup.env` from the
+envelope layers on top (job-specific tuning wins), and the reserved `AGENT_*`
+variables and resolved secrets always win over user-supplied env so they can't be
+shadowed. For **secret** values use `secretRefs`, not `--env`.
+
 **Disk hygiene.** Host job **workspaces** and container sandboxes both get
 automatic cleanup so leaked artifacts can't fill the disk. Workspaces under
 `<state>/agent-runs` are removed after each job and swept at startup + on

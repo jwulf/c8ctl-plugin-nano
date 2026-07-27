@@ -19,6 +19,8 @@ import {
   makeSecretResolver,
   buildAgentPayload,
   buildResultEnvelope,
+  parseEnvPairs,
+  normalizeEnvMap,
   reapAgentContainers,
   diskBudgetOk,
   normalizeStoredProfile,
@@ -334,6 +336,63 @@ test('reconcileAgentPr reports unsupported provider without shelling out', () =>
   assert.equal(r.openedBy, 'agent');
   assert.equal(r.found, false);
   assert.match(r.error, /unsupported/);
+});
+
+// --- Harness env (profile.env + --env) --------------------------------------
+test('parseEnvPairs parses NAME=VALUE, keeps = in values, reports bad input', () => {
+  const ok = parseEnvPairs(['A=1', 'B=x=y', 'TOKEN_ENABLED=true']);
+  assert.deepEqual(ok.env, { A: '1', B: 'x=y', TOKEN_ENABLED: 'true' });
+  assert.equal(ok.errors.length, 0);
+
+  const single = parseEnvPairs('ONLY=one'); // c8ctl may hand a scalar for a single flag
+  assert.deepEqual(single.env, { ONLY: 'one' });
+
+  const bad = parseEnvPairs(['noequals', '=nokey', '1BAD=x', 'GOOD=y']);
+  assert.deepEqual(bad.env, { GOOD: 'y' });
+  assert.equal(bad.errors.length, 3);
+
+  assert.deepEqual(parseEnvPairs(undefined).env, {});
+});
+
+test('normalizeEnvMap drops invalid names and stringifies values', () => {
+  assert.deepEqual(normalizeEnvMap({ OK: 1, FLAG: true, 'bad-name': 'x', GOOD_1: 'v', NIL: null }), { OK: '1', FLAG: 'true', GOOD_1: 'v' });
+  assert.deepEqual(normalizeEnvMap(null), {});
+});
+
+test('normalizeStoredProfile carries a normalized env map', () => {
+  const p = normalizeStoredProfile('coder', { rank: 'senior', command: 'copilot', env: { PERMS: 1, 'bad key': 'x' } });
+  assert.deepEqual(p.profile.env, { PERMS: '1' });
+  const none = normalizeStoredProfile('coder', { rank: 'senior', command: 'copilot' });
+  assert.deepEqual(none.profile.env, {}, 'missing env → empty map');
+});
+
+test('runAgentJob (host) injects profileEnv + setup.env into the harness', async () => {
+  // The host command runs via shell, so it can echo the injected vars. setup.env
+  // (per-job) must win over profileEnv (profile default) for the same key.
+  const profile = { name: 'p', rank: 'senior', command: 'printf "%s|%s" "$PERMX" "$TUNE"', model: '', capabilities: [] };
+  const job = { jobKey: 'jk', type: 'senior', variables: {}, customHeaders: {} };
+  const envelope = normalizeTaskEnvelope({}, {});
+  envelope.setup.env = { PERMX: 'job-wins', TUNE: 'from-setup' };
+  const result = await runAgentJob(profile, job, {
+    sandbox: 'none',
+    envelope,
+    profileEnv: { PERMX: 'profile-loses', OTHER: 'ignored' },
+    timeoutMs: 30_000,
+  });
+  assert.equal(result.ok, true, result.error || result.stderr);
+  assert.equal(result.stdout, 'job-wins|from-setup');
+});
+
+test('runAgentJob (host) reserved AGENT_* cannot be shadowed by profileEnv', async () => {
+  const profile = { name: 'shadowy', rank: 'senior', command: 'printf %s "$AGENT_PROFILE"', model: '', capabilities: [] };
+  const job = { jobKey: 'jk', type: 'senior', variables: {}, customHeaders: {} };
+  const result = await runAgentJob(profile, job, {
+    sandbox: 'none',
+    envelope: normalizeTaskEnvelope({}, {}),
+    profileEnv: { AGENT_PROFILE: 'spoofed' },
+    timeoutMs: 30_000,
+  });
+  assert.equal(result.stdout, 'shadowy', 'reserved AGENT_* wins over user env');
 });
 
 test('reapAgentRunDirs age-gates and skips in-flight dirs', () => {

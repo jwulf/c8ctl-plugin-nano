@@ -46,7 +46,7 @@ import {
 } from 'node:fs';
 import { randomUUID } from 'node:crypto';
 import { homedir, platform as osPlatform, devNull } from 'node:os';
-import { join, isAbsolute, resolve as resolvePath, dirname, sep } from 'node:path';
+import { join, isAbsolute, resolve as resolvePath, dirname, basename, sep } from 'node:path';
 import { createRequire } from 'node:module';
 import { fileURLToPath } from 'node:url';
 import { createInterface } from 'node:readline/promises';
@@ -1639,6 +1639,83 @@ const TASK_ENVELOPE_SCHEMA_VERSION = 1;
 // The result-envelope version is intentionally independent of the task-envelope
 // version so the two contracts can evolve separately without silently coupling.
 const RESULT_ENVELOPE_SCHEMA_VERSION = 1;
+
+// Structured result channel (agent → harness). A coding CLI streams a lot of
+// noisy prose/tool output on stdout, so scraping it for the job's structured
+// result is fragile. Instead the harness hands the agent a private file path in
+// `AGENT_RESULT_FILE`; the agent writes a JSON object of *job result variables*
+// there (e.g. `{ "status": "needs_input", "question": "…" }`). The harness reads
+// it after the run and merges those variables into the job's completion, so the
+// model sees them as first-class outputs. A `::nano:result:: {json}` stdout
+// sentinel (or a trailing ```json fence) is honoured as a fallback for agents
+// that cannot write the file. The harness stays app-agnostic: it merges whatever
+// object the agent returns; the *app's prompt* owns the field vocabulary.
+const AGENT_RESULT_FILE_ENV = 'AGENT_RESULT_FILE';
+const RESULT_SENTINEL = '::nano:result::';
+// Completion keys the harness owns — an agent's returned result can never
+// overwrite these (nor anything in the reserved `io.nanobpm.*` namespace), so a
+// stray `output`/`exitCode`/git field in the agent's JSON can't corrupt the
+// audit envelope or process bookkeeping.
+const RESERVED_RESULT_KEYS = new Set([
+  AGENT_RESULT_KEY, 'output', 'exitCode', 'agent', 'truncated',
+  'branch', 'commits', 'pushed', 'pullRequest',
+]);
+
+// Parse `text` as a JSON object, returning it only when it is a plain object.
+// Never throws — malformed agent output degrades to `null`.
+function parseAgentResultObject(text) {
+  if (typeof text !== 'string' || !text.trim()) return null;
+  try {
+    const v = JSON.parse(text);
+    return isPlainObject(v) ? v : null;
+  } catch { return null; }
+}
+
+// Read + parse the agent's result file, if it wrote one. Best-effort; a missing
+// or malformed file is treated as "no structured result".
+function readAgentResultFile(path) {
+  if (!path) return null;
+  try {
+    if (!existsSync(path)) return null;
+    return parseAgentResultObject(readFileSync(path, 'utf8'));
+  } catch { return null; }
+}
+
+// Fallback extraction from stdout, robust to the surrounding transcript: prefer
+// the LAST `::nano:result:: {json}` sentinel line (cheapest + most explicit),
+// else the LAST ```json fenced block. "Last wins" so a re-stated result
+// supersedes an earlier draft.
+function parseResultFromStdout(stdout) {
+  if (typeof stdout !== 'string' || !stdout) return null;
+  const lines = stdout.split(/\r?\n/);
+  for (let i = lines.length - 1; i >= 0; i--) {
+    const idx = lines[i].indexOf(RESULT_SENTINEL);
+    if (idx === -1) continue;
+    const obj = parseAgentResultObject(lines[i].slice(idx + RESULT_SENTINEL.length).trim());
+    if (obj) return obj;
+  }
+  const fences = [...stdout.matchAll(/```json\s*\n([\s\S]*?)```/gi)];
+  for (let i = fences.length - 1; i >= 0; i--) {
+    const obj = parseAgentResultObject(fences[i][1].trim());
+    if (obj) return obj;
+  }
+  return null;
+}
+
+// The domain result variables an agent may return: the parsed object with the
+// harness-reserved keys (and the `io.nanobpm.*` namespace) stripped, so it can
+// never clobber the audit envelope, transcript, or git facts.
+function sanitizeResultVars(obj) {
+  if (!isPlainObject(obj)) return {};
+  const out = {};
+  for (const [k, v] of Object.entries(obj)) {
+    if (RESERVED_RESULT_KEYS.has(k)) continue;
+    if (k.startsWith('io.nanobpm.')) continue;
+    out[k] = v;
+  }
+  return out;
+}
+
 const SANDBOXES = ['none', 'docker', 'podman'];
 // Only container-based sandboxes need an image / disk hygiene / a runtime bin.
 const CONTAINER_SANDBOXES = new Set(['docker', 'podman']);
@@ -2128,7 +2205,7 @@ const MAX_CAPTURE_BYTES = 1_048_576; // 1 MiB per stream
 // Spawn a child, pipe `stdinData`, capture byte-capped stdout/stderr, enforce a
 // timeout (invoking `onTimeout(child)` to tear the child down), and resolve to a
 // uniform result. Used by both the host and container executors.
-function spawnCaptureOneShot({ command, args = [], shell = false, detached = false, cwd, env, stdinData, timeoutMs, onTimeout }) {
+function spawnCaptureOneShot({ command, args = [], shell = false, detached = false, cwd, env, stdinData, timeoutMs, onTimeout, stream = false, streamPrefix = '' }) {
   return new Promise((resolve) => {
     let child;
     const stdoutChunks = [];
@@ -2140,10 +2217,32 @@ function spawnCaptureOneShot({ command, args = [], shell = false, detached = fal
     let settled = false;
     let timer = null;
 
+    // Live "spy" tee (--stream): mirror the child's output to this console,
+    // prefixing each complete line with the job tag so interleaved jobs stay
+    // legible. A per-stream buffer holds partial lines across chunk boundaries.
+    const makeTee = (sink) => {
+      if (!stream) return null;
+      let partial = '';
+      const flush = (text, final) => {
+        partial += text;
+        let nl;
+        while ((nl = partial.indexOf('\n')) !== -1) {
+          sink.write(`${streamPrefix}${partial.slice(0, nl)}\n`);
+          partial = partial.slice(nl + 1);
+        }
+        if (final && partial) { sink.write(`${streamPrefix}${partial}\n`); partial = ''; }
+      };
+      return flush;
+    };
+    const teeOut = makeTee(process.stdout);
+    const teeErr = makeTee(process.stderr);
+
     const finish = (result) => {
       if (settled) return;
       settled = true;
       if (timer) clearTimeout(timer);
+      if (teeOut) teeOut('', true);
+      if (teeErr) teeErr('', true);
       resolve(result);
     };
 
@@ -2163,6 +2262,7 @@ function spawnCaptureOneShot({ command, args = [], shell = false, detached = fal
 
     child.stdout.on('data', (d) => {
       const buf = Buffer.isBuffer(d) ? d : Buffer.from(d);
+      if (teeOut) teeOut(buf.toString('utf8'), false);
       const remaining = MAX_CAPTURE_BYTES - stdoutBytes;
       if (remaining <= 0) { stdoutTruncated = true; return; }
       if (buf.length > remaining) { stdoutChunks.push(buf.subarray(0, remaining)); stdoutBytes = MAX_CAPTURE_BYTES; stdoutTruncated = true; }
@@ -2170,6 +2270,7 @@ function spawnCaptureOneShot({ command, args = [], shell = false, detached = fal
     });
     child.stderr.on('data', (d) => {
       const buf = Buffer.isBuffer(d) ? d : Buffer.from(d);
+      if (teeErr) teeErr(buf.toString('utf8'), false);
       const remaining = MAX_CAPTURE_BYTES - stderrBytes;
       if (remaining <= 0) { stderrTruncated = true; return; }
       if (buf.length > remaining) { stderrChunks.push(buf.subarray(0, remaining)); stderrBytes = MAX_CAPTURE_BYTES; stderrTruncated = true; }
@@ -2233,7 +2334,7 @@ function baseAgentEnv(profile, job) {
  * Both paths resolve to the same result contract.
  */
 function runAgentJob(profile, job, opts = {}) {
-  const { timeoutMs, envelope, sandbox = 'none', image, runId, secretEnv = {}, passThroughSecretNames = [], cwd, extraEnv = {}, profileEnv = {} } = opts;
+  const { timeoutMs, envelope, sandbox = 'none', image, runId, secretEnv = {}, passThroughSecretNames = [], cwd, extraEnv = {}, profileEnv = {}, resultFile, stream = false, streamPrefix = '' } = opts;
   const payload = JSON.stringify(buildAgentPayload(profile, job, envelope));
   const agentEnv = baseAgentEnv(profile, job);
   // Static, non-secret env for the harness: the worker/profile's env (e.g. a
@@ -2243,6 +2344,8 @@ function runAgentJob(profile, job, opts = {}) {
   const staticEnv = { ...normalizeEnvMap(profileEnv), ...normalizeEnvMap(envelope?.setup?.env) };
 
   if (!CONTAINER_SANDBOXES.has(sandbox)) {
+    // Host: hand the agent the result file by its real path.
+    const resultEnv = resultFile ? { [AGENT_RESULT_FILE_ENV]: resultFile } : {};
     return spawnCaptureOneShot({
       command: profile.command,
       shell: true,
@@ -2250,20 +2353,34 @@ function runAgentJob(profile, job, opts = {}) {
       detached: process.platform !== 'win32',
       // When a repository was provisioned, run the harness IN the workspace.
       cwd,
-      env: { ...process.env, ...staticEnv, ...agentEnv, ...extraEnv, ...secretEnv },
+      env: { ...process.env, ...staticEnv, ...agentEnv, ...extraEnv, ...resultEnv, ...secretEnv },
       stdinData: payload,
       timeoutMs,
       onTimeout: (child) => killTree(child),
+      stream,
+      streamPrefix,
     });
   }
 
   const engine = sandbox;
   const containerName = `nano-${runId}`;
+  // Container: bind-mount the result file's directory read-write at a fixed
+  // in-container path and point AGENT_RESULT_FILE at the mounted file, so the
+  // agent writes it inside the sandbox and the harness reads it back on the host.
+  let resultEnv = {};
+  const mountArgs = [];
+  if (resultFile) {
+    const hostDir = dirname(resultFile);
+    const containerPath = `/nano-agent/${basename(resultFile)}`;
+    mountArgs.push('-v', `${hostDir}:/nano-agent`);
+    resultEnv = { [AGENT_RESULT_FILE_ENV]: containerPath };
+  }
   // Forward env by NAME only (`-e NAME`) so secret VALUES stay out of argv and
   // `docker inspect`; docker reads the value from our child's environment.
   const envArgs = [];
   for (const k of Object.keys(agentEnv)) envArgs.push('-e', k);
   for (const k of Object.keys(extraEnv)) envArgs.push('-e', k);
+  for (const k of Object.keys(resultEnv)) envArgs.push('-e', k);
   for (const n of passThroughSecretNames) envArgs.push('-e', n);
   for (const k of Object.keys(staticEnv)) envArgs.push('-e', k);
 
@@ -2276,6 +2393,7 @@ function runAgentJob(profile, job, opts = {}) {
     '--label', `nano.run=${runId}`,
     '--log-opt', 'max-size=10m',
     '--log-opt', 'max-file=3',
+    ...mountArgs,
     ...envArgs,
     image,
     'sh', '-c', profile.command,
@@ -2285,9 +2403,11 @@ function runAgentJob(profile, job, opts = {}) {
     command: engine,
     args,
     shell: false,
-    env: { ...process.env, ...staticEnv, ...agentEnv, ...extraEnv, ...secretEnv },
+    env: { ...process.env, ...staticEnv, ...agentEnv, ...extraEnv, ...resultEnv, ...secretEnv },
     stdinData: payload,
     timeoutMs,
+    stream,
+    streamPrefix,
     onTimeout: (child) => {
       try { spawnSync(engine, ['rm', '-f', containerName], { timeout: 15_000 }); } catch { /* best effort */ }
       try { killTree(child); } catch { /* best effort */ }
@@ -2297,7 +2417,7 @@ function runAgentJob(profile, job, opts = {}) {
 
 // Shape the io.nanobpm.agentResult output envelope. When a repository was
 // provisioned (increment 2a), the `git` block adds branch/commits/push/PR facts.
-function buildResultEnvelope(result, { sandbox, image, git } = {}) {
+function buildResultEnvelope(result, { sandbox, image, git, result: agentResult } = {}) {
   const status = result.ok ? 'completed' : (result.timedOut ? 'timedOut' : 'failed');
   const env = {
     schemaVersion: RESULT_ENVELOPE_SCHEMA_VERSION,
@@ -2311,6 +2431,9 @@ function buildResultEnvelope(result, { sandbox, image, git } = {}) {
     signal: result.signal ?? null,
     error: result.error ?? null,
   };
+  // The agent's structured result (as returned via $AGENT_RESULT_FILE / sentinel),
+  // preserved verbatim for auditability even when merged into the completion vars.
+  if (isPlainObject(agentResult)) env.result = agentResult;
   if (git) {
     env.repository = git.remote ?? null;
     env.branch = git.branch ?? null;
@@ -2408,6 +2531,9 @@ async function workAgent(req, flags) {
   // Git provisioning knobs (increment 2a — host harness with a repository).
   const cloneTimeoutMs = intFlag(flags?.['clone-timeout'], 120_000);
   const keepRuns = coerceBool(flags?.['keep-runs'], false);
+  // --stream: tee each agent job's live stdout/stderr to this console (spy/debug),
+  // in addition to the existing byte-capped capture used for the result envelope.
+  const stream = coerceBool(flags?.stream, false);
 
   // Tracks run ids currently executing so the reaper never removes a live
   // container out from under an in-flight job.
@@ -2534,7 +2660,17 @@ async function workAgent(req, flags) {
 
         let result;
         let gitResult = null;
+        // Private structured-result channel: hand the agent a file (outside any
+        // repo clone so it can't be `git add`ed) to write its job-result vars to.
+        let resultDir = null;
+        let resultFile = null;
         try {
+          try {
+            mkdirSync(agentRunsRoot(), { recursive: true });
+            resultDir = mkdtempSync(join(agentRunsRoot(), 'res-'));
+            resultFile = join(resultDir, 'result.json');
+          } catch { resultDir = null; resultFile = null; }
+
           result = await runAgentJob(profile, job, {
             timeoutMs: jobTimeoutMs,
             envelope,
@@ -2546,6 +2682,9 @@ async function workAgent(req, flags) {
             cwd,
             extraEnv,
             profileEnv,
+            resultFile,
+            stream,
+            streamPrefix: `[${jobType} ${job.jobKey}] `,
           });
 
           // Finalize git only when the harness succeeded — never push a
@@ -2572,14 +2711,29 @@ async function workAgent(req, flags) {
           if (runDir) liveRunDirs.delete(runDir);
         }
 
-        const resultEnvelope = buildResultEnvelope(result, { sandbox, image, git: gitResult });
+        // Read the agent's structured result: the file it wrote, else a stdout
+        // sentinel/`json fence fallback. The raw object is attached to the audit
+        // envelope; the sanitized (reserved-key-stripped) vars are merged into the
+        // job completion so the model sees `status`/`summary`/… as first-class
+        // outputs. Read before deleting the temp dir.
+        const rawResult = readAgentResultFile(resultFile) ?? parseResultFromStdout(result.stdout);
+        if (resultDir) { try { rmSync(resultDir, { recursive: true, force: true }); } catch { /* best effort */ } }
+        const resultVars = sanitizeResultVars(rawResult);
+
+        const resultEnvelope = buildResultEnvelope(result, { sandbox, image, git: gitResult, result: rawResult });
         if (result.ok) {
           const gitNote = gitResult
             ? ` [${gitResult.branch ? `branch ${gitResult.branch}` : 'detached HEAD'}: ${gitResult.commits.length} commit(s), ${gitResult.branch ? (gitResult.pushed ? 'pushed' : (gitResult.pushError ? 'push FAILED' : 'not pushed')) : 'no branch to push'}${gitResult.pr?.found ? `, PR #${gitResult.pr.number}` : ''}]`
             : '';
           logger.info(`[${jobType}] job ${job.jobKey} complete (exit 0)${result.truncated ? ' [output truncated]' : ''}${gitNote}`);
           if (gitResult?.pushError) logger.warn(`[${jobType}] job ${job.jobKey}: branch push failed — ${gitResult.pushError}`);
+          // Guard the operator against silent empty escalations: a success with no
+          // structured result means the model's status/decision vars will be unset.
+          if (!rawResult) logger.warn(`[${jobType}] job ${job.jobKey}: agent returned no structured result — write a JSON object to $AGENT_RESULT_FILE (or print a "${RESULT_SENTINEL} {…}" line) so downstream gateways see status/summary/etc.`);
+          const resultKeys = Object.keys(resultVars);
+          if (resultKeys.length > 0) logger.info(`[${jobType}] job ${job.jobKey}: merged agent result vars [${resultKeys.join(', ')}]`);
           return job.complete({
+            ...resultVars,
             [AGENT_RESULT_KEY]: resultEnvelope,
             output: result.stdout,
             exitCode: 0,
@@ -3875,6 +4029,10 @@ export {
   hostEnvSecretResolver,
   buildAgentPayload,
   buildResultEnvelope,
+  parseAgentResultObject,
+  readAgentResultFile,
+  parseResultFromStdout,
+  sanitizeResultVars,
   parseEnvPairs,
   normalizeEnvMap,
   reapAgentContainers,
@@ -3893,6 +4051,8 @@ export {
   jobTypeMatrix,
   AGENT_TASK_NS,
   AGENT_RESULT_KEY,
+  RESULT_SENTINEL,
+  RESERVED_RESULT_KEYS,
   SANDBOXES,
 };
 
@@ -3987,6 +4147,7 @@ export const commands = {
       'min-free-mb': { type: 'string', description: 'work: shed jobs when the engine data root has less than this many MB free (default 1024)' },
       'clone-timeout': { type: 'string', description: 'work: max time in ms for cloning a task repository on the host (default 120000)' },
       'keep-runs': { type: 'boolean', description: 'work: keep per-job workspaces under <state>/agent-runs instead of deleting them after each job (debug)' },
+      stream: { type: 'boolean', description: 'work: tee each agent job\'s live stdout/stderr to this console, prefixed with the job type + key (spy/debug)' },
       list: { type: 'boolean', description: 'hire: list existing agent profiles instead of creating one' },
       'max-parallel': { type: 'string', description: 'work: max concurrent jobs per worker (default 1)' },
       'job-timeout': { type: 'string', description: 'work: max harness runtime per job in ms; the spawned process is killed past this (default 300000)' },
@@ -4133,7 +4294,7 @@ function printUsage() {
   console.log('  c8ctl nano config');
   console.log('  c8ctl nano update [--check]');
   console.log('  c8ctl nano hire [--name <n>] [--rank <r>] [--command <c>] [--model <m>] [--capabilities <a,b>] [--sandbox none|docker|podman] [--image <ref>] [--env NAME=VALUE ...] [--list]');
-  console.log('  c8ctl nano work <profileName> [--max-parallel <n>] [--job-timeout <ms>] [--sandbox none|docker|podman] [--image <ref>] [--env NAME=VALUE ...] [--secret-resolver host] [--min-free-mb <n>] [--clone-timeout <ms>] [--keep-runs]');
+  console.log('  c8ctl nano work <profileName> [--max-parallel <n>] [--job-timeout <ms>] [--sandbox none|docker|podman] [--image <ref>] [--env NAME=VALUE ...] [--secret-resolver host] [--min-free-mb <n>] [--clone-timeout <ms>] [--keep-runs] [--stream]');
   console.log('');
   console.log('Subcommands:');
   console.log('  start    Spawn an N-node local cluster wired to talk to each other on localhost');

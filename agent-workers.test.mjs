@@ -19,6 +19,10 @@ import {
   makeSecretResolver,
   buildAgentPayload,
   buildResultEnvelope,
+  parseAgentResultObject,
+  readAgentResultFile,
+  parseResultFromStdout,
+  sanitizeResultVars,
   parseEnvPairs,
   normalizeEnvMap,
   reapAgentContainers,
@@ -35,6 +39,8 @@ import {
   ProvisionError,
   AGENT_TASK_NS,
   AGENT_RESULT_KEY,
+  RESULT_SENTINEL,
+  RESERVED_RESULT_KEYS,
   SANDBOXES,
 } from './c8ctl-plugin.js';
 
@@ -209,7 +215,80 @@ test('buildResultEnvelope merges the git block when a repo was provisioned', () 
   assert.equal(failed.gitError, 'finalize failed');
 });
 
-// --- Git provisioning (increment 2a) ----------------------------------------
+// --- Structured agent result channel ($AGENT_RESULT_FILE + fallback) ---------
+
+test('parseAgentResultObject accepts only plain JSON objects', () => {
+  assert.deepEqual(parseAgentResultObject('{"status":"converged"}'), { status: 'converged' });
+  assert.equal(parseAgentResultObject(''), null);
+  assert.equal(parseAgentResultObject('   '), null);
+  assert.equal(parseAgentResultObject('not json'), null);
+  assert.equal(parseAgentResultObject('[1,2,3]'), null, 'arrays are not result objects');
+  assert.equal(parseAgentResultObject('42'), null);
+  assert.equal(parseAgentResultObject('null'), null);
+});
+
+test('readAgentResultFile reads the file the agent wrote, tolerating absence/garbage', () => {
+  const dir = mkdtempSync(join(tmpdir(), 'res-'));
+  try {
+    const p = join(dir, 'result.json');
+    assert.equal(readAgentResultFile(p), null, 'missing file → null');
+    assert.equal(readAgentResultFile(null), null);
+    writeFileSync(p, '{"status":"needs_input","question":"which base branch?"}');
+    assert.deepEqual(readAgentResultFile(p), { status: 'needs_input', question: 'which base branch?' });
+    writeFileSync(p, 'corrupt {');
+    assert.equal(readAgentResultFile(p), null, 'malformed file → null, never throws');
+  } finally {
+    rmSync(dir, { recursive: true, force: true });
+  }
+});
+
+test('parseResultFromStdout prefers the last sentinel line, then the last json fence', () => {
+  // Sentinel wins and "last wins" supersedes an earlier draft.
+  const withSentinel = [
+    'thinking out loud...',
+    `${RESULT_SENTINEL} {"status":"addressed"}`,
+    'more chatter',
+    `${RESULT_SENTINEL} {"status":"converged","summary":"all resolved"}`,
+  ].join('\n');
+  assert.deepEqual(parseResultFromStdout(withSentinel), { status: 'converged', summary: 'all resolved' });
+
+  // No sentinel → fall back to the last ```json fenced block.
+  const withFence = 'prose\n```json\n{"status":"blocked"}\n```\ntrailing prose\n';
+  assert.deepEqual(parseResultFromStdout(withFence), { status: 'blocked' });
+
+  assert.equal(parseResultFromStdout('just a transcript, no result'), null);
+  assert.equal(parseResultFromStdout(''), null);
+});
+
+test('sanitizeResultVars strips harness-reserved keys and the io.nanobpm namespace', () => {
+  const vars = sanitizeResultVars({
+    status: 'converged',
+    summary: 'ok',
+    output: 'agent tried to clobber capture',
+    exitCode: 137,
+    agent: 'impostor',
+    truncated: true,
+    branch: 'evil',
+    [AGENT_RESULT_KEY]: { forged: true },
+    'io.nanobpm.somethingElse': 1,
+  });
+  assert.deepEqual(vars, { status: 'converged', summary: 'ok' });
+  for (const k of RESERVED_RESULT_KEYS) assert.equal(k in vars, false, `${k} must be stripped`);
+  assert.deepEqual(sanitizeResultVars(null), {});
+  assert.deepEqual(sanitizeResultVars('nope'), {});
+});
+
+test('buildResultEnvelope preserves the parsed agent result for audit', () => {
+  const env = buildResultEnvelope(
+    { ok: true, stdout: 'transcript', exitCode: 0 },
+    { sandbox: 'none', result: { status: 'converged', summary: 'done' } },
+  );
+  assert.deepEqual(env.result, { status: 'converged', summary: 'done' });
+  const none = buildResultEnvelope({ ok: true, stdout: '', exitCode: 0 }, { sandbox: 'none' });
+  assert.equal('result' in none, false, 'no result key when the agent returned nothing');
+});
+
+
 // These use the real `git` binary against local file:// repos — no network, no
 // token — so they run in CI. gh-backed PR reconcile is gated separately.
 const gitOk = (() => {
@@ -543,6 +622,26 @@ test('runAgentJob (host) reserved AGENT_* cannot be shadowed by profileEnv', asy
     timeoutMs: 30_000,
   });
   assert.equal(result.stdout, 'shadowy', 'reserved AGENT_* wins over user env');
+});
+
+test('runAgentJob (host) exports AGENT_RESULT_FILE for the agent to write', async () => {
+  const dir = mkdtempSync(join(tmpdir(), 'res-'));
+  try {
+    const resultFile = join(dir, 'result.json');
+    // The agent writes its structured result to the handed path.
+    const profile = { name: 'p', rank: 'senior', command: 'printf %s \'{"status":"converged","summary":"ok"}\' > "$AGENT_RESULT_FILE"', model: '', capabilities: [] };
+    const job = { jobKey: 'jk', type: 'senior', variables: {}, customHeaders: {} };
+    const result = await runAgentJob(profile, job, {
+      sandbox: 'none',
+      envelope: normalizeTaskEnvelope({}, {}),
+      timeoutMs: 30_000,
+      resultFile,
+    });
+    assert.equal(result.ok, true, result.error || result.stderr);
+    assert.deepEqual(readAgentResultFile(resultFile), { status: 'converged', summary: 'ok' });
+  } finally {
+    rmSync(dir, { recursive: true, force: true });
+  }
 });
 
 test('reapAgentRunDirs age-gates and skips in-flight dirs', () => {

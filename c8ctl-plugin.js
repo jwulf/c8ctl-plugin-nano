@@ -1955,18 +1955,23 @@ function provisionRepo({ envelope, token, runDir, timeoutMs = 120_000 }) {
   runGit(['config', 'user.name', process.env.GIT_AUTHOR_NAME || 'nano-agent'], { cwd: workspaceDir, env: gitEnv });
   runGit(['config', 'user.email', process.env.GIT_AUTHOR_EMAIL || 'nano-agent@users.noreply.github.com'], { cwd: workspaceDir, env: gitEnv });
 
-  let workingBranch = target;
+  // Determine the working branch. With branch.create we make a real branch.
+  // Otherwise we're on whatever the clone checked out: a branch only if
+  // rev-parse resolves a symbolic name — a tag/sha leaves detached HEAD, in
+  // which case there is NO branch to push and workingBranch stays null so
+  // finalizeGit skips the push/PR reconcile instead of pushing a bogus ref.
+  let workingBranch = null;
   if (envelope.branch?.create) {
     const cb = runGit(['checkout', '-B', envelope.branch.create], { cwd: workspaceDir, env: gitEnv });
     if (cb.status !== 0) throw new ProvisionError(`git checkout -B ${envelope.branch.create} failed: ${redactToken(cb.stderr, token).trim().slice(0, 300)}`);
     workingBranch = envelope.branch.create;
-  }
-  if (!workingBranch) {
+  } else {
     const head = runGit(['rev-parse', '--abbrev-ref', 'HEAD'], { cwd: workspaceDir, env: gitEnv });
-    workingBranch = (head.stdout || '').trim() || 'HEAD';
+    const name = (head.stdout || '').trim();
+    workingBranch = (name && name !== 'HEAD') ? name : null; // null ⇒ detached HEAD
   }
   const sha = runGit(['rev-parse', 'HEAD'], { cwd: workspaceDir, env: gitEnv });
-  return { workspaceDir, gitEnv, startSha: (sha.stdout || '').trim(), workingBranch, remote: redactToken(repo.url, token) };
+  return { workspaceDir, gitEnv, startSha: (sha.stdout || '').trim(), workingBranch, detached: !workingBranch, remote: redactToken(repo.url, token) };
 }
 
 // Look up a PR for this branch (2a does NOT open it — the harness does, driven
@@ -2005,13 +2010,15 @@ function finalizeGit({ workspaceDir, gitEnv, startSha, workingBranch, envelope, 
     if (log.status === 0) out.commits = log.stdout.trim().split('\n').filter(Boolean);
   }
 
-  if (coerceBool(envelope.branch?.push, true) && out.commits.length > 0) {
+  if (!workingBranch) {
+    out.detached = true; // clone landed on a tag/sha ⇒ no branch to push
+  } else if (coerceBool(envelope.branch?.push, true) && out.commits.length > 0) {
     const push = runGit([...credArgs(token), 'push', '--set-upstream', 'origin', workingBranch], { cwd: workspaceDir, env: gitEnv });
     if (push.status === 0) out.pushed = true;
     else out.pushError = redactToken(push.stderr || push.stdout, token).trim().slice(0, 300) || `push exit ${push.status}`;
   }
 
-  if (envelope.task?.allowPr) {
+  if (workingBranch && envelope.task?.allowPr) {
     out.pr = reconcileAgentPr({ workspaceDir, token, branch: workingBranch, provider: envelope.repository?.provider || 'github' });
   }
   return out;
@@ -2439,7 +2446,7 @@ async function workAgent(req, flags) {
             extraEnv = {
               AGENT_WORKSPACE: provisioned.workspaceDir,
               AGENT_REPO_URL: provisioned.remote,
-              AGENT_REPO_BRANCH: provisioned.workingBranch,
+              AGENT_REPO_BRANCH: provisioned.workingBranch || '',
               AGENT_REPO_REF: envelope.repository.ref || '',
             };
           } catch (err) {
@@ -2481,7 +2488,7 @@ async function workAgent(req, flags) {
                 token: repoToken,
               });
             } catch (err) {
-              gitResult = { branch: provisioned.workingBranch, commits: [], pushed: false, error: err.message };
+              gitResult = { branch: provisioned.workingBranch, commits: [], pushed: false, error: redactToken(err.message, repoToken) };
             }
           } else if (provisioned) {
             gitResult = { branch: provisioned.workingBranch, baseSha: provisioned.startSha || null, commits: [], pushed: false };

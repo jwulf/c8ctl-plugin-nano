@@ -240,6 +240,35 @@ test('provisionRepo clones + creates the working branch', { skip: !gitOk }, () =
   }
 });
 
+test('provisionRepo reports detached HEAD (tag ref, no create) and finalizeGit skips push', { skip: !gitOk }, () => {
+  const { root, origin } = makeOriginRepo();
+  // tag the seed commit on the origin so we can clone --branch <tag>
+  const tagClone = mkdtempSync(join(root, 'tag-'));
+  g(['clone', '-q', origin, tagClone], undefined);
+  g(['tag', 'v1'], tagClone);
+  g(['push', '-q', 'origin', 'v1'], tagClone);
+  const runDir = mkdtempSync(join(root, 'run-'));
+  try {
+    const envelope = {
+      schemaVersion: 1,
+      repository: { provider: 'github', url: origin, ref: 'v1', submodules: false },
+      branch: { base: '', create: '', push: true },
+      setup: { commands: [], env: {}, secretRefs: [] },
+      task: { allowPr: true },
+    };
+    const prov = provisionRepo({ envelope, token: null, runDir });
+    assert.equal(prov.workingBranch, null, 'a tag checkout has no branch');
+    assert.equal(prov.detached, true);
+    const out = finalizeGit({ ...prov, envelope, token: null });
+    assert.equal(out.pushed, false, 'never push a detached HEAD');
+    assert.equal(out.detached, true);
+    assert.equal(out.pushError, undefined, 'no push attempted, so no push error');
+    assert.equal(out.pr, null, 'no PR reconcile without a branch');
+  } finally {
+    rmSync(root, { recursive: true, force: true });
+  }
+});
+
 test('provisionRepo throws a ProvisionError (redacted) on clone failure', { skip: !gitOk }, () => {
   const root = mkdtempSync(join(tmpdir(), 'nano-git-'));
   const runDir = mkdtempSync(join(root, 'run-'));

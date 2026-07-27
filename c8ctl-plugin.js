@@ -2085,6 +2085,10 @@ function reapAgentRunDirs({ maxAgeMs = 0, liveRunDirs = new Set() } = {}) {
     if (!existsSync(root)) return { reaped };
     const now = Date.now();
     for (const name of readdirSync(root)) {
+      // Only reap the `run-*` workspaces this worker creates (see the
+      // `mkdtempSync(join(agentRunsRoot(), 'run-'))` in workAgent). Never touch
+      // unrelated files/dirs an operator may have placed under agent-runs.
+      if (!name.startsWith('run-')) continue;
       const p = join(root, name);
       if (liveRunDirs.has(p)) continue;
       try {

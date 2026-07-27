@@ -1,3 +1,10 @@
+## [1.10.1](https://github.com/jwulf/c8ctl-plugin-nano/compare/v1.10.0...v1.10.1) (2026-07-27)
+
+
+### Bug Fixes
+
+* drop --profile start alias that collides with c8ctl global --profile ([#12](https://github.com/jwulf/c8ctl-plugin-nano/issues/12)) ([89d1395](https://github.com/jwulf/c8ctl-plugin-nano/commit/89d1395482bdcba8746761a9f6c2f739056c1010))
+
 # [1.10.0](https://github.com/jwulf/c8ctl-plugin-nano/compare/v1.9.0...v1.10.0) (2026-07-26)
 
 

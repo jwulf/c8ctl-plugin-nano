@@ -333,7 +333,7 @@ test('redactToken masks the token and any https userinfo', () => {
 
 test('reconcileAgentPr reports unsupported provider without shelling out', () => {
   const r = reconcileAgentPr({ workspaceDir: '/tmp', token: null, branch: 'x', provider: 'gitlab' });
-  assert.equal(r.openedBy, 'agent');
+  assert.equal(r.openedBy, null);
   assert.equal(r.found, false);
   assert.match(r.error, /unsupported/);
 });

@@ -1915,6 +1915,14 @@ function authUrl(url, provider, hasToken) {
 
 class ProvisionError extends Error {}
 
+// Without a resolved token an https clone/push must NOT silently fall back to
+// the operator's configured credential helper or cached creds. Reset the helper
+// list ("") so no helper runs; combined with GIT_TERMINAL_PROMPT=0 and no
+// GIT_ASKPASS this keeps an anonymous clone genuinely anonymous.
+function credArgs(token) {
+  return token ? [] : ['-c', 'credential.helper='];
+}
+
 // Clone repo into <runDir>/workspace and check out / create the working branch.
 // Returns { workspaceDir, gitEnv, startSha, workingBranch, remote }. Throws a
 // ProvisionError (token-redacted) on any git failure so the caller can shed.
@@ -1931,7 +1939,7 @@ function provisionRepo({ envelope, token, runDir, timeoutMs = 120_000 }) {
   if (askpass) { gitEnv.GIT_ASKPASS = askpass; gitEnv.GIT_TOKEN = token; }
 
   const target = repo.ref || envelope.branch?.base || '';
-  const cloneArgs = ['clone', '--no-tags'];
+  const cloneArgs = [...credArgs(token), 'clone', '--no-tags'];
   if (repo.depth && repo.depth > 0) cloneArgs.push('--depth', String(repo.depth));
   if (repo.submodules) cloneArgs.push('--recurse-submodules');
   if (target) cloneArgs.push('--branch', target);
@@ -1961,23 +1969,24 @@ function provisionRepo({ envelope, token, runDir, timeoutMs = 120_000 }) {
   return { workspaceDir, gitEnv, startSha: (sha.stdout || '').trim(), workingBranch, remote: redactToken(repo.url, token) };
 }
 
-// Look up a PR the agent opened for this branch (2a does NOT open it — the
-// harness does, driven by the prompt). Uses gh with the resolved token so it
-// works headless. Returns a { openedBy:'agent', found, ... } block.
+// Look up a PR for this branch (2a does NOT open it — the harness does, driven
+// by the prompt). Uses gh with the resolved token so it works headless. Reports
+// the PR's ACTUAL author login in `openedBy` (null when unknown/not found) —
+// gh returns whatever PR is open for the head branch, which may not be ours.
 function reconcileAgentPr({ workspaceDir, token, branch, provider }) {
-  if (provider && provider !== 'github') return { openedBy: 'agent', found: false, error: `PR reconcile unsupported for provider "${provider}"` };
+  if (provider && provider !== 'github') return { openedBy: null, found: false, error: `PR reconcile unsupported for provider "${provider}"` };
   const env = { ...process.env };
   if (token) env.GH_TOKEN = token;
   try {
-    const r = spawnSync('gh', ['pr', 'list', '--head', branch, '--state', 'all', '--json', 'number,url,state,isDraft,title', '--limit', '1'],
+    const r = spawnSync('gh', ['pr', 'list', '--head', branch, '--state', 'all', '--json', 'number,url,state,isDraft,title,author', '--limit', '1'],
       { cwd: workspaceDir, env, encoding: 'utf8', timeout: 30_000 });
-    if (r.status !== 0) return { openedBy: 'agent', found: false, error: redactToken(r.stderr, token).trim().slice(0, 200) || 'gh pr list failed' };
+    if (r.status !== 0) return { openedBy: null, found: false, error: redactToken(r.stderr, token).trim().slice(0, 200) || 'gh pr list failed' };
     const arr = JSON.parse((r.stdout || '[]').trim() || '[]');
-    if (!Array.isArray(arr) || arr.length === 0) return { openedBy: 'agent', found: false };
+    if (!Array.isArray(arr) || arr.length === 0) return { openedBy: null, found: false };
     const pr = arr[0];
-    return { openedBy: 'agent', found: true, number: pr.number, url: pr.url, state: pr.state, isDraft: !!pr.isDraft, title: pr.title };
+    return { openedBy: pr.author?.login || null, found: true, number: pr.number, url: pr.url, state: pr.state, isDraft: !!pr.isDraft, title: pr.title };
   } catch (err) {
-    return { openedBy: 'agent', found: false, error: err.message };
+    return { openedBy: null, found: false, error: err.message };
   }
 }
 
@@ -1997,7 +2006,7 @@ function finalizeGit({ workspaceDir, gitEnv, startSha, workingBranch, envelope, 
   }
 
   if (coerceBool(envelope.branch?.push, true) && out.commits.length > 0) {
-    const push = runGit(['push', '--set-upstream', 'origin', workingBranch], { cwd: workspaceDir, env: gitEnv });
+    const push = runGit([...credArgs(token), 'push', '--set-upstream', 'origin', workingBranch], { cwd: workspaceDir, env: gitEnv });
     if (push.status === 0) out.pushed = true;
     else out.pushError = redactToken(push.stderr || push.stdout, token).trim().slice(0, 300) || `push exit ${push.status}`;
   }
@@ -3894,8 +3903,8 @@ export const commands = {
       image: { type: 'string', description: 'hire/work: container image the agent runs in (required for --sandbox docker|podman)' },
       env: { type: 'string', multiple: true, description: 'hire/work: static env var for the harness as NAME=VALUE (repeatable); persisted on hire, work extends/overrides. E.g. permission toggles.' },
       'secret-resolver': { type: 'string', description: 'work: secret resolver for task secretRefs (host = process env; default host)' },
-      'reap-age': { type: 'string', description: 'work: age in ms before a finished agent container is reaped (default 3600000)' },
-      'reap-interval': { type: 'string', description: 'work: how often to sweep finished agent containers in ms (default 300000)' },
+      'reap-age': { type: 'string', description: 'work: age in ms before a finished agent container or job workspace is reaped (default 3600000)' },
+      'reap-interval': { type: 'string', description: 'work: how often to sweep finished agent containers and job workspaces in ms (default 300000)' },
       'min-free-mb': { type: 'string', description: 'work: shed jobs when the engine data root has less than this many MB free (default 1024)' },
       'clone-timeout': { type: 'string', description: 'work: max time in ms for cloning a task repository on the host (default 120000)' },
       'keep-runs': { type: 'boolean', description: 'work: keep per-job workspaces under <state>/agent-runs instead of deleting them after each job (debug)' },
@@ -4088,8 +4097,8 @@ function printUsage() {
   console.log('  --max-parallel <n>   work: max concurrent jobs per worker (default 1)');
   console.log('  --job-timeout <ms>   work: max harness runtime per job in ms (default 300000)');
   console.log('  --secret-resolver <r> work: secret resolver for task secretRefs (host; default host)');
-  console.log('  --reap-age <ms>      work: age before a finished agent container is reaped (default 3600000)');
-  console.log('  --reap-interval <ms> work: how often to sweep finished agent containers (default 300000)');
+  console.log('  --reap-age <ms>      work: age before a finished agent container/workspace is reaped (default 3600000)');
+  console.log('  --reap-interval <ms> work: how often to sweep finished agent containers/workspaces (default 300000)');
   console.log('  --min-free-mb <n>    work: shed jobs when the engine data root has < this many MB free (default 1024)');
   console.log('  --clone-timeout <ms> work: max time to clone a task repository on the host (default 120000)');
   console.log('  --keep-runs          work: keep per-job workspaces instead of deleting them (debug)');

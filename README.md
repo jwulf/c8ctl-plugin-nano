@@ -238,7 +238,8 @@ the harness:
    envelope on stdin;
 5. on success, enumerate new commits, `git push` the branch when `branch.push`
    (default true), and — when `task.allowPr` — **reconcile the PR the agent
-   opened** for the branch (`gh pr list --head <branch>`; `openedBy:"agent"`).
+   opened** for the branch (`gh pr list --head <branch>`; `openedBy` reports the
+   PR's actual author login, or `null` when none is found).
 
 The token is delivered to git via `GIT_ASKPASS` (env), never on argv or in the
 remote URL, and is redacted from all logs/results. A push failure is reported as

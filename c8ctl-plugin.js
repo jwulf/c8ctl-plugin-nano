@@ -41,9 +41,11 @@ import {
   renameSync,
   realpathSync,
   statfsSync,
+  lstatSync,
+  mkdtempSync,
 } from 'node:fs';
 import { randomUUID } from 'node:crypto';
-import { homedir, platform as osPlatform } from 'node:os';
+import { homedir, platform as osPlatform, devNull } from 'node:os';
 import { join, isAbsolute, resolve as resolvePath, dirname, sep } from 'node:path';
 import { createRequire } from 'node:module';
 import { fileURLToPath } from 'node:url';
@@ -1316,6 +1318,41 @@ function normalizeCapabilities(input) {
   return [...new Set(raw.map((c) => String(c).trim().toLowerCase()).filter(Boolean))].sort();
 }
 
+// A conventional (POSIX-ish) environment variable name.
+const ENV_NAME_RE = /^[A-Za-z_][A-Za-z0-9_]*$/;
+
+// Normalize a stored/model env map into a clean { NAME: "value" } object:
+// drops entries with an invalid name, coerces values to strings. Used for the
+// profile's static env and the per-job envelope's setup.env.
+function normalizeEnvMap(input) {
+  const out = {};
+  if (!isPlainObject(input)) return out;
+  for (const [k, v] of Object.entries(input)) {
+    if (!ENV_NAME_RE.test(k)) continue;
+    if (v == null) continue;
+    out[k] = String(v);
+  }
+  return out;
+}
+
+// Parse repeatable `--env NAME=VALUE` CLI input (string | string[]) into a map.
+// The value may contain `=`; only the first `=` splits. Returns { env, errors }.
+function parseEnvPairs(input) {
+  const list = input == null ? [] : (Array.isArray(input) ? input : [input]);
+  const env = {};
+  const errors = [];
+  for (const item of list) {
+    const s = String(item);
+    const eq = s.indexOf('=');
+    // Never echo the value in diagnostics — a user may pass a secret via --env.
+    if (eq <= 0) { errors.push(`--env entry ${eq === 0 ? 'has an empty name' : 'must be NAME=VALUE'} (value hidden)`); continue; }
+    const name = s.slice(0, eq);
+    if (!ENV_NAME_RE.test(name)) { errors.push(`--env name "${name}" is invalid (must match ${ENV_NAME_RE.source})`); continue; }
+    env[name] = s.slice(eq + 1);
+  }
+  return { env, errors };
+}
+
 /** A profile name must be a safe, filesystem/token-friendly slug. */
 function isValidProfileName(name) {
   return typeof name === 'string' && /^[a-z0-9][a-z0-9._-]*$/i.test(name);
@@ -1388,6 +1425,7 @@ function normalizeStoredProfile(name, profile) {
       capabilities: normalizeCapabilities(profile.capabilities),
       sandbox,
       image,
+      env: normalizeEnvMap(profile.env),
     },
   };
 }
@@ -1427,8 +1465,19 @@ async function hireWorker(req, flags) {
   let capabilities = flags?.capabilities !== undefined ? flags.capabilities : undefined;
   let sandbox = flags?.sandbox !== undefined ? String(flags.sandbox).trim().toLowerCase() : undefined;
   let image = flags?.image !== undefined ? String(flags.image).trim() : undefined;
+  const envFromFlags = flags?.env !== undefined;
+  const { env: profileEnv, errors: envErrors } = parseEnvPairs(flags?.env);
+  if (envErrors.length > 0) {
+    logger.error(envErrors.join('; '));
+    logger.info('Example: c8ctl nano hire --name coder --rank senior --command copilot --env COPILOT_ENABLE_ALL_TOOLS=1 --env FOO=bar');
+    process.exit(1);
+  }
 
   const missingRequired = !name || !rank || !command;
+  // NOTE: --env is deliberately NOT part of missingOptional — a fully-specified
+  // scripted hire must not be forced into interactive mode just to skip env.
+  // The env prompt below is gated separately on !envFromFlags, so it only runs
+  // when we're already interactive for another reason.
   const missingOptional = model === undefined || capabilities === undefined;
   const interactive = process.stdin.isTTY && process.stdout.isTTY;
 
@@ -1466,6 +1515,19 @@ async function hireWorker(req, flags) {
       }
       if (capabilities === undefined) {
         capabilities = (await rl.question('Capabilities (comma-separated, optional): ')).trim();
+      }
+      // Static harness env (permission toggles, etc.). Prompted one NAME=VALUE at
+      // a time — blank finishes — so values may safely contain '=' and ','.
+      // Skipped when --env was supplied on the command line.
+      if (!envFromFlags) {
+        console.log('Harness env vars — NAME=VALUE, blank to finish (optional):');
+        for (;;) {
+          const ans = (await rl.question('  env (NAME=VALUE): ')).trim();
+          if (!ans) break;
+          const { env: one, errors } = parseEnvPairs([ans]);
+          if (errors.length > 0) { console.log(`  ${errors.join('; ')}`); continue; }
+          Object.assign(profileEnv, one);
+        }
       }
     } finally {
       rl.close();
@@ -1509,6 +1571,7 @@ async function hireWorker(req, flags) {
     capabilities: normalizeCapabilities(capabilities),
     sandbox,
     image: image || '',
+    env: profileEnv,
     createdAt: new Date().toISOString(),
   };
   writeHire(profile);
@@ -1518,6 +1581,8 @@ async function hireWorker(req, flags) {
   logger.info(`  model: ${profile.model || '(none)'}`);
   logger.info(`  capabilities: ${profile.capabilities.join(', ') || '(none)'}`);
   logger.info(`  sandbox: ${profile.sandbox}${CONTAINER_SANDBOXES.has(profile.sandbox) ? ` (image ${profile.image})` : ''}`);
+  const envKeys = Object.keys(profile.env);
+  if (envKeys.length > 0) logger.info(`  env: ${envKeys.join(', ')}`);
   logger.info(`  job types (${matrix.length}): ${matrix.join('  ')}`);
   logger.info(`Put it to work with: c8ctl nano work ${name}`);
 }
@@ -1657,7 +1722,7 @@ function normalizeTaskEnvelope(customHeaders, variables) {
   const repo = raw.repository;
   if (isPlainObject(repo) && str(repo.url)) {
     env.repository = {
-      provider: str(repo.provider) || 'github',
+      provider: (str(repo.provider) || 'github').toLowerCase(),
       url: str(repo.url),
       ref: str(repo.ref),
       depth: coerceInt(repo.depth, undefined),
@@ -1800,13 +1865,270 @@ function reapAgentContainers(engine, { maxAgeMs = 0, liveRunIds = new Set() } = 
   return { reaped };
 }
 
+// ---- Git provisioning (issue #8, increment 2a — host harness) --------------
+// A repository-bearing task is provisioned on the HOST: clone into a throwaway
+// run dir, check out / create the working branch, run the harness with the
+// workspace as CWD, then push the branch + reconcile the agent-opened PR.
+// Container-side provisioning (strong isolation) is a later increment.
+
+function agentRunsRoot() {
+  return join(getStateHome(), 'agent-runs');
+}
+
+// Redact a token that may have been embedded in a URL or surfaced in git output,
+// plus any https userinfo (x-access-token:secret@host), before it hits a log or
+// the result envelope.
+function redactToken(text, token) {
+  let s = String(text ?? '');
+  if (token) s = s.split(token).join('***');
+  return s.replace(/(https?:\/\/)[^@/\s]+@/gi, '$1');
+}
+
+function runGit(args, { cwd, env, timeoutMs = 120_000 } = {}) {
+  try {
+    const r = spawnSync('git', args, { cwd, env, encoding: 'utf8', timeout: timeoutMs });
+    return { status: r.status ?? (r.signal ? 128 : null), stdout: r.stdout || '', stderr: r.stderr || '', signal: r.signal || null };
+  } catch (err) {
+    return { status: null, stdout: '', stderr: err.message, signal: null };
+  }
+}
+
+// Write a GIT_ASKPASS helper that echoes $GIT_TOKEN, so the token reaches git
+// via the child's ENV — never on argv or in the remote URL. Uses a Node helper
+// (askpass.js reads GIT_TOKEN and writes it verbatim), launched by a per-OS
+// shim: git can't exec a POSIX `.sh` on Windows, and a raw `.cmd` would let
+// cmd.exe re-parse token metacharacters (&, |, ^). The shim keeps the token in
+// env only and never expands it in a shell.
+function writeAskpass(dir, token) {
+  if (!token) return null;
+  const js = join(dir, 'askpass.js');
+  writeFileSync(js, 'process.stdout.write(process.env.GIT_TOKEN || "");\n', { mode: 0o600 });
+  // Launch via this process's own Node (process.execPath) rather than bare
+  // `node`, which may not be on PATH when Node was invoked by absolute path.
+  const node = process.execPath;
+  if (process.platform === 'win32') {
+    const p = join(dir, 'askpass.cmd');
+    writeFileSync(p, `@"${node}" "%~dp0askpass.js"\r\n`, { mode: 0o700 });
+    return p;
+  }
+  const p = join(dir, 'askpass.sh');
+  writeFileSync(p, `#!/bin/sh\nexec "${node}" "$(dirname "$0")/askpass.js"\n`, { mode: 0o700 });
+  try { chmodSync(p, 0o700); } catch { /* best effort */ }
+  return p;
+}
+
+// For https URLs, embed a username (no secret) so git asks GIT_ASKPASS for the
+// password. Non-https URLs and author-supplied credentials are left untouched.
+function authUrl(url, provider, hasToken) {
+  if (!hasToken) return url;
+  try {
+    const u = new URL(url);
+    if (u.protocol !== 'https:') return url;
+    if (u.username || u.password) return url; // author already embedded creds
+    u.username = provider === 'github' ? 'x-access-token' : 'git';
+    return u.toString();
+  } catch {
+    return url;
+  }
+}
+
+class ProvisionError extends Error {}
+
+// Never let git invoke the host's configured credential helper for our clone/
+// push. Reset the helper list ("") so no helper runs — even when we DO have a
+// token, because helpers like `store`/keychain would persist the job's repo
+// token to disk. GIT_ASKPASS supplies the secret directly, so no helper is
+// needed. Combined with GIT_TERMINAL_PROMPT=0 this keeps tokens ephemeral and
+// an absent-token clone genuinely anonymous.
+function credArgs() {
+  return ['-c', 'credential.helper='];
+}
+
+// Clone repo into <runDir>/workspace and check out / create the working branch.
+// Returns { workspaceDir, gitEnv, startSha, workingBranch, remote }. Throws a
+// ProvisionError (token-redacted) on any git failure so the caller can shed.
+function provisionRepo({ envelope, token, runDir, timeoutMs = 120_000 }) {
+  const repo = envelope.repository;
+  if (!repo || !repo.url) throw new ProvisionError('repository.url is required to provision a workspace');
+  const workspaceDir = join(runDir, 'workspace');
+  const askpass = writeAskpass(runDir, token);
+  const gitEnv = {
+    ...process.env,
+    GIT_TERMINAL_PROMPT: '0',
+    GIT_CONFIG_NOSYSTEM: '1',
+  };
+  // Drop any inherited askpass helpers so a no-token ("anonymous") clone can't
+  // authenticate with host-provided credentials. We re-set GIT_ASKPASS below
+  // only when we minted our own token-backed helper.
+  delete gitEnv.GIT_ASKPASS;
+  delete gitEnv.SSH_ASKPASS;
+  if (askpass) {
+    gitEnv.GIT_ASKPASS = askpass;
+    gitEnv.GIT_TOKEN = token;
+  } else {
+    // No token ⇒ honor the documented "anonymous" guarantee strictly: neutralize
+    // the user's global git config too, so knobs like http.<url>.extraHeader
+    // (added by `gh auth setup-git`) or url.<...>.insteadOf can't silently inject
+    // operator credentials. Only done on the anonymous path — token-backed jobs
+    // keep global config (e.g. http.proxy for reaching the remote).
+    gitEnv.GIT_CONFIG_GLOBAL = devNull;
+  }
+
+  const target = repo.ref || envelope.branch?.base || '';
+  // `git clone --branch` accepts a branch or tag name but NOT a raw commit SHA.
+  // For a SHA we clone the default branch, then fetch + check it out below.
+  const isSha = !!target && /^[0-9a-f]{7,40}$/i.test(target);
+  const cloneArgs = [...credArgs(), 'clone', '--no-tags'];
+  if (repo.depth && repo.depth > 0) cloneArgs.push('--depth', String(repo.depth));
+  if (repo.submodules) cloneArgs.push('--recurse-submodules');
+  if (target && !isSha) cloneArgs.push('--branch', target);
+  const remote = authUrl(repo.url, repo.provider || 'github', !!token);
+  cloneArgs.push(remote, workspaceDir);
+
+  const clone = runGit(cloneArgs, { env: gitEnv, timeoutMs });
+  if (clone.status !== 0) {
+    throw new ProvisionError(`git clone failed: ${redactToken(clone.stderr || clone.stdout, token).trim().slice(0, 500) || `exit ${clone.status}`}`);
+  }
+
+  if (isSha) {
+    // The SHA may not be present under a shallow clone of the default branch —
+    // fetch it explicitly (best effort), then check it out (detached HEAD).
+    const fetch = runGit([...credArgs(), 'fetch', '--no-tags', 'origin', target], { cwd: workspaceDir, env: gitEnv, timeoutMs });
+    const co = runGit(['checkout', '--detach', target], { cwd: workspaceDir, env: gitEnv });
+    if (co.status !== 0) {
+      const why = redactToken(co.stderr || fetch.stderr, token).trim().slice(0, 300);
+      throw new ProvisionError(`git checkout ${target} failed: ${why || `exit ${co.status}`}`);
+    }
+  }
+
+  // Give the harness a committer identity in case it commits (many do).
+  runGit(['config', 'user.name', process.env.GIT_AUTHOR_NAME || 'nano-agent'], { cwd: workspaceDir, env: gitEnv });
+  runGit(['config', 'user.email', process.env.GIT_AUTHOR_EMAIL || 'nano-agent@users.noreply.github.com'], { cwd: workspaceDir, env: gitEnv });
+
+  // Determine the working branch. With branch.create we make a real branch.
+  // Otherwise we're on whatever the clone checked out: a branch only if
+  // rev-parse resolves a symbolic name — a tag/sha leaves detached HEAD, in
+  // which case there is NO branch to push and workingBranch stays null so
+  // finalizeGit skips the push/PR reconcile instead of pushing a bogus ref.
+  let workingBranch = null;
+  if (envelope.branch?.create) {
+    const cb = runGit(['checkout', '-B', envelope.branch.create], { cwd: workspaceDir, env: gitEnv });
+    if (cb.status !== 0) throw new ProvisionError(`git checkout -B ${envelope.branch.create} failed: ${redactToken(cb.stderr, token).trim().slice(0, 300)}`);
+    workingBranch = envelope.branch.create;
+  } else {
+    const head = runGit(['rev-parse', '--abbrev-ref', 'HEAD'], { cwd: workspaceDir, env: gitEnv });
+    const name = (head.stdout || '').trim();
+    workingBranch = (name && name !== 'HEAD') ? name : null; // null ⇒ detached HEAD
+  }
+  const sha = runGit(['rev-parse', 'HEAD'], { cwd: workspaceDir, env: gitEnv });
+  // `git rev-parse HEAD` on an unborn branch (freshly cloned empty repo) exits
+  // non-zero and echoes the literal "HEAD" on stdout — treat that as "no base
+  // commit" (empty startSha) rather than a bogus revision.
+  return { workspaceDir, gitEnv, startSha: sha.status === 0 ? (sha.stdout || '').trim() : '', workingBranch, detached: !workingBranch, ref: target || '', remote: redactToken(repo.url, token) };
+}
+
+// Look up a PR for this branch (2a does NOT open it — the harness does, driven
+// by the prompt). Uses gh with the resolved token so it works headless. Reports
+// the PR's ACTUAL author login in `openedBy` (null when unknown/not found) —
+// gh returns whatever PR is open for the head branch, which may not be ours.
+function reconcileAgentPr({ workspaceDir, token, branch, provider }) {
+  if (provider && provider !== 'github') return { openedBy: null, found: false, error: `PR reconcile unsupported for provider "${provider}"` };
+  const env = { ...process.env };
+  if (token) {
+    env.GH_TOKEN = token;
+  } else {
+    // No job token ⇒ honor the anonymous guarantee: never let gh fall back to an
+    // operator-provided token in the ambient env. Scrub every gh auth source so
+    // PR reconcile can only use credentials we were explicitly handed.
+    for (const k of ['GH_TOKEN', 'GITHUB_TOKEN', 'GH_ENTERPRISE_TOKEN', 'GITHUB_ENTERPRISE_TOKEN']) delete env[k];
+  }
+  try {
+    const r = spawnSync('gh', ['pr', 'list', '--head', branch, '--state', 'all', '--json', 'number,url,state,isDraft,title,author', '--limit', '1'],
+      { cwd: workspaceDir, env, encoding: 'utf8', timeout: 30_000 });
+    if (r.error) return { openedBy: null, found: false, error: `gh not runnable: ${redactToken(r.error.message, token).trim().slice(0, 200)}` };
+    if (r.status !== 0) return { openedBy: null, found: false, error: redactToken(r.stderr, token).trim().slice(0, 200) || `gh pr list failed (exit ${r.status ?? 'null'}${r.signal ? `, signal ${r.signal}` : ''})` };
+    const arr = JSON.parse((r.stdout || '[]').trim() || '[]');
+    if (!Array.isArray(arr) || arr.length === 0) return { openedBy: null, found: false };
+    const pr = arr[0];
+    return { openedBy: pr.author?.login || null, found: true, number: pr.number, url: pr.url, state: pr.state, isDraft: !!pr.isDraft, title: pr.title };
+  } catch (err) {
+    return { openedBy: null, found: false, error: err.message };
+  }
+}
+
+// After the harness runs: enumerate new commits, push the branch (when
+// branch.push), and reconcile the agent-opened PR (when task.allowPr). A push
+// failure is reported (pushError) rather than thrown — the process model decides
+// what to do next, and re-running the agent would be non-idempotent.
+function finalizeGit({ workspaceDir, gitEnv, startSha, workingBranch, envelope, token }) {
+  const out = { branch: workingBranch, baseSha: startSha || null, headSha: null, commits: [], pushed: false, remote: null, pr: null };
+  const rem = runGit(['remote', 'get-url', 'origin'], { cwd: workspaceDir, env: gitEnv });
+  if (rem.status === 0) out.remote = redactToken(rem.stdout.trim(), token);
+  const headNow = runGit(['rev-parse', 'HEAD'], { cwd: workspaceDir, env: gitEnv });
+  out.headSha = headNow.status === 0 ? ((headNow.stdout || '').trim() || null) : null;
+  if (startSha) {
+    const log = runGit(['rev-list', `${startSha}..HEAD`], { cwd: workspaceDir, env: gitEnv });
+    if (log.status === 0) out.commits = log.stdout.trim().split('\n').filter(Boolean);
+  } else if (out.headSha) {
+    // Empty-repo case: provisionRepo found no initial commit (unborn branch), so
+    // there is no base to diff against — every commit now on HEAD is new. Without
+    // this, a harness that makes the repo's first commit would enumerate as "0
+    // commits" and the branch would never be pushed.
+    const log = runGit(['rev-list', 'HEAD'], { cwd: workspaceDir, env: gitEnv });
+    if (log.status === 0) out.commits = log.stdout.trim().split('\n').filter(Boolean);
+  }
+
+  if (!workingBranch) {
+    out.detached = true; // clone landed on a tag/sha ⇒ no branch to push
+  } else if (coerceBool(envelope.branch?.push, true) && out.commits.length > 0) {
+    const push = runGit([...credArgs(), 'push', '--set-upstream', 'origin', workingBranch], { cwd: workspaceDir, env: gitEnv });
+    if (push.status === 0) out.pushed = true;
+    else out.pushError = redactToken(push.stderr || push.stdout, token).trim().slice(0, 300) || `push exit ${push.status}`;
+  }
+
+  if (workingBranch && envelope.task?.allowPr) {
+    out.pr = reconcileAgentPr({ workspaceDir, token, branch: workingBranch, provider: envelope.repository?.provider || 'github' });
+  }
+  return out;
+}
+
+// Reap leftover job workspaces under the runs root. Age-gated, skips in-flight
+// run dirs, best-effort, bounded to our own directory (never touches anything we
+// did not create).
+function reapAgentRunDirs({ maxAgeMs = 0, liveRunDirs = new Set() } = {}) {
+  let reaped = 0;
+  const root = agentRunsRoot();
+  try {
+    if (!existsSync(root)) return { reaped };
+    const now = Date.now();
+    for (const name of readdirSync(root)) {
+      // Only reap the `run-*` workspaces this worker creates (see the
+      // `mkdtempSync(join(agentRunsRoot(), 'run-'))` in workAgent). Never touch
+      // unrelated files/dirs an operator may have placed under agent-runs.
+      if (!name.startsWith('run-')) continue;
+      const p = join(root, name);
+      if (liveRunDirs.has(p)) continue;
+      try {
+        const st = lstatSync(p);
+        if (!st.isDirectory()) continue; // lstat: a symlink is not a dir ⇒ skipped, never followed
+        if (maxAgeMs > 0 && now - st.mtimeMs < maxAgeMs) continue;
+        rmSync(p, { recursive: true, force: true });
+        reaped++;
+      } catch { /* skip */ }
+    }
+  } catch (err) {
+    return { reaped, error: err.message };
+  }
+  return { reaped };
+}
+
 // ---- One-shot capture (shared by host + container executors) ---------------
 const MAX_CAPTURE_BYTES = 1_048_576; // 1 MiB per stream
 
 // Spawn a child, pipe `stdinData`, capture byte-capped stdout/stderr, enforce a
 // timeout (invoking `onTimeout(child)` to tear the child down), and resolve to a
 // uniform result. Used by both the host and container executors.
-function spawnCaptureOneShot({ command, args = [], shell = false, detached = false, env, stdinData, timeoutMs, onTimeout }) {
+function spawnCaptureOneShot({ command, args = [], shell = false, detached = false, cwd, env, stdinData, timeoutMs, onTimeout }) {
   return new Promise((resolve) => {
     let child;
     const stdoutChunks = [];
@@ -1826,7 +2148,7 @@ function spawnCaptureOneShot({ command, args = [], shell = false, detached = fal
     };
 
     try {
-      child = spawn(command, args, { shell, detached, stdio: ['pipe', 'pipe', 'pipe'], env });
+      child = spawn(command, args, { shell, detached, cwd, stdio: ['pipe', 'pipe', 'pipe'], env });
     } catch (err) {
       finish({ ok: false, exitCode: null, stdout: '', stderr: '', error: err.message, truncated: false, stderrTruncated: false });
       return;
@@ -1911,9 +2233,14 @@ function baseAgentEnv(profile, job) {
  * Both paths resolve to the same result contract.
  */
 function runAgentJob(profile, job, opts = {}) {
-  const { timeoutMs, envelope, sandbox = 'none', image, runId, secretEnv = {}, passThroughSecretNames = [] } = opts;
+  const { timeoutMs, envelope, sandbox = 'none', image, runId, secretEnv = {}, passThroughSecretNames = [], cwd, extraEnv = {}, profileEnv = {} } = opts;
   const payload = JSON.stringify(buildAgentPayload(profile, job, envelope));
   const agentEnv = baseAgentEnv(profile, job);
+  // Static, non-secret env for the harness: the worker/profile's env (e.g. a
+  // harness's permission toggles) plus the per-job envelope's setup.env
+  // (job-specific tuning wins over the profile default). Reserved AGENT_* and
+  // resolved secrets are layered on top so user env can never shadow them.
+  const staticEnv = { ...normalizeEnvMap(profileEnv), ...normalizeEnvMap(envelope?.setup?.env) };
 
   if (!CONTAINER_SANDBOXES.has(sandbox)) {
     return spawnCaptureOneShot({
@@ -1921,7 +2248,9 @@ function runAgentJob(profile, job, opts = {}) {
       shell: true,
       // Own process group so the timeout handler can kill the whole tree.
       detached: process.platform !== 'win32',
-      env: { ...process.env, ...agentEnv, ...secretEnv },
+      // When a repository was provisioned, run the harness IN the workspace.
+      cwd,
+      env: { ...process.env, ...staticEnv, ...agentEnv, ...extraEnv, ...secretEnv },
       stdinData: payload,
       timeoutMs,
       onTimeout: (child) => killTree(child),
@@ -1934,10 +2263,9 @@ function runAgentJob(profile, job, opts = {}) {
   // `docker inspect`; docker reads the value from our child's environment.
   const envArgs = [];
   for (const k of Object.keys(agentEnv)) envArgs.push('-e', k);
+  for (const k of Object.keys(extraEnv)) envArgs.push('-e', k);
   for (const n of passThroughSecretNames) envArgs.push('-e', n);
-  const setupEnv = isPlainObject(envelope?.setup?.env) ? envelope.setup.env : {};
-  const setupEnvValues = {};
-  for (const [k, v] of Object.entries(setupEnv)) { envArgs.push('-e', k); setupEnvValues[k] = String(v); }
+  for (const k of Object.keys(staticEnv)) envArgs.push('-e', k);
 
   const args = [
     'run', '--rm', '-i',
@@ -1957,7 +2285,7 @@ function runAgentJob(profile, job, opts = {}) {
     command: engine,
     args,
     shell: false,
-    env: { ...process.env, ...agentEnv, ...secretEnv, ...setupEnvValues },
+    env: { ...process.env, ...staticEnv, ...agentEnv, ...extraEnv, ...secretEnv },
     stdinData: payload,
     timeoutMs,
     onTimeout: (child) => {
@@ -1967,11 +2295,11 @@ function runAgentJob(profile, job, opts = {}) {
   });
 }
 
-// Shape the io.nanobpm.agentResult output envelope. branch/commits/pr are
-// reserved for increment 2 (git provisioning); increment 1 reports execution.
-function buildResultEnvelope(result, { sandbox, image }) {
+// Shape the io.nanobpm.agentResult output envelope. When a repository was
+// provisioned (increment 2a), the `git` block adds branch/commits/push/PR facts.
+function buildResultEnvelope(result, { sandbox, image, git } = {}) {
   const status = result.ok ? 'completed' : (result.timedOut ? 'timedOut' : 'failed');
-  return {
+  const env = {
     schemaVersion: RESULT_ENVELOPE_SCHEMA_VERSION,
     status,
     sandbox,
@@ -1983,6 +2311,18 @@ function buildResultEnvelope(result, { sandbox, image }) {
     signal: result.signal ?? null,
     error: result.error ?? null,
   };
+  if (git) {
+    env.repository = git.remote ?? null;
+    env.branch = git.branch ?? null;
+    env.baseSha = git.baseSha ?? null;
+    env.headSha = git.headSha ?? null;
+    env.commits = git.commits ?? [];
+    env.pushed = !!git.pushed;
+    if (git.pushError) env.pushError = git.pushError;
+    if (git.pr) env.pr = git.pr;
+    if (git.error) env.gitError = git.error;
+  }
+  return env;
 }
 
 /**
@@ -2020,6 +2360,16 @@ async function workAgent(req, flags) {
     process.exit(1);
   }
 
+  // Static env for the harness: the profile's persisted env, extended/overridden
+  // by any work-time `--env NAME=VALUE` (repeatable). These carry harness startup
+  // config such as permission toggles (e.g. a coder CLI started with tools enabled).
+  const { env: workEnv, errors: workEnvErrors } = parseEnvPairs(flags?.env);
+  if (workEnvErrors.length > 0) {
+    logger.error(workEnvErrors.join('; '));
+    process.exit(1);
+  }
+  const profileEnv = { ...profile.env, ...workEnv };
+
   const intFlag = (v, dflt) => {
     const n = Number.parseInt(String(v ?? ''), 10);
     return Number.isFinite(n) && n > 0 ? n : dflt;
@@ -2055,10 +2405,31 @@ async function workAgent(req, flags) {
     ? Math.max(0, intFlag(flags['min-free-mb'], 0)) * 1_048_576
     : 1_073_741_824; // 1 GiB default floor
 
+  // Git provisioning knobs (increment 2a — host harness with a repository).
+  const cloneTimeoutMs = intFlag(flags?.['clone-timeout'], 120_000);
+  const keepRuns = coerceBool(flags?.['keep-runs'], false);
+
   // Tracks run ids currently executing so the reaper never removes a live
   // container out from under an in-flight job.
   const liveRunIds = new Set();
+  // Tracks per-job workspace dirs currently in use so the run-dir reaper never
+  // deletes a workspace out from under an in-flight host job.
+  const liveRunDirs = new Set();
   let reaperTimer = null;
+  let runDirTimer = null;
+
+  // Run-dir hygiene runs regardless of sandbox: any sandbox=none job that carries
+  // a repository clones a throwaway workspace under the runs root, and a crashed
+  // worker can leave one behind. Bounded to our own directory, age-gated.
+  {
+    const initialRuns = reapAgentRunDirs({ maxAgeMs: reapAgeMs, liveRunDirs });
+    if (initialRuns.reaped > 0) logger.info(`Reaped ${initialRuns.reaped} leftover job workspace(s) at startup.`);
+    runDirTimer = setInterval(() => {
+      const r = reapAgentRunDirs({ maxAgeMs: reapAgeMs, liveRunDirs });
+      if (r.reaped > 0) logger.info(`Reaper removed ${r.reaped} finished job workspace(s).`);
+    }, reapIntervalMs);
+    if (typeof runDirTimer.unref === 'function') runDirTimer.unref();
+  }
 
   if (isContainer) {
     if (!containerEngineAvailable(sandbox)) {
@@ -2084,6 +2455,8 @@ async function workAgent(req, flags) {
   logger.info(`Putting "${name}" [${profile.rank}] to work → ${profile.command}`);
   logger.info(`  model: ${profile.model || '(none)'}; capabilities: ${profile.capabilities.join(', ') || '(none)'}`);
   logger.info(`  sandbox: ${sandbox}${isContainer ? ` (image ${image})` : ''}`);
+  const profileEnvKeys = Object.keys(profileEnv);
+  if (profileEnvKeys.length > 0) logger.info(`  harness env: ${profileEnvKeys.join(', ')}`);
   logger.info(`  listening on ${matrix.length} job type(s): ${matrix.join('  ')}`);
   logger.info(`  max parallel: ${maxParallelJobs}; job timeout: ${jobTimeoutMs}ms`);
   logger.info('Polling for work — press Ctrl-C to stop.');
@@ -2123,7 +2496,44 @@ async function workAgent(req, flags) {
 
         const runId = randomUUID();
         if (isContainer) liveRunIds.add(runId);
+
+        // Host git provisioning (increment 2a): sandbox=none + a repository →
+        // clone into a throwaway workspace, run the harness there, then push +
+        // reconcile the agent PR. Container-side cloning is a later increment.
+        const hasRepo = !isContainer && !!envelope.repository?.url;
+        let runDir = null;
+        let provisioned = null;
+        let cwd;
+        let extraEnv;
+        let repoToken = null;
+        if (hasRepo) {
+          const provider = envelope.repository.provider || 'github';
+          const authRef = envelope.repository.authRef || (provider === 'github' ? 'GITHUB_TOKEN' : null);
+          if (authRef) repoToken = secretResolver.resolve(authRef) || null; // optional: absent → anonymous clone
+          try {
+            mkdirSync(agentRunsRoot(), { recursive: true });
+            runDir = mkdtempSync(join(agentRunsRoot(), 'run-'));
+            liveRunDirs.add(runDir);
+            provisioned = provisionRepo({ envelope, token: repoToken, runDir, timeoutMs: cloneTimeoutMs });
+            cwd = provisioned.workspaceDir;
+            extraEnv = {
+              AGENT_WORKSPACE: provisioned.workspaceDir,
+              AGENT_REPO_URL: provisioned.remote,
+              AGENT_REPO_BRANCH: provisioned.workingBranch || '',
+              AGENT_REPO_REF: provisioned.ref || '',
+            };
+          } catch (err) {
+            if (runDir) { try { rmSync(runDir, { recursive: true, force: true }); } catch { /* best effort */ } liveRunDirs.delete(runDir); }
+            if (isContainer) liveRunIds.delete(runId);
+            const retries = Math.max(0, (Number(job.retries) || 1) - 1);
+            const msg = err instanceof ProvisionError ? err.message : `provisioning error: ${err.message}`;
+            logger.warn(`[${jobType}] job ${job.jobKey} not provisioned — ${msg}; retries left ${retries}`);
+            return job.fail({ errorMessage: msg.slice(0, 2000), retries, retryBackOff: 15_000 });
+          }
+        }
+
         let result;
+        let gitResult = null;
         try {
           result = await runAgentJob(profile, job, {
             timeoutMs: jobTimeoutMs,
@@ -2133,20 +2543,51 @@ async function workAgent(req, flags) {
             runId,
             secretEnv: resolved,
             passThroughSecretNames: names,
+            cwd,
+            extraEnv,
+            profileEnv,
           });
+
+          // Finalize git only when the harness succeeded — never push a
+          // half-finished workspace.
+          if (provisioned && result.ok) {
+            try {
+              gitResult = finalizeGit({
+                workspaceDir: provisioned.workspaceDir,
+                gitEnv: provisioned.gitEnv,
+                startSha: provisioned.startSha,
+                workingBranch: provisioned.workingBranch,
+                envelope,
+                token: repoToken,
+              });
+            } catch (err) {
+              gitResult = { remote: provisioned.remote, branch: provisioned.workingBranch, baseSha: provisioned.startSha || null, commits: [], pushed: false, error: redactToken(err.message, repoToken) };
+            }
+          } else if (provisioned) {
+            gitResult = { remote: provisioned.remote, branch: provisioned.workingBranch, baseSha: provisioned.startSha || null, commits: [], pushed: false };
+          }
         } finally {
           if (isContainer) liveRunIds.delete(runId);
+          if (runDir && !keepRuns) { try { rmSync(runDir, { recursive: true, force: true }); } catch { /* best effort */ } }
+          if (runDir) liveRunDirs.delete(runDir);
         }
 
-        const resultEnvelope = buildResultEnvelope(result, { sandbox, image });
+        const resultEnvelope = buildResultEnvelope(result, { sandbox, image, git: gitResult });
         if (result.ok) {
-          logger.info(`[${jobType}] job ${job.jobKey} complete (exit 0)${result.truncated ? ' [output truncated]' : ''}`);
+          const gitNote = gitResult
+            ? ` [${gitResult.branch ? `branch ${gitResult.branch}` : 'detached HEAD'}: ${gitResult.commits.length} commit(s), ${gitResult.branch ? (gitResult.pushed ? 'pushed' : (gitResult.pushError ? 'push FAILED' : 'not pushed')) : 'no branch to push'}${gitResult.pr?.found ? `, PR #${gitResult.pr.number}` : ''}]`
+            : '';
+          logger.info(`[${jobType}] job ${job.jobKey} complete (exit 0)${result.truncated ? ' [output truncated]' : ''}${gitNote}`);
+          if (gitResult?.pushError) logger.warn(`[${jobType}] job ${job.jobKey}: branch push failed — ${gitResult.pushError}`);
           return job.complete({
             [AGENT_RESULT_KEY]: resultEnvelope,
             output: result.stdout,
             exitCode: 0,
             agent: profile.name,
             truncated: Boolean(result.truncated),
+            ...(gitResult
+              ? { branch: gitResult.branch, commits: gitResult.commits, pushed: gitResult.pushed, pullRequest: gitResult.pr || null }
+              : {}),
           });
         }
         const retries = Math.max(0, (Number(job.retries) || 1) - 1);
@@ -2171,6 +2612,7 @@ async function workAgent(req, flags) {
       stopping = true;
       logger.info(`Received ${signal} — stopping ${workers.length} worker(s)...`);
       if (reaperTimer) clearInterval(reaperTimer);
+      if (runDirTimer) clearInterval(runDirTimer);
       let stopFailures = 0;
       await Promise.all(
         workers.map(async (w) => {
@@ -3433,10 +3875,20 @@ export {
   hostEnvSecretResolver,
   buildAgentPayload,
   buildResultEnvelope,
+  parseEnvPairs,
+  normalizeEnvMap,
   reapAgentContainers,
   diskBudgetOk,
   containerEngineAvailable,
   runAgentJob,
+  provisionRepo,
+  finalizeGit,
+  reconcileAgentPr,
+  reapAgentRunDirs,
+  authUrl,
+  redactToken,
+  agentRunsRoot,
+  ProvisionError,
   normalizeStoredProfile,
   jobTypeMatrix,
   AGENT_TASK_NS,
@@ -3476,6 +3928,7 @@ export const metadata = {
         { command: 'c8ctl nano update --check', description: 'Check whether a newer nano release is available' },
         { command: 'c8ctl nano hire', description: 'Interactively create a CLI agent worker profile (name, rank, command, model, capabilities)' },
         { command: 'c8ctl nano hire --name reviewer --rank senior --command copilot --model gpt-5 --capabilities code-review,testing', description: 'Create a profile non-interactively' },
+        { command: 'c8ctl nano hire --name coder --rank senior --command copilot --env COPILOT_ENABLE_ALL_TOOLS=1', description: 'Persist a harness startup env var (e.g. permissions) on the profile' },
         { command: 'c8ctl nano hire --list', description: 'List hired agent profiles' },
         { command: 'c8ctl nano hire --name coder --rank senior --command "agent-harness" --sandbox docker --image ghcr.io/acme/agent:1', description: 'Create a profile that runs each job in a throwaway Docker container' },
         { command: 'c8ctl nano work reviewer', description: 'Spawn Nano job workers for the "reviewer" profile and poll for work' },
@@ -3527,10 +3980,13 @@ export const commands = {
       capabilities: { type: 'string', description: 'hire: comma-separated capability list' },
       sandbox: { type: 'string', description: 'hire/work: execution sandbox none|docker|podman (default none). Containers isolate each job.' },
       image: { type: 'string', description: 'hire/work: container image the agent runs in (required for --sandbox docker|podman)' },
+      env: { type: 'string', multiple: true, description: 'hire/work: static env var for the harness as NAME=VALUE (repeatable); persisted on hire, work extends/overrides. E.g. permission toggles.' },
       'secret-resolver': { type: 'string', description: 'work: secret resolver for task secretRefs (host = process env; default host)' },
-      'reap-age': { type: 'string', description: 'work: age in ms before a finished agent container is reaped (default 3600000)' },
-      'reap-interval': { type: 'string', description: 'work: how often to sweep finished agent containers in ms (default 300000)' },
+      'reap-age': { type: 'string', description: 'work: age in ms before a finished agent container or job workspace is reaped (default 3600000)' },
+      'reap-interval': { type: 'string', description: 'work: how often to sweep finished agent containers and job workspaces in ms (default 300000)' },
       'min-free-mb': { type: 'string', description: 'work: shed jobs when the engine data root has less than this many MB free (default 1024)' },
+      'clone-timeout': { type: 'string', description: 'work: max time in ms for cloning a task repository on the host (default 120000)' },
+      'keep-runs': { type: 'boolean', description: 'work: keep per-job workspaces under <state>/agent-runs instead of deleting them after each job (debug)' },
       list: { type: 'boolean', description: 'hire: list existing agent profiles instead of creating one' },
       'max-parallel': { type: 'string', description: 'work: max concurrent jobs per worker (default 1)' },
       'job-timeout': { type: 'string', description: 'work: max harness runtime per job in ms; the spawned process is killed past this (default 300000)' },
@@ -3676,8 +4132,8 @@ function printUsage() {
   console.log('  c8ctl nano set <bin|model-dir> <path>');
   console.log('  c8ctl nano config');
   console.log('  c8ctl nano update [--check]');
-  console.log('  c8ctl nano hire [--name <n>] [--rank <r>] [--command <c>] [--model <m>] [--capabilities <a,b>] [--sandbox none|docker|podman] [--image <ref>] [--list]');
-  console.log('  c8ctl nano work <profileName> [--max-parallel <n>] [--job-timeout <ms>] [--sandbox none|docker|podman] [--image <ref>] [--secret-resolver host] [--min-free-mb <n>]');
+  console.log('  c8ctl nano hire [--name <n>] [--rank <r>] [--command <c>] [--model <m>] [--capabilities <a,b>] [--sandbox none|docker|podman] [--image <ref>] [--env NAME=VALUE ...] [--list]');
+  console.log('  c8ctl nano work <profileName> [--max-parallel <n>] [--job-timeout <ms>] [--sandbox none|docker|podman] [--image <ref>] [--env NAME=VALUE ...] [--secret-resolver host] [--min-free-mb <n>] [--clone-timeout <ms>] [--keep-runs]');
   console.log('');
   console.log('Subcommands:');
   console.log('  start    Spawn an N-node local cluster wired to talk to each other on localhost');
@@ -3715,13 +4171,16 @@ function printUsage() {
   console.log('  --capabilities <a,b> hire: comma-separated capability list');
   console.log('  --sandbox <s>        hire/work: execution sandbox none|docker|podman (default none)');
   console.log('  --image <ref>        hire/work: container image the agent runs in (required for docker|podman)');
+  console.log('  --env NAME=VALUE     hire/work: static env var for the harness (repeatable); persisted on hire, work extends/overrides');
   console.log('  --list               hire: list existing agent profiles instead of creating one');
   console.log('  --max-parallel <n>   work: max concurrent jobs per worker (default 1)');
   console.log('  --job-timeout <ms>   work: max harness runtime per job in ms (default 300000)');
   console.log('  --secret-resolver <r> work: secret resolver for task secretRefs (host; default host)');
-  console.log('  --reap-age <ms>      work: age before a finished agent container is reaped (default 3600000)');
-  console.log('  --reap-interval <ms> work: how often to sweep finished agent containers (default 300000)');
+  console.log('  --reap-age <ms>      work: age before a finished agent container/workspace is reaped (default 3600000)');
+  console.log('  --reap-interval <ms> work: how often to sweep finished agent containers/workspaces (default 300000)');
   console.log('  --min-free-mb <n>    work: shed jobs when the engine data root has < this many MB free (default 1024)');
+  console.log('  --clone-timeout <ms> work: max time to clone a task repository on the host (default 120000)');
+  console.log('  --keep-runs          work: keep per-job workspaces instead of deleting them (debug)');
   console.log('');
   console.log('Persistent assets:');
   console.log('  Models and workers live in the workspace dir (NANOBPMN_WORKSPACE_DIR),');

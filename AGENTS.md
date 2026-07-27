@@ -31,8 +31,9 @@ SDK client (job workers) — do **not** add the SDK as a dependency or use raw
 ## CLI agent workers (`hire` / `work`)
 
 - `hire` persists an agent profile (name, rank, command, model, capabilities,
-  and optional `sandbox`/`image`) to `config.json`; `work` registers one job
-  worker per token in the rank×capability matrix.
+  optional `sandbox`/`image`, and an optional static harness `env` map) to
+  `config.json`; `work` registers one job worker per token in the
+  rank×capability matrix.
 - Each job runs the profile `command` one-shot with the job serialized to
   **stdin** (never interpolated into argv — the trust boundary). The reserved
   **task envelope** (`io.nanobpm.agentTask`, headers=defaults ← variables=overrides,
@@ -46,6 +47,21 @@ SDK client (job workers) — do **not** add the SDK as a dependency or use raw
   (never `system prune`), age-gated, and skips in-flight run ids. Secrets are
   resolved by **name** (pluggable resolver; `host` only) and forwarded as
   `-e NAME` so values never hit argv/`docker inspect`.
+- Harness **env** (non-secret startup config, e.g. permission toggles): a static
+  `env` map on the profile (`hire --env NAME=VALUE`, repeatable), extended/
+  overridden at work time (`work --env`). Applied on host + container; per-job
+  `setup.env` layers on top, and reserved `AGENT_*` + resolved secrets always win
+  (user env can't shadow them). Secret values go through `secretRefs`, not `--env`.
+- Git provisioning (host, `sandbox=none` + `repository.url`): clone into a
+  throwaway `<state>/agent-runs/run-*` workspace → checkout/create the branch →
+  run the harness with that workspace as `cwd` → push the branch (`branch.push`)
+  → reconcile the **agent-opened** PR (`task.allowPr`, via `gh pr list --head`).
+  The repo token is delivered via `GIT_ASKPASS` (env) and **redacted** from all
+  logs/results — never in argv or the remote URL. A push failure is a
+  non-fatal `pushError` (the process model drives the merge); a clone failure
+  sheds (retryable). Workspaces are reaped like containers (age-gated, in-flight
+  skipped) and deleted per-job unless `--keep-runs`. Container-side cloning
+  (strong isolation) is a later increment; container jobs don't clone yet.
 
 ## How a cluster is modelled
 

@@ -281,6 +281,14 @@ a run that outlives `--job-timeout` is force-removed. The envelope is piped on
 the container's stdin exactly as on the host. (Container-side git provisioning —
 strong isolation — is a later increment; container jobs don't clone yet.)
 
+**Host workers inherit your credentials.** A host worker (`--sandbox none`, the
+default) runs as your user and inherits your full environment and `$HOME`, so
+your existing `gh` CLI login (from `gh auth login`) or a `GH_TOKEN`/`GITHUB_TOKEN`
+env var is available to the harness with **no extra setup** — handy when the
+agent command shells out to `gh`. A **container** sandbox is isolated and does
+**not** inherit that host login; provide the token explicitly via
+`setup.secretRefs` / `--secret-resolver host` (see **Secrets** below) instead.
+
 **Secrets.** Secrets are referenced by **name**, never value. `setup.secretRefs`
 (and the repo/PR credential when `task.allowPr` is set — defaulting to
 `GITHUB_TOKEN` for GitHub) are resolved via a pluggable `--secret-resolver`

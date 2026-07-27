@@ -285,6 +285,9 @@ c8ctl nano hire --name coder --rank senior --command copilot --env COPILOT_ENABL
 c8ctl nano work coder --env EXTRA_FLAG=on          # extends/overrides the profile env
 ```
 
+Interactive `hire` (no `--env`) prompts for these one `NAME=VALUE` at a time
+(blank to finish), so values may safely contain `=` or `,`.
+
 They apply on both the host and container paths. Per-job `setup.env` from the
 envelope layers on top (job-specific tuning wins), and the reserved `AGENT_*`
 variables and resolved secrets always win over user-supplied env so they can't be

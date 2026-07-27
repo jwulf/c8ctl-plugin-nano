@@ -1464,6 +1464,7 @@ async function hireWorker(req, flags) {
   let capabilities = flags?.capabilities !== undefined ? flags.capabilities : undefined;
   let sandbox = flags?.sandbox !== undefined ? String(flags.sandbox).trim().toLowerCase() : undefined;
   let image = flags?.image !== undefined ? String(flags.image).trim() : undefined;
+  const envFromFlags = flags?.env !== undefined;
   const { env: profileEnv, errors: envErrors } = parseEnvPairs(flags?.env);
   if (envErrors.length > 0) {
     logger.error(envErrors.join('; '));
@@ -1472,7 +1473,7 @@ async function hireWorker(req, flags) {
   }
 
   const missingRequired = !name || !rank || !command;
-  const missingOptional = model === undefined || capabilities === undefined;
+  const missingOptional = model === undefined || capabilities === undefined || !envFromFlags;
   const interactive = process.stdin.isTTY && process.stdout.isTTY;
 
   // Non-interactively only name/rank/command are required; model and
@@ -1509,6 +1510,19 @@ async function hireWorker(req, flags) {
       }
       if (capabilities === undefined) {
         capabilities = (await rl.question('Capabilities (comma-separated, optional): ')).trim();
+      }
+      // Static harness env (permission toggles, etc.). Prompted one NAME=VALUE at
+      // a time — blank finishes — so values may safely contain '=' and ','.
+      // Skipped when --env was supplied on the command line.
+      if (!envFromFlags) {
+        console.log('Harness env vars — NAME=VALUE, blank to finish (optional):');
+        for (;;) {
+          const ans = (await rl.question('  env (NAME=VALUE): ')).trim();
+          if (!ans) break;
+          const { env: one, errors } = parseEnvPairs([ans]);
+          if (errors.length > 0) { console.log(`  ${errors.join('; ')}`); continue; }
+          Object.assign(profileEnv, one);
+        }
       }
     } finally {
       rl.close();

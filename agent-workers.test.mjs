@@ -5,6 +5,10 @@ import { test } from 'node:test';
 import assert from 'node:assert/strict';
 import { spawnSync } from 'node:child_process';
 
+import { mkdtempSync, mkdirSync, writeFileSync, rmSync, existsSync, utimesSync } from 'node:fs';
+import { tmpdir } from 'node:os';
+import { join } from 'node:path';
+
 import {
   normalizeTaskEnvelope,
   collectEnvelopeFrom,
@@ -20,6 +24,13 @@ import {
   normalizeStoredProfile,
   containerEngineAvailable,
   runAgentJob,
+  provisionRepo,
+  finalizeGit,
+  reconcileAgentPr,
+  reapAgentRunDirs,
+  authUrl,
+  redactToken,
+  ProvisionError,
   AGENT_TASK_NS,
   AGENT_RESULT_KEY,
   SANDBOXES,
@@ -158,6 +169,197 @@ test('buildResultEnvelope reflects status/exit/sandbox', () => {
   const failed = buildResultEnvelope({ ok: false, exitCode: 1 }, { sandbox: 'none' });
   assert.equal(failed.status, 'failed');
   assert.equal(failed.exitCode, 1);
+});
+
+test('buildResultEnvelope merges the git block when a repo was provisioned', () => {
+  const env = buildResultEnvelope(
+    { ok: true, stdout: 'done', exitCode: 0 },
+    { sandbox: 'none', git: { branch: 'feat/x', baseSha: 'aaa', headSha: 'bbb', commits: ['bbb'], pushed: true, remote: 'https://github.com/o/r.git', pr: { openedBy: 'agent', found: true, number: 7 } } },
+  );
+  assert.equal(env.branch, 'feat/x');
+  assert.deepEqual(env.commits, ['bbb']);
+  assert.equal(env.pushed, true);
+  assert.equal(env.remote ?? env.repository, 'https://github.com/o/r.git');
+  assert.equal(env.pr.number, 7);
+
+  const noGit = buildResultEnvelope({ ok: true, stdout: '', exitCode: 0 }, { sandbox: 'none' });
+  assert.equal('branch' in noGit, false, 'no git block when no repo');
+});
+
+// --- Git provisioning (increment 2a) ----------------------------------------
+// These use the real `git` binary against local file:// repos — no network, no
+// token — so they run in CI. gh-backed PR reconcile is gated separately.
+const gitOk = (() => {
+  try { return spawnSync('git', ['--version'], { timeout: 10_000 }).status === 0; } catch { return false; }
+})();
+
+function g(args, cwd) {
+  const r = spawnSync('git', args, { cwd, encoding: 'utf8', timeout: 30_000, env: { ...process.env, GIT_CONFIG_NOSYSTEM: '1' } });
+  if (r.status !== 0) throw new Error(`git ${args.join(' ')} failed: ${r.stderr || r.stdout}`);
+  return (r.stdout || '').trim();
+}
+
+// Build a bare origin repo with one commit on `main`, return its path + a
+// throwaway root to clean up.
+function makeOriginRepo() {
+  const root = mkdtempSync(join(tmpdir(), 'nano-git-'));
+  const src = join(root, 'src');
+  mkdirSync(src, { recursive: true });
+  g(['init', '-q', src], undefined);
+  g(['checkout', '-q', '-B', 'main'], src);
+  g(['config', 'user.name', 'seed'], src);
+  g(['config', 'user.email', 'seed@example.com'], src);
+  writeFileSync(join(src, 'README.md'), '# seed\n');
+  g(['add', '-A'], src);
+  g(['commit', '-q', '-m', 'seed'], src);
+  const origin = join(root, 'origin.git');
+  g(['clone', '-q', '--bare', src, origin], undefined);
+  return { root, origin };
+}
+
+test('provisionRepo clones + creates the working branch', { skip: !gitOk }, () => {
+  const { root, origin } = makeOriginRepo();
+  const runDir = mkdtempSync(join(root, 'run-'));
+  try {
+    const envelope = {
+      schemaVersion: 1,
+      repository: { provider: 'github', url: origin, submodules: false },
+      branch: { base: '', create: 'feat/nano', push: true },
+      setup: { commands: [], env: {}, secretRefs: [] },
+      task: { allowPr: false },
+    };
+    const prov = provisionRepo({ envelope, token: null, runDir });
+    assert.ok(existsSync(join(prov.workspaceDir, 'README.md')), 'clone populated the workspace');
+    assert.equal(prov.workingBranch, 'feat/nano');
+    assert.match(prov.startSha, /^[0-9a-f]{7,40}$/);
+    assert.equal(g(['rev-parse', '--abbrev-ref', 'HEAD'], prov.workspaceDir), 'feat/nano');
+  } finally {
+    rmSync(root, { recursive: true, force: true });
+  }
+});
+
+test('provisionRepo throws a ProvisionError (redacted) on clone failure', { skip: !gitOk }, () => {
+  const root = mkdtempSync(join(tmpdir(), 'nano-git-'));
+  const runDir = mkdtempSync(join(root, 'run-'));
+  try {
+    const envelope = {
+      schemaVersion: 1,
+      repository: { provider: 'github', url: join(root, 'does-not-exist'), submodules: false },
+      branch: { base: '', create: '', push: false },
+      setup: { commands: [], env: {}, secretRefs: [] },
+      task: { allowPr: false },
+    };
+    assert.throws(() => provisionRepo({ envelope, token: 'supersecret', runDir }), (err) => {
+      assert.ok(err instanceof ProvisionError);
+      assert.equal(err.message.includes('supersecret'), false, 'token must be redacted from errors');
+      return true;
+    });
+  } finally {
+    rmSync(root, { recursive: true, force: true });
+  }
+});
+
+test('finalizeGit enumerates new commits and pushes the branch', { skip: !gitOk }, () => {
+  const { root, origin } = makeOriginRepo();
+  const runDir = mkdtempSync(join(root, 'run-'));
+  try {
+    const envelope = {
+      schemaVersion: 1,
+      repository: { provider: 'github', url: origin, submodules: false },
+      branch: { base: '', create: 'feat/work', push: true },
+      setup: { commands: [], env: {}, secretRefs: [] },
+      task: { allowPr: false },
+    };
+    const prov = provisionRepo({ envelope, token: null, runDir });
+    // Simulate the harness doing work + committing.
+    writeFileSync(join(prov.workspaceDir, 'NEW.txt'), 'agent change\n');
+    g(['add', '-A'], prov.workspaceDir);
+    g(['commit', '-q', '-m', 'agent: add NEW.txt'], prov.workspaceDir);
+
+    const out = finalizeGit({
+      workspaceDir: prov.workspaceDir,
+      gitEnv: prov.gitEnv,
+      startSha: prov.startSha,
+      workingBranch: prov.workingBranch,
+      envelope,
+      token: null,
+    });
+    assert.equal(out.commits.length, 1, 'one new commit since start');
+    assert.equal(out.pushed, true, out.pushError || 'push should succeed to a bare origin');
+    assert.equal(out.branch, 'feat/work');
+    // Origin now carries the pushed branch.
+    assert.match(g(['--git-dir', origin, 'rev-parse', 'feat/work'], undefined), /^[0-9a-f]{40}$/);
+  } finally {
+    rmSync(root, { recursive: true, force: true });
+  }
+});
+
+test('finalizeGit does not push when the harness produced no commits', { skip: !gitOk }, () => {
+  const { root, origin } = makeOriginRepo();
+  const runDir = mkdtempSync(join(root, 'run-'));
+  try {
+    const envelope = {
+      schemaVersion: 1,
+      repository: { provider: 'github', url: origin, submodules: false },
+      branch: { base: '', create: 'feat/empty', push: true },
+      setup: { commands: [], env: {}, secretRefs: [] },
+      task: { allowPr: false },
+    };
+    const prov = provisionRepo({ envelope, token: null, runDir });
+    const out = finalizeGit({ workspaceDir: prov.workspaceDir, gitEnv: prov.gitEnv, startSha: prov.startSha, workingBranch: prov.workingBranch, envelope, token: null });
+    assert.equal(out.commits.length, 0);
+    assert.equal(out.pushed, false);
+    assert.throws(() => g(['--git-dir', origin, 'rev-parse', 'feat/empty'], undefined), 'nothing pushed for an empty branch');
+  } finally {
+    rmSync(root, { recursive: true, force: true });
+  }
+});
+
+test('authUrl embeds a username only when a token is present (https)', () => {
+  assert.equal(authUrl('https://github.com/o/r.git', 'github', false), 'https://github.com/o/r.git');
+  assert.equal(authUrl('https://github.com/o/r.git', 'github', true), 'https://x-access-token@github.com/o/r.git');
+  assert.equal(authUrl('https://gitlab.com/o/r.git', 'gitlab', true), 'https://git@gitlab.com/o/r.git');
+  // ssh + author-supplied creds are left untouched.
+  assert.equal(authUrl('git@github.com:o/r.git', 'github', true), 'git@github.com:o/r.git');
+  assert.equal(authUrl('https://user:pw@github.com/o/r.git', 'github', true), 'https://user:pw@github.com/o/r.git');
+});
+
+test('redactToken masks the token and any https userinfo', () => {
+  assert.equal(redactToken('cloning https://x-access-token:sekret@github.com/o/r.git', 'sekret'), 'cloning https://github.com/o/r.git');
+  assert.equal(redactToken('token is abc123 here', 'abc123'), 'token is *** here');
+});
+
+test('reconcileAgentPr reports unsupported provider without shelling out', () => {
+  const r = reconcileAgentPr({ workspaceDir: '/tmp', token: null, branch: 'x', provider: 'gitlab' });
+  assert.equal(r.openedBy, 'agent');
+  assert.equal(r.found, false);
+  assert.match(r.error, /unsupported/);
+});
+
+test('reapAgentRunDirs age-gates and skips in-flight dirs', () => {
+  const home = mkdtempSync(join(tmpdir(), 'nano-home-'));
+  const prev = process.env.C8CTL_NANO_HOME;
+  process.env.C8CTL_NANO_HOME = home;
+  try {
+    const runs = join(home, 'agent-runs');
+    mkdirSync(runs, { recursive: true });
+    const oldDir = join(runs, 'run-old');
+    const freshDir = join(runs, 'run-fresh');
+    const liveDir = join(runs, 'run-live');
+    for (const d of [oldDir, freshDir, liveDir]) mkdirSync(d, { recursive: true });
+    const old = Date.now() / 1000 - 7200; // 2h ago
+    utimesSync(oldDir, old, old);
+    utimesSync(liveDir, old, old);
+
+    const r = reapAgentRunDirs({ maxAgeMs: 60 * 60_000, liveRunDirs: new Set([liveDir]) });
+    assert.equal(r.reaped, 1, 'only the aged, non-live dir is reaped');
+    assert.equal(existsSync(oldDir), false);
+    assert.equal(existsSync(freshDir), true, 'fresh dir under the age gate is kept');
+    assert.equal(existsSync(liveDir), true, 'in-flight dir is never reaped');
+  } finally {
+    if (prev === undefined) delete process.env.C8CTL_NANO_HOME; else process.env.C8CTL_NANO_HOME = prev;
+    rmSync(home, { recursive: true, force: true });
+  }
 });
 
 test('normalizeStoredProfile validates sandbox + image', () => {

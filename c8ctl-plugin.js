@@ -41,6 +41,8 @@ import {
   renameSync,
   realpathSync,
   statfsSync,
+  statSync,
+  mkdtempSync,
 } from 'node:fs';
 import { randomUUID } from 'node:crypto';
 import { homedir, platform as osPlatform } from 'node:os';
@@ -1800,13 +1802,187 @@ function reapAgentContainers(engine, { maxAgeMs = 0, liveRunIds = new Set() } = 
   return { reaped };
 }
 
+// ---- Git provisioning (issue #8, increment 2a — host harness) --------------
+// A repository-bearing task is provisioned on the HOST: clone into a throwaway
+// run dir, check out / create the working branch, run the harness with the
+// workspace as CWD, then push the branch + reconcile the agent-opened PR.
+// Container-side provisioning (strong isolation) is a later increment.
+
+function agentRunsRoot() {
+  return join(getStateHome(), 'agent-runs');
+}
+
+// Redact a token that may have been embedded in a URL or surfaced in git output,
+// plus any https userinfo (x-access-token:secret@host), before it hits a log or
+// the result envelope.
+function redactToken(text, token) {
+  let s = String(text ?? '');
+  if (token) s = s.split(token).join('***');
+  return s.replace(/(https?:\/\/)[^@/\s]+@/gi, '$1');
+}
+
+function runGit(args, { cwd, env, timeoutMs = 120_000 } = {}) {
+  try {
+    const r = spawnSync('git', args, { cwd, env, encoding: 'utf8', timeout: timeoutMs });
+    return { status: r.status ?? (r.signal ? 128 : null), stdout: r.stdout || '', stderr: r.stderr || '', signal: r.signal || null };
+  } catch (err) {
+    return { status: null, stdout: '', stderr: err.message, signal: null };
+  }
+}
+
+// Write a one-line GIT_ASKPASS helper that echoes $GIT_TOKEN, so the token is
+// delivered to git via the child's ENV — never on argv or in the remote URL.
+function writeAskpass(dir, token) {
+  if (!token) return null;
+  const p = join(dir, 'askpass.sh');
+  writeFileSync(p, '#!/bin/sh\nprintf %s "$GIT_TOKEN"\n', { mode: 0o700 });
+  try { chmodSync(p, 0o700); } catch { /* best effort */ }
+  return p;
+}
+
+// For https URLs, embed a username (no secret) so git asks GIT_ASKPASS for the
+// password. Non-https URLs and author-supplied credentials are left untouched.
+function authUrl(url, provider, hasToken) {
+  if (!hasToken) return url;
+  try {
+    const u = new URL(url);
+    if (u.protocol !== 'https:') return url;
+    if (u.username || u.password) return url; // author already embedded creds
+    u.username = provider === 'github' ? 'x-access-token' : 'git';
+    return u.toString();
+  } catch {
+    return url;
+  }
+}
+
+class ProvisionError extends Error {}
+
+// Clone repo into <runDir>/workspace and check out / create the working branch.
+// Returns { workspaceDir, gitEnv, startSha, workingBranch, remote }. Throws a
+// ProvisionError (token-redacted) on any git failure so the caller can shed.
+function provisionRepo({ envelope, token, runDir, timeoutMs = 120_000 }) {
+  const repo = envelope.repository;
+  if (!repo || !repo.url) throw new ProvisionError('repository.url is required to provision a workspace');
+  const workspaceDir = join(runDir, 'workspace');
+  const askpass = writeAskpass(runDir, token);
+  const gitEnv = {
+    ...process.env,
+    GIT_TERMINAL_PROMPT: '0',
+    GIT_CONFIG_NOSYSTEM: '1',
+  };
+  if (askpass) { gitEnv.GIT_ASKPASS = askpass; gitEnv.GIT_TOKEN = token; }
+
+  const target = repo.ref || envelope.branch?.base || '';
+  const cloneArgs = ['clone', '--no-tags'];
+  if (repo.depth && repo.depth > 0) cloneArgs.push('--depth', String(repo.depth));
+  if (repo.submodules) cloneArgs.push('--recurse-submodules');
+  if (target) cloneArgs.push('--branch', target);
+  const remote = authUrl(repo.url, repo.provider || 'github', !!token);
+  cloneArgs.push(remote, workspaceDir);
+
+  const clone = runGit(cloneArgs, { env: gitEnv, timeoutMs });
+  if (clone.status !== 0) {
+    throw new ProvisionError(`git clone failed: ${redactToken(clone.stderr || clone.stdout, token).trim().slice(0, 500) || `exit ${clone.status}`}`);
+  }
+
+  // Give the harness a committer identity in case it commits (many do).
+  runGit(['config', 'user.name', process.env.GIT_AUTHOR_NAME || 'nano-agent'], { cwd: workspaceDir, env: gitEnv });
+  runGit(['config', 'user.email', process.env.GIT_AUTHOR_EMAIL || 'nano-agent@users.noreply.github.com'], { cwd: workspaceDir, env: gitEnv });
+
+  let workingBranch = target;
+  if (envelope.branch?.create) {
+    const cb = runGit(['checkout', '-B', envelope.branch.create], { cwd: workspaceDir, env: gitEnv });
+    if (cb.status !== 0) throw new ProvisionError(`git checkout -B ${envelope.branch.create} failed: ${redactToken(cb.stderr, token).trim().slice(0, 300)}`);
+    workingBranch = envelope.branch.create;
+  }
+  if (!workingBranch) {
+    const head = runGit(['rev-parse', '--abbrev-ref', 'HEAD'], { cwd: workspaceDir, env: gitEnv });
+    workingBranch = (head.stdout || '').trim() || 'HEAD';
+  }
+  const sha = runGit(['rev-parse', 'HEAD'], { cwd: workspaceDir, env: gitEnv });
+  return { workspaceDir, gitEnv, startSha: (sha.stdout || '').trim(), workingBranch, remote: redactToken(repo.url, token) };
+}
+
+// Look up a PR the agent opened for this branch (2a does NOT open it — the
+// harness does, driven by the prompt). Uses gh with the resolved token so it
+// works headless. Returns a { openedBy:'agent', found, ... } block.
+function reconcileAgentPr({ workspaceDir, token, branch, provider }) {
+  if (provider && provider !== 'github') return { openedBy: 'agent', found: false, error: `PR reconcile unsupported for provider "${provider}"` };
+  const env = { ...process.env };
+  if (token) env.GH_TOKEN = token;
+  try {
+    const r = spawnSync('gh', ['pr', 'list', '--head', branch, '--state', 'all', '--json', 'number,url,state,isDraft,title', '--limit', '1'],
+      { cwd: workspaceDir, env, encoding: 'utf8', timeout: 30_000 });
+    if (r.status !== 0) return { openedBy: 'agent', found: false, error: redactToken(r.stderr, token).trim().slice(0, 200) || 'gh pr list failed' };
+    const arr = JSON.parse((r.stdout || '[]').trim() || '[]');
+    if (!Array.isArray(arr) || arr.length === 0) return { openedBy: 'agent', found: false };
+    const pr = arr[0];
+    return { openedBy: 'agent', found: true, number: pr.number, url: pr.url, state: pr.state, isDraft: !!pr.isDraft, title: pr.title };
+  } catch (err) {
+    return { openedBy: 'agent', found: false, error: err.message };
+  }
+}
+
+// After the harness runs: enumerate new commits, push the branch (when
+// branch.push), and reconcile the agent-opened PR (when task.allowPr). A push
+// failure is reported (pushError) rather than thrown — the process model decides
+// what to do next, and re-running the agent would be non-idempotent.
+function finalizeGit({ workspaceDir, gitEnv, startSha, workingBranch, envelope, token }) {
+  const out = { branch: workingBranch, baseSha: startSha || null, headSha: null, commits: [], pushed: false, remote: null, pr: null };
+  const rem = runGit(['remote', 'get-url', 'origin'], { cwd: workspaceDir, env: gitEnv });
+  if (rem.status === 0) out.remote = redactToken(rem.stdout.trim(), token);
+  const headNow = runGit(['rev-parse', 'HEAD'], { cwd: workspaceDir, env: gitEnv });
+  out.headSha = (headNow.stdout || '').trim() || null;
+  if (startSha) {
+    const log = runGit(['rev-list', `${startSha}..HEAD`], { cwd: workspaceDir, env: gitEnv });
+    if (log.status === 0) out.commits = log.stdout.trim().split('\n').filter(Boolean);
+  }
+
+  if (coerceBool(envelope.branch?.push, true) && out.commits.length > 0) {
+    const push = runGit(['push', '--set-upstream', 'origin', workingBranch], { cwd: workspaceDir, env: gitEnv });
+    if (push.status === 0) out.pushed = true;
+    else out.pushError = redactToken(push.stderr || push.stdout, token).trim().slice(0, 300) || `push exit ${push.status}`;
+  }
+
+  if (envelope.task?.allowPr) {
+    out.pr = reconcileAgentPr({ workspaceDir, token, branch: workingBranch, provider: envelope.repository?.provider || 'github' });
+  }
+  return out;
+}
+
+// Reap leftover job workspaces under the runs root. Age-gated, skips in-flight
+// run dirs, best-effort, bounded to our own directory (never touches anything we
+// did not create).
+function reapAgentRunDirs({ maxAgeMs = 0, liveRunDirs = new Set() } = {}) {
+  let reaped = 0;
+  const root = agentRunsRoot();
+  try {
+    if (!existsSync(root)) return { reaped };
+    const now = Date.now();
+    for (const name of readdirSync(root)) {
+      const p = join(root, name);
+      if (liveRunDirs.has(p)) continue;
+      try {
+        const st = statSync(p);
+        if (!st.isDirectory()) continue;
+        if (maxAgeMs > 0 && now - st.mtimeMs < maxAgeMs) continue;
+        rmSync(p, { recursive: true, force: true });
+        reaped++;
+      } catch { /* skip */ }
+    }
+  } catch (err) {
+    return { reaped, error: err.message };
+  }
+  return { reaped };
+}
+
 // ---- One-shot capture (shared by host + container executors) ---------------
 const MAX_CAPTURE_BYTES = 1_048_576; // 1 MiB per stream
 
 // Spawn a child, pipe `stdinData`, capture byte-capped stdout/stderr, enforce a
 // timeout (invoking `onTimeout(child)` to tear the child down), and resolve to a
 // uniform result. Used by both the host and container executors.
-function spawnCaptureOneShot({ command, args = [], shell = false, detached = false, env, stdinData, timeoutMs, onTimeout }) {
+function spawnCaptureOneShot({ command, args = [], shell = false, detached = false, cwd, env, stdinData, timeoutMs, onTimeout }) {
   return new Promise((resolve) => {
     let child;
     const stdoutChunks = [];
@@ -1826,7 +2002,7 @@ function spawnCaptureOneShot({ command, args = [], shell = false, detached = fal
     };
 
     try {
-      child = spawn(command, args, { shell, detached, stdio: ['pipe', 'pipe', 'pipe'], env });
+      child = spawn(command, args, { shell, detached, cwd, stdio: ['pipe', 'pipe', 'pipe'], env });
     } catch (err) {
       finish({ ok: false, exitCode: null, stdout: '', stderr: '', error: err.message, truncated: false, stderrTruncated: false });
       return;
@@ -1911,7 +2087,7 @@ function baseAgentEnv(profile, job) {
  * Both paths resolve to the same result contract.
  */
 function runAgentJob(profile, job, opts = {}) {
-  const { timeoutMs, envelope, sandbox = 'none', image, runId, secretEnv = {}, passThroughSecretNames = [] } = opts;
+  const { timeoutMs, envelope, sandbox = 'none', image, runId, secretEnv = {}, passThroughSecretNames = [], cwd, extraEnv = {} } = opts;
   const payload = JSON.stringify(buildAgentPayload(profile, job, envelope));
   const agentEnv = baseAgentEnv(profile, job);
 
@@ -1921,7 +2097,9 @@ function runAgentJob(profile, job, opts = {}) {
       shell: true,
       // Own process group so the timeout handler can kill the whole tree.
       detached: process.platform !== 'win32',
-      env: { ...process.env, ...agentEnv, ...secretEnv },
+      // When a repository was provisioned, run the harness IN the workspace.
+      cwd,
+      env: { ...process.env, ...agentEnv, ...extraEnv, ...secretEnv },
       stdinData: payload,
       timeoutMs,
       onTimeout: (child) => killTree(child),
@@ -1967,11 +2145,11 @@ function runAgentJob(profile, job, opts = {}) {
   });
 }
 
-// Shape the io.nanobpm.agentResult output envelope. branch/commits/pr are
-// reserved for increment 2 (git provisioning); increment 1 reports execution.
-function buildResultEnvelope(result, { sandbox, image }) {
+// Shape the io.nanobpm.agentResult output envelope. When a repository was
+// provisioned (increment 2a), the `git` block adds branch/commits/push/PR facts.
+function buildResultEnvelope(result, { sandbox, image, git } = {}) {
   const status = result.ok ? 'completed' : (result.timedOut ? 'timedOut' : 'failed');
-  return {
+  const env = {
     schemaVersion: RESULT_ENVELOPE_SCHEMA_VERSION,
     status,
     sandbox,
@@ -1983,6 +2161,18 @@ function buildResultEnvelope(result, { sandbox, image }) {
     signal: result.signal ?? null,
     error: result.error ?? null,
   };
+  if (git) {
+    env.repository = git.remote ?? null;
+    env.branch = git.branch ?? null;
+    env.baseSha = git.baseSha ?? null;
+    env.headSha = git.headSha ?? null;
+    env.commits = git.commits ?? [];
+    env.pushed = !!git.pushed;
+    if (git.pushError) env.pushError = git.pushError;
+    if (git.pr) env.pr = git.pr;
+    if (git.error) env.gitError = git.error;
+  }
+  return env;
 }
 
 /**
@@ -2055,10 +2245,31 @@ async function workAgent(req, flags) {
     ? Math.max(0, intFlag(flags['min-free-mb'], 0)) * 1_048_576
     : 1_073_741_824; // 1 GiB default floor
 
+  // Git provisioning knobs (increment 2a — host harness with a repository).
+  const cloneTimeoutMs = intFlag(flags?.['clone-timeout'], 120_000);
+  const keepRuns = coerceBool(flags?.['keep-runs'], false);
+
   // Tracks run ids currently executing so the reaper never removes a live
   // container out from under an in-flight job.
   const liveRunIds = new Set();
+  // Tracks per-job workspace dirs currently in use so the run-dir reaper never
+  // deletes a workspace out from under an in-flight host job.
+  const liveRunDirs = new Set();
   let reaperTimer = null;
+  let runDirTimer = null;
+
+  // Run-dir hygiene runs regardless of sandbox: any sandbox=none job that carries
+  // a repository clones a throwaway workspace under the runs root, and a crashed
+  // worker can leave one behind. Bounded to our own directory, age-gated.
+  {
+    const initialRuns = reapAgentRunDirs({ maxAgeMs: reapAgeMs, liveRunDirs });
+    if (initialRuns.reaped > 0) logger.info(`Reaped ${initialRuns.reaped} leftover job workspace(s) at startup.`);
+    runDirTimer = setInterval(() => {
+      const r = reapAgentRunDirs({ maxAgeMs: reapAgeMs, liveRunDirs });
+      if (r.reaped > 0) logger.info(`Reaper removed ${r.reaped} finished job workspace(s).`);
+    }, reapIntervalMs);
+    if (typeof runDirTimer.unref === 'function') runDirTimer.unref();
+  }
 
   if (isContainer) {
     if (!containerEngineAvailable(sandbox)) {
@@ -2123,7 +2334,44 @@ async function workAgent(req, flags) {
 
         const runId = randomUUID();
         if (isContainer) liveRunIds.add(runId);
+
+        // Host git provisioning (increment 2a): sandbox=none + a repository →
+        // clone into a throwaway workspace, run the harness there, then push +
+        // reconcile the agent PR. Container-side cloning is a later increment.
+        const hasRepo = !isContainer && !!envelope.repository?.url;
+        let runDir = null;
+        let provisioned = null;
+        let cwd;
+        let extraEnv;
+        let repoToken = null;
+        if (hasRepo) {
+          const provider = envelope.repository.provider || 'github';
+          const authRef = envelope.repository.authRef || (provider === 'github' ? 'GITHUB_TOKEN' : null);
+          if (authRef) repoToken = secretResolver.resolve(authRef) || null; // optional: absent → anonymous clone
+          try {
+            mkdirSync(agentRunsRoot(), { recursive: true });
+            runDir = mkdtempSync(join(agentRunsRoot(), 'run-'));
+            liveRunDirs.add(runDir);
+            provisioned = provisionRepo({ envelope, token: repoToken, runDir, timeoutMs: cloneTimeoutMs });
+            cwd = provisioned.workspaceDir;
+            extraEnv = {
+              AGENT_WORKSPACE: provisioned.workspaceDir,
+              AGENT_REPO_URL: provisioned.remote,
+              AGENT_REPO_BRANCH: provisioned.workingBranch,
+              AGENT_REPO_REF: envelope.repository.ref || '',
+            };
+          } catch (err) {
+            if (runDir) { try { rmSync(runDir, { recursive: true, force: true }); } catch { /* best effort */ } liveRunDirs.delete(runDir); }
+            if (isContainer) liveRunIds.delete(runId);
+            const retries = Math.max(0, (Number(job.retries) || 1) - 1);
+            const msg = err instanceof ProvisionError ? err.message : `provisioning error: ${err.message}`;
+            logger.warn(`[${jobType}] job ${job.jobKey} not provisioned — ${msg}; retries left ${retries}`);
+            return job.fail({ errorMessage: msg.slice(0, 2000), retries, retryBackOff: 15_000 });
+          }
+        }
+
         let result;
+        let gitResult = null;
         try {
           result = await runAgentJob(profile, job, {
             timeoutMs: jobTimeoutMs,
@@ -2133,20 +2381,50 @@ async function workAgent(req, flags) {
             runId,
             secretEnv: resolved,
             passThroughSecretNames: names,
+            cwd,
+            extraEnv,
           });
+
+          // Finalize git only when the harness succeeded — never push a
+          // half-finished workspace.
+          if (provisioned && result.ok) {
+            try {
+              gitResult = finalizeGit({
+                workspaceDir: provisioned.workspaceDir,
+                gitEnv: provisioned.gitEnv,
+                startSha: provisioned.startSha,
+                workingBranch: provisioned.workingBranch,
+                envelope,
+                token: repoToken,
+              });
+            } catch (err) {
+              gitResult = { branch: provisioned.workingBranch, commits: [], pushed: false, error: err.message };
+            }
+          } else if (provisioned) {
+            gitResult = { branch: provisioned.workingBranch, baseSha: provisioned.startSha || null, commits: [], pushed: false };
+          }
         } finally {
           if (isContainer) liveRunIds.delete(runId);
+          if (runDir && !keepRuns) { try { rmSync(runDir, { recursive: true, force: true }); } catch { /* best effort */ } }
+          if (runDir) liveRunDirs.delete(runDir);
         }
 
-        const resultEnvelope = buildResultEnvelope(result, { sandbox, image });
+        const resultEnvelope = buildResultEnvelope(result, { sandbox, image, git: gitResult });
         if (result.ok) {
-          logger.info(`[${jobType}] job ${job.jobKey} complete (exit 0)${result.truncated ? ' [output truncated]' : ''}`);
+          const gitNote = gitResult
+            ? ` [branch ${gitResult.branch}: ${gitResult.commits.length} commit(s), ${gitResult.pushed ? 'pushed' : (gitResult.pushError ? 'push FAILED' : 'not pushed')}${gitResult.pr?.found ? `, PR #${gitResult.pr.number}` : ''}]`
+            : '';
+          logger.info(`[${jobType}] job ${job.jobKey} complete (exit 0)${result.truncated ? ' [output truncated]' : ''}${gitNote}`);
+          if (gitResult?.pushError) logger.warn(`[${jobType}] job ${job.jobKey}: branch push failed — ${gitResult.pushError}`);
           return job.complete({
             [AGENT_RESULT_KEY]: resultEnvelope,
             output: result.stdout,
             exitCode: 0,
             agent: profile.name,
             truncated: Boolean(result.truncated),
+            ...(gitResult
+              ? { branch: gitResult.branch, commits: gitResult.commits, pushed: gitResult.pushed, pullRequest: gitResult.pr || null }
+              : {}),
           });
         }
         const retries = Math.max(0, (Number(job.retries) || 1) - 1);
@@ -2171,6 +2449,7 @@ async function workAgent(req, flags) {
       stopping = true;
       logger.info(`Received ${signal} — stopping ${workers.length} worker(s)...`);
       if (reaperTimer) clearInterval(reaperTimer);
+      if (runDirTimer) clearInterval(runDirTimer);
       let stopFailures = 0;
       await Promise.all(
         workers.map(async (w) => {
@@ -3437,6 +3716,14 @@ export {
   diskBudgetOk,
   containerEngineAvailable,
   runAgentJob,
+  provisionRepo,
+  finalizeGit,
+  reconcileAgentPr,
+  reapAgentRunDirs,
+  authUrl,
+  redactToken,
+  agentRunsRoot,
+  ProvisionError,
   normalizeStoredProfile,
   jobTypeMatrix,
   AGENT_TASK_NS,
@@ -3532,6 +3819,8 @@ export const commands = {
       'reap-age': { type: 'string', description: 'work: age in ms before a finished agent container is reaped (default 3600000)' },
       'reap-interval': { type: 'string', description: 'work: how often to sweep finished agent containers in ms (default 300000)' },
       'min-free-mb': { type: 'string', description: 'work: shed jobs when the engine data root has less than this many MB free (default 1024)' },
+      'clone-timeout': { type: 'string', description: 'work: max time in ms for cloning a task repository on the host (default 120000)' },
+      'keep-runs': { type: 'boolean', description: 'work: keep per-job workspaces under <state>/agent-runs instead of deleting them after each job (debug)' },
       list: { type: 'boolean', description: 'hire: list existing agent profiles instead of creating one' },
       'max-parallel': { type: 'string', description: 'work: max concurrent jobs per worker (default 1)' },
       'job-timeout': { type: 'string', description: 'work: max harness runtime per job in ms; the spawned process is killed past this (default 300000)' },
@@ -3678,7 +3967,7 @@ function printUsage() {
   console.log('  c8ctl nano config');
   console.log('  c8ctl nano update [--check]');
   console.log('  c8ctl nano hire [--name <n>] [--rank <r>] [--command <c>] [--model <m>] [--capabilities <a,b>] [--sandbox none|docker|podman] [--image <ref>] [--list]');
-  console.log('  c8ctl nano work <profileName> [--max-parallel <n>] [--job-timeout <ms>] [--sandbox none|docker|podman] [--image <ref>] [--secret-resolver host] [--min-free-mb <n>]');
+  console.log('  c8ctl nano work <profileName> [--max-parallel <n>] [--job-timeout <ms>] [--sandbox none|docker|podman] [--image <ref>] [--secret-resolver host] [--min-free-mb <n>] [--clone-timeout <ms>] [--keep-runs]');
   console.log('');
   console.log('Subcommands:');
   console.log('  start    Spawn an N-node local cluster wired to talk to each other on localhost');
@@ -3723,6 +4012,8 @@ function printUsage() {
   console.log('  --reap-age <ms>      work: age before a finished agent container is reaped (default 3600000)');
   console.log('  --reap-interval <ms> work: how often to sweep finished agent containers (default 300000)');
   console.log('  --min-free-mb <n>    work: shed jobs when the engine data root has < this many MB free (default 1024)');
+  console.log('  --clone-timeout <ms> work: max time to clone a task repository on the host (default 120000)');
+  console.log('  --keep-runs          work: keep per-job workspaces instead of deleting them (debug)');
   console.log('');
   console.log('Persistent assets:');
   console.log('  Models and workers live in the workspace dir (NANOBPMN_WORKSPACE_DIR),');

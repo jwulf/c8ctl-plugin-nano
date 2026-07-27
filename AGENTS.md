@@ -46,6 +46,16 @@ SDK client (job workers) — do **not** add the SDK as a dependency or use raw
   (never `system prune`), age-gated, and skips in-flight run ids. Secrets are
   resolved by **name** (pluggable resolver; `host` only) and forwarded as
   `-e NAME` so values never hit argv/`docker inspect`.
+- Git provisioning (host, `sandbox=none` + `repository.url`): clone into a
+  throwaway `<state>/agent-runs/run-*` workspace → checkout/create the branch →
+  run the harness with that workspace as `cwd` → push the branch (`branch.push`)
+  → reconcile the **agent-opened** PR (`task.allowPr`, via `gh pr list --head`).
+  The repo token is delivered via `GIT_ASKPASS` (env) and **redacted** from all
+  logs/results — never in argv or the remote URL. A push failure is a
+  non-fatal `pushError` (the process model drives the merge); a clone failure
+  sheds (retryable). Workspaces are reaped like containers (age-gated, in-flight
+  skipped) and deleted per-job unless `--keep-runs`. Container-side cloning
+  (strong isolation) is a later increment; container jobs don't clone yet.
 
 ## How a cluster is modelled
 

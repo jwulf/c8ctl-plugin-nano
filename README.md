@@ -220,7 +220,36 @@ them into a nested object and coerces `"true"/"false"` → bool and numeric
 strings → int. The normalized shape is
 `{ schemaVersion, repository{provider,url,ref,depth,submodules,authRef}, branch{base,create,push}, setup{commands,env,secretRefs}, task{prompt,promptFile,maxIterations,timeoutMs,allowPr,prBase} }`.
 On completion the plugin writes an **output envelope** back under
-`io.nanobpm.agentResult` (`{schemaVersion, status, sandbox, image, output, truncated, stderrTruncated, exitCode, signal, error}`).
+`io.nanobpm.agentResult` (`{schemaVersion, status, sandbox, image, output, truncated, stderrTruncated, exitCode, signal, error}`). When a repository was
+provisioned (below) it also carries `{repository, branch, baseSha, headSha, commits[], pushed, pushError?, pr?}`.
+
+**Git provisioning (host).** When `--sandbox none` (the default) and the envelope
+carries a `repository.url`, the plugin provisions a workspace on the host around
+the harness:
+
+1. resolve the optional repo credential (`repository.authRef`, or `GITHUB_TOKEN`
+   for GitHub) — absent ⇒ anonymous clone;
+2. `git clone` (honouring `depth`/`submodules`, and `repository.ref`/`branch.base`
+   as the checkout target) into a throwaway workspace under
+   `<state>/agent-runs/run-*`;
+3. create `branch.create` (if set) off that target;
+4. run the harness **in the workspace** (`cwd`), with `AGENT_WORKSPACE`,
+   `AGENT_REPO_URL`, `AGENT_REPO_BRANCH`, `AGENT_REPO_REF` exported and the job
+   envelope on stdin;
+5. on success, enumerate new commits, `git push` the branch when `branch.push`
+   (default true), and — when `task.allowPr` — **reconcile the PR the agent
+   opened** for the branch (`gh pr list --head <branch>`; `openedBy:"agent"`).
+
+The token is delivered to git via `GIT_ASKPASS` (env), never on argv or in the
+remote URL, and is redacted from all logs/results. A push failure is reported as
+`pushError` (the job still completes) so a later BPMN step can drive the merge; a
+clone/checkout failure sheds the job (retryable). Workspaces are deleted after
+each job (keep them with `--keep-runs`).
+
+```bash
+# The harness sees a cloned repo at $AGENT_WORKSPACE; branch/push/PR are handled for it.
+c8ctl nano work coder            # sandbox=none: repository-bearing jobs are provisioned on the host
+```
 
 **Sandbox.** By default the command runs on the host (`--sandbox none`). Pass
 `--sandbox docker` (or `podman`) with an `--image` to run **each job in a
@@ -236,7 +265,8 @@ c8ctl nano work coder --sandbox docker --image ghcr.io/acme/agent:1   # or overr
 Containers are labelled (`nano.managed=1`, `nano.worker`, `nano.jobKey`,
 `nano.run=<uuid>`), log-capped (`max-size=10m max-file=3`), run with `--rm`, and
 a run that outlives `--job-timeout` is force-removed. The envelope is piped on
-the container's stdin exactly as on the host.
+the container's stdin exactly as on the host. (Container-side git provisioning —
+strong isolation — is a later increment; container jobs don't clone yet.)
 
 **Secrets.** Secrets are referenced by **name**, never value. `setup.secretRefs`
 (and the repo/PR credential when `task.allowPr` is set — defaulting to
@@ -245,8 +275,11 @@ the container's stdin exactly as on the host.
 container by name (`-e NAME`) so values never appear in argv or `docker inspect`.
 A missing required secret fails the job with a clear provisioning message.
 
-**Disk hygiene.** Container sandboxes get automatic cleanup so leaked
-containers can't fill the disk: a **label-scoped** reaper runs at worker startup
+**Disk hygiene.** Host job **workspaces** and container sandboxes both get
+automatic cleanup so leaked artifacts can't fill the disk. Workspaces under
+`<state>/agent-runs` are removed after each job and swept at startup + on
+`--reap-interval` (leftovers older than `--reap-age`, in-flight dirs skipped).
+For container sandboxes a **label-scoped** reaper runs at worker startup
 and on an interval (`--reap-interval`, **milliseconds**, default `300000` = 5m),
 removing finished/`exited` containers older than `--reap-age` (**milliseconds**,
 default `3600000` = 1h) while **skipping any run still in flight** — it never
@@ -254,9 +287,9 @@ touches containers it didn't create and never `system prune`s. A **disk-budget
 admission shed** fails (retryable) new jobs when the engine data root has less
 than `--min-free-mb` MB free (default `1024`).
 
-> Git provisioning (clone/branch/push), agent-opened PRs, and the
-> Vercel/Sandcastle provider are **increment 2** — the envelope names above are
-> frozen so the [nano-ide element-template pack](https://github.com/jwulf/nano-ide/issues/37)
+> Container-side git provisioning (strong isolation) and the
+> Vercel/Sandcastle provider are **later increments** — the envelope names above
+> are frozen so the [nano-ide element-template pack](https://github.com/jwulf/nano-ide/issues/37)
 > can be built against this contract.
 
 ## Cleaning up disk

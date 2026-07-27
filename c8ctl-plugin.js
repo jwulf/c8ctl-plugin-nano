@@ -1474,7 +1474,11 @@ async function hireWorker(req, flags) {
   }
 
   const missingRequired = !name || !rank || !command;
-  const missingOptional = model === undefined || capabilities === undefined || !envFromFlags;
+  // NOTE: --env is deliberately NOT part of missingOptional — a fully-specified
+  // scripted hire must not be forced into interactive mode just to skip env.
+  // The env prompt below is gated separately on !envFromFlags, so it only runs
+  // when we're already interactive for another reason.
+  const missingOptional = model === undefined || capabilities === undefined;
   const interactive = process.stdin.isTTY && process.stdout.isTTY;
 
   // Non-interactively only name/rank/command are required; model and
@@ -1899,13 +1903,16 @@ function writeAskpass(dir, token) {
   if (!token) return null;
   const js = join(dir, 'askpass.js');
   writeFileSync(js, 'process.stdout.write(process.env.GIT_TOKEN || "");\n', { mode: 0o600 });
+  // Launch via this process's own Node (process.execPath) rather than bare
+  // `node`, which may not be on PATH when Node was invoked by absolute path.
+  const node = process.execPath;
   if (process.platform === 'win32') {
     const p = join(dir, 'askpass.cmd');
-    writeFileSync(p, '@node "%~dp0askpass.js"\r\n', { mode: 0o700 });
+    writeFileSync(p, `@"${node}" "%~dp0askpass.js"\r\n`, { mode: 0o700 });
     return p;
   }
   const p = join(dir, 'askpass.sh');
-  writeFileSync(p, `#!/bin/sh\nexec node "$(dirname "$0")/askpass.js"\n`, { mode: 0o700 });
+  writeFileSync(p, `#!/bin/sh\nexec "${node}" "$(dirname "$0")/askpass.js"\n`, { mode: 0o700 });
   try { chmodSync(p, 0o700); } catch { /* best effort */ }
   return p;
 }
@@ -2004,7 +2011,7 @@ function provisionRepo({ envelope, token, runDir, timeoutMs = 120_000 }) {
     workingBranch = (name && name !== 'HEAD') ? name : null; // null ⇒ detached HEAD
   }
   const sha = runGit(['rev-parse', 'HEAD'], { cwd: workspaceDir, env: gitEnv });
-  return { workspaceDir, gitEnv, startSha: (sha.stdout || '').trim(), workingBranch, detached: !workingBranch, remote: redactToken(repo.url, token) };
+  return { workspaceDir, gitEnv, startSha: (sha.stdout || '').trim(), workingBranch, detached: !workingBranch, ref: target || '', remote: redactToken(repo.url, token) };
 }
 
 // Look up a PR for this branch (2a does NOT open it — the harness does, driven
@@ -2480,7 +2487,7 @@ async function workAgent(req, flags) {
               AGENT_WORKSPACE: provisioned.workspaceDir,
               AGENT_REPO_URL: provisioned.remote,
               AGENT_REPO_BRANCH: provisioned.workingBranch || '',
-              AGENT_REPO_REF: envelope.repository.ref || '',
+              AGENT_REPO_REF: provisioned.ref || '',
             };
           } catch (err) {
             if (runDir) { try { rmSync(runDir, { recursive: true, force: true }); } catch { /* best effort */ } liveRunDirs.delete(runDir); }

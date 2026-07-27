@@ -226,13 +226,14 @@ test('provisionRepo clones + creates the working branch', { skip: !gitOk }, () =
     const envelope = {
       schemaVersion: 1,
       repository: { provider: 'github', url: origin, submodules: false },
-      branch: { base: '', create: 'feat/nano', push: true },
+      branch: { base: 'main', create: 'feat/nano', push: true },
       setup: { commands: [], env: {}, secretRefs: [] },
       task: { allowPr: false },
     };
     const prov = provisionRepo({ envelope, token: null, runDir });
     assert.ok(existsSync(join(prov.workspaceDir, 'README.md')), 'clone populated the workspace');
     assert.equal(prov.workingBranch, 'feat/nano');
+    assert.equal(prov.ref, 'main', 'effective ref falls back to branch.base when repository.ref is absent');
     assert.match(prov.startSha, /^[0-9a-f]{7,40}$/);
     assert.equal(g(['rev-parse', '--abbrev-ref', 'HEAD'], prov.workspaceDir), 'feat/nano');
   } finally {
@@ -259,6 +260,7 @@ test('provisionRepo reports detached HEAD (tag ref, no create) and finalizeGit s
     const prov = provisionRepo({ envelope, token: null, runDir });
     assert.equal(prov.workingBranch, null, 'a tag checkout has no branch');
     assert.equal(prov.detached, true);
+    assert.equal(prov.ref, 'v1', 'exposes the effective ref for AGENT_REPO_REF');
     const out = finalizeGit({ ...prov, envelope, token: null });
     assert.equal(out.pushed, false, 'never push a detached HEAD');
     assert.equal(out.detached, true);
@@ -294,6 +296,7 @@ test('provisionRepo checks out a commit SHA ref (detached, not via --branch)', {
     assert.equal(g(['rev-parse', 'HEAD'], prov.workspaceDir), firstSha, 'HEAD is pinned to the requested SHA');
     assert.equal(prov.workingBranch, null, 'a SHA checkout has no branch');
     assert.equal(prov.detached, true);
+    assert.equal(prov.ref, firstSha, 'exposes the effective SHA ref');
   } finally {
     rmSync(root, { recursive: true, force: true });
   }

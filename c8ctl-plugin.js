@@ -1618,7 +1618,7 @@ async function hireWorker(req, flags) {
   logger.info(`${existed ? 'Updated' : 'Hired'} "${name}" [${profile.rank}] → ${buildAgentCommandLine(profile.command, profile.args)}`);
   logger.info(`  model: ${profile.model || '(none)'}`);
   logger.info(`  capabilities: ${profile.capabilities.join(', ') || '(none)'}`);
-  if (profile.args.length > 0) logger.info(`  args: ${profile.args.join(' ')}`);
+  if (profile.args.length > 0) logger.info(`  args: ${profile.args.map(shQuote).join(' ')}`);
   logger.info(`  sandbox: ${profile.sandbox}${CONTAINER_SANDBOXES.has(profile.sandbox) ? ` (image ${profile.image})` : ''}`);
   const envKeys = Object.keys(profile.env);
   if (envKeys.length > 0) logger.info(`  env: ${envKeys.join(', ')}`);
@@ -2592,6 +2592,17 @@ async function workAgent(req, flags) {
   const isContainer = CONTAINER_SANDBOXES.has(sandbox);
   if (isContainer && !image) {
     logger.error(`--sandbox ${sandbox} requires an --image (or hire the profile with --image).`);
+    process.exit(1);
+  }
+  // Structured --arg tokens are POSIX single-quoted (shQuote) for the harness
+  // shell. On the host path that shell is the platform default — cmd.exe on
+  // Windows, which does not honour single quotes — so the quoting would leak
+  // literal quote characters and mis-parse the switches. The container path
+  // always targets the image's `sh`, so it stays correct regardless of host OS.
+  // Fail fast with actionable guidance rather than silently corrupting argv.
+  if (!isContainer && effectiveArgs.length > 0 && process.platform === 'win32') {
+    logger.error('--arg is not supported for host execution on Windows (cmd.exe does not honour POSIX quoting).');
+    logger.error('Use a container sandbox (--sandbox docker|podman --image <ref>) or bake the switches into --command.');
     process.exit(1);
   }
 

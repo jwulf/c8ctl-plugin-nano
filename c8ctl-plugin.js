@@ -1888,10 +1888,17 @@ function runGit(args, { cwd, env, timeoutMs = 120_000 } = {}) {
   }
 }
 
-// Write a one-line GIT_ASKPASS helper that echoes $GIT_TOKEN, so the token is
-// delivered to git via the child's ENV — never on argv or in the remote URL.
+// Write a GIT_ASKPASS helper that echoes $GIT_TOKEN, so the token reaches git
+// via the child's ENV — never on argv or in the remote URL. On Windows git
+// can't exec a POSIX `.sh`, so emit a `.cmd` there instead.
 function writeAskpass(dir, token) {
   if (!token) return null;
+  if (process.platform === 'win32') {
+    const p = join(dir, 'askpass.cmd');
+    // `<nul set /p=` prints the value with no trailing newline.
+    writeFileSync(p, '@echo off\r\n<nul set /p=%GIT_TOKEN%\r\n', { mode: 0o700 });
+    return p;
+  }
   const p = join(dir, 'askpass.sh');
   writeFileSync(p, '#!/bin/sh\nprintf %s "$GIT_TOKEN"\n', { mode: 0o700 });
   try { chmodSync(p, 0o700); } catch { /* best effort */ }
@@ -1938,6 +1945,11 @@ function provisionRepo({ envelope, token, runDir, timeoutMs = 120_000 }) {
     GIT_TERMINAL_PROMPT: '0',
     GIT_CONFIG_NOSYSTEM: '1',
   };
+  // Drop any inherited askpass helpers so a no-token ("anonymous") clone can't
+  // authenticate with host-provided credentials. We re-set GIT_ASKPASS below
+  // only when we minted our own token-backed helper.
+  delete gitEnv.GIT_ASKPASS;
+  delete gitEnv.SSH_ASKPASS;
   if (askpass) { gitEnv.GIT_ASKPASS = askpass; gitEnv.GIT_TOKEN = token; }
 
   const target = repo.ref || envelope.branch?.base || '';

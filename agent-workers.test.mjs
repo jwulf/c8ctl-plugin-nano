@@ -299,6 +299,31 @@ test('provisionRepo checks out a commit SHA ref (detached, not via --branch)', {
   }
 });
 
+test('provisionRepo drops inherited GIT_ASKPASS/SSH_ASKPASS for an anonymous clone', { skip: !gitOk }, () => {
+  const { root, origin } = makeOriginRepo();
+  const runDir = mkdtempSync(join(root, 'run-'));
+  const savedGit = process.env.GIT_ASKPASS;
+  const savedSsh = process.env.SSH_ASKPASS;
+  process.env.GIT_ASKPASS = '/host/echo-secret';
+  process.env.SSH_ASKPASS = '/host/echo-secret';
+  try {
+    const envelope = {
+      schemaVersion: 1,
+      repository: { provider: 'github', url: origin, submodules: false },
+      branch: { base: '', create: 'feat/x', push: false },
+      setup: { commands: [], env: {}, secretRefs: [] },
+      task: { allowPr: false },
+    };
+    const prov = provisionRepo({ envelope, token: null, runDir });
+    assert.equal(prov.gitEnv.GIT_ASKPASS, undefined, 'host GIT_ASKPASS must not leak into an anonymous clone');
+    assert.equal(prov.gitEnv.SSH_ASKPASS, undefined, 'host SSH_ASKPASS must not leak into an anonymous clone');
+  } finally {
+    if (savedGit === undefined) delete process.env.GIT_ASKPASS; else process.env.GIT_ASKPASS = savedGit;
+    if (savedSsh === undefined) delete process.env.SSH_ASKPASS; else process.env.SSH_ASKPASS = savedSsh;
+    rmSync(root, { recursive: true, force: true });
+  }
+});
+
 test('provisionRepo throws a ProvisionError (redacted) on clone failure', { skip: !gitOk }, () => {
   const root = mkdtempSync(join(tmpdir(), 'nano-git-'));
   const runDir = mkdtempSync(join(root, 'run-'));

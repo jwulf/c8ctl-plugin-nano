@@ -2412,6 +2412,13 @@ function runAgentJob(profile, job, opts = {}) {
 
   if (!CONTAINER_SANDBOXES.has(sandbox)) {
     // Host: hand the agent the result file by its real path.
+    // Defense in depth: --arg tokens are POSIX single-quoted, which cmd.exe on
+    // a Windows host does not honour, so args would be mis-parsed under the
+    // shell:true spawn. workAgent already rejects this at startup, but guard the
+    // spawn site too so the invariant holds for any direct caller of runAgentJob.
+    if (commandLine !== profile.command && process.platform === 'win32') {
+      return Promise.resolve({ ok: false, exitCode: null, stdout: '', stderr: '', error: 'command-line args (--arg) are not supported for host execution on Windows; use a container sandbox or bake switches into the command', truncated: false, stderrTruncated: false });
+    }
     const resultEnv = resultFile ? { [AGENT_RESULT_FILE_ENV]: resultFile } : {};
     return spawnCaptureOneShot({
       command: commandLine,

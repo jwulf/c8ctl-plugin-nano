@@ -329,8 +329,11 @@ c8ctl nano work coder --arg --verbose            # appends to the profile args
 
 The command is spawned through a shell (so `command` still resolves on `PATH`),
 but each `--arg` is shell-quoted as a single literal token, so a value with
-spaces or shell metacharacters can't break out or inject. They apply on both the
-host and container paths.
+spaces or shell metacharacters can't break out or inject. They apply on the
+container path on any OS, and on the host path on POSIX systems. **On a Windows
+host (`sandbox=none`), `--arg` is rejected** with a clear error — the POSIX
+quoting isn't honoured by `cmd.exe` — so use a container sandbox
+(`--sandbox docker|podman`) or bake the switches into `--command` there.
 
 **Disk hygiene.** Host job **workspaces** and container sandboxes both get
 automatic cleanup so leaked artifacts can't fill the disk. Workspaces under

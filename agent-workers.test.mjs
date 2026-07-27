@@ -647,7 +647,7 @@ test('normalizeStoredProfile normalizes the args list', () => {
   assert.deepEqual(none.profile.args, [], 'missing args → empty list');
 });
 
-test('runAgentJob (host) passes structured --arg switches to the harness', async () => {
+test('runAgentJob (host) passes structured --arg switches to the harness', { skip: process.platform === 'win32' }, async () => {
   // The harness echoes its own argv (after the shell/-c script name), proving the
   // profile args are appended as distinct, shell-quoted tokens.
   const profile = { name: 'p', rank: 'senior', command: 'printf "%s|" "$@"', args: ['--allow-all', 'a b'], model: '', capabilities: [] };
@@ -662,7 +662,7 @@ test('runAgentJob (host) passes structured --arg switches to the harness', async
   assert.equal(result.stdout, '--allow-all|a b|');
 });
 
-test('runAgentJob (host) work-time opts.args override the profile args', async () => {
+test('runAgentJob (host) work-time opts.args override the profile args', { skip: process.platform === 'win32' }, async () => {
   const profile = { name: 'p', rank: 'senior', command: 'printf "%s|" "$@"', args: ['--from-profile'], model: '', capabilities: [] };
   const job = { jobKey: 'jk', type: 'senior', variables: {}, customHeaders: {} };
   const result = await runAgentJob(profile, job, {
@@ -673,6 +673,32 @@ test('runAgentJob (host) work-time opts.args override the profile args', async (
   });
   assert.equal(result.ok, true, result.error || result.stderr);
   assert.equal(result.stdout, '--from-profile|--extra|');
+});
+
+test('runAgentJob (host) rejects --arg on a Windows host (POSIX quoting unsafe under cmd.exe)', async () => {
+  const orig = process.platform;
+  Object.defineProperty(process, 'platform', { value: 'win32', configurable: true });
+  try {
+    const profile = { name: 'p', rank: 'senior', command: 'copilot', args: ['--allow-all'], model: '', capabilities: [] };
+    const job = { jobKey: 'jk', type: 'senior', variables: {}, customHeaders: {} };
+    const result = await runAgentJob(profile, job, {
+      sandbox: 'none',
+      envelope: normalizeTaskEnvelope({}, {}),
+      timeoutMs: 30_000,
+    });
+    assert.equal(result.ok, false);
+    assert.match(result.error, /not supported for host execution on Windows/);
+  } finally {
+    Object.defineProperty(process, 'platform', { value: orig, configurable: true });
+  }
+});
+
+test('runAgentJob (host) still runs on a Windows host when there are no --arg switches', async () => {
+  // With no args, commandLine === command, so the Windows guard must NOT trip.
+  // (We assert the guard is bypassed via buildAgentCommandLine equality rather
+  // than spawning, because a stubbed win32 platform would make node spawn the
+  // absent cmd.exe here.)
+  assert.equal(buildAgentCommandLine('printf ok', []), 'printf ok');
 });
 
 test('runAgentJob (host) injects profileEnv + setup.env into the harness', async () => {

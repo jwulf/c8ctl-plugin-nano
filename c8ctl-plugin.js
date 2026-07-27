@@ -1722,7 +1722,7 @@ function normalizeTaskEnvelope(customHeaders, variables) {
   const repo = raw.repository;
   if (isPlainObject(repo) && str(repo.url)) {
     env.repository = {
-      provider: str(repo.provider) || 'github',
+      provider: (str(repo.provider) || 'github').toLowerCase(),
       url: str(repo.url),
       ref: str(repo.ref),
       depth: coerceInt(repo.depth, undefined),

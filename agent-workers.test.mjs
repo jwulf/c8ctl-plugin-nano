@@ -104,6 +104,17 @@ test('normalizeTaskEnvelope: no repository when url absent', () => {
   assert.equal(env.task.allowPr, false);
 });
 
+test('normalizeTaskEnvelope: provider is lowercased so downstream compares work', () => {
+  const env = normalizeTaskEnvelope(
+    {
+      [`${AGENT_TASK_NS}.repository.url`]: 'https://github.com/o/r.git',
+      [`${AGENT_TASK_NS}.repository.provider`]: 'GitHub',
+    },
+    {},
+  );
+  assert.equal(env.repository.provider, 'github');
+});
+
 test('resolveJobSecrets: host resolver reads env, reports missing', () => {
   const resolver = makeSecretResolver('host');
   process.env.__NANO_TEST_SECRET = 'shhh';

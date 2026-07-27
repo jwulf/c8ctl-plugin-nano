@@ -243,15 +243,17 @@ the harness:
 
 The token is delivered to git via `GIT_ASKPASS` (env), never on argv or in the
 remote URL, and is redacted from all logs/results. When **no** token is resolved
-the clone is strictly anonymous: credential helpers are disabled, inherited
-`GIT_ASKPASS`/`SSH_ASKPASS` are cleared, and the operator's global git config is
-neutralized (`GIT_CONFIG_GLOBAL` → the platform null device, `/dev/null` or
-`NUL` on Windows) so knobs like `http.*.extraHeader`
-or `url.*.insteadOf` can't silently inject operator credentials. Token-backed
-jobs keep global config (e.g. `http.proxy`). A push failure is reported as
-`pushError` (the job still completes) so a later BPMN step can drive the merge; a
-clone/checkout failure sheds the job (retryable). Workspaces are deleted after
-each job (keep them with `--keep-runs`).
+the clone is anonymous **for HTTPS remotes**: credential helpers are disabled,
+inherited `GIT_ASKPASS`/`SSH_ASKPASS` are cleared, and the operator's global git
+config is neutralized (`GIT_CONFIG_GLOBAL` → the platform null device,
+`/dev/null` or `NUL` on Windows) so knobs like `http.*.extraHeader`
+or `url.*.insteadOf` can't silently inject operator credentials. (An **SSH**
+remote — `git@…`/`ssh://…` — can still authenticate via the host's SSH
+agent/config; use HTTPS URLs if you need a guaranteed-anonymous clone.)
+Token-backed jobs keep global config (e.g. `http.proxy`). A push failure is
+reported as `pushError` (the job still completes) so a later BPMN step can drive
+the merge; a clone/checkout failure sheds the job (retryable). Workspaces are
+deleted after each job (keep them with `--keep-runs`).
 
 ```bash
 # The harness sees a cloned repo at $AGENT_WORKSPACE; branch/push/PR are handled for it.

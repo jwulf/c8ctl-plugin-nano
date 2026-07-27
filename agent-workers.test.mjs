@@ -269,6 +269,36 @@ test('provisionRepo reports detached HEAD (tag ref, no create) and finalizeGit s
   }
 });
 
+test('provisionRepo checks out a commit SHA ref (detached, not via --branch)', { skip: !gitOk }, () => {
+  const { root, origin } = makeOriginRepo();
+  // add a second commit so we can pin the FIRST one by SHA
+  const wc = mkdtempSync(join(root, 'wc-'));
+  g(['clone', '-q', origin, wc], undefined);
+  const firstSha = g(['rev-parse', 'HEAD'], wc);
+  g(['config', 'user.name', 'seed'], wc);
+  g(['config', 'user.email', 'seed@example.com'], wc);
+  writeFileSync(join(wc, 'two.txt'), 'two\n');
+  g(['add', '-A'], wc);
+  g(['commit', '-q', '-m', 'second'], wc);
+  g(['push', '-q', 'origin', 'main'], wc);
+  const runDir = mkdtempSync(join(root, 'run-'));
+  try {
+    const envelope = {
+      schemaVersion: 1,
+      repository: { provider: 'github', url: origin, ref: firstSha, submodules: false },
+      branch: { base: '', create: '', push: false },
+      setup: { commands: [], env: {}, secretRefs: [] },
+      task: { allowPr: false },
+    };
+    const prov = provisionRepo({ envelope, token: null, runDir });
+    assert.equal(g(['rev-parse', 'HEAD'], prov.workspaceDir), firstSha, 'HEAD is pinned to the requested SHA');
+    assert.equal(prov.workingBranch, null, 'a SHA checkout has no branch');
+    assert.equal(prov.detached, true);
+  } finally {
+    rmSync(root, { recursive: true, force: true });
+  }
+});
+
 test('provisionRepo throws a ProvisionError (redacted) on clone failure', { skip: !gitOk }, () => {
   const root = mkdtempSync(join(tmpdir(), 'nano-git-'));
   const runDir = mkdtempSync(join(root, 'run-'));

@@ -1915,12 +1915,14 @@ function authUrl(url, provider, hasToken) {
 
 class ProvisionError extends Error {}
 
-// Without a resolved token an https clone/push must NOT silently fall back to
-// the operator's configured credential helper or cached creds. Reset the helper
-// list ("") so no helper runs; combined with GIT_TERMINAL_PROMPT=0 and no
-// GIT_ASKPASS this keeps an anonymous clone genuinely anonymous.
-function credArgs(token) {
-  return token ? [] : ['-c', 'credential.helper='];
+// Never let git invoke the host's configured credential helper for our clone/
+// push. Reset the helper list ("") so no helper runs — even when we DO have a
+// token, because helpers like `store`/keychain would persist the job's repo
+// token to disk. GIT_ASKPASS supplies the secret directly, so no helper is
+// needed. Combined with GIT_TERMINAL_PROMPT=0 this keeps tokens ephemeral and
+// an absent-token clone genuinely anonymous.
+function credArgs() {
+  return ['-c', 'credential.helper='];
 }
 
 // Clone repo into <runDir>/workspace and check out / create the working branch.
@@ -1939,16 +1941,30 @@ function provisionRepo({ envelope, token, runDir, timeoutMs = 120_000 }) {
   if (askpass) { gitEnv.GIT_ASKPASS = askpass; gitEnv.GIT_TOKEN = token; }
 
   const target = repo.ref || envelope.branch?.base || '';
-  const cloneArgs = [...credArgs(token), 'clone', '--no-tags'];
+  // `git clone --branch` accepts a branch or tag name but NOT a raw commit SHA.
+  // For a SHA we clone the default branch, then fetch + check it out below.
+  const isSha = !!target && /^[0-9a-f]{7,40}$/i.test(target);
+  const cloneArgs = [...credArgs(), 'clone', '--no-tags'];
   if (repo.depth && repo.depth > 0) cloneArgs.push('--depth', String(repo.depth));
   if (repo.submodules) cloneArgs.push('--recurse-submodules');
-  if (target) cloneArgs.push('--branch', target);
+  if (target && !isSha) cloneArgs.push('--branch', target);
   const remote = authUrl(repo.url, repo.provider || 'github', !!token);
   cloneArgs.push(remote, workspaceDir);
 
   const clone = runGit(cloneArgs, { env: gitEnv, timeoutMs });
   if (clone.status !== 0) {
     throw new ProvisionError(`git clone failed: ${redactToken(clone.stderr || clone.stdout, token).trim().slice(0, 500) || `exit ${clone.status}`}`);
+  }
+
+  if (isSha) {
+    // The SHA may not be present under a shallow clone of the default branch —
+    // fetch it explicitly (best effort), then check it out (detached HEAD).
+    const fetch = runGit([...credArgs(), 'fetch', '--no-tags', 'origin', target], { cwd: workspaceDir, env: gitEnv, timeoutMs });
+    const co = runGit(['checkout', '--detach', target], { cwd: workspaceDir, env: gitEnv });
+    if (co.status !== 0) {
+      const why = redactToken(co.stderr || fetch.stderr, token).trim().slice(0, 300);
+      throw new ProvisionError(`git checkout ${target} failed: ${why || `exit ${co.status}`}`);
+    }
   }
 
   // Give the harness a committer identity in case it commits (many do).
@@ -2013,7 +2029,7 @@ function finalizeGit({ workspaceDir, gitEnv, startSha, workingBranch, envelope, 
   if (!workingBranch) {
     out.detached = true; // clone landed on a tag/sha ⇒ no branch to push
   } else if (coerceBool(envelope.branch?.push, true) && out.commits.length > 0) {
-    const push = runGit([...credArgs(token), 'push', '--set-upstream', 'origin', workingBranch], { cwd: workspaceDir, env: gitEnv });
+    const push = runGit([...credArgs(), 'push', '--set-upstream', 'origin', workingBranch], { cwd: workspaceDir, env: gitEnv });
     if (push.status === 0) out.pushed = true;
     else out.pushError = redactToken(push.stderr || push.stdout, token).trim().slice(0, 300) || `push exit ${push.status}`;
   }

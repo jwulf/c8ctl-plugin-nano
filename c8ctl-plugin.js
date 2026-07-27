@@ -1344,9 +1344,10 @@ function parseEnvPairs(input) {
   for (const item of list) {
     const s = String(item);
     const eq = s.indexOf('=');
-    if (eq <= 0) { errors.push(`--env "${s}" must be NAME=VALUE`); continue; }
+    // Never echo the value in diagnostics — a user may pass a secret via --env.
+    if (eq <= 0) { errors.push(`--env entry ${eq === 0 ? 'has an empty name' : 'must be NAME=VALUE'} (value hidden)`); continue; }
     const name = s.slice(0, eq);
-    if (!ENV_NAME_RE.test(name)) { errors.push(`--env "${s}" has an invalid variable name`); continue; }
+    if (!ENV_NAME_RE.test(name)) { errors.push(`--env name "${name}" is invalid (must match ${ENV_NAME_RE.source})`); continue; }
     env[name] = s.slice(eq + 1);
   }
   return { env, errors };
@@ -1889,18 +1890,22 @@ function runGit(args, { cwd, env, timeoutMs = 120_000 } = {}) {
 }
 
 // Write a GIT_ASKPASS helper that echoes $GIT_TOKEN, so the token reaches git
-// via the child's ENV — never on argv or in the remote URL. On Windows git
-// can't exec a POSIX `.sh`, so emit a `.cmd` there instead.
+// via the child's ENV — never on argv or in the remote URL. Uses a Node helper
+// (askpass.js reads GIT_TOKEN and writes it verbatim), launched by a per-OS
+// shim: git can't exec a POSIX `.sh` on Windows, and a raw `.cmd` would let
+// cmd.exe re-parse token metacharacters (&, |, ^). The shim keeps the token in
+// env only and never expands it in a shell.
 function writeAskpass(dir, token) {
   if (!token) return null;
+  const js = join(dir, 'askpass.js');
+  writeFileSync(js, 'process.stdout.write(process.env.GIT_TOKEN || "");\n', { mode: 0o600 });
   if (process.platform === 'win32') {
     const p = join(dir, 'askpass.cmd');
-    // `<nul set /p=` prints the value with no trailing newline.
-    writeFileSync(p, '@echo off\r\n<nul set /p=%GIT_TOKEN%\r\n', { mode: 0o700 });
+    writeFileSync(p, '@node "%~dp0askpass.js"\r\n', { mode: 0o700 });
     return p;
   }
   const p = join(dir, 'askpass.sh');
-  writeFileSync(p, '#!/bin/sh\nprintf %s "$GIT_TOKEN"\n', { mode: 0o700 });
+  writeFileSync(p, `#!/bin/sh\nexec node "$(dirname "$0")/askpass.js"\n`, { mode: 0o700 });
   try { chmodSync(p, 0o700); } catch { /* best effort */ }
   return p;
 }
@@ -2530,7 +2535,7 @@ async function workAgent(req, flags) {
         const resultEnvelope = buildResultEnvelope(result, { sandbox, image, git: gitResult });
         if (result.ok) {
           const gitNote = gitResult
-            ? ` [branch ${gitResult.branch}: ${gitResult.commits.length} commit(s), ${gitResult.pushed ? 'pushed' : (gitResult.pushError ? 'push FAILED' : 'not pushed')}${gitResult.pr?.found ? `, PR #${gitResult.pr.number}` : ''}]`
+            ? ` [${gitResult.branch ? `branch ${gitResult.branch}` : 'detached HEAD'}: ${gitResult.commits.length} commit(s), ${gitResult.branch ? (gitResult.pushed ? 'pushed' : (gitResult.pushError ? 'push FAILED' : 'not pushed')) : 'no branch to push'}${gitResult.pr?.found ? `, PR #${gitResult.pr.number}` : ''}]`
             : '';
           logger.info(`[${jobType}] job ${job.jobKey} complete (exit 0)${result.truncated ? ' [output truncated]' : ''}${gitNote}`);
           if (gitResult?.pushError) logger.warn(`[${jobType}] job ${job.jobKey}: branch push failed — ${gitResult.pushError}`);

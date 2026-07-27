@@ -435,6 +435,14 @@ test('parseEnvPairs parses NAME=VALUE, keeps = in values, reports bad input', ()
   assert.deepEqual(bad.env, { GOOD: 'y' });
   assert.equal(bad.errors.length, 3);
 
+  // Errors must never echo the value (it may be a secret passed via --env).
+  const leak = parseEnvPairs(['BAD NAME=sk-supersecret', 'no-dash=alsosecret']);
+  assert.equal(leak.errors.length, 2);
+  for (const e of leak.errors) {
+    assert.equal(e.includes('supersecret'), false, 'error leaked a secret value');
+    assert.equal(e.includes('alsosecret'), false, 'error leaked a secret value');
+  }
+
   assert.deepEqual(parseEnvPairs(undefined).env, {});
 });
 

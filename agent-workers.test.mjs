@@ -237,6 +237,9 @@ test('readAgentResultFile reads the file the agent wrote, tolerating absence/gar
     assert.deepEqual(readAgentResultFile(p), { status: 'needs_input', question: 'which base branch?' });
     writeFileSync(p, 'corrupt {');
     assert.equal(readAgentResultFile(p), null, 'malformed file → null, never throws');
+    // Oversized agent output is refused (DoS guard) rather than read into memory.
+    writeFileSync(p, `{"status":"${'x'.repeat(1_100_000)}"}`);
+    assert.equal(readAgentResultFile(p), null, 'file over the size cap → null');
   } finally {
     rmSync(dir, { recursive: true, force: true });
   }

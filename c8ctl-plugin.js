@@ -1672,11 +1672,16 @@ function parseAgentResultObject(text) {
 }
 
 // Read + parse the agent's result file, if it wrote one. Best-effort; a missing
-// or malformed file is treated as "no structured result".
+// or malformed file is treated as "no structured result". The file is
+// agent-controlled, so guard against a symlink or an oversized payload (DoS):
+// only a regular file no larger than the cap is read. A well-formed result is a
+// tiny JSON object, so the cap is generous.
+const MAX_RESULT_FILE_BYTES = 1_048_576; // 1 MiB
 function readAgentResultFile(path) {
   if (!path) return null;
   try {
-    if (!existsSync(path)) return null;
+    const st = lstatSync(path); // lstat: never follow a symlink the agent planted
+    if (!st.isFile() || st.size > MAX_RESULT_FILE_BYTES) return null;
     return parseAgentResultObject(readFileSync(path, 'utf8'));
   } catch { return null; }
 }

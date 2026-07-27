@@ -2226,7 +2226,10 @@ function spawnCaptureOneShot({ command, args = [], shell = false, detached = fal
 
     // Live "spy" tee (--stream): mirror the child's output to this console,
     // prefixing each complete line with the job tag so interleaved jobs stay
-    // legible. A per-stream buffer holds partial lines across chunk boundaries.
+    // legible. A per-stream buffer holds partial lines across chunk boundaries;
+    // it is force-flushed once it exceeds STREAM_TEE_LINE_CAP so a newline-less
+    // torrent (progress bars, binary output) can't grow it without bound.
+    const STREAM_TEE_LINE_CAP = 64 * 1024;
     const makeTee = (sink) => {
       if (!stream) return null;
       let partial = '';
@@ -2236,6 +2239,10 @@ function spawnCaptureOneShot({ command, args = [], shell = false, detached = fal
         while ((nl = partial.indexOf('\n')) !== -1) {
           sink.write(`${streamPrefix}${partial.slice(0, nl)}\n`);
           partial = partial.slice(nl + 1);
+        }
+        while (partial.length >= STREAM_TEE_LINE_CAP) {
+          sink.write(`${streamPrefix}${partial.slice(0, STREAM_TEE_LINE_CAP)}\n`);
+          partial = partial.slice(STREAM_TEE_LINE_CAP);
         }
         if (final && partial) { sink.write(`${streamPrefix}${partial}\n`); partial = ''; }
       };
@@ -2734,11 +2741,15 @@ async function workAgent(req, flags) {
             : '';
           logger.info(`[${jobType}] job ${job.jobKey} complete (exit 0)${result.truncated ? ' [output truncated]' : ''}${gitNote}`);
           if (gitResult?.pushError) logger.warn(`[${jobType}] job ${job.jobKey}: branch push failed — ${gitResult.pushError}`);
-          // Guard the operator against silent empty escalations: a success with no
-          // structured result means the model's status/decision vars will be unset.
-          if (!rawResult) logger.warn(`[${jobType}] job ${job.jobKey}: agent returned no structured result — write a JSON object to $AGENT_RESULT_FILE (or print a "${RESULT_SENTINEL} {…}" line) so downstream gateways see status/summary/etc.`);
+          // Guard the operator against silent empty escalations: a success that
+          // yields no *effective* result vars (no file/sentinel at all, an empty
+          // `{}`, or only reserved keys that were sanitized away) means the
+          // model's status/decision vars stay unset and any status gateway will
+          // fall through to its default. Warn on the merged-vars emptiness, not
+          // just a missing rawResult.
           const resultKeys = Object.keys(resultVars);
-          if (resultKeys.length > 0) logger.info(`[${jobType}] job ${job.jobKey}: merged agent result vars [${resultKeys.join(', ')}]`);
+          if (resultKeys.length === 0) logger.warn(`[${jobType}] job ${job.jobKey}: agent returned no usable result vars — write a JSON object of result variables to $AGENT_RESULT_FILE (or print a "${RESULT_SENTINEL} {…}" line) so downstream gateways see status/summary/etc.`);
+          else logger.info(`[${jobType}] job ${job.jobKey}: merged agent result vars [${resultKeys.join(', ')}]`);
           return job.complete({
             ...resultVars,
             [AGENT_RESULT_KEY]: resultEnvelope,

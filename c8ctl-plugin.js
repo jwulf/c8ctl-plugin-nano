@@ -2218,7 +2218,7 @@ const MAX_CAPTURE_BYTES = 1_048_576; // 1 MiB per stream
 // Spawn a child, pipe `stdinData`, capture byte-capped stdout/stderr, enforce a
 // timeout (invoking `onTimeout(child)` to tear the child down), and resolve to a
 // uniform result. Used by both the host and container executors.
-function spawnCaptureOneShot({ command, args = [], shell = false, detached = false, cwd, env, stdinData, timeoutMs, onTimeout, stream = false, streamPrefix = '' }) {
+function spawnCaptureOneShot({ command, args = [], shell = false, detached = false, cwd, env, stdinData, timeoutMs, onTimeout, stream = false, streamPrefix = '', onStreamOut, onStreamErr }) {
   return new Promise((resolve) => {
     let child;
     const stdoutChunks = [];
@@ -2230,32 +2230,36 @@ function spawnCaptureOneShot({ command, args = [], shell = false, detached = fal
     let settled = false;
     let timer = null;
 
-    // Live "spy" tee (--stream): mirror the child's output to this console,
-    // prefixing each complete line with the job tag so interleaved jobs stay
+    // Live "spy" tee (--stream): mirror the child's output line-by-line to a
+    // caller-supplied emitter (the worker routes these through c8ctl's
+    // output-mode-aware logger so streaming never corrupts a structured/JSON
+    // output mode; falling back to a raw console write only when none is given).
+    // Each complete line is tagged with the job prefix so interleaved jobs stay
     // legible. A per-stream buffer holds partial lines across chunk boundaries;
     // it is force-flushed once it exceeds STREAM_TEE_LINE_CAP so a newline-less
     // torrent (progress bars, binary output) can't grow it without bound.
     const STREAM_TEE_LINE_CAP = 64 * 1024;
-    const makeTee = (sink) => {
+    const makeTee = (emit) => {
       if (!stream) return null;
+      const sink = emit || ((line) => process.stdout.write(`${line}\n`));
       let partial = '';
       const flush = (text, final) => {
         partial += text;
         let nl;
         while ((nl = partial.indexOf('\n')) !== -1) {
-          sink.write(`${streamPrefix}${partial.slice(0, nl)}\n`);
+          sink(`${streamPrefix}${partial.slice(0, nl)}`);
           partial = partial.slice(nl + 1);
         }
         while (partial.length >= STREAM_TEE_LINE_CAP) {
-          sink.write(`${streamPrefix}${partial.slice(0, STREAM_TEE_LINE_CAP)}\n`);
+          sink(`${streamPrefix}${partial.slice(0, STREAM_TEE_LINE_CAP)}`);
           partial = partial.slice(STREAM_TEE_LINE_CAP);
         }
-        if (final && partial) { sink.write(`${streamPrefix}${partial}\n`); partial = ''; }
+        if (final && partial) { sink(`${streamPrefix}${partial}`); partial = ''; }
       };
       return flush;
     };
-    const teeOut = makeTee(process.stdout);
-    const teeErr = makeTee(process.stderr);
+    const teeOut = makeTee(onStreamOut);
+    const teeErr = makeTee(onStreamErr || onStreamOut);
 
     const finish = (result) => {
       if (settled) return;
@@ -2354,7 +2358,7 @@ function baseAgentEnv(profile, job) {
  * Both paths resolve to the same result contract.
  */
 function runAgentJob(profile, job, opts = {}) {
-  const { timeoutMs, envelope, sandbox = 'none', image, runId, secretEnv = {}, passThroughSecretNames = [], cwd, extraEnv = {}, profileEnv = {}, resultFile, stream = false, streamPrefix = '' } = opts;
+  const { timeoutMs, envelope, sandbox = 'none', image, runId, secretEnv = {}, passThroughSecretNames = [], cwd, extraEnv = {}, profileEnv = {}, resultFile, stream = false, streamPrefix = '', onStreamOut, onStreamErr } = opts;
   const payload = JSON.stringify(buildAgentPayload(profile, job, envelope));
   const agentEnv = baseAgentEnv(profile, job);
   // Static, non-secret env for the harness: the worker/profile's env (e.g. a
@@ -2381,6 +2385,8 @@ function runAgentJob(profile, job, opts = {}) {
       onTimeout: (child) => killTree(child),
       stream,
       streamPrefix,
+      onStreamOut,
+      onStreamErr,
     });
   }
 
@@ -2433,6 +2439,8 @@ function runAgentJob(profile, job, opts = {}) {
     timeoutMs,
     stream,
     streamPrefix,
+    onStreamOut,
+    onStreamErr,
     onTimeout: (child) => {
       try { spawnSync(engine, ['rm', '-f', containerName], { timeout: 15_000 }); } catch { /* best effort */ }
       try { killTree(child); } catch { /* best effort */ }
@@ -2713,6 +2721,10 @@ async function workAgent(req, flags) {
             resultFile,
             stream,
             streamPrefix: `[${jobType} ${job.jobKey}] `,
+            // Route the --stream tee through c8ctl's output-mode-aware logger so
+            // spying never corrupts a structured/JSON output mode.
+            onStreamOut: stream ? (line) => logger.info(line) : undefined,
+            onStreamErr: stream ? (line) => logger.warn(line) : undefined,
           });
 
           // Finalize git only when the harness succeeded — never push a

@@ -1,3 +1,10 @@
+# [1.12.0](https://github.com/jwulf/c8ctl-plugin-nano/compare/v1.11.0...v1.12.0) (2026-07-27)
+
+
+### Features
+
+* **work:** structured agent result channel + --stream spy ([#14](https://github.com/jwulf/c8ctl-plugin-nano/issues/14)) ([a992c76](https://github.com/jwulf/c8ctl-plugin-nano/commit/a992c76cf7adddbf268f713f26cb0bc9fac8df8d))
+
 # [1.11.0](https://github.com/jwulf/c8ctl-plugin-nano/compare/v1.10.1...v1.11.0) (2026-07-27)
 
 

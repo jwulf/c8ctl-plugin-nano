@@ -330,6 +330,7 @@ test('provisionRepo drops inherited GIT_ASKPASS/SSH_ASKPASS for an anonymous clo
     const prov = provisionRepo({ envelope, token: null, runDir });
     assert.equal(prov.gitEnv.GIT_ASKPASS, undefined, 'host GIT_ASKPASS must not leak into an anonymous clone');
     assert.equal(prov.gitEnv.SSH_ASKPASS, undefined, 'host SSH_ASKPASS must not leak into an anonymous clone');
+    assert.ok(prov.gitEnv.GIT_CONFIG_GLOBAL, 'anonymous clone neutralizes global git config');
   } finally {
     if (savedGit === undefined) delete process.env.GIT_ASKPASS; else process.env.GIT_ASKPASS = savedGit;
     if (savedSsh === undefined) delete process.env.SSH_ASKPASS; else process.env.SSH_ASKPASS = savedSsh;

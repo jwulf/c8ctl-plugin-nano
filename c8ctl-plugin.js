@@ -45,7 +45,7 @@ import {
   mkdtempSync,
 } from 'node:fs';
 import { randomUUID } from 'node:crypto';
-import { homedir, platform as osPlatform } from 'node:os';
+import { homedir, platform as osPlatform, devNull } from 'node:os';
 import { join, isAbsolute, resolve as resolvePath, dirname, sep } from 'node:path';
 import { createRequire } from 'node:module';
 import { fileURLToPath } from 'node:url';
@@ -1962,7 +1962,17 @@ function provisionRepo({ envelope, token, runDir, timeoutMs = 120_000 }) {
   // only when we minted our own token-backed helper.
   delete gitEnv.GIT_ASKPASS;
   delete gitEnv.SSH_ASKPASS;
-  if (askpass) { gitEnv.GIT_ASKPASS = askpass; gitEnv.GIT_TOKEN = token; }
+  if (askpass) {
+    gitEnv.GIT_ASKPASS = askpass;
+    gitEnv.GIT_TOKEN = token;
+  } else {
+    // No token ⇒ honor the documented "anonymous" guarantee strictly: neutralize
+    // the user's global git config too, so knobs like http.<url>.extraHeader
+    // (added by `gh auth setup-git`) or url.<...>.insteadOf can't silently inject
+    // operator credentials. Only done on the anonymous path — token-backed jobs
+    // keep global config (e.g. http.proxy for reaching the remote).
+    gitEnv.GIT_CONFIG_GLOBAL = devNull;
+  }
 
   const target = repo.ref || envelope.branch?.base || '';
   // `git clone --branch` accepts a branch or tag name but NOT a raw commit SHA.

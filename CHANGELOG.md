@@ -1,3 +1,10 @@
+# [1.11.0](https://github.com/jwulf/c8ctl-plugin-nano/compare/v1.10.1...v1.11.0) (2026-07-27)
+
+
+### Features
+
+* **nano:** host git provisioning for agent workers (part 2a of [#8](https://github.com/jwulf/c8ctl-plugin-nano/issues/8)) ([#10](https://github.com/jwulf/c8ctl-plugin-nano/issues/10)) ([aa0d0fc](https://github.com/jwulf/c8ctl-plugin-nano/commit/aa0d0fc90d18bf56e78337a344501d2650af6b07))
+
 ## [1.10.1](https://github.com/jwulf/c8ctl-plugin-nano/compare/v1.10.0...v1.10.1) (2026-07-27)
 
 

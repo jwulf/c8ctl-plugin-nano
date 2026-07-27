@@ -292,6 +292,39 @@ test('provisionRepo reports detached HEAD (tag ref, no create) and finalizeGit s
   }
 });
 
+test('finalizeGit pushes the first commit into an empty repo (no base sha)', { skip: !gitOk }, () => {
+  const root = mkdtempSync(join(tmpdir(), 'nano-git-'));
+  const origin = join(root, 'origin.git');
+  g(['init', '-q', '--bare', origin], undefined);
+  const runDir = mkdtempSync(join(root, 'run-'));
+  try {
+    const envelope = {
+      schemaVersion: 1,
+      repository: { provider: 'github', url: origin, submodules: false },
+      branch: { base: '', create: 'feat/first', push: true },
+      setup: { commands: [], env: {}, secretRefs: [] },
+      task: { allowPr: false },
+    };
+    const prov = provisionRepo({ envelope, token: null, runDir });
+    assert.equal(prov.workingBranch, 'feat/first');
+    assert.equal(prov.startSha, '', 'an empty repo has no initial commit');
+
+    // Simulate the harness making the repo's first commit.
+    writeFileSync(join(prov.workspaceDir, 'hello.txt'), 'hi\n');
+    g(['add', '-A'], prov.workspaceDir);
+    g(['-c', 'user.name=nano', '-c', 'user.email=nano@example.com', 'commit', '-q', '-m', 'first'], prov.workspaceDir);
+
+    const out = finalizeGit({ ...prov, envelope, token: null });
+    assert.equal(out.commits.length, 1, 'the first commit is enumerated even without a base sha');
+    assert.equal(out.pushed, true, 'the branch is pushed');
+    assert.equal(out.pushError, undefined);
+    // the branch now exists on the origin
+    assert.equal(g(['-c', 'safe.bareRepository=all', 'rev-parse', '--verify', 'refs/heads/feat/first'], origin).length, 40);
+  } finally {
+    rmSync(root, { recursive: true, force: true });
+  }
+});
+
 test('provisionRepo checks out a commit SHA ref (detached, not via --branch)', { skip: !gitOk }, () => {
   const { root, origin } = makeOriginRepo();
   // add a second commit so we can pin the FIRST one by SHA

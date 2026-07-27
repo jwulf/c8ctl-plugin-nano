@@ -2021,7 +2021,10 @@ function provisionRepo({ envelope, token, runDir, timeoutMs = 120_000 }) {
     workingBranch = (name && name !== 'HEAD') ? name : null; // null ⇒ detached HEAD
   }
   const sha = runGit(['rev-parse', 'HEAD'], { cwd: workspaceDir, env: gitEnv });
-  return { workspaceDir, gitEnv, startSha: (sha.stdout || '').trim(), workingBranch, detached: !workingBranch, ref: target || '', remote: redactToken(repo.url, token) };
+  // `git rev-parse HEAD` on an unborn branch (freshly cloned empty repo) exits
+  // non-zero and echoes the literal "HEAD" on stdout — treat that as "no base
+  // commit" (empty startSha) rather than a bogus revision.
+  return { workspaceDir, gitEnv, startSha: sha.status === 0 ? (sha.stdout || '').trim() : '', workingBranch, detached: !workingBranch, ref: target || '', remote: redactToken(repo.url, token) };
 }
 
 // Look up a PR for this branch (2a does NOT open it — the harness does, driven
@@ -2062,9 +2065,16 @@ function finalizeGit({ workspaceDir, gitEnv, startSha, workingBranch, envelope, 
   const rem = runGit(['remote', 'get-url', 'origin'], { cwd: workspaceDir, env: gitEnv });
   if (rem.status === 0) out.remote = redactToken(rem.stdout.trim(), token);
   const headNow = runGit(['rev-parse', 'HEAD'], { cwd: workspaceDir, env: gitEnv });
-  out.headSha = (headNow.stdout || '').trim() || null;
+  out.headSha = headNow.status === 0 ? ((headNow.stdout || '').trim() || null) : null;
   if (startSha) {
     const log = runGit(['rev-list', `${startSha}..HEAD`], { cwd: workspaceDir, env: gitEnv });
+    if (log.status === 0) out.commits = log.stdout.trim().split('\n').filter(Boolean);
+  } else if (out.headSha) {
+    // Empty-repo case: provisionRepo found no initial commit (unborn branch), so
+    // there is no base to diff against — every commit now on HEAD is new. Without
+    // this, a harness that makes the repo's first commit would enumerate as "0
+    // commits" and the branch would never be pushed.
+    const log = runGit(['rev-list', 'HEAD'], { cwd: workspaceDir, env: gitEnv });
     if (log.status === 0) out.commits = log.stdout.trim().split('\n').filter(Boolean);
   }
 

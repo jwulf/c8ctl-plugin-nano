@@ -41,7 +41,7 @@ import {
   renameSync,
   realpathSync,
   statfsSync,
-  statSync,
+  lstatSync,
   mkdtempSync,
 } from 'node:fs';
 import { randomUUID } from 'node:crypto';
@@ -2099,8 +2099,8 @@ function reapAgentRunDirs({ maxAgeMs = 0, liveRunDirs = new Set() } = {}) {
       const p = join(root, name);
       if (liveRunDirs.has(p)) continue;
       try {
-        const st = statSync(p);
-        if (!st.isDirectory()) continue;
+        const st = lstatSync(p);
+        if (!st.isDirectory()) continue; // lstat: a symlink is not a dir ⇒ skipped, never followed
         if (maxAgeMs > 0 && now - st.mtimeMs < maxAgeMs) continue;
         rmSync(p, { recursive: true, force: true });
         reaped++;

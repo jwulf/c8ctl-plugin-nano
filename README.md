@@ -242,8 +242,11 @@ the harness:
    PR's actual author login, or `null` when none is found).
 
 The token is delivered to git via `GIT_ASKPASS` (env), never on argv or in the
-remote URL, and is redacted from all logs/results. When **no** token is resolved
-the clone is anonymous **for HTTPS remotes**: credential helpers are disabled,
+remote URL, and is redacted from all logs/results. Credential helpers are
+**always** disabled for the clone/fetch/push (`-c credential.helper=`), even when
+a token is present, so a helper like `store`/keychain can never persist the
+job's token to disk — `GIT_ASKPASS` supplies the secret directly. When **no**
+token is resolved the clone is *additionally* anonymous **for HTTPS remotes**:
 inherited `GIT_ASKPASS`/`SSH_ASKPASS` are cleared, and the operator's global git
 config is neutralized (`GIT_CONFIG_GLOBAL` → the platform null device,
 `/dev/null` or `NUL` on Windows) so knobs like `http.*.extraHeader`

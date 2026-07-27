@@ -186,6 +186,16 @@ test('buildResultEnvelope merges the git block when a repo was provisioned', () 
 
   const noGit = buildResultEnvelope({ ok: true, stdout: '', exitCode: 0 }, { sandbox: 'none' });
   assert.equal('branch' in noGit, false, 'no git block when no repo');
+
+  // A failed job that WAS provisioned must still carry repo context.
+  const failed = buildResultEnvelope(
+    { ok: false, stdout: '', exitCode: 1, error: 'boom' },
+    { sandbox: 'none', git: { remote: 'https://github.com/o/r.git', branch: 'feat/x', baseSha: 'aaa', commits: [], pushed: false, error: 'finalize failed' } },
+  );
+  assert.equal(failed.status, 'failed');
+  assert.equal(failed.repository, 'https://github.com/o/r.git', 'repository preserved on failure');
+  assert.equal(failed.branch, 'feat/x');
+  assert.equal(failed.gitError, 'finalize failed');
 });
 
 // --- Git provisioning (increment 2a) ----------------------------------------

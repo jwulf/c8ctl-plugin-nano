@@ -2528,10 +2528,10 @@ async function workAgent(req, flags) {
                 token: repoToken,
               });
             } catch (err) {
-              gitResult = { branch: provisioned.workingBranch, commits: [], pushed: false, error: redactToken(err.message, repoToken) };
+              gitResult = { remote: provisioned.remote, branch: provisioned.workingBranch, baseSha: provisioned.startSha || null, commits: [], pushed: false, error: redactToken(err.message, repoToken) };
             }
           } else if (provisioned) {
-            gitResult = { branch: provisioned.workingBranch, baseSha: provisioned.startSha || null, commits: [], pushed: false };
+            gitResult = { remote: provisioned.remote, branch: provisioned.workingBranch, baseSha: provisioned.startSha || null, commits: [], pushed: false };
           }
         } finally {
           if (isContainer) liveRunIds.delete(runId);

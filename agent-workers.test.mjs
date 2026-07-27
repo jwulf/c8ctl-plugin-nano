@@ -25,6 +25,9 @@ import {
   sanitizeResultVars,
   parseEnvPairs,
   normalizeEnvMap,
+  normalizeArgList,
+  shQuote,
+  buildAgentCommandLine,
   reapAgentContainers,
   diskBudgetOk,
   normalizeStoredProfile,
@@ -609,6 +612,67 @@ test('normalizeStoredProfile carries a normalized env map', () => {
   assert.deepEqual(p.profile.env, { PERMS: '1' });
   const none = normalizeStoredProfile('coder', { rank: 'senior', command: 'copilot' });
   assert.deepEqual(none.profile.env, {}, 'missing env → empty map');
+});
+
+test('normalizeArgList coerces to a clean string[], dropping empties/nullish', () => {
+  assert.deepEqual(normalizeArgList('--allow-all'), ['--allow-all'], 'a bare string is one arg');
+  assert.deepEqual(normalizeArgList(['--a', '', null, undefined, '--b']), ['--a', '--b']);
+  assert.deepEqual(normalizeArgList([1, true]), ['1', 'true'], 'non-strings are coerced');
+  assert.deepEqual(normalizeArgList(undefined), []);
+  assert.deepEqual(normalizeArgList('--foo=a b'), ['--foo=a b'], 'interior whitespace is preserved');
+});
+
+test('shQuote wraps a value as one shell-safe literal, escaping single quotes', () => {
+  assert.equal(shQuote('--allow-all'), `'--allow-all'`);
+  assert.equal(shQuote('a b'), `'a b'`, 'spaces stay inside one token');
+  assert.equal(shQuote(`it's`), `'it'\\''s'`, 'embedded single quote is escaped');
+  assert.equal(shQuote(''), `''`, 'empty string → empty literal');
+});
+
+test('buildAgentCommandLine appends shell-quoted args, verbatim when none', () => {
+  assert.equal(buildAgentCommandLine('copilot', []), 'copilot', 'no args → command verbatim');
+  assert.equal(buildAgentCommandLine('copilot', ['--allow-all']), `copilot '--allow-all'`);
+  assert.equal(
+    buildAgentCommandLine('copilot', ['--model', 'gpt-5', '--dir', 'a b']),
+    `copilot '--model' 'gpt-5' '--dir' 'a b'`,
+  );
+  // A malicious arg can't break out of its literal (no injection).
+  assert.equal(buildAgentCommandLine('copilot', ['; rm -rf /']), `copilot '; rm -rf /'`);
+});
+
+test('normalizeStoredProfile normalizes the args list', () => {
+  const p = normalizeStoredProfile('coder', { rank: 'senior', command: 'copilot', args: ['--allow-all', '', null] });
+  assert.deepEqual(p.profile.args, ['--allow-all']);
+  const none = normalizeStoredProfile('coder', { rank: 'senior', command: 'copilot' });
+  assert.deepEqual(none.profile.args, [], 'missing args → empty list');
+});
+
+test('runAgentJob (host) passes structured --arg switches to the harness', async () => {
+  // The harness echoes its own argv (after the shell/-c script name), proving the
+  // profile args are appended as distinct, shell-quoted tokens.
+  const profile = { name: 'p', rank: 'senior', command: 'printf "%s|" "$@"', args: ['--allow-all', 'a b'], model: '', capabilities: [] };
+  const job = { jobKey: 'jk', type: 'senior', variables: {}, customHeaders: {} };
+  const result = await runAgentJob(profile, job, {
+    sandbox: 'none',
+    envelope: normalizeTaskEnvelope({}, {}),
+    timeoutMs: 30_000,
+  });
+  assert.equal(result.ok, true, result.error || result.stderr);
+  // `sh -c 'printf "%s|" "$@"' <script0> --allow-all 'a b'` → "$@" is the args.
+  assert.equal(result.stdout, '--allow-all|a b|');
+});
+
+test('runAgentJob (host) work-time opts.args override the profile args', async () => {
+  const profile = { name: 'p', rank: 'senior', command: 'printf "%s|" "$@"', args: ['--from-profile'], model: '', capabilities: [] };
+  const job = { jobKey: 'jk', type: 'senior', variables: {}, customHeaders: {} };
+  const result = await runAgentJob(profile, job, {
+    sandbox: 'none',
+    envelope: normalizeTaskEnvelope({}, {}),
+    args: ['--from-profile', '--extra'],
+    timeoutMs: 30_000,
+  });
+  assert.equal(result.ok, true, result.error || result.stderr);
+  assert.equal(result.stdout, '--from-profile|--extra|');
 });
 
 test('runAgentJob (host) injects profileEnv + setup.env into the harness', async () => {

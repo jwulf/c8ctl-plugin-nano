@@ -1694,7 +1694,9 @@ function parseResultFromStdout(stdout) {
     const obj = parseAgentResultObject(lines[i].slice(idx + RESULT_SENTINEL.length).trim());
     if (obj) return obj;
   }
-  const fences = [...stdout.matchAll(/```json\s*\n([\s\S]*?)```/gi)];
+  // Match the opening fence tolerantly (optional language tag, CRLF or LF) so a
+  // Windows agent's `\r\n` output still parses.
+  const fences = [...stdout.matchAll(/```[^\n]*\r?\n([\s\S]*?)```/g)];
   for (let i = fences.length - 1; i >= 0; i--) {
     const obj = parseAgentResultObject(fences[i][1].trim());
     if (obj) return obj;
@@ -1704,12 +1706,17 @@ function parseResultFromStdout(stdout) {
 
 // The domain result variables an agent may return: the parsed object with the
 // harness-reserved keys (and the `io.nanobpm.*` namespace) stripped, so it can
-// never clobber the audit envelope, transcript, or git facts.
+// never clobber the audit envelope, transcript, or git facts. The agent's output
+// is untrusted, so build the result on a null-prototype object and drop the
+// prototype-pollution keys — a merged `__proto__`/`constructor`/`prototype`
+// must never mutate object prototypes when spread into the job completion.
+const PROTO_POLLUTION_KEYS = new Set(['__proto__', 'constructor', 'prototype']);
 function sanitizeResultVars(obj) {
   if (!isPlainObject(obj)) return {};
-  const out = {};
+  const out = Object.create(null);
   for (const [k, v] of Object.entries(obj)) {
     if (RESERVED_RESULT_KEYS.has(k)) continue;
+    if (PROTO_POLLUTION_KEYS.has(k)) continue;
     if (k.startsWith('io.nanobpm.')) continue;
     out[k] = v;
   }

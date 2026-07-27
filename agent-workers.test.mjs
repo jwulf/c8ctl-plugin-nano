@@ -252,9 +252,11 @@ test('parseResultFromStdout prefers the last sentinel line, then the last json f
   ].join('\n');
   assert.deepEqual(parseResultFromStdout(withSentinel), { status: 'converged', summary: 'all resolved' });
 
-  // No sentinel → fall back to the last ```json fenced block.
-  const withFence = 'prose\n```json\n{"status":"blocked"}\n```\ntrailing prose\n';
+  // No sentinel → fall back to the last fenced block (CRLF-tolerant, tag optional).
+  const withFence = 'prose\r\n```json\r\n{"status":"blocked"}\r\n```\r\ntrailing\r\n';
   assert.deepEqual(parseResultFromStdout(withFence), { status: 'blocked' });
+  const untagged = 'prose\n```\n{"status":"converged"}\n```\n';
+  assert.deepEqual(parseResultFromStdout(untagged), { status: 'converged' });
 
   assert.equal(parseResultFromStdout('just a transcript, no result'), null);
   assert.equal(parseResultFromStdout(''), null);
@@ -272,10 +274,21 @@ test('sanitizeResultVars strips harness-reserved keys and the io.nanobpm namespa
     [AGENT_RESULT_KEY]: { forged: true },
     'io.nanobpm.somethingElse': 1,
   });
-  assert.deepEqual(vars, { status: 'converged', summary: 'ok' });
+  assert.deepEqual({ ...vars }, { status: 'converged', summary: 'ok' });
   for (const k of RESERVED_RESULT_KEYS) assert.equal(k in vars, false, `${k} must be stripped`);
   assert.deepEqual(sanitizeResultVars(null), {});
   assert.deepEqual(sanitizeResultVars('nope'), {});
+});
+
+test('sanitizeResultVars is prototype-pollution safe with untrusted agent output', () => {
+  // A malicious agent returns __proto__/constructor/prototype keys.
+  const vars = sanitizeResultVars(JSON.parse('{"__proto__":{"polluted":true},"constructor":1,"prototype":2,"status":"ok"}'));
+  assert.equal(({}).polluted, undefined, 'Object.prototype must not be polluted');
+  assert.equal(Object.getPrototypeOf(vars), null, 'result is a null-prototype object');
+  assert.equal('__proto__' in vars, false);
+  assert.equal('constructor' in vars, false);
+  assert.equal('prototype' in vars, false);
+  assert.equal(vars.status, 'ok', 'benign keys survive');
 });
 
 test('buildResultEnvelope preserves the parsed agent result for audit', () => {

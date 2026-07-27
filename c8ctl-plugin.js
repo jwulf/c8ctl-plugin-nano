@@ -2031,7 +2031,14 @@ function provisionRepo({ envelope, token, runDir, timeoutMs = 120_000 }) {
 function reconcileAgentPr({ workspaceDir, token, branch, provider }) {
   if (provider && provider !== 'github') return { openedBy: null, found: false, error: `PR reconcile unsupported for provider "${provider}"` };
   const env = { ...process.env };
-  if (token) env.GH_TOKEN = token;
+  if (token) {
+    env.GH_TOKEN = token;
+  } else {
+    // No job token ⇒ honor the anonymous guarantee: never let gh fall back to an
+    // operator-provided token in the ambient env. Scrub every gh auth source so
+    // PR reconcile can only use credentials we were explicitly handed.
+    for (const k of ['GH_TOKEN', 'GITHUB_TOKEN', 'GH_ENTERPRISE_TOKEN', 'GITHUB_ENTERPRISE_TOKEN']) delete env[k];
+  }
   try {
     const r = spawnSync('gh', ['pr', 'list', '--head', branch, '--state', 'all', '--json', 'number,url,state,isDraft,title,author', '--limit', '1'],
       { cwd: workspaceDir, env, encoding: 'utf8', timeout: 30_000 });

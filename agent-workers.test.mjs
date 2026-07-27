@@ -104,7 +104,7 @@ test('normalizeTaskEnvelope: no repository when url absent', () => {
   assert.equal(env.task.allowPr, false);
 });
 
-test('normalizeTaskEnvelope: provider is lowercased so downstream compares work', () => {
+test('normalizeTaskEnvelope: provider is lowercased so downstream comparisons work', () => {
   const env = normalizeTaskEnvelope(
     {
       [`${AGENT_TASK_NS}.repository.url`]: 'https://github.com/o/r.git',

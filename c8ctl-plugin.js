@@ -2186,10 +2186,11 @@ function reapAgentRunDirs({ maxAgeMs = 0, liveRunDirs = new Set() } = {}) {
     if (!existsSync(root)) return { reaped };
     const now = Date.now();
     for (const name of readdirSync(root)) {
-      // Only reap the `run-*` workspaces this worker creates (see the
-      // `mkdtempSync(join(agentRunsRoot(), 'run-'))` in workAgent). Never touch
-      // unrelated files/dirs an operator may have placed under agent-runs.
-      if (!name.startsWith('run-')) continue;
+      // Only reap the throwaway dirs this worker creates under agent-runs: the
+      // `run-*` job workspaces and the `res-*` structured-result dirs (see the
+      // `mkdtempSync(...)` calls in workAgent). Never touch unrelated files/dirs
+      // an operator may have placed under agent-runs.
+      if (!name.startsWith('run-') && !name.startsWith('res-')) continue;
       const p = join(root, name);
       if (liveRunDirs.has(p)) continue;
       try {
@@ -2367,7 +2368,9 @@ function runAgentJob(profile, job, opts = {}) {
       detached: process.platform !== 'win32',
       // When a repository was provisioned, run the harness IN the workspace.
       cwd,
-      env: { ...process.env, ...staticEnv, ...agentEnv, ...extraEnv, ...resultEnv, ...secretEnv },
+      // Reserved harness env (AGENT_* + the result-file path) is layered AFTER
+      // resolved secrets so a task-supplied secret NAME can never shadow it.
+      env: { ...process.env, ...staticEnv, ...secretEnv, ...agentEnv, ...extraEnv, ...resultEnv },
       stdinData: payload,
       timeoutMs,
       onTimeout: (child) => killTree(child),
@@ -2417,7 +2420,10 @@ function runAgentJob(profile, job, opts = {}) {
     command: engine,
     args,
     shell: false,
-    env: { ...process.env, ...staticEnv, ...agentEnv, ...extraEnv, ...resultEnv, ...secretEnv },
+    // Reserved harness env (AGENT_* + the result-file path) is layered AFTER
+    // resolved secrets so a task-supplied secret NAME can never shadow it. In
+    // container mode docker reads these values from our child env by NAME.
+    env: { ...process.env, ...staticEnv, ...secretEnv, ...agentEnv, ...extraEnv, ...resultEnv },
     stdinData: payload,
     timeoutMs,
     stream,
@@ -2683,6 +2689,9 @@ async function workAgent(req, flags) {
             mkdirSync(agentRunsRoot(), { recursive: true });
             resultDir = mkdtempSync(join(agentRunsRoot(), 'res-'));
             resultFile = join(resultDir, 'result.json');
+            // Track it so the run-dir reaper skips it while in-flight and reaps it
+            // (as a `res-*` dir) if this worker crashes before the cleanup below.
+            liveRunDirs.add(resultDir);
           } catch { resultDir = null; resultFile = null; }
 
           result = await runAgentJob(profile, job, {
@@ -2731,7 +2740,7 @@ async function workAgent(req, flags) {
         // job completion so the model sees `status`/`summary`/… as first-class
         // outputs. Read before deleting the temp dir.
         const rawResult = readAgentResultFile(resultFile) ?? parseResultFromStdout(result.stdout);
-        if (resultDir) { try { rmSync(resultDir, { recursive: true, force: true }); } catch { /* best effort */ } }
+        if (resultDir) { try { rmSync(resultDir, { recursive: true, force: true }); } catch { /* best effort */ } liveRunDirs.delete(resultDir); }
         const resultVars = sanitizeResultVars(rawResult);
 
         const resultEnvelope = buildResultEnvelope(result, { sandbox, image, git: gitResult, result: rawResult });

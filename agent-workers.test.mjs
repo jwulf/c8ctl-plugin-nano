@@ -683,7 +683,7 @@ test('reapAgentRunDirs age-gates and skips in-flight dirs', () => {
   }
 });
 
-test('reapAgentRunDirs only touches run-* dirs, never unrelated operator files', () => {
+test('reapAgentRunDirs reaps run-* and res-* dirs, never unrelated operator files', () => {
   const home = mkdtempSync(join(tmpdir(), 'nano-home-'));
   const prev = process.env.C8CTL_NANO_HOME;
   process.env.C8CTL_NANO_HOME = home;
@@ -691,16 +691,18 @@ test('reapAgentRunDirs only touches run-* dirs, never unrelated operator files',
     const runs = join(home, 'agent-runs');
     mkdirSync(runs, { recursive: true });
     const runDir = join(runs, 'run-old');
+    const resDir = join(runs, 'res-old'); // structured-result temp dir
     const foreignDir = join(runs, 'operator-notes');
-    for (const d of [runDir, foreignDir]) mkdirSync(d, { recursive: true });
+    for (const d of [runDir, resDir, foreignDir]) mkdirSync(d, { recursive: true });
     const foreignFile = join(runs, 'README.txt');
     writeFileSync(foreignFile, 'do not delete');
     const old = Date.now() / 1000 - 7200; // 2h ago
-    for (const p of [runDir, foreignDir, foreignFile]) utimesSync(p, old, old);
+    for (const p of [runDir, resDir, foreignDir, foreignFile]) utimesSync(p, old, old);
 
     const r = reapAgentRunDirs({ maxAgeMs: 60 * 60_000 });
-    assert.equal(r.reaped, 1, 'only the run-* dir is reaped');
+    assert.equal(r.reaped, 2, 'both the run-* and res-* dirs are reaped');
     assert.equal(existsSync(runDir), false);
+    assert.equal(existsSync(resDir), false, 'leftover result dir is reaped');
     assert.equal(existsSync(foreignDir), true, 'unrelated dir is never reaped');
     assert.equal(existsSync(foreignFile), true, 'unrelated file is never reaped');
   } finally {

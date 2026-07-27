@@ -23,7 +23,8 @@ platform so there is nothing to compile.
 It adds a single `nano` command:
 
 ```bash
-c8ctl nano start|status|stop|restart|logs|clean|set|config
+c8ctl nano start|status|stop|restart|logs|pause|resume|clean|set|config|update
+c8ctl nano hire|work   # turn a CLI agent harness into a Nano job worker
 ```
 
 `nano start N` spawns **N** nanobpmn node processes wired to talk to each other

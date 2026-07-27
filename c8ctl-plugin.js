@@ -398,7 +398,7 @@ function parseRequest(args, flags) {
     capture: Boolean(flags?.capture),
     inMemory: Boolean(flags?.['in-memory'] || flags?.['no-journal']),
     historyMax: intFlag('history-max'),
-    console: flags?.console ?? flags?.profile,
+    console: flags?.console,
     workspace: Boolean(flags?.workspace),
     check: Boolean(flags?.check),
     binary: flags?.binary,
@@ -552,7 +552,7 @@ const CONSOLE_PROFILES = ['off', 'observe', 'studio'];
 
 /**
  * Resolves the runtime console profile to pass through as NANOBPMN_CONSOLE.
- * Precedence: --console/--profile flag > inherited NANOBPMN_CONSOLE env >
+ * Precedence: --console flag > inherited NANOBPMN_CONSOLE env >
  * 'studio' (the full IDE, our default). Unknown values are rejected so a typo
  * fails fast here rather than silently degrading the console in the server.
  */
@@ -708,7 +708,7 @@ async function startCluster(req) {
       // outside the per-node data dir so "nano clean" never wipes it.
       NANOBPMN_WORKSPACE_DIR: workspaceDir,
       // Runtime console profile (off | observe | studio). Default studio (full
-      // IDE); pass-through so --console/--profile or an inherited NANOBPMN_CONSOLE
+      // IDE); pass-through so --console or an inherited NANOBPMN_CONSOLE
       // picks the observability-only or headless surface. See nano-bpm ADR 0035 §C.
       NANOBPMN_CONSOLE: consoleProfile,
     };
@@ -3513,8 +3513,7 @@ export const commands = {
       'in-memory': { type: 'boolean', description: 'start: run with NO on-disk journal/read-model (in-memory engine; state lost on restart). Alias: --no-journal' },
       'no-journal': { type: 'boolean', description: 'start: alias for --in-memory' },
       'history-max': { type: 'string', description: 'start: cap retained terminal instances in the read model (NANOBPMN_HISTORY_MAX_INSTANCES; 0/unset = unbounded)' },
-      console: { type: 'string', description: 'start: runtime console profile off|observe|studio (NANOBPMN_CONSOLE; default studio). Alias: --profile' },
-      profile: { type: 'string', description: 'start: alias for --console (off|observe|studio; default studio)' },
+      console: { type: 'string', description: 'start: runtime console profile off|observe|studio (NANOBPMN_CONSOLE; default studio)' },
       follow: { type: 'boolean', description: 'logs: stream output (tail -F)', short: 'f' },
       purge: { type: 'boolean', description: 'stop/restart: also delete per-node engine data' },
       force: { type: 'boolean', description: 'start: stop any existing cluster first' },
@@ -3704,7 +3703,7 @@ function printUsage() {
   console.log('  --capture            start: enable trace capture (recorded-input replay) on every node');
   console.log('  --in-memory          start: run with NO on-disk journal/read-model (alias --no-journal; state lost on restart)');
   console.log('  --history-max <n>    start: cap retained terminal instances in the read model (0/unset = unbounded)');
-  console.log('  --console <profile>  start: runtime console profile off|observe|studio (alias --profile; default studio)');
+  console.log('  --console <profile>  start: runtime console profile off|observe|studio (default studio)');
   console.log('  --binary <path>      Path to the nanobpmn server binary (overrides "set bin")');
   console.log('  --purge              stop: also delete per-node engine data');
   console.log('  --force              start: stop any existing cluster first');

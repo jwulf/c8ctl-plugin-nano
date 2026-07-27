@@ -2241,6 +2241,7 @@ function runAgentJob(profile, job, opts = {}) {
   // `docker inspect`; docker reads the value from our child's environment.
   const envArgs = [];
   for (const k of Object.keys(agentEnv)) envArgs.push('-e', k);
+  for (const k of Object.keys(extraEnv)) envArgs.push('-e', k);
   for (const n of passThroughSecretNames) envArgs.push('-e', n);
   for (const k of Object.keys(staticEnv)) envArgs.push('-e', k);
 
@@ -2262,7 +2263,7 @@ function runAgentJob(profile, job, opts = {}) {
     command: engine,
     args,
     shell: false,
-    env: { ...process.env, ...staticEnv, ...agentEnv, ...secretEnv },
+    env: { ...process.env, ...staticEnv, ...agentEnv, ...extraEnv, ...secretEnv },
     stdinData: payload,
     timeoutMs,
     onTimeout: (child) => {

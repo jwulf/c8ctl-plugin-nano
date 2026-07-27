@@ -221,7 +221,7 @@ strings → int. The normalized shape is
 `{ schemaVersion, repository{provider,url,ref,depth,submodules,authRef}, branch{base,create,push}, setup{commands,env,secretRefs}, task{prompt,promptFile,maxIterations,timeoutMs,allowPr,prBase} }`.
 On completion the plugin writes an **output envelope** back under
 `io.nanobpm.agentResult` (`{schemaVersion, status, sandbox, image, output, truncated, stderrTruncated, exitCode, signal, error}`). When a repository was
-provisioned (below) it also carries `{repository, branch, baseSha, headSha, commits[], pushed, pushError?, pr?}`.
+provisioned (below) it also carries `{repository, branch, baseSha, headSha, commits[], pushed, pushError?, gitError?, pr?}`.
 
 **Git provisioning (host).** When `--sandbox none` (the default) and the envelope
 carries a `repository.url`, the plugin provisions a workspace on the host around
@@ -245,7 +245,8 @@ The token is delivered to git via `GIT_ASKPASS` (env), never on argv or in the
 remote URL, and is redacted from all logs/results. When **no** token is resolved
 the clone is strictly anonymous: credential helpers are disabled, inherited
 `GIT_ASKPASS`/`SSH_ASKPASS` are cleared, and the operator's global git config is
-neutralized (`GIT_CONFIG_GLOBAL=/dev/null`) so knobs like `http.*.extraHeader`
+neutralized (`GIT_CONFIG_GLOBAL` → the platform null device, `/dev/null` or
+`NUL` on Windows) so knobs like `http.*.extraHeader`
 or `url.*.insteadOf` can't silently inject operator credentials. Token-backed
 jobs keep global config (e.g. `http.proxy`). A push failure is reported as
 `pushError` (the job still completes) so a later BPMN step can drive the merge; a

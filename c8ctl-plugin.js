@@ -2035,7 +2035,8 @@ function reconcileAgentPr({ workspaceDir, token, branch, provider }) {
   try {
     const r = spawnSync('gh', ['pr', 'list', '--head', branch, '--state', 'all', '--json', 'number,url,state,isDraft,title,author', '--limit', '1'],
       { cwd: workspaceDir, env, encoding: 'utf8', timeout: 30_000 });
-    if (r.status !== 0) return { openedBy: null, found: false, error: redactToken(r.stderr, token).trim().slice(0, 200) || 'gh pr list failed' };
+    if (r.error) return { openedBy: null, found: false, error: `gh not runnable: ${redactToken(r.error.message, token).trim().slice(0, 200)}` };
+    if (r.status !== 0) return { openedBy: null, found: false, error: redactToken(r.stderr, token).trim().slice(0, 200) || `gh pr list failed (exit ${r.status ?? 'null'}${r.signal ? `, signal ${r.signal}` : ''})` };
     const arr = JSON.parse((r.stdout || '[]').trim() || '[]');
     if (!Array.isArray(arr) || arr.length === 0) return { openedBy: null, found: false };
     const pr = arr[0];

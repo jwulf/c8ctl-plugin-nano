@@ -1,3 +1,10 @@
+# [1.13.0](https://github.com/jwulf/c8ctl-plugin-nano/compare/v1.12.0...v1.13.0) (2026-07-30)
+
+
+### Features
+
+* **update:** route npm through the portable c8ctl.npm runner ([#17](https://github.com/jwulf/c8ctl-plugin-nano/issues/17)) ([bf23929](https://github.com/jwulf/c8ctl-plugin-nano/commit/bf23929d4071ad1348510d636408e7f2e0de0aef)), closes [camunda/c8ctl#490](https://github.com/camunda/c8ctl/issues/490) [#16](https://github.com/jwulf/c8ctl-plugin-nano/issues/16)
+
 # [1.12.0](https://github.com/jwulf/c8ctl-plugin-nano/compare/v1.11.0...v1.12.0) (2026-07-27)
 
 

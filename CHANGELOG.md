@@ -1,3 +1,10 @@
+## [1.13.1](https://github.com/jwulf/c8ctl-plugin-nano/compare/v1.13.0...v1.13.1) (2026-07-30)
+
+
+### Bug Fixes
+
+* clarify 0-indexed node ids in pause/resume UX ([#18](https://github.com/jwulf/c8ctl-plugin-nano/issues/18)) ([893e7a0](https://github.com/jwulf/c8ctl-plugin-nano/commit/893e7a0bde1ecb78685a31b291908bd52bfd76b8)), closes [Magikcraft/nano-bpm#386](https://github.com/Magikcraft/nano-bpm/issues/386)
+
 # [1.13.0](https://github.com/jwulf/c8ctl-plugin-nano/compare/v1.12.0...v1.13.0) (2026-07-30)
 
 

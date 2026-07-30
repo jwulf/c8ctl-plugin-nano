@@ -1127,16 +1127,17 @@ function controlNode(req, { signal, verb, paused }) {
   }
 
   const nodeIds = state.nodes.map((n) => n.id).join(', ');
+  const exampleId = state.nodes[0].id;
   const idArg = req.positional[0];
   if (idArg === undefined) {
-    logger.error(`Specify a node id, e.g. "c8ctl nano ${verb} 1". Nodes: ${nodeIds}`);
+    logger.error(`Specify a node id, e.g. "c8ctl nano ${verb} ${exampleId}". Running nodes: [${nodeIds}]`);
     process.exit(1);
   }
 
   const id = Number.parseInt(idArg, 10);
   const node = Number.isFinite(id) ? state.nodes.find((n) => n.id === id) : undefined;
   if (!node) {
-    logger.error(`No node "${idArg}" in the running cluster. Nodes: ${nodeIds}`);
+    logger.error(`No node "${idArg}" in the running cluster. Running nodes: [${nodeIds}]`);
     process.exit(1);
   }
 

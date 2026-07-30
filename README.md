@@ -79,12 +79,13 @@ c8ctl nano status
 # Inspect a cluster c8ctl did NOT start (queries /v2/topology on the given port)
 c8ctl nano status --port 8080
 
-# Tail a node's log (-f / --follow to stream)
-c8ctl nano logs 1 --follow
+# Tail a node's log (-f / --follow to stream). Node ids are 0-indexed,
+# so a single-node cluster is node 0.
+c8ctl nano logs 0 --follow
 
 # Simulate a node failing (freeze it) and recovering (resume it)
-c8ctl nano pause 1
-c8ctl nano resume 1
+c8ctl nano pause 0
+c8ctl nano resume 0
 
 # Stop the cluster (engine data is retained)
 c8ctl nano stop

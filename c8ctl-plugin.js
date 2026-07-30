@@ -28,7 +28,7 @@
  *   c8ctl nano restart [<nodes>] [--purge] ...
  */
 
-import { spawn, spawnSync } from 'node:child_process';
+import { spawn, spawnSync, execFileSync, execSync } from 'node:child_process';
 import {
   existsSync,
   mkdirSync,
@@ -2877,21 +2877,90 @@ function compareSemver(a, b) {
   return 0;
 }
 
+/**
+ * Resolve how npm must be spawned on the given platform. Spawning `npm`
+ * directly is not portable: on Windows npm is a `npm.cmd` shim, so bare
+ * `"npm"` fails with ENOENT and `"npm.cmd"` fails with EINVAL under the
+ * CVE-2024-27980 hardening. On Windows the shim is therefore run through
+ * cmd.exe (`shell: true`) with every argument double-quoted, and the two
+ * constructs that survive double quotes — an embedded `"` and a `%VAR%`
+ * reference — are rejected rather than escaped.
+ *
+ * This mirrors the host CLI's own `buildNpmInvocation`; it is the local
+ * fallback for `runNpm` when the host runner (`c8ctl.npm`) is unavailable.
+ * `platform` is a parameter so the Windows branch is unit-testable on POSIX.
+ */
+function buildNpmInvocation(args, platform = process.platform) {
+  if (platform !== 'win32') {
+    return { command: 'npm', args: [...args], shell: false };
+  }
+  for (const arg of args) {
+    if (/["\r\n\0]/.test(arg)) {
+      throw new Error(
+        `Refusing to run npm: argument contains a quote or line break that cannot be passed safely to cmd.exe: ${JSON.stringify(arg)}`,
+      );
+    }
+    if (/%[A-Z_][^%]*?%/i.test(arg)) {
+      throw new Error(
+        `Refusing to run npm: argument contains a cmd.exe environment variable reference: ${JSON.stringify(arg)}`,
+      );
+    }
+  }
+  return {
+    command: 'npm.cmd',
+    args: args.map((arg) => `"${arg.replace(/(\\+)$/, '$1$1')}"`),
+    shell: true,
+  };
+}
+
+/** Local, platform-aware npm runner used when the host `c8ctl.npm` is absent. */
+function runNpmLocal(args, { stdout = false, stdio } = {}) {
+  const { command, args: resolved, shell } = buildNpmInvocation(args);
+  if (shell) {
+    const cmdLine = [command, ...resolved].join(' ');
+    if (stdout) {
+      return { stdout: execSync(cmdLine, { stdio: ['ignore', 'pipe', 'pipe'], encoding: 'utf8' }) };
+    }
+    execSync(cmdLine, { stdio });
+    return undefined;
+  }
+  if (stdout) {
+    return {
+      stdout: execFileSync(command, resolved, { stdio: ['ignore', 'pipe', 'pipe'], encoding: 'utf8', shell: false }),
+    };
+  }
+  execFileSync(command, resolved, { stdio, shell: false });
+  return undefined;
+}
+
+/**
+ * Run npm portably. Prefers the host CLI's cross-platform runner
+ * (`globalThis.c8ctl.npm`, added in c8ctl's plugin runtime); falls back to the
+ * local platform-aware invocation for older hosts and for the detached update
+ * refresh, which runs without the host runtime. Throws on a nonzero exit.
+ */
+function runNpm(args, { stdout = false, stdio } = {}) {
+  const host = globalThis.c8ctl;
+  if (host && typeof host.npm === 'function') {
+    return stdout ? host.npm({ args, stdout: true }) : host.npm({ args, stdio });
+  }
+  return runNpmLocal(args, { stdout, stdio });
+}
+
 /** Latest published version of `name` per the npm registry (throws on failure). */
 function npmLatestVersion(name) {
-  const res = spawnSync('npm', ['view', name, 'version'], { encoding: 'utf8' });
-  if (res.error) throw new Error(res.error.message);
-  if (res.status !== 0) {
-    throw new Error((res.stderr || '').trim() || `npm view exited ${res.status}`);
-  }
-  return res.stdout.trim();
+  const { stdout } = runNpm(['view', name, 'version'], { stdout: true });
+  return stdout.trim();
 }
 
 /** True when this plugin lives under npm's global node_modules (so `-g` updates it). */
 function isGlobalInstall() {
-  const res = spawnSync('npm', ['root', '-g'], { encoding: 'utf8' });
-  if (res.status !== 0) return false;
-  const root = res.stdout.trim();
+  let root;
+  try {
+    root = runNpm(['root', '-g'], { stdout: true }).stdout.trim();
+  } catch {
+    return false;
+  }
   return Boolean(root) && pluginDir.startsWith(root);
 }
 
@@ -3009,9 +3078,9 @@ function updatePlugin(req) {
   const where = info.mode === 'managed' ? 'the c8ctl plugin store' : "npm's global prefix";
   console.log(`Pulling ${name}@${latest} into ${where}...`);
   console.log('');
-  const res = spawnSync('npm', installArgs, { stdio: 'inherit' });
-  if (res.error) throw new Error(res.error.message);
-  if (res.status !== 0) {
+  try {
+    runNpm(installArgs, { stdio: 'inherit' });
+  } catch (err) {
     let hint;
     if (info.mode === 'managed') {
       hint = `You can also run:\n${manual}`;
@@ -3020,8 +3089,9 @@ function updatePlugin(req) {
     } else {
       hint = `You may need elevated permissions: sudo ${manual.trim()}`;
     }
+    const code = typeof err?.status === 'number' ? ` (exit ${err.status})` : '';
     throw new Error(
-      `npm ${installArgs.join(' ')} failed (exit ${res.status}). ${hint}`,
+      `npm ${installArgs.join(' ')} failed${code}. ${hint}`,
     );
   }
   console.log('');
@@ -3081,13 +3151,28 @@ function updateNotifierDisabled() {
  * fresh result is used on the *next* invocation.
  */
 function spawnUpdateRefresh(name, cacheFile) {
+  // The refresh runs in a detached bare-node child that has no host runtime, so
+  // it cannot use c8ctl.npm. Resolve the portable npm invocation here (single
+  // source of truth) and bake the decided command into a generic runner in the
+  // child — the child makes no platform decision of its own.
+  let inv;
+  try {
+    inv = buildNpmInvocation(['view', name, 'version']);
+  } catch {
+    return; /* unsafe argument for cmd.exe; skip this cycle */
+  }
   const script =
-    'const{spawnSync}=require("child_process");' +
+    'const{execFileSync,execSync}=require("child_process");' +
     'const{readFileSync,writeFileSync}=require("fs");' +
+    `const cmd=${JSON.stringify(inv.command)},args=${JSON.stringify(inv.args)},shell=${JSON.stringify(inv.shell)};` +
     `let prev={};try{prev=JSON.parse(readFileSync(${JSON.stringify(cacheFile)},"utf8"))}catch{}` +
     'const out=Object.assign({},prev,{lastCheck:Date.now()});' +
-    `const r=spawnSync("npm",["view",${JSON.stringify(name)},"version"],{encoding:"utf8"});` +
-    'if(r.status===0){out.latest=String(r.stdout||"").trim()}' +
+    'try{' +
+    'const o=shell' +
+    '?execSync([cmd,...args].join(" "),{stdio:["ignore","pipe","pipe"],encoding:"utf8"})' +
+    ':execFileSync(cmd,args,{stdio:["ignore","pipe","pipe"],encoding:"utf8",shell:false});' +
+    'out.latest=String(o||"").trim()' +
+    '}catch{}' +
     `try{writeFileSync(${JSON.stringify(cacheFile)},JSON.stringify(out))}catch{}`;
   try {
     const child = spawn(process.execPath, ['-e', script], { detached: true, stdio: 'ignore' });
@@ -4062,6 +4147,7 @@ function parseProcessosRequest(args, flags) {
 // Internal helpers exported for tests/tooling only. c8ctl consumes just
 // `metadata` and `commands`; these named exports are inert to it.
 export { resolveBinary, findBinary, launcherEnvMarkers };
+export { buildNpmInvocation };
 export {
   normalizeTaskEnvelope,
   collectEnvelopeFrom,

@@ -1119,6 +1119,20 @@ function logsCluster(req) {
 
 function controlNode(req, { signal, verb, paused }) {
   const logger = getLogger();
+
+  // pause/resume rely on SIGSTOP/SIGCONT, which are POSIX-only. On Windows
+  // Node throws "Unknown signal: SIGSTOP" from process.kill, so fail fast with
+  // a clear message instead of a raw crash (see nano-bpm#390).
+  if (process.platform === 'win32') {
+    logger.error(
+      `"c8ctl nano ${verb}" isn't supported on Windows yet — it relies on ` +
+        `SIGSTOP/SIGCONT, which Windows doesn't have. To simulate a node ` +
+        `failing and recovering, use "c8ctl nano stop <id>" then ` +
+        `"c8ctl nano start" instead.`,
+    );
+    process.exit(1);
+  }
+
   const state = readState();
 
   if (!state || !Array.isArray(state.nodes) || state.nodes.length === 0) {

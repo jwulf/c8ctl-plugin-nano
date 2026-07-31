@@ -465,7 +465,7 @@ function liveNodeCount(state) {
  */
 function webConsoleUrl(baseUrl, journey) {
   const base = `${baseUrl}/console`;
-  return journey ? `${base}?tour=${journey}` : base;
+  return journey ? `${base}?tour=${encodeURIComponent(journey)}` : base;
 }
 
 /**

@@ -1,3 +1,10 @@
+## [1.13.2](https://github.com/jwulf/c8ctl-plugin-nano/compare/v1.13.1...v1.13.2) (2026-07-31)
+
+
+### Bug Fixes
+
+* graceful error for pause/resume on Windows ([#19](https://github.com/jwulf/c8ctl-plugin-nano/issues/19)) ([a768a64](https://github.com/jwulf/c8ctl-plugin-nano/commit/a768a64e63f27439f5537c3e151b648c4752bafc)), closes [nano-bpm#390](https://github.com/nano-bpm/issues/390) [Magikcraft/nano-bpm#390](https://github.com/Magikcraft/nano-bpm/issues/390)
+
 ## [1.13.1](https://github.com/jwulf/c8ctl-plugin-nano/compare/v1.13.0...v1.13.1) (2026-07-30)
 
 

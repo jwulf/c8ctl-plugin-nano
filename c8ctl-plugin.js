@@ -1401,6 +1401,35 @@ function parseEnvPairs(input) {
   return { env, errors };
 }
 
+// A worker job-type token: rank/capability tokens use `:` (rank↔cap) and `+`
+// (combined caps) as delimiters, and code-first `@nanobpm/workflow` job types
+// are `<flowId>:<taskName>` or an explicit override. The first character must be
+// a letter, digit, or `_`; the remainder may also include `. : + -`. Mirrors the
+// SDK's assertJobType so a token authored on one side is accepted on the other.
+const JOB_TYPE_TOKEN_RE = /^[A-Za-z0-9_][A-Za-z0-9_.:+-]*$/;
+
+// Parse repeatable `--job-type <token>` CLI input (string | string[]) into a
+// deduped, validated list of explicit job types a worker should also service,
+// in addition to its rank×capability matrix. Returns { jobTypes, errors }.
+function parseJobTypeFlags(input) {
+  const list = input == null ? [] : (Array.isArray(input) ? input : [input]);
+  const seen = new Set();
+  const jobTypes = [];
+  const errors = [];
+  for (const item of list) {
+    const token = String(item).trim();
+    if (!token) { errors.push('--job-type must be a non-empty token'); continue; }
+    if (!JOB_TYPE_TOKEN_RE.test(token)) {
+      errors.push(`--job-type "${token}" is invalid (must match ${JOB_TYPE_TOKEN_RE.source})`);
+      continue;
+    }
+    if (seen.has(token)) continue;
+    seen.add(token);
+    jobTypes.push(token);
+  }
+  return { jobTypes, errors };
+}
+
 /** A profile name must be a safe, filesystem/token-friendly slug. */
 function isValidProfileName(name) {
   return typeof name === 'string' && /^[a-z0-9][a-z0-9._-]*$/i.test(name);
@@ -2658,6 +2687,16 @@ async function workAgent(req, flags) {
   }
 
   const matrix = jobTypeMatrix(profile.rank, profile.capabilities);
+  // Optional explicit job types (repeatable `--job-type`), serviced in addition
+  // to the rank×capability matrix. This lets a hired profile also drive a pool
+  // keyed on a token the matrix can't express — e.g. a code-first
+  // `@nanobpm/workflow` flow whose external task type isn't a `rank:cap` token.
+  const { jobTypes: extraJobTypes, errors: jobTypeErrors } = parseJobTypeFlags(flags?.['job-type']);
+  if (jobTypeErrors.length > 0) {
+    logger.error(jobTypeErrors.join('; '));
+    process.exit(1);
+  }
+  const jobTypes = [...new Set([...matrix, ...extraJobTypes])];
   const camunda = globalThis.c8ctl.createClient();
 
   logger.info(`Putting "${name}" [${profile.rank}] to work → ${profile.command}`);
@@ -2665,12 +2704,13 @@ async function workAgent(req, flags) {
   logger.info(`  sandbox: ${sandbox}${isContainer ? ` (image ${image})` : ''}`);
   const profileEnvKeys = Object.keys(profileEnv);
   if (profileEnvKeys.length > 0) logger.info(`  harness env: ${profileEnvKeys.join(', ')}`);
-  logger.info(`  listening on ${matrix.length} job type(s): ${matrix.join('  ')}`);
+  const extraNote = extraJobTypes.length > 0 ? ` (${extraJobTypes.length} via --job-type)` : '';
+  logger.info(`  listening on ${jobTypes.length} job type(s)${extraNote}: ${jobTypes.join('  ')}`);
   logger.info(`  max parallel: ${maxParallelJobs}; job timeout: ${jobTimeoutMs}ms`);
   logger.info(`  console: ${webConsoleUrl(runningConsoleBaseUrl(), JOURNEY_AGENTIC_AUTHOR)}`);
   logger.info('Polling for work — press Ctrl-C to stop.');
 
-  const workers = matrix.map((jobType) =>
+  const workers = jobTypes.map((jobType) =>
     camunda.createJobWorker({
       jobType,
       workerName: `${name}:${jobType}`,
@@ -4236,6 +4276,7 @@ export {
   ProvisionError,
   normalizeStoredProfile,
   jobTypeMatrix,
+  parseJobTypeFlags,
   AGENT_TASK_NS,
   AGENT_RESULT_KEY,
   RESULT_SENTINEL,
@@ -4338,6 +4379,7 @@ export const commands = {
       list: { type: 'boolean', description: 'hire: list existing agent profiles instead of creating one' },
       'max-parallel': { type: 'string', description: 'work: max concurrent jobs per worker (default 1)' },
       'job-timeout': { type: 'string', description: 'work: max harness runtime per job in ms; the spawned process is killed past this (default 300000)' },
+      'job-type': { type: 'string', multiple: true, description: 'work: extra job type to service alongside the rank×capability matrix (repeatable)' },
     },
     handler: async (args, flags) => {
       const logger = getLogger();
@@ -4481,7 +4523,7 @@ function printUsage() {
   console.log('  c8ctl nano config');
   console.log('  c8ctl nano update [--check]');
   console.log('  c8ctl nano hire [--name <n>] [--rank <r>] [--command <c>] [--model <m>] [--capabilities <a,b>] [--sandbox none|docker|podman] [--image <ref>] [--env NAME=VALUE ...] [--list]');
-  console.log('  c8ctl nano work <profileName> [--max-parallel <n>] [--job-timeout <ms>] [--sandbox none|docker|podman] [--image <ref>] [--env NAME=VALUE ...] [--secret-resolver host] [--min-free-mb <n>] [--clone-timeout <ms>] [--keep-runs] [--stream]');
+  console.log('  c8ctl nano work <profileName> [--max-parallel <n>] [--job-timeout <ms>] [--job-type <token> ...] [--sandbox none|docker|podman] [--image <ref>] [--env NAME=VALUE ...] [--secret-resolver host] [--min-free-mb <n>] [--clone-timeout <ms>] [--keep-runs] [--stream]');
   console.log('');
   console.log('Subcommands:');
   console.log('  start    Spawn an N-node local cluster wired to talk to each other on localhost');
@@ -4522,6 +4564,7 @@ function printUsage() {
   console.log('  --env NAME=VALUE     hire/work: static env var for the harness (repeatable); persisted on hire, work extends/overrides');
   console.log('  --list               hire: list existing agent profiles instead of creating one');
   console.log('  --max-parallel <n>   work: max concurrent jobs per worker (default 1)');
+  console.log('  --job-type <token>   work: extra job type to service alongside the rank×capability matrix (repeatable)');
   console.log('  --job-timeout <ms>   work: max harness runtime per job in ms (default 300000)');
   console.log('  --secret-resolver <r> work: secret resolver for task secretRefs (host; default host)');
   console.log('  --reap-age <ms>      work: age before a finished agent container/workspace is reaped (default 3600000)');

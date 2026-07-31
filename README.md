@@ -169,6 +169,18 @@ capabilities `code-review, testing` the matrix is:
 so a BPMN service task can target a worker at any granularity by setting its job
 type to the matching token.
 
+To also service a job type the matrix can't express — for example a code-first
+[`@nanobpm/workflow`](https://www.npmjs.com/package/@nanobpm/workflow) flow whose
+external task type is `<flowId>:<taskName>`, or any bespoke token — add one or
+more `--job-type <token>` flags. They are serviced **in addition to** the
+rank×capability matrix, so a single hired reviewer can drive both a model-first
+`senior:pr-review` task and a code-first flow's task without re-hiring:
+
+```bash
+c8ctl nano work reviewer --job-type convergence-loop:review-round
+c8ctl nano work reviewer --job-type senior:pr-review --job-type senior:triage
+```
+
 ```bash
 c8ctl nano work reviewer                     # poll for work until Ctrl-C
 c8ctl nano work reviewer --max-parallel 2 --job-timeout 600000

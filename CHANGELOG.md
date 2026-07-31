@@ -1,3 +1,10 @@
+# [1.15.0](https://github.com/jwulf/c8ctl-plugin-nano/compare/v1.14.1...v1.15.0) (2026-07-31)
+
+
+### Features
+
+* **nano:** let `work` service extra job types via --job-type ([#21](https://github.com/jwulf/c8ctl-plugin-nano/issues/21)) ([00c3978](https://github.com/jwulf/c8ctl-plugin-nano/commit/00c39786374e5120cbcc922243fde09f4323cfec))
+
 ## [1.14.1](https://github.com/jwulf/c8ctl-plugin-nano/compare/v1.14.0...v1.14.1) (2026-07-31)
 
 

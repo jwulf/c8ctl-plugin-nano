@@ -1,3 +1,10 @@
+# [1.16.0](https://github.com/jwulf/c8ctl-plugin-nano/compare/v1.15.0...v1.16.0) (2026-07-31)
+
+
+### Features
+
+* stop spraying console links; start prints a plain URL, hire/work print none ([#22](https://github.com/jwulf/c8ctl-plugin-nano/issues/22)) ([06d9b5e](https://github.com/jwulf/c8ctl-plugin-nano/commit/06d9b5e32d00f8e9ad58f8f384dc914c4b859048)), closes [#464](https://github.com/jwulf/c8ctl-plugin-nano/issues/464) [#413](https://github.com/jwulf/c8ctl-plugin-nano/issues/413)
+
 # [1.15.0](https://github.com/jwulf/c8ctl-plugin-nano/compare/v1.14.1...v1.15.0) (2026-07-31)
 
 

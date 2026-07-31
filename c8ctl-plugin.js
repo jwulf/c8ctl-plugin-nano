@@ -1403,9 +1403,9 @@ function parseEnvPairs(input) {
 
 // A worker job-type token: rank/capability tokens use `:` (rank↔cap) and `+`
 // (combined caps) as delimiters, and code-first `@nanobpm/workflow` job types
-// are `<flowId>:<taskName>` or an explicit override — so allow letters, digits,
-// and `_ . : + -`. Mirrors the SDK's assertJobType so a token authored on one
-// side is accepted on the other.
+// are `<flowId>:<taskName>` or an explicit override. The first character must be
+// a letter, digit, or `_`; the remainder may also include `. : + -`. Mirrors the
+// SDK's assertJobType so a token authored on one side is accepted on the other.
 const JOB_TYPE_TOKEN_RE = /^[A-Za-z0-9_][A-Za-z0-9_.:+-]*$/;
 
 // Parse repeatable `--job-type <token>` CLI input (string | string[]) into a
@@ -4379,6 +4379,7 @@ export const commands = {
       list: { type: 'boolean', description: 'hire: list existing agent profiles instead of creating one' },
       'max-parallel': { type: 'string', description: 'work: max concurrent jobs per worker (default 1)' },
       'job-timeout': { type: 'string', description: 'work: max harness runtime per job in ms; the spawned process is killed past this (default 300000)' },
+      'job-type': { type: 'string', multiple: true, description: 'work: extra job type to service alongside the rank×capability matrix (repeatable)' },
     },
     handler: async (args, flags) => {
       const logger = getLogger();

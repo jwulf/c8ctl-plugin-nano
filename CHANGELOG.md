@@ -1,3 +1,10 @@
+# [1.14.0](https://github.com/jwulf/c8ctl-plugin-nano/compare/v1.13.2...v1.14.0) (2026-07-31)
+
+
+### Features
+
+* **nano:** print ?tour= guided-journey console links ([#413](https://github.com/jwulf/c8ctl-plugin-nano/issues/413)) ([#20](https://github.com/jwulf/c8ctl-plugin-nano/issues/20)) ([66afb65](https://github.com/jwulf/c8ctl-plugin-nano/commit/66afb65c68f01d707123404a89ac28b847200255)), closes [#406](https://github.com/jwulf/c8ctl-plugin-nano/issues/406)
+
 ## [1.13.2](https://github.com/jwulf/c8ctl-plugin-nano/compare/v1.13.1...v1.13.2) (2026-07-31)
 
 

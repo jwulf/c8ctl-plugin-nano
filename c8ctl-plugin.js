@@ -120,15 +120,6 @@ const PROCESSOS_STATE_FILE = 'processos.json';
 const PROCESSOS_DEFAULT_PORT = 8090;
 const DEFAULT_NANO_URL = 'http://localhost:8080';
 
-// Guided-journey deep links (ADR 0049 §2). The console renders a first-run tour
-// chosen by `…/console?tour=<journeyId>`, and the *command the user ran* already
-// encodes the persona — so the CLI bakes the journey into the console URL it
-// prints rather than making the console guess. These ids are a contract with the
-// console (`console/src/lib/tour`): an unknown id is silently ignored, so they
-// are asserted verbatim in the tests.
-const JOURNEY_LOCALDEV = 'localdev';
-const JOURNEY_AGENTIC_AUTHOR = 'agentic-author';
-
 // Passive update notifier (npm-style): refresh the latest published version
 // from the registry in a detached background process at most once per day, and
 // surface a one-line "update available" notice at most once per day. Never
@@ -459,27 +450,15 @@ function liveNodeCount(state) {
 }
 
 /**
- * Compose a web-console URL for a node's base URL, optionally carrying a guided
- * journey (`?tour=<id>`, ADR 0049 §2). Never hardcodes a port: `baseUrl` is the
- * real address the node came up on.
+ * Compose a web-console URL for a node's base URL. Never hardcodes a port:
+ * `baseUrl` is the real address the node came up on.
+ *
+ * No longer carries a `?tour=<id>` deep link: onboarding is chosen in the
+ * console's own startup persona panel (nano-bpm #464), not sprayed across every
+ * command's output.
  */
-function webConsoleUrl(baseUrl, journey) {
-  const base = `${baseUrl}/console`;
-  return journey ? `${base}?tour=${encodeURIComponent(journey)}` : base;
-}
-
-/**
- * Base URL of the running cluster the user would actually open: the first
- * still-alive node, falling back to the first recorded node, then to the default
- * gateway URL when no cluster has been started. Used by hire/work, which surface
- * a console link for the agentic-SDLC journey.
- */
-function runningConsoleBaseUrl(state = readState()) {
-  if (state && Array.isArray(state.nodes) && state.nodes.length > 0) {
-    const alive = state.nodes.find((n) => isPidAlive(n.pid));
-    return (alive || state.nodes[0]).url;
-  }
-  return DEFAULT_NANO_URL;
+function webConsoleUrl(baseUrl) {
+  return `${baseUrl}/console`;
 }
 
 /** Probe a node's always-on GET /v2/topology endpoint for reachability. */
@@ -861,7 +840,7 @@ async function printSummary(state) {
   console.log(`  REST API     ${entry.url}/v2`);
   console.log(`  Topology     ${entry.url}/v2/topology`);
   if (hasConsole) {
-    console.log(`  Web console  ${webConsoleUrl(entry.url, JOURNEY_LOCALDEV)}`);
+    console.log(`  Web console  ${webConsoleUrl(entry.url)}`);
     console.log(`  User guide   ${entry.url}/docs`);
   }
   if (state.workspaceDir) {
@@ -1662,7 +1641,6 @@ async function hireWorker(req, flags) {
   if (envKeys.length > 0) logger.info(`  env: ${envKeys.join(', ')}`);
   logger.info(`  job types (${matrix.length}): ${matrix.join('  ')}`);
   logger.info(`Put it to work with: c8ctl nano work ${name}`);
-  logger.info(`Open the console:    ${webConsoleUrl(runningConsoleBaseUrl(), JOURNEY_AGENTIC_AUTHOR)}`);
 }
 
 /**
@@ -2707,7 +2685,6 @@ async function workAgent(req, flags) {
   const extraNote = extraJobTypes.length > 0 ? ` (${extraJobTypes.length} via --job-type)` : '';
   logger.info(`  listening on ${jobTypes.length} job type(s)${extraNote}: ${jobTypes.join('  ')}`);
   logger.info(`  max parallel: ${maxParallelJobs}; job timeout: ${jobTimeoutMs}ms`);
-  logger.info(`  console: ${webConsoleUrl(runningConsoleBaseUrl(), JOURNEY_AGENTIC_AUTHOR)}`);
   logger.info('Polling for work — press Ctrl-C to stop.');
 
   const workers = jobTypes.map((jobType) =>
@@ -4240,10 +4217,7 @@ export { resolveBinary, findBinary, launcherEnvMarkers };
 export { buildNpmInvocation };
 export {
   webConsoleUrl,
-  runningConsoleBaseUrl,
   hireWorker,
-  JOURNEY_LOCALDEV,
-  JOURNEY_AGENTIC_AUTHOR,
 };
 export {
   normalizeTaskEnvelope,

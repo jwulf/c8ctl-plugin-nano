@@ -1,8 +1,11 @@
-// Tests for the guided-journey console deep links (ADR 0049 §2, issue #413):
-// `c8ctl nano start` prints `…/console?tour=localdev` and `c8ctl nano hire`
-// (and `work`) print `…/console?tour=agentic-author`. The journey ids are a
-// contract with the console — an unknown `?tour=` is silently ignored — so they
-// are asserted verbatim, and on a NON-default port so a hardcoded 8080 fails.
+// Tests for the console links printed by the CLI (nano-bpm #464, revising #413).
+//
+// The earlier design had `start`/`hire`/`work` spray guided-journey deep links
+// (`…/console?tour=<id>`) across their output. That is gone: onboarding is now
+// chosen in the console's own startup persona panel. So:
+//   - `c8ctl nano start` prints a PLAIN `…/console` URL (no `?tour=`),
+//   - `c8ctl nano hire` (and `work`) print NO console link at all.
+// The port is non-default throughout, so a hardcoded 8080 would fail.
 import { test } from 'node:test';
 import assert from 'node:assert/strict';
 
@@ -10,73 +13,36 @@ import { mkdtempSync, mkdirSync, writeFileSync, rmSync } from 'node:fs';
 import { tmpdir } from 'node:os';
 import { join } from 'node:path';
 
-import {
-  webConsoleUrl,
-  runningConsoleBaseUrl,
-  hireWorker,
-  JOURNEY_LOCALDEV,
-  JOURNEY_AGENTIC_AUTHOR,
-} from './c8ctl-plugin.js';
+import { webConsoleUrl, hireWorker } from './c8ctl-plugin.js';
 
 // A non-default port throughout: if any code path fell back to a hardcoded 8080
 // these assertions would fail.
 const PORT = 9137;
 const BASE = `http://127.0.0.1:${PORT}`;
 
-test('journey ids are the exact console-contract values', () => {
-  assert.equal(JOURNEY_LOCALDEV, 'localdev');
-  assert.equal(JOURNEY_AGENTIC_AUTHOR, 'agentic-author');
-});
-
-test('webConsoleUrl carries the journey on a non-default port', () => {
-  // The exact URL `start` prints (localdev) and `hire`/`work` print (agentic-author).
-  assert.equal(webConsoleUrl(BASE, JOURNEY_LOCALDEV), `${BASE}/console?tour=localdev`);
-  assert.equal(webConsoleUrl(BASE, JOURNEY_AGENTIC_AUTHOR), `${BASE}/console?tour=agentic-author`);
-  // No journey → a plain console URL (unchanged behaviour for callers that pass none).
+test('webConsoleUrl is a plain console URL with no ?tour= deep link', () => {
   assert.equal(webConsoleUrl(BASE), `${BASE}/console`);
+  // The old signature carried a journey id; assert it no longer leaks one even
+  // if a stray argument is passed.
+  assert.equal(webConsoleUrl(BASE, 'localdev'), `${BASE}/console`);
 });
 
-test('runningConsoleBaseUrl uses the real cluster address, never a hardcoded port', () => {
-  // Prefer a still-alive node (this test process is definitely alive).
-  const deadPid = 2147483646; // not a live pid
-  assert.equal(
-    runningConsoleBaseUrl({
-      nodes: [
-        { url: 'http://127.0.0.1:7001', pid: deadPid },
-        { url: BASE, pid: process.pid },
-      ],
-    }),
-    BASE,
-  );
-  // No node is alive → the first recorded node (the one the user would open).
-  assert.equal(
-    runningConsoleBaseUrl({ nodes: [{ url: BASE, pid: deadPid }] }),
-    BASE,
-  );
-  // No cluster recorded → the default gateway URL.
-  assert.equal(runningConsoleBaseUrl(null), 'http://localhost:8080');
+test('webConsoleUrl uses the real port, never a hardcoded 8080', () => {
+  assert.equal(webConsoleUrl('http://127.0.0.1:7001'), 'http://127.0.0.1:7001/console');
 });
 
-test('a 3-node start points its console link at node 0 (localdev)', () => {
-  // `start` prints `webConsoleUrl(state.nodes[0].url, localdev)`; a 3-node start
-  // must therefore point at the node the user would actually open (node 0), on
-  // its real port.
-  const node0 = { url: BASE };
-  assert.equal(
-    webConsoleUrl(node0.url, JOURNEY_LOCALDEV),
-    `${BASE}/console?tour=localdev`,
-  );
-});
-
-test('`hire` prints the exact agentic-author console URL on a non-default port', async () => {
+test('`hire` prints no console link', async () => {
   // Drive the real hire code path non-interactively against an isolated state
-  // home holding a cluster on a non-default port, and assert the printed line.
+  // home holding a cluster on a non-default port, and assert nothing prints a
+  // console URL.
   const home = mkdtempSync(join(tmpdir(), 'c8ctl-nano-journey-'));
   const prevHome = process.env.C8CTL_NANO_HOME;
   process.env.C8CTL_NANO_HOME = home;
   const origLog = console.log;
   const lines = [];
-  console.log = (...args) => { lines.push(args.join(' ')); };
+  console.log = (...args) => {
+    lines.push(args.join(' '));
+  };
   try {
     mkdirSync(home, { recursive: true });
     // A running cluster on a non-default port (this process is the alive node).
@@ -95,9 +61,11 @@ test('`hire` prints the exact agentic-author console URL on a non-default port',
     rmSync(home, { recursive: true, force: true });
   }
   const out = lines.join('\n');
-  assert.match(out, /Open the console:/);
+  assert.doesNotMatch(out, /Open the console:/);
   assert.ok(
-    out.includes(`${BASE}/console?tour=agentic-author`),
-    `hire output should print the agentic-author console URL on port ${PORT}; got:\n${out}`,
+    !out.includes('/console'),
+    `hire output should print no console link; got:\n${out}`,
   );
+  // It still tells the user how to put the hire to work — that line stays.
+  assert.match(out, /c8ctl nano work reviewer/);
 });

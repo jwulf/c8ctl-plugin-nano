@@ -461,6 +461,16 @@ function webConsoleUrl(baseUrl) {
   return `${baseUrl}/console`;
 }
 
+/**
+ * Human label for the console link, keyed on the runtime console profile.
+ * The default `studio` profile IS the full web IDE, so name it as such — users
+ * kept missing that Nano ships a browser IDE when it was labelled "Web console".
+ * `observe` is the read-only console; `off` serves no console at all.
+ */
+function consoleLinkLabel(profile) {
+  return profile === 'studio' ? 'Web IDE (Studio)' : `Web console (${profile})`;
+}
+
 /** Probe a node's always-on GET /v2/topology endpoint for reachability. */
 async function probeHealthy(url) {
   const controller = new AbortController();
@@ -788,6 +798,7 @@ async function startCluster(req) {
     inMemory,
     historyMax: historyMax ?? null,
     basePort,
+    consoleProfile,
     nodes,
   };
   writeState(state);
@@ -834,15 +845,21 @@ async function printSummary(state) {
   // The landing page (and the /docs user guide + /console) only exist in builds
   // compiled with the web console; probe so we advertise the right entry point.
   const hasConsole = await probePath(entry.url, '/');
+  const profile = state.consoleProfile ?? 'studio';
+  // Lead with the web IDE — it is Nano's headline surface and the thing users
+  // most often did not realise was there. Only advertise it when this build
+  // actually serves a console and the profile is not 'off'.
+  if (hasConsole && profile !== 'off') {
+    console.log(`  ${consoleLinkLabel(profile)}   ${webConsoleUrl(entry.url)}`);
+    console.log('    ^ open this in your browser: the Nano web IDE');
+    console.log('');
+  }
   if (hasConsole) {
-    console.log(`  Start here   ${entry.url}/          (landing: console, user guide & API docs)`);
+    console.log(`  Landing      ${entry.url}/          (console, user guide & API docs)`);
+    console.log(`  User guide   ${entry.url}/docs`);
   }
   console.log(`  REST API     ${entry.url}/v2`);
   console.log(`  Topology     ${entry.url}/v2/topology`);
-  if (hasConsole) {
-    console.log(`  Web console  ${webConsoleUrl(entry.url)}`);
-    console.log(`  User guide   ${entry.url}/docs`);
-  }
   if (state.workspaceDir) {
     console.log(`  Workspace    ${state.workspaceDir} (models/, workers/)`);
   }
@@ -1051,6 +1068,18 @@ async function statusCluster(req) {
     );
   }
   console.log('');
+
+  // Surface the web IDE again here so it stays discoverable long after the
+  // initial `start` scrolled off — probe a healthy node so we only advertise a
+  // console that is actually served (API-only builds 404 `/`).
+  const profile = state.consoleProfile ?? 'studio';
+  if (overall !== 'stopped' && profile !== 'off') {
+    const consoleNode = checks.find((c) => c.healthy) ?? checks.find((c) => c.alive);
+    if (consoleNode && (await probePath(consoleNode.url, '/'))) {
+      console.log(`  ${consoleLinkLabel(profile)}   ${webConsoleUrl(consoleNode.url)}`);
+      console.log('');
+    }
+  }
 
   // Enrich with the live topology when reachable — the authoritative view of
   // partition leadership across the cluster.
@@ -4217,6 +4246,7 @@ export { resolveBinary, findBinary, launcherEnvMarkers };
 export { buildNpmInvocation };
 export {
   webConsoleUrl,
+  consoleLinkLabel,
   hireWorker,
 };
 export {

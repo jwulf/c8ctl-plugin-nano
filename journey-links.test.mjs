@@ -13,7 +13,7 @@ import { mkdtempSync, mkdirSync, writeFileSync, rmSync } from 'node:fs';
 import { tmpdir } from 'node:os';
 import { join } from 'node:path';
 
-import { webConsoleUrl, hireWorker } from './c8ctl-plugin.js';
+import { webConsoleUrl, consoleLinkLabel, hireWorker } from './c8ctl-plugin.js';
 
 // A non-default port throughout: if any code path fell back to a hardcoded 8080
 // these assertions would fail.
@@ -29,6 +29,14 @@ test('webConsoleUrl is a plain console URL with no ?tour= deep link', () => {
 
 test('webConsoleUrl uses the real port, never a hardcoded 8080', () => {
   assert.equal(webConsoleUrl('http://127.0.0.1:7001'), 'http://127.0.0.1:7001/console');
+});
+
+test('consoleLinkLabel names the studio profile as the web IDE', () => {
+  // The default `studio` profile is the full web IDE — users kept missing that
+  // when the link was labelled a generic "Web console".
+  assert.equal(consoleLinkLabel('studio'), 'Web IDE (Studio)');
+  // Non-studio profiles keep the console wording, qualified by profile.
+  assert.equal(consoleLinkLabel('observe'), 'Web console (observe)');
 });
 
 test('`hire` prints no console link', async () => {

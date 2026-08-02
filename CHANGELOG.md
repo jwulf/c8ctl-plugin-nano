@@ -1,3 +1,10 @@
+# [1.17.0](https://github.com/jwulf/c8ctl-plugin-nano/compare/v1.16.0...v1.17.0) (2026-08-02)
+
+
+### Features
+
+* **nano:** surface the web IDE prominently in start/status output ([#23](https://github.com/jwulf/c8ctl-plugin-nano/issues/23)) ([bae9553](https://github.com/jwulf/c8ctl-plugin-nano/commit/bae95530253bbd58b4f9d51eb0d7a88166f06225))
+
 # [1.16.0](https://github.com/jwulf/c8ctl-plugin-nano/compare/v1.15.0...v1.16.0) (2026-07-31)
 
 

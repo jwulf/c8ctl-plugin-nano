@@ -37,6 +37,8 @@ test('consoleLinkLabel names the studio profile as the web IDE', () => {
   assert.equal(consoleLinkLabel('studio'), 'Web IDE (Studio)');
   // Non-studio profiles keep the console wording, qualified by profile.
   assert.equal(consoleLinkLabel('observe'), 'Web console (observe)');
+  // `off` serves no console, so the helper returns null (callers must guard).
+  assert.equal(consoleLinkLabel('off'), null);
 });
 
 test('`hire` prints no console link', async () => {

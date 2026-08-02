@@ -465,9 +465,12 @@ function webConsoleUrl(baseUrl) {
  * Human label for the console link, keyed on the runtime console profile.
  * The default `studio` profile IS the full web IDE, so name it as such — users
  * kept missing that Nano ships a browser IDE when it was labelled "Web console".
- * `observe` is the read-only console; `off` serves no console at all.
+ * `observe` is the read-only console. `off` serves no console, so the label is
+ * meaningless there; callers must guard `profile !== 'off'` before rendering it,
+ * and this helper returns null for `off` to enforce that contract.
  */
 function consoleLinkLabel(profile) {
+  if (profile === 'off') return null;
   return profile === 'studio' ? 'Web IDE (Studio)' : `Web console (${profile})`;
 }
 
@@ -851,7 +854,8 @@ async function printSummary(state) {
   // actually serves a console and the profile is not 'off'.
   if (hasConsole && profile !== 'off') {
     console.log(`  ${consoleLinkLabel(profile)}   ${webConsoleUrl(entry.url)}`);
-    console.log('    ^ open this in your browser: the Nano web IDE');
+    const surface = profile === 'studio' ? 'the Nano web IDE' : 'the Nano web console';
+    console.log(`    ^ open this in your browser: ${surface}`);
     console.log('');
   }
   if (hasConsole) {
@@ -1074,7 +1078,10 @@ async function statusCluster(req) {
   // console that is actually served (API-only builds 404 `/`).
   const profile = state.consoleProfile ?? 'studio';
   if (overall !== 'stopped' && profile !== 'off') {
-    const consoleNode = checks.find((c) => c.healthy) ?? checks.find((c) => c.alive);
+    // Only probe a HEALTHY node: it already answered /v2/topology this run, so
+    // GET / returns fast. Falling back to a merely-alive (unreachable) node
+    // would add a full probe timeout to every `nano status` in a degraded state.
+    const consoleNode = checks.find((c) => c.healthy);
     if (consoleNode && (await probePath(consoleNode.url, '/'))) {
       console.log(`  ${consoleLinkLabel(profile)}   ${webConsoleUrl(consoleNode.url)}`);
       console.log('');

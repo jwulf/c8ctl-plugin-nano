@@ -1,3 +1,10 @@
+# [1.18.0](https://github.com/jwulf/c8ctl-plugin-nano/compare/v1.17.0...v1.18.0) (2026-08-03)
+
+
+### Features
+
+* **hire:** structured --arg command-line switches for agent harnesses ([#15](https://github.com/jwulf/c8ctl-plugin-nano/issues/15)) ([2b50624](https://github.com/jwulf/c8ctl-plugin-nano/commit/2b50624e2002ff84918e011abc8b5008f25f16a9))
+
 # [1.17.0](https://github.com/jwulf/c8ctl-plugin-nano/compare/v1.16.0...v1.17.0) (2026-08-02)
 
 

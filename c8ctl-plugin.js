@@ -1416,6 +1416,39 @@ function parseEnvPairs(input) {
   return { env, errors };
 }
 
+// Normalize a stored/CLI argument list (string | string[]) into a clean string[]:
+// each entry is one whole argv token (e.g. "--allow-all"), coerced to a string,
+// with null/undefined and empty tokens dropped. Interior whitespace is preserved
+// so a single arg may carry a value like "--foo=a b" intact.
+function normalizeArgList(input) {
+  const list = input == null ? [] : (Array.isArray(input) ? input : [input]);
+  const out = [];
+  for (const item of list) {
+    if (item == null) continue;
+    const s = String(item);
+    if (s.length === 0) continue;
+    out.push(s);
+  }
+  return out;
+}
+
+// POSIX single-quote a string so it survives `sh -c`/shell:true as one literal
+// argv token, no matter what it contains (spaces, $, quotes, globs). Empty
+// string → ''. This is what keeps structured `--arg` values injection-safe even
+// though the harness is spawned through a shell (for PATH resolution).
+function shQuote(s) {
+  return `'${String(s).replace(/'/g, `'\\''`)}'`;
+}
+
+// Build the shell command line for the agent harness: the base command followed
+// by each structured argument, shell-quoted. With no args the command is used
+// verbatim (preserving pre-existing hires that baked switches into the command).
+function buildAgentCommandLine(command, args) {
+  const list = normalizeArgList(args);
+  if (list.length === 0) return command;
+  return `${command} ${list.map(shQuote).join(' ')}`;
+}
+
 // A worker job-type token: rank/capability tokens use `:` (rank↔cap) and `+`
 // (combined caps) as delimiters, and code-first `@nanobpm/workflow` job types
 // are `<flowId>:<taskName>` or an explicit override. The first character must be
@@ -1513,6 +1546,7 @@ function normalizeStoredProfile(name, profile) {
       name,
       rank,
       command,
+      args: normalizeArgList(profile.args),
       model: typeof profile.model === 'string' ? profile.model.trim() : '',
       capabilities: normalizeCapabilities(profile.capabilities),
       sandbox,
@@ -1541,7 +1575,7 @@ async function hireWorker(req, flags) {
     logger.info('Hired agent profiles:');
     for (const name of names.sort()) {
       const p = hires[name];
-      logger.info(`  ${name}  [${p.rank}]  ${p.command}  (model: ${p.model || '-'}; caps: ${normalizeCapabilities(p.capabilities).join(', ') || '-'})`);
+      logger.info(`  ${name}  [${p.rank}]  ${buildAgentCommandLine(p.command, p.args)}  (model: ${p.model || '-'}; caps: ${normalizeCapabilities(p.capabilities).join(', ') || '-'})`);
     }
     logger.info('');
     logger.info('Put one to work with: c8ctl nano work <name>');
@@ -1557,11 +1591,14 @@ async function hireWorker(req, flags) {
   let capabilities = flags?.capabilities !== undefined ? flags.capabilities : undefined;
   let sandbox = flags?.sandbox !== undefined ? String(flags.sandbox).trim().toLowerCase() : undefined;
   let image = flags?.image !== undefined ? String(flags.image).trim() : undefined;
+  // Structured command-line switches appended to the command when spawned, e.g.
+  // `--arg --allow-all` for `copilot`. Repeatable; each --arg is one argv token.
+  const commandArgs = normalizeArgList(flags?.arg);
   const envFromFlags = flags?.env !== undefined;
   const { env: profileEnv, errors: envErrors } = parseEnvPairs(flags?.env);
   if (envErrors.length > 0) {
     logger.error(envErrors.join('; '));
-    logger.info('Example: c8ctl nano hire --name coder --rank senior --command copilot --env COPILOT_ENABLE_ALL_TOOLS=1 --env FOO=bar');
+    logger.info('Example: c8ctl nano hire --name coder --rank senior --command copilot --arg --allow-all --env COPILOT_ENABLE_ALL_TOOLS=1');
     process.exit(1);
   }
 
@@ -1659,6 +1696,7 @@ async function hireWorker(req, flags) {
     name,
     rank,
     command,
+    args: commandArgs,
     model: model || '',
     capabilities: normalizeCapabilities(capabilities),
     sandbox,
@@ -1669,9 +1707,10 @@ async function hireWorker(req, flags) {
   writeHire(profile);
 
   const matrix = jobTypeMatrix(profile.rank, profile.capabilities);
-  logger.info(`${existed ? 'Updated' : 'Hired'} "${name}" [${profile.rank}] → ${profile.command}`);
+  logger.info(`${existed ? 'Updated' : 'Hired'} "${name}" [${profile.rank}] → ${buildAgentCommandLine(profile.command, profile.args)}`);
   logger.info(`  model: ${profile.model || '(none)'}`);
   logger.info(`  capabilities: ${profile.capabilities.join(', ') || '(none)'}`);
+  if (profile.args.length > 0) logger.info(`  args: ${profile.args.map(shQuote).join(' ')}`);
   logger.info(`  sandbox: ${profile.sandbox}${CONTAINER_SANDBOXES.has(profile.sandbox) ? ` (image ${profile.image})` : ''}`);
   const envKeys = Object.keys(profile.env);
   if (envKeys.length > 0) logger.info(`  env: ${envKeys.join(', ')}`);
@@ -2450,9 +2489,13 @@ function baseAgentEnv(profile, job) {
  * Both paths resolve to the same result contract.
  */
 function runAgentJob(profile, job, opts = {}) {
-  const { timeoutMs, envelope, sandbox = 'none', image, runId, secretEnv = {}, passThroughSecretNames = [], cwd, extraEnv = {}, profileEnv = {}, resultFile, stream = false, streamPrefix = '', onStreamOut, onStreamErr } = opts;
+  const { timeoutMs, envelope, sandbox = 'none', image, runId, secretEnv = {}, passThroughSecretNames = [], cwd, extraEnv = {}, profileEnv = {}, resultFile, stream = false, streamPrefix = '', onStreamOut, onStreamErr, args: commandArgs } = opts;
   const payload = JSON.stringify(buildAgentPayload(profile, job, envelope));
   const agentEnv = baseAgentEnv(profile, job);
+  // The harness command line: the profile command plus its structured switches
+  // (persisted `--arg`s, possibly extended at work time via opts.args), each
+  // shell-quoted. Spawned through a shell so `command` still resolves on PATH.
+  const commandLine = buildAgentCommandLine(profile.command, commandArgs ?? profile.args);
   // Static, non-secret env for the harness: the worker/profile's env (e.g. a
   // harness's permission toggles) plus the per-job envelope's setup.env
   // (job-specific tuning wins over the profile default). Reserved AGENT_* and
@@ -2461,9 +2504,16 @@ function runAgentJob(profile, job, opts = {}) {
 
   if (!CONTAINER_SANDBOXES.has(sandbox)) {
     // Host: hand the agent the result file by its real path.
+    // Defense in depth: --arg tokens are POSIX single-quoted, which cmd.exe on
+    // a Windows host does not honour, so args would be mis-parsed under the
+    // shell:true spawn. workAgent already rejects this at startup, but guard the
+    // spawn site too so the invariant holds for any direct caller of runAgentJob.
+    if (commandLine !== profile.command && process.platform === 'win32') {
+      return Promise.resolve({ ok: false, exitCode: null, stdout: '', stderr: '', error: 'command-line args (--arg) are not supported for host execution on Windows; use a container sandbox or bake switches into the command', truncated: false, stderrTruncated: false });
+    }
     const resultEnv = resultFile ? { [AGENT_RESULT_FILE_ENV]: resultFile } : {};
     return spawnCaptureOneShot({
-      command: profile.command,
+      command: commandLine,
       shell: true,
       // Own process group so the timeout handler can kill the whole tree.
       detached: process.platform !== 'win32',
@@ -2516,7 +2566,7 @@ function runAgentJob(profile, job, opts = {}) {
     ...mountArgs,
     ...envArgs,
     image,
-    'sh', '-c', profile.command,
+    'sh', '-c', commandLine,
   ];
 
   return spawnCaptureOneShot({
@@ -2618,6 +2668,11 @@ async function workAgent(req, flags) {
   }
   const profileEnv = { ...profile.env, ...workEnv };
 
+  // Structured command-line switches: the profile's persisted `--arg`s, extended
+  // by any work-time `--arg` (appended). Lets an operator add switches (e.g.
+  // `--allow-all`) at dispatch time without re-hiring.
+  const effectiveArgs = [...profile.args, ...normalizeArgList(flags?.arg)];
+
   const intFlag = (v, dflt) => {
     const n = Number.parseInt(String(v ?? ''), 10);
     return Number.isFinite(n) && n > 0 ? n : dflt;
@@ -2636,6 +2691,17 @@ async function workAgent(req, flags) {
   const isContainer = CONTAINER_SANDBOXES.has(sandbox);
   if (isContainer && !image) {
     logger.error(`--sandbox ${sandbox} requires an --image (or hire the profile with --image).`);
+    process.exit(1);
+  }
+  // Structured --arg tokens are POSIX single-quoted (shQuote) for the harness
+  // shell. On the host path that shell is the platform default — cmd.exe on
+  // Windows, which does not honour single quotes — so the quoting would leak
+  // literal quote characters and mis-parse the switches. The container path
+  // always targets the image's `sh`, so it stays correct regardless of host OS.
+  // Fail fast with actionable guidance rather than silently corrupting argv.
+  if (!isContainer && effectiveArgs.length > 0 && process.platform === 'win32') {
+    logger.error('--arg is not supported for host execution on Windows (cmd.exe does not honour POSIX quoting).');
+    logger.error('Use a container sandbox (--sandbox docker|podman --image <ref>) or bake the switches into --command.');
     process.exit(1);
   }
 
@@ -2713,7 +2779,7 @@ async function workAgent(req, flags) {
   const jobTypes = [...new Set([...matrix, ...extraJobTypes])];
   const camunda = globalThis.c8ctl.createClient();
 
-  logger.info(`Putting "${name}" [${profile.rank}] to work → ${profile.command}`);
+  logger.info(`Putting "${name}" [${profile.rank}] to work → ${buildAgentCommandLine(profile.command, effectiveArgs)}`);
   logger.info(`  model: ${profile.model || '(none)'}; capabilities: ${profile.capabilities.join(', ') || '(none)'}`);
   logger.info(`  sandbox: ${sandbox}${isContainer ? ` (image ${image})` : ''}`);
   const profileEnvKeys = Object.keys(profileEnv);
@@ -2730,7 +2796,7 @@ async function workAgent(req, flags) {
       maxParallelJobs,
       jobTimeoutMs,
       jobHandler: async (job) => {
-        logger.info(`[${jobType}] job ${job.jobKey} (instance ${job.processInstanceKey ?? '-'}) → ${profile.command}`);
+        logger.info(`[${jobType}] job ${job.jobKey} (instance ${job.processInstanceKey ?? '-'}) → ${buildAgentCommandLine(profile.command, effectiveArgs)}`);
 
         // Disk-budget admission shed: if the engine data root is below the free
         // floor, don't start a container — fail (retryable) so work sheds until
@@ -2824,6 +2890,7 @@ async function workAgent(req, flags) {
             resultFile,
             stream,
             streamPrefix: `[${jobType} ${job.jobKey}] `,
+            args: effectiveArgs,
             // Route the --stream tee through c8ctl's output-mode-aware logger so
             // spying never corrupts a structured/JSON output mode.
             onStreamOut: stream ? (line) => logger.info(line) : undefined,
@@ -4273,6 +4340,9 @@ export {
   sanitizeResultVars,
   parseEnvPairs,
   normalizeEnvMap,
+  normalizeArgList,
+  shQuote,
+  buildAgentCommandLine,
   reapAgentContainers,
   diskBudgetOk,
   containerEngineAvailable,
@@ -4327,6 +4397,7 @@ export const metadata = {
         { command: 'c8ctl nano update --check', description: 'Check whether a newer nano release is available' },
         { command: 'c8ctl nano hire', description: 'Interactively create a CLI agent worker profile (name, rank, command, model, capabilities)' },
         { command: 'c8ctl nano hire --name reviewer --rank senior --command copilot --model gpt-5 --capabilities code-review,testing', description: 'Create a profile non-interactively' },
+        { command: 'c8ctl nano hire --name coder --rank senior --command copilot --arg --allow-all', description: 'Hire copilot with a command-line switch (copilot --allow-all)' },
         { command: 'c8ctl nano hire --name coder --rank senior --command copilot --env COPILOT_ENABLE_ALL_TOOLS=1', description: 'Persist a harness startup env var (e.g. permissions) on the profile' },
         { command: 'c8ctl nano hire --list', description: 'List hired agent profiles' },
         { command: 'c8ctl nano hire --name coder --rank senior --command "agent-harness" --sandbox docker --image ghcr.io/acme/agent:1', description: 'Create a profile that runs each job in a throwaway Docker container' },
@@ -4375,6 +4446,7 @@ export const commands = {
       name: { type: 'string', description: 'hire/work: agent profile name (alt to positional arg)' },
       rank: { type: 'string', description: 'hire: agent rank (principal|senior|junior|decider)' },
       command: { type: 'string', description: 'hire: CLI command that runs the agent harness (e.g. copilot, claude, pi)' },
+      arg: { type: 'string', multiple: true, description: 'hire/work: command-line switch/arg appended to the harness command (repeatable), e.g. --arg --allow-all. Persisted on hire; work appends more.' },
       model: { type: 'string', description: 'hire: model name passed to the harness (AGENT_MODEL)' },
       capabilities: { type: 'string', description: 'hire: comma-separated capability list' },
       sandbox: { type: 'string', description: 'hire/work: execution sandbox none|docker|podman (default none). Containers isolate each job.' },
@@ -4533,8 +4605,8 @@ function printUsage() {
   console.log('  c8ctl nano set <bin|model-dir> <path>');
   console.log('  c8ctl nano config');
   console.log('  c8ctl nano update [--check]');
-  console.log('  c8ctl nano hire [--name <n>] [--rank <r>] [--command <c>] [--model <m>] [--capabilities <a,b>] [--sandbox none|docker|podman] [--image <ref>] [--env NAME=VALUE ...] [--list]');
-  console.log('  c8ctl nano work <profileName> [--max-parallel <n>] [--job-timeout <ms>] [--job-type <token> ...] [--sandbox none|docker|podman] [--image <ref>] [--env NAME=VALUE ...] [--secret-resolver host] [--min-free-mb <n>] [--clone-timeout <ms>] [--keep-runs] [--stream]');
+  console.log('  c8ctl nano hire [--name <n>] [--rank <r>] [--command <c>] [--arg <switch> ...] [--model <m>] [--capabilities <a,b>] [--sandbox none|docker|podman] [--image <ref>] [--env NAME=VALUE ...] [--list]');
+  console.log('  c8ctl nano work <profileName> [--arg <switch> ...] [--max-parallel <n>] [--job-timeout <ms>] [--job-type <token> ...] [--sandbox none|docker|podman] [--image <ref>] [--env NAME=VALUE ...] [--secret-resolver host] [--min-free-mb <n>] [--clone-timeout <ms>] [--keep-runs] [--stream]');
   console.log('');
   console.log('Subcommands:');
   console.log('  start    Spawn an N-node local cluster wired to talk to each other on localhost');

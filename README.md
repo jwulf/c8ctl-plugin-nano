@@ -150,6 +150,9 @@ c8ctl nano hire
 c8ctl nano hire --name reviewer --rank senior --command copilot \
   --model gpt-5 --capabilities code-review,testing
 
+# Give the harness command-line switches (e.g. run copilot with --allow-all)
+c8ctl nano hire --name coder --rank senior --command copilot --arg --allow-all
+
 # List profiles
 c8ctl nano hire --list
 ```
@@ -326,6 +329,24 @@ They apply on both the host and container paths. Per-job `setup.env` from the
 envelope layers on top (job-specific tuning wins), and the reserved `AGENT_*`
 variables and resolved secrets always win over user-supplied env so they can't be
 shadowed. For **secret** values use `secretRefs`, not `--env`.
+
+**Command-line switches.** Some harnesses take switches rather than env vars —
+e.g. `copilot --allow-all`. Append them to the harness command with a repeatable
+`--arg` (each `--arg` is one argv token). They are persisted on the profile at
+hire time and can be extended at work time:
+
+```bash
+c8ctl nano hire --name coder --rank senior --command copilot --arg --allow-all
+c8ctl nano work coder --arg --verbose            # appends to the profile args
+```
+
+The command is spawned through a shell (so `command` still resolves on `PATH`),
+but each `--arg` is shell-quoted as a single literal token, so a value with
+spaces or shell metacharacters can't break out or inject. They apply on the
+container path on any OS, and on the host path on POSIX systems. **On a Windows
+host (`sandbox=none`), `--arg` is rejected** with a clear error — the POSIX
+quoting isn't honoured by `cmd.exe` — so use a container sandbox
+(`--sandbox docker|podman`) or bake the switches into `--command` there.
 
 **Disk hygiene.** Host job **workspaces** and container sandboxes both get
 automatic cleanup so leaked artifacts can't fill the disk. Workspaces under

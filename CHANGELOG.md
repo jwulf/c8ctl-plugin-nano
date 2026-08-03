@@ -1,3 +1,59 @@
+# [1.17.0](https://github.com/jwulf/c8ctl-plugin-nano/compare/v1.16.0...v1.17.0) (2026-08-02)
+
+
+### Features
+
+* **nano:** surface the web IDE prominently in start/status output ([#23](https://github.com/jwulf/c8ctl-plugin-nano/issues/23)) ([bae9553](https://github.com/jwulf/c8ctl-plugin-nano/commit/bae95530253bbd58b4f9d51eb0d7a88166f06225))
+
+# [1.16.0](https://github.com/jwulf/c8ctl-plugin-nano/compare/v1.15.0...v1.16.0) (2026-07-31)
+
+
+### Features
+
+* stop spraying console links; start prints a plain URL, hire/work print none ([#22](https://github.com/jwulf/c8ctl-plugin-nano/issues/22)) ([06d9b5e](https://github.com/jwulf/c8ctl-plugin-nano/commit/06d9b5e32d00f8e9ad58f8f384dc914c4b859048)), closes [#464](https://github.com/jwulf/c8ctl-plugin-nano/issues/464) [#413](https://github.com/jwulf/c8ctl-plugin-nano/issues/413)
+
+# [1.15.0](https://github.com/jwulf/c8ctl-plugin-nano/compare/v1.14.1...v1.15.0) (2026-07-31)
+
+
+### Features
+
+* **nano:** let `work` service extra job types via --job-type ([#21](https://github.com/jwulf/c8ctl-plugin-nano/issues/21)) ([00c3978](https://github.com/jwulf/c8ctl-plugin-nano/commit/00c39786374e5120cbcc922243fde09f4323cfec))
+
+## [1.14.1](https://github.com/jwulf/c8ctl-plugin-nano/compare/v1.14.0...v1.14.1) (2026-07-31)
+
+
+### Bug Fixes
+
+* **binary:** bundle nanobpmn 0.0.11 (6eed16b) ([1747d03](https://github.com/jwulf/c8ctl-plugin-nano/commit/1747d0356847d1eefe08e19b664f00f0a2de5d18))
+
+# [1.14.0](https://github.com/jwulf/c8ctl-plugin-nano/compare/v1.13.2...v1.14.0) (2026-07-31)
+
+
+### Features
+
+* **nano:** print ?tour= guided-journey console links ([#413](https://github.com/jwulf/c8ctl-plugin-nano/issues/413)) ([#20](https://github.com/jwulf/c8ctl-plugin-nano/issues/20)) ([66afb65](https://github.com/jwulf/c8ctl-plugin-nano/commit/66afb65c68f01d707123404a89ac28b847200255)), closes [#406](https://github.com/jwulf/c8ctl-plugin-nano/issues/406)
+
+## [1.13.2](https://github.com/jwulf/c8ctl-plugin-nano/compare/v1.13.1...v1.13.2) (2026-07-31)
+
+
+### Bug Fixes
+
+* graceful error for pause/resume on Windows ([#19](https://github.com/jwulf/c8ctl-plugin-nano/issues/19)) ([a768a64](https://github.com/jwulf/c8ctl-plugin-nano/commit/a768a64e63f27439f5537c3e151b648c4752bafc)), closes [nano-bpm#390](https://github.com/nano-bpm/issues/390) [Magikcraft/nano-bpm#390](https://github.com/Magikcraft/nano-bpm/issues/390)
+
+## [1.13.1](https://github.com/jwulf/c8ctl-plugin-nano/compare/v1.13.0...v1.13.1) (2026-07-30)
+
+
+### Bug Fixes
+
+* clarify 0-indexed node ids in pause/resume UX ([#18](https://github.com/jwulf/c8ctl-plugin-nano/issues/18)) ([893e7a0](https://github.com/jwulf/c8ctl-plugin-nano/commit/893e7a0bde1ecb78685a31b291908bd52bfd76b8)), closes [Magikcraft/nano-bpm#386](https://github.com/Magikcraft/nano-bpm/issues/386)
+
+# [1.13.0](https://github.com/jwulf/c8ctl-plugin-nano/compare/v1.12.0...v1.13.0) (2026-07-30)
+
+
+### Features
+
+* **update:** route npm through the portable c8ctl.npm runner ([#17](https://github.com/jwulf/c8ctl-plugin-nano/issues/17)) ([bf23929](https://github.com/jwulf/c8ctl-plugin-nano/commit/bf23929d4071ad1348510d636408e7f2e0de0aef)), closes [camunda/c8ctl#490](https://github.com/camunda/c8ctl/issues/490) [#16](https://github.com/jwulf/c8ctl-plugin-nano/issues/16)
+
 # [1.12.0](https://github.com/jwulf/c8ctl-plugin-nano/compare/v1.11.0...v1.12.0) (2026-07-27)
 
 

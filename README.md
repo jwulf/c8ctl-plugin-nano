@@ -79,12 +79,13 @@ c8ctl nano status
 # Inspect a cluster c8ctl did NOT start (queries /v2/topology on the given port)
 c8ctl nano status --port 8080
 
-# Tail a node's log (-f / --follow to stream)
-c8ctl nano logs 1 --follow
+# Tail a node's log (-f / --follow to stream). Node ids are 0-indexed,
+# so a single-node cluster is node 0.
+c8ctl nano logs 0 --follow
 
 # Simulate a node failing (freeze it) and recovering (resume it)
-c8ctl nano pause 1
-c8ctl nano resume 1
+c8ctl nano pause 0
+c8ctl nano resume 0
 
 # Stop the cluster (engine data is retained)
 c8ctl nano stop
@@ -170,6 +171,18 @@ capabilities `code-review, testing` the matrix is:
 
 so a BPMN service task can target a worker at any granularity by setting its job
 type to the matching token.
+
+To also service a job type the matrix can't express — for example a code-first
+[`@nanobpm/workflow`](https://www.npmjs.com/package/@nanobpm/workflow) flow whose
+external task type is `<flowId>:<taskName>`, or any bespoke token — add one or
+more `--job-type <token>` flags. They are serviced **in addition to** the
+rank×capability matrix, so a single hired reviewer can drive both a model-first
+`senior:pr-review` task and a code-first flow's task without re-hiring:
+
+```bash
+c8ctl nano work reviewer --job-type convergence-loop:review-round
+c8ctl nano work reviewer --job-type senior:pr-review --job-type senior:triage
+```
 
 ```bash
 c8ctl nano work reviewer                     # poll for work until Ctrl-C

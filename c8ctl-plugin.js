@@ -28,7 +28,7 @@
  *   c8ctl nano restart [<nodes>] [--purge] ...
  */
 
-import { spawn, spawnSync } from 'node:child_process';
+import { spawn, spawnSync, execFileSync, execSync } from 'node:child_process';
 import {
   existsSync,
   mkdirSync,
@@ -449,6 +449,31 @@ function liveNodeCount(state) {
   return state.nodes.filter((n) => isPidAlive(n.pid)).length;
 }
 
+/**
+ * Compose a web-console URL for a node's base URL. Never hardcodes a port:
+ * `baseUrl` is the real address the node came up on.
+ *
+ * No longer carries a `?tour=<id>` deep link: onboarding is chosen in the
+ * console's own startup persona panel (nano-bpm #464), not sprayed across every
+ * command's output.
+ */
+function webConsoleUrl(baseUrl) {
+  return `${baseUrl}/console`;
+}
+
+/**
+ * Human label for the console link, keyed on the runtime console profile.
+ * The default `studio` profile IS the full web IDE, so name it as such — users
+ * kept missing that Nano ships a browser IDE when it was labelled "Web console".
+ * `observe` is the read-only console. `off` serves no console, so the label is
+ * meaningless there; callers must guard `profile !== 'off'` before rendering it,
+ * and this helper returns null for `off` to enforce that contract.
+ */
+function consoleLinkLabel(profile) {
+  if (profile === 'off') return null;
+  return profile === 'studio' ? 'Web IDE (Studio)' : `Web console (${profile})`;
+}
+
 /** Probe a node's always-on GET /v2/topology endpoint for reachability. */
 async function probeHealthy(url) {
   const controller = new AbortController();
@@ -776,6 +801,7 @@ async function startCluster(req) {
     inMemory,
     historyMax: historyMax ?? null,
     basePort,
+    consoleProfile,
     nodes,
   };
   writeState(state);
@@ -822,15 +848,22 @@ async function printSummary(state) {
   // The landing page (and the /docs user guide + /console) only exist in builds
   // compiled with the web console; probe so we advertise the right entry point.
   const hasConsole = await probePath(entry.url, '/');
+  const profile = state.consoleProfile ?? 'studio';
+  // Lead with the web IDE — it is Nano's headline surface and the thing users
+  // most often did not realise was there. Only advertise it when this build
+  // actually serves a console and the profile is not 'off'.
+  if (hasConsole && profile !== 'off') {
+    console.log(`  ${consoleLinkLabel(profile)}   ${webConsoleUrl(entry.url)}`);
+    const surface = profile === 'studio' ? 'the Nano web IDE' : 'the Nano web console';
+    console.log(`    ^ open this in your browser: ${surface}`);
+    console.log('');
+  }
   if (hasConsole) {
-    console.log(`  Start here   ${entry.url}/          (landing: console, user guide & API docs)`);
+    console.log(`  Landing      ${entry.url}/          (console, user guide & API docs)`);
+    console.log(`  User guide   ${entry.url}/docs`);
   }
   console.log(`  REST API     ${entry.url}/v2`);
   console.log(`  Topology     ${entry.url}/v2/topology`);
-  if (hasConsole) {
-    console.log(`  Web console  ${entry.url}/console`);
-    console.log(`  User guide   ${entry.url}/docs`);
-  }
   if (state.workspaceDir) {
     console.log(`  Workspace    ${state.workspaceDir} (models/, workers/)`);
   }
@@ -1040,6 +1073,21 @@ async function statusCluster(req) {
   }
   console.log('');
 
+  // Surface the web IDE again here so it stays discoverable long after the
+  // initial `start` scrolled off — probe a healthy node so we only advertise a
+  // console that is actually served (API-only builds 404 `/`).
+  const profile = state.consoleProfile ?? 'studio';
+  if (overall !== 'stopped' && profile !== 'off') {
+    // Only probe a HEALTHY node: it already answered /v2/topology this run, so
+    // GET / returns fast. Falling back to a merely-alive (unreachable) node
+    // would add a full probe timeout to every `nano status` in a degraded state.
+    const consoleNode = checks.find((c) => c.healthy);
+    if (consoleNode && (await probePath(consoleNode.url, '/'))) {
+      console.log(`  ${consoleLinkLabel(profile)}   ${webConsoleUrl(consoleNode.url)}`);
+      console.log('');
+    }
+  }
+
   // Enrich with the live topology when reachable — the authoritative view of
   // partition leadership across the cluster.
   if (topo) {
@@ -1119,6 +1167,20 @@ function logsCluster(req) {
 
 function controlNode(req, { signal, verb, paused }) {
   const logger = getLogger();
+
+  // pause/resume rely on SIGSTOP/SIGCONT, which are POSIX-only. On Windows
+  // Node throws "Unknown signal: SIGSTOP" from process.kill, so fail fast with
+  // a clear message instead of a raw crash (see nano-bpm#390).
+  if (process.platform === 'win32') {
+    logger.error(
+      `"c8ctl nano ${verb}" isn't supported on Windows yet — it relies on ` +
+        `SIGSTOP/SIGCONT, which Windows doesn't have. To simulate a node ` +
+        `failing and recovering, use "c8ctl nano stop <id>" then ` +
+        `"c8ctl nano start" instead.`,
+    );
+    process.exit(1);
+  }
+
   const state = readState();
 
   if (!state || !Array.isArray(state.nodes) || state.nodes.length === 0) {
@@ -1127,16 +1189,17 @@ function controlNode(req, { signal, verb, paused }) {
   }
 
   const nodeIds = state.nodes.map((n) => n.id).join(', ');
+  const exampleId = state.nodes[0].id;
   const idArg = req.positional[0];
   if (idArg === undefined) {
-    logger.error(`Specify a node id, e.g. "c8ctl nano ${verb} 1". Nodes: ${nodeIds}`);
+    logger.error(`Specify a node id, e.g. "c8ctl nano ${verb} ${exampleId}". Running nodes: [${nodeIds}]`);
     process.exit(1);
   }
 
   const id = Number.parseInt(idArg, 10);
   const node = Number.isFinite(id) ? state.nodes.find((n) => n.id === id) : undefined;
   if (!node) {
-    logger.error(`No node "${idArg}" in the running cluster. Nodes: ${nodeIds}`);
+    logger.error(`No node "${idArg}" in the running cluster. Running nodes: [${nodeIds}]`);
     process.exit(1);
   }
 
@@ -1384,6 +1447,35 @@ function buildAgentCommandLine(command, args) {
   const list = normalizeArgList(args);
   if (list.length === 0) return command;
   return `${command} ${list.map(shQuote).join(' ')}`;
+}
+
+// A worker job-type token: rank/capability tokens use `:` (rank↔cap) and `+`
+// (combined caps) as delimiters, and code-first `@nanobpm/workflow` job types
+// are `<flowId>:<taskName>` or an explicit override. The first character must be
+// a letter, digit, or `_`; the remainder may also include `. : + -`. Mirrors the
+// SDK's assertJobType so a token authored on one side is accepted on the other.
+const JOB_TYPE_TOKEN_RE = /^[A-Za-z0-9_][A-Za-z0-9_.:+-]*$/;
+
+// Parse repeatable `--job-type <token>` CLI input (string | string[]) into a
+// deduped, validated list of explicit job types a worker should also service,
+// in addition to its rank×capability matrix. Returns { jobTypes, errors }.
+function parseJobTypeFlags(input) {
+  const list = input == null ? [] : (Array.isArray(input) ? input : [input]);
+  const seen = new Set();
+  const jobTypes = [];
+  const errors = [];
+  for (const item of list) {
+    const token = String(item).trim();
+    if (!token) { errors.push('--job-type must be a non-empty token'); continue; }
+    if (!JOB_TYPE_TOKEN_RE.test(token)) {
+      errors.push(`--job-type "${token}" is invalid (must match ${JOB_TYPE_TOKEN_RE.source})`);
+      continue;
+    }
+    if (seen.has(token)) continue;
+    seen.add(token);
+    jobTypes.push(token);
+  }
+  return { jobTypes, errors };
 }
 
 /** A profile name must be a safe, filesystem/token-friendly slug. */
@@ -2675,6 +2767,16 @@ async function workAgent(req, flags) {
   }
 
   const matrix = jobTypeMatrix(profile.rank, profile.capabilities);
+  // Optional explicit job types (repeatable `--job-type`), serviced in addition
+  // to the rank×capability matrix. This lets a hired profile also drive a pool
+  // keyed on a token the matrix can't express — e.g. a code-first
+  // `@nanobpm/workflow` flow whose external task type isn't a `rank:cap` token.
+  const { jobTypes: extraJobTypes, errors: jobTypeErrors } = parseJobTypeFlags(flags?.['job-type']);
+  if (jobTypeErrors.length > 0) {
+    logger.error(jobTypeErrors.join('; '));
+    process.exit(1);
+  }
+  const jobTypes = [...new Set([...matrix, ...extraJobTypes])];
   const camunda = globalThis.c8ctl.createClient();
 
   logger.info(`Putting "${name}" [${profile.rank}] to work → ${buildAgentCommandLine(profile.command, effectiveArgs)}`);
@@ -2682,11 +2784,12 @@ async function workAgent(req, flags) {
   logger.info(`  sandbox: ${sandbox}${isContainer ? ` (image ${image})` : ''}`);
   const profileEnvKeys = Object.keys(profileEnv);
   if (profileEnvKeys.length > 0) logger.info(`  harness env: ${profileEnvKeys.join(', ')}`);
-  logger.info(`  listening on ${matrix.length} job type(s): ${matrix.join('  ')}`);
+  const extraNote = extraJobTypes.length > 0 ? ` (${extraJobTypes.length} via --job-type)` : '';
+  logger.info(`  listening on ${jobTypes.length} job type(s)${extraNote}: ${jobTypes.join('  ')}`);
   logger.info(`  max parallel: ${maxParallelJobs}; job timeout: ${jobTimeoutMs}ms`);
   logger.info('Polling for work — press Ctrl-C to stop.');
 
-  const workers = matrix.map((jobType) =>
+  const workers = jobTypes.map((jobType) =>
     camunda.createJobWorker({
       jobType,
       workerName: `${name}:${jobType}`,
@@ -2944,21 +3047,90 @@ function compareSemver(a, b) {
   return 0;
 }
 
+/**
+ * Resolve how npm must be spawned on the given platform. Spawning `npm`
+ * directly is not portable: on Windows npm is a `npm.cmd` shim, so bare
+ * `"npm"` fails with ENOENT and `"npm.cmd"` fails with EINVAL under the
+ * CVE-2024-27980 hardening. On Windows the shim is therefore run through
+ * cmd.exe (`shell: true`) with every argument double-quoted, and the two
+ * constructs that survive double quotes — an embedded `"` and a `%VAR%`
+ * reference — are rejected rather than escaped.
+ *
+ * This mirrors the host CLI's own `buildNpmInvocation`; it is the local
+ * fallback for `runNpm` when the host runner (`c8ctl.npm`) is unavailable.
+ * `platform` is a parameter so the Windows branch is unit-testable on POSIX.
+ */
+function buildNpmInvocation(args, platform = process.platform) {
+  if (platform !== 'win32') {
+    return { command: 'npm', args: [...args], shell: false };
+  }
+  for (const arg of args) {
+    if (/["\r\n\0]/.test(arg)) {
+      throw new Error(
+        `Refusing to run npm: argument contains a quote or line break that cannot be passed safely to cmd.exe: ${JSON.stringify(arg)}`,
+      );
+    }
+    if (/%[A-Z_][^%]*?%/i.test(arg)) {
+      throw new Error(
+        `Refusing to run npm: argument contains a cmd.exe environment variable reference: ${JSON.stringify(arg)}`,
+      );
+    }
+  }
+  return {
+    command: 'npm.cmd',
+    args: args.map((arg) => `"${arg.replace(/(\\+)$/, '$1$1')}"`),
+    shell: true,
+  };
+}
+
+/** Local, platform-aware npm runner used when the host `c8ctl.npm` is absent. */
+function runNpmLocal(args, { stdout = false, stdio } = {}) {
+  const { command, args: resolved, shell } = buildNpmInvocation(args);
+  if (shell) {
+    const cmdLine = [command, ...resolved].join(' ');
+    if (stdout) {
+      return { stdout: execSync(cmdLine, { stdio: ['ignore', 'pipe', 'pipe'], encoding: 'utf8' }) };
+    }
+    execSync(cmdLine, { stdio });
+    return undefined;
+  }
+  if (stdout) {
+    return {
+      stdout: execFileSync(command, resolved, { stdio: ['ignore', 'pipe', 'pipe'], encoding: 'utf8', shell: false }),
+    };
+  }
+  execFileSync(command, resolved, { stdio, shell: false });
+  return undefined;
+}
+
+/**
+ * Run npm portably. Prefers the host CLI's cross-platform runner
+ * (`globalThis.c8ctl.npm`, added in c8ctl's plugin runtime); falls back to the
+ * local platform-aware invocation for older hosts and for the detached update
+ * refresh, which runs without the host runtime. Throws on a nonzero exit.
+ */
+function runNpm(args, { stdout = false, stdio } = {}) {
+  const host = globalThis.c8ctl;
+  if (host && typeof host.npm === 'function') {
+    return stdout ? host.npm({ args, stdout: true }) : host.npm({ args, stdio });
+  }
+  return runNpmLocal(args, { stdout, stdio });
+}
+
 /** Latest published version of `name` per the npm registry (throws on failure). */
 function npmLatestVersion(name) {
-  const res = spawnSync('npm', ['view', name, 'version'], { encoding: 'utf8' });
-  if (res.error) throw new Error(res.error.message);
-  if (res.status !== 0) {
-    throw new Error((res.stderr || '').trim() || `npm view exited ${res.status}`);
-  }
-  return res.stdout.trim();
+  const { stdout } = runNpm(['view', name, 'version'], { stdout: true });
+  return stdout.trim();
 }
 
 /** True when this plugin lives under npm's global node_modules (so `-g` updates it). */
 function isGlobalInstall() {
-  const res = spawnSync('npm', ['root', '-g'], { encoding: 'utf8' });
-  if (res.status !== 0) return false;
-  const root = res.stdout.trim();
+  let root;
+  try {
+    root = runNpm(['root', '-g'], { stdout: true }).stdout.trim();
+  } catch {
+    return false;
+  }
   return Boolean(root) && pluginDir.startsWith(root);
 }
 
@@ -3076,9 +3248,9 @@ function updatePlugin(req) {
   const where = info.mode === 'managed' ? 'the c8ctl plugin store' : "npm's global prefix";
   console.log(`Pulling ${name}@${latest} into ${where}...`);
   console.log('');
-  const res = spawnSync('npm', installArgs, { stdio: 'inherit' });
-  if (res.error) throw new Error(res.error.message);
-  if (res.status !== 0) {
+  try {
+    runNpm(installArgs, { stdio: 'inherit' });
+  } catch (err) {
     let hint;
     if (info.mode === 'managed') {
       hint = `You can also run:\n${manual}`;
@@ -3087,8 +3259,9 @@ function updatePlugin(req) {
     } else {
       hint = `You may need elevated permissions: sudo ${manual.trim()}`;
     }
+    const code = typeof err?.status === 'number' ? ` (exit ${err.status})` : '';
     throw new Error(
-      `npm ${installArgs.join(' ')} failed (exit ${res.status}). ${hint}`,
+      `npm ${installArgs.join(' ')} failed${code}. ${hint}`,
     );
   }
   console.log('');
@@ -3148,13 +3321,28 @@ function updateNotifierDisabled() {
  * fresh result is used on the *next* invocation.
  */
 function spawnUpdateRefresh(name, cacheFile) {
+  // The refresh runs in a detached bare-node child that has no host runtime, so
+  // it cannot use c8ctl.npm. Resolve the portable npm invocation here (single
+  // source of truth) and bake the decided command into a generic runner in the
+  // child — the child makes no platform decision of its own.
+  let inv;
+  try {
+    inv = buildNpmInvocation(['view', name, 'version']);
+  } catch {
+    return; /* unsafe argument for cmd.exe; skip this cycle */
+  }
   const script =
-    'const{spawnSync}=require("child_process");' +
+    'const{execFileSync,execSync}=require("child_process");' +
     'const{readFileSync,writeFileSync}=require("fs");' +
+    `const cmd=${JSON.stringify(inv.command)},args=${JSON.stringify(inv.args)},shell=${JSON.stringify(inv.shell)};` +
     `let prev={};try{prev=JSON.parse(readFileSync(${JSON.stringify(cacheFile)},"utf8"))}catch{}` +
     'const out=Object.assign({},prev,{lastCheck:Date.now()});' +
-    `const r=spawnSync("npm",["view",${JSON.stringify(name)},"version"],{encoding:"utf8"});` +
-    'if(r.status===0){out.latest=String(r.stdout||"").trim()}' +
+    'try{' +
+    'const o=shell' +
+    '?execSync([cmd,...args].join(" "),{stdio:["ignore","pipe","pipe"],encoding:"utf8"})' +
+    ':execFileSync(cmd,args,{stdio:["ignore","pipe","pipe"],encoding:"utf8",shell:false});' +
+    'out.latest=String(o||"").trim()' +
+    '}catch{}' +
     `try{writeFileSync(${JSON.stringify(cacheFile)},JSON.stringify(out))}catch{}`;
   try {
     const child = spawn(process.execPath, ['-e', script], { detached: true, stdio: 'ignore' });
@@ -4129,6 +4317,12 @@ function parseProcessosRequest(args, flags) {
 // Internal helpers exported for tests/tooling only. c8ctl consumes just
 // `metadata` and `commands`; these named exports are inert to it.
 export { resolveBinary, findBinary, launcherEnvMarkers };
+export { buildNpmInvocation };
+export {
+  webConsoleUrl,
+  consoleLinkLabel,
+  hireWorker,
+};
 export {
   normalizeTaskEnvelope,
   collectEnvelopeFrom,
@@ -4163,6 +4357,7 @@ export {
   ProvisionError,
   normalizeStoredProfile,
   jobTypeMatrix,
+  parseJobTypeFlags,
   AGENT_TASK_NS,
   AGENT_RESULT_KEY,
   RESULT_SENTINEL,
@@ -4267,6 +4462,7 @@ export const commands = {
       list: { type: 'boolean', description: 'hire: list existing agent profiles instead of creating one' },
       'max-parallel': { type: 'string', description: 'work: max concurrent jobs per worker (default 1)' },
       'job-timeout': { type: 'string', description: 'work: max harness runtime per job in ms; the spawned process is killed past this (default 300000)' },
+      'job-type': { type: 'string', multiple: true, description: 'work: extra job type to service alongside the rank×capability matrix (repeatable)' },
     },
     handler: async (args, flags) => {
       const logger = getLogger();
@@ -4410,7 +4606,7 @@ function printUsage() {
   console.log('  c8ctl nano config');
   console.log('  c8ctl nano update [--check]');
   console.log('  c8ctl nano hire [--name <n>] [--rank <r>] [--command <c>] [--arg <switch> ...] [--model <m>] [--capabilities <a,b>] [--sandbox none|docker|podman] [--image <ref>] [--env NAME=VALUE ...] [--list]');
-  console.log('  c8ctl nano work <profileName> [--arg <switch> ...] [--max-parallel <n>] [--job-timeout <ms>] [--sandbox none|docker|podman] [--image <ref>] [--env NAME=VALUE ...] [--secret-resolver host] [--min-free-mb <n>] [--clone-timeout <ms>] [--keep-runs] [--stream]');
+  console.log('  c8ctl nano work <profileName> [--arg <switch> ...] [--max-parallel <n>] [--job-timeout <ms>] [--job-type <token> ...] [--sandbox none|docker|podman] [--image <ref>] [--env NAME=VALUE ...] [--secret-resolver host] [--min-free-mb <n>] [--clone-timeout <ms>] [--keep-runs] [--stream]');
   console.log('');
   console.log('Subcommands:');
   console.log('  start    Spawn an N-node local cluster wired to talk to each other on localhost');
@@ -4451,6 +4647,7 @@ function printUsage() {
   console.log('  --env NAME=VALUE     hire/work: static env var for the harness (repeatable); persisted on hire, work extends/overrides');
   console.log('  --list               hire: list existing agent profiles instead of creating one');
   console.log('  --max-parallel <n>   work: max concurrent jobs per worker (default 1)');
+  console.log('  --job-type <token>   work: extra job type to service alongside the rank×capability matrix (repeatable)');
   console.log('  --job-timeout <ms>   work: max harness runtime per job in ms (default 300000)');
   console.log('  --secret-resolver <r> work: secret resolver for task secretRefs (host; default host)');
   console.log('  --reap-age <ms>      work: age before a finished agent container/workspace is reaped (default 3600000)');

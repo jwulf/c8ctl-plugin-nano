@@ -24,6 +24,7 @@ import {
   parseResultFromStdout,
   sanitizeResultVars,
   parseEnvPairs,
+  parseJobTypeFlags,
   normalizeEnvMap,
   normalizeArgList,
   shQuote,
@@ -600,6 +601,27 @@ test('parseEnvPairs parses NAME=VALUE, keeps = in values, reports bad input', ()
   }
 
   assert.deepEqual(parseEnvPairs(undefined).env, {});
+});
+
+test('parseJobTypeFlags: validates, dedupes, accepts token delimiters, scalars', () => {
+  // Accepts rank:cap tokens, combined caps, and code-first flowId:task tokens.
+  const ok = parseJobTypeFlags(['senior:pr-review', 'senior:pr-review+triage', 'convergence-loop:review-round']);
+  assert.deepEqual(ok.jobTypes, ['senior:pr-review', 'senior:pr-review+triage', 'convergence-loop:review-round']);
+  assert.deepEqual(ok.errors, []);
+
+  // c8ctl may hand a scalar for a single flag occurrence.
+  assert.deepEqual(parseJobTypeFlags('senior:pr-review').jobTypes, ['senior:pr-review']);
+
+  // Dedupes repeats (and matrix union in workAgent dedupes again).
+  assert.deepEqual(parseJobTypeFlags(['a:b', 'a:b']).jobTypes, ['a:b']);
+
+  // Rejects empties and tokens with illegal characters, keeping the good ones.
+  const bad = parseJobTypeFlags(['', '  ', 'has space', 'bad/slash', 'good.token']);
+  assert.deepEqual(bad.jobTypes, ['good.token']);
+  assert.equal(bad.errors.length, 4);
+
+  // Absent input yields no job types and no errors.
+  assert.deepEqual(parseJobTypeFlags(undefined), { jobTypes: [], errors: [] });
 });
 
 test('normalizeEnvMap drops invalid names and stringifies values', () => {

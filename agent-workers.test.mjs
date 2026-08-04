@@ -914,6 +914,11 @@ test('deriveJobLockMs: lock strictly outlasts the harness kill deadline', () => 
   assert.ok(deriveJobLockMs(0, 0) > 5 * 60_000 - 1 && deriveJobLockMs(0, 0) > 0);
   assert.ok(deriveJobLockMs(300_000, 0) > 300_000);
   assert.ok(deriveJobLockMs(NaN, NaN) > 0);
+  // Very large (non-safe) integer inputs must not round `kill + grace` back
+  // down to `kill`; the invariant must still hold strictly.
+  assert.ok(deriveJobLockMs(Number.MAX_SAFE_INTEGER, 120_000) > Number.MAX_SAFE_INTEGER - 120_000);
+  assert.ok(Number.isSafeInteger(deriveJobLockMs(2 ** 53, 2 ** 53)));
+  assert.ok(Number.isSafeInteger(deriveJobLockMs(2 ** 60, 2 ** 60)));
   for (const kill of [1_000, 60_000, 300_000, 900_000]) {
     for (const grace of [1, 1_000, 120_000]) {
       assert.ok(deriveJobLockMs(kill, grace) > kill, `lock must exceed kill for kill=${kill} grace=${grace}`);

@@ -1483,12 +1483,23 @@ function parseJobTypeFlags(input) {
  * deadline: the worker has to report the outcome (complete/fail) before the lock
  * lapses, or the broker re-activates the still-retryable job (a second agent
  * starts) and the stale `fail` is rejected 409 "job cannot be failed in the
- * current state". So lock = kill + grace. Non-positive inputs are floored to a
- * minimal positive grace so the invariant lock > kill always holds.
+ * current state". So lock = kill + grace. Non-finite or non-positive inputs
+ * fall back to fixed defaults (5m kill / 2m grace). All inputs are coerced to
+ * safe positive integers and kill is capped so `kill + grace` stays within the
+ * safe-integer range, so the invariant lock > kill holds strictly for every
+ * accepted input — including values at or beyond 2^53 where float addition
+ * would otherwise round `kill + grace` back down to `kill`.
  */
 function deriveJobLockMs(jobTimeoutMs, lockGraceMs) {
-  const kill = Number.isFinite(jobTimeoutMs) && jobTimeoutMs > 0 ? jobTimeoutMs : 5 * 60_000;
-  const grace = Number.isFinite(lockGraceMs) && lockGraceMs > 0 ? lockGraceMs : 2 * 60_000;
+  const MAX = Number.MAX_SAFE_INTEGER;
+  const toSafeMs = (value, fallback) => {
+    const n = Number.isFinite(value) && value > 0 ? Math.floor(value) : fallback;
+    return Math.min(n, MAX);
+  };
+  const grace = Math.max(1, toSafeMs(lockGraceMs, 2 * 60_000));
+  // Cap kill so kill + grace stays a safe integer; the sum is then exact and
+  // strictly greater than kill (never equal to it via float rounding).
+  const kill = Math.min(toSafeMs(jobTimeoutMs, 5 * 60_000), MAX - grace);
   return kill + grace;
 }
 

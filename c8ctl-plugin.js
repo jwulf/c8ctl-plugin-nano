@@ -1518,7 +1518,32 @@ function deriveJobLockMs(jobTimeoutMs, lockGraceMs) {
   return { killMs, lockMs: killMs + grace };
 }
 
-/** A profile name must be a safe, filesystem/token-friendly slug. */
+/**
+ * Resolve the broker long-poll window (ms) each `activateJobs` request is held
+ * open before returning empty. A longer window keeps an idle worker on ONE open
+ * connection for that whole window instead of reconnecting every few seconds,
+ * cutting the number of connection establishments — and thus the number of
+ * chances to hit a transient connect failure (ECONNREFUSED / connect-timeout)
+ * on a flaky link.
+ *
+ * The value is passed straight through to the SDK as `pollTimeoutMs` → the
+ * broker's `requestTimeout`, so the documented broker semantics apply: `0` =
+ * broker default (~5s), a negative value = return immediately when no job is
+ * available. Parsing is `parseInt`-style: only a flag with no leading integer
+ * (absent, blank, or non-numeric such as `"abc"`) falls back to the default,
+ * while a leading integer with trailing junk (e.g. `"30000ms"`) is honoured as
+ * that integer. `0` and negatives are honoured too (which is why this cannot
+ * reuse `intFlag`, whose "> 0" guard would floor them to the default).
+ *
+ * @returns {number}
+ */
+function derivePollTimeoutMs(flagValue, dflt = 30_000) {
+  if (flagValue === undefined || flagValue === null || String(flagValue).trim() === '') {
+    return dflt;
+  }
+  const n = Number.parseInt(String(flagValue), 10);
+  return Number.isFinite(n) ? n : dflt;
+}
 function isValidProfileName(name) {
   return typeof name === 'string' && /^[a-z0-9][a-z0-9._-]*$/i.test(name);
 }
@@ -2730,6 +2755,11 @@ async function workAgent(req, flags) {
   // MUST enforce the clamped `jobKillMs` (not the raw --job-timeout), or a very
   // large --job-timeout would outlive the broker lock and re-break the invariant.
   const { killMs: jobKillMs, lockMs: jobLockMs } = deriveJobLockMs(jobTimeoutMs, lockGraceMs);
+  // Broker long-poll window: how long each activateJobs request is held open
+  // waiting for work. 30s default so idle workers hold one connection open ~30s
+  // rather than reconnecting every few seconds — fewer reconnects, fewer chances
+  // to hit a transient connect error on a flaky link. Passed to the SDK verbatim.
+  const pollTimeoutMs = derivePollTimeoutMs(flags?.['poll-timeout']);
 
   // Sandbox: flag overrides the stored profile default. `none` runs on the host
   // (legacy); `docker`/`podman` run each job in a throwaway labelled container.
@@ -2837,7 +2867,7 @@ async function workAgent(req, flags) {
   if (profileEnvKeys.length > 0) logger.info(`  harness env: ${profileEnvKeys.join(', ')}`);
   const extraNote = extraJobTypes.length > 0 ? ` (${extraJobTypes.length} via --job-type)` : '';
   logger.info(`  listening on ${jobTypes.length} job type(s)${extraNote}: ${jobTypes.join('  ')}`);
-  logger.info(`  max parallel: ${maxParallelJobs}; job timeout: ${jobKillMs}ms; activation lock: ${jobLockMs}ms`);
+  logger.info(`  max parallel: ${maxParallelJobs}; job timeout: ${jobKillMs}ms; activation lock: ${jobLockMs}ms; poll timeout: ${pollTimeoutMs}ms`);
   logger.info('Polling for work — press Ctrl-C to stop.');
 
   const workers = jobTypes.map((jobType) =>
@@ -2846,6 +2876,7 @@ async function workAgent(req, flags) {
       workerName: `${name}:${jobType}`,
       maxParallelJobs,
       jobTimeoutMs: jobLockMs,
+      pollTimeoutMs,
       jobHandler: async (job) => {
         logger.info(`[${jobType}] job ${job.jobKey} (instance ${job.processInstanceKey ?? '-'}) → ${buildAgentCommandLine(profile.command, effectiveArgs)}`);
 
@@ -4410,6 +4441,7 @@ export {
   jobTypeMatrix,
   parseJobTypeFlags,
   deriveJobLockMs,
+  derivePollTimeoutMs,
   AGENT_TASK_NS,
   AGENT_RESULT_KEY,
   RESULT_SENTINEL,
@@ -4515,6 +4547,7 @@ export const commands = {
       'max-parallel': { type: 'string', description: 'work: max concurrent jobs per worker (default 1)' },
       'job-timeout': { type: 'string', description: 'work: max harness runtime per job in ms; the spawned process is killed past this (default 300000)' },
       'lock-grace': { type: 'string', description: 'work: extra ms added to --job-timeout to derive the broker activation lock, so the worker reports before the lock lapses (default 120000)' },
+      'poll-timeout': { type: 'string', description: 'work: broker long-poll window in ms each activateJobs request is held open (fewer reconnects → fewer transient connect errors); default 30000, 0 = broker default, negative = return immediately' },
       'job-type': { type: 'string', multiple: true, description: 'work: extra job type to service alongside the rank×capability matrix (repeatable)' },
     },
     handler: async (args, flags) => {
@@ -4659,7 +4692,7 @@ function printUsage() {
   console.log('  c8ctl nano config');
   console.log('  c8ctl nano update [--check]');
   console.log('  c8ctl nano hire [--name <n>] [--rank <r>] [--command <c>] [--arg <switch> ...] [--model <m>] [--capabilities <a,b>] [--sandbox none|docker|podman] [--image <ref>] [--env NAME=VALUE ...] [--list]');
-  console.log('  c8ctl nano work <profileName> [--arg <switch> ...] [--max-parallel <n>] [--job-timeout <ms>] [--lock-grace <ms>] [--job-type <token> ...] [--sandbox none|docker|podman] [--image <ref>] [--env NAME=VALUE ...] [--secret-resolver host] [--min-free-mb <n>] [--clone-timeout <ms>] [--keep-runs] [--stream]');
+  console.log('  c8ctl nano work <profileName> [--arg <switch> ...] [--max-parallel <n>] [--job-timeout <ms>] [--lock-grace <ms>] [--poll-timeout <ms>] [--job-type <token> ...] [--sandbox none|docker|podman] [--image <ref>] [--env NAME=VALUE ...] [--secret-resolver host] [--min-free-mb <n>] [--clone-timeout <ms>] [--keep-runs] [--stream]');
   console.log('');
   console.log('Subcommands:');
   console.log('  start    Spawn an N-node local cluster wired to talk to each other on localhost');
@@ -4703,6 +4736,7 @@ function printUsage() {
   console.log('  --job-type <token>   work: extra job type to service alongside the rank×capability matrix (repeatable)');
   console.log('  --job-timeout <ms>   work: max harness runtime per job in ms (default 300000)');
   console.log('  --lock-grace <ms>    work: extra ms over --job-timeout for the broker activation lock (default 120000)');
+  console.log('  --poll-timeout <ms>  work: broker long-poll window per activateJobs request (default 30000; 0 = broker default, negative = immediate)');
   console.log('  --secret-resolver <r> work: secret resolver for task secretRefs (host; default host)');
   console.log('  --reap-age <ms>      work: age before a finished agent container/workspace is reaped (default 3600000)');
   console.log('  --reap-interval <ms> work: how often to sweep finished agent containers/workspaces (default 300000)');

@@ -1485,21 +1485,27 @@ function parseJobTypeFlags(input) {
  * starts) and the stale `fail` is rejected 409 "job cannot be failed in the
  * current state". So lock = kill + grace. Non-finite or non-positive inputs
  * fall back to fixed defaults (5m kill / 2m grace). All inputs are coerced to
- * safe positive integers and kill is capped so `kill + grace` stays within the
- * safe-integer range, so the invariant lock > kill holds strictly for every
+ * safe positive integers (positive fractional values floor to at least 1) and
+ * grace is capped so a positive kill always fits and `kill + grace` stays within
+ * the safe-integer range, so the invariant lock > kill holds strictly for every
  * accepted input — including values at or beyond 2^53 where float addition
  * would otherwise round `kill + grace` back down to `kill`.
  */
 function deriveJobLockMs(jobTimeoutMs, lockGraceMs) {
   const MAX = Number.MAX_SAFE_INTEGER;
   const toSafeMs = (value, fallback) => {
-    const n = Number.isFinite(value) && value > 0 ? Math.floor(value) : fallback;
+    // Floor positive fractional values to at least 1 so a sub-millisecond input
+    // (e.g. 0.5) never collapses to a non-positive value.
+    const n = Number.isFinite(value) && value > 0 ? Math.max(1, Math.floor(value)) : fallback;
     return Math.min(n, MAX);
   };
-  const grace = Math.max(1, toSafeMs(lockGraceMs, 2 * 60_000));
-  // Cap kill so kill + grace stays a safe integer; the sum is then exact and
-  // strictly greater than kill (never equal to it via float rounding).
-  const kill = Math.min(toSafeMs(jobTimeoutMs, 5 * 60_000), MAX - grace);
+  // Cap grace to MAX - 1 so there is always room for a positive kill while
+  // keeping kill + grace within the safe-integer range.
+  const grace = Math.min(toSafeMs(lockGraceMs, 2 * 60_000), MAX - 1);
+  // Cap kill so kill + grace stays a safe integer and floor it at 1 so the
+  // internal kill is always positive; the sum is then exact and strictly
+  // greater than kill (never equal to it via float rounding).
+  const kill = Math.max(1, Math.min(toSafeMs(jobTimeoutMs, 5 * 60_000), MAX - grace));
   return kill + grace;
 }
 

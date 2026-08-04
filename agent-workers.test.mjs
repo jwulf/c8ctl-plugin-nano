@@ -25,6 +25,7 @@ import {
   sanitizeResultVars,
   parseEnvPairs,
   parseJobTypeFlags,
+  deriveJobLockMs,
   normalizeEnvMap,
   normalizeArgList,
   shQuote,
@@ -899,4 +900,23 @@ test('runAgentJob (docker): pipes envelope, captures output, reaps container', {
   // --rm removes the container on exit; the reaper is a backstop and must not error.
   const reap = reapAgentContainers('docker', { maxAgeMs: 0, liveRunIds: new Set() });
   assert.ok(typeof reap.reaped === 'number');
+});
+
+// Regression (issue: 409 "job cannot be failed" race). The broker activation
+// lock must strictly outlast the harness kill deadline, or a lapsed lock
+// re-activates the still-retryable job and the stale fail() is rejected 409.
+// deriveJobLockMs must therefore always return kill + a positive grace.
+test('deriveJobLockMs: lock strictly outlasts the harness kill deadline', () => {
+  assert.equal(deriveJobLockMs(300_000, 120_000), 420_000);
+  assert.ok(deriveJobLockMs(300_000, 120_000) > 300_000);
+  // Non-positive/invalid inputs are floored to sane positive defaults so the
+  // lock > kill invariant still holds (never lock == kill).
+  assert.ok(deriveJobLockMs(0, 0) > 5 * 60_000 - 1 && deriveJobLockMs(0, 0) > 0);
+  assert.ok(deriveJobLockMs(300_000, 0) > 300_000);
+  assert.ok(deriveJobLockMs(NaN, NaN) > 0);
+  for (const kill of [1_000, 60_000, 300_000, 900_000]) {
+    for (const grace of [1, 1_000, 120_000]) {
+      assert.ok(deriveJobLockMs(kill, grace) > kill, `lock must exceed kill for kill=${kill} grace=${grace}`);
+    }
+  }
 });

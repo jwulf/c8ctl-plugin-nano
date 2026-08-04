@@ -1478,6 +1478,20 @@ function parseJobTypeFlags(input) {
   return { jobTypes, errors };
 }
 
+/**
+ * The broker job-activation lock must strictly outlast the harness kill
+ * deadline: the worker has to report the outcome (complete/fail) before the lock
+ * lapses, or the broker re-activates the still-retryable job (a second agent
+ * starts) and the stale `fail` is rejected 409 "job cannot be failed in the
+ * current state". So lock = kill + grace. Non-positive inputs are floored to a
+ * minimal positive grace so the invariant lock > kill always holds.
+ */
+function deriveJobLockMs(jobTimeoutMs, lockGraceMs) {
+  const kill = Number.isFinite(jobTimeoutMs) && jobTimeoutMs > 0 ? jobTimeoutMs : 5 * 60_000;
+  const grace = Number.isFinite(lockGraceMs) && lockGraceMs > 0 ? lockGraceMs : 2 * 60_000;
+  return kill + grace;
+}
+
 /** A profile name must be a safe, filesystem/token-friendly slug. */
 function isValidProfileName(name) {
   return typeof name === 'string' && /^[a-z0-9][a-z0-9._-]*$/i.test(name);
@@ -2679,6 +2693,14 @@ async function workAgent(req, flags) {
   };
   const maxParallelJobs = intFlag(flags?.['max-parallel'], 1);
   const jobTimeoutMs = intFlag(flags?.['job-timeout'], 5 * 60_000);
+  // The broker's job-activation lock MUST outlast the harness kill deadline: the
+  // worker has to report the outcome (complete/fail) before the lock lapses,
+  // otherwise the broker re-activates the still-retryable job (a second agent
+  // starts) and the stale `fail` is rejected with a 409 "job cannot be failed in
+  // the current state". So lock = harness kill + grace. Raising --job-timeout
+  // alone does not help — it moves both coupled deadlines together.
+  const lockGraceMs = intFlag(flags?.['lock-grace'], 2 * 60_000);
+  const jobLockMs = deriveJobLockMs(jobTimeoutMs, lockGraceMs);
 
   // Sandbox: flag overrides the stored profile default. `none` runs on the host
   // (legacy); `docker`/`podman` run each job in a throwaway labelled container.
@@ -2786,7 +2808,7 @@ async function workAgent(req, flags) {
   if (profileEnvKeys.length > 0) logger.info(`  harness env: ${profileEnvKeys.join(', ')}`);
   const extraNote = extraJobTypes.length > 0 ? ` (${extraJobTypes.length} via --job-type)` : '';
   logger.info(`  listening on ${jobTypes.length} job type(s)${extraNote}: ${jobTypes.join('  ')}`);
-  logger.info(`  max parallel: ${maxParallelJobs}; job timeout: ${jobTimeoutMs}ms`);
+  logger.info(`  max parallel: ${maxParallelJobs}; job timeout: ${jobTimeoutMs}ms; activation lock: ${jobLockMs}ms`);
   logger.info('Polling for work — press Ctrl-C to stop.');
 
   const workers = jobTypes.map((jobType) =>
@@ -2794,7 +2816,7 @@ async function workAgent(req, flags) {
       jobType,
       workerName: `${name}:${jobType}`,
       maxParallelJobs,
-      jobTimeoutMs,
+      jobTimeoutMs: jobLockMs,
       jobHandler: async (job) => {
         logger.info(`[${jobType}] job ${job.jobKey} (instance ${job.processInstanceKey ?? '-'}) → ${buildAgentCommandLine(profile.command, effectiveArgs)}`);
 
@@ -4358,6 +4380,7 @@ export {
   normalizeStoredProfile,
   jobTypeMatrix,
   parseJobTypeFlags,
+  deriveJobLockMs,
   AGENT_TASK_NS,
   AGENT_RESULT_KEY,
   RESULT_SENTINEL,
@@ -4462,6 +4485,7 @@ export const commands = {
       list: { type: 'boolean', description: 'hire: list existing agent profiles instead of creating one' },
       'max-parallel': { type: 'string', description: 'work: max concurrent jobs per worker (default 1)' },
       'job-timeout': { type: 'string', description: 'work: max harness runtime per job in ms; the spawned process is killed past this (default 300000)' },
+      'lock-grace': { type: 'string', description: 'work: extra ms added to --job-timeout to derive the broker activation lock, so the worker reports before the lock lapses (default 120000)' },
       'job-type': { type: 'string', multiple: true, description: 'work: extra job type to service alongside the rank×capability matrix (repeatable)' },
     },
     handler: async (args, flags) => {
@@ -4606,7 +4630,7 @@ function printUsage() {
   console.log('  c8ctl nano config');
   console.log('  c8ctl nano update [--check]');
   console.log('  c8ctl nano hire [--name <n>] [--rank <r>] [--command <c>] [--arg <switch> ...] [--model <m>] [--capabilities <a,b>] [--sandbox none|docker|podman] [--image <ref>] [--env NAME=VALUE ...] [--list]');
-  console.log('  c8ctl nano work <profileName> [--arg <switch> ...] [--max-parallel <n>] [--job-timeout <ms>] [--job-type <token> ...] [--sandbox none|docker|podman] [--image <ref>] [--env NAME=VALUE ...] [--secret-resolver host] [--min-free-mb <n>] [--clone-timeout <ms>] [--keep-runs] [--stream]');
+  console.log('  c8ctl nano work <profileName> [--arg <switch> ...] [--max-parallel <n>] [--job-timeout <ms>] [--lock-grace <ms>] [--job-type <token> ...] [--sandbox none|docker|podman] [--image <ref>] [--env NAME=VALUE ...] [--secret-resolver host] [--min-free-mb <n>] [--clone-timeout <ms>] [--keep-runs] [--stream]');
   console.log('');
   console.log('Subcommands:');
   console.log('  start    Spawn an N-node local cluster wired to talk to each other on localhost');
@@ -4649,6 +4673,7 @@ function printUsage() {
   console.log('  --max-parallel <n>   work: max concurrent jobs per worker (default 1)');
   console.log('  --job-type <token>   work: extra job type to service alongside the rank×capability matrix (repeatable)');
   console.log('  --job-timeout <ms>   work: max harness runtime per job in ms (default 300000)');
+  console.log('  --lock-grace <ms>    work: extra ms over --job-timeout for the broker activation lock (default 120000)');
   console.log('  --secret-resolver <r> work: secret resolver for task secretRefs (host; default host)');
   console.log('  --reap-age <ms>      work: age before a finished agent container/workspace is reaped (default 3600000)');
   console.log('  --reap-interval <ms> work: how often to sweep finished agent containers/workspaces (default 300000)');

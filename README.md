@@ -207,6 +207,16 @@ the job with a decremented retry count, and a job that outlives `--job-timeout`
 is killed. Profiles are stored in the plugin's `config.json` (see `c8ctl nano
 config`).
 
+> **Activation lock vs. kill deadline.** `--job-timeout` is the harness *kill*
+> deadline. The broker's job-activation lock is derived as `--job-timeout +
+> --lock-grace` (grace defaults to `120000`ms) so it strictly outlasts the kill:
+> the worker always reports the outcome (complete/fail) before the lock lapses.
+> Without that gap a lock expiring exactly as the harness dies lets the broker
+> re-activate the still-retryable job (a second agent starts) and the stale
+> `fail` is rejected with a 409 "job cannot be failed in the current state".
+> Raising `--job-timeout` alone does **not** fix this — it moves both coupled
+> deadlines together; widen `--lock-grace` (or keep the default) instead.
+
 > **Trust boundary.** The profile `command` is run through a shell so you can
 > write a full invocation (args, pipes, multi-word commands). It is
 > **operator-authored** — only what you put in your own `config.json` is

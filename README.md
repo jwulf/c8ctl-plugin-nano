@@ -217,6 +217,16 @@ config`).
 > Raising `--job-timeout` alone does **not** fix this — it moves both coupled
 > deadlines together; widen `--lock-grace` (or keep the default) instead.
 
+> **Long-poll window.** `--poll-timeout` (default `30000`ms) is how long the
+> broker holds each `activateJobs` request open waiting for work before returning
+> empty. A longer window keeps an idle worker on **one** connection for that whole
+> window instead of reconnecting every few seconds — cutting the number of
+> connection establishments, and thus the chances of hitting a transient connect
+> error (`ECONNREFUSED` / connect-timeout) on a flaky link. It maps straight to
+> the SDK's `pollTimeoutMs` → the broker's `requestTimeout`: `0` selects the
+> broker's own default (~5s) and a negative value returns immediately when no job
+> is available.
+
 > **Trust boundary.** The profile `command` is run through a shell so you can
 > write a full invocation (args, pipes, multi-word commands). It is
 > **operator-authored** — only what you put in your own `config.json` is

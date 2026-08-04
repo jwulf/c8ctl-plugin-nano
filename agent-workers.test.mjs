@@ -26,6 +26,7 @@ import {
   parseEnvPairs,
   parseJobTypeFlags,
   deriveJobLockMs,
+  derivePollTimeoutMs,
   normalizeEnvMap,
   normalizeArgList,
   shQuote,
@@ -945,4 +946,28 @@ test('deriveJobLockMs: lock strictly outlasts the harness kill deadline', () => 
       assert.ok(lock(kill, grace) > kill, `lock must exceed kill for kill=${kill} grace=${grace}`);
     }
   }
+});
+
+// derivePollTimeoutMs resolves the broker long-poll window passed to the SDK as
+// pollTimeoutMs. Only absent/blank/non-numeric input falls back to the 30s
+// default; 0 (broker default) and negative (immediate return) are honoured — the
+// whole point of a dedicated helper rather than reusing intFlag's ">0" guard.
+test('derivePollTimeoutMs: defaults to 30s but honours 0 and negative', () => {
+  // Absent / blank / non-numeric → default.
+  assert.equal(derivePollTimeoutMs(undefined), 30_000);
+  assert.equal(derivePollTimeoutMs(null), 30_000);
+  assert.equal(derivePollTimeoutMs(''), 30_000);
+  assert.equal(derivePollTimeoutMs('   '), 30_000);
+  assert.equal(derivePollTimeoutMs('abc'), 30_000);
+  // Custom default is respected.
+  assert.equal(derivePollTimeoutMs(undefined, 5_000), 5_000);
+  // Explicit positive window (string, as flags arrive from the CLI).
+  assert.equal(derivePollTimeoutMs('60000'), 60_000);
+  assert.equal(derivePollTimeoutMs(45_000), 45_000);
+  // 0 = broker default, negative = immediate — must pass through, NOT be floored.
+  assert.equal(derivePollTimeoutMs('0'), 0);
+  assert.equal(derivePollTimeoutMs('-1'), -1);
+  assert.equal(derivePollTimeoutMs('-5000'), -5_000);
+  // Leading numeric with trailing junk parses like parseInt (best-effort).
+  assert.equal(derivePollTimeoutMs('30000ms'), 30_000);
 });

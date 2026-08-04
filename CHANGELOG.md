@@ -1,3 +1,10 @@
+## [1.18.1](https://github.com/jwulf/c8ctl-plugin-nano/compare/v1.18.0...v1.18.1) (2026-08-04)
+
+
+### Bug Fixes
+
+* **work:** decouple broker activation lock from harness terminate deadline ([#24](https://github.com/jwulf/c8ctl-plugin-nano/issues/24)) ([8618cdf](https://github.com/jwulf/c8ctl-plugin-nano/commit/8618cdf21d0351c967e6261703e4a87b3c5dc60c))
+
 # [1.18.0](https://github.com/jwulf/c8ctl-plugin-nano/compare/v1.17.0...v1.18.0) (2026-08-03)
 
 

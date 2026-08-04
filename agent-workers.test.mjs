@@ -905,28 +905,44 @@ test('runAgentJob (docker): pipes envelope, captures output, reaps container', {
 // Regression (issue: 409 "job cannot be failed" race). The broker activation
 // lock must strictly outlast the harness kill deadline, or a lapsed lock
 // re-activates the still-retryable job and the stale fail() is rejected 409.
-// deriveJobLockMs must therefore always return kill + a positive grace.
+// deriveJobLockMs is the single source of truth for BOTH deadlines: it returns
+// the clamped harness kill deadline (killMs) the caller must enforce and the
+// broker lock (lockMs), with lockMs > killMs always. The caller must use killMs
+// (not the raw --job-timeout), or a huge raw input outlives the lock.
 test('deriveJobLockMs: lock strictly outlasts the harness kill deadline', () => {
-  assert.equal(deriveJobLockMs(300_000, 120_000), 420_000);
-  assert.ok(deriveJobLockMs(300_000, 120_000) > 300_000);
+  const lock = (kill, grace) => deriveJobLockMs(kill, grace).lockMs;
+  assert.deepEqual(deriveJobLockMs(300_000, 120_000), { killMs: 300_000, lockMs: 420_000 });
+  assert.ok(lock(300_000, 120_000) > 300_000);
   // Non-positive/invalid inputs are floored to sane positive defaults so the
   // lock > kill invariant still holds (never lock == kill).
-  assert.ok(deriveJobLockMs(0, 0) > 5 * 60_000 - 1 && deriveJobLockMs(0, 0) > 0);
-  assert.ok(deriveJobLockMs(300_000, 0) > 300_000);
-  assert.ok(deriveJobLockMs(NaN, NaN) > 0);
+  assert.ok(lock(0, 0) > 5 * 60_000 - 1 && lock(0, 0) > 0);
+  assert.ok(lock(300_000, 0) > 300_000);
+  assert.ok(lock(NaN, NaN) > 0);
   // Very large (non-safe) integer inputs must not round `kill + grace` back
   // down to `kill`; the invariant must still hold strictly.
-  assert.ok(deriveJobLockMs(Number.MAX_SAFE_INTEGER, 120_000) > Number.MAX_SAFE_INTEGER - 120_000);
-  assert.ok(Number.isSafeInteger(deriveJobLockMs(2 ** 53, 2 ** 53)));
-  assert.ok(Number.isSafeInteger(deriveJobLockMs(2 ** 60, 2 ** 60)));
+  assert.ok(lock(Number.MAX_SAFE_INTEGER, 120_000) > Number.MAX_SAFE_INTEGER - 120_000);
+  assert.ok(Number.isSafeInteger(lock(2 ** 53, 2 ** 53)));
+  assert.ok(Number.isSafeInteger(lock(2 ** 60, 2 ** 60)));
   // Fractional-positive and MAX-grace inputs must still yield a positive,
   // safe-integer lock that strictly exceeds the (positive) internal kill.
-  assert.ok(Number.isSafeInteger(deriveJobLockMs(0.5, 0.5)) && deriveJobLockMs(0.5, 0.5) > 0);
-  assert.ok(Number.isSafeInteger(deriveJobLockMs(300_000, Number.MAX_SAFE_INTEGER)));
-  assert.ok(deriveJobLockMs(300_000, Number.MAX_SAFE_INTEGER) > Number.MAX_SAFE_INTEGER - 1);
+  assert.ok(Number.isSafeInteger(lock(0.5, 0.5)) && lock(0.5, 0.5) > 0);
+  assert.ok(Number.isSafeInteger(lock(300_000, Number.MAX_SAFE_INTEGER)));
+  assert.ok(lock(300_000, Number.MAX_SAFE_INTEGER) > Number.MAX_SAFE_INTEGER - 1);
+  // The RETURNED killMs (the deadline the harness enforces) must always be a
+  // safe positive integer strictly below lockMs — including huge/at-cap inputs
+  // where the raw --job-timeout would otherwise reach or exceed the lock.
+  for (const [kill, grace] of [
+    [300_000, 120_000], [0, 0], [NaN, NaN], [0.5, 0.5],
+    [Number.MAX_SAFE_INTEGER, 120_000], [Number.MAX_SAFE_INTEGER, Number.MAX_SAFE_INTEGER],
+    [2 ** 60, 2 ** 60], [300_000, Number.MAX_SAFE_INTEGER],
+  ]) {
+    const { killMs, lockMs } = deriveJobLockMs(kill, grace);
+    assert.ok(Number.isSafeInteger(killMs) && killMs > 0, `killMs safe positive for kill=${kill} grace=${grace}`);
+    assert.ok(Number.isSafeInteger(lockMs) && lockMs > killMs, `lockMs > killMs for kill=${kill} grace=${grace}`);
+  }
   for (const kill of [1_000, 60_000, 300_000, 900_000]) {
     for (const grace of [1, 1_000, 120_000]) {
-      assert.ok(deriveJobLockMs(kill, grace) > kill, `lock must exceed kill for kill=${kill} grace=${grace}`);
+      assert.ok(lock(kill, grace) > kill, `lock must exceed kill for kill=${kill} grace=${grace}`);
     }
   }
 });

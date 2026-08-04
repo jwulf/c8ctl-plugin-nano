@@ -1490,6 +1490,15 @@ function parseJobTypeFlags(input) {
  * the safe-integer range, so the invariant lock > kill holds strictly for every
  * accepted input — including values at or beyond 2^53 where float addition
  * would otherwise round `kill + grace` back down to `kill`.
+ *
+ * Returns BOTH derived deadlines from this single computation so the caller
+ * never re-derives (and drifts): `killMs` is the *clamped* harness kill deadline
+ * the caller must actually enforce, and `lockMs` is the broker activation lock.
+ * The caller must use `killMs` — not the raw input — for the harness timeout, or
+ * the lock > kill invariant breaks for large inputs (the raw input can exceed
+ * the clamped `killMs`, and thus reach or exceed `lockMs`).
+ *
+ * @returns {{ killMs: number, lockMs: number }}
  */
 function deriveJobLockMs(jobTimeoutMs, lockGraceMs) {
   const MAX = Number.MAX_SAFE_INTEGER;
@@ -1505,8 +1514,8 @@ function deriveJobLockMs(jobTimeoutMs, lockGraceMs) {
   // Cap kill so kill + grace stays a safe integer and floor it at 1 so the
   // internal kill is always positive; the sum is then exact and strictly
   // greater than kill (never equal to it via float rounding).
-  const kill = Math.max(1, Math.min(toSafeMs(jobTimeoutMs, 5 * 60_000), MAX - grace));
-  return kill + grace;
+  const killMs = Math.max(1, Math.min(toSafeMs(jobTimeoutMs, 5 * 60_000), MAX - grace));
+  return { killMs, lockMs: killMs + grace };
 }
 
 /** A profile name must be a safe, filesystem/token-friendly slug. */
@@ -2717,7 +2726,10 @@ async function workAgent(req, flags) {
   // the current state". So lock = harness kill + grace. Raising --job-timeout
   // alone does not help — it moves both coupled deadlines together.
   const lockGraceMs = intFlag(flags?.['lock-grace'], 2 * 60_000);
-  const jobLockMs = deriveJobLockMs(jobTimeoutMs, lockGraceMs);
+  // deriveJobLockMs is the single source of truth for both deadlines: the harness
+  // MUST enforce the clamped `jobKillMs` (not the raw --job-timeout), or a very
+  // large --job-timeout would outlive the broker lock and re-break the invariant.
+  const { killMs: jobKillMs, lockMs: jobLockMs } = deriveJobLockMs(jobTimeoutMs, lockGraceMs);
 
   // Sandbox: flag overrides the stored profile default. `none` runs on the host
   // (legacy); `docker`/`podman` run each job in a throwaway labelled container.
@@ -2825,7 +2837,7 @@ async function workAgent(req, flags) {
   if (profileEnvKeys.length > 0) logger.info(`  harness env: ${profileEnvKeys.join(', ')}`);
   const extraNote = extraJobTypes.length > 0 ? ` (${extraJobTypes.length} via --job-type)` : '';
   logger.info(`  listening on ${jobTypes.length} job type(s)${extraNote}: ${jobTypes.join('  ')}`);
-  logger.info(`  max parallel: ${maxParallelJobs}; job timeout: ${jobTimeoutMs}ms; activation lock: ${jobLockMs}ms`);
+  logger.info(`  max parallel: ${maxParallelJobs}; job timeout: ${jobKillMs}ms; activation lock: ${jobLockMs}ms`);
   logger.info('Polling for work — press Ctrl-C to stop.');
 
   const workers = jobTypes.map((jobType) =>
@@ -2916,7 +2928,7 @@ async function workAgent(req, flags) {
           } catch { resultDir = null; resultFile = null; }
 
           result = await runAgentJob(profile, job, {
-            timeoutMs: jobTimeoutMs,
+            timeoutMs: jobKillMs,
             envelope,
             sandbox,
             image,

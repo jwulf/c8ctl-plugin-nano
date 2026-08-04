@@ -1529,9 +1529,11 @@ function deriveJobLockMs(jobTimeoutMs, lockGraceMs) {
  * The value is passed straight through to the SDK as `pollTimeoutMs` → the
  * broker's `requestTimeout`, so the documented broker semantics apply: `0` =
  * broker default (~5s), a negative value = return immediately when no job is
- * available. Only an absent/blank/non-numeric flag falls back to the default;
- * `0` and negatives are honoured (which is why this cannot reuse `intFlag`,
- * whose "> 0" guard would floor them to the default).
+ * available. Parsing is `parseInt`-style: only a flag with no leading integer
+ * (absent, blank, or non-numeric such as `"abc"`) falls back to the default,
+ * while a leading integer with trailing junk (e.g. `"30000ms"`) is honoured as
+ * that integer. `0` and negatives are honoured too (which is why this cannot
+ * reuse `intFlag`, whose "> 0" guard would floor them to the default).
  *
  * @returns {number}
  */

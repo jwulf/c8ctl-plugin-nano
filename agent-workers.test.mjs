@@ -949,9 +949,11 @@ test('deriveJobLockMs: lock strictly outlasts the harness kill deadline', () => 
 });
 
 // derivePollTimeoutMs resolves the broker long-poll window passed to the SDK as
-// pollTimeoutMs. Only absent/blank/non-numeric input falls back to the 30s
-// default; 0 (broker default) and negative (immediate return) are honoured — the
-// whole point of a dedicated helper rather than reusing intFlag's ">0" guard.
+// pollTimeoutMs. Parsing is parseInt-style: only input with no leading integer
+// (absent/blank/non-numeric such as 'abc') falls back to the 30s default, while
+// a leading integer with trailing junk (e.g. '30000ms') is honoured; 0 (broker
+// default) and negative (immediate return) also pass through — the whole point
+// of a dedicated helper rather than reusing intFlag's ">0" guard.
 test('derivePollTimeoutMs: defaults to 30s but honours 0 and negative', () => {
   // Absent / blank / non-numeric → default.
   assert.equal(derivePollTimeoutMs(undefined), 30_000);

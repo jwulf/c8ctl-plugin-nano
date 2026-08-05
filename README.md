@@ -24,7 +24,7 @@ It adds a single `nano` command:
 
 ```bash
 c8ctl nano start|status|stop|restart|logs|pause|resume|clean|set|config|update
-c8ctl nano hire|assign|work   # turn a CLI agent harness into a Nano job worker
+c8ctl nano hire|assign|work   # hire/assign manage agent profiles; work runs one as a Nano job worker
 ```
 
 `nano start N` spawns **N** nanobpmn node processes wired to talk to each other

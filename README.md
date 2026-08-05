@@ -24,7 +24,7 @@ It adds a single `nano` command:
 
 ```bash
 c8ctl nano start|status|stop|restart|logs|pause|resume|clean|set|config|update
-c8ctl nano hire|work   # turn a CLI agent harness into a Nano job worker
+c8ctl nano hire|assign|work   # turn a CLI agent harness into a Nano job worker
 ```
 
 `nano start N` spawns **N** nanobpmn node processes wired to talk to each other
@@ -156,6 +156,24 @@ c8ctl nano hire --name coder --rank senior --command copilot --arg --allow-all
 # List profiles
 c8ctl nano hire --list
 ```
+
+**`assign <name> [capabilities...]`** grants new capabilities (roles) to an
+existing hire without re-running `hire`. Capabilities are **added** to (unioned
+with) the profile's current set — `assign` never removes a role — and the
+updated job-type matrix is printed. Restart the profile's workers so they pick
+up the new job types:
+
+```bash
+# Give an existing reviewer two more capabilities
+c8ctl nano assign reviewer triage refactoring
+
+# --capabilities works too (comma-separated), equivalent to the positionals above
+c8ctl nano assign reviewer --capabilities triage,refactoring
+
+# then restart its workers to service the new job types
+c8ctl nano work reviewer
+```
+
 
 **`work <name>`** loads the profile, connects with the c8ctl SDK client, and
 registers one job worker per token in the **rank × capability matrix**, then

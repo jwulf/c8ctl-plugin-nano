@@ -34,6 +34,7 @@ import {
   reapAgentContainers,
   diskBudgetOk,
   normalizeStoredProfile,
+  applyAssign,
   containerEngineAvailable,
   runAgentJob,
   provisionRepo,
@@ -972,4 +973,42 @@ test('derivePollTimeoutMs: defaults to 30s but honours 0 and negative', () => {
   assert.equal(derivePollTimeoutMs('-5000'), -5_000);
   // Leading numeric with trailing junk parses like parseInt (best-effort).
   assert.equal(derivePollTimeoutMs('30000ms'), 30_000);
+});
+
+test('applyAssign unions new capabilities into an existing profile (canonical, additive)', () => {
+  const base = {
+    name: 'reviewer',
+    rank: 'senior',
+    command: 'copilot',
+    model: '',
+    capabilities: ['code-review', 'testing'],
+    sandbox: 'none',
+    image: '',
+    env: {},
+    createdAt: '2026-01-01T00:00:00.000Z',
+  };
+  const { profile, added } = applyAssign(base, 'triage, Refactoring', '2026-02-02T00:00:00.000Z');
+  // Union, deduped, lowercased, sorted.
+  assert.deepEqual(profile.capabilities, ['code-review', 'refactoring', 'testing', 'triage']);
+  // Only the genuinely new roles are reported.
+  assert.deepEqual(added, ['refactoring', 'triage']);
+  // Existing fields (incl. createdAt) preserved; updatedAt refreshed.
+  assert.equal(profile.createdAt, '2026-01-01T00:00:00.000Z');
+  assert.equal(profile.updatedAt, '2026-02-02T00:00:00.000Z');
+  assert.equal(profile.rank, 'senior');
+  assert.equal(profile.command, 'copilot');
+});
+
+test('applyAssign is idempotent: assigning existing capabilities is a no-op (added is empty)', () => {
+  const base = { name: 'r', rank: 'senior', command: 'copilot', capabilities: ['code-review', 'testing'] };
+  const { profile, added } = applyAssign(base, ['testing', 'code-review']);
+  assert.deepEqual(added, []);
+  assert.deepEqual(profile.capabilities, ['code-review', 'testing']);
+});
+
+test('applyAssign accepts an array of capabilities and adds to an empty set', () => {
+  const base = { name: 'r', rank: 'junior', command: 'copilot', capabilities: [] };
+  const { profile, added } = applyAssign(base, ['docs']);
+  assert.deepEqual(profile.capabilities, ['docs']);
+  assert.deepEqual(added, ['docs']);
 });

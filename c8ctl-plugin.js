@@ -4635,7 +4635,7 @@ export const commands = {
       workspace: { type: 'boolean', description: 'clean: also delete the workspace (models + workers)' },
       check: { type: 'boolean', description: 'update: only report whether a new release is available; do not install' },
       binary: { type: 'string', description: 'Path to the nanobpmn server binary' },
-      name: { type: 'string', description: 'hire/work: agent profile name (alt to positional arg)' },
+      name: { type: 'string', description: 'hire/work/assign: agent profile name (alt to positional arg)' },
       rank: { type: 'string', description: 'hire: agent rank (principal|senior|junior|decider)' },
       command: { type: 'string', description: 'hire: CLI command that runs the agent harness (e.g. copilot, claude, pi)' },
       arg: { type: 'string', multiple: true, description: 'hire/work: command-line switch/arg appended to the harness command (repeatable), e.g. --arg --allow-all. Persisted on hire; work appends more.' },
@@ -4836,7 +4836,7 @@ function printUsage() {
   console.log('  --purge              stop: also delete per-node engine data');
   console.log('  --force              start: stop any existing cluster first');
   console.log('  --workspace          clean: also delete the workspace (models + workers)');
-  console.log('  --name <n>           hire/work: agent profile name (alt to positional arg)');
+  console.log('  --name <n>           hire/work/assign: agent profile name (alt to positional arg)');
   console.log('  --rank <r>           hire: agent rank (principal|senior|junior|decider)');
   console.log('  --command <c>        hire: CLI command that runs the agent harness');
   console.log('  --model <m>          hire: model name passed to the harness (AGENT_MODEL)');

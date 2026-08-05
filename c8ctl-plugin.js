@@ -2123,8 +2123,21 @@ function normalizeTaskEnvelope(customHeaders, variables) {
   };
 
   const task = isPlainObject(raw.task) ? raw.task : {};
+  // Base prompt: the reserved `task.prompt` (typically a model header filled at deploy time),
+  // else a plain `prompt`/`task` job variable (the pre-header delivery path).
+  const basePrompt = str(task.prompt) ?? str(variables?.prompt) ?? str(variables?.task);
+  // Verbatim dynamic append: a header-delivered base prompt can't be composed in FEEL, so a task
+  // may supply per-instance context (e.g. plan-revision feedback, a per-task brief) via the
+  // reserved `task.appendPrompt`, or a plain `appendPrompt` variable. It is concatenated onto the
+  // base with NO injected separator — the caller (the model's ioMapping) owns any leading
+  // separator/preamble — so a null/empty append leaves the base prompt untouched.
+  const appendPrompt = str(task.appendPrompt) ?? str(variables?.appendPrompt);
+  const prompt =
+    appendPrompt != null && appendPrompt !== ""
+      ? `${basePrompt ?? ""}${appendPrompt}`
+      : basePrompt;
   env.task = {
-    prompt: str(task.prompt) ?? str(variables?.prompt) ?? str(variables?.task),
+    prompt,
     promptFile: str(task.promptFile),
     maxIterations: coerceInt(task.maxIterations, undefined),
     timeoutMs: coerceInt(task.timeoutMs, undefined),

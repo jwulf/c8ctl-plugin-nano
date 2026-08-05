@@ -1640,16 +1640,34 @@ function applyAssign(existing, incoming, now = new Date().toISOString()) {
 }
 
 /**
+ * Resolve the profile name and the raw comma-joined capability string for an
+ * `assign` invocation from parsed positionals + flags. Pure (no I/O) so the
+ * positional-slicing rules are unit-testable.
+ *
+ * When `--name` is supplied the name does NOT consume a positional, so every
+ * positional is a capability. Otherwise the first positional is the name and
+ * the rest are capabilities. `--capabilities a,b` is always appended.
+ */
+function resolveAssignInputs(req, flags) {
+  const positional = Array.isArray(req?.positional) ? req.positional : [];
+  const name = flags?.name ? String(flags.name).trim() : positional[0];
+  const positionalCaps = flags?.name ? positional : positional.slice(1);
+  const flagCaps = flags?.capabilities !== undefined ? String(flags.capabilities) : '';
+  const incomingRaw = [...positionalCaps, flagCaps].filter(Boolean).join(',');
+  return { name, incomingRaw };
+}
+
+/**
  * assign — grant new capabilities (roles) to an existing hire without
- * re-running `hire`. The profile name is positional[0]; capabilities are the
- * remaining positionals and/or `--capabilities a,b`. Capabilities are unioned
- * with the profile's existing set (additive; assign never removes a role) and
- * the updated rank×capability job-type matrix is printed. Re-run `work` to pick
- * up the new job types.
+ * re-running `hire`. The profile name is positional[0] (or `--name`);
+ * capabilities are the remaining positionals and/or `--capabilities a,b`.
+ * Capabilities are unioned with the profile's existing set (additive; assign
+ * never removes a role) and the updated rank×capability job-type matrix is
+ * printed. Re-run `work` to pick up the new job types.
  */
 async function assignCapabilities(req, flags) {
   const logger = getLogger();
-  const name = flags?.name ? String(flags.name).trim() : req.positional[0];
+  const { name, incomingRaw } = resolveAssignInputs(req, flags);
   if (!name) {
     logger.error('Usage: c8ctl nano assign <profileName> <capability> [<capability> ...]');
     logger.info('Grant new capabilities to an existing hire. List profiles with: c8ctl nano hire --list');
@@ -1660,10 +1678,6 @@ async function assignCapabilities(req, flags) {
     process.exit(1);
   }
 
-  // Capabilities come from positional args after the name and/or --capabilities.
-  const positionalCaps = req.positional.slice(1);
-  const flagCaps = flags?.capabilities !== undefined ? String(flags.capabilities) : '';
-  const incomingRaw = [...positionalCaps, flagCaps].filter(Boolean).join(',');
   if (normalizeCapabilities(incomingRaw).length === 0) {
     logger.error('Provide at least one capability to assign.');
     logger.info(`Example: c8ctl nano assign ${name} code-review testing`);
@@ -4518,6 +4532,7 @@ export {
   ProvisionError,
   normalizeStoredProfile,
   applyAssign,
+  resolveAssignInputs,
   jobTypeMatrix,
   parseJobTypeFlags,
   deriveJobLockMs,

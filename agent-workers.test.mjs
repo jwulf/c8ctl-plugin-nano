@@ -35,6 +35,7 @@ import {
   diskBudgetOk,
   normalizeStoredProfile,
   applyAssign,
+  resolveAssignInputs,
   containerEngineAvailable,
   runAgentJob,
   provisionRepo,
@@ -1011,4 +1012,40 @@ test('applyAssign accepts an array of capabilities and adds to an empty set', ()
   const { profile, added } = applyAssign(base, ['docs']);
   assert.deepEqual(profile.capabilities, ['docs']);
   assert.deepEqual(added, ['docs']);
+});
+
+test('resolveAssignInputs: positional name — first positional is the name, rest are capabilities', () => {
+  const { name, incomingRaw } = resolveAssignInputs(
+    { positional: ['reviewer', 'triage', 'refactoring'] },
+    {},
+  );
+  assert.equal(name, 'reviewer');
+  assert.equal(incomingRaw, 'triage,refactoring');
+});
+
+test('resolveAssignInputs: --name — every positional is a capability (no first-cap drop)', () => {
+  const { name, incomingRaw } = resolveAssignInputs(
+    { positional: ['triage', 'refactoring'] },
+    { name: 'reviewer' },
+  );
+  assert.equal(name, 'reviewer');
+  assert.equal(incomingRaw, 'triage,refactoring');
+});
+
+test('resolveAssignInputs: --name with --capabilities and positionals are all unioned', () => {
+  const { name, incomingRaw } = resolveAssignInputs(
+    { positional: ['triage'] },
+    { name: 'reviewer', capabilities: 'docs,testing' },
+  );
+  assert.equal(name, 'reviewer');
+  assert.equal(incomingRaw, 'triage,docs,testing');
+});
+
+test('resolveAssignInputs: positional name with only --capabilities (no capability positionals)', () => {
+  const { name, incomingRaw } = resolveAssignInputs(
+    { positional: ['reviewer'] },
+    { capabilities: 'docs' },
+  );
+  assert.equal(name, 'reviewer');
+  assert.equal(incomingRaw, 'docs');
 });

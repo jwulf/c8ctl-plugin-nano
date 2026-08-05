@@ -1669,7 +1669,7 @@ async function assignCapabilities(req, flags) {
   const logger = getLogger();
   const { name, incomingRaw } = resolveAssignInputs(req, flags);
   if (!name) {
-    logger.error('Usage: c8ctl nano assign <profileName> <capability> [<capability> ...]');
+    logger.error('Usage: c8ctl nano assign <profileName> [<capability> ...] [--name <n>] [--capabilities <a,b>]');
     logger.info('Grant new capabilities to an existing hire. List profiles with: c8ctl nano hire --list');
     process.exit(1);
   }
@@ -2133,8 +2133,8 @@ function normalizeTaskEnvelope(customHeaders, variables) {
   // separator/preamble — so a null/empty append leaves the base prompt untouched.
   const appendPrompt = str(task.appendPrompt) ?? str(variables?.appendPrompt);
   const prompt =
-    appendPrompt != null && appendPrompt !== ""
-      ? `${basePrompt ?? ""}${appendPrompt}`
+    appendPrompt != null && appendPrompt !== ''
+      ? `${basePrompt ?? ''}${appendPrompt}`
       : basePrompt;
   env.task = {
     prompt,
@@ -4803,7 +4803,7 @@ function printUsage() {
   console.log('  c8ctl nano config');
   console.log('  c8ctl nano update [--check]');
   console.log('  c8ctl nano hire [--name <n>] [--rank <r>] [--command <c>] [--arg <switch> ...] [--model <m>] [--capabilities <a,b>] [--sandbox none|docker|podman] [--image <ref>] [--env NAME=VALUE ...] [--list]');
-  console.log('  c8ctl nano assign <profileName> [<capability> ...] [--capabilities <a,b>]');
+  console.log('  c8ctl nano assign <profileName> [<capability> ...] [--name <n>] [--capabilities <a,b>]');
   console.log('  c8ctl nano work <profileName> [--arg <switch> ...] [--max-parallel <n>] [--job-timeout <ms>] [--lock-grace <ms>] [--poll-timeout <ms>] [--job-type <token> ...] [--sandbox none|docker|podman] [--image <ref>] [--env NAME=VALUE ...] [--secret-resolver host] [--min-free-mb <n>] [--clone-timeout <ms>] [--keep-runs] [--stream]');
   console.log('');
   console.log('Subcommands:');

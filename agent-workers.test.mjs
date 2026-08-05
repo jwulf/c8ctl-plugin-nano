@@ -110,6 +110,34 @@ test('normalizeTaskEnvelope: variables override headers, coercion applied', () =
   assert.equal(env.task.prompt, 'do the thing');
 });
 
+test('normalizeTaskEnvelope: appendPrompt (reserved) is concatenated verbatim onto the header base', () => {
+  const headers = { [`${AGENT_TASK_NS}.task.prompt`]: 'BASE PROMPT' };
+  const variables = { [`${AGENT_TASK_NS}.task.appendPrompt`]: '\n\n---\n\nEXTRA' };
+  const env = normalizeTaskEnvelope(headers, variables);
+  assert.equal(env.task.prompt, 'BASE PROMPT\n\n---\n\nEXTRA');
+});
+
+test('normalizeTaskEnvelope: a plain appendPrompt variable also appends (no injected separator)', () => {
+  const env = normalizeTaskEnvelope(
+    { [`${AGENT_TASK_NS}.task.prompt`]: 'BASE' },
+    { appendPrompt: 'SUFFIX' },
+  );
+  // Verbatim concat — the model owns any separator, so none is inserted by the harness.
+  assert.equal(env.task.prompt, 'BASESUFFIX');
+});
+
+test('normalizeTaskEnvelope: a null/empty appendPrompt leaves the base prompt untouched', () => {
+  const base = { [`${AGENT_TASK_NS}.task.prompt`]: 'BASE' };
+  assert.equal(normalizeTaskEnvelope(base, { appendPrompt: null }).task.prompt, 'BASE');
+  assert.equal(normalizeTaskEnvelope(base, { appendPrompt: '' }).task.prompt, 'BASE');
+  assert.equal(normalizeTaskEnvelope(base, {}).task.prompt, 'BASE');
+});
+
+test('normalizeTaskEnvelope: appendPrompt also composes onto a base delivered as a plain prompt var', () => {
+  const env = normalizeTaskEnvelope({}, { prompt: 'BASE', appendPrompt: '+MORE' });
+  assert.equal(env.task.prompt, 'BASE+MORE');
+});
+
 test('normalizeTaskEnvelope: no repository when url absent', () => {
   const env = normalizeTaskEnvelope({}, {});
   assert.equal(env.repository, undefined);

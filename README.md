@@ -274,6 +274,16 @@ Element templates emit flat dotpath header keys (strings); the plugin expands
 them into a nested object and coerces `"true"/"false"` → bool and numeric
 strings → int. The normalized shape is
 `{ schemaVersion, repository{provider,url,ref,depth,submodules,authRef}, branch{base,create,push}, setup{commands,env,secretRefs}, task{prompt,promptFile,maxIterations,timeoutMs,allowPr,prBase} }`.
+
+**Prompt = base + optional verbatim append.** The agent's prompt resolves to
+`task.prompt` (typically a model header filled at deploy time), falling back to a
+plain `prompt`/`task` variable. Because a header-delivered base prompt can't be
+composed in FEEL, a task may supply per-instance context via **`task.appendPrompt`**
+(reserved) or a plain **`appendPrompt`** variable — it is concatenated onto the base
+**verbatim, with no injected separator** (the model's ioMapping owns any leading
+separator/preamble), so a null/empty append leaves the base untouched. This lets the
+static prompt live in a model header/side-car while the dynamic tail (e.g. plan-revision
+feedback, a per-task brief) is built per instance.
 On completion the plugin writes an **output envelope** back under
 `io.nanobpm.agentResult` (`{schemaVersion, status, sandbox, image, output, truncated, stderrTruncated, exitCode, signal, error}`). When a repository was
 provisioned (below) it also carries `{repository, branch, baseSha, headSha, commits[], pushed, pushError?, gitError?, pr?}`.

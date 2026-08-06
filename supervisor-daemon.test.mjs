@@ -94,6 +94,21 @@ test('supervisor daemon: start → add → status → remove → stop', async (t
   assert.equal(bad.ok, false);
   assert.match(bad.error, /no hire/);
 
+  // `--name` is rejected: it would run a different hire than the reported
+  // profile, desynchronising status/logs from what actually runs.
+  const named = await mod.supervisorRequest({ op: 'add', profile: 'faker', args: ['--name', 'someone-else'] });
+  assert.equal(named.ok, false);
+  assert.match(named.error, /--name is not allowed/);
+  const nameShort = await mod.supervisorRequest({ op: 'add', profile: 'faker', args: ['-n', 'someone-else'] });
+  assert.equal(nameShort.ok, false);
+  assert.match(nameShort.error, /--name is not allowed/);
+
+  // The persisted state file records worker argv — it must be owner-only.
+  if (process.platform !== 'win32') {
+    const stMode = statSync(mod.getSupervisorStateFile()).mode & 0o777;
+    assert.equal(stMode, 0o600, `supervisor state file should be 0600, got ${stMode.toString(8)}`);
+  }
+
   // Remove the worker.
   const removed = await mod.supervisorRequest({ op: 'remove', target: 'faker' });
   assert.equal(removed.ok, true);

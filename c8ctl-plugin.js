@@ -3244,22 +3244,30 @@ async function workAgent(req, flags) {
     return { jobTypes: [...new Set([...m, ...extraJobTypes])] };
   };
 
-  const reconcile = async () => {
-    if (draining || reconciling) {
+  const reconcile = () => {
+    if (draining) return inFlightReconcile || Promise.resolve();
+    if (reconciling) {
       // A change landed mid-reconcile — remember it so the current pass loops
       // once more rather than leaving the worker set stale until the next edit.
-      if (reconciling && !draining) reconcileRequested = true;
-      return;
+      // Return the ACTUAL in-flight promise (not a fresh short-lived one) so a
+      // caller — including shutdown — waits for the real reconcile to finish.
+      reconcileRequested = true;
+      return inFlightReconcile || Promise.resolve();
     }
     reconciling = true;
-    try {
-      do {
-        reconcileRequested = false;
-        await runReconcilePass();
-      } while (reconcileRequested && !draining);
-    } finally {
-      reconciling = false;
-    }
+    reconcileRequested = false;
+    inFlightReconcile = (async () => {
+      try {
+        do {
+          reconcileRequested = false;
+          await runReconcilePass();
+        } while (reconcileRequested && !draining);
+      } finally {
+        reconciling = false;
+        inFlightReconcile = null;
+      }
+    })();
+    return inFlightReconcile;
   };
 
   const runReconcilePass = async () => {
@@ -3282,13 +3290,16 @@ async function workAgent(req, flags) {
       await Promise.all(
         removed.map(async (jt) => {
           const w = workers.get(jt);
-          workers.delete(jt);
           logger.info(`  - draining ${jt} …`);
           const ok = await drainWorker(w);
           if (ok) {
+            // Only drop it from the registry once it has actually stopped, so a
+            // failed drain stays tracked and gets retried on the next reconcile
+            // pass (or on shutdown) instead of leaking an untracked poller.
+            workers.delete(jt);
             logger.info(`  - stopped ${jt}`);
           } else {
-            logger.warn(`  - ${jt} did not stop cleanly; some connections may still be open.`);
+            logger.warn(`  - ${jt} did not stop cleanly; keeping it tracked so it is retried on the next reconcile or shutdown.`);
           }
         }),
       );
@@ -3301,9 +3312,10 @@ async function workAgent(req, flags) {
   // rare + manual, so a ~1.5s poll latency is fine.
   watchFile(configFile, { interval: WATCH_INTERVAL_MS }, (curr, prev) => {
     if (curr.mtimeMs === prev.mtimeMs) return; // fires each interval; act on real changes only
-    inFlightReconcile = reconcile()
-      .catch((err) => logger.warn(`profile reload failed: ${err?.message || err}`))
-      .finally(() => { inFlightReconcile = null; });
+    // `reconcile()` owns the `inFlightReconcile` handle: a change arriving while
+    // a reconcile is already running coalesces into the current pass and returns
+    // that same in-flight promise, so shutdown always waits for the real one.
+    reconcile().catch((err) => logger.warn(`profile reload failed: ${err?.message || err}`));
   });
 
   // Keep the process alive until a stop signal, then drain gracefully.

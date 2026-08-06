@@ -3950,7 +3950,18 @@ async function startSupervisorDaemon() {
   while (Date.now() < deadline) {
     try {
       const res = await supervisorRequest({ op: 'status' }, { socketPath, timeoutMs: 750 });
-      if (res && res.ok) return runningSupervisor() || readSupervisorState();
+      if (res && res.ok) {
+        // The daemon can answer `status` on the socket a beat before it has
+        // written supervisor.json. Fall back to the live status response so
+        // callers always get a state object with a usable pid.
+        return runningSupervisor() || readSupervisorState() || {
+          pid: res.daemon?.pid,
+          startedAt: res.daemon?.startedAt,
+          socket: res.daemon?.socket || socketPath,
+          logFile: res.daemon?.logFile,
+          workers: res.workers || [],
+        };
+      }
     } catch { /* not up yet */ }
     await new Promise((r) => setTimeout(r, 150));
   }

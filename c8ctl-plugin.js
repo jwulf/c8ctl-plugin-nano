@@ -3971,18 +3971,31 @@ async function runSupervisorDaemon() {
     sock.on('error', () => attachClients.delete(sock));
   });
 
-  await new Promise((resolve, reject) => {
-    server.once('error', reject);
-    server.listen(socketPath, resolve);
-  }).catch((err) => {
+  // Create the control socket owner-only from the start. The socket file lives
+  // in shared tmpdir(); libuv binds it synchronously inside listen(), so a
+  // restrictive umask around that call closes the TOCTOU window where another
+  // local user could connect before the chmod below lands. Restore the previous
+  // umask immediately after — the listen() bind is synchronous, so no unrelated
+  // file creation can interleave. Unix only; on Windows umask/mode are no-ops.
+  const isWin = osPlatform() === 'win32';
+  const prevUmask = isWin ? null : process.umask(0o177);
+  try {
+    await new Promise((resolve, reject) => {
+      server.once('error', reject);
+      server.listen(socketPath, resolve);
+    });
+  } catch (err) {
     dlog(`failed to bind control socket ${socketPath}: ${err.message}`);
     process.exit(1);
-  });
+  } finally {
+    if (!isWin) { try { process.umask(prevUmask); } catch { /* ignore */ } }
+  }
 
   // Lock the control socket to the owner so another local user can't drive the
   // supervisor (stop/add/remove). Unix only — Windows named pipes are secured
-  // by their own ACLs, not filesystem mode bits.
-  if (osPlatform() !== 'win32') {
+  // by their own ACLs, not filesystem mode bits. This chmod is now a backstop
+  // for the owner-only umask applied around listen() above.
+  if (!isWin) {
     try { chmodSync(socketPath, 0o600); } catch (err) { dlog(`could not chmod control socket: ${err.message}`); }
   }
 

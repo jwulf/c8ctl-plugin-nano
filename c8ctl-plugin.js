@@ -35,6 +35,7 @@ import {
   openSync,
   readFileSync,
   writeFileSync,
+  appendFileSync,
   rmSync,
   readdirSync,
   chmodSync,
@@ -43,13 +44,16 @@ import {
   statfsSync,
   lstatSync,
   mkdtempSync,
+  closeSync,
 } from 'node:fs';
-import { randomUUID } from 'node:crypto';
-import { homedir, platform as osPlatform, devNull } from 'node:os';
+import { createConnection, createServer } from 'node:net';
+import { randomUUID, createHash } from 'node:crypto';
+import { homedir, platform as osPlatform, devNull, tmpdir } from 'node:os';
 import { join, isAbsolute, resolve as resolvePath, dirname, basename, sep } from 'node:path';
 import { createRequire } from 'node:module';
 import { fileURLToPath } from 'node:url';
 import { createInterface } from 'node:readline/promises';
+import { createInterface as createReadline } from 'node:readline';
 import { platformForHost } from './platforms.mjs';
 
 const requireFromHere = createRequire(import.meta.url);
@@ -117,6 +121,7 @@ const READINESS_POLL_MS = 500;
 const HEALTH_TIMEOUT_MS = 1_500;
 const STOP_GRACE_MS = 8_000;
 const PROCESSOS_STATE_FILE = 'processos.json';
+const SUPERVISOR_STATE_FILE = 'supervisor.json';
 const PROCESSOS_DEFAULT_PORT = 8090;
 const DEFAULT_NANO_URL = 'http://localhost:8080';
 
@@ -189,6 +194,34 @@ function getDataDir() {
 
 function getLogDir() {
   return join(getStateHome(), 'logs');
+}
+
+// ---------------------------------------------------------------------------
+// Worker supervisor paths (see the `supervisor` command). The supervisor is a
+// detached daemon that manages a fleet of `nano work` child processes; it keeps
+// its own state file, a control socket, and per-worker + daemon log files.
+// ---------------------------------------------------------------------------
+
+function getSupervisorStateFile() {
+  return join(getStateHome(), SUPERVISOR_STATE_FILE);
+}
+
+function getSupervisorLogDir() {
+  return join(getLogDir(), 'supervisor');
+}
+
+/**
+ * Deterministic control-socket path shared by the daemon and every client.
+ * Derived from a hash of the (possibly overridden) state home so distinct
+ * C8CTL_NANO_HOME instances get distinct sockets, and kept SHORT to stay under
+ * the ~104-byte AF_UNIX `sun_path` limit on macOS regardless of username. On
+ * Windows a named pipe is used instead. The chosen path is also recorded in the
+ * state file so clients can prefer the daemon's own reported path.
+ */
+function getSupervisorSocketPath() {
+  const hash = createHash('sha1').update(getStateHome()).digest('hex').slice(0, 8);
+  if (osPlatform() === 'win32') return `\\\\.\\pipe\\c8ctl-nano-sup-${hash}`;
+  return join(tmpdir(), `c8ctl-nano-sup-${hash}.sock`);
 }
 
 // ---------------------------------------------------------------------------
@@ -368,7 +401,7 @@ function launcherEnvMarkers(resolved) {
 // Argument parsing
 // ---------------------------------------------------------------------------
 
-const VALID_SUBCOMMANDS = ['start', 'stop', 'status', 'logs', 'log', 'restart', 'pause', 'resume', 'clean', 'set', 'config', 'update', 'hire', 'assign', 'work'];
+const VALID_SUBCOMMANDS = ['start', 'stop', 'status', 'logs', 'log', 'restart', 'pause', 'resume', 'clean', 'set', 'config', 'update', 'hire', 'assign', 'work', 'supervisor'];
 
 /**
  * Parse positional args + flags into a normalized request.
@@ -3196,6 +3229,837 @@ async function workAgent(req, flags) {
 }
 
 // ---------------------------------------------------------------------------
+// supervisor — run & manage a fleet of `nano work` children from one terminal.
+//
+// `nano work` needs the c8ctl host runtime (createClient), so worker loops
+// cannot run inside a bare detached process. The supervisor is therefore a
+// process *manager*: a detached daemon spawns one `c8ctl nano work <profile>`
+// child per worker, restarts crashed children with capped backoff, and serves a
+// control socket (newline-delimited JSON) used by both the management
+// subcommands (status/add/remove/restart/stop/logs — no interactive surface
+// needed) and the interactive `attach` console, which can be detached from
+// (leaving the daemon running) or used to `stop` the whole fleet.
+// ---------------------------------------------------------------------------
+
+const SUPERVISOR_BACKOFF_BASE_MS = 1_000;
+const SUPERVISOR_BACKOFF_MAX_MS = 30_000;
+// A child that stayed up at least this long before exiting is not crash-looping,
+// so its restart backoff is reset to zero.
+const SUPERVISOR_HEALTHY_UPTIME_MS = 60_000;
+const SUPERVISOR_CONNECT_TIMEOUT_MS = 6_000;
+
+// The `nano work` flags forwarded verbatim to each spawned child.
+// kind: 'value' → `--flag v`; 'boolean' → `--flag`; 'list' → repeated `--flag v`.
+const WORK_FORWARD_FLAGS = {
+  'max-parallel': 'value',
+  'job-timeout': 'value',
+  'lock-grace': 'value',
+  'poll-timeout': 'value',
+  sandbox: 'value',
+  image: 'value',
+  'secret-resolver': 'value',
+  'reap-age': 'value',
+  'reap-interval': 'value',
+  'min-free-mb': 'value',
+  'clone-timeout': 'value',
+  'keep-runs': 'boolean',
+  stream: 'boolean',
+  arg: 'list',
+  env: 'list',
+  'job-type': 'list',
+};
+
+/**
+ * Reconstruct the `work` argv tail from a parsed flags object, so `supervisor
+ * add <profile> [work flags]` forwards those flags to the spawned child. Pure.
+ */
+function reconstructWorkArgs(flags) {
+  const out = [];
+  if (!flags || typeof flags !== 'object') return out;
+  for (const [name, kind] of Object.entries(WORK_FORWARD_FLAGS)) {
+    const v = flags[name];
+    if (v === undefined || v === null) continue;
+    if (kind === 'boolean') {
+      if (v === true || v === 'true') out.push(`--${name}`);
+    } else if (kind === 'list') {
+      const items = Array.isArray(v) ? v : [v];
+      for (const item of items) {
+        if (item === undefined || item === null) continue;
+        out.push(`--${name}`, String(item));
+      }
+    } else if (v !== '') {
+      out.push(`--${name}`, String(v));
+    }
+  }
+  return out;
+}
+
+/** Assign a unique, stable worker id from a profile name (pure). */
+function supervisorWorkerId(profile, taken) {
+  const base = String(profile || '').trim() || 'worker';
+  const set = taken instanceof Set ? taken : new Set(taken || []);
+  if (!set.has(base)) return base;
+  for (let i = 2; ; i++) {
+    const candidate = `${base}#${i}`;
+    if (!set.has(candidate)) return candidate;
+  }
+}
+
+/** Capped exponential restart backoff for a crash-looping child (pure). */
+function supervisorBackoffMs(restarts, base = SUPERVISOR_BACKOFF_BASE_MS, max = SUPERVISOR_BACKOFF_MAX_MS) {
+  const n = Math.max(0, Number(restarts) || 0);
+  return Math.min(max, base * 2 ** Math.min(n, 20));
+}
+
+/** Newline-delimited JSON framing for the control socket (pure). */
+function encodeFrame(obj) {
+  return JSON.stringify(obj) + '\n';
+}
+
+/** Split a buffered string into complete JSON frames + a remainder (pure). */
+function decodeFrames(buffer) {
+  const frames = [];
+  let rest = String(buffer ?? '');
+  let idx;
+  while ((idx = rest.indexOf('\n')) >= 0) {
+    const line = rest.slice(0, idx).trim();
+    rest = rest.slice(idx + 1);
+    if (!line) continue;
+    try { frames.push(JSON.parse(line)); } catch { /* skip malformed frame */ }
+  }
+  return { frames, rest };
+}
+
+/** Humanise a millisecond duration compactly (pure). */
+function formatDuration(ms) {
+  const s = Math.floor((Number(ms) || 0) / 1000);
+  if (s < 60) return `${s}s`;
+  const m = Math.floor(s / 60);
+  if (m < 60) return `${m}m${s % 60}s`;
+  const h = Math.floor(m / 60);
+  if (h < 24) return `${h}h${m % 60}m`;
+  const d = Math.floor(h / 24);
+  return `${d}d${h % 24}h`;
+}
+
+/** Project a live/stored worker record to a status row (pure w.r.t. `now`). */
+function summarizeSupervisorWorker(w, now = Date.now()) {
+  const alive = isPidAlive(w.pid);
+  const uptimeMs = alive && w.startedAt ? Math.max(0, now - new Date(w.startedAt).getTime()) : 0;
+  return {
+    id: w.id,
+    profile: w.profile,
+    pid: alive ? w.pid : null,
+    state: w.stopping ? 'stopping' : alive ? 'running' : 'down',
+    restarts: Number(w.restarts) || 0,
+    uptimeMs,
+    lastExit: w.lastExit ?? null,
+    args: Array.isArray(w.args) ? w.args : [],
+  };
+}
+
+/** Render a supervisor status object as an aligned text table. */
+function formatSupervisorStatus(status) {
+  const lines = [];
+  const d = status.daemon || {};
+  const alive = d.pid ? isPidAlive(d.pid) : false;
+  lines.push('Supervisor:');
+  lines.push(`  daemon pid: ${d.pid ?? '-'} ${alive ? '(alive)' : '(dead — stale state)'}`);
+  if (d.startedAt) lines.push(`  started:    ${d.startedAt}`);
+  if (d.socket) lines.push(`  control:    ${d.socket}`);
+  const workers = Array.isArray(status.workers) ? status.workers : [];
+  lines.push('');
+  if (workers.length === 0) {
+    lines.push('  No workers. Add one with: c8ctl nano supervisor add <profile>');
+    return lines.join('\n');
+  }
+  const rows = workers.map((w) => ({
+    id: String(w.id),
+    profile: String(w.profile),
+    state: String(w.state),
+    pid: w.pid ? String(w.pid) : '-',
+    restarts: String(w.restarts),
+    uptime: w.state === 'running' ? formatDuration(w.uptimeMs) : '-',
+    last: w.lastExit ? String(w.lastExit) : '-',
+  }));
+  const head = { id: 'ID', profile: 'PROFILE', state: 'STATE', pid: 'PID', restarts: 'RESTARTS', uptime: 'UPTIME', last: 'LAST EXIT' };
+  const cols = ['id', 'profile', 'state', 'pid', 'restarts', 'uptime', 'last'];
+  const width = {};
+  for (const c of cols) width[c] = Math.max(head[c].length, ...rows.map((r) => r[c].length));
+  const fmt = (r) => '  ' + cols.map((c) => r[c].padEnd(width[c])).join('  ');
+  lines.push(fmt(head));
+  for (const r of rows) lines.push(fmt(r));
+  return lines.join('\n');
+}
+
+function readSupervisorState() {
+  const file = getSupervisorStateFile();
+  if (!existsSync(file)) return null;
+  try {
+    return JSON.parse(readFileSync(file, 'utf-8'));
+  } catch {
+    return null;
+  }
+}
+
+function writeSupervisorState(state) {
+  mkdirSync(getStateHome(), { recursive: true });
+  writeFileSync(getSupervisorStateFile(), JSON.stringify(state, null, 2));
+}
+
+function clearSupervisorState() {
+  const file = getSupervisorStateFile();
+  try { if (existsSync(file)) rmSync(file); } catch { /* best effort */ }
+}
+
+/** Running daemon state (pid alive) or null. */
+function runningSupervisor() {
+  const state = readSupervisorState();
+  return state && isPidAlive(state.pid) ? state : null;
+}
+
+/** How to re-invoke the c8ctl CLI to spawn the daemon + `work` children. */
+function c8ctlInvocation() {
+  const entry = process.env.C8CTL_NANO_ENTRY || process.argv[1];
+  return { exec: process.execPath, entry };
+}
+
+function supervisorDaemonLogFile() {
+  return join(getSupervisorLogDir(), 'daemon.log');
+}
+
+function supervisorWorkerLogFile(id) {
+  return join(getSupervisorLogDir(), `worker-${String(id).replace(/[^\w.#-]/g, '_')}.log`);
+}
+
+function waitForChildExit(child, timeoutMs) {
+  return new Promise((resolve) => {
+    if (!child || child.exitCode !== null || child.signalCode !== null) return resolve();
+    let done = false;
+    const finish = () => { if (done) return; done = true; clearTimeout(t); resolve(); };
+    const t = setTimeout(finish, timeoutMs);
+    child.once('exit', finish);
+  });
+}
+
+// --- Daemon ----------------------------------------------------------------
+
+/**
+ * The supervisor daemon body. Runs under `c8ctl nano supervisor __daemon`,
+ * spawned detached by `startSupervisorDaemon`. Never returns — it runs until a
+ * stop request or SIGTERM, then drains children and exits.
+ */
+async function runSupervisorDaemon() {
+  const startedAt = new Date().toISOString();
+  const { exec, entry } = c8ctlInvocation();
+  const socketPath = getSupervisorSocketPath();
+  const daemonLogFile = supervisorDaemonLogFile();
+  mkdirSync(getSupervisorLogDir(), { recursive: true });
+
+  const workers = new Map();
+  const attachClients = new Set();
+  let shuttingDown = false;
+
+  const dlog = (msg) => {
+    try { appendFileSync(daemonLogFile, `[${new Date().toISOString()}] ${msg}\n`); } catch { /* best effort */ }
+  };
+
+  const workerPublic = (w) => summarizeSupervisorWorker(w);
+
+  const persist = () => {
+    try {
+      writeSupervisorState({
+        pid: process.pid,
+        startedAt,
+        socket: socketPath,
+        logFile: daemonLogFile,
+        workers: [...workers.values()].map((w) => ({
+          id: w.id, profile: w.profile, args: w.args, pid: isPidAlive(w.pid) ? w.pid : null,
+          startedAt: w.startedAt || null, restarts: w.restarts, lastExit: w.lastExit ?? null,
+          stopping: !!w.stopping, logFile: w.logFile,
+        })),
+      });
+    } catch { /* best effort */ }
+  };
+
+  const broadcast = (frame) => {
+    const data = encodeFrame(frame);
+    for (const sock of attachClients) {
+      try { sock.write(data); } catch { /* client gone */ }
+    }
+  };
+
+  const startWorker = (w) => {
+    let fd;
+    try { fd = openSync(w.logFile, 'a'); } catch { fd = 'ignore'; }
+    const child = spawn(exec, [entry, 'nano', 'work', w.profile, ...w.args], {
+      env: process.env,
+      stdio: ['ignore', fd, fd],
+    });
+    if (typeof fd === 'number') { try { closeSync(fd); } catch { /* dup'd into child */ } }
+    w.child = child;
+    w.pid = child.pid || null;
+    w.startedAt = new Date().toISOString();
+    w.spawnedAt = Date.now();
+    dlog(`worker '${w.id}' (profile ${w.profile}) started pid ${w.pid}: work ${[w.profile, ...w.args].join(' ')}`);
+    broadcast({ type: 'event', event: 'worker-start', worker: workerPublic(w) });
+
+    child.on('error', (err) => {
+      dlog(`worker '${w.id}' spawn error: ${err.message}`);
+    });
+    child.on('exit', (code, signal) => {
+      // Ignore a stale child's exit (e.g. the old process dying after `restart`
+      // already swapped in a new one); otherwise it would clobber the live
+      // child's pid and spuriously restart, leaking a duplicate worker.
+      if (w.child !== child) return;
+      w.pid = null;
+      w.lastExit = signal ? `signal ${signal}` : `code ${code}`;
+      const ranMs = Date.now() - (w.spawnedAt || Date.now());
+      if (ranMs >= SUPERVISOR_HEALTHY_UPTIME_MS) w.restarts = 0;
+      if (w.stopping || shuttingDown || !workers.has(w.id)) { persist(); return; }
+      const delay = supervisorBackoffMs(w.restarts);
+      w.restarts += 1;
+      dlog(`worker '${w.id}' exited (${w.lastExit}); restarting in ${delay}ms (restart #${w.restarts})`);
+      broadcast({ type: 'event', event: 'worker-exit', worker: workerPublic(w), restartInMs: delay });
+      w.restartTimer = setTimeout(() => {
+        w.restartTimer = null;
+        if (!w.stopping && !shuttingDown && workers.has(w.id)) startWorker(w);
+      }, delay);
+      if (typeof w.restartTimer.unref === 'function') w.restartTimer.unref();
+      persist();
+    });
+    persist();
+  };
+
+  const addWorker = (profile, args) => {
+    const id = supervisorWorkerId(profile, new Set(workers.keys()));
+    const w = {
+      id, profile: String(profile), args: Array.isArray(args) ? args.map(String) : [],
+      restarts: 0, stopping: false, lastExit: null, logFile: supervisorWorkerLogFile(id),
+    };
+    workers.set(id, w);
+    startWorker(w);
+    return w;
+  };
+
+  const stopWorker = async (id) => {
+    const w = workers.get(id);
+    if (!w) return false;
+    w.stopping = true;
+    if (w.restartTimer) { clearTimeout(w.restartTimer); w.restartTimer = null; }
+    const pid = w.pid;
+    if (w.child && pid) {
+      try { process.kill(pid, 'SIGTERM'); } catch { /* already gone */ }
+      await waitForChildExit(w.child, STOP_GRACE_MS);
+      if (isPidAlive(pid)) { try { process.kill(pid, 'SIGKILL'); } catch { /* ignore */ } }
+    }
+    return true;
+  };
+
+  const removeWorker = async (id) => {
+    if (!workers.has(id)) return false;
+    await stopWorker(id);
+    workers.delete(id);
+    dlog(`worker '${id}' removed`);
+    broadcast({ type: 'event', event: 'worker-remove', id });
+    persist();
+    return true;
+  };
+
+  const restartWorker = async (id) => {
+    const w = workers.get(id);
+    if (!w) return false;
+    await stopWorker(id);
+    w.stopping = false;
+    w.restarts = 0;
+    startWorker(w);
+    dlog(`worker '${id}' restarted`);
+    return true;
+  };
+
+  // Resolve a target token to worker ids: exact id, else all with that profile.
+  const resolveTargets = (target) => {
+    const t = String(target || '').trim();
+    if (!t) return [];
+    if (t === 'all' || t === '*') return [...workers.keys()];
+    if (workers.has(t)) return [t];
+    return [...workers.values()].filter((w) => w.profile === t).map((w) => w.id);
+  };
+
+  const statusFrame = (final) => ({
+    ok: true,
+    type: 'status',
+    daemon: { pid: process.pid, startedAt, socket: socketPath, logFile: daemonLogFile },
+    workers: [...workers.values()].map(workerPublic),
+    ...(final ? { final: true } : {}),
+  });
+
+  const shutdown = async (signal) => {
+    if (shuttingDown) return;
+    shuttingDown = true;
+    dlog(`received ${signal || 'stop'} — stopping ${workers.size} worker(s)`);
+    await Promise.all([...workers.keys()].map((id) => stopWorker(id)));
+    broadcast({ type: 'event', event: 'daemon-stop' });
+    try { server.close(); } catch { /* ignore */ }
+    if (osPlatform() !== 'win32') { try { rmSync(socketPath, { force: true }); } catch { /* ignore */ } }
+    clearSupervisorState();
+    process.exit(0);
+  };
+
+  const handleRequest = async (req, sock) => {
+    const op = req && req.op;
+    try {
+      switch (op) {
+        case 'status':
+          sock.write(encodeFrame(statusFrame(true)));
+          break;
+        case 'add': {
+          if (!req.profile) { sock.write(encodeFrame({ ok: false, error: 'add requires a profile', final: true })); break; }
+          const stored = readHires()[String(req.profile)];
+          if (!stored) { sock.write(encodeFrame({ ok: false, error: `no hire named "${req.profile}"`, final: true })); break; }
+          const w = addWorker(req.profile, req.args || []);
+          sock.write(encodeFrame({ ok: true, type: 'added', worker: workerPublic(w), final: true }));
+          break;
+        }
+        case 'remove': {
+          const ids = resolveTargets(req.target);
+          for (const id of ids) await removeWorker(id);
+          sock.write(encodeFrame({ ok: true, type: 'removed', removed: ids, final: true }));
+          break;
+        }
+        case 'restart': {
+          const ids = resolveTargets(req.target);
+          for (const id of ids) await restartWorker(id);
+          sock.write(encodeFrame({ ok: true, type: 'restarted', restarted: ids, final: true }));
+          break;
+        }
+        case 'attach':
+          attachClients.add(sock);
+          sock.write(encodeFrame(statusFrame(false)));
+          break;
+        case 'stop':
+          sock.write(encodeFrame({ ok: true, type: 'stopping', final: true }));
+          setTimeout(() => shutdown('stop'), 50);
+          break;
+        default:
+          sock.write(encodeFrame({ ok: false, error: `unknown op "${op}"`, final: true }));
+      }
+    } catch (err) {
+      try { sock.write(encodeFrame({ ok: false, error: String(err && err.message || err), final: true })); } catch { /* ignore */ }
+    }
+  };
+
+  // Bind the control socket. A stale unix socket file from a crashed daemon
+  // would make listen() fail with EADDRINUSE even though nobody is listening;
+  // remove it first (we already know no live daemon owns our state).
+  if (osPlatform() !== 'win32') { try { rmSync(socketPath, { force: true }); } catch { /* ignore */ } }
+
+  const server = createServer((sock) => {
+    sock.setEncoding('utf8');
+    let buf = '';
+    sock.on('data', async (chunk) => {
+      buf += chunk;
+      const { frames, rest } = decodeFrames(buf);
+      buf = rest;
+      for (const req of frames) await handleRequest(req, sock);
+    });
+    sock.on('close', () => attachClients.delete(sock));
+    sock.on('error', () => attachClients.delete(sock));
+  });
+
+  await new Promise((resolve, reject) => {
+    server.once('error', reject);
+    server.listen(socketPath, resolve);
+  }).catch((err) => {
+    dlog(`failed to bind control socket ${socketPath}: ${err.message}`);
+    process.exit(1);
+  });
+
+  process.once('SIGTERM', () => shutdown('SIGTERM'));
+  process.once('SIGINT', () => shutdown('SIGINT'));
+  dlog(`supervisor daemon up (pid ${process.pid}) — control ${socketPath}`);
+  persist();
+
+  // Keep the event loop alive indefinitely; the server holds it, but add an
+  // explicit never-resolving guard so a transient server close can't exit us.
+  await new Promise(() => {});
+}
+
+// --- Client (management subcommands + attach) ------------------------------
+
+/** Connect to the control socket, resolving with the socket once connected. */
+function supervisorConnect(socketPath, { timeoutMs = SUPERVISOR_CONNECT_TIMEOUT_MS } = {}) {
+  return new Promise((resolve, reject) => {
+    const sock = createConnection(socketPath);
+    let settled = false;
+    const timer = setTimeout(() => {
+      if (settled) return;
+      settled = true;
+      sock.destroy();
+      reject(new Error(`timed out connecting to supervisor at ${socketPath}`));
+    }, timeoutMs);
+    sock.once('connect', () => {
+      if (settled) return;
+      settled = true;
+      clearTimeout(timer);
+      sock.setEncoding('utf8');
+      resolve(sock);
+    });
+    sock.once('error', (err) => {
+      if (settled) return;
+      settled = true;
+      clearTimeout(timer);
+      reject(err);
+    });
+  });
+}
+
+/** Send one request and collect frames until a `final:true` frame arrives. */
+function supervisorRequest(req, { socketPath, timeoutMs } = {}) {
+  const path = socketPath || (readSupervisorState()?.socket) || getSupervisorSocketPath();
+  return new Promise((resolve, reject) => {
+    supervisorConnect(path, { timeoutMs }).then((sock) => {
+      let buf = '';
+      const done = (result) => { try { sock.end(); } catch { /* ignore */ } resolve(result); };
+      sock.on('data', (chunk) => {
+        buf += chunk;
+        const { frames, rest } = decodeFrames(buf);
+        buf = rest;
+        for (const frame of frames) {
+          if (frame.final) return done(frame);
+        }
+      });
+      sock.on('error', reject);
+      sock.on('close', () => resolve({ ok: false, error: 'connection closed before response' }));
+      sock.write(encodeFrame(req));
+    }).catch(reject);
+  });
+}
+
+/**
+ * Ensure a daemon is running, spawning it detached if not, and return its
+ * running state. Polls the control socket until it answers a status request.
+ */
+async function startSupervisorDaemon() {
+  const existing = runningSupervisor();
+  if (existing) return existing;
+  clearSupervisorState(); // clear any stale marker from a dead daemon
+
+  const { exec, entry } = c8ctlInvocation();
+  mkdirSync(getSupervisorLogDir(), { recursive: true });
+  const logFile = supervisorDaemonLogFile();
+  let fd;
+  try { fd = openSync(logFile, 'a'); } catch { fd = 'ignore'; }
+  const child = spawn(exec, [entry, 'nano', 'supervisor', '__daemon'], {
+    env: process.env,
+    detached: true,
+    stdio: ['ignore', fd, fd],
+  });
+  child.unref();
+  if (typeof fd === 'number') { try { closeSync(fd); } catch { /* ignore */ } }
+  if (typeof child.pid !== 'number') throw new Error('failed to spawn supervisor daemon');
+
+  const socketPath = getSupervisorSocketPath();
+  const deadline = Date.now() + SUPERVISOR_CONNECT_TIMEOUT_MS;
+  while (Date.now() < deadline) {
+    try {
+      const res = await supervisorRequest({ op: 'status' }, { socketPath, timeoutMs: 750 });
+      if (res && res.ok) return runningSupervisor() || readSupervisorState();
+    } catch { /* not up yet */ }
+    await new Promise((r) => setTimeout(r, 150));
+  }
+  throw new Error(`supervisor daemon did not become ready (see ${logFile})`);
+}
+
+async function supervisorStartCmd(req, flags) {
+  const logger = getLogger();
+  const state = await startSupervisorDaemon();
+  logger.info(`Supervisor daemon running (pid ${state.pid}).`);
+
+  const specs = normalizeArgList(flags?.worker);
+  const workArgs = reconstructWorkArgs(flags);
+  for (const profile of specs) {
+    const res = await supervisorRequest({ op: 'add', profile, args: workArgs });
+    if (res.ok) logger.info(`  + worker "${res.worker.id}" (profile ${profile})`);
+    else logger.error(`  ! could not add "${profile}": ${res.error}`);
+  }
+
+  if (coerceBool(flags?.attach, false)) {
+    await attachSupervisorConsole(runningSupervisor() || state);
+    return;
+  }
+  await supervisorStatusCmd();
+  logger.info('');
+  logger.info('Attach an interactive console with: c8ctl nano supervisor');
+  logger.info('Manage without it:                  c8ctl nano supervisor add|remove|restart|status|stop');
+}
+
+async function supervisorStatusCmd() {
+  const running = runningSupervisor();
+  if (!running) {
+    const stale = readSupervisorState();
+    if (stale) {
+      console.log('Supervisor: not running (stale state — daemon pid is dead).');
+      console.log('  Start it with: c8ctl nano supervisor start');
+    } else {
+      console.log('Supervisor: not running.');
+      console.log('  Start it with: c8ctl nano supervisor start   (or attach: c8ctl nano supervisor)');
+    }
+    return;
+  }
+  try {
+    const res = await supervisorRequest({ op: 'status' });
+    if (res.ok) { console.log(formatSupervisorStatus(res)); return; }
+  } catch { /* fall back to state file below */ }
+  // Socket unreachable but pid alive — render from the last persisted state.
+  console.log(formatSupervisorStatus({
+    daemon: { pid: running.pid, startedAt: running.startedAt, socket: running.socket },
+    workers: (running.workers || []).map((w) => summarizeSupervisorWorker(w)),
+  }));
+}
+
+async function supervisorAddCmd(req, flags) {
+  const logger = getLogger();
+  const profile = flags?.name ? String(flags.name).trim() : req.positional[1];
+  if (!profile) { logger.error('Usage: c8ctl nano supervisor add <profile> [work flags]'); process.exit(1); }
+  await startSupervisorDaemon();
+  const res = await supervisorRequest({ op: 'add', profile, args: reconstructWorkArgs(flags) });
+  if (res.ok) logger.info(`Added worker "${res.worker.id}" (profile ${profile}); pid ${res.worker.pid ?? 'starting'}.`);
+  else { logger.error(`Could not add "${profile}": ${res.error}`); process.exit(1); }
+}
+
+async function supervisorRemoveCmd(req) {
+  const logger = getLogger();
+  const target = req.positional[1];
+  if (!target) { logger.error('Usage: c8ctl nano supervisor remove <id|profile|all>'); process.exit(1); }
+  if (!runningSupervisor()) { logger.error('Supervisor is not running.'); process.exit(1); }
+  const res = await supervisorRequest({ op: 'remove', target });
+  if (res.ok && res.removed.length > 0) logger.info(`Removed worker(s): ${res.removed.join(', ')}.`);
+  else if (res.ok) { logger.warn(`No worker matched "${target}".`); }
+  else { logger.error(res.error); process.exit(1); }
+}
+
+async function supervisorRestartCmd(req) {
+  const logger = getLogger();
+  const target = req.positional[1];
+  if (!target) { logger.error('Usage: c8ctl nano supervisor restart <id|profile|all>'); process.exit(1); }
+  if (!runningSupervisor()) { logger.error('Supervisor is not running.'); process.exit(1); }
+  const res = await supervisorRequest({ op: 'restart', target });
+  if (res.ok && res.restarted.length > 0) logger.info(`Restarted worker(s): ${res.restarted.join(', ')}.`);
+  else if (res.ok) { logger.warn(`No worker matched "${target}".`); }
+  else { logger.error(res.error); process.exit(1); }
+}
+
+async function supervisorStopCmd() {
+  const logger = getLogger();
+  const running = runningSupervisor();
+  if (!running) {
+    if (readSupervisorState()) { clearSupervisorState(); logger.info('Cleared stale supervisor state.'); }
+    else logger.warn('Supervisor is not running — nothing to stop.');
+    return;
+  }
+  try {
+    await supervisorRequest({ op: 'stop' });
+  } catch {
+    // Socket unreachable — fall back to signalling the daemon pid directly.
+    try { process.kill(running.pid, 'SIGTERM'); } catch { /* already gone */ }
+  }
+  const deadline = Date.now() + STOP_GRACE_MS + 2_000;
+  while (Date.now() < deadline) {
+    if (!runningSupervisor()) break;
+    await new Promise((r) => setTimeout(r, 150));
+  }
+  if (runningSupervisor()) {
+    logger.warn(`Supervisor (pid ${running.pid}) did not stop gracefully — sending SIGKILL.`);
+    try { process.kill(running.pid, 'SIGKILL'); } catch { /* ignore */ }
+    clearSupervisorState();
+  }
+  logger.info('Supervisor stopped.');
+}
+
+function supervisorLogsCmd(req) {
+  const logger = getLogger();
+  const id = req.positional[1];
+  const file = id ? supervisorWorkerLogFile(id) : supervisorDaemonLogFile();
+  if (!existsSync(file)) {
+    logger.error(`No log file at ${file}.${id ? ` (unknown worker "${id}"?)` : ''}`);
+    process.exit(1);
+  }
+  const follow = Boolean(req.follow);
+  const tailArgs = follow ? ['-n', '200', '-F', file] : ['-n', '200', file];
+  const proc = spawn('tail', tailArgs, { stdio: ['ignore', 'inherit', 'inherit'] });
+  proc.on('error', () => {
+    // tail unavailable (e.g. Windows): print the tail ourselves, no follow.
+    try {
+      const lines = readFileSync(file, 'utf-8').split('\n');
+      console.log(lines.slice(-200).join('\n'));
+    } catch (err) { logger.error(`Could not read ${file}: ${err.message}`); }
+  });
+}
+
+/**
+ * Interactive attach console. Streams live events from the daemon and accepts
+ * line commands. `detach` (or Ctrl-D) disconnects but leaves the daemon
+ * running; `stop` tears the fleet down.
+ */
+async function attachSupervisorConsole(state) {
+  const logger = getLogger();
+  const socketPath = state?.socket || getSupervisorSocketPath();
+  let sock;
+  try {
+    sock = await supervisorConnect(socketPath);
+  } catch (err) {
+    logger.error(`Could not attach to supervisor: ${err.message}`);
+    process.exit(1);
+  }
+
+  const out = (s) => process.stdout.write(s + '\n');
+  out('Attached to nano worker supervisor. Type "help" for commands.');
+  out('Detach (leave it running) with "detach" or Ctrl-D; tear it down with "stop".');
+  sock.write(encodeFrame({ op: 'attach' }));
+
+  let buf = '';
+  sock.on('data', (chunk) => {
+    buf += chunk;
+    const { frames, rest } = decodeFrames(buf);
+    buf = rest;
+    for (const frame of frames) {
+      if (frame.type === 'status') {
+        out('');
+        out(formatSupervisorStatus(frame));
+      } else if (frame.type === 'event') {
+        const w = frame.worker;
+        if (frame.event === 'worker-start') out(`• worker ${w.id} started (pid ${w.pid}).`);
+        else if (frame.event === 'worker-exit') out(`• worker ${w.id} exited (${w.lastExit}); restarting in ${formatDuration(frame.restartInMs)}.`);
+        else if (frame.event === 'worker-remove') out(`• worker ${frame.id} removed.`);
+        else if (frame.event === 'daemon-stop') out('• supervisor stopping.');
+      } else if (frame.type === 'added') {
+        out(`• added worker ${frame.worker.id}.`);
+      } else if (frame.type === 'removed') {
+        out(`• removed: ${frame.removed.join(', ') || '(none matched)'}.`);
+      } else if (frame.type === 'restarted') {
+        out(`• restarted: ${frame.restarted.join(', ') || '(none matched)'}.`);
+      } else if (frame.ok === false) {
+        out(`! ${frame.error}`);
+      }
+    }
+  });
+
+  const rl = createReadline({ input: process.stdin, output: process.stdout, prompt: 'supervisor> ' });
+  rl.prompt();
+
+  await new Promise((resolve) => {
+    let stopping = false;
+    const finish = () => { try { rl.close(); } catch { /* ignore */ } try { sock.end(); } catch { /* ignore */ } resolve(); };
+
+    sock.on('close', () => { if (!stopping) out('\nSupervisor connection closed.'); finish(); });
+
+    rl.on('line', (line) => {
+      const parts = String(line).trim().split(/\s+/).filter(Boolean);
+      const cmd = (parts.shift() || '').toLowerCase();
+      switch (cmd) {
+        case '': break;
+        case 'help':
+          out('Commands: status | add <profile> [work flags] | remove <id|profile|all> |');
+          out('          restart <id|profile|all> | logs [id] | detach | stop | help');
+          break;
+        case 'status': sock.write(encodeFrame({ op: 'status' })); break;
+        case 'add': {
+          const profile = parts.shift();
+          if (!profile) { out('usage: add <profile> [work flags]'); break; }
+          sock.write(encodeFrame({ op: 'add', profile, args: parts }));
+          break;
+        }
+        case 'remove': case 'rm': {
+          const target = parts.shift();
+          if (!target) { out('usage: remove <id|profile|all>'); break; }
+          sock.write(encodeFrame({ op: 'remove', target }));
+          break;
+        }
+        case 'restart': {
+          const target = parts.shift();
+          if (!target) { out('usage: restart <id|profile|all>'); break; }
+          sock.write(encodeFrame({ op: 'restart', target }));
+          break;
+        }
+        case 'logs': case 'log': {
+          const file = parts[0] ? supervisorWorkerLogFile(parts[0]) : supervisorDaemonLogFile();
+          try {
+            const lines = readFileSync(file, 'utf-8').split('\n');
+            out(lines.slice(-30).join('\n'));
+          } catch { out(`no log at ${file}`); }
+          break;
+        }
+        case 'detach': case 'quit': case 'exit':
+          out('Detaching — supervisor keeps running. Reattach with: c8ctl nano supervisor');
+          finish();
+          return;
+        case 'stop':
+          stopping = true;
+          out('Stopping supervisor…');
+          sock.write(encodeFrame({ op: 'stop' }));
+          setTimeout(finish, 500);
+          return;
+        default:
+          out(`unknown command "${cmd}" — type "help"`);
+      }
+      rl.prompt();
+    });
+
+    // Ctrl-D (EOF) detaches, leaving the daemon running.
+    rl.on('close', () => {
+      if (stopping) return;
+      out('\nDetaching — supervisor keeps running. Reattach with: c8ctl nano supervisor');
+      finish();
+    });
+  });
+}
+
+/** Dispatch the `supervisor` subcommand's action. */
+async function supervisorCommand(req, flags) {
+  const action = (req.positional[0] || '').toLowerCase();
+  switch (action) {
+    case '__daemon':
+      await runSupervisorDaemon();
+      return;
+    case '':
+    case 'attach': {
+      const state = await startSupervisorDaemon();
+      await attachSupervisorConsole(runningSupervisor() || state);
+      return;
+    }
+    case 'start':
+      await supervisorStartCmd(req, flags);
+      return;
+    case 'status':
+    case 'list':
+    case 'ls':
+      await supervisorStatusCmd();
+      return;
+    case 'add':
+      await supervisorAddCmd(req, flags);
+      return;
+    case 'remove':
+    case 'rm':
+      await supervisorRemoveCmd(req);
+      return;
+    case 'restart':
+      await supervisorRestartCmd(req);
+      return;
+    case 'stop':
+      await supervisorStopCmd();
+      return;
+    case 'logs':
+    case 'log':
+      supervisorLogsCmd(req);
+      return;
+    default:
+      getLogger().error(`Unknown supervisor action "${action}". Use: start|status|add|remove|restart|stop|logs|attach`);
+      process.exit(1);
+  }
+}
+
+// ---------------------------------------------------------------------------
 // update — pull a new nanobpmn release onto a machine with an existing install.
 // The plugin (and the bundled server binary, shipped via the matching platform
 // package) is distributed on npm as c8ctl-plugin-nano, so a release is pulled by
@@ -4556,6 +5420,24 @@ export {
   RESERVED_RESULT_KEYS,
   SANDBOXES,
 };
+export {
+  reconstructWorkArgs,
+  supervisorWorkerId,
+  supervisorBackoffMs,
+  encodeFrame,
+  decodeFrames,
+  formatDuration,
+  summarizeSupervisorWorker,
+  formatSupervisorStatus,
+  WORK_FORWARD_FLAGS,
+  runSupervisorDaemon,
+  startSupervisorDaemon,
+  supervisorRequest,
+  runningSupervisor,
+  readSupervisorState,
+  clearSupervisorState,
+  getSupervisorSocketPath,
+};
 
 export const metadata = {
   name: 'c8ctl-plugin-nano',
@@ -4595,6 +5477,12 @@ export const metadata = {
         { command: 'c8ctl nano hire --name coder --rank senior --command "agent-harness" --sandbox docker --image ghcr.io/acme/agent:1', description: 'Create a profile that runs each job in a throwaway Docker container' },
         { command: 'c8ctl nano work reviewer', description: 'Spawn Nano job workers for the "reviewer" profile and poll for work' },
         { command: 'c8ctl nano work coder --sandbox docker --image ghcr.io/acme/agent:1', description: 'Run jobs in isolated containers with disk-hygiene reaping' },
+        { command: 'c8ctl nano supervisor start --worker reviewer --worker coder', description: 'Start a detached supervisor managing several workers from one terminal' },
+        { command: 'c8ctl nano supervisor', description: 'Attach an interactive console to the supervisor (detach with Ctrl-D, leaving it running)' },
+        { command: 'c8ctl nano supervisor status', description: 'List supervised workers (pid, state, restarts, uptime) without the console' },
+        { command: 'c8ctl nano supervisor add decider --max-parallel 2', description: 'Add a supervised worker (forwarding work flags) to the running supervisor' },
+        { command: 'c8ctl nano supervisor restart reviewer', description: 'Restart a supervised worker by id or profile' },
+        { command: 'c8ctl nano supervisor stop', description: 'Stop the supervisor daemon and all its workers' },
       ],
     },
     processos: {
@@ -4657,6 +5545,8 @@ export const commands = {
       'lock-grace': { type: 'string', description: 'work: extra ms added to --job-timeout to derive the broker activation lock, so the worker reports before the lock lapses (default 120000)' },
       'poll-timeout': { type: 'string', description: 'work: broker long-poll window in ms each activateJobs request is held open (fewer reconnects → fewer transient connect errors); default 30000, 0 = broker default, negative = return immediately' },
       'job-type': { type: 'string', multiple: true, description: 'work: extra job type to service alongside the rank×capability matrix (repeatable)' },
+      worker: { type: 'string', multiple: true, description: 'supervisor start: profile to launch as a supervised worker (repeatable)' },
+      attach: { type: 'boolean', description: 'supervisor start: attach the interactive console after starting the daemon' },
     },
     handler: async (args, flags) => {
       const logger = getLogger();
@@ -4713,6 +5603,9 @@ export const commands = {
             break;
           case 'work':
             await workAgent(req, flags);
+            break;
+          case 'supervisor':
+            await supervisorCommand(req, flags);
             break;
         }
       } catch (error) {
@@ -4805,6 +5698,7 @@ function printUsage() {
   console.log('  c8ctl nano hire [--name <n>] [--rank <r>] [--command <c>] [--arg <switch> ...] [--model <m>] [--capabilities <a,b>] [--sandbox none|docker|podman] [--image <ref>] [--env NAME=VALUE ...] [--list]');
   console.log('  c8ctl nano assign <profileName> [<capability> ...] [--name <n>] [--capabilities <a,b>]');
   console.log('  c8ctl nano work <profileName> [--arg <switch> ...] [--max-parallel <n>] [--job-timeout <ms>] [--lock-grace <ms>] [--poll-timeout <ms>] [--job-type <token> ...] [--sandbox none|docker|podman] [--image <ref>] [--env NAME=VALUE ...] [--secret-resolver host] [--min-free-mb <n>] [--clone-timeout <ms>] [--keep-runs] [--stream]');
+  console.log('  c8ctl nano supervisor [start|status|add|remove|restart|stop|logs|attach] ... (manage many workers from one terminal)');
   console.log('');
   console.log('Subcommands:');
   console.log('  start    Spawn an N-node local cluster wired to talk to each other on localhost');
@@ -4821,6 +5715,7 @@ function printUsage() {
   console.log('  hire     Create a CLI agent worker profile (rank + capabilities → job-type matrix)');
   console.log('  assign   Grant new capabilities (roles) to an existing hire (additive)');
   console.log('  work     Run a hired profile as Nano job workers, polling for work until Ctrl-C');
+  console.log('  supervisor  Run/manage a fleet of workers from one terminal (detachable console + non-interactive control)');
   console.log('');
   console.log('Options:');
   console.log('  <nodes>              Number of nodes to start (default 1)');

@@ -3900,11 +3900,16 @@ async function runSupervisorDaemon() {
           // added as profile X but carrying `--name Y` would run Y while status
           // and logs report X. Reject it — the supervisor id derives from the
           // positional profile and that must be what actually runs.
-          const badName = (req.args || []).find((a) => a === '--name' || a === '-n' || /^--name=/.test(a) || /^-n=/.test(a));
+          // `req.args` comes from untrusted JSON and may be non-array (e.g. a
+          // string or object). Coerce to an array of string tokens before
+          // scanning/forwarding so a malformed payload yields a clean rejection
+          // instead of throwing a generic request error.
+          const args = Array.isArray(req.args) ? req.args.filter((a) => typeof a === 'string') : [];
+          const badName = args.find((a) => a === '--name' || a === '-n' || /^--name=/.test(a) || /^-n=/.test(a));
           if (badName) { sock.write(encodeFrame({ ok: false, error: `--name is not allowed for a supervised worker (it would run a different hire than the reported profile "${req.profile}")`, final: true })); break; }
           const stored = readHires()[String(req.profile)];
           if (!stored) { sock.write(encodeFrame({ ok: false, error: `no hire named "${req.profile}"`, final: true })); break; }
-          const w = await serializeOp(() => addWorker(req.profile, req.args || []));
+          const w = await serializeOp(() => addWorker(req.profile, args));
           sock.write(encodeFrame({ ok: true, type: 'added', worker: workerPublic(w), final: true }));
           break;
         }
@@ -4091,7 +4096,14 @@ async function startSupervisorDaemon() {
   // original and its workers.
   try {
     const res = await supervisorRequest({ op: 'status' }, { socketPath, timeoutMs: 500, responseTimeoutMs: SUPERVISOR_PROBE_RESPONSE_TIMEOUT_MS });
-    if (res && res.ok) return runningSupervisor() || stateFromStatus(res, socketPath);
+    if (res && res.ok) {
+      // Re-persist the adopted daemon's state so subsequent pid-based checks
+      // (runningSupervisor()) work immediately, instead of staying broken until
+      // some later command happens to heal supervisor.json.
+      const adopted = runningSupervisor() || stateFromStatus(res, socketPath);
+      try { writeSupervisorState(adopted); } catch { /* best effort */ }
+      return adopted;
+    }
   } catch { /* no live daemon on the socket — safe to (re)spawn */ }
 
   clearSupervisorState(); // clear any stale marker from a dead daemon

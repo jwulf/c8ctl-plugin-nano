@@ -63,6 +63,32 @@ SDK client (job workers) — do **not** add the SDK as a dependency or use raw
   skipped) and deleted per-job unless `--keep-runs`. Container-side cloning
   (strong isolation) is a later increment; container jobs don't clone yet.
 
+## Worker supervisor (`supervisor`)
+
+- Runs/manages a fleet of `nano work` children from one terminal. `nano work`
+  needs the host runtime (`createClient`), so worker loops **cannot** run in a
+  bare detached process — the supervisor is a **process manager**, not an
+  in-process multiplexer.
+- A **detached daemon** (`nano supervisor __daemon`, spawned detached+`unref`'d,
+  re-invoked via `process.execPath` + the c8ctl entry from `process.argv[1]` /
+  `C8CTL_NANO_ENTRY`) spawns one `c8ctl nano work <profile> [flags]` child per
+  worker (inheriting `process.env`, so each child gets its own runtime + SDK
+  client — all `work` logic is reused unchanged), restarts crashes with capped
+  exponential backoff (`supervisorBackoffMs`), and serves a **control socket**
+  (Unix socket / Windows named pipe, newline-delimited JSON via `encodeFrame`/
+  `decodeFrames`).
+- State file `supervisor.json` (`{ pid, socket, logFile, workers:[…] }`); logs
+  under `logs/supervisor/`. Management subcommands (`status|add|remove|restart|
+  stop|logs`) are thin socket clients (`supervisorRequest`) needing no
+  interactive surface; the interactive `attach` console streams events and can
+  **detach** (Ctrl-D / `detach`, leaving the daemon running) or `stop` the fleet.
+- Invariants: `stop` always clears `supervisor.json` (no stale marker wedges a
+  future start); `remove`/`stop` cancel a pending restart; a `restart` swaps the
+  child under a **child-identity guard** so a late old-child exit is never
+  misattributed to the new child (no spurious restart / duplicate leak); the
+  daemon never runs a worker loop itself. Forwarded flags come from
+  `WORK_FORWARD_FLAGS` via `reconstructWorkArgs` (only real `work` flags).
+
 ## How a cluster is modelled
 
 - Each nanobpmn node is the single server binary, configured by env vars:

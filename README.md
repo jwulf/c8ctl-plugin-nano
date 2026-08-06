@@ -436,6 +436,55 @@ than `--min-free-mb` MB free (default `1024`).
 > are frozen so the [nano-ide element-template pack](https://github.com/jwulf/nano-ide/issues/37)
 > can be built against this contract.
 
+## Supervising a fleet of workers: `supervisor`
+
+Running several workers means several `nano work` foreground processes — one
+terminal each, none of them restarted if they crash. The **`supervisor`** runs
+and manages a whole fleet from a **single terminal**: a detached daemon spawns
+one `nano work <profile>` child per worker, restarts a crashed child with capped
+backoff, and is driven either interactively (a console you can **detach from**,
+leaving it running) or non-interactively with plain subcommands.
+
+```bash
+# Start a detached supervisor managing several workers at once
+c8ctl nano supervisor start --worker reviewer --worker coder --worker decider
+
+# Attach an interactive console (starts the daemon if needed).
+# Detach with `detach` or Ctrl-D — the daemon KEEPS RUNNING. `stop` tears it down.
+c8ctl nano supervisor
+
+# Manage the fleet without the console (any terminal, any time):
+c8ctl nano supervisor status                       # id, state, pid, restarts, uptime
+c8ctl nano supervisor add reviewer --max-parallel 2 # add + spawn a worker (forwards work flags)
+c8ctl nano supervisor restart reviewer             # by worker id or profile name
+c8ctl nano supervisor remove coder                 # stop + drop a worker (also: `all`)
+c8ctl nano supervisor logs reviewer --follow       # tail a worker's log (or the daemon's)
+c8ctl nano supervisor stop                          # stop the daemon and every worker
+```
+
+Each worker takes the **same flags as `nano work`** (`--max-parallel`,
+`--job-timeout`, `--lock-grace`, `--poll-timeout`, `--sandbox`/`--image`,
+`--job-type`, `--env`, `--arg`, …); they are forwarded verbatim to the spawned
+child, so a supervised worker is byte-identical to a hand-run `nano work`. In the
+interactive console, type the flags after the profile: `add reviewer --max-parallel 2`.
+
+How it works and where things live:
+
+- The daemon runs **detached + `unref`'d** (like `nano start` nodes), so it
+  outlives the CLI invocation that launched it — that is what "detach" means.
+- A JSON state file `supervisor.json` records `{ pid, socket, workers:[…] }`;
+  management commands talk to the daemon over a **control socket** (a Unix domain
+  socket, or a named pipe on Windows) and fall back to the state file when the
+  socket is unreachable (to report a stale/dead daemon).
+- Per-worker and daemon logs live under `logs/supervisor/` in the state home
+  (`worker-<id>.log`, `daemon.log`).
+- **Restart policy:** a crashed child is restarted with exponential backoff
+  (1s → 30s cap); a child that stayed up ≥60s resets its backoff. `remove`/`stop`
+  cancel any pending restart, and a `restart` cleanly swaps the child (a late
+  exit from the old process is never mis-counted against the new one).
+- Stopping is SIGTERM → grace → SIGKILL, per worker and for the daemon; `stop`
+  always clears `supervisor.json` so a stale marker never wedges a future start.
+
 ## Cleaning up disk
 
 ```bash

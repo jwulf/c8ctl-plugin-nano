@@ -92,6 +92,14 @@ test('redactWorkArgs masks multiple --env values and a bare (=-less) value', () 
   );
 });
 
+test('redactWorkArgs masks the inline --env=NAME=VALUE form', () => {
+  assert.deepEqual(
+    redactWorkArgs(['--env=TOKEN=s3cr3t', '--stream']),
+    ['--env=TOKEN=***', '--stream'],
+  );
+  assert.deepEqual(redactWorkArgs(['--env=JUSTNAME']), ['--env=***']);
+});
+
 test('redactWorkArgs leaves argv without --env untouched and tolerates non-arrays', () => {
   assert.deepEqual(redactWorkArgs(['--sandbox', 'docker']), ['--sandbox', 'docker']);
   assert.deepEqual(redactWorkArgs(undefined), []);

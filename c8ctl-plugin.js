@@ -3499,19 +3499,24 @@ function supervisorWorkerId(profile, taken) {
 
 /**
  * Redact sensitive values from a reconstructed `work` argv before logging, so
- * supervisor logs never capture secrets. `--env NAME=VALUE` becomes
- * `--env NAME=***` (the value passed to `nano work` is untouched). Pure.
+ * supervisor logs never capture secrets. Both `--env NAME=VALUE` and the
+ * inline `--env=NAME=VALUE` form become `NAME=***` (the value passed to
+ * `nano work` is untouched). Pure.
  */
 function redactWorkArgs(args) {
   const out = [];
   const list = Array.isArray(args) ? args : [];
+  const redactPair = (pair) => {
+    const eq = pair.indexOf('=');
+    return eq === -1 ? '***' : `${pair.slice(0, eq)}=***`;
+  };
   for (let i = 0; i < list.length; i++) {
     const tok = String(list[i]);
     if (tok === '--env' && i + 1 < list.length) {
-      const next = String(list[i + 1]);
-      const eq = next.indexOf('=');
-      out.push(tok, eq === -1 ? '***' : `${next.slice(0, eq)}=***`);
+      out.push(tok, redactPair(String(list[i + 1])));
       i++;
+    } else if (tok.startsWith('--env=')) {
+      out.push(`--env=${redactPair(tok.slice('--env='.length))}`);
     } else {
       out.push(tok);
     }
@@ -3947,7 +3952,10 @@ async function runSupervisorDaemon() {
     let queue = Promise.resolve();
     sock.on('data', (chunk) => {
       buf += chunk;
-      if (buf.length > SUPERVISOR_MAX_FRAME_BYTES) {
+      // Cap by UTF-8 byte length, not string length: buf is a decoded string
+      // whose .length counts UTF-16 code units, so multibyte input could hold
+      // far more than SUPERVISOR_MAX_FRAME_BYTES in memory before being dropped.
+      if (Buffer.byteLength(buf, 'utf8') > SUPERVISOR_MAX_FRAME_BYTES) {
         dlog(`control connection exceeded ${SUPERVISOR_MAX_FRAME_BYTES} bytes without a complete frame — dropping`);
         try { sock.destroy(); } catch { /* ignore */ }
         buf = '';

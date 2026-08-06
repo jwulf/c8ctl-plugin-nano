@@ -202,13 +202,20 @@ function getConfigFile() {
   return join(getStateHome(), CONFIG_FILE);
 }
 
-function readConfig() {
+function readConfigStrict() {
   const file = getConfigFile();
   if (!existsSync(file)) return {};
+  const cfg = JSON.parse(readFileSync(file, 'utf-8'));
+  return cfg && typeof cfg === 'object' ? cfg : {};
+}
+
+function readConfig() {
   try {
-    const cfg = JSON.parse(readFileSync(file, 'utf-8'));
-    return cfg && typeof cfg === 'object' ? cfg : {};
+    return readConfigStrict();
   } catch {
+    // A malformed/torn config.json is swallowed here so ordinary callers get an
+    // empty map; callers that must tell "absent" from "unreadable" apart use
+    // readConfigStrict() directly and handle the throw.
     return {};
   }
 }
@@ -1599,6 +1606,16 @@ function readHires() {
   const cfg = readConfig();
   // A JSON array is `typeof === 'object'` but drops string-keyed writes on
   // JSON.stringify, so treat only plain objects as a valid hires map.
+  return cfg.hires && typeof cfg.hires === 'object' && !Array.isArray(cfg.hires) ? cfg.hires : {};
+}
+
+/**
+ * Like readHires(), but propagates a malformed-config parse error instead of
+ * swallowing it. Lets a caller distinguish "profile genuinely removed" from
+ * "config temporarily unreadable/torn" so it can report an accurate reason.
+ */
+function readHiresStrict() {
+  const cfg = readConfigStrict();
   return cfg.hires && typeof cfg.hires === 'object' && !Array.isArray(cfg.hires) ? cfg.hires : {};
 }
 
@@ -3236,7 +3253,14 @@ async function workAgent(req, flags) {
   // extras). Returns { skip } for a transient/torn read, a vanished profile, or
   // an invalid edit — callers must then KEEP the running set, never tear down.
   const desiredJobTypes = () => {
-    const stored = readHires()[name];
+    let stored;
+    try {
+      stored = readHiresStrict()[name];
+    } catch {
+      // config.json exists but doesn't parse (e.g. a torn write): the profile is
+      // NOT necessarily gone, so don't claim it was deleted — skip this pass.
+      return { skip: 'config unreadable' };
+    }
     if (!stored) return { skip: 'deleted' };
     const norm = normalizeStoredProfile(name, stored);
     if (norm.error) return { skip: norm.error };

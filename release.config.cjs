@@ -17,7 +17,7 @@ module.exports = {
     // back entirely: releases push only the git TAG (by semantic-release core;
     // tags are not covered by this branch ruleset), publish to npm, and record
     // the notes on the GitHub Release (via @semantic-release/github below). The
-    // repo therefore no longer carries a committed CHANGELOG.md.
+    // repo no longer auto-updates CHANGELOG.md (an existing file may become stale).
     // Platform packages: pin the root's optionalDependencies and stage one npm
     // package per platform from the downloaded binaries (prepare), then publish
     // them BEFORE the root meta-package (publish). This plugin is listed before

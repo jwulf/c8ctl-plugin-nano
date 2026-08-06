@@ -207,6 +207,29 @@ c8ctl nano work reviewer                     # poll for work until Ctrl-C
 c8ctl nano work reviewer --max-parallel 2 --job-timeout 600000
 ```
 
+### Live profile reload (no restart on `assign`)
+
+A running `c8ctl nano work <name>` **watches** the profile it is servicing. When
+you extend or reduce that profile's capabilities in another terminal —
+
+```bash
+c8ctl nano assign reviewer fix-ci     # add a capability to the live profile
+```
+
+— the supervisor reconciles its pollers in place: it **starts** pollers for the
+newly added rank×capability job types and **gracefully drains** the pollers for
+removed types — best-effort: each draining poller is given a bounded grace
+window (`STOP_GRACE_MS`) for its in-flight jobs to finish before
+it is stopped, so long-running work exceeding that window may still be
+interrupted. Unchanged job types keep running undisturbed, so there is no need
+to stop and restart the worker.
+
+Only **job types** (rank + capabilities, plus any `--job-type` extras) reconcile
+live. Changes to the profile's `command`, `model`, `sandbox`/`image`, or `env`
+still require a restart to take effect. If the profile is deleted or the config
+file is mid-write when the reload fires, the running workers are **kept** (never
+torn down) and a warning is logged.
+
 Each activated job runs the profile's command **once** (one-shot): the job is
 serialized to JSON and piped to the CLI's **stdin** —
 

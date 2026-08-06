@@ -43,6 +43,8 @@ import {
   statfsSync,
   lstatSync,
   mkdtempSync,
+  watchFile,
+  unwatchFile,
 } from 'node:fs';
 import { randomUUID } from 'node:crypto';
 import { homedir, platform as osPlatform, devNull } from 'node:os';
@@ -200,20 +202,39 @@ function getConfigFile() {
   return join(getStateHome(), CONFIG_FILE);
 }
 
-function readConfig() {
+function readConfigStrict() {
   const file = getConfigFile();
   if (!existsSync(file)) return {};
+  const cfg = JSON.parse(readFileSync(file, 'utf-8'));
+  return cfg && typeof cfg === 'object' ? cfg : {};
+}
+
+function readConfig() {
   try {
-    const cfg = JSON.parse(readFileSync(file, 'utf-8'));
-    return cfg && typeof cfg === 'object' ? cfg : {};
+    return readConfigStrict();
   } catch {
+    // A malformed/torn config.json is swallowed here so ordinary callers get an
+    // empty map; callers that must tell "absent" from "unreadable" apart use
+    // readConfigStrict() directly and handle the throw.
     return {};
   }
 }
 
 function writeConfig(cfg) {
   mkdirSync(getStateHome(), { recursive: true });
-  writeFileSync(getConfigFile(), JSON.stringify(cfg, null, 2));
+  // Atomic write: serialize to a temp file in the same dir, then rename over the
+  // target. A rename is atomic on a POSIX filesystem, so a concurrent reader
+  // (e.g. `work`'s profile watcher, or another `assign`) never observes a
+  // half-written config.json and JSON.parse never sees a torn file.
+  const target = getConfigFile();
+  const tmp = `${target}.${process.pid}.${Date.now()}.tmp`;
+  writeFileSync(tmp, JSON.stringify(cfg, null, 2));
+  try {
+    renameSync(tmp, target);
+  } catch (err) {
+    try { rmSync(tmp, { force: true }); } catch { /* best effort */ }
+    throw err;
+  }
 }
 
 /**
@@ -1565,11 +1586,36 @@ function jobTypeMatrix(rank, capabilities) {
   return [...new Set(tokens)];
 }
 
+/**
+ * Diff a running set of job-type pollers against a desired set. Pure so the
+ * profile-watch reconcile in `work` (which starts pollers for `added` types and
+ * gracefully drains pollers for `removed` types) is unit-testable. Order in the
+ * returned arrays is stable (desired order for `added`, current order for
+ * `removed`) for deterministic logging.
+ */
+function diffJobTypes(current, desired) {
+  const cur = new Set(current);
+  const want = new Set(desired);
+  const added = [...want].filter((t) => !cur.has(t));
+  const removed = [...cur].filter((t) => !want.has(t));
+  return { added, removed };
+}
+
 /** All persisted hire profiles, keyed by name. */
 function readHires() {
   const cfg = readConfig();
   // A JSON array is `typeof === 'object'` but drops string-keyed writes on
   // JSON.stringify, so treat only plain objects as a valid hires map.
+  return cfg.hires && typeof cfg.hires === 'object' && !Array.isArray(cfg.hires) ? cfg.hires : {};
+}
+
+/**
+ * Like readHires(), but propagates a malformed-config parse error instead of
+ * swallowing it. Lets a caller distinguish "profile genuinely removed" from
+ * "config temporarily unreadable/torn" so it can report an accurate reason.
+ */
+function readHiresStrict() {
+  const cfg = readConfigStrict();
   return cfg.hires && typeof cfg.hires === 'object' && !Array.isArray(cfg.hires) ? cfg.hires : {};
 }
 
@@ -2975,7 +3021,10 @@ async function workAgent(req, flags) {
   logger.info(`  max parallel: ${maxParallelJobs}; job timeout: ${jobKillMs}ms; activation lock: ${jobLockMs}ms; poll timeout: ${pollTimeoutMs}ms`);
   logger.info('Polling for work — press Ctrl-C to stop.');
 
-  const workers = jobTypes.map((jobType) =>
+  // A per-job-type worker factory. Captures all the CLI-local + profile context
+  // in closure scope so the profile watcher below can (re)spawn a poller for any
+  // job type on demand without re-reading the flags.
+  const makeWorker = (jobType) =>
     camunda.createJobWorker({
       jobType,
       workerName: `${name}:${jobType}`,
@@ -3156,35 +3205,172 @@ async function workAgent(req, flags) {
           variables: { [AGENT_RESULT_KEY]: resultEnvelope },
         });
       },
-    }),
-  );
+    });
 
-  // Keep the process alive until a stop signal, then drain gracefully.
-  await new Promise((resolve) => {
-    let stopping = false;
-    const stop = async (signal) => {
-      if (stopping) return;
-      stopping = true;
-      logger.info(`Received ${signal} — stopping ${workers.length} worker(s)...`);
-      if (reaperTimer) clearInterval(reaperTimer);
-      if (runDirTimer) clearInterval(runDirTimer);
-      let stopFailures = 0;
+  // Live worker registry keyed by job type, so the profile watcher can add or
+  // drain individual pollers without disturbing the others. `draining` is the
+  // shutdown latch (shared with the watcher so a reconcile can't race a stop).
+  const workers = new Map();
+  let draining = false;
+
+  const drainWorker = async (w) => {
+    try {
+      if (typeof w.stopGracefully === 'function') {
+        await w.stopGracefully({ waitUpToMs: STOP_GRACE_MS });
+      } else if (typeof w.stop === 'function') {
+        await w.stop();
+      }
+      return true;
+    } catch {
+      return false; // best-effort: never let one worker's stop failure hang us
+    }
+  };
+
+  const spawnJobType = (jobType) => {
+    if (workers.has(jobType)) return false;
+    workers.set(jobType, makeWorker(jobType));
+    return true;
+  };
+
+  for (const jobType of jobTypes) spawnJobType(jobType);
+
+  // ---- Live profile watch: reconcile the poller set when the watched profile's
+  // job types change (e.g. `c8ctl nano assign <name> …`) — start pollers for
+  // added types, gracefully drain pollers for removed types — without a restart
+  // and without disturbing unchanged types' in-flight work. ----
+  const configFile = getConfigFile();
+  const WATCH_INTERVAL_MS = 1500;
+  let reconciling = false;
+  // Set when a profile change arrives while a reconcile is already in flight, so
+  // we run one more pass after the current drain completes instead of dropping
+  // the update until the next change fires.
+  let reconcileRequested = false;
+  // Handle to the in-flight reconcile so shutdown can wait for it to finish
+  // before snapshotting `workers` (avoids double-stops / missed drains).
+  let inFlightReconcile = null;
+
+  // Desired job types from the CURRENT on-disk profile (matrix ∪ --job-type
+  // extras). Returns { skip } for a transient/torn read, a vanished profile, or
+  // an invalid edit — callers must then KEEP the running set, never tear down.
+  const desiredJobTypes = () => {
+    let stored;
+    try {
+      stored = readHiresStrict()[name];
+    } catch {
+      // config.json exists but doesn't parse (e.g. a torn write): the profile is
+      // NOT necessarily gone, so don't claim it was deleted — skip this pass.
+      return { skip: 'config unreadable' };
+    }
+    if (!stored) return { skip: 'deleted' };
+    const norm = normalizeStoredProfile(name, stored);
+    if (norm.error) return { skip: norm.error };
+    const m = jobTypeMatrix(norm.profile.rank, norm.profile.capabilities);
+    return { jobTypes: [...new Set([...m, ...extraJobTypes])] };
+  };
+
+  const reconcile = () => {
+    if (draining) return inFlightReconcile || Promise.resolve();
+    if (reconciling) {
+      // A change landed mid-reconcile — remember it so the current pass loops
+      // once more rather than leaving the worker set stale until the next edit.
+      // Return the ACTUAL in-flight promise (not a fresh short-lived one) so a
+      // caller — including shutdown — waits for the real reconcile to finish.
+      reconcileRequested = true;
+      return inFlightReconcile || Promise.resolve();
+    }
+    reconciling = true;
+    reconcileRequested = false;
+    inFlightReconcile = (async () => {
+      try {
+        do {
+          reconcileRequested = false;
+          await runReconcilePass();
+        } while (reconcileRequested && !draining);
+      } finally {
+        reconciling = false;
+        inFlightReconcile = null;
+      }
+    })();
+    return inFlightReconcile;
+  };
+
+  const runReconcilePass = async () => {
+      const desired = desiredJobTypes();
+      if (desired.skip) {
+        if (desired.skip === 'deleted') {
+          logger.warn(`Profile "${name}" is gone from config — keeping the current ${workers.size} worker(s) running.`);
+        } else {
+          logger.warn(`Profile "${name}" reload skipped — ${desired.skip}; keeping current workers.`);
+        }
+        return;
+      }
+      const { added, removed } = diffJobTypes([...workers.keys()], desired.jobTypes);
+      if (added.length === 0 && removed.length === 0) return;
+      logger.info(`Profile "${name}" changed — reconciling job types (+${added.length} / -${removed.length}).`);
+      for (const jt of added) {
+        spawnJobType(jt);
+        logger.info(`  + now listening on ${jt}`);
+      }
       await Promise.all(
-        workers.map(async (w) => {
-          try {
-            if (typeof w.stopGracefully === 'function') {
-              await w.stopGracefully({ waitUpToMs: STOP_GRACE_MS });
-            } else if (typeof w.stop === 'function') {
-              await w.stop();
-            }
-          } catch {
-            // best-effort: never let one worker's stop failure hang shutdown
-            stopFailures += 1;
+        removed.map(async (jt) => {
+          const w = workers.get(jt);
+          logger.info(`  - draining ${jt} …`);
+          const ok = await drainWorker(w);
+          if (ok) {
+            // Only drop it from the registry once it has actually stopped, so a
+            // failed drain stays tracked and gets retried on the next reconcile
+            // pass (or on shutdown) instead of leaking an untracked poller.
+            workers.delete(jt);
+            logger.info(`  - stopped ${jt}`);
+          } else {
+            logger.warn(`  - ${jt} did not stop cleanly; keeping it tracked so it is retried on the next reconcile or shutdown.`);
           }
         }),
       );
+      logger.info(`  now listening on ${workers.size} job type(s): ${[...workers.keys()].join('  ')}`);
+  };
+
+  // `watchFile` (polling stat) is deliberate over `fs.watch`: it survives the
+  // atomic temp+rename that `writeConfig` does (fs.watch would rebind to the old
+  // inode and go silent), and it's uniform across platforms. Profile edits are
+  // rare + manual, so a ~1.5s poll latency is fine.
+  watchFile(configFile, { interval: WATCH_INTERVAL_MS }, (curr, prev) => {
+    // Fires each interval; act only on real changes. Compare mtime, ctime and
+    // size, not mtime alone: on filesystems with coarse mtime resolution (or two
+    // edits within one mtime tick) mtimeMs can be unchanged while size/ctimeMs
+    // differ, and an mtime-only guard would skip a genuine profile update.
+    if (
+      curr.mtimeMs === prev.mtimeMs &&
+      curr.ctimeMs === prev.ctimeMs &&
+      curr.size === prev.size
+    ) return;
+    // `reconcile()` owns the `inFlightReconcile` handle: a change arriving while
+    // a reconcile is already running coalesces into the current pass and returns
+    // that same in-flight promise, so shutdown always waits for the real one.
+    reconcile().catch((err) => logger.warn(`profile reload failed: ${err?.message || err}`));
+  });
+
+  // Keep the process alive until a stop signal, then drain gracefully.
+  await new Promise((resolve) => {
+    const stop = async (signal) => {
+      if (draining) return;
+      draining = true;
+      // Stop watching first so no new reconcile can be triggered, then wait for
+      // any in-flight reconcile to finish before snapshotting `workers` — this
+      // prevents double-stops, missed drains, or a wrong worker count on exit.
+      unwatchFile(configFile);
+      if (inFlightReconcile) {
+        logger.info('Waiting for in-flight profile reconcile to finish before shutdown…');
+        await inFlightReconcile;
+      }
+      const list = [...workers.values()];
+      logger.info(`Received ${signal} — stopping ${list.length} worker(s)...`);
+      if (reaperTimer) clearInterval(reaperTimer);
+      if (runDirTimer) clearInterval(runDirTimer);
+      const results = await Promise.all(list.map(drainWorker));
+      const stopFailures = results.filter((ok) => !ok).length;
       if (stopFailures > 0) {
-        logger.warn(`${stopFailures} of ${workers.length} worker(s) did not stop cleanly; some connections may still be open.`);
+        logger.warn(`${stopFailures} of ${list.length} worker(s) did not stop cleanly; some connections may still be open.`);
       } else {
         logger.info('All workers stopped.');
       }
@@ -4547,6 +4733,7 @@ export {
   applyAssign,
   resolveAssignInputs,
   jobTypeMatrix,
+  diffJobTypes,
   parseJobTypeFlags,
   deriveJobLockMs,
   derivePollTimeoutMs,

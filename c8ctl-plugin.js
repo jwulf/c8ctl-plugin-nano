@@ -3491,6 +3491,28 @@ function supervisorWorkerId(profile, taken) {
   }
 }
 
+/**
+ * Redact sensitive values from a reconstructed `work` argv before logging, so
+ * supervisor logs never capture secrets. `--env NAME=VALUE` becomes
+ * `--env NAME=***` (the value passed to `nano work` is untouched). Pure.
+ */
+function redactWorkArgs(args) {
+  const out = [];
+  const list = Array.isArray(args) ? args : [];
+  for (let i = 0; i < list.length; i++) {
+    const tok = String(list[i]);
+    if (tok === '--env' && i + 1 < list.length) {
+      const next = String(list[i + 1]);
+      const eq = next.indexOf('=');
+      out.push(tok, eq === -1 ? '***' : `${next.slice(0, eq)}=***`);
+      i++;
+    } else {
+      out.push(tok);
+    }
+  }
+  return out;
+}
+
 /** Capped exponential restart backoff for a crash-looping child (pure). */
 function supervisorBackoffMs(restarts, base = SUPERVISOR_BACKOFF_BASE_MS, max = SUPERVISOR_BACKOFF_MAX_MS) {
   const n = Math.max(0, Number(restarts) || 0);
@@ -3698,7 +3720,7 @@ async function runSupervisorDaemon() {
     w.pid = child.pid || null;
     w.startedAt = new Date().toISOString();
     w.spawnedAt = Date.now();
-    dlog(`worker '${w.id}' (profile ${w.profile}) started pid ${w.pid}: work ${[w.profile, ...w.args].join(' ')}`);
+    dlog(`worker '${w.id}' (profile ${w.profile}) started pid ${w.pid}: work ${[w.profile, ...redactWorkArgs(w.args)].join(' ')}`);
     broadcast({ type: 'event', event: 'worker-start', worker: workerPublic(w) });
 
     // A spawn failure (ENOENT/EMFILE/…) emits only 'error' with no 'exit', so
@@ -5678,6 +5700,7 @@ export {
 export {
   reconstructWorkArgs,
   supervisorWorkerId,
+  redactWorkArgs,
   supervisorBackoffMs,
   encodeFrame,
   decodeFrames,

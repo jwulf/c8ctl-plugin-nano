@@ -16,8 +16,17 @@ const pluginUrl = new URL('./c8ctl-plugin.js', import.meta.url).href;
 
 function sleep(ms) { return new Promise((r) => setTimeout(r, ms)); }
 
+// Restore an env var to its prior value (or unset it if it was unset), so a
+// test never clobbers a variable the runner/developer set before it ran.
+function restoreEnv(key, prev) {
+  if (prev === undefined) delete process.env[key];
+  else process.env[key] = prev;
+}
+
 test('supervisor daemon: start → add → status → remove → stop', async (t) => {
   const HOME = mkdtempSync(join(tmpdir(), 'c8ctl-sup-it-'));
+  const prevHome = process.env.C8CTL_NANO_HOME;
+  const prevEntry = process.env.C8CTL_NANO_ENTRY;
   process.env.C8CTL_NANO_HOME = HOME;
 
   // A profile must exist for `add` to be accepted (the daemon validates against
@@ -47,8 +56,8 @@ test('supervisor daemon: start → add → status → remove → stop', async (t
     const st = mod.runningSupervisor();
     if (st) { try { process.kill(st.pid, 'SIGKILL'); } catch { /* ignore */ } }
     mod.clearSupervisorState();
-    delete process.env.C8CTL_NANO_ENTRY;
-    delete process.env.C8CTL_NANO_HOME;
+    restoreEnv('C8CTL_NANO_ENTRY', prevEntry);
+    restoreEnv('C8CTL_NANO_HOME', prevHome);
     try { rmSync(HOME, { recursive: true, force: true }); } catch { /* ignore */ }
   });
 
@@ -97,6 +106,8 @@ test('supervisor daemon: start → add → status → remove → stop', async (t
 
 test('supervisor daemon: restarts a crashing worker', async (t) => {
   const HOME = mkdtempSync(join(tmpdir(), 'c8ctl-sup-rt-'));
+  const prevHome = process.env.C8CTL_NANO_HOME;
+  const prevEntry = process.env.C8CTL_NANO_ENTRY;
   process.env.C8CTL_NANO_HOME = HOME;
   writeFileSync(join(HOME, 'config.json'), JSON.stringify({
     hires: { flaky: { name: 'flaky', rank: 'senior', command: 'true', model: '', capabilities: [] } },
@@ -121,8 +132,8 @@ test('supervisor daemon: restarts a crashing worker', async (t) => {
     const st = mod.runningSupervisor();
     if (st) { try { process.kill(st.pid, 'SIGKILL'); } catch { /* ignore */ } }
     mod.clearSupervisorState();
-    delete process.env.C8CTL_NANO_ENTRY;
-    delete process.env.C8CTL_NANO_HOME;
+    restoreEnv('C8CTL_NANO_ENTRY', prevEntry);
+    restoreEnv('C8CTL_NANO_HOME', prevHome);
     try { rmSync(HOME, { recursive: true, force: true }); } catch { /* ignore */ }
   });
 
@@ -144,6 +155,8 @@ test('supervisor daemon: restarts a crashing worker', async (t) => {
 
 test('supervisor daemon: restart swaps the child without a spurious restart bump', async (t) => {
   const HOME = mkdtempSync(join(tmpdir(), 'c8ctl-sup-rs-'));
+  const prevHome = process.env.C8CTL_NANO_HOME;
+  const prevEntry = process.env.C8CTL_NANO_ENTRY;
   process.env.C8CTL_NANO_HOME = HOME;
   writeFileSync(join(HOME, 'config.json'), JSON.stringify({
     hires: { steady: { name: 'steady', rank: 'senior', command: 'true', model: '', capabilities: [] } },
@@ -169,8 +182,8 @@ test('supervisor daemon: restart swaps the child without a spurious restart bump
     const st = mod.runningSupervisor();
     if (st) { try { process.kill(st.pid, 'SIGKILL'); } catch { /* ignore */ } }
     mod.clearSupervisorState();
-    delete process.env.C8CTL_NANO_ENTRY;
-    delete process.env.C8CTL_NANO_HOME;
+    restoreEnv('C8CTL_NANO_ENTRY', prevEntry);
+    restoreEnv('C8CTL_NANO_HOME', prevHome);
     try { rmSync(HOME, { recursive: true, force: true }); } catch { /* ignore */ }
   });
 
@@ -193,6 +206,52 @@ test('supervisor daemon: restart swaps the child without a spurious restart bump
   assert.equal(s2.workers[0].state, 'running');
   assert.notEqual(s2.workers[0].pid, first, 'restart should swap in a new child pid');
   assert.equal(s2.workers[0].restarts, 0, 'restart must not be counted as a crash-restart');
+
+  await mod.supervisorRequest({ op: 'stop' });
+});
+
+test('supervisor daemon: adopts a live daemon when the state file is missing', async (t) => {
+  const HOME = mkdtempSync(join(tmpdir(), 'c8ctl-sup-ad-'));
+  const prevHome = process.env.C8CTL_NANO_HOME;
+  const prevEntry = process.env.C8CTL_NANO_ENTRY;
+  process.env.C8CTL_NANO_HOME = HOME;
+  writeFileSync(join(HOME, 'config.json'), JSON.stringify({
+    hires: { faker: { name: 'faker', rank: 'senior', command: 'true', model: '', capabilities: [] } },
+  }));
+  const shim = join(HOME, 'fake-entry.mjs');
+  writeFileSync(shim, [
+    `const argv = process.argv.slice(2);`,
+    `if (argv[0] === 'nano' && argv[1] === 'supervisor' && argv[2] === '__daemon') {`,
+    `  const mod = await import(${JSON.stringify(pluginUrl)});`,
+    `  await mod.runSupervisorDaemon();`,
+    `} else if (argv[0] === 'nano' && argv[1] === 'work') {`,
+    `  setInterval(() => {}, 1 << 30);`,
+    `}`,
+  ].join('\n'));
+  process.env.C8CTL_NANO_ENTRY = shim;
+
+  const mod = await import(pluginUrl);
+  t.after(async () => {
+    try { await mod.supervisorRequest({ op: 'stop' }); } catch { /* ignore */ }
+    const st = mod.runningSupervisor();
+    if (st) { try { process.kill(st.pid, 'SIGKILL'); } catch { /* ignore */ } }
+    mod.clearSupervisorState();
+    restoreEnv('C8CTL_NANO_ENTRY', prevEntry);
+    restoreEnv('C8CTL_NANO_HOME', prevHome);
+    try { rmSync(HOME, { recursive: true, force: true }); } catch { /* ignore */ }
+  });
+
+  const first = await mod.startSupervisorDaemon();
+  assert.ok(first && first.pid, 'daemon should be up with a pid');
+
+  // Simulate the state file being deleted/cleaned while the daemon still
+  // listens on the deterministic socket.
+  mod.clearSupervisorState();
+  assert.equal(mod.readSupervisorState(), null, 'state file should be gone');
+
+  // A second start must adopt the live daemon over the socket, not spawn another.
+  const second = await mod.startSupervisorDaemon();
+  assert.equal(second.pid, first.pid, 'should adopt the existing daemon, not spawn a second');
 
   await mod.supervisorRequest({ op: 'stop' });
 });

@@ -3604,6 +3604,17 @@ function runningSupervisor() {
   return state && isPidAlive(state.pid) ? state : null;
 }
 
+/** Synthesize a state-file-shaped object from a live `status` response. */
+function stateFromStatus(res, socketPath) {
+  return {
+    pid: res.daemon?.pid,
+    startedAt: res.daemon?.startedAt,
+    socket: res.daemon?.socket || socketPath,
+    logFile: res.daemon?.logFile,
+    workers: res.workers || [],
+  };
+}
+
 /** How to re-invoke the c8ctl CLI to spawn the daemon + `work` children. */
 function c8ctlInvocation() {
   const entry = process.env.C8CTL_NANO_ENTRY || process.argv[1];
@@ -3929,6 +3940,17 @@ function supervisorRequest(req, { socketPath, timeoutMs } = {}) {
 async function startSupervisorDaemon() {
   const existing = runningSupervisor();
   if (existing) return existing;
+
+  const socketPath = getSupervisorSocketPath();
+  // The state file may be missing (deleted, cleaned up, or not yet written)
+  // while a daemon is still listening on the deterministic socket. Adopt that
+  // live daemon instead of spawning a second one that would orphan the
+  // original and its workers.
+  try {
+    const res = await supervisorRequest({ op: 'status' }, { socketPath, timeoutMs: 500 });
+    if (res && res.ok) return runningSupervisor() || stateFromStatus(res, socketPath);
+  } catch { /* no live daemon on the socket — safe to (re)spawn */ }
+
   clearSupervisorState(); // clear any stale marker from a dead daemon
 
   const { exec, entry } = c8ctlInvocation();
@@ -3945,7 +3967,7 @@ async function startSupervisorDaemon() {
   if (typeof fd === 'number') { try { closeSync(fd); } catch { /* ignore */ } }
   if (typeof child.pid !== 'number') throw new Error('failed to spawn supervisor daemon');
 
-  const socketPath = getSupervisorSocketPath();
+
   const deadline = Date.now() + SUPERVISOR_CONNECT_TIMEOUT_MS;
   while (Date.now() < deadline) {
     try {
@@ -3954,13 +3976,7 @@ async function startSupervisorDaemon() {
         // The daemon can answer `status` on the socket a beat before it has
         // written supervisor.json. Fall back to the live status response so
         // callers always get a state object with a usable pid.
-        return runningSupervisor() || readSupervisorState() || {
-          pid: res.daemon?.pid,
-          startedAt: res.daemon?.startedAt,
-          socket: res.daemon?.socket || socketPath,
-          logFile: res.daemon?.logFile,
-          workers: res.workers || [],
-        };
+        return runningSupervisor() || readSupervisorState() || stateFromStatus(res, socketPath);
       }
     } catch { /* not up yet */ }
     await new Promise((r) => setTimeout(r, 150));
@@ -3992,24 +4008,25 @@ async function supervisorStartCmd(req, flags) {
 }
 
 async function supervisorStatusCmd() {
+  const logger = getLogger();
   const running = runningSupervisor();
   if (!running) {
     const stale = readSupervisorState();
     if (stale) {
-      console.log('Supervisor: not running (stale state — daemon pid is dead).');
-      console.log('  Start it with: c8ctl nano supervisor start');
+      logger.info('Supervisor: not running (stale state — daemon pid is dead).');
+      logger.info('  Start it with: c8ctl nano supervisor start');
     } else {
-      console.log('Supervisor: not running.');
-      console.log('  Start it with: c8ctl nano supervisor start   (or attach: c8ctl nano supervisor)');
+      logger.info('Supervisor: not running.');
+      logger.info('  Start it with: c8ctl nano supervisor start   (or attach: c8ctl nano supervisor)');
     }
     return;
   }
   try {
     const res = await supervisorRequest({ op: 'status' });
-    if (res.ok) { console.log(formatSupervisorStatus(res)); return; }
+    if (res.ok) { logger.info(formatSupervisorStatus(res)); return; }
   } catch { /* fall back to state file below */ }
   // Socket unreachable but pid alive — render from the last persisted state.
-  console.log(formatSupervisorStatus({
+  logger.info(formatSupervisorStatus({
     daemon: { pid: running.pid, startedAt: running.startedAt, socket: running.socket },
     workers: (running.workers || []).map((w) => summarizeSupervisorWorker(w)),
   }));

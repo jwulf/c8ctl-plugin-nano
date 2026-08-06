@@ -35,6 +35,8 @@ import {
   diskBudgetOk,
   normalizeStoredProfile,
   applyAssign,
+  jobTypeMatrix,
+  diffJobTypes,
   resolveAssignInputs,
   containerEngineAvailable,
   runAgentJob,
@@ -1040,6 +1042,41 @@ test('applyAssign accepts an array of capabilities and adds to an empty set', ()
   const { profile, added } = applyAssign(base, ['docs']);
   assert.deepEqual(profile.capabilities, ['docs']);
   assert.deepEqual(added, ['docs']);
+});
+
+test('diffJobTypes: added-only (capability gained via assign) — no drains', () => {
+  const cur = jobTypeMatrix('senior', ['pr-review']);
+  const want = jobTypeMatrix('senior', ['pr-review', 'fix-ci']);
+  const { added, removed } = diffJobTypes(cur, want);
+  assert.deepEqual(removed, []);
+  // gains the new single-cap token and the combined token
+  assert.deepEqual(added.sort(), ['senior:fix-ci', 'senior:fix-ci+pr-review'].sort());
+});
+
+test('diffJobTypes: removed-only (capability revoked) — no spawns', () => {
+  const cur = jobTypeMatrix('senior', ['pr-review', 'fix-ci']);
+  const want = jobTypeMatrix('senior', ['pr-review']);
+  const { added, removed } = diffJobTypes(cur, want);
+  assert.deepEqual(added, []);
+  assert.deepEqual(removed.sort(), ['senior:fix-ci', 'senior:fix-ci+pr-review'].sort());
+});
+
+test('diffJobTypes: no-op when the sets match (unchanged types untouched)', () => {
+  const cur = jobTypeMatrix('senior', ['plan', 'feature']);
+  const want = jobTypeMatrix('senior', ['feature', 'plan']); // order-insensitive
+  const { added, removed } = diffJobTypes(cur, want);
+  assert.deepEqual(added, []);
+  assert.deepEqual(removed, []);
+});
+
+test('diffJobTypes: preserves --job-type extras as unchanged (they live in both sets)', () => {
+  const extras = ['custom:one'];
+  const cur = [...jobTypeMatrix('senior', ['pr-review']), ...extras];
+  const want = [...jobTypeMatrix('senior', ['pr-review', 'plan']), ...extras];
+  const { added, removed } = diffJobTypes(cur, want);
+  assert.deepEqual(removed, []);
+  assert.ok(!added.includes('custom:one'));
+  assert.ok(added.includes('senior:plan'));
 });
 
 test('resolveAssignInputs: positional name — first positional is the name, rest are capabilities', () => {

@@ -43,6 +43,8 @@ import {
   statfsSync,
   lstatSync,
   mkdtempSync,
+  watchFile,
+  unwatchFile,
 } from 'node:fs';
 import { randomUUID } from 'node:crypto';
 import { homedir, platform as osPlatform, devNull } from 'node:os';
@@ -213,7 +215,19 @@ function readConfig() {
 
 function writeConfig(cfg) {
   mkdirSync(getStateHome(), { recursive: true });
-  writeFileSync(getConfigFile(), JSON.stringify(cfg, null, 2));
+  // Atomic write: serialize to a temp file in the same dir, then rename over the
+  // target. A rename is atomic on a POSIX filesystem, so a concurrent reader
+  // (e.g. `work`'s profile watcher, or another `assign`) never observes a
+  // half-written config.json and JSON.parse never sees a torn file.
+  const target = getConfigFile();
+  const tmp = `${target}.${process.pid}.${Date.now()}.tmp`;
+  writeFileSync(tmp, JSON.stringify(cfg, null, 2));
+  try {
+    renameSync(tmp, target);
+  } catch (err) {
+    try { rmSync(tmp, { force: true }); } catch { /* best effort */ }
+    throw err;
+  }
 }
 
 /**
@@ -1563,6 +1577,21 @@ function jobTypeMatrix(rank, capabilities) {
   for (const c of caps) tokens.push(`${rank}:${c}`);
   if (caps.length > 1) tokens.push(`${rank}:${caps.join('+')}`);
   return [...new Set(tokens)];
+}
+
+/**
+ * Diff a running set of job-type pollers against a desired set. Pure so the
+ * profile-watch reconcile in `work` (which starts pollers for `added` types and
+ * gracefully drains pollers for `removed` types) is unit-testable. Order in the
+ * returned arrays is stable (desired order for `added`, current order for
+ * `removed`) for deterministic logging.
+ */
+function diffJobTypes(current, desired) {
+  const cur = new Set(current);
+  const want = new Set(desired);
+  const added = [...want].filter((t) => !cur.has(t));
+  const removed = [...cur].filter((t) => !want.has(t));
+  return { added, removed };
 }
 
 /** All persisted hire profiles, keyed by name. */
@@ -2975,7 +3004,10 @@ async function workAgent(req, flags) {
   logger.info(`  max parallel: ${maxParallelJobs}; job timeout: ${jobKillMs}ms; activation lock: ${jobLockMs}ms; poll timeout: ${pollTimeoutMs}ms`);
   logger.info('Polling for work — press Ctrl-C to stop.');
 
-  const workers = jobTypes.map((jobType) =>
+  // A per-job-type worker factory. Captures all the CLI-local + profile context
+  // in closure scope so the profile watcher below can (re)spawn a poller for any
+  // job type on demand without re-reading the flags.
+  const makeWorker = (jobType) =>
     camunda.createJobWorker({
       jobType,
       workerName: `${name}:${jobType}`,
@@ -3156,35 +3188,113 @@ async function workAgent(req, flags) {
           variables: { [AGENT_RESULT_KEY]: resultEnvelope },
         });
       },
-    }),
-  );
+    });
+
+  // Live worker registry keyed by job type, so the profile watcher can add or
+  // drain individual pollers without disturbing the others. `draining` is the
+  // shutdown latch (shared with the watcher so a reconcile can't race a stop).
+  const workers = new Map();
+  let draining = false;
+
+  const drainWorker = async (w) => {
+    try {
+      if (typeof w.stopGracefully === 'function') {
+        await w.stopGracefully({ waitUpToMs: STOP_GRACE_MS });
+      } else if (typeof w.stop === 'function') {
+        await w.stop();
+      }
+      return true;
+    } catch {
+      return false; // best-effort: never let one worker's stop failure hang us
+    }
+  };
+
+  const spawnJobType = (jobType) => {
+    if (workers.has(jobType)) return false;
+    workers.set(jobType, makeWorker(jobType));
+    return true;
+  };
+
+  for (const jobType of jobTypes) spawnJobType(jobType);
+
+  // ---- Live profile watch: reconcile the poller set when the watched profile's
+  // job types change (e.g. `c8ctl nano assign <name> …`) — start pollers for
+  // added types, gracefully drain pollers for removed types — without a restart
+  // and without disturbing unchanged types' in-flight work. ----
+  const configFile = getConfigFile();
+  const WATCH_INTERVAL_MS = 1500;
+  let reconciling = false;
+
+  // Desired job types from the CURRENT on-disk profile (matrix ∪ --job-type
+  // extras). Returns { skip } for a transient/torn read, a vanished profile, or
+  // an invalid edit — callers must then KEEP the running set, never tear down.
+  const desiredJobTypes = () => {
+    const stored = readHires()[name];
+    if (!stored) return { skip: 'deleted' };
+    const norm = normalizeStoredProfile(name, stored);
+    if (norm.error) return { skip: norm.error };
+    const m = jobTypeMatrix(norm.profile.rank, norm.profile.capabilities);
+    return { jobTypes: [...new Set([...m, ...extraJobTypes])] };
+  };
+
+  const reconcile = async () => {
+    if (draining || reconciling) return;
+    reconciling = true;
+    try {
+      const desired = desiredJobTypes();
+      if (desired.skip) {
+        if (desired.skip === 'deleted') {
+          logger.warn(`Profile "${name}" is gone from config — keeping the current ${workers.size} worker(s) running.`);
+        } else {
+          logger.warn(`Profile "${name}" reload skipped — ${desired.skip}; keeping current workers.`);
+        }
+        return;
+      }
+      const { added, removed } = diffJobTypes([...workers.keys()], desired.jobTypes);
+      if (added.length === 0 && removed.length === 0) return;
+      logger.info(`Profile "${name}" changed — reconciling job types (+${added.length} / -${removed.length}).`);
+      for (const jt of added) {
+        spawnJobType(jt);
+        logger.info(`  + now listening on ${jt}`);
+      }
+      await Promise.all(
+        removed.map(async (jt) => {
+          const w = workers.get(jt);
+          workers.delete(jt);
+          logger.info(`  - draining ${jt} …`);
+          await drainWorker(w);
+          logger.info(`  - stopped ${jt}`);
+        }),
+      );
+      logger.info(`  now listening on ${workers.size} job type(s): ${[...workers.keys()].join('  ')}`);
+    } finally {
+      reconciling = false;
+    }
+  };
+
+  // `watchFile` (polling stat) is deliberate over `fs.watch`: it survives the
+  // atomic temp+rename that `writeConfig` does (fs.watch would rebind to the old
+  // inode and go silent), and it's uniform across platforms. Profile edits are
+  // rare + manual, so a ~1.5s poll latency is fine.
+  watchFile(configFile, { interval: WATCH_INTERVAL_MS }, (curr, prev) => {
+    if (curr.mtimeMs === prev.mtimeMs) return; // fires each interval; act on real changes only
+    reconcile().catch((err) => logger.warn(`profile reload failed: ${err?.message || err}`));
+  });
 
   // Keep the process alive until a stop signal, then drain gracefully.
   await new Promise((resolve) => {
-    let stopping = false;
     const stop = async (signal) => {
-      if (stopping) return;
-      stopping = true;
-      logger.info(`Received ${signal} — stopping ${workers.length} worker(s)...`);
+      if (draining) return;
+      draining = true;
+      const list = [...workers.values()];
+      logger.info(`Received ${signal} — stopping ${list.length} worker(s)...`);
+      unwatchFile(configFile);
       if (reaperTimer) clearInterval(reaperTimer);
       if (runDirTimer) clearInterval(runDirTimer);
-      let stopFailures = 0;
-      await Promise.all(
-        workers.map(async (w) => {
-          try {
-            if (typeof w.stopGracefully === 'function') {
-              await w.stopGracefully({ waitUpToMs: STOP_GRACE_MS });
-            } else if (typeof w.stop === 'function') {
-              await w.stop();
-            }
-          } catch {
-            // best-effort: never let one worker's stop failure hang shutdown
-            stopFailures += 1;
-          }
-        }),
-      );
+      const results = await Promise.all(list.map(drainWorker));
+      const stopFailures = results.filter((ok) => !ok).length;
       if (stopFailures > 0) {
-        logger.warn(`${stopFailures} of ${workers.length} worker(s) did not stop cleanly; some connections may still be open.`);
+        logger.warn(`${stopFailures} of ${list.length} worker(s) did not stop cleanly; some connections may still be open.`);
       } else {
         logger.info('All workers stopped.');
       }
@@ -4547,6 +4657,7 @@ export {
   applyAssign,
   resolveAssignInputs,
   jobTypeMatrix,
+  diffJobTypes,
   parseJobTypeFlags,
   deriveJobLockMs,
   derivePollTimeoutMs,

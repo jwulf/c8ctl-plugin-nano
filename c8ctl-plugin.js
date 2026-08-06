@@ -3224,6 +3224,13 @@ async function workAgent(req, flags) {
   const configFile = getConfigFile();
   const WATCH_INTERVAL_MS = 1500;
   let reconciling = false;
+  // Set when a profile change arrives while a reconcile is already in flight, so
+  // we run one more pass after the current drain completes instead of dropping
+  // the update until the next change fires.
+  let reconcileRequested = false;
+  // Handle to the in-flight reconcile so shutdown can wait for it to finish
+  // before snapshotting `workers` (avoids double-stops / missed drains).
+  let inFlightReconcile = null;
 
   // Desired job types from the CURRENT on-disk profile (matrix ∪ --job-type
   // extras). Returns { skip } for a transient/torn read, a vanished profile, or
@@ -3238,9 +3245,24 @@ async function workAgent(req, flags) {
   };
 
   const reconcile = async () => {
-    if (draining || reconciling) return;
+    if (draining || reconciling) {
+      // A change landed mid-reconcile — remember it so the current pass loops
+      // once more rather than leaving the worker set stale until the next edit.
+      if (reconciling && !draining) reconcileRequested = true;
+      return;
+    }
     reconciling = true;
     try {
+      do {
+        reconcileRequested = false;
+        await runReconcilePass();
+      } while (reconcileRequested && !draining);
+    } finally {
+      reconciling = false;
+    }
+  };
+
+  const runReconcilePass = async () => {
       const desired = desiredJobTypes();
       if (desired.skip) {
         if (desired.skip === 'deleted') {
@@ -3262,14 +3284,15 @@ async function workAgent(req, flags) {
           const w = workers.get(jt);
           workers.delete(jt);
           logger.info(`  - draining ${jt} …`);
-          await drainWorker(w);
-          logger.info(`  - stopped ${jt}`);
+          const ok = await drainWorker(w);
+          if (ok) {
+            logger.info(`  - stopped ${jt}`);
+          } else {
+            logger.warn(`  - ${jt} did not stop cleanly; some connections may still be open.`);
+          }
         }),
       );
       logger.info(`  now listening on ${workers.size} job type(s): ${[...workers.keys()].join('  ')}`);
-    } finally {
-      reconciling = false;
-    }
   };
 
   // `watchFile` (polling stat) is deliberate over `fs.watch`: it survives the
@@ -3278,7 +3301,9 @@ async function workAgent(req, flags) {
   // rare + manual, so a ~1.5s poll latency is fine.
   watchFile(configFile, { interval: WATCH_INTERVAL_MS }, (curr, prev) => {
     if (curr.mtimeMs === prev.mtimeMs) return; // fires each interval; act on real changes only
-    reconcile().catch((err) => logger.warn(`profile reload failed: ${err?.message || err}`));
+    inFlightReconcile = reconcile()
+      .catch((err) => logger.warn(`profile reload failed: ${err?.message || err}`))
+      .finally(() => { inFlightReconcile = null; });
   });
 
   // Keep the process alive until a stop signal, then drain gracefully.
@@ -3286,9 +3311,16 @@ async function workAgent(req, flags) {
     const stop = async (signal) => {
       if (draining) return;
       draining = true;
+      // Stop watching first so no new reconcile can be triggered, then wait for
+      // any in-flight reconcile to finish before snapshotting `workers` — this
+      // prevents double-stops, missed drains, or a wrong worker count on exit.
+      unwatchFile(configFile);
+      if (inFlightReconcile) {
+        logger.info('Waiting for in-flight profile reconcile to finish before shutdown…');
+        await inFlightReconcile;
+      }
       const list = [...workers.values()];
       logger.info(`Received ${signal} — stopping ${list.length} worker(s)...`);
-      unwatchFile(configFile);
       if (reaperTimer) clearInterval(reaperTimer);
       if (runDirTimer) clearInterval(runDirTimer);
       const results = await Promise.all(list.map(drainWorker));

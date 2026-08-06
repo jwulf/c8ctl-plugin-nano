@@ -4231,12 +4231,18 @@ async function supervisorStopCmd() {
     // Socket unreachable — fall back to signalling the daemon pid directly.
     try { process.kill(running.pid, 'SIGTERM'); } catch { /* already gone */ }
   }
+  // Gate the wait loop and the SIGKILL fallback on the daemon pid we captured,
+  // not on runningSupervisor()/the state file: the daemon clears its state file
+  // as part of shutting down (and liveSupervisor()/external cleanup can remove
+  // it too), so a state-file check can report "gone" while the process is still
+  // alive — which would break the loop early and skip the SIGKILL fallback,
+  // leaving a wedged daemon and its worker process group running.
   const deadline = Date.now() + STOP_GRACE_MS + 2_000;
   while (Date.now() < deadline) {
-    if (!runningSupervisor()) break;
+    if (!isPidAlive(running.pid)) break;
     await new Promise((r) => setTimeout(r, 150));
   }
-  if (runningSupervisor()) {
+  if (isPidAlive(running.pid)) {
     logger.warn(`Supervisor (pid ${running.pid}) did not stop gracefully — sending SIGKILL.`);
     // The daemon is spawned detached (a process-group leader) and its workers
     // are children in that group, so SIGKILL the whole group to avoid orphaning

@@ -3436,6 +3436,11 @@ const SUPERVISOR_CONNECT_TIMEOUT_MS = 6_000;
 // End-to-end deadline for a single request: once connected, a wedged/incompatible
 // daemon that accepts but never sends a `final` frame must not hang the client.
 const SUPERVISOR_RESPONSE_TIMEOUT_MS = 15_000;
+// Tighter end-to-end deadline for quick liveness probes (status checks used by
+// liveSupervisor/ensureSupervisor). Without this, a daemon that accepts the
+// connection but never returns a `final` frame would still block the "fast"
+// probe for the full SUPERVISOR_RESPONSE_TIMEOUT_MS, hanging stop/remove/restart.
+const SUPERVISOR_PROBE_RESPONSE_TIMEOUT_MS = 2_000;
 // Hard cap on a single connection's inbound buffer, so a misbehaving client
 // can't grow the daemon's memory without bound with a newline-free frame.
 const SUPERVISOR_MAX_FRAME_BYTES = 1 << 20; // 1 MiB
@@ -3667,7 +3672,7 @@ async function liveSupervisor() {
   if (running) return running;
   try {
     const socketPath = getSupervisorSocketPath();
-    const res = await supervisorRequest({ op: 'status' }, { socketPath, timeoutMs: 500 });
+    const res = await supervisorRequest({ op: 'status' }, { socketPath, timeoutMs: 500, responseTimeoutMs: SUPERVISOR_PROBE_RESPONSE_TIMEOUT_MS });
     if (res && res.ok) {
       const state = stateFromStatus(res, socketPath);
       try { writeSupervisorState(state); } catch { /* best effort */ }
@@ -4085,7 +4090,7 @@ async function startSupervisorDaemon() {
   // live daemon instead of spawning a second one that would orphan the
   // original and its workers.
   try {
-    const res = await supervisorRequest({ op: 'status' }, { socketPath, timeoutMs: 500 });
+    const res = await supervisorRequest({ op: 'status' }, { socketPath, timeoutMs: 500, responseTimeoutMs: SUPERVISOR_PROBE_RESPONSE_TIMEOUT_MS });
     if (res && res.ok) return runningSupervisor() || stateFromStatus(res, socketPath);
   } catch { /* no live daemon on the socket — safe to (re)spawn */ }
 
@@ -4109,7 +4114,7 @@ async function startSupervisorDaemon() {
   const deadline = Date.now() + SUPERVISOR_CONNECT_TIMEOUT_MS;
   while (Date.now() < deadline) {
     try {
-      const res = await supervisorRequest({ op: 'status' }, { socketPath, timeoutMs: 750 });
+      const res = await supervisorRequest({ op: 'status' }, { socketPath, timeoutMs: 750, responseTimeoutMs: SUPERVISOR_PROBE_RESPONSE_TIMEOUT_MS });
       if (res && res.ok) {
         // The daemon can answer `status` on the socket a beat before it has
         // written supervisor.json. Fall back to the live status response so

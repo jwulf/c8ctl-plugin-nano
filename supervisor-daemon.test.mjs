@@ -6,8 +6,8 @@
 // (so no createClient/broker is needed).
 import { test } from 'node:test';
 import assert from 'node:assert/strict';
-import { mkdtempSync, writeFileSync, rmSync } from 'node:fs';
-import { tmpdir } from 'node:os';
+import { mkdtempSync, writeFileSync, rmSync, statSync } from 'node:fs';
+import { tmpdir, platform as osPlatform } from 'node:os';
 import { join, dirname } from 'node:path';
 import { fileURLToPath } from 'node:url';
 
@@ -68,6 +68,13 @@ test('supervisor daemon: start → add → status → remove → stop', async (t
   assert.equal(st0.ok, true);
   assert.equal(st0.workers.length, 0);
 
+  // The control socket must be owner-only (0600) so other local users can't
+  // drive the supervisor. (Named pipes on Windows use ACLs, not mode bits.)
+  if (osPlatform() !== 'win32') {
+    const mode = statSync(mod.getSupervisorSocketPath()).mode & 0o777;
+    assert.equal(mode, 0o600, `control socket should be 0600, got ${mode.toString(8)}`);
+  }
+
   // Add a worker and confirm it comes up running.
   const added = await mod.supervisorRequest({ op: 'add', profile: 'faker', args: ['--max-parallel', '1'] });
   assert.equal(added.ok, true);
@@ -86,6 +93,21 @@ test('supervisor daemon: start → add → status → remove → stop', async (t
   const bad = await mod.supervisorRequest({ op: 'add', profile: 'nope' });
   assert.equal(bad.ok, false);
   assert.match(bad.error, /no hire/);
+
+  // `--name` is rejected: it would run a different hire than the reported
+  // profile, desynchronising status/logs from what actually runs.
+  const named = await mod.supervisorRequest({ op: 'add', profile: 'faker', args: ['--name', 'someone-else'] });
+  assert.equal(named.ok, false);
+  assert.match(named.error, /--name is not allowed/);
+  const nameShort = await mod.supervisorRequest({ op: 'add', profile: 'faker', args: ['-n', 'someone-else'] });
+  assert.equal(nameShort.ok, false);
+  assert.match(nameShort.error, /--name is not allowed/);
+
+  // The persisted state file records worker argv — it must be owner-only.
+  if (process.platform !== 'win32') {
+    const stMode = statSync(mod.getSupervisorStateFile()).mode & 0o777;
+    assert.equal(stMode, 0o600, `supervisor state file should be 0600, got ${stMode.toString(8)}`);
+  }
 
   // Remove the worker.
   const removed = await mod.supervisorRequest({ op: 'remove', target: 'faker' });

@@ -3701,22 +3701,23 @@ async function runSupervisorDaemon() {
     dlog(`worker '${w.id}' (profile ${w.profile}) started pid ${w.pid}: work ${[w.profile, ...w.args].join(' ')}`);
     broadcast({ type: 'event', event: 'worker-start', worker: workerPublic(w) });
 
-    child.on('error', (err) => {
-      dlog(`worker '${w.id}' spawn error: ${err.message}`);
-    });
-    child.on('exit', (code, signal) => {
-      // Ignore a stale child's exit (e.g. the old process dying after `restart`
-      // already swapped in a new one); otherwise it would clobber the live
-      // child's pid and spuriously restart, leaking a duplicate worker.
-      if (w.child !== child) return;
+    // A spawn failure (ENOENT/EMFILE/…) emits only 'error' with no 'exit', so
+    // both paths funnel through one death handler that schedules a restart.
+    // `settled` guards the error+exit double-fire; the `w.child !== child` check
+    // ignores a stale child's late exit after `restart` swapped in a new one
+    // (which would otherwise clobber the live pid and leak a duplicate worker).
+    let settled = false;
+    const handleDeath = (reason) => {
+      if (w.child !== child || settled) return;
+      settled = true;
       w.pid = null;
-      w.lastExit = signal ? `signal ${signal}` : `code ${code}`;
+      w.lastExit = reason;
       const ranMs = Date.now() - (w.spawnedAt || Date.now());
       if (ranMs >= SUPERVISOR_HEALTHY_UPTIME_MS) w.restarts = 0;
       if (w.stopping || shuttingDown || !workers.has(w.id)) { persist(); return; }
       const delay = supervisorBackoffMs(w.restarts);
       w.restarts += 1;
-      dlog(`worker '${w.id}' exited (${w.lastExit}); restarting in ${delay}ms (restart #${w.restarts})`);
+      dlog(`worker '${w.id}' down (${reason}); restarting in ${delay}ms (restart #${w.restarts})`);
       broadcast({ type: 'event', event: 'worker-exit', worker: workerPublic(w), restartInMs: delay });
       w.restartTimer = setTimeout(() => {
         w.restartTimer = null;
@@ -3724,7 +3725,9 @@ async function runSupervisorDaemon() {
       }, delay);
       if (typeof w.restartTimer.unref === 'function') w.restartTimer.unref();
       persist();
-    });
+    };
+    child.on('error', (err) => handleDeath(`spawn error: ${err.message}`));
+    child.on('exit', (code, signal) => handleDeath(signal ? `signal ${signal}` : `code ${code}`));
     persist();
   };
 

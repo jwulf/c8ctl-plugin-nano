@@ -4113,7 +4113,15 @@ async function supervisorStopCmd() {
   }
   if (runningSupervisor()) {
     logger.warn(`Supervisor (pid ${running.pid}) did not stop gracefully — sending SIGKILL.`);
-    try { process.kill(running.pid, 'SIGKILL'); } catch { /* ignore */ }
+    // The daemon is spawned detached (a process-group leader) and its workers
+    // are children in that group, so SIGKILL the whole group to avoid orphaning
+    // `nano work` processes. Fall back to the bare pid (e.g. on Windows, or if
+    // the daemon isn't a group leader).
+    let killedGroup = false;
+    if (osPlatform() !== 'win32') {
+      try { process.kill(-running.pid, 'SIGKILL'); killedGroup = true; } catch { /* fall back below */ }
+    }
+    if (!killedGroup) { try { process.kill(running.pid, 'SIGKILL'); } catch { /* ignore */ } }
     clearSupervisorState();
   }
   logger.info('Supervisor stopped.');

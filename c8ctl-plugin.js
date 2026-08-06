@@ -4062,7 +4062,10 @@ async function supervisorStatusCmd() {
 
 async function supervisorAddCmd(req, flags) {
   const logger = getLogger();
-  const profile = flags?.name ? String(flags.name).trim() : req.positional[1];
+  // Use only the positional profile. `--name` is a documented hire/work/assign
+  // flag, so honouring it here would make `supervisor add reviewer --name foo`
+  // surprisingly add `foo` instead of `reviewer`.
+  const profile = req.positional[1];
   if (!profile) { logger.error('Usage: c8ctl nano supervisor add <profile> [work flags]'); process.exit(1); }
   await startSupervisorDaemon();
   const res = await supervisorRequest({ op: 'add', profile, args: reconstructWorkArgs(flags) });

@@ -368,7 +368,7 @@ function launcherEnvMarkers(resolved) {
 // Argument parsing
 // ---------------------------------------------------------------------------
 
-const VALID_SUBCOMMANDS = ['start', 'stop', 'status', 'logs', 'log', 'restart', 'pause', 'resume', 'clean', 'set', 'config', 'update', 'hire', 'work'];
+const VALID_SUBCOMMANDS = ['start', 'stop', 'status', 'logs', 'log', 'restart', 'pause', 'resume', 'clean', 'set', 'config', 'update', 'hire', 'assign', 'work'];
 
 /**
  * Parse positional args + flags into a normalized request.
@@ -1622,7 +1622,99 @@ function normalizeStoredProfile(name, profile) {
 }
 
 /**
- * hire — create (or overwrite) an agent profile. Interactive by default; every
+ * Merge additional capabilities into an already-normalized profile, returning a
+ * new profile object with the union of capabilities (canonical order) and a
+ * refreshed `updatedAt`. Pure (no config I/O), so it is unit-testable. Existing
+ * fields — including `createdAt` — are preserved. `incoming` may be a
+ * comma-string or an array. Returns `{ profile, added }`, where `added` lists
+ * the newly gained capabilities (empty when the assign is a no-op).
+ */
+function applyAssign(existing, incoming, now = new Date().toISOString()) {
+  const before = new Set(normalizeCapabilities(existing && existing.capabilities));
+  const union = normalizeCapabilities([...before, ...normalizeCapabilities(incoming)]);
+  const added = union.filter((c) => !before.has(c));
+  return {
+    profile: { ...existing, capabilities: union, updatedAt: now },
+    added,
+  };
+}
+
+/**
+ * Resolve the profile name and the raw comma-joined capability string for an
+ * `assign` invocation from parsed positionals + flags. Pure (no I/O) so the
+ * positional-slicing rules are unit-testable.
+ *
+ * When `--name` is supplied the name does NOT consume a positional, so every
+ * positional is a capability. Otherwise the first positional is the name and
+ * the rest are capabilities. `--capabilities a,b` is always appended.
+ */
+function resolveAssignInputs(req, flags) {
+  const positional = Array.isArray(req?.positional) ? req.positional : [];
+  const name = flags?.name ? String(flags.name).trim() : positional[0];
+  const positionalCaps = flags?.name ? positional : positional.slice(1);
+  const flagCaps = flags?.capabilities !== undefined ? String(flags.capabilities) : '';
+  const incomingRaw = [...positionalCaps, flagCaps].filter(Boolean).join(',');
+  return { name, incomingRaw };
+}
+
+/**
+ * assign — grant new capabilities (roles) to an existing hire without
+ * re-running `hire`. The profile name is positional[0] (or `--name`);
+ * capabilities are the remaining positionals and/or `--capabilities a,b`.
+ * Capabilities are unioned with the profile's existing set (additive; assign
+ * never removes a role) and the updated rank×capability job-type matrix is
+ * printed. Re-run `work` to pick up the new job types.
+ */
+async function assignCapabilities(req, flags) {
+  const logger = getLogger();
+  const { name, incomingRaw } = resolveAssignInputs(req, flags);
+  if (!name) {
+    logger.error('Usage: c8ctl nano assign <profileName> [<capability> ...] [--name <n>] [--capabilities <a,b>]');
+    logger.info('Grant new capabilities to an existing hire. List profiles with: c8ctl nano hire --list');
+    process.exit(1);
+  }
+  if (!isValidProfileName(name)) {
+    logger.error(`Invalid profile name "${name}". Use letters, digits, dot, dash or underscore.`);
+    process.exit(1);
+  }
+
+  if (normalizeCapabilities(incomingRaw).length === 0) {
+    logger.error('Provide at least one capability to assign.');
+    logger.info(`Example: c8ctl nano assign ${name} code-review testing`);
+    process.exit(1);
+  }
+
+  const raw = readHires()[name];
+  if (!raw) {
+    logger.error(`No hire named "${name}". List profiles with: c8ctl nano hire --list`);
+    process.exit(1);
+  }
+  const normalized = normalizeStoredProfile(name, raw);
+  if (normalized.error) {
+    logger.error(`Cannot assign to "${name}": ${normalized.error}. Re-create it with: c8ctl nano hire`);
+    process.exit(1);
+  }
+
+  // Preserve createdAt (normalizeStoredProfile drops it) on the canonical form.
+  const base = {
+    ...normalized.profile,
+    createdAt: typeof raw.createdAt === 'string' ? raw.createdAt : new Date().toISOString(),
+  };
+  const { profile, added } = applyAssign(base, incomingRaw);
+  if (added.length === 0) {
+    logger.info(`"${name}" already has: ${profile.capabilities.join(', ') || '(none)'} — no change.`);
+    return;
+  }
+  writeHire(profile);
+
+  const matrix = jobTypeMatrix(profile.rank, profile.capabilities);
+  logger.info(`Assigned to "${name}" [${profile.rank}]: +${added.join(', ')}`);
+  logger.info(`  capabilities: ${profile.capabilities.join(', ')}`);
+  logger.info(`  job types (${matrix.length}): ${matrix.join('  ')}`);
+  logger.info(`Restart its workers to pick up the new roles: c8ctl nano work ${name}`);
+}
+
+/**
  * field can also be supplied via a flag (--name/--rank/--command/--model/
  * --capabilities) for scripting. Prompts only for the fields still missing.
  * `--list` prints existing profiles instead.
@@ -2031,8 +2123,21 @@ function normalizeTaskEnvelope(customHeaders, variables) {
   };
 
   const task = isPlainObject(raw.task) ? raw.task : {};
+  // Base prompt: the reserved `task.prompt` (typically a model header filled at deploy time),
+  // else a plain `prompt`/`task` job variable (the pre-header delivery path).
+  const basePrompt = str(task.prompt) ?? str(variables?.prompt) ?? str(variables?.task);
+  // Verbatim dynamic append: a header-delivered base prompt can't be composed in FEEL, so a task
+  // may supply per-instance context (e.g. plan-revision feedback, a per-task brief) via the
+  // reserved `task.appendPrompt`, or a plain `appendPrompt` variable. It is concatenated onto the
+  // base with NO injected separator — the caller (the model's ioMapping) owns any leading
+  // separator/preamble — so a null/empty append leaves the base prompt untouched.
+  const appendPrompt = str(task.appendPrompt) ?? str(variables?.appendPrompt);
+  const prompt =
+    appendPrompt != null && appendPrompt !== ''
+      ? `${basePrompt ?? ''}${appendPrompt}`
+      : basePrompt;
   env.task = {
-    prompt: str(task.prompt) ?? str(variables?.prompt) ?? str(variables?.task),
+    prompt,
     promptFile: str(task.promptFile),
     maxIterations: coerceInt(task.maxIterations, undefined),
     timeoutMs: coerceInt(task.timeoutMs, undefined),
@@ -4404,6 +4509,7 @@ export {
   webConsoleUrl,
   consoleLinkLabel,
   hireWorker,
+  assignCapabilities,
 };
 export {
   normalizeTaskEnvelope,
@@ -4438,6 +4544,8 @@ export {
   agentRunsRoot,
   ProvisionError,
   normalizeStoredProfile,
+  applyAssign,
+  resolveAssignInputs,
   jobTypeMatrix,
   parseJobTypeFlags,
   deriveJobLockMs,
@@ -4527,12 +4635,12 @@ export const commands = {
       workspace: { type: 'boolean', description: 'clean: also delete the workspace (models + workers)' },
       check: { type: 'boolean', description: 'update: only report whether a new release is available; do not install' },
       binary: { type: 'string', description: 'Path to the nanobpmn server binary' },
-      name: { type: 'string', description: 'hire/work: agent profile name (alt to positional arg)' },
+      name: { type: 'string', description: 'hire/work/assign: agent profile name (alt to positional arg)' },
       rank: { type: 'string', description: 'hire: agent rank (principal|senior|junior|decider)' },
       command: { type: 'string', description: 'hire: CLI command that runs the agent harness (e.g. copilot, claude, pi)' },
       arg: { type: 'string', multiple: true, description: 'hire/work: command-line switch/arg appended to the harness command (repeatable), e.g. --arg --allow-all. Persisted on hire; work appends more.' },
       model: { type: 'string', description: 'hire: model name passed to the harness (AGENT_MODEL)' },
-      capabilities: { type: 'string', description: 'hire: comma-separated capability list' },
+      capabilities: { type: 'string', description: 'hire/assign: comma-separated capability list' },
       sandbox: { type: 'string', description: 'hire/work: execution sandbox none|docker|podman (default none). Containers isolate each job.' },
       image: { type: 'string', description: 'hire/work: container image the agent runs in (required for --sandbox docker|podman)' },
       env: { type: 'string', multiple: true, description: 'hire/work: static env var for the harness as NAME=VALUE (repeatable); persisted on hire, work extends/overrides. E.g. permission toggles.' },
@@ -4599,6 +4707,9 @@ export const commands = {
             break;
           case 'hire':
             await hireWorker(req, flags);
+            break;
+          case 'assign':
+            await assignCapabilities(req, flags);
             break;
           case 'work':
             await workAgent(req, flags);
@@ -4692,6 +4803,7 @@ function printUsage() {
   console.log('  c8ctl nano config');
   console.log('  c8ctl nano update [--check]');
   console.log('  c8ctl nano hire [--name <n>] [--rank <r>] [--command <c>] [--arg <switch> ...] [--model <m>] [--capabilities <a,b>] [--sandbox none|docker|podman] [--image <ref>] [--env NAME=VALUE ...] [--list]');
+  console.log('  c8ctl nano assign <profileName> [<capability> ...] [--name <n>] [--capabilities <a,b>]');
   console.log('  c8ctl nano work <profileName> [--arg <switch> ...] [--max-parallel <n>] [--job-timeout <ms>] [--lock-grace <ms>] [--poll-timeout <ms>] [--job-type <token> ...] [--sandbox none|docker|podman] [--image <ref>] [--env NAME=VALUE ...] [--secret-resolver host] [--min-free-mb <n>] [--clone-timeout <ms>] [--keep-runs] [--stream]');
   console.log('');
   console.log('Subcommands:');
@@ -4707,6 +4819,7 @@ function printUsage() {
   console.log('  config   Show current configuration and on-disk locations');
   console.log('  update   Pull the latest published nano release (--check to only report)');
   console.log('  hire     Create a CLI agent worker profile (rank + capabilities → job-type matrix)');
+  console.log('  assign   Grant new capabilities (roles) to an existing hire (additive)');
   console.log('  work     Run a hired profile as Nano job workers, polling for work until Ctrl-C');
   console.log('');
   console.log('Options:');
@@ -4723,11 +4836,11 @@ function printUsage() {
   console.log('  --purge              stop: also delete per-node engine data');
   console.log('  --force              start: stop any existing cluster first');
   console.log('  --workspace          clean: also delete the workspace (models + workers)');
-  console.log('  --name <n>           hire/work: agent profile name (alt to positional arg)');
+  console.log('  --name <n>           hire/work/assign: agent profile name (alt to positional arg)');
   console.log('  --rank <r>           hire: agent rank (principal|senior|junior|decider)');
   console.log('  --command <c>        hire: CLI command that runs the agent harness');
   console.log('  --model <m>          hire: model name passed to the harness (AGENT_MODEL)');
-  console.log('  --capabilities <a,b> hire: comma-separated capability list');
+  console.log('  --capabilities <a,b> hire/assign: comma-separated capability list');
   console.log('  --sandbox <s>        hire/work: execution sandbox none|docker|podman (default none)');
   console.log('  --image <ref>        hire/work: container image the agent runs in (required for docker|podman)');
   console.log('  --env NAME=VALUE     hire/work: static env var for the harness (repeatable); persisted on hire, work extends/overrides');

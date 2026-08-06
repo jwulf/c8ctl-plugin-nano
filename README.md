@@ -24,7 +24,7 @@ It adds a single `nano` command:
 
 ```bash
 c8ctl nano start|status|stop|restart|logs|pause|resume|clean|set|config|update
-c8ctl nano hire|work   # turn a CLI agent harness into a Nano job worker
+c8ctl nano hire|assign|work   # hire/assign manage agent profiles; work runs one as a Nano job worker
 ```
 
 `nano start N` spawns **N** nanobpmn node processes wired to talk to each other
@@ -157,6 +157,24 @@ c8ctl nano hire --name coder --rank senior --command copilot --arg --allow-all
 c8ctl nano hire --list
 ```
 
+**`assign <name> [capabilities...]`** grants new capabilities (roles) to an
+existing hire without re-running `hire`. Capabilities are **added** to (unioned
+with) the profile's current set — `assign` never removes a role — and the
+updated job-type matrix is printed. Restart the profile's workers so they pick
+up the new job types:
+
+```bash
+# Give an existing reviewer two more capabilities
+c8ctl nano assign reviewer triage refactoring
+
+# --capabilities works too (comma-separated), equivalent to the positionals above
+c8ctl nano assign reviewer --capabilities triage,refactoring
+
+# then restart its workers to service the new job types
+c8ctl nano work reviewer
+```
+
+
 **`work <name>`** loads the profile, connects with the c8ctl SDK client, and
 registers one job worker per token in the **rank × capability matrix**, then
 polls for work in the foreground until Ctrl-C. For rank `senior` and
@@ -256,6 +274,16 @@ Element templates emit flat dotpath header keys (strings); the plugin expands
 them into a nested object and coerces `"true"/"false"` → bool and numeric
 strings → int. The normalized shape is
 `{ schemaVersion, repository{provider,url,ref,depth,submodules,authRef}, branch{base,create,push}, setup{commands,env,secretRefs}, task{prompt,promptFile,maxIterations,timeoutMs,allowPr,prBase} }`.
+
+**Prompt = base + optional verbatim append.** The agent's prompt resolves to
+`task.prompt` (typically a model header filled at deploy time), falling back to a
+plain `prompt`/`task` variable. Because a header-delivered base prompt can't be
+composed in FEEL, a task may supply per-instance context via **`task.appendPrompt`**
+(reserved) or a plain **`appendPrompt`** variable — it is concatenated onto the base
+**verbatim, with no injected separator** (the model's ioMapping owns any leading
+separator/preamble), so a null/empty append leaves the base untouched. This lets the
+static prompt live in a model header/side-car while the dynamic tail (e.g. plan-revision
+feedback, a per-task brief) is built per instance.
 On completion the plugin writes an **output envelope** back under
 `io.nanobpm.agentResult` (`{schemaVersion, status, sandbox, image, output, truncated, stderrTruncated, exitCode, signal, error}`). When a repository was
 provisioned (below) it also carries `{repository, branch, baseSha, headSha, commits[], pushed, pushError?, gitError?, pr?}`.

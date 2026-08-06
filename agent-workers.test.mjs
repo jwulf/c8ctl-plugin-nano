@@ -34,6 +34,8 @@ import {
   reapAgentContainers,
   diskBudgetOk,
   normalizeStoredProfile,
+  applyAssign,
+  resolveAssignInputs,
   containerEngineAvailable,
   runAgentJob,
   provisionRepo,
@@ -106,6 +108,34 @@ test('normalizeTaskEnvelope: variables override headers, coercion applied', () =
   assert.equal(env.task.allowPr, true, 'variable override should win');
   assert.equal(env.task.maxIterations, 5);
   assert.equal(env.task.prompt, 'do the thing');
+});
+
+test('normalizeTaskEnvelope: appendPrompt (reserved) is concatenated verbatim onto the header base', () => {
+  const headers = { [`${AGENT_TASK_NS}.task.prompt`]: 'BASE PROMPT' };
+  const variables = { [`${AGENT_TASK_NS}.task.appendPrompt`]: '\n\n---\n\nEXTRA' };
+  const env = normalizeTaskEnvelope(headers, variables);
+  assert.equal(env.task.prompt, 'BASE PROMPT\n\n---\n\nEXTRA');
+});
+
+test('normalizeTaskEnvelope: a plain appendPrompt variable also appends (no injected separator)', () => {
+  const env = normalizeTaskEnvelope(
+    { [`${AGENT_TASK_NS}.task.prompt`]: 'BASE' },
+    { appendPrompt: 'SUFFIX' },
+  );
+  // Verbatim concat — the model owns any separator, so none is inserted by the harness.
+  assert.equal(env.task.prompt, 'BASESUFFIX');
+});
+
+test('normalizeTaskEnvelope: a null/empty appendPrompt leaves the base prompt untouched', () => {
+  const base = { [`${AGENT_TASK_NS}.task.prompt`]: 'BASE' };
+  assert.equal(normalizeTaskEnvelope(base, { appendPrompt: null }).task.prompt, 'BASE');
+  assert.equal(normalizeTaskEnvelope(base, { appendPrompt: '' }).task.prompt, 'BASE');
+  assert.equal(normalizeTaskEnvelope(base, {}).task.prompt, 'BASE');
+});
+
+test('normalizeTaskEnvelope: appendPrompt also composes onto a base delivered as a plain prompt var', () => {
+  const env = normalizeTaskEnvelope({}, { prompt: 'BASE', appendPrompt: '+MORE' });
+  assert.equal(env.task.prompt, 'BASE+MORE');
 });
 
 test('normalizeTaskEnvelope: no repository when url absent', () => {
@@ -972,4 +1002,78 @@ test('derivePollTimeoutMs: defaults to 30s but honours 0 and negative', () => {
   assert.equal(derivePollTimeoutMs('-5000'), -5_000);
   // Leading numeric with trailing junk parses like parseInt (best-effort).
   assert.equal(derivePollTimeoutMs('30000ms'), 30_000);
+});
+
+test('applyAssign unions new capabilities into an existing profile (canonical, additive)', () => {
+  const base = {
+    name: 'reviewer',
+    rank: 'senior',
+    command: 'copilot',
+    model: '',
+    capabilities: ['code-review', 'testing'],
+    sandbox: 'none',
+    image: '',
+    env: {},
+    createdAt: '2026-01-01T00:00:00.000Z',
+  };
+  const { profile, added } = applyAssign(base, 'triage, Refactoring', '2026-02-02T00:00:00.000Z');
+  // Union, deduped, lowercased, sorted.
+  assert.deepEqual(profile.capabilities, ['code-review', 'refactoring', 'testing', 'triage']);
+  // Only the genuinely new roles are reported.
+  assert.deepEqual(added, ['refactoring', 'triage']);
+  // Existing fields (incl. createdAt) preserved; updatedAt refreshed.
+  assert.equal(profile.createdAt, '2026-01-01T00:00:00.000Z');
+  assert.equal(profile.updatedAt, '2026-02-02T00:00:00.000Z');
+  assert.equal(profile.rank, 'senior');
+  assert.equal(profile.command, 'copilot');
+});
+
+test('applyAssign is idempotent: assigning existing capabilities is a no-op (added is empty)', () => {
+  const base = { name: 'r', rank: 'senior', command: 'copilot', capabilities: ['code-review', 'testing'] };
+  const { profile, added } = applyAssign(base, ['testing', 'code-review']);
+  assert.deepEqual(added, []);
+  assert.deepEqual(profile.capabilities, ['code-review', 'testing']);
+});
+
+test('applyAssign accepts an array of capabilities and adds to an empty set', () => {
+  const base = { name: 'r', rank: 'junior', command: 'copilot', capabilities: [] };
+  const { profile, added } = applyAssign(base, ['docs']);
+  assert.deepEqual(profile.capabilities, ['docs']);
+  assert.deepEqual(added, ['docs']);
+});
+
+test('resolveAssignInputs: positional name — first positional is the name, rest are capabilities', () => {
+  const { name, incomingRaw } = resolveAssignInputs(
+    { positional: ['reviewer', 'triage', 'refactoring'] },
+    {},
+  );
+  assert.equal(name, 'reviewer');
+  assert.equal(incomingRaw, 'triage,refactoring');
+});
+
+test('resolveAssignInputs: --name — every positional is a capability (no first-cap drop)', () => {
+  const { name, incomingRaw } = resolveAssignInputs(
+    { positional: ['triage', 'refactoring'] },
+    { name: 'reviewer' },
+  );
+  assert.equal(name, 'reviewer');
+  assert.equal(incomingRaw, 'triage,refactoring');
+});
+
+test('resolveAssignInputs: --name with --capabilities and positionals are all unioned', () => {
+  const { name, incomingRaw } = resolveAssignInputs(
+    { positional: ['triage'] },
+    { name: 'reviewer', capabilities: 'docs,testing' },
+  );
+  assert.equal(name, 'reviewer');
+  assert.equal(incomingRaw, 'triage,docs,testing');
+});
+
+test('resolveAssignInputs: positional name with only --capabilities (no capability positionals)', () => {
+  const { name, incomingRaw } = resolveAssignInputs(
+    { positional: ['reviewer'] },
+    { capabilities: 'docs' },
+  );
+  assert.equal(name, 'reviewer');
+  assert.equal(incomingRaw, 'docs');
 });

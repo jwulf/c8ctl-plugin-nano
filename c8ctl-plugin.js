@@ -3914,6 +3914,7 @@ async function runSupervisorDaemon() {
           break;
         }
         case 'remove': {
+          if (shuttingDown) { sock.write(encodeFrame({ ok: false, error: 'supervisor is shutting down', final: true })); break; }
           const removed = await serializeOp(async () => {
             const ids = resolveTargets(req.target);
             for (const id of ids) await removeWorker(id);
@@ -4171,7 +4172,7 @@ async function supervisorStatusCmd() {
     // adopts. Probe it before declaring the supervisor down, and re-persist so
     // the state file is healed for later pid-based checks.
     try {
-      const res = await supervisorRequest({ op: 'status' }, { socketPath: getSupervisorSocketPath() });
+      const res = await supervisorRequest({ op: 'status' }, { socketPath: getSupervisorSocketPath(), timeoutMs: 500, responseTimeoutMs: SUPERVISOR_PROBE_RESPONSE_TIMEOUT_MS });
       if (res && res.ok) {
         try { writeSupervisorState(stateFromStatus(res, getSupervisorSocketPath())); } catch { /* best effort */ }
         logger.info(formatSupervisorStatus(res));

@@ -4014,6 +4014,18 @@ async function supervisorStatusCmd() {
   const logger = getLogger();
   const running = runningSupervisor();
   if (!running) {
+    // The state file may be missing (deleted/cleaned) while a daemon is still
+    // listening on the deterministic socket — same case startSupervisorDaemon
+    // adopts. Probe it before declaring the supervisor down, and re-persist so
+    // the state file is healed for later pid-based checks.
+    try {
+      const res = await supervisorRequest({ op: 'status' }, { socketPath: getSupervisorSocketPath() });
+      if (res && res.ok) {
+        try { writeSupervisorState(stateFromStatus(res, getSupervisorSocketPath())); } catch { /* best effort */ }
+        logger.info(formatSupervisorStatus(res));
+        return;
+      }
+    } catch { /* no live daemon on the socket — genuinely down */ }
     const stale = readSupervisorState();
     if (stale) {
       logger.info('Supervisor: not running (stale state — daemon pid is dead).');

@@ -3857,11 +3857,17 @@ async function runSupervisorDaemon() {
   const server = createServer((sock) => {
     sock.setEncoding('utf8');
     let buf = '';
-    sock.on('data', async (chunk) => {
+    // Serialize requests per connection: handleRequest is async and mutates the
+    // shared workers map, so a second 'data' event arriving mid-await must not
+    // interleave add/remove/restart. Chain each frame onto a per-socket queue.
+    let queue = Promise.resolve();
+    sock.on('data', (chunk) => {
       buf += chunk;
       const { frames, rest } = decodeFrames(buf);
       buf = rest;
-      for (const req of frames) await handleRequest(req, sock);
+      for (const req of frames) {
+        queue = queue.then(() => handleRequest(req, sock)).catch((err) => dlog(`request error: ${err?.message || err}`));
+      }
     });
     sock.on('close', () => attachClients.delete(sock));
     sock.on('error', () => attachClients.delete(sock));
@@ -3874,6 +3880,13 @@ async function runSupervisorDaemon() {
     dlog(`failed to bind control socket ${socketPath}: ${err.message}`);
     process.exit(1);
   });
+
+  // Lock the control socket to the owner so another local user can't drive the
+  // supervisor (stop/add/remove). Unix only — Windows named pipes are secured
+  // by their own ACLs, not filesystem mode bits.
+  if (osPlatform() !== 'win32') {
+    try { chmodSync(socketPath, 0o600); } catch (err) { dlog(`could not chmod control socket: ${err.message}`); }
+  }
 
   process.once('SIGTERM', () => shutdown('SIGTERM'));
   process.once('SIGINT', () => shutdown('SIGINT'));
@@ -4119,9 +4132,10 @@ function supervisorLogsCmd(req) {
   const proc = spawn('tail', tailArgs, { stdio: ['ignore', 'inherit', 'inherit'] });
   proc.on('error', () => {
     // tail unavailable (e.g. Windows): print the tail ourselves, no follow.
+    if (follow) logger.warn('`--follow` is not supported without `tail` on this platform; printing the current tail only.');
     try {
       const lines = readFileSync(file, 'utf-8').split('\n');
-      console.log(lines.slice(-200).join('\n'));
+      logger.info(lines.slice(-200).join('\n'));
     } catch (err) { logger.error(`Could not read ${file}: ${err.message}`); }
   });
 }

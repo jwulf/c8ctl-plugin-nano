@@ -6,8 +6,8 @@
 // (so no createClient/broker is needed).
 import { test } from 'node:test';
 import assert from 'node:assert/strict';
-import { mkdtempSync, writeFileSync, rmSync } from 'node:fs';
-import { tmpdir } from 'node:os';
+import { mkdtempSync, writeFileSync, rmSync, statSync } from 'node:fs';
+import { tmpdir, platform as osPlatform } from 'node:os';
 import { join, dirname } from 'node:path';
 import { fileURLToPath } from 'node:url';
 
@@ -67,6 +67,13 @@ test('supervisor daemon: start → add → status → remove → stop', async (t
   const st0 = await mod.supervisorRequest({ op: 'status' });
   assert.equal(st0.ok, true);
   assert.equal(st0.workers.length, 0);
+
+  // The control socket must be owner-only (0600) so other local users can't
+  // drive the supervisor. (Named pipes on Windows use ACLs, not mode bits.)
+  if (osPlatform() !== 'win32') {
+    const mode = statSync(mod.getSupervisorSocketPath()).mode & 0o777;
+    assert.equal(mode, 0o600, `control socket should be 0600, got ${mode.toString(8)}`);
+  }
 
   // Add a worker and confirm it comes up running.
   const added = await mod.supervisorRequest({ op: 'add', profile: 'faker', args: ['--max-parallel', '1'] });

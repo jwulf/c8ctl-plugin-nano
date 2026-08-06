@@ -10,6 +10,7 @@ import assert from 'node:assert/strict';
 import {
   reconstructWorkArgs,
   supervisorWorkerId,
+  redactWorkArgs,
   supervisorBackoffMs,
   encodeFrame,
   decodeFrames,
@@ -73,6 +74,28 @@ test('supervisorWorkerId disambiguates duplicates with #N', () => {
 test('supervisorWorkerId accepts an array of taken ids and falls back on blanks', () => {
   assert.equal(supervisorWorkerId('coder', ['coder']), 'coder#2');
   assert.equal(supervisorWorkerId('', new Set()), 'worker');
+});
+
+// --- redactWorkArgs --------------------------------------------------------
+
+test('redactWorkArgs masks --env values but preserves the name and other flags', () => {
+  assert.deepEqual(
+    redactWorkArgs(['--max-parallel', '2', '--env', 'TOKEN=s3cr3t', '--stream']),
+    ['--max-parallel', '2', '--env', 'TOKEN=***', '--stream'],
+  );
+});
+
+test('redactWorkArgs masks multiple --env values and a bare (=-less) value', () => {
+  assert.deepEqual(
+    redactWorkArgs(['--env', 'A=1', '--env', 'B=2', '--env', 'JUSTNAME']),
+    ['--env', 'A=***', '--env', 'B=***', '--env', '***'],
+  );
+});
+
+test('redactWorkArgs leaves argv without --env untouched and tolerates non-arrays', () => {
+  assert.deepEqual(redactWorkArgs(['--sandbox', 'docker']), ['--sandbox', 'docker']);
+  assert.deepEqual(redactWorkArgs(undefined), []);
+  assert.deepEqual(redactWorkArgs(['--env']), ['--env']); // trailing flag, no value
 });
 
 // --- supervisorBackoffMs ---------------------------------------------------

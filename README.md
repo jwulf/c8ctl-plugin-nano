@@ -219,7 +219,7 @@ c8ctl nano assign reviewer fix-ci     # add a capability to the live profile
 — the supervisor reconciles its pollers in place: it **starts** pollers for the
 newly added rank×capability job types and **gracefully drains** the pollers for
 removed types — best-effort: each draining poller is given a bounded grace
-window (`STOP_GRACE_MS`, currently 8s) for its in-flight jobs to finish before
+window (`STOP_GRACE_MS`) for its in-flight jobs to finish before
 it is stopped, so long-running work exceeding that window may still be
 interrupted. Unchanged job types keep running undisturbed, so there is no need
 to stop and restart the worker.

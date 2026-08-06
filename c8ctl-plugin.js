@@ -3335,7 +3335,15 @@ async function workAgent(req, flags) {
   // inode and go silent), and it's uniform across platforms. Profile edits are
   // rare + manual, so a ~1.5s poll latency is fine.
   watchFile(configFile, { interval: WATCH_INTERVAL_MS }, (curr, prev) => {
-    if (curr.mtimeMs === prev.mtimeMs) return; // fires each interval; act on real changes only
+    // Fires each interval; act only on real changes. Compare mtime, ctime and
+    // size, not mtime alone: on filesystems with coarse mtime resolution (or two
+    // edits within one mtime tick) mtimeMs can be unchanged while size/ctimeMs
+    // differ, and an mtime-only guard would skip a genuine profile update.
+    if (
+      curr.mtimeMs === prev.mtimeMs &&
+      curr.ctimeMs === prev.ctimeMs &&
+      curr.size === prev.size
+    ) return;
     // `reconcile()` owns the `inFlightReconcile` handle: a change arriving while
     // a reconcile is already running coalesces into the current pass and returns
     // that same in-flight promise, so shutdown always waits for the real one.

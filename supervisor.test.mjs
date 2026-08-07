@@ -10,6 +10,11 @@ import assert from 'node:assert/strict';
 import {
   reconstructWorkArgs,
   supervisorWorkerId,
+  autoWorkerName,
+  sanitizeNameToken,
+  isValidWorkerName,
+  randomNameSuffix,
+  extractNameFlag,
   redactWorkArgs,
   supervisorBackoffMs,
   encodeFrame,
@@ -74,6 +79,111 @@ test('supervisorWorkerId disambiguates duplicates with #N', () => {
 test('supervisorWorkerId accepts an array of taken ids and falls back on blanks', () => {
   assert.equal(supervisorWorkerId('coder', ['coder']), 'coder#2');
   assert.equal(supervisorWorkerId('', new Set()), 'worker');
+});
+
+// --- sanitizeNameToken -----------------------------------------------------
+
+test('sanitizeNameToken lowercases nothing but strips unsafe chars and trims separators', () => {
+  assert.equal(sanitizeNameToken('reviewer', 'x'), 'reviewer');
+  assert.equal(sanitizeNameToken('My Worker!', 'x'), 'My-Worker');
+  assert.equal(sanitizeNameToken('  --weird__name--  ', 'x'), 'weird__name');
+});
+
+test('sanitizeNameToken falls back when the result would be empty', () => {
+  assert.equal(sanitizeNameToken('', 'fallback'), 'fallback');
+  assert.equal(sanitizeNameToken('***', 'fallback'), 'fallback');
+  assert.equal(sanitizeNameToken(null, 'fallback'), 'fallback');
+});
+
+// --- isValidWorkerName -----------------------------------------------------
+
+test('isValidWorkerName accepts safe id tokens (trimmed)', () => {
+  assert.equal(isValidWorkerName('reviewer'), true);
+  assert.equal(isValidWorkerName('reviewer-eu.2_beta'), true);
+  assert.equal(isValidWorkerName('  reviewer  '), true); // trimmed first
+});
+
+test('isValidWorkerName rejects blanks, non-strings, and unsafe chars', () => {
+  assert.equal(isValidWorkerName(''), false);
+  assert.equal(isValidWorkerName('   '), false);
+  assert.equal(isValidWorkerName(null), false);
+  assert.equal(isValidWorkerName(123), false);
+  // `:` would corrupt the broker `‹name›:‹jobType›` form:
+  assert.equal(isValidWorkerName('faker:1'), false);
+  // path separators / traversal must never reach a log filename:
+  assert.equal(isValidWorkerName('a/b'), false);
+  assert.equal(isValidWorkerName('../etc'), false);
+  assert.equal(isValidWorkerName('has space'), false);
+});
+
+test('isValidWorkerName rejects names that would collide on the sanitized log file', () => {
+  // `faker:1` and `faker_1` both sanitize to worker-faker_1.log; rejecting the
+  // former (`:` unsafe) prevents two distinct workers sharing one log file.
+  assert.equal(isValidWorkerName('faker:1'), false);
+  assert.equal(isValidWorkerName('faker_1'), true);
+});
+
+// --- randomNameSuffix ------------------------------------------------------
+
+test('randomNameSuffix is a lowercase hex string of the requested byte length', () => {
+  assert.match(randomNameSuffix(4), /^[0-9a-f]{8}$/);
+  assert.match(randomNameSuffix(2), /^[0-9a-f]{4}$/);
+});
+
+// --- autoWorkerName --------------------------------------------------------
+
+test('autoWorkerName builds ‹short-host›-‹profile›-‹random› with injected parts', () => {
+  assert.equal(
+    autoWorkerName('reviewer', { host: 'MBP.local', rand: () => 'abcd' }),
+    'mbp-reviewer-abcd',
+  );
+});
+
+test('autoWorkerName uses the first dot-label of the host, lowercased', () => {
+  assert.equal(
+    autoWorkerName('coder', { host: 'Build-Box.eu.example.com', rand: () => '01ff' }),
+    'build-box-coder-01ff',
+  );
+});
+
+test('autoWorkerName sanitizes each segment and applies fallbacks', () => {
+  assert.equal(autoWorkerName('', { host: '', rand: () => '' }), 'host-worker-0');
+});
+
+test('autoWorkerName varies with the random suffix (distinct rand → distinct name)', () => {
+  // Deterministic: inject a rand that yields two distinct suffixes and assert the
+  // suffix drives the name apart — the property that keeps two same-profile
+  // workers distinct — without relying on probability.
+  const seq = ['aaaa', 'bbbb'];
+  let i = 0;
+  const rand = () => seq[i++];
+  const a = autoWorkerName('reviewer', { host: 'h', rand });
+  const b = autoWorkerName('reviewer', { host: 'h', rand });
+  assert.equal(a, 'h-reviewer-aaaa');
+  assert.equal(b, 'h-reviewer-bbbb');
+  assert.notEqual(a, b);
+});
+
+// --- extractNameFlag -------------------------------------------------------
+
+test('extractNameFlag pulls --name <val> out of the token list', () => {
+  assert.deepEqual(
+    extractNameFlag(['--name', 'alice', '--max-parallel', '2']),
+    { name: 'alice', rest: ['--max-parallel', '2'] },
+  );
+});
+
+test('extractNameFlag supports --name=val and -n forms', () => {
+  assert.deepEqual(extractNameFlag(['--name=bob', '--stream']), { name: 'bob', rest: ['--stream'] });
+  assert.deepEqual(extractNameFlag(['-n', 'carol']), { name: 'carol', rest: [] });
+  assert.deepEqual(extractNameFlag(['-n=dave']), { name: 'dave', rest: [] });
+});
+
+test('extractNameFlag last occurrence wins and blanks yield undefined', () => {
+  assert.deepEqual(extractNameFlag(['--name', 'a', '--name', 'b']), { name: 'b', rest: [] });
+  assert.deepEqual(extractNameFlag(['--name']), { name: undefined, rest: [] });
+  assert.deepEqual(extractNameFlag([]), { name: undefined, rest: [] });
+  assert.deepEqual(extractNameFlag(null), { name: undefined, rest: [] });
 });
 
 // --- redactWorkArgs --------------------------------------------------------

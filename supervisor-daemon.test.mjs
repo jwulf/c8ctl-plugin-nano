@@ -6,7 +6,7 @@
 // (so no createClient/broker is needed).
 import { test } from 'node:test';
 import assert from 'node:assert/strict';
-import { mkdtempSync, writeFileSync, rmSync, statSync } from 'node:fs';
+import { mkdtempSync, writeFileSync, readFileSync, readdirSync, rmSync, statSync } from 'node:fs';
 import { tmpdir, platform as osPlatform } from 'node:os';
 import { join, dirname } from 'node:path';
 import { fileURLToPath } from 'node:url';
@@ -15,6 +15,21 @@ const here = dirname(fileURLToPath(import.meta.url));
 const pluginUrl = new URL('./c8ctl-plugin.js', import.meta.url).href;
 
 function sleep(ms) { return new Promise((r) => setTimeout(r, ms)); }
+
+// Read the argv a shim child recorded for a given pid (best effort — the file
+// is written on the child's first tick after spawn, so retry with real delays).
+async function readChildArgv(dir, pid) {
+  for (let i = 0; i < 30; i++) {
+    try { return JSON.parse(readFileSync(join(dir, `${pid}.json`), 'utf8')); } catch { /* not yet */ }
+    // Fall back to scanning the dir in case the reported pid differs.
+    try {
+      const files = readdirSync(dir);
+      if (files.length) return JSON.parse(readFileSync(join(dir, files[0]), 'utf8'));
+    } catch { /* dir not created yet */ }
+    await sleep(50);
+  }
+  return null;
+}
 
 // Restore an env var to its prior value (or unset it if it was unset), so a
 // test never clobbers a variable the runner/developer set before it ran.
@@ -36,14 +51,21 @@ test('supervisor daemon: start → add → status → remove → stop', async (t
   }));
 
   // Fake c8ctl entry: routes the daemon to the real code and `work` to an idle
-  // stand-in. Kept dependency-free so it works under `node <shim>`.
+  // stand-in. The `work` branch records its own argv to `work-argv/<pid>.json`
+  // so the test can prove the daemon spawns the child with `--name <w.id>`.
+  // Kept dependency-free so it works under `node <shim>`.
+  const workArgvDir = join(HOME, 'work-argv');
   const shim = join(HOME, 'fake-entry.mjs');
   writeFileSync(shim, [
+    `import { writeFileSync, mkdirSync } from 'node:fs';`,
+    `import { join } from 'node:path';`,
     `const argv = process.argv.slice(2);`,
     `if (argv[0] === 'nano' && argv[1] === 'supervisor' && argv[2] === '__daemon') {`,
     `  const mod = await import(${JSON.stringify(pluginUrl)});`,
     `  await mod.runSupervisorDaemon();`,
     `} else if (argv[0] === 'nano' && argv[1] === 'work') {`,
+    `  try { mkdirSync(${JSON.stringify(workArgvDir)}, { recursive: true }); ` +
+    `writeFileSync(join(${JSON.stringify(workArgvDir)}, process.pid + '.json'), JSON.stringify(argv)); } catch {}`,
     `  setInterval(() => {}, 1 << 30); // idle worker stand-in until killed`,
     `}`,
   ].join('\n'));
@@ -75,10 +97,14 @@ test('supervisor daemon: start → add → status → remove → stop', async (t
     assert.equal(mode, 0o600, `control socket should be 0600, got ${mode.toString(8)}`);
   }
 
-  // Add a worker and confirm it comes up running.
+  // Add a worker and confirm it comes up running. With no explicit name the
+  // daemon auto-assigns ‹short-host›-‹profile›-‹random›; the profile is still
+  // `faker` (that's the hire it runs).
   const added = await mod.supervisorRequest({ op: 'add', profile: 'faker', args: ['--max-parallel', '1'] });
   assert.equal(added.ok, true);
-  assert.equal(added.worker.id, 'faker');
+  assert.match(added.worker.id, /^[a-z0-9._-]+-faker-[0-9a-f]+$/);
+  assert.equal(added.worker.profile, 'faker');
+  const autoId = added.worker.id;
 
   // Poll briefly for the child to be observed running.
   let running = false;
@@ -89,19 +115,48 @@ test('supervisor daemon: start → add → status → remove → stop', async (t
   }
   assert.ok(running, 'the added worker should be running');
 
+  // The daemon must spawn the child with `--name <w.id>` so the child's broker
+  // workerName matches its supervisor id (the core same-profile-distinctness
+  // mechanism). The shim recorded its own argv keyed by pid.
+  const childArgv = await readChildArgv(workArgvDir, added.worker.pid);
+  assert.ok(childArgv, 'the child should have recorded its argv');
+  const nameIdx = childArgv.indexOf('--name');
+  assert.ok(nameIdx !== -1, `child argv should carry --name: ${JSON.stringify(childArgv)}`);
+  assert.equal(childArgv[nameIdx + 1], autoId, 'child --name should equal the supervisor id');
+  assert.deepEqual(childArgv.slice(0, 3), ['nano', 'work', 'faker'], 'child runs the positional profile');
+
   // Adding an unknown profile is rejected.
   const bad = await mod.supervisorRequest({ op: 'add', profile: 'nope' });
   assert.equal(bad.ok, false);
   assert.match(bad.error, /no hire/);
 
-  // `--name` is rejected: it would run a different hire than the reported
-  // profile, desynchronising status/logs from what actually runs.
-  const named = await mod.supervisorRequest({ op: 'add', profile: 'faker', args: ['--name', 'someone-else'] });
-  assert.equal(named.ok, false);
-  assert.match(named.error, /--name is not allowed/);
-  const nameShort = await mod.supervisorRequest({ op: 'add', profile: 'faker', args: ['-n', 'someone-else'] });
-  assert.equal(nameShort.ok, false);
-  assert.match(nameShort.error, /--name is not allowed/);
+  // A top-level `name` names the worker (it runs the positional profile). Add a
+  // second same-profile instance under an explicit name to prove co-existence.
+  const named = await mod.supervisorRequest({ op: 'add', profile: 'faker', name: 'faker-two' });
+  assert.equal(named.ok, true);
+  assert.equal(named.worker.id, 'faker-two');
+  assert.equal(named.worker.profile, 'faker');
+
+  // Re-using an existing worker name is rejected.
+  const dup = await mod.supervisorRequest({ op: 'add', profile: 'faker', name: 'faker-two' });
+  assert.equal(dup.ok, false);
+  assert.match(dup.error, /already exists/);
+
+  // An explicit name with unsafe chars (here `:`, which would both corrupt the
+  // broker `‹name›:‹jobType›` form and collide onto a sanitized log filename) is
+  // rejected up-front rather than silently mangled.
+  const badName = await mod.supervisorRequest({ op: 'add', profile: 'faker', name: 'faker:1' });
+  assert.equal(badName.ok, false);
+  assert.match(badName.error, /invalid worker name/);
+
+  // `--name` inside the forwarded work args is rejected: it would fight the
+  // supervisor-assigned id. Operators must use the dedicated top-level flag.
+  const badArgName = await mod.supervisorRequest({ op: 'add', profile: 'faker', args: ['--name', 'someone-else'] });
+  assert.equal(badArgName.ok, false);
+  assert.match(badArgName.error, /not inside its work flags/);
+  const badArgShort = await mod.supervisorRequest({ op: 'add', profile: 'faker', args: ['-n', 'someone-else'] });
+  assert.equal(badArgShort.ok, false);
+  assert.match(badArgShort.error, /not inside its work flags/);
 
   // The persisted state file records worker argv — it must be owner-only.
   if (process.platform !== 'win32') {
@@ -109,10 +164,10 @@ test('supervisor daemon: start → add → status → remove → stop', async (t
     assert.equal(stMode, 0o600, `supervisor state file should be 0600, got ${stMode.toString(8)}`);
   }
 
-  // Remove the worker.
+  // Removing by profile resolves to every same-profile worker (both instances).
   const removed = await mod.supervisorRequest({ op: 'remove', target: 'faker' });
   assert.equal(removed.ok, true);
-  assert.deepEqual(removed.removed, ['faker']);
+  assert.deepEqual([...removed.removed].sort(), [autoId, 'faker-two'].sort());
   const st1 = await mod.supervisorRequest({ op: 'status' });
   assert.equal(st1.workers.length, 0);
 

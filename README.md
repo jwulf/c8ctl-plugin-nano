@@ -205,7 +205,15 @@ c8ctl nano work reviewer --job-type senior:pr-review --job-type senior:triage
 ```bash
 c8ctl nano work reviewer                     # poll for work until Ctrl-C
 c8ctl nano work reviewer --max-parallel 2 --job-timeout 600000
+c8ctl nano work reviewer --name reviewer-eu  # name this worker (else auto ‹host›-‹profile›-‹random›)
 ```
+
+The optional `--name` sets **this worker's name** — the `workerName` it
+registers under at the broker (`‹name›:‹jobType›`) and how it shows up in
+supervisor status/logs. Omit it and a distinct `‹host›-‹profile›-‹random›`
+name is generated, so two `work reviewer` processes never collide at the
+broker. (`--name` names the worker; the profile to run is always the
+positional argument.)
 
 ### Live profile reload (no restart on `assign`)
 
@@ -456,11 +464,20 @@ c8ctl nano supervisor
 # Manage the fleet without the console (any terminal, any time):
 c8ctl nano supervisor status                       # id, state, pid, restarts, uptime
 c8ctl nano supervisor add reviewer --max-parallel 2 # add + spawn a worker (forwards work flags)
+c8ctl nano supervisor add reviewer --name reviewer-2 # a SECOND reviewer, named so it stays distinct
 c8ctl nano supervisor restart reviewer             # by worker id or profile name
 c8ctl nano supervisor remove coder                 # stop + drop a worker (also: `all`)
 c8ctl nano supervisor logs reviewer --follow       # tail a worker's log (or the daemon's)
 c8ctl nano supervisor stop                          # stop the daemon and every worker
 ```
+
+Each worker has a **name** — its supervisor id and the broker `workerName` it
+registers under. Pass `--name` on `supervisor add` (or `work`) to set it;
+omit it and one is auto-generated as `‹host›-‹profile›-‹random›`, so you can
+run **several instances of the same profile** and they stay distinct
+end-to-end (status, logs, and at the broker). `restart`/`remove` accept either
+a worker id **or** a profile name — targeting a profile affects *every*
+instance of it.
 
 Each worker takes the **same flags as `nano work`** (`--max-parallel`,
 `--job-timeout`, `--lock-grace`, `--poll-timeout`, `--sandbox`/`--image`,

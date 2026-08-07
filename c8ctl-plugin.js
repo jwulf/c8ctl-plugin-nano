@@ -49,8 +49,8 @@ import {
   unwatchFile,
 } from 'node:fs';
 import { createConnection, createServer } from 'node:net';
-import { randomUUID, createHash } from 'node:crypto';
-import { homedir, platform as osPlatform, devNull, tmpdir } from 'node:os';
+import { randomUUID, createHash, randomBytes } from 'node:crypto';
+import { homedir, platform as osPlatform, devNull, tmpdir, hostname } from 'node:os';
 import { join, isAbsolute, resolve as resolvePath, dirname, basename, sep } from 'node:path';
 import { createRequire } from 'node:module';
 import { fileURLToPath } from 'node:url';
@@ -2879,7 +2879,10 @@ function buildResultEnvelope(result, { sandbox, image, git, result: agentResult 
  */
 async function workAgent(req, flags) {
   const logger = getLogger();
-  const name = flags?.name ? String(flags.name).trim() : req.positional[0];
+  // The hire to run always comes from the positional profile. `--name` no longer
+  // selects the hire (that was a footgun: `work reviewer --name coder` silently
+  // ran `coder`); it now names THIS worker instance (see `workerName` below).
+  const name = req.positional[0];
 
   if (!name) {
     const hires = readHires();
@@ -2901,6 +2904,19 @@ async function workAgent(req, flags) {
     process.exit(1);
   }
   const profile = normalized.profile;
+
+  // This worker's identity, surfaced to the broker as the `workerName` on every
+  // activateJobs call (`‹workerName›:‹jobType›`). An explicit `--name` wins;
+  // otherwise auto-generate `‹host›-‹profile›-‹random›` so two workers of the
+  // same profile (e.g. launched by the supervisor) stay distinct at the broker
+  // and in logs. A blank/whitespace `--name` falls back to auto (mirrors the
+  // supervisor path); a non-blank one must be a safe worker-name token.
+  const explicitName = flags?.name ? String(flags.name).trim() : '';
+  if (explicitName !== '' && !isValidWorkerName(explicitName)) {
+    logger.error(`Invalid --name "${flags.name}": use only letters, digits, and . _ -`);
+    process.exit(1);
+  }
+  const workerName = explicitName !== '' ? explicitName : autoWorkerName(name);
 
   if (!globalThis.c8ctl || typeof globalThis.c8ctl.createClient !== 'function') {
     logger.error('work requires the c8ctl runtime (createClient). Run it via the c8ctl CLI.');
@@ -3045,6 +3061,7 @@ async function workAgent(req, flags) {
   const camunda = globalThis.c8ctl.createClient();
 
   logger.info(`Putting "${name}" [${profile.rank}] to work → ${buildAgentCommandLine(profile.command, effectiveArgs)}`);
+  logger.info(`  worker: ${workerName}`);
   logger.info(`  model: ${profile.model || '(none)'}; capabilities: ${profile.capabilities.join(', ') || '(none)'}`);
   logger.info(`  sandbox: ${sandbox}${isContainer ? ` (image ${image})` : ''}`);
   const profileEnvKeys = Object.keys(profileEnv);
@@ -3060,7 +3077,7 @@ async function workAgent(req, flags) {
   const makeWorker = (jobType) =>
     camunda.createJobWorker({
       jobType,
-      workerName: `${name}:${jobType}`,
+      workerName: `${workerName}:${jobType}`,
       maxParallelJobs,
       jobTimeoutMs: jobLockMs,
       pollTimeoutMs,
@@ -3491,6 +3508,78 @@ function reconstructWorkArgs(flags) {
   return out;
 }
 
+/**
+ * Sanitize one token for use inside a worker name: keep `[A-Za-z0-9._-]`,
+ * collapse every other run to a single `-`, and trim leading/trailing
+ * separators. Returns `fallback` when nothing survives (e.g. an all-symbol
+ * input). Pure.
+ */
+function sanitizeNameToken(raw, fallback = 'x') {
+  const s = String(raw ?? '')
+    .trim()
+    .replace(/[^A-Za-z0-9._-]+/g, '-')
+    .replace(/^[-._]+|[-._]+$/g, '');
+  return s || fallback;
+}
+
+/**
+ * An explicit worker name (`--name`) is valid iff — after trimming — it is a
+ * non-empty run of `[A-Za-z0-9._-]`. That charset is the intersection of what
+ * is safe in a broker `workerName` (no `:` to corrupt the `‹name›:‹jobType›`
+ * form) and what survives `supervisorWorkerLogFile`'s filename sanitization
+ * unchanged (so distinct ids can never collapse onto the same `worker-‹id›.log`
+ * or escape the log dir). Auto-generated names are already in this shape;
+ * operator-supplied names are validated against it so both invariants hold.
+ * Pure.
+ */
+function isValidWorkerName(name) {
+  const s = typeof name === 'string' ? name.trim() : '';
+  return s !== '' && /^[A-Za-z0-9._-]+$/.test(s);
+}
+
+/** A short, lowercase, collision-resistant suffix for auto worker names. */
+function randomNameSuffix(bytes = 4) {
+  return randomBytes(bytes).toString('hex');
+}
+
+/**
+ * Auto-generated worker name: `‹short-hostname›-‹profile›-‹random›`. The host
+ * defaults to this machine's short hostname (the first dot-label, lowercased);
+ * the random suffix keeps two same-profile workers on the same host distinct.
+ * `host`/`rand` are injectable so tests can assert a deterministic shape. Pure
+ * given its options.
+ */
+function autoWorkerName(profile, { host = hostname(), rand = randomNameSuffix } = {}) {
+  const shortHost = sanitizeNameToken(String(host || '').split('.')[0].toLowerCase(), 'host');
+  const prof = sanitizeNameToken(profile, 'worker');
+  const suffix = sanitizeNameToken(typeof rand === 'function' ? rand() : rand, '0');
+  return `${shortHost}-${prof}-${suffix}`;
+}
+
+/**
+ * Split a supervised-worker name (`--name X`, `--name=X`, `-n X`) out of a raw
+ * token list, returning `{ name, rest }` where `rest` is the remaining work
+ * flags. Used by the interactive console's `add`, whose tokens aren't parsed by
+ * the CLI flag layer. Last occurrence wins; a trailing `--name` with no value
+ * yields `name: undefined`. Pure.
+ */
+function extractNameFlag(parts) {
+  const rest = [];
+  let name;
+  const list = Array.isArray(parts) ? parts : [];
+  for (let i = 0; i < list.length; i++) {
+    const tok = String(list[i]);
+    const eq = /^(?:--name|-n)=(.*)$/.exec(tok);
+    if (eq) { name = eq[1]; continue; }
+    if (tok === '--name' || tok === '-n') {
+      if (i + 1 < list.length) { name = String(list[i + 1]); i++; }
+      continue;
+    }
+    rest.push(tok);
+  }
+  return { name: name != null && name.trim() !== '' ? name.trim() : undefined, rest };
+}
+
 /** Assign a unique, stable worker id from a profile name (pure). */
 function supervisorWorkerId(profile, taken) {
   const base = String(profile || '').trim() || 'worker';
@@ -3766,7 +3855,9 @@ async function runSupervisorDaemon() {
   const startWorker = (w) => {
     let fd;
     try { fd = openSync(w.logFile, 'a'); } catch { fd = 'ignore'; }
-    const child = spawn(exec, [entry, 'nano', 'work', w.profile, ...w.args], {
+    // `--name w.id` makes the child's broker workerName match this worker's
+    // supervisor id, so the same profile launched twice is distinct end-to-end.
+    const child = spawn(exec, [entry, 'nano', 'work', w.profile, '--name', w.id, ...w.args], {
       env: process.env,
       stdio: ['ignore', fd, fd],
     });
@@ -3808,8 +3899,19 @@ async function runSupervisorDaemon() {
     persist();
   };
 
-  const addWorker = (profile, args) => {
-    const id = supervisorWorkerId(profile, new Set(workers.keys()));
+  const addWorker = (profile, args, name) => {
+    const taken = new Set(workers.keys());
+    let id;
+    if (name != null && String(name).trim() !== '') {
+      id = String(name).trim();
+      if (!isValidWorkerName(id)) throw new Error(`invalid worker name "${id}": use only letters, digits, and . _ -`);
+      if (taken.has(id)) throw new Error(`a worker named "${id}" already exists`);
+    } else {
+      // No explicit name → auto ‹host›-‹profile›-‹random›. The random suffix is
+      // collision-resistant, but never hand back a duplicate id.
+      id = autoWorkerName(profile);
+      while (taken.has(id)) id = autoWorkerName(profile);
+    }
     const w = {
       id, profile: String(profile), args: Array.isArray(args) ? args.map(String) : [],
       restarts: 0, stopping: false, lastExit: null, logFile: supervisorWorkerLogFile(id),
@@ -3896,20 +3998,22 @@ async function runSupervisorDaemon() {
         case 'add': {
           if (shuttingDown) { sock.write(encodeFrame({ ok: false, error: 'supervisor is shutting down', final: true })); break; }
           if (!req.profile) { sock.write(encodeFrame({ ok: false, error: 'add requires a profile', final: true })); break; }
-          // `--name` selects a DIFFERENT hire inside `nano work`, so a worker
-          // added as profile X but carrying `--name Y` would run Y while status
-          // and logs report X. Reject it — the supervisor id derives from the
-          // positional profile and that must be what actually runs.
+          // A supervised worker's name is supplied out-of-band as `req.name`
+          // (which the daemon forwards to the child as `nano work … --name`).
+          // A bare `--name` inside the forwarded work args is therefore ambiguous
+          // — it would fight the supervisor-assigned id — so reject it here and
+          // steer the operator to the dedicated flag.
           // `req.args` comes from untrusted JSON and may be non-array (e.g. a
           // string or object). Coerce to an array of string tokens before
           // scanning/forwarding so a malformed payload yields a clean rejection
           // instead of throwing a generic request error.
           const args = Array.isArray(req.args) ? req.args.filter((a) => typeof a === 'string') : [];
           const badName = args.find((a) => a === '--name' || a === '-n' || /^--name=/.test(a) || /^-n=/.test(a));
-          if (badName) { sock.write(encodeFrame({ ok: false, error: `--name is not allowed for a supervised worker (it would run a different hire than the reported profile "${req.profile}")`, final: true })); break; }
+          if (badName) { sock.write(encodeFrame({ ok: false, error: 'name a supervised worker with `--name` on `supervisor add`, not inside its work flags', final: true })); break; }
           const stored = readHires()[String(req.profile)];
           if (!stored) { sock.write(encodeFrame({ ok: false, error: `no hire named "${req.profile}"`, final: true })); break; }
-          const w = await serializeOp(() => addWorker(req.profile, args));
+          const name = typeof req.name === 'string' ? req.name.trim() : '';
+          const w = await serializeOp(() => addWorker(req.profile, args, name));
           sock.write(encodeFrame({ ok: true, type: 'added', worker: workerPublic(w), final: true }));
           break;
         }
@@ -4147,8 +4251,17 @@ async function supervisorStartCmd(req, flags) {
 
   const specs = normalizeArgList(flags?.worker);
   const workArgs = reconstructWorkArgs(flags);
-  for (const profile of specs) {
-    const res = await supervisorRequest({ op: 'add', profile, args: workArgs });
+  // `--name` names a single launched worker. With several `--worker` specs a lone
+  // name can't apply to all of them, so honour it only for a single spec and let
+  // the rest auto-name; warn so the intent isn't silently dropped.
+  const explicitName = flags?.name ? String(flags.name).trim() : undefined;
+  if (explicitName && specs.length > 1) {
+    logger.warn('--name is ignored when starting multiple --worker specs; each is auto-named.');
+  }
+  const nameFor = (i) => (explicitName && specs.length === 1 ? explicitName : undefined);
+  for (let i = 0; i < specs.length; i++) {
+    const profile = specs[i];
+    const res = await supervisorRequest({ op: 'add', profile, name: nameFor(i), args: workArgs });
     if (res.ok) logger.info(`  + worker "${res.worker.id}" (profile ${profile})`);
     else logger.error(`  ! could not add "${profile}": ${res.error}`);
   }
@@ -4202,13 +4315,14 @@ async function supervisorStatusCmd() {
 
 async function supervisorAddCmd(req, flags) {
   const logger = getLogger();
-  // Use only the positional profile. `--name` is a documented hire/work/assign
-  // flag, so honouring it here would make `supervisor add reviewer --name foo`
-  // surprisingly add `foo` instead of `reviewer`.
+  // The positional profile is what runs; `--name` names this worker instance
+  // (forwarded to the child as `nano work … --name`, and used as its supervisor
+  // id). Omit `--name` to auto-generate ‹host›-‹profile›-‹random›.
   const profile = req.positional[1];
-  if (!profile) { logger.error('Usage: c8ctl nano supervisor add <profile> [work flags]'); process.exit(1); }
+  if (!profile) { logger.error('Usage: c8ctl nano supervisor add <profile> [--name <worker>] [work flags]'); process.exit(1); }
+  const name = flags?.name ? String(flags.name).trim() : undefined;
   await startSupervisorDaemon();
-  const res = await supervisorRequest({ op: 'add', profile, args: reconstructWorkArgs(flags) });
+  const res = await supervisorRequest({ op: 'add', profile, name, args: reconstructWorkArgs(flags) });
   if (res.ok) logger.info(`Added worker "${res.worker.id}" (profile ${profile}); pid ${res.worker.pid ?? 'starting'}.`);
   else { logger.error(`Could not add "${profile}": ${res.error}`); process.exit(1); }
 }
@@ -4360,14 +4474,16 @@ async function attachSupervisorConsole(state) {
       switch (cmd) {
         case '': break;
         case 'help':
-          out('Commands: status | add <profile> [work flags] | remove <id|profile|all> |');
-          out('          restart <id|profile|all> | logs [id] | detach | stop | help');
+          out('Commands: status | add <profile> [--name <worker>] [work flags] |');
+          out('          remove <id|profile|all> | restart <id|profile|all> |');
+          out('          logs [id] | detach | stop | help');
           break;
         case 'status': sock.write(encodeFrame({ op: 'status' })); break;
         case 'add': {
           const profile = parts.shift();
-          if (!profile) { out('usage: add <profile> [work flags]'); break; }
-          sock.write(encodeFrame({ op: 'add', profile, args: parts }));
+          if (!profile) { out('usage: add <profile> [--name <worker>] [work flags]'); break; }
+          const { name, rest } = extractNameFlag(parts);
+          sock.write(encodeFrame({ op: 'add', profile, name, args: rest }));
           break;
         }
         case 'remove': case 'rm': {
@@ -5824,6 +5940,11 @@ export {
 export {
   reconstructWorkArgs,
   supervisorWorkerId,
+  autoWorkerName,
+  sanitizeNameToken,
+  isValidWorkerName,
+  randomNameSuffix,
+  extractNameFlag,
   redactWorkArgs,
   supervisorBackoffMs,
   encodeFrame,
@@ -5926,7 +6047,7 @@ export const commands = {
       workspace: { type: 'boolean', description: 'clean: also delete the workspace (models + workers)' },
       check: { type: 'boolean', description: 'update: only report whether a new release is available; do not install' },
       binary: { type: 'string', description: 'Path to the nanobpmn server binary' },
-      name: { type: 'string', description: 'hire/work/assign: agent profile name (alt to positional arg)' },
+      name: { type: 'string', description: 'work/supervisor add: worker name (auto ‹host›-‹profile›-‹random› if omitted); hire/assign: agent profile name' },
       rank: { type: 'string', description: 'hire: agent rank (principal|senior|junior|decider)' },
       command: { type: 'string', description: 'hire: CLI command that runs the agent harness (e.g. copilot, claude, pi)' },
       arg: { type: 'string', multiple: true, description: 'hire/work: command-line switch/arg appended to the harness command (repeatable), e.g. --arg --allow-all. Persisted on hire; work appends more.' },

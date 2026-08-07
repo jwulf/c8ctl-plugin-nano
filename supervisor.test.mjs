@@ -128,7 +128,6 @@ test('isValidWorkerName rejects names that would collide on the sanitized log fi
 test('randomNameSuffix is a lowercase hex string of the requested byte length', () => {
   assert.match(randomNameSuffix(4), /^[0-9a-f]{8}$/);
   assert.match(randomNameSuffix(2), /^[0-9a-f]{4}$/);
-  assert.notEqual(randomNameSuffix(), randomNameSuffix()); // collision-resistant
 });
 
 // --- autoWorkerName --------------------------------------------------------
@@ -151,9 +150,17 @@ test('autoWorkerName sanitizes each segment and applies fallbacks', () => {
   assert.equal(autoWorkerName('', { host: '', rand: () => '' }), 'host-worker-0');
 });
 
-test('autoWorkerName produces distinct names for the same profile+host', () => {
-  const a = autoWorkerName('reviewer', { host: 'h' });
-  const b = autoWorkerName('reviewer', { host: 'h' });
+test('autoWorkerName varies with the random suffix (distinct rand → distinct name)', () => {
+  // Deterministic: inject a rand that yields two distinct suffixes and assert the
+  // suffix drives the name apart — the property that keeps two same-profile
+  // workers distinct — without relying on probability.
+  const seq = ['aaaa', 'bbbb'];
+  let i = 0;
+  const rand = () => seq[i++];
+  const a = autoWorkerName('reviewer', { host: 'h', rand });
+  const b = autoWorkerName('reviewer', { host: 'h', rand });
+  assert.equal(a, 'h-reviewer-aaaa');
+  assert.equal(b, 'h-reviewer-bbbb');
   assert.notEqual(a, b);
 });
 

@@ -75,10 +75,14 @@ test('supervisor daemon: start → add → status → remove → stop', async (t
     assert.equal(mode, 0o600, `control socket should be 0600, got ${mode.toString(8)}`);
   }
 
-  // Add a worker and confirm it comes up running.
+  // Add a worker and confirm it comes up running. With no explicit name the
+  // daemon auto-assigns ‹short-host›-‹profile›-‹random›; the profile is still
+  // `faker` (that's the hire it runs).
   const added = await mod.supervisorRequest({ op: 'add', profile: 'faker', args: ['--max-parallel', '1'] });
   assert.equal(added.ok, true);
-  assert.equal(added.worker.id, 'faker');
+  assert.match(added.worker.id, /^[a-z0-9._-]+-faker-[0-9a-f]+$/);
+  assert.equal(added.worker.profile, 'faker');
+  const autoId = added.worker.id;
 
   // Poll briefly for the child to be observed running.
   let running = false;
@@ -94,14 +98,26 @@ test('supervisor daemon: start → add → status → remove → stop', async (t
   assert.equal(bad.ok, false);
   assert.match(bad.error, /no hire/);
 
-  // `--name` is rejected: it would run a different hire than the reported
-  // profile, desynchronising status/logs from what actually runs.
-  const named = await mod.supervisorRequest({ op: 'add', profile: 'faker', args: ['--name', 'someone-else'] });
-  assert.equal(named.ok, false);
-  assert.match(named.error, /--name is not allowed/);
-  const nameShort = await mod.supervisorRequest({ op: 'add', profile: 'faker', args: ['-n', 'someone-else'] });
-  assert.equal(nameShort.ok, false);
-  assert.match(nameShort.error, /--name is not allowed/);
+  // A top-level `name` names the worker (it runs the positional profile). Add a
+  // second same-profile instance under an explicit name to prove co-existence.
+  const named = await mod.supervisorRequest({ op: 'add', profile: 'faker', name: 'faker-two' });
+  assert.equal(named.ok, true);
+  assert.equal(named.worker.id, 'faker-two');
+  assert.equal(named.worker.profile, 'faker');
+
+  // Re-using an existing worker name is rejected.
+  const dup = await mod.supervisorRequest({ op: 'add', profile: 'faker', name: 'faker-two' });
+  assert.equal(dup.ok, false);
+  assert.match(dup.error, /already exists/);
+
+  // `--name` inside the forwarded work args is rejected: it would fight the
+  // supervisor-assigned id. Operators must use the dedicated top-level flag.
+  const badArgName = await mod.supervisorRequest({ op: 'add', profile: 'faker', args: ['--name', 'someone-else'] });
+  assert.equal(badArgName.ok, false);
+  assert.match(badArgName.error, /not inside its work flags/);
+  const badArgShort = await mod.supervisorRequest({ op: 'add', profile: 'faker', args: ['-n', 'someone-else'] });
+  assert.equal(badArgShort.ok, false);
+  assert.match(badArgShort.error, /not inside its work flags/);
 
   // The persisted state file records worker argv — it must be owner-only.
   if (process.platform !== 'win32') {
@@ -109,10 +125,10 @@ test('supervisor daemon: start → add → status → remove → stop', async (t
     assert.equal(stMode, 0o600, `supervisor state file should be 0600, got ${stMode.toString(8)}`);
   }
 
-  // Remove the worker.
+  // Removing by profile resolves to every same-profile worker (both instances).
   const removed = await mod.supervisorRequest({ op: 'remove', target: 'faker' });
   assert.equal(removed.ok, true);
-  assert.deepEqual(removed.removed, ['faker']);
+  assert.deepEqual([...removed.removed].sort(), [autoId, 'faker-two'].sort());
   const st1 = await mod.supervisorRequest({ op: 'status' });
   assert.equal(st1.workers.length, 0);
 

@@ -2909,8 +2909,14 @@ async function workAgent(req, flags) {
   // activateJobs call (`‹workerName›:‹jobType›`). An explicit `--name` wins;
   // otherwise auto-generate `‹host›-‹profile›-‹random›` so two workers of the
   // same profile (e.g. launched by the supervisor) stay distinct at the broker
-  // and in logs.
-  const workerName = flags?.name ? String(flags.name).trim() : autoWorkerName(name);
+  // and in logs. A blank/whitespace `--name` falls back to auto (mirrors the
+  // supervisor path); a non-blank one must be a safe worker-name token.
+  const explicitName = flags?.name ? String(flags.name).trim() : '';
+  if (explicitName !== '' && !isValidWorkerName(explicitName)) {
+    logger.error(`Invalid --name "${flags.name}": use only letters, digits, and . _ -`);
+    process.exit(1);
+  }
+  const workerName = explicitName !== '' ? explicitName : autoWorkerName(name);
 
   if (!globalThis.c8ctl || typeof globalThis.c8ctl.createClient !== 'function') {
     logger.error('work requires the c8ctl runtime (createClient). Run it via the c8ctl CLI.');
@@ -3516,6 +3522,21 @@ function sanitizeNameToken(raw, fallback = 'x') {
   return s || fallback;
 }
 
+/**
+ * An explicit worker name (`--name`) is valid iff — after trimming — it is a
+ * non-empty run of `[A-Za-z0-9._-]`. That charset is the intersection of what
+ * is safe in a broker `workerName` (no `:` to corrupt the `‹name›:‹jobType›`
+ * form) and what survives `supervisorWorkerLogFile`'s filename sanitization
+ * unchanged (so distinct ids can never collapse onto the same `worker-‹id›.log`
+ * or escape the log dir). Auto-generated names are already in this shape;
+ * operator-supplied names are validated against it so both invariants hold.
+ * Pure.
+ */
+function isValidWorkerName(name) {
+  const s = typeof name === 'string' ? name.trim() : '';
+  return s !== '' && /^[A-Za-z0-9._-]+$/.test(s);
+}
+
 /** A short, lowercase, collision-resistant suffix for auto worker names. */
 function randomNameSuffix(bytes = 4) {
   return randomBytes(bytes).toString('hex');
@@ -3883,6 +3904,7 @@ async function runSupervisorDaemon() {
     let id;
     if (name != null && String(name).trim() !== '') {
       id = String(name).trim();
+      if (!isValidWorkerName(id)) throw new Error(`invalid worker name "${id}": use only letters, digits, and . _ -`);
       if (taken.has(id)) throw new Error(`a worker named "${id}" already exists`);
     } else {
       // No explicit name → auto ‹host›-‹profile›-‹random›. The random suffix is
@@ -5920,6 +5942,7 @@ export {
   supervisorWorkerId,
   autoWorkerName,
   sanitizeNameToken,
+  isValidWorkerName,
   randomNameSuffix,
   extractNameFlag,
   redactWorkArgs,

@@ -12,6 +12,7 @@ import {
   supervisorWorkerId,
   autoWorkerName,
   sanitizeNameToken,
+  isValidWorkerName,
   randomNameSuffix,
   extractNameFlag,
   redactWorkArgs,
@@ -92,6 +93,34 @@ test('sanitizeNameToken falls back when the result would be empty', () => {
   assert.equal(sanitizeNameToken('', 'fallback'), 'fallback');
   assert.equal(sanitizeNameToken('***', 'fallback'), 'fallback');
   assert.equal(sanitizeNameToken(null, 'fallback'), 'fallback');
+});
+
+// --- isValidWorkerName -----------------------------------------------------
+
+test('isValidWorkerName accepts safe id tokens (trimmed)', () => {
+  assert.equal(isValidWorkerName('reviewer'), true);
+  assert.equal(isValidWorkerName('reviewer-eu.2_beta'), true);
+  assert.equal(isValidWorkerName('  reviewer  '), true); // trimmed first
+});
+
+test('isValidWorkerName rejects blanks, non-strings, and unsafe chars', () => {
+  assert.equal(isValidWorkerName(''), false);
+  assert.equal(isValidWorkerName('   '), false);
+  assert.equal(isValidWorkerName(null), false);
+  assert.equal(isValidWorkerName(123), false);
+  // `:` would corrupt the broker `‹name›:‹jobType›` form:
+  assert.equal(isValidWorkerName('faker:1'), false);
+  // path separators / traversal must never reach a log filename:
+  assert.equal(isValidWorkerName('a/b'), false);
+  assert.equal(isValidWorkerName('../etc'), false);
+  assert.equal(isValidWorkerName('has space'), false);
+});
+
+test('isValidWorkerName rejects names that would collide on the sanitized log file', () => {
+  // `faker:1` and `faker_1` both sanitize to worker-faker_1.log; rejecting the
+  // former (`:` unsafe) prevents two distinct workers sharing one log file.
+  assert.equal(isValidWorkerName('faker:1'), false);
+  assert.equal(isValidWorkerName('faker_1'), true);
 });
 
 // --- randomNameSuffix ------------------------------------------------------

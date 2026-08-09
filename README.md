@@ -204,7 +204,7 @@ c8ctl nano work reviewer --job-type senior:pr-review --job-type senior:triage
 
 ```bash
 c8ctl nano work reviewer                     # poll for work until Ctrl-C
-c8ctl nano work reviewer --max-parallel 2 --job-timeout 600000
+c8ctl nano work reviewer --max-parallel 2 --recovery-window 300000
 c8ctl nano work reviewer --name reviewer-eu  # name this worker (else auto ‹host›-‹profile›-‹random›)
 ```
 
@@ -252,19 +252,32 @@ and the profile/model are also exported as `AGENT_PROFILE`, `AGENT_RANK`,
 `AGENT_MODEL`, `AGENT_CAPABILITIES`, `AGENT_JOB_TYPE` env vars. On exit `0` the
 job is **completed** with `{ output: <stdout>, exitCode: 0 }` (captured output is
 capped at 1 MiB, with a `truncated` flag when exceeded); any other exit **fails**
-the job with a decremented retry count, and a job that outlives `--job-timeout`
-is killed. Profiles are stored in the plugin's `config.json` (see `c8ctl nano
-config`).
+the job with a decremented retry count. Profiles are stored in the plugin's
+`config.json` (see `c8ctl nano config`).
 
-> **Activation lock vs. kill deadline.** `--job-timeout` is the harness *kill*
-> deadline. The broker's job-activation lock is derived as `--job-timeout +
-> --lock-grace` (grace defaults to `120000`ms) so it strictly outlasts the kill:
-> the worker always reports the outcome (complete/fail) before the lock lapses.
-> Without that gap a lock expiring exactly as the harness dies lets the broker
-> re-activate the still-retryable job (a second agent starts) and the stale
-> `fail` is rejected with a 409 "job cannot be failed in the current state".
-> Raising `--job-timeout` alone does **not** fix this — it moves both coupled
-> deadlines together; widen `--lock-grace` (or keep the default) instead.
+> **Self-managing activation lock (no hardcoded job timeout).** An agent job's
+> duration is unpredictable, so the worker does **not** ask you to pick a fixed
+> timeout up front. It keeps the broker's job-activation lock a bounded
+> `--recovery-window` (default `300000`ms) ahead of *now*, refreshing it every
+> ~1/3 of that window for as long as the harness is alive **and** producing
+> output. Consequences:
+> - **Long jobs never lose their lock.** A run that takes hours keeps going — the
+>   lock is continuously extended, so the broker never re-activates the job while
+>   you're still working on it (which would start a second agent and get the stale
+>   `complete`/`fail` rejected with a 409 "job cannot be failed in the current
+>   state").
+> - **Fast recovery on death.** Because each refresh *sets* the deadline to
+>   now+window (the `UpdateJobTimeout` contract is a duration-from-now, not a
+>   cumulative delta), the moment the worker stops refreshing — the process dies,
+>   the node is lost, the harness is idle-killed, or it hits the hard cap — the
+>   lock lapses within one `--recovery-window` and the broker reclaims the job.
+>   This is deliberately optimised for quick reclaim, not for holding a stale lock.
+> - **`--idle-timeout`** (default `300000`ms) is the liveness gate: if the agent
+>   produces no stdout/stderr for this long it is killed as wedged, extension
+>   stops, and the job is reclaimed — so a hung agent can't hold a job forever.
+> - **`--job-timeout`** is now an *optional* absolute hard cap on total harness
+>   runtime (default `0` = unlimited), for when you want a ceiling regardless of
+>   output. `--lock-grace` is **deprecated and ignored** — the lock is auto-managed.
 
 > **Long-poll window.** `--poll-timeout` (default `30000`ms) is how long the
 > broker holds each `activateJobs` request open waiting for work before returning
@@ -372,7 +385,8 @@ c8ctl nano work coder --sandbox docker --image ghcr.io/acme/agent:1   # or overr
 
 Containers are labelled (`nano.managed=1`, `nano.worker`, `nano.jobKey`,
 `nano.run=<uuid>`), log-capped (`max-size=10m max-file=3`), run with `--rm`, and
-a run that outlives `--job-timeout` is force-removed. The envelope is piped on
+a run that is idle-killed (or that outlives an optional `--job-timeout` hard cap)
+is force-removed. The envelope is piped on
 the container's stdin exactly as on the host. (Container-side git provisioning —
 strong isolation — is a later increment; container jobs don't clone yet.)
 
@@ -480,9 +494,10 @@ a worker id **or** a profile name — targeting a profile affects *every*
 instance of it.
 
 Each worker takes the **same flags as `nano work`** (`--max-parallel`,
-`--job-timeout`, `--lock-grace`, `--poll-timeout`, `--sandbox`/`--image`,
-`--job-type`, `--env`, `--arg`, …); they are forwarded verbatim to the spawned
-child, so a supervised worker is byte-identical to a hand-run `nano work`. In the
+`--recovery-window`, `--idle-timeout`, `--job-timeout`, `--poll-timeout`,
+`--sandbox`/`--image`, `--job-type`, `--env`, `--arg`, …); they are forwarded
+verbatim to the spawned child, so a supervised worker is byte-identical to a
+hand-run `nano work`. In the
 interactive console, type the flags after the profile: `add reviewer --max-parallel 2`.
 
 How it works and where things live:

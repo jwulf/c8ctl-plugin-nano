@@ -25,7 +25,6 @@ import {
   sanitizeResultVars,
   parseEnvPairs,
   parseJobTypeFlags,
-  deriveJobLockMs,
   derivePollTimeoutMs,
   normalizeEnvMap,
   normalizeArgList,
@@ -40,6 +39,7 @@ import {
   resolveAssignInputs,
   containerEngineAvailable,
   runAgentJob,
+  startLockExtender,
   provisionRepo,
   finalizeGit,
   reconcileAgentPr,
@@ -935,49 +935,94 @@ test('runAgentJob (docker): pipes envelope, captures output, reaps container', {
   assert.ok(typeof reap.reaped === 'number');
 });
 
-// Regression (issue: 409 "job cannot be failed" race). The broker activation
-// lock must strictly outlast the harness kill deadline, or a lapsed lock
-// re-activates the still-retryable job and the stale fail() is rejected 409.
-// deriveJobLockMs is the single source of truth for BOTH deadlines: it returns
-// the clamped harness kill deadline (killMs) the caller must enforce and the
-// broker lock (lockMs), with lockMs > killMs always. The caller must use killMs
-// (not the raw --job-timeout), or a huge raw input outlives the lock.
-test('deriveJobLockMs: lock strictly outlasts the harness kill deadline', () => {
-  const lock = (kill, grace) => deriveJobLockMs(kill, grace).lockMs;
-  assert.deepEqual(deriveJobLockMs(300_000, 120_000), { killMs: 300_000, lockMs: 420_000 });
-  assert.ok(lock(300_000, 120_000) > 300_000);
-  // Non-positive/invalid inputs are floored to sane positive defaults so the
-  // lock > kill invariant still holds (never lock == kill).
-  assert.ok(lock(0, 0) > 5 * 60_000 - 1 && lock(0, 0) > 0);
-  assert.ok(lock(300_000, 0) > 300_000);
-  assert.ok(lock(NaN, NaN) > 0);
-  // Very large (non-safe) integer inputs must not round `kill + grace` back
-  // down to `kill`; the invariant must still hold strictly.
-  assert.ok(lock(Number.MAX_SAFE_INTEGER, 120_000) > Number.MAX_SAFE_INTEGER - 120_000);
-  assert.ok(Number.isSafeInteger(lock(2 ** 53, 2 ** 53)));
-  assert.ok(Number.isSafeInteger(lock(2 ** 60, 2 ** 60)));
-  // Fractional-positive and MAX-grace inputs must still yield a positive,
-  // safe-integer lock that strictly exceeds the (positive) internal kill.
-  assert.ok(Number.isSafeInteger(lock(0.5, 0.5)) && lock(0.5, 0.5) > 0);
-  assert.ok(Number.isSafeInteger(lock(300_000, Number.MAX_SAFE_INTEGER)));
-  assert.ok(lock(300_000, Number.MAX_SAFE_INTEGER) > Number.MAX_SAFE_INTEGER - 1);
-  // The RETURNED killMs (the deadline the harness enforces) must always be a
-  // safe positive integer strictly below lockMs — including huge/at-cap inputs
-  // where the raw --job-timeout would otherwise reach or exceed the lock.
-  for (const [kill, grace] of [
-    [300_000, 120_000], [0, 0], [NaN, NaN], [0.5, 0.5],
-    [Number.MAX_SAFE_INTEGER, 120_000], [Number.MAX_SAFE_INTEGER, Number.MAX_SAFE_INTEGER],
-    [2 ** 60, 2 ** 60], [300_000, Number.MAX_SAFE_INTEGER],
-  ]) {
-    const { killMs, lockMs } = deriveJobLockMs(kill, grace);
-    assert.ok(Number.isSafeInteger(killMs) && killMs > 0, `killMs safe positive for kill=${kill} grace=${grace}`);
-    assert.ok(Number.isSafeInteger(lockMs) && lockMs > killMs, `lockMs > killMs for kill=${kill} grace=${grace}`);
-  }
-  for (const kill of [1_000, 60_000, 300_000, 900_000]) {
-    for (const grace of [1, 1_000, 120_000]) {
-      assert.ok(lock(kill, grace) > kill, `lock must exceed kill for kill=${kill} grace=${grace}`);
-    }
-  }
+// The broker activation lock is no longer a hardcoded up-front value. Instead the
+// worker keeps it a bounded `recovery-window` ahead of *now* via startLockExtender
+// while the harness runs, so a long agent job never has its lock lapse (which
+// would re-activate the still-retryable job → a second agent + the stale-fail 409
+// race). Each refresh SETS the deadline to now+window (UpdateJobTimeout is a
+// duration-from-now, not a delta), so the deadline never creeps unbounded and a
+// stop() reclaims within one window.
+test('startLockExtender refreshes the lock to the window on an interval, then stop() halts it', async () => {
+  const calls = [];
+  const job = { jobKey: 'jk', modifyJobTimeout: async ({ newTimeoutMs }) => { calls.push(newTimeoutMs); } };
+  const stop = startLockExtender(job, 300_000, 20, 'tag', null);
+  await new Promise((r) => setTimeout(r, 200));
+  const afterRun = calls.length;
+  assert.ok(afterRun >= 2, `expected ≥2 refreshes, got ${afterRun}`);
+  assert.ok(calls.every((ms) => ms === 300_000), 'every refresh sets the deadline to now+window (absolute, not cumulative)');
+  stop();
+  await new Promise((r) => setTimeout(r, 60));
+  assert.equal(calls.length, afterRun, 'stop() halts all further refreshes');
+});
+
+test('startLockExtender renews immediately (harness gets a full window regardless of provisioning time)', async () => {
+  const calls = [];
+  const job = { jobKey: 'jk', modifyJobTimeout: async ({ newTimeoutMs }) => { calls.push(newTimeoutMs); } };
+  const stop = startLockExtender(job, 300_000, 100_000, 'tag', null);
+  // No interval has elapsed, but the first renewal must already have been queued.
+  await new Promise((r) => setTimeout(r, 50));
+  stop();
+  assert.ok(calls.length >= 1, 'the first renewal fires immediately, not after one interval');
+  assert.equal(calls[0], 300_000, 'the immediate renewal sets the deadline to now+window');
+});
+
+test('startLockExtender warns loudly when the SDK cannot extend the timeout', () => {
+  const warned = [];
+  const stop = startLockExtender({ jobKey: 'jk' }, 300_000, 20, 'tag', { warn: (m) => warned.push(m) });
+  stop();
+  assert.equal(warned.length, 1, 'a missing modifyJobTimeout is surfaced, not swallowed silently');
+  assert.ok(warned[0].includes('will NOT be auto-extended'));
+});
+
+test('startLockExtender is a safe no-op when the job cannot extend its timeout', () => {
+  // Older SDKs without modifyJobTimeout, or a non-positive window/interval, must
+  // degrade to the fixed initial lock rather than throw.
+  assert.doesNotThrow(() => startLockExtender({}, 300_000, 20, 'tag', null)());
+  assert.doesNotThrow(() => startLockExtender({ modifyJobTimeout() {} }, 0, 20, 'tag', null)());
+  assert.doesNotThrow(() => startLockExtender({ modifyJobTimeout() {} }, 300_000, 0, 'tag', null)());
+});
+
+test('startLockExtender swallows a failing extend without crashing the handler', async () => {
+  const warned = [];
+  const job = { jobKey: 'jk', modifyJobTimeout: async () => { throw new Error('network blip'); } };
+  const stop = startLockExtender(job, 300_000, 20, 'tag', { warn: (m) => warned.push(m) });
+  await new Promise((r) => setTimeout(r, 55));
+  stop();
+  assert.ok(warned.length >= 1, 'extend failures are logged, not thrown');
+  assert.ok(warned[0].includes('lock extend failed'));
+});
+
+// The idle-timeout is the liveness gate the lock-extender relies on: a harness
+// that goes silent (no stdout/stderr) for longer than the window is killed as
+// wedged, which resolves runAgentJob so the worker can fail+reclaim the job.
+test('runAgentJob (host) idle-timeout kills a silent harness', { skip: process.platform === 'win32' }, async () => {
+  const profile = { name: 'p', rank: 'senior', command: 'sleep 5', args: [], model: '', capabilities: [] };
+  const job = { jobKey: 'jk', type: 'senior', variables: {}, customHeaders: {} };
+  const t0 = Date.now();
+  const result = await runAgentJob(profile, job, {
+    sandbox: 'none',
+    envelope: normalizeTaskEnvelope({}, {}),
+    idleTimeoutMs: 200,
+  });
+  assert.equal(result.ok, false);
+  assert.equal(result.idle, true, 'silent harness is flagged idle');
+  assert.equal(result.timedOut, true);
+  assert.ok(Date.now() - t0 < 4_000, 'killed on idle, well before the 5s sleep completes');
+});
+
+test('runAgentJob (host) idle-timeout does NOT kill a harness that keeps producing output', { skip: process.platform === 'win32' }, async () => {
+  // Emits a byte every ~100ms for ~500ms — each gap is under the 400ms idle
+  // window, so the run must complete normally rather than be idle-killed.
+  const profile = { name: 'p', rank: 'senior', command: 'i=0; while [ $i -lt 5 ]; do printf x; sleep 0.1; i=$((i+1)); done', args: [], model: '', capabilities: [] };
+  const job = { jobKey: 'jk', type: 'senior', variables: {}, customHeaders: {} };
+  const result = await runAgentJob(profile, job, {
+    sandbox: 'none',
+    envelope: normalizeTaskEnvelope({}, {}),
+    idleTimeoutMs: 400,
+  });
+  assert.equal(result.ok, true, result.error || result.stderr);
+  assert.notEqual(result.idle, true);
+  assert.equal(result.stdout, 'xxxxx');
 });
 
 // derivePollTimeoutMs resolves the broker long-poll window passed to the SDK as

@@ -1561,46 +1561,6 @@ function parseJobTypeFlags(input) {
 }
 
 /**
- * The broker job-activation lock must strictly outlast the harness kill
- * deadline: the worker has to report the outcome (complete/fail) before the lock
- * lapses, or the broker re-activates the still-retryable job (a second agent
- * starts) and the stale `fail` is rejected 409 "job cannot be failed in the
- * current state". So lock = kill + grace. Non-finite or non-positive inputs
- * fall back to fixed defaults (5m kill / 2m grace). All inputs are coerced to
- * safe positive integers (positive fractional values floor to at least 1) and
- * grace is capped so a positive kill always fits and `kill + grace` stays within
- * the safe-integer range, so the invariant lock > kill holds strictly for every
- * accepted input — including values at or beyond 2^53 where float addition
- * would otherwise round `kill + grace` back down to `kill`.
- *
- * Returns BOTH derived deadlines from this single computation so the caller
- * never re-derives (and drifts): `killMs` is the *clamped* harness kill deadline
- * the caller must actually enforce, and `lockMs` is the broker activation lock.
- * The caller must use `killMs` — not the raw input — for the harness timeout, or
- * the lock > kill invariant breaks for large inputs (the raw input can exceed
- * the clamped `killMs`, and thus reach or exceed `lockMs`).
- *
- * @returns {{ killMs: number, lockMs: number }}
- */
-function deriveJobLockMs(jobTimeoutMs, lockGraceMs) {
-  const MAX = Number.MAX_SAFE_INTEGER;
-  const toSafeMs = (value, fallback) => {
-    // Floor positive fractional values to at least 1 so a sub-millisecond input
-    // (e.g. 0.5) never collapses to a non-positive value.
-    const n = Number.isFinite(value) && value > 0 ? Math.max(1, Math.floor(value)) : fallback;
-    return Math.min(n, MAX);
-  };
-  // Cap grace to MAX - 1 so there is always room for a positive kill while
-  // keeping kill + grace within the safe-integer range.
-  const grace = Math.min(toSafeMs(lockGraceMs, 2 * 60_000), MAX - 1);
-  // Cap kill so kill + grace stays a safe integer and floor it at 1 so the
-  // internal kill is always positive; the sum is then exact and strictly
-  // greater than kill (never equal to it via float rounding).
-  const killMs = Math.max(1, Math.min(toSafeMs(jobTimeoutMs, 5 * 60_000), MAX - grace));
-  return { killMs, lockMs: killMs + grace };
-}
-
-/**
  * Resolve the broker long-poll window (ms) each `activateJobs` request is held
  * open before returning empty. A longer window keeps an idle worker on ONE open
  * connection for that whole window instead of reconnecting every few seconds,
@@ -2626,7 +2586,7 @@ const MAX_CAPTURE_BYTES = 1_048_576; // 1 MiB per stream
 // Spawn a child, pipe `stdinData`, capture byte-capped stdout/stderr, enforce a
 // timeout (invoking `onTimeout(child)` to tear the child down), and resolve to a
 // uniform result. Used by both the host and container executors.
-function spawnCaptureOneShot({ command, args = [], shell = false, detached = false, cwd, env, stdinData, timeoutMs, onTimeout, stream = false, streamPrefix = '', onStreamOut, onStreamErr }) {
+function spawnCaptureOneShot({ command, args = [], shell = false, detached = false, cwd, env, stdinData, timeoutMs, idleTimeoutMs, onTimeout, stream = false, streamPrefix = '', onStreamOut, onStreamErr }) {
   return new Promise((resolve) => {
     let child;
     const stdoutChunks = [];
@@ -2637,6 +2597,7 @@ function spawnCaptureOneShot({ command, args = [], shell = false, detached = fal
     let stderrTruncated = false;
     let settled = false;
     let timer = null;
+    let idleTimer = null;
 
     // Live "spy" tee (--stream): mirror the child's output line-by-line to a
     // caller-supplied emitter (the worker routes these through c8ctl's
@@ -2673,6 +2634,7 @@ function spawnCaptureOneShot({ command, args = [], shell = false, detached = fal
       if (settled) return;
       settled = true;
       if (timer) clearTimeout(timer);
+      if (idleTimer) clearTimeout(idleTimer);
       if (teeOut) teeOut('', true);
       if (teeErr) teeErr('', true);
       resolve(result);
@@ -2692,7 +2654,25 @@ function spawnCaptureOneShot({ command, args = [], shell = false, detached = fal
         }, timeoutMs)
       : null;
 
+    // Idle-liveness kill: if the child emits no stdout/stderr for `idleTimeoutMs`,
+    // treat it as wedged and kill the tree. This is the liveness signal the
+    // worker's lock-extender relies on — a silent hang stops producing output, we
+    // kill it here, `runAgentJob` resolves, and the worker fails the job
+    // (retryable) so the broker reclaims it. Distinct from the absolute `timeoutMs`
+    // hard cap: this fires on *silence*, not total runtime. Re-armed on every chunk.
+    const armIdle = () => {
+      if (settled) return;
+      if (!(idleTimeoutMs && idleTimeoutMs > 0)) return;
+      if (idleTimer) clearTimeout(idleTimer);
+      idleTimer = setTimeout(() => {
+        try { if (onTimeout) onTimeout(child); } catch { /* best effort */ }
+        finish({ ok: false, exitCode: null, stdout: joinCapped(stdoutChunks), stderr: joinCapped(stderrChunks), error: `no output for ${idleTimeoutMs}ms (idle)`, timedOut: true, idle: true, truncated: stdoutTruncated, stderrTruncated });
+      }, idleTimeoutMs);
+    };
+    armIdle();
+
     child.stdout.on('data', (d) => {
+      armIdle();
       const buf = Buffer.isBuffer(d) ? d : Buffer.from(d);
       if (teeOut) teeOut(buf.toString('utf8'), false);
       const remaining = MAX_CAPTURE_BYTES - stdoutBytes;
@@ -2701,6 +2681,7 @@ function spawnCaptureOneShot({ command, args = [], shell = false, detached = fal
       else { stdoutChunks.push(buf); stdoutBytes += buf.length; }
     });
     child.stderr.on('data', (d) => {
+      armIdle();
       const buf = Buffer.isBuffer(d) ? d : Buffer.from(d);
       if (teeErr) teeErr(buf.toString('utf8'), false);
       const remaining = MAX_CAPTURE_BYTES - stderrBytes;
@@ -2757,6 +2738,43 @@ function baseAgentEnv(profile, job) {
 }
 
 /**
+ * Keep a leased job's broker activation lock ahead of *now* while the harness is
+ * running, so a long agent run never has its lock lapse and get re-activated (a
+ * second worker starting → the classic stale complete/fail 409). The lock is NOT
+ * hardcoded up front: we refresh it to `windowMs` — a duration-from-now, per the
+ * UpdateJobTimeout contract ("the duration of the new timeout in ms, starting
+ * from the current moment"), so calls SET rather than accumulate — every
+ * `intervalMs`. The deadline therefore stays a bounded `windowMs` ahead of now.
+ * The instant we stop refreshing (harness exit / idle-kill / hard cap) the lock
+ * lapses within `windowMs` and the broker reclaims the job — fast node-loss
+ * recovery. Because the harness is always killed locally before we stop, the lock
+ * strictly outlives our local run, so a reclaim never races a still-running agent.
+ *
+ * Returns a stop() to call once the run settles. Extension failures are logged
+ * and swallowed — a transient network blip must not crash the job handler. Older
+ * SDKs without `modifyJobTimeout` degrade to the fixed initial lock (a no-op stop).
+ */
+function startLockExtender(job, windowMs, intervalMs, tag, logger) {
+  if (!(windowMs > 0) || !(intervalMs > 0)) {
+    return () => {};
+  }
+  if (typeof job?.modifyJobTimeout !== 'function') {
+    logger?.warn?.(`${tag}: job.modifyJobTimeout unavailable — activation lock will NOT be auto-extended; a run longer than ${windowMs}ms risks being reclaimed and executed twice`);
+    return () => {};
+  }
+  const extend = () => Promise.resolve()
+    .then(() => job.modifyJobTimeout({ newTimeoutMs: windowMs }))
+    .catch((err) => logger?.warn?.(`${tag}: lock extend failed — ${err?.message ?? err}`));
+  // Renew immediately so the harness starts with a full, fresh window no matter
+  // how much of the initial activation lease provisioning (clone/checkout) ate.
+  extend();
+  const timer = setInterval(extend, intervalMs);
+  // Never let the heartbeat keep the process alive on shutdown.
+  if (typeof timer.unref === 'function') timer.unref();
+  return () => clearInterval(timer);
+}
+
+/**
  * Run a single activated job through the profile's CLI command (one-shot),
  * dispatching on the profile's sandbox:
  *   - none            → spawn the command on the host (legacy behaviour).
@@ -2766,7 +2784,7 @@ function baseAgentEnv(profile, job) {
  * Both paths resolve to the same result contract.
  */
 function runAgentJob(profile, job, opts = {}) {
-  const { timeoutMs, envelope, sandbox = 'none', image, runId, secretEnv = {}, passThroughSecretNames = [], cwd, extraEnv = {}, profileEnv = {}, resultFile, stream = false, streamPrefix = '', onStreamOut, onStreamErr, args: commandArgs } = opts;
+  const { timeoutMs, idleTimeoutMs, envelope, sandbox = 'none', image, runId, secretEnv = {}, passThroughSecretNames = [], cwd, extraEnv = {}, profileEnv = {}, resultFile, stream = false, streamPrefix = '', onStreamOut, onStreamErr, args: commandArgs } = opts;
   const payload = JSON.stringify(buildAgentPayload(profile, job, envelope));
   const agentEnv = baseAgentEnv(profile, job);
   // The harness command line: the profile command plus its structured switches
@@ -2801,6 +2819,7 @@ function runAgentJob(profile, job, opts = {}) {
       env: { ...process.env, ...staticEnv, ...secretEnv, ...agentEnv, ...extraEnv, ...resultEnv },
       stdinData: payload,
       timeoutMs,
+      idleTimeoutMs,
       onTimeout: (child) => killTree(child),
       stream,
       streamPrefix,
@@ -2856,6 +2875,7 @@ function runAgentJob(profile, job, opts = {}) {
     env: { ...process.env, ...staticEnv, ...secretEnv, ...agentEnv, ...extraEnv, ...resultEnv },
     stdinData: payload,
     timeoutMs,
+    idleTimeoutMs,
     stream,
     streamPrefix,
     onStreamOut,
@@ -2971,18 +2991,36 @@ async function workAgent(req, flags) {
     return Number.isFinite(n) && n > 0 ? n : dflt;
   };
   const maxParallelJobs = intFlag(flags?.['max-parallel'], 1);
-  const jobTimeoutMs = intFlag(flags?.['job-timeout'], 5 * 60_000);
-  // The broker's job-activation lock MUST outlast the harness kill deadline: the
-  // worker has to report the outcome (complete/fail) before the lock lapses,
-  // otherwise the broker re-activates the still-retryable job (a second agent
-  // starts) and the stale `fail` is rejected with a 409 "job cannot be failed in
-  // the current state". So lock = harness kill + grace. Raising --job-timeout
-  // alone does not help — it moves both coupled deadlines together.
-  const lockGraceMs = intFlag(flags?.['lock-grace'], 2 * 60_000);
-  // deriveJobLockMs is the single source of truth for both deadlines: the harness
-  // MUST enforce the clamped `jobKillMs` (not the raw --job-timeout), or a very
-  // large --job-timeout would outlive the broker lock and re-break the invariant.
-  const { killMs: jobKillMs, lockMs: jobLockMs } = deriveJobLockMs(jobTimeoutMs, lockGraceMs);
+  // The broker job-activation lock is NOT hardcoded up front. A fixed timeout is
+  // impossible to size for an agent: too short reclaims a still-working job (a
+  // second agent starts + the stale complete/fail is rejected 409), too long
+  // strands a dead worker's job. Instead the worker keeps the lock a bounded
+  // `recovery-window` ahead of *now* while the harness runs (see
+  // startLockExtender), so long runs never lose their lock, and a dead/killed
+  // worker's job is reclaimed within one window. Liveness is enforced by
+  // `idle-timeout` (max silence before the harness is killed as wedged), so the
+  // lock is held only while the agent is alive AND producing output.
+  const recoveryWindowMs = intFlag(flags?.['recovery-window'], 5 * 60_000);
+  const idleTimeoutMs = intFlag(flags?.['idle-timeout'], 5 * 60_000);
+  // `--job-timeout` is now an OPTIONAL absolute hard cap on total harness runtime
+  // (0/absent = unlimited), for operators who still want a ceiling regardless of
+  // output. It no longer governs the broker lock. intFlag floors non-positive to
+  // the default, so 0/absent both mean "no cap".
+  const hardCapMs = intFlag(flags?.['job-timeout'], 0);
+  // Refresh the lock well before it lapses: to `recovery-window` every ~1/3 of it,
+  // so a couple of missed beats (a slow extend RPC) don't drop the job, while a
+  // true stop (exit / idle-kill / hard cap) still reclaims within one window.
+  // Floored at 5s so a tiny window can't spin the extender.
+  // Refresh interval: ~1/3 of the window so we always renew comfortably before it
+  // lapses, floored at 5s (avoid hammering the gateway) and capped strictly below
+  // the window so even a tiny recovery window still renews before it expires.
+  const lockExtendIntervalMs = Math.min(
+    Math.max(5_000, Math.floor(recoveryWindowMs / 3)),
+    // Strict upper bound: always renew before the window lapses. `* 0.75` (never
+    // floored back up above the window) keeps the interval < recoveryWindowMs even
+    // for a tiny window, so the lock can't lapse between beats.
+    Math.max(1, Math.floor(recoveryWindowMs * 0.75)),
+  );
   // Broker long-poll window: how long each activateJobs request is held open
   // waiting for work. 30s default so idle workers hold one connection open ~30s
   // rather than reconnecting every few seconds — fewer reconnects, fewer chances
@@ -3096,7 +3134,7 @@ async function workAgent(req, flags) {
   if (profileEnvKeys.length > 0) logger.info(`  harness env: ${profileEnvKeys.join(', ')}`);
   const extraNote = extraJobTypes.length > 0 ? ` (${extraJobTypes.length} via --job-type)` : '';
   logger.info(`  listening on ${jobTypes.length} job type(s)${extraNote}: ${jobTypes.join('  ')}`);
-  logger.info(`  max parallel: ${maxParallelJobs}; job timeout: ${jobKillMs}ms; activation lock: ${jobLockMs}ms; poll timeout: ${pollTimeoutMs}ms`);
+  logger.info(`  max parallel: ${maxParallelJobs}; recovery window: ${recoveryWindowMs}ms; idle timeout: ${idleTimeoutMs}ms; hard cap: ${hardCapMs > 0 ? `${hardCapMs}ms` : 'off'}; poll timeout: ${pollTimeoutMs}ms`);
   logger.info('Polling for work — press Ctrl-C to stop.');
 
   // When launched under the supervisor, report per-job activity — which job(s)
@@ -3141,10 +3179,16 @@ async function workAgent(req, flags) {
       jobType,
       workerName: `${workerName}:${jobType}`,
       maxParallelJobs,
-      jobTimeoutMs: jobLockMs,
+      jobTimeoutMs: recoveryWindowMs,
       pollTimeoutMs,
       jobHandler: async (job) => {
         recordJobStart(job, jobType);
+        // Auto-extend the broker lock for the whole life of this job (harness run
+        // + git finalize + complete/fail), stopped in the outer finally. The lock
+        // is held only while the harness stays alive and productive — a silent
+        // hang is killed by the idle-timeout, which resolves runAgentJob and stops
+        // the extension, so the broker can reclaim the job.
+        let stopLockExtender = () => {};
         try {
         logger.info(`[${jobType}] job ${job.jobKey} (instance ${job.processInstanceKey ?? '-'}) → ${buildAgentCommandLine(profile.command, effectiveArgs)}`);
 
@@ -3181,6 +3225,12 @@ async function workAgent(req, flags) {
         const hasRepo = !isContainer && !!envelope.repository?.url;
         let runDir = null;
         let provisioned = null;
+        // Start refreshing the broker activation lock BEFORE any potentially-long
+        // work (host git clone/checkout can outlast the initial window). Starting
+        // here — ahead of provisionRepo — guarantees the first renewal is queued
+        // before the clone, so the lock can't lapse mid-provision and trigger the
+        // duplicate-activation / stale-409 race. The `finally` below stops it.
+        stopLockExtender = startLockExtender(job, recoveryWindowMs, lockExtendIntervalMs, `[${jobType}] job ${job.jobKey}`, logger);
         let cwd;
         let extraEnv;
         let repoToken = null;
@@ -3227,7 +3277,8 @@ async function workAgent(req, flags) {
           } catch { resultDir = null; resultFile = null; }
 
           result = await runAgentJob(profile, job, {
-            timeoutMs: jobKillMs,
+            timeoutMs: hardCapMs,
+            idleTimeoutMs,
             envelope,
             sandbox,
             image,
@@ -3296,7 +3347,7 @@ async function workAgent(req, flags) {
           const resultKeys = Object.keys(resultVars);
           if (resultKeys.length === 0) logger.warn(`[${jobType}] job ${job.jobKey}: agent returned no usable result vars — write a JSON object of result variables to $AGENT_RESULT_FILE (or print a "${RESULT_SENTINEL} {…}" line) so downstream gateways see status/summary/etc.`);
           else logger.info(`[${jobType}] job ${job.jobKey}: merged agent result vars [${resultKeys.join(', ')}]`);
-          return job.complete({
+          return await job.complete({
             ...resultVars,
             [AGENT_RESULT_KEY]: resultEnvelope,
             output: result.stdout,
@@ -3313,12 +3364,13 @@ async function workAgent(req, flags) {
           || (result.stderr || '').trim() + (result.stderrTruncated && (result.stderr || '').trim() ? ' [stderr truncated]' : '')
           || (result.signal ? `terminated by signal ${result.signal}` : `exit code ${result.exitCode}`);
         logger.warn(`[${jobType}] job ${job.jobKey} failed (${detail}); retries left ${retries}`);
-        return job.fail({
+        return await job.fail({
           errorMessage: `agent "${profile.name}" failed: ${detail}`.slice(0, 2000),
           retries,
           variables: { [AGENT_RESULT_KEY]: resultEnvelope },
         });
         } finally {
+          stopLockExtender();
           recordJobEnd(job);
         }
       },
@@ -3534,6 +3586,8 @@ const SUPERVISOR_MAX_FRAME_BYTES = 1 << 20; // 1 MiB
 const WORK_FORWARD_FLAGS = {
   'max-parallel': 'value',
   'job-timeout': 'value',
+  'recovery-window': 'value',
+  'idle-timeout': 'value',
   'lock-grace': 'value',
   'poll-timeout': 'value',
   sandbox: 'value',
@@ -6023,6 +6077,7 @@ export {
   diskBudgetOk,
   containerEngineAvailable,
   runAgentJob,
+  startLockExtender,
   provisionRepo,
   finalizeGit,
   reconcileAgentPr,
@@ -6037,7 +6092,6 @@ export {
   jobTypeMatrix,
   diffJobTypes,
   parseJobTypeFlags,
-  deriveJobLockMs,
   derivePollTimeoutMs,
   AGENT_TASK_NS,
   AGENT_RESULT_KEY,
@@ -6175,8 +6229,10 @@ export const commands = {
       stream: { type: 'boolean', description: 'work: tee each agent job\'s live stdout/stderr to this console, prefixed with the job type + key (spy/debug)' },
       list: { type: 'boolean', description: 'hire: list existing agent profiles instead of creating one' },
       'max-parallel': { type: 'string', description: 'work: max concurrent jobs per worker (default 1)' },
-      'job-timeout': { type: 'string', description: 'work: max harness runtime per job in ms; the spawned process is killed past this (default 300000)' },
-      'lock-grace': { type: 'string', description: 'work: extra ms added to --job-timeout to derive the broker activation lock, so the worker reports before the lock lapses (default 120000)' },
+      'job-timeout': { type: 'string', description: 'work: OPTIONAL absolute hard cap on total harness runtime per job in ms; the process is killed past this. Default 0 = unlimited (the broker lock is auto-managed — see --recovery-window / --idle-timeout).' },
+      'recovery-window': { type: 'string', description: 'work: broker activation-lock window in ms, auto-refreshed while the agent runs; also the node-loss reclaim time (a dead/killed worker\'s job is re-activated within this). Default 300000.' },
+      'idle-timeout': { type: 'string', description: 'work: max ms an agent may produce no stdout/stderr before it is killed as wedged (stops lock extension → job reclaimed). Default 300000.' },
+      'lock-grace': { type: 'string', description: 'work: DEPRECATED and ignored — the broker lock is now auto-managed via --recovery-window.' },
       'poll-timeout': { type: 'string', description: 'work: broker long-poll window in ms each activateJobs request is held open (fewer reconnects → fewer transient connect errors); default 30000, 0 = broker default, negative = return immediately' },
       'job-type': { type: 'string', multiple: true, description: 'work: extra job type to service alongside the rank×capability matrix (repeatable)' },
       worker: { type: 'string', multiple: true, description: 'supervisor start: profile to launch as a supervised worker (repeatable)' },
@@ -6331,7 +6387,7 @@ function printUsage() {
   console.log('  c8ctl nano update [--check]');
   console.log('  c8ctl nano hire [--name <n>] [--rank <r>] [--command <c>] [--arg <switch> ...] [--model <m>] [--capabilities <a,b>] [--sandbox none|docker|podman] [--image <ref>] [--env NAME=VALUE ...] [--list]');
   console.log('  c8ctl nano assign <profileName> [<capability> ...] [--name <n>] [--capabilities <a,b>]');
-  console.log('  c8ctl nano work <profileName> [--arg <switch> ...] [--max-parallel <n>] [--job-timeout <ms>] [--lock-grace <ms>] [--poll-timeout <ms>] [--job-type <token> ...] [--sandbox none|docker|podman] [--image <ref>] [--env NAME=VALUE ...] [--secret-resolver host] [--min-free-mb <n>] [--clone-timeout <ms>] [--keep-runs] [--stream]');
+  console.log('  c8ctl nano work <profileName> [--arg <switch> ...] [--max-parallel <n>] [--recovery-window <ms>] [--idle-timeout <ms>] [--job-timeout <ms>] [--poll-timeout <ms>] [--job-type <token> ...] [--sandbox none|docker|podman] [--image <ref>] [--env NAME=VALUE ...] [--secret-resolver host] [--min-free-mb <n>] [--clone-timeout <ms>] [--keep-runs] [--stream]');
   console.log('  c8ctl nano supervisor [start|status|add|remove|restart|stop|logs|attach] ... (manage many workers from one terminal)');
   console.log('');
   console.log('Subcommands:');
@@ -6376,8 +6432,10 @@ function printUsage() {
   console.log('  --list               hire: list existing agent profiles instead of creating one');
   console.log('  --max-parallel <n>   work: max concurrent jobs per worker (default 1)');
   console.log('  --job-type <token>   work: extra job type to service alongside the rank×capability matrix (repeatable)');
-  console.log('  --job-timeout <ms>   work: max harness runtime per job in ms (default 300000)');
-  console.log('  --lock-grace <ms>    work: extra ms over --job-timeout for the broker activation lock (default 120000)');
+  console.log('  --recovery-window <ms> work: broker activation-lock window, auto-refreshed while the agent runs; also the node-loss reclaim time (default 300000)');
+  console.log('  --idle-timeout <ms>  work: max silence (no agent stdout/stderr) before the harness is killed as wedged and the job reclaimed (default 300000)');
+  console.log('  --job-timeout <ms>   work: OPTIONAL absolute hard cap on total harness runtime; killed past this (default 0 = unlimited)');
+  console.log('  --lock-grace <ms>    work: DEPRECATED, ignored — the broker lock is now auto-managed via --recovery-window');
   console.log('  --poll-timeout <ms>  work: broker long-poll window per activateJobs request (default 30000; 0 = broker default, negative = immediate)');
   console.log('  --secret-resolver <r> work: secret resolver for task secretRefs (host; default host)');
   console.log('  --reap-age <ms>      work: age before a finished agent container/workspace is reaped (default 3600000)');

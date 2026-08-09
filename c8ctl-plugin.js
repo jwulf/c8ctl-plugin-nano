@@ -3016,7 +3016,10 @@ async function workAgent(req, flags) {
   // the window so even a tiny recovery window still renews before it expires.
   const lockExtendIntervalMs = Math.min(
     Math.max(5_000, Math.floor(recoveryWindowMs / 3)),
-    Math.max(1_000, Math.floor(recoveryWindowMs * 0.75)),
+    // Strict upper bound: always renew before the window lapses. `* 0.75` (never
+    // floored back up above the window) keeps the interval < recoveryWindowMs even
+    // for a tiny window, so the lock can't lapse between beats.
+    Math.max(1, Math.floor(recoveryWindowMs * 0.75)),
   );
   // Broker long-poll window: how long each activateJobs request is held open
   // waiting for work. 30s default so idle workers hold one connection open ~30s
@@ -3222,6 +3225,12 @@ async function workAgent(req, flags) {
         const hasRepo = !isContainer && !!envelope.repository?.url;
         let runDir = null;
         let provisioned = null;
+        // Start refreshing the broker activation lock BEFORE any potentially-long
+        // work (host git clone/checkout can outlast the initial window). Starting
+        // here — ahead of provisionRepo — guarantees the first renewal is queued
+        // before the clone, so the lock can't lapse mid-provision and trigger the
+        // duplicate-activation / stale-409 race. The `finally` below stops it.
+        stopLockExtender = startLockExtender(job, recoveryWindowMs, lockExtendIntervalMs, `[${jobType}] job ${job.jobKey}`, logger);
         let cwd;
         let extraEnv;
         let repoToken = null;
@@ -3267,7 +3276,6 @@ async function workAgent(req, flags) {
             liveRunDirs.add(resultDir);
           } catch { resultDir = null; resultFile = null; }
 
-          stopLockExtender = startLockExtender(job, recoveryWindowMs, lockExtendIntervalMs, `[${jobType}] job ${job.jobKey}`, logger);
           result = await runAgentJob(profile, job, {
             timeoutMs: hardCapMs,
             idleTimeoutMs,

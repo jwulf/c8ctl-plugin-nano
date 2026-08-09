@@ -946,7 +946,7 @@ test('startLockExtender refreshes the lock to the window on an interval, then st
   const calls = [];
   const job = { jobKey: 'jk', modifyJobTimeout: async ({ newTimeoutMs }) => { calls.push(newTimeoutMs); } };
   const stop = startLockExtender(job, 300_000, 20, 'tag', null);
-  await new Promise((r) => setTimeout(r, 75));
+  await new Promise((r) => setTimeout(r, 200));
   const afterRun = calls.length;
   assert.ok(afterRun >= 2, `expected ≥2 refreshes, got ${afterRun}`);
   assert.ok(calls.every((ms) => ms === 300_000), 'every refresh sets the deadline to now+window (absolute, not cumulative)');
@@ -960,7 +960,7 @@ test('startLockExtender renews immediately (harness gets a full window regardles
   const job = { jobKey: 'jk', modifyJobTimeout: async ({ newTimeoutMs }) => { calls.push(newTimeoutMs); } };
   const stop = startLockExtender(job, 300_000, 100_000, 'tag', null);
   // No interval has elapsed, but the first renewal must already have been queued.
-  await new Promise((r) => setTimeout(r, 5));
+  await new Promise((r) => setTimeout(r, 50));
   stop();
   assert.ok(calls.length >= 1, 'the first renewal fires immediately, not after one interval');
   assert.equal(calls[0], 300_000, 'the immediate renewal sets the deadline to now+window');

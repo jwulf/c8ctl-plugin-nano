@@ -3110,12 +3110,15 @@ async function workAgent(req, flags) {
     if (!activityFile) return;
     const jobs = [...activeJobs.entries()].map(([key, v]) => ({ key, type: v.type, since: v.since }));
     const payload = { pid: process.pid, updatedAt: Date.now(), busy: jobs.length > 0, jobs };
+    const tmp = `${activityFile}.${process.pid}.tmp`;
     try {
       mkdirSync(dirname(activityFile), { recursive: true });
-      const tmp = `${activityFile}.${process.pid}.tmp`;
-      writeFileSync(tmp, JSON.stringify(payload));
+      writeFileSync(tmp, JSON.stringify(payload), { mode: 0o600 });
       renameSync(tmp, activityFile); // atomic swap so a reader never sees a half-write
-    } catch { /* best effort — activity is advisory, never fail a job over it */ }
+    } catch {
+      try { rmSync(tmp, { force: true }); } catch { /* best effort */ }
+      /* best effort — activity is advisory, never fail a job over it */
+    }
   };
   const recordJobStart = (job, jobType) => {
     if (!activityFile) return;

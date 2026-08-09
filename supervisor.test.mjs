@@ -22,6 +22,8 @@ import {
   formatDuration,
   summarizeSupervisorWorker,
   formatSupervisorStatus,
+  supervisorJobCell,
+  supervisorWorkerActivityFile,
   WORK_FORWARD_FLAGS,
 } from './c8ctl-plugin.js';
 
@@ -314,4 +316,64 @@ test('formatSupervisorStatus guides the operator when there are no workers', () 
   const text = formatSupervisorStatus({ daemon: { pid: process.pid }, workers: [] });
   assert.match(text, /No workers/);
   assert.match(text, /supervisor add/);
+});
+
+// --- supervisorJobCell (per-job activity rendering) ------------------------
+
+test('supervisorJobCell shows the job key a worker is servicing', () => {
+  const row = { state: 'running', activity: { state: 'busy', jobs: [{ key: '2251799813685249', type: 'senior:pr-review', sinceMs: 5000 }] } };
+  const cell = supervisorJobCell(row);
+  assert.match(cell, /2251799813685249/);
+  assert.match(cell, /\(5s\)/); // includes how long it has been on the job
+});
+
+test('supervisorJobCell shows idle for a live worker with no in-flight job', () => {
+  assert.equal(supervisorJobCell({ state: 'running', activity: { state: 'idle', jobs: [] } }), 'idle');
+});
+
+test('supervisorJobCell counts extra concurrent jobs beyond the first', () => {
+  const row = { state: 'running', activity: { state: 'busy', jobs: [
+    { key: 'A', type: 't', sinceMs: 1000 },
+    { key: 'B', type: 't', sinceMs: 2000 },
+    { key: 'C', type: 't', sinceMs: 3000 },
+  ] } };
+  assert.match(supervisorJobCell(row), /^A \+2 \(1s\)$/);
+});
+
+test('supervisorJobCell is - for a down worker and ? for an alive non-reporter', () => {
+  assert.equal(supervisorJobCell({ state: 'down', activity: null }), '-');
+  assert.equal(supervisorJobCell({ state: 'stopping', activity: null }), '-');
+  assert.equal(supervisorJobCell({ state: 'running', activity: null }), '?');
+});
+
+// --- summarizeSupervisorWorker reads the on-disk activity marker -----------
+
+test('summarizeSupervisorWorker surfaces a live worker\'s serviced job from its marker', async (t) => {
+  const { mkdtempSync, mkdirSync, writeFileSync, rmSync } = await import('node:fs');
+  const { tmpdir } = await import('node:os');
+  const { join, dirname } = await import('node:path');
+  const home = mkdtempSync(join(tmpdir(), 'c8ctl-activity-'));
+  const prev = process.env.C8CTL_NANO_HOME;
+  process.env.C8CTL_NANO_HOME = home;
+  t.after(() => {
+    if (prev === undefined) delete process.env.C8CTL_NANO_HOME; else process.env.C8CTL_NANO_HOME = prev;
+    try { rmSync(home, { recursive: true, force: true }); } catch { /* best effort */ }
+  });
+
+  // A marker whose pid matches the (live) worker pid → busy on that job.
+  const file = supervisorWorkerActivityFile('reviewer');
+  mkdirSync(dirname(file), { recursive: true });
+  writeFileSync(file, JSON.stringify({ pid: process.pid, busy: true, jobs: [{ key: 'JOB-1', type: 'senior:pr-review', since: Date.now() - 2000 }] }));
+  const busy = summarizeSupervisorWorker({ id: 'reviewer', profile: 'reviewer', pid: process.pid });
+  assert.equal(busy.activity.state, 'busy');
+  assert.equal(busy.activity.jobs[0].key, 'JOB-1');
+
+  // A stale marker from a previous incarnation (different pid) is ignored.
+  writeFileSync(file, JSON.stringify({ pid: 999999999, busy: true, jobs: [{ key: 'STALE', since: Date.now() }] }));
+  const guarded = summarizeSupervisorWorker({ id: 'reviewer', profile: 'reviewer', pid: process.pid });
+  assert.equal(guarded.activity, null);
+
+  // No marker at all → idle-with-no-report (null), rendered as '?'.
+  const other = summarizeSupervisorWorker({ id: 'never-reported', profile: 'x', pid: process.pid });
+  assert.equal(other.activity, null);
 });

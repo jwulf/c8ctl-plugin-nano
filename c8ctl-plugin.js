@@ -213,6 +213,34 @@ function getSupervisorLogDir() {
 }
 
 /**
+ * Per-worker activity directory + file. A supervised `nano work` child writes a
+ * small JSON marker here reporting which job(s) it is currently servicing (or
+ * that it is idle); the daemon reads it for `supervisor status`. Worker ids are
+ * validated (`isValidWorkerName`: letters, digits, . _ -) so they are safe as a
+ * filename with no traversal risk.
+ */
+function getSupervisorActivityDir() {
+  return join(getStateHome(), 'supervisor-activity');
+}
+
+function supervisorWorkerActivityFile(id) {
+  return join(getSupervisorActivityDir(), `${id}.json`);
+}
+
+/**
+ * Read a worker's activity marker. Returns the parsed object, or `null` when the
+ * file is absent (worker not reporting yet, or a standalone/older worker) or
+ * unreadable. Pure enough for status rendering (best-effort IO).
+ */
+function readWorkerActivity(id) {
+  try {
+    return JSON.parse(readFileSync(supervisorWorkerActivityFile(id), 'utf-8'));
+  } catch {
+    return null;
+  }
+}
+
+/**
  * Deterministic control-socket path shared by the daemon and every client.
  * Derived from a hash of the (possibly overridden) state home so distinct
  * C8CTL_NANO_HOME instances get distinct sockets, and kept SHORT to stay under
@@ -3071,6 +3099,40 @@ async function workAgent(req, flags) {
   logger.info(`  max parallel: ${maxParallelJobs}; job timeout: ${jobKillMs}ms; activation lock: ${jobLockMs}ms; poll timeout: ${pollTimeoutMs}ms`);
   logger.info('Polling for work — press Ctrl-C to stop.');
 
+  // When launched under the supervisor, report per-job activity — which job(s)
+  // this worker is currently servicing, or that it is idle — to a small marker
+  // file the supervisor reads for `supervisor status`. The daemon passes the
+  // path via NANO_SUPERVISOR_ACTIVITY_FILE; a standalone `nano work` has no such
+  // env var and writes nothing (this is entirely advisory).
+  const activityFile = process.env.NANO_SUPERVISOR_ACTIVITY_FILE || null;
+  const activeJobs = new Map(); // jobKey -> { type, since (ms epoch) }
+  const writeActivity = () => {
+    if (!activityFile) return;
+    const jobs = [...activeJobs.entries()].map(([key, v]) => ({ key, type: v.type, since: v.since }));
+    const payload = { pid: process.pid, updatedAt: Date.now(), busy: jobs.length > 0, jobs };
+    const tmp = `${activityFile}.${process.pid}.tmp`;
+    try {
+      mkdirSync(dirname(activityFile), { recursive: true });
+      writeFileSync(tmp, JSON.stringify(payload), { mode: 0o600 });
+      renameSync(tmp, activityFile); // atomic swap so a reader never sees a half-write
+    } catch {
+      try { rmSync(tmp, { force: true }); } catch { /* best effort */ }
+      /* best effort — activity is advisory, never fail a job over it */
+    }
+  };
+  const recordJobStart = (job, jobType) => {
+    if (!activityFile) return;
+    activeJobs.set(String(job.jobKey), { type: jobType, since: Date.now() });
+    writeActivity();
+  };
+  const recordJobEnd = (job) => {
+    if (!activityFile) return;
+    activeJobs.delete(String(job.jobKey));
+    writeActivity();
+  };
+  // Seed an initial idle marker so status reports 'idle' immediately after spawn.
+  writeActivity();
+
   // A per-job-type worker factory. Captures all the CLI-local + profile context
   // in closure scope so the profile watcher below can (re)spawn a poller for any
   // job type on demand without re-reading the flags.
@@ -3082,6 +3144,8 @@ async function workAgent(req, flags) {
       jobTimeoutMs: jobLockMs,
       pollTimeoutMs,
       jobHandler: async (job) => {
+        recordJobStart(job, jobType);
+        try {
         logger.info(`[${jobType}] job ${job.jobKey} (instance ${job.processInstanceKey ?? '-'}) → ${buildAgentCommandLine(profile.command, effectiveArgs)}`);
 
         // Disk-budget admission shed: if the engine data root is below the free
@@ -3254,6 +3318,9 @@ async function workAgent(req, flags) {
           retries,
           variables: { [AGENT_RESULT_KEY]: resultEnvelope },
         });
+        } finally {
+          recordJobEnd(job);
+        }
       },
     });
 
@@ -3659,6 +3726,23 @@ function formatDuration(ms) {
 function summarizeSupervisorWorker(w, now = Date.now()) {
   const alive = isPidAlive(w.pid);
   const uptimeMs = alive && w.startedAt ? Math.max(0, now - new Date(w.startedAt).getTime()) : 0;
+  // Per-job activity (supervised workers only). Guard on pid so a stale marker
+  // left by a previous incarnation can't show a dead job as in-flight.
+  let activity = null; // { state: 'busy'|'idle', jobs: [{ key, type, sinceMs }] }
+  if (alive) {
+    const act = readWorkerActivity(w.id);
+    if (act && act.pid === w.pid) {
+      const jobs = Array.isArray(act.jobs)
+        ? act.jobs.map((j) => ({
+            key: String(j.key),
+            type: j.type ?? null,
+            sinceMs: Number.isFinite(j.since) ? Math.max(0, now - j.since) : null,
+          }))
+        : [];
+      activity = { state: jobs.length > 0 ? 'busy' : 'idle', jobs };
+    }
+    // No marker (or a stale-pid one): leave activity null → rendered as unknown.
+  }
   return {
     id: w.id,
     profile: w.profile,
@@ -3668,7 +3752,20 @@ function summarizeSupervisorWorker(w, now = Date.now()) {
     uptimeMs,
     lastExit: w.lastExit ?? null,
     args: Array.isArray(w.args) ? w.args : [],
+    activity,
   };
+}
+
+/** One-line JOB cell for a status row: the serviced job key, `idle`, or `-`. */
+function supervisorJobCell(w) {
+  if (w.state !== 'running') return '-';
+  const a = w.activity;
+  if (!a) return '?'; // alive but not reporting (older worker / marker not yet written)
+  if (a.state !== 'busy' || a.jobs.length === 0) return 'idle';
+  const [first, ...rest] = a.jobs;
+  const dur = first.sinceMs != null ? ` (${formatDuration(first.sinceMs)})` : '';
+  const more = rest.length > 0 ? ` +${rest.length}` : '';
+  return `${first.key}${more}${dur}`;
 }
 
 /** Render a supervisor status object as an aligned text table. */
@@ -3690,13 +3787,14 @@ function formatSupervisorStatus(status) {
     id: String(w.id),
     profile: String(w.profile),
     state: String(w.state),
+    job: supervisorJobCell(w),
     pid: w.pid ? String(w.pid) : '-',
     restarts: String(w.restarts),
     uptime: w.state === 'running' ? formatDuration(w.uptimeMs) : '-',
     last: w.lastExit ? String(w.lastExit) : '-',
   }));
-  const head = { id: 'ID', profile: 'PROFILE', state: 'STATE', pid: 'PID', restarts: 'RESTARTS', uptime: 'UPTIME', last: 'LAST EXIT' };
-  const cols = ['id', 'profile', 'state', 'pid', 'restarts', 'uptime', 'last'];
+  const head = { id: 'ID', profile: 'PROFILE', state: 'STATE', job: 'JOB', pid: 'PID', restarts: 'RESTARTS', uptime: 'UPTIME', last: 'LAST EXIT' };
+  const cols = ['id', 'profile', 'state', 'job', 'pid', 'restarts', 'uptime', 'last'];
   const width = {};
   for (const c of cols) width[c] = Math.max(head[c].length, ...rows.map((r) => r[c].length));
   const fmt = (r) => '  ' + cols.map((c) => r[c].padEnd(width[c])).join('  ');
@@ -3855,10 +3953,17 @@ async function runSupervisorDaemon() {
   const startWorker = (w) => {
     let fd;
     try { fd = openSync(w.logFile, 'a'); } catch { fd = 'ignore'; }
+    // Clear any stale activity marker from a previous incarnation so a freshly
+    // (re)started worker never briefly shows a dead job as in-flight.
+    const activityFile = supervisorWorkerActivityFile(w.id);
+    w.activityFile = activityFile;
+    try { rmSync(activityFile, { force: true }); } catch { /* best effort */ }
     // `--name w.id` makes the child's broker workerName match this worker's
     // supervisor id, so the same profile launched twice is distinct end-to-end.
+    // NANO_SUPERVISOR_ACTIVITY_FILE tells the child where to report per-job
+    // activity for `supervisor status` (idle vs the job key it is servicing).
     const child = spawn(exec, [entry, 'nano', 'work', w.profile, '--name', w.id, ...w.args], {
-      env: process.env,
+      env: { ...process.env, NANO_SUPERVISOR_ACTIVITY_FILE: activityFile },
       stdio: ['ignore', fd, fd],
     });
     if (typeof fd === 'number') { try { closeSync(fd); } catch { /* dup'd into child */ } }
@@ -3880,6 +3985,8 @@ async function runSupervisorDaemon() {
       settled = true;
       w.pid = null;
       w.lastExit = reason;
+      // Drop the activity marker — a dead worker services no job.
+      try { rmSync(w.activityFile || supervisorWorkerActivityFile(w.id), { force: true }); } catch { /* best effort */ }
       const ranMs = Date.now() - (w.spawnedAt || Date.now());
       if (ranMs >= SUPERVISOR_HEALTHY_UPTIME_MS) w.restarts = 0;
       if (w.stopping || shuttingDown || !workers.has(w.id)) { persist(); return; }
@@ -3939,6 +4046,7 @@ async function runSupervisorDaemon() {
     if (!workers.has(id)) return false;
     await stopWorker(id);
     workers.delete(id);
+    try { rmSync(supervisorWorkerActivityFile(id), { force: true }); } catch { /* best effort */ }
     dlog(`worker '${id}' removed`);
     broadcast({ type: 'event', event: 'worker-remove', id });
     persist();
@@ -5952,6 +6060,8 @@ export {
   formatDuration,
   summarizeSupervisorWorker,
   formatSupervisorStatus,
+  supervisorJobCell,
+  supervisorWorkerActivityFile,
   WORK_FORWARD_FLAGS,
   runSupervisorDaemon,
   startSupervisorDaemon,
@@ -6003,7 +6113,7 @@ export const metadata = {
         { command: 'c8ctl nano work coder --sandbox docker --image ghcr.io/acme/agent:1', description: 'Run jobs in isolated containers with disk-hygiene reaping' },
         { command: 'c8ctl nano supervisor start --worker reviewer --worker coder', description: 'Start a detached supervisor managing several workers from one terminal' },
         { command: 'c8ctl nano supervisor', description: 'Attach an interactive console to the supervisor (detach with Ctrl-D, leaving it running)' },
-        { command: 'c8ctl nano supervisor status', description: 'List supervised workers (pid, state, restarts, uptime) without the console' },
+        { command: 'c8ctl nano supervisor status', description: 'List supervised workers (pid, state, serviced job / idle, restarts, uptime) without the console' },
         { command: 'c8ctl nano supervisor add decider --max-parallel 2', description: 'Add a supervised worker (forwarding work flags) to the running supervisor' },
         { command: 'c8ctl nano supervisor restart reviewer', description: 'Restart a supervised worker by id or profile' },
         { command: 'c8ctl nano supervisor stop', description: 'Stop the supervisor daemon and all its workers' },

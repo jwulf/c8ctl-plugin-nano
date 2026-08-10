@@ -1484,7 +1484,7 @@ function showConfig() {
   console.log('Nano plugin configuration:');
   console.log('');
   console.log(`  state home   ${getStateHome()}`);
-  console.log(`  binary       ${cfg.binary || '(auto-detect: $NANOBPMN_BINARY or repo build)'}`);
+  console.log(`  binary       ${cfg.binary || '(auto-detect: $NANOBPMN_BINARY, managed platform package, or repo build)'}`);
   const bundled = readBundledBinaryInfo();
   if (bundled) {
     const at = bundled.commit && bundled.commit !== 'unknown' ? ` (${bundled.commit})` : '';

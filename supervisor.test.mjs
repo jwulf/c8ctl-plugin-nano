@@ -15,6 +15,8 @@ import {
   isValidWorkerName,
   randomNameSuffix,
   extractNameFlag,
+  parseInstancesCount,
+  extractInstancesFlag,
   redactWorkArgs,
   supervisorBackoffMs,
   encodeFrame,
@@ -186,6 +188,64 @@ test('extractNameFlag last occurrence wins and blanks yield undefined', () => {
   assert.deepEqual(extractNameFlag(['--name']), { name: undefined, rest: [] });
   assert.deepEqual(extractNameFlag([]), { name: undefined, rest: [] });
   assert.deepEqual(extractNameFlag(null), { name: undefined, rest: [] });
+});
+
+// --- parseInstancesCount ---------------------------------------------------
+
+test('parseInstancesCount defaults to 1 for absent/blank input', () => {
+  assert.deepEqual(parseInstancesCount(undefined), { count: 1 });
+  assert.deepEqual(parseInstancesCount(null), { count: 1 });
+  assert.deepEqual(parseInstancesCount(''), { count: 1 });
+  assert.deepEqual(parseInstancesCount('  '), { count: 1 });
+});
+
+test('parseInstancesCount accepts a positive whole number (string or number)', () => {
+  assert.deepEqual(parseInstancesCount('3'), { count: 3 });
+  assert.deepEqual(parseInstancesCount(5), { count: 5 });
+  assert.deepEqual(parseInstancesCount(' 2 '), { count: 2 });
+});
+
+test('parseInstancesCount takes the last occurrence when repeated (array)', () => {
+  assert.deepEqual(parseInstancesCount(['2', '4']), { count: 4 });
+});
+
+test('parseInstancesCount rejects non-integers, zero and negatives', () => {
+  assert.ok(parseInstancesCount('0').error);
+  assert.ok(parseInstancesCount('-1').error);
+  assert.ok(parseInstancesCount('1.5').error);
+  assert.ok(parseInstancesCount('abc').error);
+  assert.ok(parseInstancesCount(true).error); // bare `--instances` with no value
+});
+
+test('parseInstancesCount rejects counts over the per-command cap', () => {
+  assert.deepEqual(parseInstancesCount('64'), { count: 64 });
+  assert.ok(parseInstancesCount('65').error);
+});
+
+// --- extractInstancesFlag --------------------------------------------------
+
+test('extractInstancesFlag pulls --instances <val> out of the token list', () => {
+  assert.deepEqual(
+    extractInstancesFlag(['--instances', '3', '--max-parallel', '2']),
+    { count: 3, rest: ['--max-parallel', '2'] },
+  );
+});
+
+test('extractInstancesFlag supports --instances=val and leaves other flags intact', () => {
+  assert.deepEqual(extractInstancesFlag(['--instances=4', '--stream']), { count: 4, rest: ['--stream'] });
+});
+
+test('extractInstancesFlag defaults to 1 when absent and forwards a trailing bare flag as absent', () => {
+  assert.deepEqual(extractInstancesFlag(['--stream']), { count: 1, rest: ['--stream'] });
+  assert.deepEqual(extractInstancesFlag(['--stream', '--instances']), { count: 1, rest: ['--stream'] });
+  assert.deepEqual(extractInstancesFlag([]), { count: 1, rest: [] });
+  assert.deepEqual(extractInstancesFlag(null), { count: 1, rest: [] });
+});
+
+test('extractInstancesFlag surfaces a validation error while still stripping the flag', () => {
+  const r = extractInstancesFlag(['--instances', '0', '--stream']);
+  assert.ok(r.error);
+  assert.deepEqual(r.rest, ['--stream']);
 });
 
 // --- redactWorkArgs --------------------------------------------------------

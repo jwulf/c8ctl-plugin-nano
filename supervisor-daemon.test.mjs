@@ -332,3 +332,80 @@ test('supervisor daemon: adopts a live daemon when the state file is missing', a
 
   await mod.supervisorRequest({ op: 'stop' });
 });
+
+test('supervisor add --instances N: spawns N distinct auto-named workers, forwarding work flags (not --instances)', async (t) => {
+  const HOME = mkdtempSync(join(tmpdir(), 'c8ctl-sup-inst-'));
+  const prevHome = process.env.C8CTL_NANO_HOME;
+  const prevEntry = process.env.C8CTL_NANO_ENTRY;
+  process.env.C8CTL_NANO_HOME = HOME;
+  writeFileSync(join(HOME, 'config.json'), JSON.stringify({
+    hires: { faker: { name: 'faker', rank: 'senior', command: 'true', model: '', capabilities: [] } },
+  }));
+
+  // Idle `work` stand-in that records its own argv (keyed by pid) so we can prove
+  // each spawned child got the forwarded work flag and NOT `--instances`.
+  const workArgvDir = join(HOME, 'work-argv');
+  const shim = join(HOME, 'fake-entry.mjs');
+  writeFileSync(shim, [
+    `import { writeFileSync, mkdirSync } from 'node:fs';`,
+    `import { join } from 'node:path';`,
+    `const argv = process.argv.slice(2);`,
+    `if (argv[0] === 'nano' && argv[1] === 'supervisor' && argv[2] === '__daemon') {`,
+    `  const mod = await import(${JSON.stringify(pluginUrl)});`,
+    `  await mod.runSupervisorDaemon();`,
+    `} else if (argv[0] === 'nano' && argv[1] === 'work') {`,
+    `  try { mkdirSync(${JSON.stringify(workArgvDir)}, { recursive: true }); ` +
+    `writeFileSync(join(${JSON.stringify(workArgvDir)}, process.pid + '.json'), JSON.stringify(argv)); } catch {}`,
+    `  setInterval(() => {}, 1 << 30);`,
+    `}`,
+  ].join('\n'));
+  process.env.C8CTL_NANO_ENTRY = shim;
+
+  const mod = await import(pluginUrl);
+  t.after(async () => {
+    try { await mod.supervisorRequest({ op: 'stop' }); } catch { /* ignore */ }
+    const st = mod.runningSupervisor();
+    if (st) { try { process.kill(st.pid, 'SIGKILL'); } catch { /* ignore */ } }
+    mod.clearSupervisorState();
+    restoreEnv('C8CTL_NANO_ENTRY', prevEntry);
+    restoreEnv('C8CTL_NANO_HOME', prevHome);
+    try { rmSync(HOME, { recursive: true, force: true }); } catch { /* ignore */ }
+  });
+
+  await mod.startSupervisorDaemon();
+
+  // Drive the real CLI handler path: `supervisor add faker --instances 3 --max-parallel 2`.
+  const req = { subcommand: 'supervisor', positional: ['add', 'faker'] };
+  await mod.supervisorAddCmd(req, { instances: '3', 'max-parallel': '2' });
+
+  // Three distinct workers, all running the `faker` profile, each auto-named.
+  let workers = [];
+  for (let i = 0; i < 30; i++) {
+    const s = await mod.supervisorRequest({ op: 'status' });
+    workers = s.workers;
+    if (workers.length === 3 && workers.every((w) => w.state === 'running' && w.pid)) break;
+    await sleep(100);
+  }
+  assert.equal(workers.length, 3, 'should have spawned exactly 3 workers');
+  const ids = workers.map((w) => w.id);
+  assert.equal(new Set(ids).size, 3, `worker ids must be distinct: ${JSON.stringify(ids)}`);
+  for (const w of workers) {
+    assert.equal(w.profile, 'faker');
+    assert.match(w.id, /^[a-z0-9._-]+-faker-[0-9a-f]+$/, `auto-named id expected, got ${w.id}`);
+  }
+
+  // Every child got the forwarded `--max-parallel 2` and its `--name <id>`, but
+  // never the `--instances` flag (that is consumed by the CLI, not `nano work`).
+  for (const w of workers) {
+    const childArgv = await readChildArgv(workArgvDir, w.pid);
+    assert.ok(childArgv, `child argv for ${w.id} should be recorded`);
+    assert.deepEqual(childArgv.slice(0, 3), ['nano', 'work', 'faker']);
+    assert.ok(!childArgv.includes('--instances'), `child must not receive --instances: ${JSON.stringify(childArgv)}`);
+    const mp = childArgv.indexOf('--max-parallel');
+    assert.ok(mp !== -1 && childArgv[mp + 1] === '2', `child should carry --max-parallel 2: ${JSON.stringify(childArgv)}`);
+    const nameIdx = childArgv.indexOf('--name');
+    assert.ok(nameIdx !== -1 && childArgv[nameIdx + 1] === w.id, 'child --name should equal its supervisor id');
+  }
+
+  await mod.supervisorRequest({ op: 'stop' });
+});

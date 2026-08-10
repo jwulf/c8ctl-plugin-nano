@@ -479,6 +479,7 @@ c8ctl nano supervisor
 c8ctl nano supervisor status                       # id, state, pid, restarts, uptime
 c8ctl nano supervisor add reviewer --max-parallel 2 # add + spawn a worker (forwards work flags)
 c8ctl nano supervisor add reviewer --name reviewer-2 # a SECOND reviewer, named so it stays distinct
+c8ctl nano supervisor add reviewer --instances 3    # add 3 distinct auto-named reviewers in one call
 c8ctl nano supervisor restart reviewer             # by worker id or profile name
 c8ctl nano supervisor remove coder                 # stop + drop a worker (also: `all`)
 c8ctl nano supervisor logs reviewer --follow       # tail a worker's log (or the daemon's)
@@ -489,9 +490,13 @@ Each worker has a **name** — its supervisor id and the broker `workerName` it
 registers under. Pass `--name` on `supervisor add` (or `work`) to set it;
 omit it and one is auto-generated as `‹host›-‹profile›-‹random›`, so you can
 run **several instances of the same profile** and they stay distinct
-end-to-end (status, logs, and at the broker). `restart`/`remove` accept either
-a worker id **or** a profile name — targeting a profile affects *every*
-instance of it.
+end-to-end (status, logs, and at the broker). To scale a hire to several
+instances in one call, pass `--instances N` on `supervisor add` — it spawns N
+distinct auto-named workers of the profile at once (default 1, capped per call).
+Because each instance needs its own distinct name, `--instances N` (for N > 1)
+cannot be combined with `--name`; omit `--name` to let them auto-name.
+`restart`/`remove` accept either a worker id **or** a profile name — targeting a
+profile affects *every* instance of it.
 
 Each worker takes the **same flags as `nano work`** (`--max-parallel`,
 `--recovery-window`, `--idle-timeout`, `--job-timeout`, `--poll-timeout`,

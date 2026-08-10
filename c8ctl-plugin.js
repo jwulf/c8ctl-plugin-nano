@@ -3701,6 +3701,58 @@ function extractNameFlag(parts) {
   return { name: name != null && name.trim() !== '' ? name.trim() : undefined, rest };
 }
 
+/**
+ * Upper bound on how many workers a single `supervisor add --instances N` may
+ * spawn. Not a fleet cap (add again to grow further) — a typo guard, so a
+ * fat-fingered `--instances 100000` can't fork-bomb the host in one keystroke.
+ */
+const MAX_ADD_INSTANCES = 64;
+
+/**
+ * Parse the `--instances N` count for `supervisor add`. Accepts undefined/blank
+ * (defaults to 1), and a whole number in `[1, MAX_ADD_INSTANCES]`. Rejects
+ * non-integers, zero/negatives, and anything over the cap with a clear message.
+ * When a flag is repeated the last occurrence wins (arrays are tolerated).
+ * Returns `{ count }` on success or `{ error }` on rejection. Pure.
+ */
+function parseInstancesCount(raw) {
+  const v = Array.isArray(raw) ? raw[raw.length - 1] : raw;
+  if (v === undefined || v === null || (typeof v === 'string' && v.trim() === '')) {
+    return { count: 1 };
+  }
+  const s = String(v).trim();
+  if (!/^\d+$/.test(s)) return { error: `Invalid --instances "${v}": use a whole number between 1 and ${MAX_ADD_INSTANCES}.` };
+  const n = Number.parseInt(s, 10);
+  if (n < 1) return { error: `Invalid --instances "${v}": use a whole number between 1 and ${MAX_ADD_INSTANCES}.` };
+  if (n > MAX_ADD_INSTANCES) return { error: `--instances ${n} exceeds the ${MAX_ADD_INSTANCES}-per-command cap; run "supervisor add" again to add more.` };
+  return { count: n };
+}
+
+/**
+ * Split `--instances N` / `--instances=N` out of a raw token list, returning
+ * `{ count, rest, error }` where `rest` is the remaining work flags (with the
+ * flag removed so it is never forwarded to `nano work`). Used by the interactive
+ * console's `add`, whose tokens aren't parsed by the CLI flag layer. Last
+ * occurrence wins; a trailing `--instances` with no value is treated as absent
+ * (count 1), mirroring `extractNameFlag`. Pure.
+ */
+function extractInstancesFlag(parts) {
+  const rest = [];
+  let raw;
+  const list = Array.isArray(parts) ? parts : [];
+  for (let i = 0; i < list.length; i++) {
+    const tok = String(list[i]);
+    const eq = /^--instances=(.*)$/.exec(tok);
+    if (eq) { raw = eq[1]; continue; }
+    if (tok === '--instances') {
+      if (i + 1 < list.length) { raw = String(list[i + 1]); i++; }
+      continue;
+    }
+    rest.push(tok);
+  }
+  return { ...parseInstancesCount(raw), rest };
+}
+
 /** Assign a unique, stable worker id from a profile name (pure). */
 function supervisorWorkerId(profile, taken) {
   const base = String(profile || '').trim() || 'worker';
@@ -4479,14 +4531,31 @@ async function supervisorAddCmd(req, flags) {
   const logger = getLogger();
   // The positional profile is what runs; `--name` names this worker instance
   // (forwarded to the child as `nano work … --name`, and used as its supervisor
-  // id). Omit `--name` to auto-generate ‹host›-‹profile›-‹random›.
+  // id). Omit `--name` to auto-generate ‹host›-‹profile›-‹random›. `--instances N`
+  // spawns N distinct auto-named workers of the profile in one call.
   const profile = req.positional[1];
-  if (!profile) { logger.error('Usage: c8ctl nano supervisor add <profile> [--name <worker>] [work flags]'); process.exit(1); }
+  if (!profile) { logger.error('Usage: c8ctl nano supervisor add <profile> [--name <worker>] [--instances <n>] [work flags]'); process.exit(1); }
+  const { count, error } = parseInstancesCount(flags?.instances);
+  if (error) { logger.error(error); process.exit(1); }
   const name = flags?.name ? String(flags.name).trim() : undefined;
+  // A single `--name` can't apply to several distinct workers (each needs its
+  // own broker workerName / supervisor id), so reject the combination and steer
+  // the operator to auto-naming.
+  if (name && count > 1) {
+    logger.error('--name cannot be combined with --instances > 1 (each instance needs a distinct name); omit --name to auto-name them.');
+    process.exit(1);
+  }
   await startSupervisorDaemon();
-  const res = await supervisorRequest({ op: 'add', profile, name, args: reconstructWorkArgs(flags) });
-  if (res.ok) logger.info(`Added worker "${res.worker.id}" (profile ${profile}); pid ${res.worker.pid ?? 'starting'}.`);
-  else { logger.error(`Could not add "${profile}": ${res.error}`); process.exit(1); }
+  const workArgs = reconstructWorkArgs(flags);
+  let added = 0;
+  let failed = 0;
+  for (let i = 0; i < count; i++) {
+    const res = await supervisorRequest({ op: 'add', profile, name, args: workArgs });
+    if (res.ok) { added++; logger.info(`Added worker "${res.worker.id}" (profile ${profile}); pid ${res.worker.pid ?? 'starting'}.`); }
+    else { failed++; logger.error(`Could not add "${profile}": ${res.error}`); }
+  }
+  if (count > 1) logger.info(`Added ${added}/${count} instance(s) of "${profile}".`);
+  if (failed > 0) process.exit(1);
 }
 
 async function supervisorRemoveCmd(req) {
@@ -4636,16 +4705,21 @@ async function attachSupervisorConsole(state) {
       switch (cmd) {
         case '': break;
         case 'help':
-          out('Commands: status | add <profile> [--name <worker>] [work flags] |');
+          out('Commands: status | add <profile> [--name <worker>] [--instances <n>] [work flags] |');
           out('          remove <id|profile|all> | restart <id|profile|all> |');
           out('          logs [id] | detach | stop | help');
           break;
         case 'status': sock.write(encodeFrame({ op: 'status' })); break;
         case 'add': {
           const profile = parts.shift();
-          if (!profile) { out('usage: add <profile> [--name <worker>] [work flags]'); break; }
+          if (!profile) { out('usage: add <profile> [--name <worker>] [--instances <n>] [work flags]'); break; }
           const { name, rest } = extractNameFlag(parts);
-          sock.write(encodeFrame({ op: 'add', profile, name, args: rest }));
+          const { count, rest: workArgs, error } = extractInstancesFlag(rest);
+          if (error) { out(error); break; }
+          if (name && count > 1) { out('--name cannot be combined with --instances > 1; omit --name to auto-name them.'); break; }
+          for (let i = 0; i < count; i++) {
+            sock.write(encodeFrame({ op: 'add', profile, name, args: workArgs }));
+          }
           break;
         }
         case 'remove': case 'rm': {
@@ -6107,6 +6181,8 @@ export {
   isValidWorkerName,
   randomNameSuffix,
   extractNameFlag,
+  parseInstancesCount,
+  extractInstancesFlag,
   redactWorkArgs,
   supervisorBackoffMs,
   encodeFrame,
@@ -6120,6 +6196,7 @@ export {
   runSupervisorDaemon,
   startSupervisorDaemon,
   supervisorRequest,
+  supervisorAddCmd,
   runningSupervisor,
   readSupervisorState,
   clearSupervisorState,
@@ -6169,6 +6246,7 @@ export const metadata = {
         { command: 'c8ctl nano supervisor', description: 'Attach an interactive console to the supervisor (detach with Ctrl-D, leaving it running)' },
         { command: 'c8ctl nano supervisor status', description: 'List supervised workers (pid, state, serviced job / idle, restarts, uptime) without the console' },
         { command: 'c8ctl nano supervisor add decider --max-parallel 2', description: 'Add a supervised worker (forwarding work flags) to the running supervisor' },
+        { command: 'c8ctl nano supervisor add reviewer --instances 3', description: 'Add 3 distinct auto-named instances of a profile in one call' },
         { command: 'c8ctl nano supervisor restart reviewer', description: 'Restart a supervised worker by id or profile' },
         { command: 'c8ctl nano supervisor stop', description: 'Stop the supervisor daemon and all its workers' },
       ],
@@ -6236,6 +6314,7 @@ export const commands = {
       'poll-timeout': { type: 'string', description: 'work: broker long-poll window in ms each activateJobs request is held open (fewer reconnects → fewer transient connect errors); default 30000, 0 = broker default, negative = return immediately' },
       'job-type': { type: 'string', multiple: true, description: 'work: extra job type to service alongside the rank×capability matrix (repeatable)' },
       worker: { type: 'string', multiple: true, description: 'supervisor start: profile to launch as a supervised worker (repeatable)' },
+      instances: { type: 'string', description: `supervisor add: spawn N distinct auto-named instances of the profile in one call (default 1, max ${MAX_ADD_INSTANCES}; cannot combine with --name)` },
       attach: { type: 'boolean', description: 'supervisor start: attach the interactive console after starting the daemon' },
     },
     handler: async (args, flags) => {

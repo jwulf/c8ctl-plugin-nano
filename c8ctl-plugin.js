@@ -1387,7 +1387,7 @@ function setConfig(req) {
   const key = req.positional[0];
   const value = req.positional[1];
 
-  if (!key || !(key in SETTING_ALIASES)) {
+  if (!key || !Object.hasOwn(SETTING_ALIASES, key)) {
     logger.error('Usage: c8ctl nano set <bin|model-dir> <path>');
     logger.info('Settings:');
     logger.info('  bin <path>        Path to the nanobpmn server binary');
@@ -1434,7 +1434,7 @@ function unsetConfig(req) {
   const logger = getLogger();
   const key = req.positional[0];
 
-  if (!key || !(key in SETTING_ALIASES)) {
+  if (!key || !Object.hasOwn(SETTING_ALIASES, key)) {
     logger.error('Usage: c8ctl nano unset <bin|model-dir>');
     logger.info('Settings:');
     logger.info('  bin        Clear the custom server binary (back to the managed/release binary)');

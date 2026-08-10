@@ -125,3 +125,24 @@ test('unset with no key exits non-zero', () => {
     assert.equal(exitCode, 1);
   });
 });
+
+test('unset rejects inherited object keys (toString / __proto__)', () => {
+  withHome(() => {
+    writeFileSync(getConfigFile(), JSON.stringify({ binary: '/keep/me' }));
+    for (const bogus of ['toString', '__proto__', 'hasOwnProperty']) {
+      const prevExit = process.exit;
+      let exitCode;
+      process.exit = (code) => {
+        exitCode = code;
+        throw new Error('__exit__');
+      };
+      try {
+        assert.throws(() => unsetConfig({ positional: [bogus] }), /__exit__/, bogus);
+      } finally {
+        process.exit = prevExit;
+      }
+      assert.equal(exitCode, 1, `${bogus} should be rejected`);
+    }
+    assert.equal(readConfig().binary, '/keep/me');
+  });
+});

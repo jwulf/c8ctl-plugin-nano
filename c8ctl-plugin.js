@@ -1730,13 +1730,14 @@ function resolveAssignInputs(req, flags) {
  * capabilities are the remaining positionals and/or `--capabilities a,b`.
  * Capabilities are unioned with the profile's existing set (additive; assign
  * never removes a role) and the updated rank×capability job-type matrix is
- * printed. Re-run `work` to pick up the new job types.
+ * printed. Running workers hot-reload the new job types within ~1.5s — no
+ * restart needed.
  */
 async function assignCapabilities(req, flags) {
   const logger = getLogger();
   const { name, incomingRaw } = resolveAssignInputs(req, flags);
   if (!name) {
-    logger.error('Usage: c8ctl nano assign <profileName> [<capability> ...] [--name <n>] [--capabilities <a,b>]');
+    logger.error('Usage: c8ctl nano assign <profileName> <cap[,cap...]> [--name <n>] [--capabilities <a,b>]');
     logger.info('Grant new capabilities to an existing hire. List profiles with: c8ctl nano hire --list');
     process.exit(1);
   }
@@ -1747,7 +1748,7 @@ async function assignCapabilities(req, flags) {
 
   if (normalizeCapabilities(incomingRaw).length === 0) {
     logger.error('Provide at least one capability to assign.');
-    logger.info(`Example: c8ctl nano assign ${name} code-review testing`);
+    logger.info(`Example: c8ctl nano assign ${name} code-review,testing`);
     process.exit(1);
   }
 
@@ -1778,7 +1779,7 @@ async function assignCapabilities(req, flags) {
   logger.info(`Assigned to "${name}" [${profile.rank}]: +${added.join(', ')}`);
   logger.info(`  capabilities: ${profile.capabilities.join(', ')}`);
   logger.info(`  job types (${matrix.length}): ${matrix.join('  ')}`);
-  logger.info(`Restart its workers to pick up the new roles: c8ctl nano work ${name}`);
+  logger.info(`Running workers pick this up automatically within ~1.5s — no restart needed.`);
 }
 
 /**
@@ -6240,6 +6241,7 @@ export const metadata = {
         { command: 'c8ctl nano hire --name coder --rank senior --command copilot --env COPILOT_ENABLE_ALL_TOOLS=1', description: 'Persist a harness startup env var (e.g. permissions) on the profile' },
         { command: 'c8ctl nano hire --list', description: 'List hired agent profiles' },
         { command: 'c8ctl nano hire --name coder --rank senior --command "agent-harness" --sandbox docker --image ghcr.io/acme/agent:1', description: 'Create a profile that runs each job in a throwaway Docker container' },
+        { command: 'c8ctl nano assign reviewer code-review,testing', description: 'Grant more capabilities (comma-separated, like hire) to an existing hire — additive; running workers hot-reload it' },
         { command: 'c8ctl nano work reviewer', description: 'Spawn Nano job workers for the "reviewer" profile and poll for work' },
         { command: 'c8ctl nano work coder --sandbox docker --image ghcr.io/acme/agent:1', description: 'Run jobs in isolated containers with disk-hygiene reaping' },
         { command: 'c8ctl nano supervisor start --worker reviewer --worker coder', description: 'Start a detached supervisor managing several workers from one terminal' },
@@ -6465,7 +6467,7 @@ function printUsage() {
   console.log('  c8ctl nano config');
   console.log('  c8ctl nano update [--check]');
   console.log('  c8ctl nano hire [--name <n>] [--rank <r>] [--command <c>] [--arg <switch> ...] [--model <m>] [--capabilities <a,b>] [--sandbox none|docker|podman] [--image <ref>] [--env NAME=VALUE ...] [--list]');
-  console.log('  c8ctl nano assign <profileName> [<capability> ...] [--name <n>] [--capabilities <a,b>]');
+  console.log('  c8ctl nano assign <profileName> <cap[,cap...]> [--name <n>] [--capabilities <a,b>]');
   console.log('  c8ctl nano work <profileName> [--arg <switch> ...] [--max-parallel <n>] [--recovery-window <ms>] [--idle-timeout <ms>] [--job-timeout <ms>] [--poll-timeout <ms>] [--job-type <token> ...] [--sandbox none|docker|podman] [--image <ref>] [--env NAME=VALUE ...] [--secret-resolver host] [--min-free-mb <n>] [--clone-timeout <ms>] [--keep-runs] [--stream]');
   console.log('  c8ctl nano supervisor [start|status|add|remove|restart|stop|logs|attach] ... (manage many workers from one terminal)');
   console.log('');
@@ -6482,7 +6484,7 @@ function printUsage() {
   console.log('  config   Show current configuration and on-disk locations');
   console.log('  update   Pull the latest published nano release (--check to only report)');
   console.log('  hire     Create a CLI agent worker profile (rank + capabilities → job-type matrix)');
-  console.log('  assign   Grant new capabilities (roles) to an existing hire (additive)');
+  console.log('  assign   Grant new capabilities (roles) to an existing hire (additive; comma-separated; workers hot-reload)');
   console.log('  work     Run a hired profile as Nano job workers, polling for work until Ctrl-C');
   console.log('  supervisor  Run/manage a fleet of workers from one terminal (detachable console + non-interactive control)');
   console.log('');

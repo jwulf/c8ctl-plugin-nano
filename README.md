@@ -106,6 +106,10 @@ c8ctl nano clean
 c8ctl nano set bin   ~/workspace/nanobpmn/server/target/release/nanobpm-gateway-rest-server
 c8ctl nano set model-dir ~/bpmn-workspace
 
+# Clear a custom setting (back to the managed/release binary, or default workspace)
+c8ctl nano unset bin
+c8ctl nano unset model-dir
+
 # Show current configuration and on-disk locations
 c8ctl nano config
 ```
@@ -575,16 +579,22 @@ c8ctl nano start --console off        # headless: no console router at all
   env var is honored when the flag is not passed. The plugin passes the choice
   through as `NANOBPMN_CONSOLE` on every node.
 
-## Configuration (`set` / `config`)
+## Configuration (`set` / `unset` / `config`)
 
 Persistent settings are stored in `<state home>/config.json`:
 
-| Setting             | Env mapping              | Set with                          |
-|---------------------|--------------------------|-----------------------------------|
-| Binary path         | (used to launch nodes)   | `c8ctl nano set bin <path>`       |
-| Workspace directory | `NANOBPMN_WORKSPACE_DIR` | `c8ctl nano set model-dir <path>` |
+| Setting             | Env mapping              | Set with                          | Clear with                    |
+|---------------------|--------------------------|-----------------------------------|-------------------------------|
+| Binary path         | (used to launch nodes)   | `c8ctl nano set bin <path>`       | `c8ctl nano unset bin`        |
+| Workspace directory | `NANOBPMN_WORKSPACE_DIR` | `c8ctl nano set model-dir <path>` | `c8ctl nano unset model-dir`  |
 
 Show the effective configuration and all on-disk locations with `c8ctl nano config`.
+
+`unset bin` clears a custom binary path so node launches fall back to the
+managed platform binary — i.e. back on the release train that `c8ctl nano
+update` tracks. (Note: a `NANOBPMN_BINARY` environment variable still overrides
+even after `unset`.) `unset model-dir` returns the workspace to its default
+(`<state home>/workspace`).
 
 ## Updating to a new release (`update`)
 

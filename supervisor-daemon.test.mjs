@@ -21,10 +21,12 @@ function sleep(ms) { return new Promise((r) => setTimeout(r, ms)); }
 async function readChildArgv(dir, pid) {
   for (let i = 0; i < 30; i++) {
     try { return JSON.parse(readFileSync(join(dir, `${pid}.json`), 'utf8')); } catch { /* not yet */ }
-    // Fall back to scanning the dir in case the reported pid differs.
+    // Fall back to scanning the dir in case the reported pid differs — but ONLY
+    // when there is a single recorded child, so we never return a *different*
+    // worker's argv when several are running (each keyed by its own pid).
     try {
       const files = readdirSync(dir);
-      if (files.length) return JSON.parse(readFileSync(join(dir, files[0]), 'utf8'));
+      if (files.length === 1) return JSON.parse(readFileSync(join(dir, files[0]), 'utf8'));
     } catch { /* dir not created yet */ }
     await sleep(50);
   }

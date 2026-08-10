@@ -450,7 +450,7 @@ function launcherEnvMarkers(resolved) {
 // Argument parsing
 // ---------------------------------------------------------------------------
 
-const VALID_SUBCOMMANDS = ['start', 'stop', 'status', 'logs', 'log', 'restart', 'pause', 'resume', 'clean', 'set', 'config', 'update', 'hire', 'assign', 'work', 'supervisor'];
+const VALID_SUBCOMMANDS = ['start', 'stop', 'status', 'logs', 'log', 'restart', 'pause', 'resume', 'clean', 'set', 'unset', 'config', 'update', 'hire', 'assign', 'work', 'supervisor'];
 
 /**
  * Parse positional args + flags into a normalized request.
@@ -1387,7 +1387,7 @@ function setConfig(req) {
   const key = req.positional[0];
   const value = req.positional[1];
 
-  if (!key || !(key in SETTING_ALIASES)) {
+  if (!key || !Object.hasOwn(SETTING_ALIASES, key)) {
     logger.error('Usage: c8ctl nano set <bin|model-dir> <path>');
     logger.info('Settings:');
     logger.info('  bin <path>        Path to the nanobpmn server binary');
@@ -1423,12 +1423,69 @@ function setConfig(req) {
   }
 }
 
+/**
+ * Clear a configured setting so resolution falls back to the default. The
+ * headline use is `unset bin`: after `set bin <path>` pins a self-managed
+ * binary (source 'configured', which disables self-update), clearing it lets
+ * the plugin fall back to the managed npm platform package — i.e. back on the
+ * release train. `unset model-dir` returns the workspace to its default.
+ */
+function unsetConfig(req) {
+  const logger = getLogger();
+  const key = req.positional[0];
+
+  if (!key || !Object.hasOwn(SETTING_ALIASES, key)) {
+    logger.error('Usage: c8ctl nano unset <bin|model-dir>');
+    logger.info('Settings:');
+    logger.info('  bin        Clear the custom server binary (back to the managed/release binary)');
+    logger.info('  model-dir  Clear the custom workspace dir (back to the default)');
+    process.exit(1);
+  }
+
+  const field = SETTING_ALIASES[key];
+  const cfg = readConfig();
+  const prev = cfg[field];
+  const wasSet = prev !== undefined && prev !== null && prev !== '';
+  const label = field === 'binary' ? 'custom binary override' : 'custom workspace override';
+
+  if (!wasSet) {
+    logger.info(`No ${label} is configured — nothing to clear.`);
+  } else {
+    delete cfg[field];
+    writeConfig(cfg);
+    logger.info(`Cleared ${label} (was ${prev}).`);
+  }
+
+  if (field === 'binary') {
+    // Report what resolves now, so the operator can see they are back on the
+    // managed release train (or what still overrides it).
+    try {
+      const r = resolveBinary({});
+      logger.info(`Now using: ${r.path} (${r.from}).`);
+      if (r.source === 'managed-npm') {
+        logger.info('Back on the managed release train — "c8ctl nano update" now tracks the published release.');
+      } else if (r.source === 'configured') {
+        logger.warn('Still pinned by NANOBPMN_BINARY in your environment; unset that to use the managed binary.');
+      }
+    } catch (err) {
+      logger.warn(`No binary resolves now: ${err instanceof Error ? err.message : err}`);
+      logger.info('Reinstall the plugin to fetch the managed platform binary, or set one again with "c8ctl nano set bin <path>".');
+    }
+  } else if (field === 'workspaceDir') {
+    logger.info(`Workspace is now the default: ${getWorkspaceDir()}.`);
+    const running = readState();
+    if (running && liveNodeCount(running) > 0) {
+      logger.warn('A cluster is running — restart it for the new workspace to take effect.');
+    }
+  }
+}
+
 function showConfig() {
   const cfg = readConfig();
   console.log('Nano plugin configuration:');
   console.log('');
   console.log(`  state home   ${getStateHome()}`);
-  console.log(`  binary       ${cfg.binary || '(auto-detect: $NANOBPMN_BINARY or repo build)'}`);
+  console.log(`  binary       ${cfg.binary || '(auto-detect: $NANOBPMN_BINARY, managed platform package, or repo build)'}`);
   const bundled = readBundledBinaryInfo();
   if (bundled) {
     const at = bundled.commit && bundled.commit !== 'unknown' ? ` (${bundled.commit})` : '';
@@ -1441,6 +1498,7 @@ function showConfig() {
   console.log(`  config file  ${getConfigFile()}`);
   console.log('');
   console.log('  Change with: c8ctl nano set bin <path> | c8ctl nano set model-dir <path>');
+  console.log('  Clear with:  c8ctl nano unset bin | c8ctl nano unset model-dir');
 }
 
 // ---------------------------------------------------------------------------
@@ -6121,6 +6179,7 @@ function parseProcessosRequest(args, flags) {
 // Internal helpers exported for tests/tooling only. c8ctl consumes just
 // `metadata` and `commands`; these named exports are inert to it.
 export { resolveBinary, findBinary, launcherEnvMarkers };
+export { setConfig, unsetConfig, readConfig, writeConfig, getConfigFile, SETTING_ALIASES };
 export { buildNpmInvocation };
 export {
   webConsoleUrl,
@@ -6231,6 +6290,7 @@ export const metadata = {
         { command: 'c8ctl nano restart --purge', description: 'Restart the cluster from a clean slate (delete engine data)' },
         { command: 'c8ctl nano clean', description: 'Wipe journal/data + logs on disk (keeps models/workers)' },
         { command: 'c8ctl nano set bin <path>', description: 'Set the nanobpmn server binary path' },
+        { command: 'c8ctl nano unset bin', description: 'Clear a custom binary path and return to the managed/release binary' },
         { command: 'c8ctl nano set model-dir <path>', description: 'Set the workspace dir (models + workers)' },
         { command: 'c8ctl nano config', description: 'Show current plugin configuration and paths' },
         { command: 'c8ctl nano update', description: 'Pull the latest published nano release (re-installs via npm)' },
@@ -6360,6 +6420,9 @@ export const commands = {
           case 'set':
             setConfig(req);
             break;
+          case 'unset':
+            unsetConfig(req);
+            break;
           case 'config':
             showConfig();
             break;
@@ -6464,6 +6527,7 @@ function printUsage() {
   console.log('  c8ctl nano restart [<nodes>] [--purge] ...');
   console.log('  c8ctl nano clean [--workspace]');
   console.log('  c8ctl nano set <bin|model-dir> <path>');
+  console.log('  c8ctl nano unset <bin|model-dir>');
   console.log('  c8ctl nano config');
   console.log('  c8ctl nano update [--check]');
   console.log('  c8ctl nano hire [--name <n>] [--rank <r>] [--command <c>] [--arg <switch> ...] [--model <m>] [--capabilities <a,b>] [--sandbox none|docker|podman] [--image <ref>] [--env NAME=VALUE ...] [--list]');
@@ -6481,6 +6545,7 @@ function printUsage() {
   console.log('  restart  Stop then start');
   console.log('  clean    Wipe journal/data + logs on disk (keeps models/workers)');
   console.log('  set      Persist a setting: "bin <path>" or "model-dir <path>"');
+  console.log('  unset    Clear a setting ("bin" or "model-dir") back to its default');
   console.log('  config   Show current configuration and on-disk locations');
   console.log('  update   Pull the latest published nano release (--check to only report)');
   console.log('  hire     Create a CLI agent worker profile (rank + capabilities → job-type matrix)');

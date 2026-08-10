@@ -6525,6 +6525,7 @@ function printUsage() {
   console.log('  c8ctl nano restart [<nodes>] [--purge] ...');
   console.log('  c8ctl nano clean [--workspace]');
   console.log('  c8ctl nano set <bin|model-dir> <path>');
+  console.log('  c8ctl nano unset <bin|model-dir>');
   console.log('  c8ctl nano config');
   console.log('  c8ctl nano update [--check]');
   console.log('  c8ctl nano hire [--name <n>] [--rank <r>] [--command <c>] [--arg <switch> ...] [--model <m>] [--capabilities <a,b>] [--sandbox none|docker|podman] [--image <ref>] [--env NAME=VALUE ...] [--list]');
@@ -6542,6 +6543,7 @@ function printUsage() {
   console.log('  restart  Stop then start');
   console.log('  clean    Wipe journal/data + logs on disk (keeps models/workers)');
   console.log('  set      Persist a setting: "bin <path>" or "model-dir <path>"');
+  console.log('  unset    Clear a setting ("bin" or "model-dir") back to its default');
   console.log('  config   Show current configuration and on-disk locations');
   console.log('  update   Pull the latest published nano release (--check to only report)');
   console.log('  hire     Create a CLI agent worker profile (rank + capabilities → job-type matrix)');

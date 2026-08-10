@@ -127,3 +127,39 @@ test('help lists an `assign` example with comma-separated capabilities', () => {
     `assign example should show comma-separated caps; got: ${assignEx.map((e) => e.command).join(' | ')}`,
   );
 });
+
+test('`assign` no-capabilities error hint uses the comma-separated form', async () => {
+  // The usage/help and docs document comma-separated capabilities, so the
+  // "Provide at least one capability" hint must not suggest a space-separated
+  // example (which the parser would read as a single name+cap, not two caps).
+  const home = mkdtempSync(join(tmpdir(), 'c8ctl-nano-assign-err-'));
+  const prevHome = process.env.C8CTL_NANO_HOME;
+  process.env.C8CTL_NANO_HOME = home;
+  const origLog = console.log;
+  const origErr = console.error;
+  const origExit = process.exit;
+  const lines = [];
+  console.log = (...args) => { lines.push(args.join(' ')); };
+  console.error = (...args) => { lines.push(args.join(' ')); };
+  process.exit = (code) => { throw new Error(`__exit__${code}`); };
+  try {
+    mkdirSync(home, { recursive: true });
+    // No capabilities supplied → the error/hint path fires and exits.
+    await assert.rejects(
+      assignCapabilities({ subcommand: 'assign', positional: ['reviewer'] }, {}),
+      /__exit__1/,
+    );
+  } finally {
+    console.log = origLog;
+    console.error = origErr;
+    process.exit = origExit;
+    if (prevHome === undefined) delete process.env.C8CTL_NANO_HOME;
+    else process.env.C8CTL_NANO_HOME = prevHome;
+    rmSync(home, { recursive: true, force: true });
+  }
+  const out = lines.join('\n');
+  assert.match(out, /Provide at least one capability/);
+  // The example must use the comma-separated form, matching help + hire.
+  assert.match(out, /assign reviewer [\w-]+,[\w-]+/);
+  assert.doesNotMatch(out, /assign reviewer [\w-]+ [\w-]+/);
+});

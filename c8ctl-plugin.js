@@ -1730,7 +1730,8 @@ function resolveAssignInputs(req, flags) {
  * capabilities are the remaining positionals and/or `--capabilities a,b`.
  * Capabilities are unioned with the profile's existing set (additive; assign
  * never removes a role) and the updated rank×capability job-type matrix is
- * printed. Re-run `work` to pick up the new job types.
+ * printed. Running workers hot-reload the new job types within ~1.5s — no
+ * restart needed.
  */
 async function assignCapabilities(req, flags) {
   const logger = getLogger();
@@ -1747,7 +1748,7 @@ async function assignCapabilities(req, flags) {
 
   if (normalizeCapabilities(incomingRaw).length === 0) {
     logger.error('Provide at least one capability to assign.');
-    logger.info(`Example: c8ctl nano assign ${name} code-review testing`);
+    logger.info(`Example: c8ctl nano assign ${name} code-review,testing`);
     process.exit(1);
   }
 

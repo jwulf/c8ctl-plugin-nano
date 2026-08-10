@@ -13,7 +13,7 @@ import { mkdtempSync, mkdirSync, writeFileSync, rmSync } from 'node:fs';
 import { tmpdir } from 'node:os';
 import { join } from 'node:path';
 
-import { webConsoleUrl, consoleLinkLabel, hireWorker } from './c8ctl-plugin.js';
+import { webConsoleUrl, consoleLinkLabel, hireWorker, assignCapabilities, metadata } from './c8ctl-plugin.js';
 
 // A non-default port throughout: if any code path fell back to a hardcoded 8080
 // these assertions would fail.
@@ -78,4 +78,52 @@ test('`hire` prints no console link', async () => {
   );
   // It still tells the user how to put the hire to work — that line stays.
   assert.match(out, /c8ctl nano work reviewer/);
+});
+
+test('`assign` does not tell the user to restart workers — they hot-reload', async () => {
+  // `work` runs a live watchFile reconciler (issue #30): running workers pick up
+  // an assign within ~1.5s with no restart. The success message must not tell the
+  // user to re-run `work`, and should say the change is picked up automatically.
+  const home = mkdtempSync(join(tmpdir(), 'c8ctl-nano-assign-'));
+  const prevHome = process.env.C8CTL_NANO_HOME;
+  process.env.C8CTL_NANO_HOME = home;
+  const origLog = console.log;
+  const lines = [];
+  console.log = (...args) => {
+    lines.push(args.join(' '));
+  };
+  try {
+    mkdirSync(home, { recursive: true });
+    await hireWorker(
+      { subcommand: 'hire', positional: [] },
+      { name: 'reviewer', rank: 'senior', command: 'copilot', capabilities: 'code-review' },
+    );
+    lines.length = 0; // isolate assign's output
+    // Comma-separated caps, mirroring `hire --capabilities a,b`.
+    await assignCapabilities({ subcommand: 'assign', positional: ['reviewer', 'testing,docs'] }, {});
+  } finally {
+    console.log = origLog;
+    if (prevHome === undefined) delete process.env.C8CTL_NANO_HOME;
+    else process.env.C8CTL_NANO_HOME = prevHome;
+    rmSync(home, { recursive: true, force: true });
+  }
+  const out = lines.join('\n');
+  // The comma-separated list is honoured (both caps added).
+  assert.match(out, /\+docs, testing/);
+  // No stale "restart its workers / re-run work" instruction.
+  assert.doesNotMatch(out, /Restart its workers/i);
+  assert.doesNotMatch(out, /c8ctl nano work reviewer/);
+  // It tells the user the running workers pick it up automatically.
+  assert.match(out, /automatically/i);
+});
+
+test('help lists an `assign` example with comma-separated capabilities', () => {
+  const examples = metadata.commands.nano.examples;
+  const assignEx = examples.filter((e) => /c8ctl nano assign\b/.test(e.command));
+  assert.ok(assignEx.length > 0, 'metadata.commands.nano.examples must include an `assign` example');
+  // At least one example shows the comma-separated form, matching `hire`.
+  assert.ok(
+    assignEx.some((e) => /assign \S+ [\w-]+,[\w-]+/.test(e.command)),
+    `assign example should show comma-separated caps; got: ${assignEx.map((e) => e.command).join(' | ')}`,
+  );
 });

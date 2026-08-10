@@ -16,10 +16,17 @@ import {
   SETTING_ALIASES,
 } from './c8ctl-plugin.js';
 
-// Silence the plugin's logger so test output stays clean.
+// Silence the plugin's logger so test output stays clean. Save and restore the
+// prior value on exit so this never leaks into other test files that might run
+// in the same process.
+const prevC8ctl = globalThis.c8ctl;
 globalThis.c8ctl = {
   getLogger: () => ({ info: () => {}, warn: () => {}, error: () => {}, debug: () => {} }),
 };
+process.on('exit', () => {
+  if (prevC8ctl === undefined) delete globalThis.c8ctl;
+  else globalThis.c8ctl = prevC8ctl;
+});
 
 function withHome(fn) {
   const HOME = mkdtempSync(join(tmpdir(), 'c8ctl-cfg-'));

@@ -1446,13 +1446,14 @@ function unsetConfig(req) {
   const cfg = readConfig();
   const prev = cfg[field];
   const wasSet = prev !== undefined && prev !== null && prev !== '';
+  const label = field === 'binary' ? 'custom binary override' : 'custom workspace override';
 
   if (!wasSet) {
-    logger.info(`${field} is not set — nothing to clear.`);
+    logger.info(`No ${label} is configured — nothing to clear.`);
   } else {
     delete cfg[field];
     writeConfig(cfg);
-    logger.info(`Unset ${field} (was ${prev}).`);
+    logger.info(`Cleared ${label} (was ${prev}).`);
   }
 
   if (field === 'binary') {

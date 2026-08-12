@@ -4537,11 +4537,15 @@ async function runSupervisorDaemon() {
     return [...workers.values()].filter((w) => w.profile === t).map((w) => w.id);
   };
 
-  const statusFrame = (final) => ({
+  // `pub` lets a caller that has already sampled the fleet (e.g. the monitor
+  // tick, which needs the snapshot to compute its change signature) reuse that
+  // exact snapshot for the frame — so the broadcast payload is guaranteed to
+  // match the signature that decided to send it, with no second re-sample.
+  const statusFrame = (final, pub) => ({
     ok: true,
     type: 'status',
     daemon: { pid: process.pid, startedAt, socket: socketPath, logFile: daemonLogFile },
-    workers: [...workers.values()].map(workerPublic),
+    workers: pub || [...workers.values()].map(workerPublic),
     ...(final ? { final: true } : {}),
   });
 
@@ -4697,8 +4701,12 @@ async function runSupervisorDaemon() {
   // actually changed since the last push (idle↔busy, a new/finished job, a
   // restart/exit). This keeps an attached `supervisor` console current without
   // spamming a quiet fleet. The signature always tracks the latest state (even
-  // with no clients attached) so a client that attaches — and gets its own
-  // snapshot — never triggers a redundant reprint for everyone on the next tick.
+  // with no clients attached) so an idle-fleet attach — whose snapshot already
+  // matches the tracked signature — won't provoke a redundant reprint for
+  // everyone on the next tick. (A change that lands in the sub-tick window
+  // *between* a tick and a fresh attach can still yield one extra identical
+  // frame to the newcomer; that reprint is required to inform the already-
+  // attached clients of the change, and is harmless — same content, re-rendered.)
   // Env-gated: NANO_SUPERVISOR_MONITOR_MS=0 disables; otherwise it's the cadence.
   const monitorMs = (() => {
     const raw = process.env.NANO_SUPERVISOR_MONITOR_MS;
@@ -4714,7 +4722,7 @@ async function runSupervisorDaemon() {
       const sig = supervisorStatusSignature(pub);
       const changed = sig !== lastMonitorSig;
       lastMonitorSig = sig;
-      if (changed && attachClients.size > 0) broadcast(statusFrame(false));
+      if (changed && attachClients.size > 0) broadcast(statusFrame(false, pub));
     }, monitorMs);
     if (typeof monitorTimer.unref === 'function') monitorTimer.unref();
   }

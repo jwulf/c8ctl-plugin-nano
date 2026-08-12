@@ -2718,15 +2718,7 @@ function provisionRepo({ envelope, token, runDir, timeoutMs = 120_000 }) {
 // gh returns whatever PR is open for the head branch, which may not be ours.
 function reconcileAgentPr({ workspaceDir, token, branch, provider }) {
   if (provider && provider !== 'github') return { openedBy: null, found: false, error: `PR reconcile unsupported for provider "${provider}"` };
-  const env = { ...process.env };
-  if (token) {
-    env.GH_TOKEN = token;
-  } else {
-    // No job token ⇒ honor the anonymous guarantee: never let gh fall back to an
-    // operator-provided token in the ambient env. Scrub every gh auth source so
-    // PR reconcile can only use credentials we were explicitly handed.
-    for (const k of ['GH_TOKEN', 'GITHUB_TOKEN', 'GH_ENTERPRISE_TOKEN', 'GITHUB_ENTERPRISE_TOKEN']) delete env[k];
-  }
+  const env = ghAuthEnv(token, workspaceDir);
   try {
     const r = spawnSync('gh', ['pr', 'list', '--head', branch, '--state', 'all', '--json', 'number,url,state,isDraft,title,author', '--limit', '1'],
       { cwd: workspaceDir, env, encoding: 'utf8', timeout: 30_000 });
@@ -2743,14 +2735,28 @@ function reconcileAgentPr({ workspaceDir, token, branch, provider }) {
 
 // Build the gh environment for PR-side calls: inject the resolved job token, or
 // (anonymous path) scrub every ambient gh credential so we can only use what we
-// were explicitly handed. Mirrors reconcileAgentPr's env handling.
-function ghPrEnv(token) {
+// were explicitly handed. Scrubbing the token env vars alone is not enough — gh
+// will still authenticate from its on-disk config (hosts.yml / OS keychain), so
+// in the anonymous path we also point gh at a private, empty GH_CONFIG_DIR
+// (created inside the harness-reaped workspace) and disable interactive prompts,
+// guaranteeing a token-less job cannot act as the operator via stored creds.
+function ghAuthEnv(token, workspaceDir) {
   const env = { ...process.env };
   if (token) {
     env.GH_TOKEN = token;
-  } else {
-    for (const k of ['GH_TOKEN', 'GITHUB_TOKEN', 'GH_ENTERPRISE_TOKEN', 'GITHUB_ENTERPRISE_TOKEN']) delete env[k];
+    return env;
   }
+  for (const k of ['GH_TOKEN', 'GITHUB_TOKEN', 'GH_ENTERPRISE_TOKEN', 'GITHUB_ENTERPRISE_TOKEN']) delete env[k];
+  try {
+    const dir = join(workspaceDir || tmpdir(), '.nano-gh-anon');
+    mkdirSync(dir, { recursive: true });
+    env.GH_CONFIG_DIR = dir;
+  } catch {
+    // Best effort: even without an isolated config dir the token scrub above
+    // still applies. Fall through so PR-side calls can still run.
+  }
+  env.GH_PROMPT_DISABLED = '1';
+  env.GH_NO_UPDATE_NOTIFIER = '1';
   return env;
 }
 
@@ -2768,7 +2774,7 @@ const ATTRIBUTION_MARKER = '<!-- nano-agent-attribution -->';
 function postAgentAttribution({ workspaceDir, token, number, agentName = AGENT_ATTRIBUTION_NAME }) {
   if (!coerceBool(process.env.NANO_AGENT_ATTRIBUTION, true)) return { posted: false, reason: 'disabled' };
   if (!number) return { posted: false, reason: 'no-pr' };
-  const env = ghPrEnv(token);
+  const env = ghAuthEnv(token, workspaceDir);
   try {
     const existing = spawnSync('gh', ['pr', 'view', String(number), '--json', 'comments', '--jq', '.comments[].body'],
       { cwd: workspaceDir, env, encoding: 'utf8', timeout: 30_000 });

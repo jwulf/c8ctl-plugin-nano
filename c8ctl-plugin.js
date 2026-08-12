@@ -2548,7 +2548,8 @@ function hostGitIdentity() {
 function ghUserIdentity() {
   try {
     const r = spawnSync('gh', ['api', 'user', '--jq', '[.name // "", .login // "", .email // "", (.id // "" | tostring)] | @tsv'],
-      { encoding: 'utf8', timeout: 10_000 });
+      { encoding: 'utf8', timeout: 10_000,
+        env: { ...process.env, GH_PROMPT_DISABLED: '1', GH_NO_UPDATE_NOTIFIER: '1' } });
     if (r.status !== 0) return { name: '', email: '' };
     const [name = '', login = '', email = '', id = ''] = (r.stdout || '').trim().split('\t');
     const resolvedName = name || login || '';
@@ -2742,6 +2743,11 @@ function reconcileAgentPr({ workspaceDir, token, branch, provider }) {
 // guaranteeing a token-less job cannot act as the operator via stored creds.
 function ghAuthEnv(token, workspaceDir) {
   const env = { ...process.env };
+  // These apply on every path: workers are non-interactive, so gh must fail
+  // fast rather than block on an auth/update prompt — even a provided token can
+  // be invalid/expired, in which case gh would otherwise try to prompt.
+  env.GH_PROMPT_DISABLED = '1';
+  env.GH_NO_UPDATE_NOTIFIER = '1';
   if (token) {
     env.GH_TOKEN = token;
     return env;
@@ -2755,8 +2761,6 @@ function ghAuthEnv(token, workspaceDir) {
     // Best effort: even without an isolated config dir the token scrub above
     // still applies. Fall through so PR-side calls can still run.
   }
-  env.GH_PROMPT_DISABLED = '1';
-  env.GH_NO_UPDATE_NOTIFIER = '1';
   return env;
 }
 

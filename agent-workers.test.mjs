@@ -217,8 +217,31 @@ test('resolveJobSecrets: allowPr pulls the github default credential from gh whe
   }
 });
 
-test('resolveJobSecrets: a custom github authRef does NOT fall back to gh (stays missing)', () => {
+test('resolveJobSecrets: GITHUB_TOKEN in secretRefs is not left in missing when gh fallback resolves it', () => {
   const resolver = makeSecretResolver('host');
+  const saved = process.env.GITHUB_TOKEN;
+  delete process.env.GITHUB_TOKEN;
+  try {
+    const env = normalizeTaskEnvelope(
+      {
+        [AGENT_TASK_NS]: JSON.stringify({
+          repository: { url: 'https://github.com/o/r.git' },
+          task: { allowPr: true },
+          setup: { secretRefs: ['GITHUB_TOKEN'] },
+        }),
+      },
+      {},
+    );
+    const { resolved, missing } = resolveJobSecrets(resolver, env, { ghAuthToken: () => 'gh-cli-tok' });
+    assert.equal(resolved.GITHUB_TOKEN, 'gh-cli-tok');
+    assert.deepEqual(missing, []);
+  } finally {
+    if (saved === undefined) delete process.env.GITHUB_TOKEN;
+    else process.env.GITHUB_TOKEN = saved;
+  }
+});
+
+test('resolveJobSecrets: a custom github authRef does NOT fall back to gh (stays missing)', () => {  const resolver = makeSecretResolver('host');
   const env = normalizeTaskEnvelope(
     {
       [`${AGENT_TASK_NS}.repository.url`]: 'https://github.com/o/r.git',

@@ -2315,8 +2315,13 @@ function resolveJobSecrets(resolver, envelope, { ghAuthToken = ghAuthTokenFromCl
     if (ghAuthRef) {
       names.add(ghAuthRef);
       const token = githubCloneToken({ provider, authRef, secretResolver: resolver, ghAuthToken });
-      if (token) resolved[ghAuthRef] = token;
-      else missing.push(ghAuthRef);
+      const missingIdx = missing.indexOf(ghAuthRef);
+      if (token) {
+        resolved[ghAuthRef] = token;
+        if (missingIdx !== -1) missing.splice(missingIdx, 1);
+      } else if (missingIdx === -1) {
+        missing.push(ghAuthRef);
+      }
     }
   }
   return { resolved, missing, names: [...names] };

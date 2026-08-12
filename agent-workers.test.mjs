@@ -46,6 +46,8 @@ import {
   reapAgentRunDirs,
   authUrl,
   githubCloneToken,
+  primeGhAuthToken,
+  ghAuthTokenFromCli,
   redactToken,
   ProvisionError,
   AGENT_TASK_NS,
@@ -320,6 +322,16 @@ test('githubCloneToken: a present-but-blank authRef never borrows gh/default', (
     if (saved === undefined) delete process.env.GITHUB_TOKEN;
     else process.env.GITHUB_TOKEN = saved;
   }
+});
+
+test('primeGhAuthToken warms the cache and is idempotent', () => {
+  // Populates the process-lifetime cache (to a token or null, depending on the
+  // host's gh state) and always reports the cache as populated afterwards. A
+  // second call is a warm cache hit that returns the same result without error.
+  assert.equal(primeGhAuthToken(), true);
+  const first = ghAuthTokenFromCli();
+  assert.equal(primeGhAuthToken(), true);
+  assert.equal(ghAuthTokenFromCli(), first);
 });
 
 test('makeSecretResolver rejects unknown kinds', () => {

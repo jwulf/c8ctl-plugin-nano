@@ -2495,6 +2495,13 @@ function credArgs() {
 // (maxParallelJobs > 1), so consult the CLI at most once per worker run rather
 // than blocking every handler. A sentinel distinguishes "not yet computed" from
 // a cached null (gh missing / not logged in).
+//
+// Memoization alone still lets the *first* job pay the synchronous spawn on the
+// event loop, stalling any sibling handlers (and lock-extension heartbeats) for
+// up to the timeout. So `nano work` primes this cache once at startup via
+// `primeGhAuthToken()` — before the poll loop — moving the one unavoidable
+// blocking spawn off the job-handling path entirely. Any later call is a warm
+// cache hit; the memoization here is the safety net for paths that never primed.
 const GH_AUTH_TOKEN_UNSET = Symbol('gh-auth-token-unset');
 let ghAuthTokenCache = GH_AUTH_TOKEN_UNSET;
 function ghAuthTokenFromCli() {
@@ -2509,6 +2516,14 @@ function ghAuthTokenFromCli() {
   }
   ghAuthTokenCache = token;
   return token;
+}
+
+// Warm the gh-token cache once, off the job-handling path. Safe to call any
+// number of times: the first call performs the (possibly blocking) lookup, the
+// rest are cache hits. Returns true once the cache is populated.
+function primeGhAuthToken() {
+  ghAuthTokenFromCli();
+  return ghAuthTokenCache !== GH_AUTH_TOKEN_UNSET;
 }
 
 // Normalize a repository authRef into one of three intents. Trimming matters so
@@ -3278,6 +3293,12 @@ async function workAgent(req, flags) {
   const extraNote = extraJobTypes.length > 0 ? ` (${extraJobTypes.length} via --job-type)` : '';
   logger.info(`  listening on ${jobTypes.length} job type(s)${extraNote}: ${jobTypes.join('  ')}`);
   logger.info(`  max parallel: ${maxParallelJobs}; recovery window: ${recoveryWindowMs}ms; idle timeout: ${idleTimeoutMs}ms; hard cap: ${hardCapMs > 0 ? `${hardCapMs}ms` : 'off'}; poll timeout: ${pollTimeoutMs}ms`);
+  // Warm the gh-token cache now, off the job-handling path: githubCloneToken()
+  // may consult `gh auth token` (a synchronous spawn, up to 10s) as its default
+  // credential fallback, and doing that inside a job handler would stall sibling
+  // handlers + lock heartbeats when maxParallelJobs > 1. Priming here pays that
+  // cost once at startup so every later lookup is a warm cache hit.
+  primeGhAuthToken();
   logger.info('Polling for work — press Ctrl-C to stop.');
 
   // When launched under the supervisor, report per-job activity — which job(s)
@@ -6303,6 +6324,7 @@ export {
   authUrl,
   githubCloneToken,
   ghAuthTokenFromCli,
+  primeGhAuthToken,
   redactToken,
   agentRunsRoot,
   ProvisionError,

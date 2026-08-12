@@ -4204,9 +4204,9 @@ function supervisorStatusSignature(workers) {
   return JSON.stringify(
     list.map((w) => [
       w.id,
-     w.profile ?? '',
-     w.state,
-     w.pid ?? 0,
+      w.profile ?? '',
+      w.state,
+      w.pid ?? 0,
       Number(w.restarts) || 0,
       w.lastExit ?? '',
       w.activity ? w.activity.state : null,

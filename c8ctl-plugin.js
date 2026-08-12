@@ -2785,7 +2785,13 @@ function postAgentAttribution({ workspaceDir, token, number, agentName = AGENT_A
   if (!number) return { posted: false, reason: 'no-pr' };
   const env = ghAuthEnv(token, workspaceDir);
   try {
-    const existing = spawnSync('gh', ['pr', 'view', String(number), '--json', 'comments', '--jq', '.comments[].body'],
+    // Ask jq for a single boolean ("marker present?") rather than streaming every
+    // comment body back through stdout. On PRs with many/large comments the full
+    // dump can be slow and can exceed spawnSync's output buffer (maxBuffer),
+    // surfacing as existing.error and wedging attribution forever; a lone
+    // true/false keeps output tiny while preserving idempotency.
+    const markerFilter = `any((.comments // [])[].body; contains(${JSON.stringify(ATTRIBUTION_MARKER)}))`;
+    const existing = spawnSync('gh', ['pr', 'view', String(number), '--json', 'comments', '--jq', markerFilter],
       { cwd: workspaceDir, env, encoding: 'utf8', timeout: 30_000 });
     // Idempotency hinges on reliably reading the existing comments: if we cannot
     // verify whether the marker is already present (transient gh failure — rate
@@ -2797,7 +2803,7 @@ function postAgentAttribution({ workspaceDir, token, number, agentName = AGENT_A
     if (existing.status !== 0) {
       return { posted: false, error: redactToken(existing.stderr || existing.stdout, token).trim().slice(0, 200) || `gh pr view failed (exit ${existing.status ?? 'null'}${existing.signal ? `, signal ${existing.signal}` : ''})` };
     }
-    if ((existing.stdout || '').includes(ATTRIBUTION_MARKER)) {
+    if ((existing.stdout || '').trim() === 'true') {
       return { posted: false, reason: 'exists' };
     }
     const body = `${ATTRIBUTION_MARKER}\n`

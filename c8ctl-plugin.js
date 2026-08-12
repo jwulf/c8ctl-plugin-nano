@@ -2526,6 +2526,66 @@ function primeGhAuthToken() {
   return ghAuthTokenCache !== GH_AUTH_TOKEN_UNSET;
 }
 
+// Read the operator's own git identity from their GLOBAL config, using the real
+// host environment (process.env) rather than a job's sanitized gitEnv — so it
+// resolves even on the anonymous clone path, where gitEnv points
+// GIT_CONFIG_GLOBAL at /dev/null. Returns { name, email }, each possibly ''.
+function hostGitIdentity() {
+  const read = (key) => {
+    try {
+      const r = spawnSync('git', ['config', '--global', '--get', key], { encoding: 'utf8', timeout: 5_000 });
+      return r.status === 0 ? (r.stdout || '').trim() : '';
+    } catch {
+      return '';
+    }
+  };
+  return { name: read('user.name'), email: read('user.email') };
+}
+
+// Fall back to the gh-authenticated GitHub user for a committer identity. Uses
+// the account's public email, or the id+login noreply address when the email is
+// private/unset. Returns { name, email }, each possibly ''.
+function ghUserIdentity() {
+  try {
+    const r = spawnSync('gh', ['api', 'user', '--jq', '[.name // "", .login // "", .email // "", (.id // "" | tostring)] | @tsv'],
+      { encoding: 'utf8', timeout: 10_000 });
+    if (r.status !== 0) return { name: '', email: '' };
+    const [name = '', login = '', email = '', id = ''] = (r.stdout || '').trim().split('\t');
+    const resolvedName = name || login || '';
+    const resolvedEmail = email || (id && login ? `${id}+${login}@users.noreply.github.com` : '');
+    return { name: resolvedName, email: resolvedEmail };
+  } catch {
+    return { name: '', email: '' };
+  }
+}
+
+// Resolve the committer identity the harness stamps onto the cloned workspace.
+// Per-field precedence: explicit GIT_AUTHOR_* env → the operator's global git
+// config → the gh-authenticated GitHub user → the `nano-agent` fallback.
+// Preferring the operator's real identity means autonomous commits are authored
+// by the human running the fleet (who has signed any CLA) rather than an
+// anonymous bot that hasn't; the agent's own authorship is recorded as a PR
+// comment (see postAgentAttribution) instead of forged onto the commit. The gh
+// lookup is performed at most once and only when git config didn't supply the
+// field. `gitIdentity`/`ghIdentity` are injectable for testing.
+function resolveCommitterIdentity({ gitIdentity = hostGitIdentity, ghIdentity = ghUserIdentity } = {}) {
+  const envName = process.env.GIT_AUTHOR_NAME || '';
+  const envEmail = process.env.GIT_AUTHOR_EMAIL || '';
+  const g = gitIdentity() || { name: '', email: '' };
+  let gh = null;
+  const ghOnce = () => (gh ??= (ghIdentity() || { name: '', email: '' }));
+
+  const name = envName || g.name || ghOnce().name || 'nano-agent';
+  const email = envEmail || g.email || ghOnce().email || 'nano-agent@users.noreply.github.com';
+
+  const source =
+    (envName || envEmail) ? 'env'
+      : (g.name || g.email) ? 'git-global'
+        : (gh && (gh.name || gh.email)) ? 'gh'
+          : 'fallback';
+  return { name, email, source };
+}
+
 // Normalize a repository authRef into one of three intents. Trimming matters so
 // a present-but-blank authRef ('' or whitespace) is treated as a misconfiguration
 // rather than "absent": absence enables the default/gh fallback, but a blank
@@ -2616,9 +2676,15 @@ function provisionRepo({ envelope, token, runDir, timeoutMs = 120_000 }) {
     }
   }
 
-  // Give the harness a committer identity in case it commits (many do).
-  runGit(['config', 'user.name', process.env.GIT_AUTHOR_NAME || 'nano-agent'], { cwd: workspaceDir, env: gitEnv });
-  runGit(['config', 'user.email', process.env.GIT_AUTHOR_EMAIL || 'nano-agent@users.noreply.github.com'], { cwd: workspaceDir, env: gitEnv });
+  // Give the harness a committer identity in case it commits (many do). Prefer
+  // the operator's real identity (git global / gh user) over the `nano-agent`
+  // fallback so autonomous commits are authored by the human running the fleet —
+  // who has signed any CLA — instead of an anonymous bot. The agent's authorship
+  // is instead recorded as a PR comment (postAgentAttribution). Set via repo-
+  // level config, which overrides global, so the identity is deterministic.
+  const committer = resolveCommitterIdentity();
+  runGit(['config', 'user.name', committer.name], { cwd: workspaceDir, env: gitEnv });
+  runGit(['config', 'user.email', committer.email], { cwd: workspaceDir, env: gitEnv });
 
   // Determine the working branch. With branch.create we make a real branch.
   // Otherwise we're on whatever the clone checked out: a branch only if
@@ -2671,6 +2737,55 @@ function reconcileAgentPr({ workspaceDir, token, branch, provider }) {
   }
 }
 
+// Build the gh environment for PR-side calls: inject the resolved job token, or
+// (anonymous path) scrub every ambient gh credential so we can only use what we
+// were explicitly handed. Mirrors reconcileAgentPr's env handling.
+function ghPrEnv(token) {
+  const env = { ...process.env };
+  if (token) {
+    env.GH_TOKEN = token;
+  } else {
+    for (const k of ['GH_TOKEN', 'GITHUB_TOKEN', 'GH_ENTERPRISE_TOKEN', 'GITHUB_ENTERPRISE_TOKEN']) delete env[k];
+  }
+  return env;
+}
+
+// The agent whose authorship we record on the PR. Because commits are now
+// authored under the operator's own identity (so they satisfy CLA/DCO), this
+// comment preserves the provenance that the change was machine-generated.
+const AGENT_ATTRIBUTION_NAME = process.env.NANO_AGENT_NAME || 'nano-agent';
+const ATTRIBUTION_MARKER = '<!-- nano-agent-attribution -->';
+
+// Post a one-time attribution comment on the agent-opened PR, recording that the
+// change was produced by the autonomous agent even though the commits carry the
+// operator's identity. Idempotent via a hidden marker so convergence's repeated
+// rounds don't spam the thread. Gated off with NANO_AGENT_ATTRIBUTION=0. Best
+// effort: never throws; returns a small status object.
+function postAgentAttribution({ workspaceDir, token, number, agentName = AGENT_ATTRIBUTION_NAME }) {
+  if (!coerceBool(process.env.NANO_AGENT_ATTRIBUTION, true)) return { posted: false, reason: 'disabled' };
+  if (!number) return { posted: false, reason: 'no-pr' };
+  const env = ghPrEnv(token);
+  try {
+    const existing = spawnSync('gh', ['pr', 'view', String(number), '--json', 'comments', '--jq', '.comments[].body'],
+      { cwd: workspaceDir, env, encoding: 'utf8', timeout: 30_000 });
+    if (existing.status === 0 && (existing.stdout || '').includes(ATTRIBUTION_MARKER)) {
+      return { posted: false, reason: 'exists' };
+    }
+    const body = `${ATTRIBUTION_MARKER}\n`
+      + `🤖 The changes in this PR were produced by **${agentName}**, an autonomous agent. `
+      + `Commits are authored under the operator's own git identity (the human running the fleet, who has signed the CLA); `
+      + `this note records that the work was generated by the agent.`;
+    const r = spawnSync('gh', ['pr', 'comment', String(number), '--body', body],
+      { cwd: workspaceDir, env, encoding: 'utf8', timeout: 30_000 });
+    if (r.status !== 0) {
+      return { posted: false, error: redactToken(r.stderr || r.stdout, token).trim().slice(0, 200) || `gh pr comment failed (exit ${r.status ?? 'null'})` };
+    }
+    return { posted: true };
+  } catch (err) {
+    return { posted: false, error: err.message };
+  }
+}
+
 // After the harness runs: enumerate new commits, push the branch (when
 // branch.push), and reconcile the agent-opened PR (when task.allowPr). A push
 // failure is reported (pushError) rather than thrown — the process model decides
@@ -2703,6 +2818,11 @@ function finalizeGit({ workspaceDir, gitEnv, startSha, workingBranch, envelope, 
 
   if (workingBranch && envelope.task?.allowPr) {
     out.pr = reconcileAgentPr({ workspaceDir, token, branch: workingBranch, provider: envelope.repository?.provider || 'github' });
+    // Record the agent's authorship on the PR (commits carry the operator's
+    // identity now, so this preserves the machine-generated provenance).
+    if (out.pr?.found && out.pr.number && (envelope.repository?.provider || 'github') === 'github') {
+      out.attribution = postAgentAttribution({ workspaceDir, token, number: out.pr.number });
+    }
   }
   return out;
 }
@@ -6320,6 +6440,8 @@ export {
   provisionRepo,
   finalizeGit,
   reconcileAgentPr,
+  resolveCommitterIdentity,
+  postAgentAttribution,
   reapAgentRunDirs,
   authUrl,
   githubCloneToken,

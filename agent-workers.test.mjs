@@ -254,6 +254,28 @@ test('resolveJobSecrets: a custom github authRef does NOT fall back to gh (stays
   assert.deepEqual(missing, ['MY_PAT']);
 });
 
+test('resolveJobSecrets: a present-but-blank authRef is missing, never borrows gh/default', () => {
+  const resolver = makeSecretResolver('host');
+  const saved = process.env.GITHUB_TOKEN;
+  process.env.GITHUB_TOKEN = 'env-tok';
+  try {
+    const env = normalizeTaskEnvelope(
+      {
+        [`${AGENT_TASK_NS}.repository.url`]: 'https://github.com/o/r.git',
+        [`${AGENT_TASK_NS}.repository.authRef`]: '   ',
+        [`${AGENT_TASK_NS}.task.allowPr`]: 'true',
+      },
+      {},
+    );
+    const { resolved, missing } = resolveJobSecrets(resolver, env, { ghAuthToken: () => 'gh-cli-tok' });
+    assert.deepEqual(missing, ['repository.authRef']);
+    assert.equal(resolved.GITHUB_TOKEN, undefined);
+  } finally {
+    if (saved === undefined) delete process.env.GITHUB_TOKEN;
+    else process.env.GITHUB_TOKEN = saved;
+  }
+});
+
 test('githubCloneToken: env GITHUB_TOKEN wins over gh fallback', () => {
   const resolver = makeSecretResolver('host');
   const saved = process.env.GITHUB_TOKEN;
@@ -284,6 +306,19 @@ test('githubCloneToken: a custom authRef never borrows the gh login', () => {
   const resolver = makeSecretResolver('host');
   const tok = githubCloneToken({ provider: 'github', authRef: 'MY_PAT', secretResolver: resolver, ghAuthToken: () => 'gh-tok' });
   assert.equal(tok, null);
+});
+
+test('githubCloneToken: a present-but-blank authRef never borrows gh/default', () => {
+  const resolver = makeSecretResolver('host');
+  const saved = process.env.GITHUB_TOKEN;
+  process.env.GITHUB_TOKEN = 'env-tok';
+  try {
+    const tok = githubCloneToken({ provider: 'github', authRef: '   ', secretResolver: resolver, ghAuthToken: () => 'gh-tok' });
+    assert.equal(tok, null);
+  } finally {
+    if (saved === undefined) delete process.env.GITHUB_TOKEN;
+    else process.env.GITHUB_TOKEN = saved;
+  }
 });
 
 test('makeSecretResolver rejects unknown kinds', () => {

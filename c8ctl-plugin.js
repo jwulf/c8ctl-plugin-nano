@@ -2311,16 +2311,25 @@ function resolveJobSecrets(resolver, envelope, { ghAuthToken = ghAuthTokenFromCl
   if (envelope.task?.allowPr) {
     const provider = envelope.repository?.provider || 'github';
     const authRef = envelope.repository?.authRef;
-    const ghAuthRef = authRef || (provider === 'github' ? 'GITHUB_TOKEN' : undefined);
-    if (ghAuthRef) {
-      names.add(ghAuthRef);
-      const token = githubCloneToken({ provider, authRef, secretResolver: resolver, ghAuthToken });
-      const missingIdx = missing.indexOf(ghAuthRef);
-      if (token) {
-        resolved[ghAuthRef] = token;
-        if (missingIdx !== -1) missing.splice(missingIdx, 1);
-      } else if (missingIdx === -1) {
-        missing.push(ghAuthRef);
+    const ref = normalizeAuthRef(authRef);
+    if (ref.kind === 'invalid') {
+      // A present-but-blank authRef is a misconfiguration: surface it as missing
+      // so provisioning sheds rather than silently borrowing the default/gh token.
+      if (!missing.includes('repository.authRef')) missing.push('repository.authRef');
+    } else {
+      const ghAuthRef = ref.kind === 'custom'
+        ? ref.name
+        : (provider === 'github' ? 'GITHUB_TOKEN' : undefined);
+      if (ghAuthRef) {
+        names.add(ghAuthRef);
+        const token = githubCloneToken({ provider, authRef, secretResolver: resolver, ghAuthToken });
+        const missingIdx = missing.indexOf(ghAuthRef);
+        if (token) {
+          resolved[ghAuthRef] = token;
+          if (missingIdx !== -1) missing.splice(missingIdx, 1);
+        } else if (missingIdx === -1) {
+          missing.push(ghAuthRef);
+        }
       }
     }
   }
@@ -2491,16 +2500,34 @@ function ghAuthTokenFromCli() {
   }
 }
 
+// Normalize a repository authRef into one of three intents. Trimming matters so
+// a present-but-blank authRef ('' or whitespace) is treated as a misconfiguration
+// rather than "absent": absence enables the default/gh fallback, but a blank
+// custom ref must NOT silently borrow the operator's gh login.
+//   { kind: 'default' }        no custom authRef configured (undefined/null)
+//   { kind: 'custom', name }   a non-empty custom authRef (strict)
+//   { kind: 'invalid' }        authRef present but blank (config error)
+function normalizeAuthRef(authRef) {
+  if (authRef === undefined || authRef === null) return { kind: 'default' };
+  const trimmed = String(authRef).trim();
+  if (trimmed === '') return { kind: 'invalid' };
+  return { kind: 'custom', name: trimmed };
+}
+
 // Resolve the github clone/push credential. The default credential (env
 // GITHUB_TOKEN) falls back to the gh CLI's stored token so `gh auth login`
 // setups work without exporting GITHUB_TOKEN. A custom `authRef` is honored
 // strictly (env/secret resolver only, no gh fallback) so a misconfigured named
 // secret surfaces as missing rather than silently borrowing the operator's gh
-// login. `ghAuthToken` is injectable for testing. Returns a token or null.
+// login. An authRef that is present but blank is a misconfiguration and yields no
+// token (never the gh fallback). `ghAuthToken` is injectable for testing.
+// Returns a token or null.
 function githubCloneToken({ provider, authRef, secretResolver, ghAuthToken = ghAuthTokenFromCli }) {
   const prov = provider || 'github';
-  const usesDefault = prov === 'github' && !authRef;
-  const name = authRef || (prov === 'github' ? 'GITHUB_TOKEN' : null);
+  const ref = normalizeAuthRef(authRef);
+  if (ref.kind === 'invalid') return null;
+  const usesDefault = prov === 'github' && ref.kind === 'default';
+  const name = ref.kind === 'custom' ? ref.name : (prov === 'github' ? 'GITHUB_TOKEN' : null);
   let token = name ? (secretResolver.resolve(name) || null) : null;
   if (!token && usesDefault) token = ghAuthToken() || null;
   return token;

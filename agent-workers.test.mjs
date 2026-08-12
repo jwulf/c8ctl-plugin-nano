@@ -45,6 +45,9 @@ import {
   reconcileAgentPr,
   reapAgentRunDirs,
   authUrl,
+  githubCloneToken,
+  primeGhAuthToken,
+  ghAuthTokenFromCli,
   redactToken,
   ProvisionError,
   AGENT_TASK_NS,
@@ -193,6 +196,142 @@ test('resolveJobSecrets: allowPr pulls the github default credential', () => {
   } finally {
     delete process.env.GITHUB_TOKEN;
   }
+});
+
+test('resolveJobSecrets: allowPr pulls the github default credential from gh when GITHUB_TOKEN is absent', () => {
+  const resolver = makeSecretResolver('host');
+  const saved = process.env.GITHUB_TOKEN;
+  delete process.env.GITHUB_TOKEN;
+  try {
+    const env = normalizeTaskEnvelope(
+      {
+        [`${AGENT_TASK_NS}.repository.url`]: 'https://github.com/o/r.git',
+        [`${AGENT_TASK_NS}.task.allowPr`]: 'true',
+      },
+      {},
+    );
+    const { resolved, missing } = resolveJobSecrets(resolver, env, { ghAuthToken: () => 'gh-cli-tok' });
+    assert.equal(resolved.GITHUB_TOKEN, 'gh-cli-tok');
+    assert.deepEqual(missing, []);
+  } finally {
+    if (saved === undefined) delete process.env.GITHUB_TOKEN;
+    else process.env.GITHUB_TOKEN = saved;
+  }
+});
+
+test('resolveJobSecrets: GITHUB_TOKEN in secretRefs is not left in missing when gh fallback resolves it', () => {
+  const resolver = makeSecretResolver('host');
+  const saved = process.env.GITHUB_TOKEN;
+  delete process.env.GITHUB_TOKEN;
+  try {
+    const env = normalizeTaskEnvelope(
+      {
+        [AGENT_TASK_NS]: JSON.stringify({
+          repository: { url: 'https://github.com/o/r.git' },
+          task: { allowPr: true },
+          setup: { secretRefs: ['GITHUB_TOKEN'] },
+        }),
+      },
+      {},
+    );
+    const { resolved, missing } = resolveJobSecrets(resolver, env, { ghAuthToken: () => 'gh-cli-tok' });
+    assert.equal(resolved.GITHUB_TOKEN, 'gh-cli-tok');
+    assert.deepEqual(missing, []);
+  } finally {
+    if (saved === undefined) delete process.env.GITHUB_TOKEN;
+    else process.env.GITHUB_TOKEN = saved;
+  }
+});
+
+test('resolveJobSecrets: a custom github authRef does NOT fall back to gh (stays missing)', () => {
+  const resolver = makeSecretResolver('host');
+  const env = normalizeTaskEnvelope(
+    {
+      [`${AGENT_TASK_NS}.repository.url`]: 'https://github.com/o/r.git',
+      [`${AGENT_TASK_NS}.repository.authRef`]: 'MY_PAT',
+      [`${AGENT_TASK_NS}.task.allowPr`]: 'true',
+    },
+    {},
+  );
+  const { missing } = resolveJobSecrets(resolver, env, { ghAuthToken: () => 'gh-cli-tok' });
+  assert.deepEqual(missing, ['MY_PAT']);
+});
+
+test('resolveJobSecrets: a present-but-blank authRef is missing, never borrows gh/default', () => {
+  const resolver = makeSecretResolver('host');
+  const saved = process.env.GITHUB_TOKEN;
+  process.env.GITHUB_TOKEN = 'env-tok';
+  try {
+    const env = normalizeTaskEnvelope(
+      {
+        [`${AGENT_TASK_NS}.repository.url`]: 'https://github.com/o/r.git',
+        [`${AGENT_TASK_NS}.repository.authRef`]: '   ',
+        [`${AGENT_TASK_NS}.task.allowPr`]: 'true',
+      },
+      {},
+    );
+    const { resolved, missing } = resolveJobSecrets(resolver, env, { ghAuthToken: () => 'gh-cli-tok' });
+    assert.deepEqual(missing, ['repository.authRef']);
+    assert.equal(resolved.GITHUB_TOKEN, undefined);
+  } finally {
+    if (saved === undefined) delete process.env.GITHUB_TOKEN;
+    else process.env.GITHUB_TOKEN = saved;
+  }
+});
+
+test('githubCloneToken: env GITHUB_TOKEN wins over gh fallback', () => {
+  const resolver = makeSecretResolver('host');
+  const saved = process.env.GITHUB_TOKEN;
+  process.env.GITHUB_TOKEN = 'env-tok';
+  try {
+    const tok = githubCloneToken({ provider: 'github', authRef: undefined, secretResolver: resolver, ghAuthToken: () => 'gh-tok' });
+    assert.equal(tok, 'env-tok');
+  } finally {
+    if (saved === undefined) delete process.env.GITHUB_TOKEN;
+    else process.env.GITHUB_TOKEN = saved;
+  }
+});
+
+test('githubCloneToken: falls back to gh when the default credential is absent', () => {
+  const resolver = makeSecretResolver('host');
+  const saved = process.env.GITHUB_TOKEN;
+  delete process.env.GITHUB_TOKEN;
+  try {
+    const tok = githubCloneToken({ provider: 'github', authRef: undefined, secretResolver: resolver, ghAuthToken: () => 'gh-tok' });
+    assert.equal(tok, 'gh-tok');
+  } finally {
+    if (saved === undefined) delete process.env.GITHUB_TOKEN;
+    else process.env.GITHUB_TOKEN = saved;
+  }
+});
+
+test('githubCloneToken: a custom authRef never borrows the gh login', () => {
+  const resolver = makeSecretResolver('host');
+  const tok = githubCloneToken({ provider: 'github', authRef: 'MY_PAT', secretResolver: resolver, ghAuthToken: () => 'gh-tok' });
+  assert.equal(tok, null);
+});
+
+test('githubCloneToken: a present-but-blank authRef never borrows gh/default', () => {
+  const resolver = makeSecretResolver('host');
+  const saved = process.env.GITHUB_TOKEN;
+  process.env.GITHUB_TOKEN = 'env-tok';
+  try {
+    const tok = githubCloneToken({ provider: 'github', authRef: '   ', secretResolver: resolver, ghAuthToken: () => 'gh-tok' });
+    assert.equal(tok, null);
+  } finally {
+    if (saved === undefined) delete process.env.GITHUB_TOKEN;
+    else process.env.GITHUB_TOKEN = saved;
+  }
+});
+
+test('primeGhAuthToken warms the cache and is idempotent', () => {
+  // Populates the process-lifetime cache (to a token or null, depending on the
+  // host's gh state) and always reports the cache as populated afterwards. A
+  // second call is a warm cache hit that returns the same result without error.
+  assert.equal(primeGhAuthToken(), true);
+  const first = ghAuthTokenFromCli();
+  assert.equal(primeGhAuthToken(), true);
+  assert.equal(ghAuthTokenFromCli(), first);
 });
 
 test('makeSecretResolver rejects unknown kinds', () => {

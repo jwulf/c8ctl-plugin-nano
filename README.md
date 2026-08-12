@@ -346,13 +346,21 @@ the harness:
    as the checkout target) into a throwaway workspace under
    `<state>/agent-runs/run-*`;
 3. create `branch.create` (if set) off that target;
-4. run the harness **in the workspace** (`cwd`), with `AGENT_WORKSPACE`,
+4. set a **committer identity** on the workspace, preferring the operator's own
+   (`GIT_AUTHOR_*` env → global `git config user.name/email` → the
+   `gh`-authenticated GitHub user), and only falling back to `nano-agent` when
+   none resolve — so autonomous commits are authored by the human running the
+   fleet (who has signed any CLA/DCO), not an anonymous bot;
+5. run the harness **in the workspace** (`cwd`), with `AGENT_WORKSPACE`,
    `AGENT_REPO_URL`, `AGENT_REPO_BRANCH`, `AGENT_REPO_REF` exported and the job
    envelope on stdin;
-5. on success, enumerate new commits, `git push` the branch when `branch.push`
+6. on success, enumerate new commits, `git push` the branch when `branch.push`
    (default true), and — when `task.allowPr` — **reconcile the PR the agent
    opened** for the branch (`gh pr list --head <branch>`; `openedBy` reports the
-   PR's actual author login, or `null` when none is found).
+   PR's actual author login, or `null` when none is found), then post a one-time
+   attribution comment recording that the change was agent-generated (marker-
+   guarded so convergence rounds don't repeat it; disable with
+   `NANO_AGENT_ATTRIBUTION=0`, rename the agent with `NANO_AGENT_NAME`).
 
 The token is delivered to git via `GIT_ASKPASS` (env), never on argv or in the
 remote URL, and is redacted from all logs/results. Credential helpers are

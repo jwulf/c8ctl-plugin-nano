@@ -43,11 +43,13 @@ import {
   provisionRepo,
   finalizeGit,
   reconcileAgentPr,
+  resolveCommitterIdentity,
   reapAgentRunDirs,
   authUrl,
   githubCloneToken,
   primeGhAuthToken,
   ghAuthTokenFromCli,
+  ghAuthEnv,
   redactToken,
   ProvisionError,
   AGENT_TASK_NS,
@@ -710,6 +712,93 @@ test('finalizeGit enumerates new commits and pushes the branch', { skip: !gitOk 
   }
 });
 
+test('resolveCommitterIdentity: prefers operator identity over the nano-agent fallback', () => {
+  const savedName = process.env.GIT_AUTHOR_NAME;
+  const savedEmail = process.env.GIT_AUTHOR_EMAIL;
+  try {
+    delete process.env.GIT_AUTHOR_NAME;
+    delete process.env.GIT_AUTHOR_EMAIL;
+
+    // git global config wins over gh, and gh is not even consulted.
+    let ghCalls = 0;
+    const gh = () => { ghCalls++; return { name: 'GH User', email: 'gh@example.com' }; };
+    const fromGit = resolveCommitterIdentity({
+      gitIdentity: () => ({ name: 'Ada Lovelace', email: 'ada@example.com' }),
+      ghIdentity: gh,
+    });
+    assert.deepEqual({ name: fromGit.name, email: fromGit.email, source: fromGit.source },
+      { name: 'Ada Lovelace', email: 'ada@example.com', source: 'git-global' });
+    assert.equal(ghCalls, 0, 'gh not consulted when git config supplies both fields');
+
+    // gh fills in fields git config lacks (single lookup).
+    ghCalls = 0;
+    const fromGh = resolveCommitterIdentity({
+      gitIdentity: () => ({ name: '', email: '' }),
+      ghIdentity: gh,
+    });
+    assert.deepEqual({ name: fromGh.name, email: fromGh.email, source: fromGh.source },
+      { name: 'GH User', email: 'gh@example.com', source: 'gh' });
+    assert.equal(ghCalls, 1, 'gh consulted at most once');
+
+    // Nothing resolvable ⇒ the nano-agent fallback (unsigned bot identity).
+    const fallback = resolveCommitterIdentity({
+      gitIdentity: () => ({ name: '', email: '' }),
+      ghIdentity: () => ({ name: '', email: '' }),
+    });
+    assert.deepEqual({ name: fallback.name, email: fallback.email, source: fallback.source },
+      { name: 'nano-agent', email: 'nano-agent@users.noreply.github.com', source: 'fallback' });
+
+    // Explicit GIT_AUTHOR_* env overrides everything (per field), and neither the
+    // git-config nor gh lookups are consulted when env fully supplies both fields.
+    process.env.GIT_AUTHOR_NAME = 'Env Name';
+    process.env.GIT_AUTHOR_EMAIL = 'env@example.com';
+    ghCalls = 0;
+    let gitCalls = 0;
+    const gitSpy = () => { gitCalls++; return { name: 'Ada', email: 'ada@example.com' }; };
+    const fromEnv = resolveCommitterIdentity({
+      gitIdentity: gitSpy,
+      ghIdentity: gh,
+    });
+    assert.deepEqual({ name: fromEnv.name, email: fromEnv.email, source: fromEnv.source },
+      { name: 'Env Name', email: 'env@example.com', source: 'env' });
+    assert.equal(gitCalls, 0, 'git config not consulted when env supplies both fields');
+    assert.equal(ghCalls, 0, 'gh not consulted when env supplies both fields');
+  } finally {
+    if (savedName === undefined) delete process.env.GIT_AUTHOR_NAME; else process.env.GIT_AUTHOR_NAME = savedName;
+    if (savedEmail === undefined) delete process.env.GIT_AUTHOR_EMAIL; else process.env.GIT_AUTHOR_EMAIL = savedEmail;
+  }
+});
+
+test('provisionRepo stamps the operator identity onto the workspace (commits as the human)', { skip: !gitOk }, () => {
+  const { root, origin } = makeOriginRepo();
+  const runDir = mkdtempSync(join(root, 'run-'));
+  const savedName = process.env.GIT_AUTHOR_NAME;
+  const savedEmail = process.env.GIT_AUTHOR_EMAIL;
+  try {
+    process.env.GIT_AUTHOR_NAME = 'Grace Hopper';
+    process.env.GIT_AUTHOR_EMAIL = 'grace@example.com';
+    const envelope = {
+      schemaVersion: 1,
+      repository: { provider: 'github', url: origin, submodules: false },
+      branch: { base: 'main', create: 'feat/ident', push: false },
+      setup: { commands: [], env: {}, secretRefs: [] },
+      task: { allowPr: false },
+    };
+    const prov = provisionRepo({ envelope, token: null, runDir });
+    assert.equal(g(['config', 'user.name'], prov.workspaceDir), 'Grace Hopper');
+    assert.equal(g(['config', 'user.email'], prov.workspaceDir), 'grace@example.com');
+    // A commit the harness would make is authored as the operator, not nano-agent.
+    writeFileSync(join(prov.workspaceDir, 'A.txt'), 'x\n');
+    g(['add', '-A'], prov.workspaceDir);
+    g(['commit', '-q', '-m', 'change'], prov.workspaceDir);
+    assert.equal(g(['log', '-1', '--format=%an <%ae>'], prov.workspaceDir), 'Grace Hopper <grace@example.com>');
+  } finally {
+    if (savedName === undefined) delete process.env.GIT_AUTHOR_NAME; else process.env.GIT_AUTHOR_NAME = savedName;
+    if (savedEmail === undefined) delete process.env.GIT_AUTHOR_EMAIL; else process.env.GIT_AUTHOR_EMAIL = savedEmail;
+    rmSync(root, { recursive: true, force: true });
+  }
+});
+
 test('finalizeGit does not push when the harness produced no commits', { skip: !gitOk }, () => {
   const { root, origin } = makeOriginRepo();
   const runDir = mkdtempSync(join(root, 'run-'));
@@ -1297,4 +1386,69 @@ test('resolveAssignInputs: positional name with only --capabilities (no capabili
   );
   assert.equal(name, 'reviewer');
   assert.equal(incomingRaw, 'docs');
+});
+
+test('ghAuthEnv: token path sets the job token and non-interactive flags', () => {
+  const prev = { GH_TOKEN: process.env.GH_TOKEN, GITHUB_TOKEN: process.env.GITHUB_TOKEN };
+  process.env.GH_TOKEN = 'ambient-operator';
+  process.env.GITHUB_TOKEN = 'ambient-operator-2';
+  try {
+    const env = ghAuthEnv('job-token', '/tmp/does-not-matter');
+    assert.equal(env.GH_TOKEN, 'job-token', 'job token takes precedence over ambient');
+    assert.equal(env.GH_PROMPT_DISABLED, '1');
+    assert.equal(env.GH_NO_UPDATE_NOTIFIER, '1');
+    // A provided token short-circuits, so no anonymous config-dir isolation.
+    assert.equal(env.GH_CONFIG_DIR, undefined);
+  } finally {
+    if (prev.GH_TOKEN === undefined) delete process.env.GH_TOKEN; else process.env.GH_TOKEN = prev.GH_TOKEN;
+    if (prev.GITHUB_TOKEN === undefined) delete process.env.GITHUB_TOKEN; else process.env.GITHUB_TOKEN = prev.GITHUB_TOKEN;
+  }
+});
+
+test('ghAuthEnv: no-token path scrubs ambient credentials and isolates GH_CONFIG_DIR', () => {
+  const prev = {
+    GH_TOKEN: process.env.GH_TOKEN,
+    GITHUB_TOKEN: process.env.GITHUB_TOKEN,
+    GH_ENTERPRISE_TOKEN: process.env.GH_ENTERPRISE_TOKEN,
+    GITHUB_ENTERPRISE_TOKEN: process.env.GITHUB_ENTERPRISE_TOKEN,
+  };
+  process.env.GH_TOKEN = 'ambient-operator';
+  process.env.GITHUB_TOKEN = 'ambient-operator-2';
+  process.env.GH_ENTERPRISE_TOKEN = 'ambient-ent';
+  process.env.GITHUB_ENTERPRISE_TOKEN = 'ambient-ent-2';
+  const ws = mkdtempSync(join(tmpdir(), 'nano-ghauth-'));
+  try {
+    const env = ghAuthEnv(undefined, ws);
+    assert.equal(env.GH_TOKEN, undefined, 'GH_TOKEN scrubbed');
+    assert.equal(env.GITHUB_TOKEN, undefined, 'GITHUB_TOKEN scrubbed');
+    assert.equal(env.GH_ENTERPRISE_TOKEN, undefined, 'GH_ENTERPRISE_TOKEN scrubbed');
+    assert.equal(env.GITHUB_ENTERPRISE_TOKEN, undefined, 'GITHUB_ENTERPRISE_TOKEN scrubbed');
+    assert.equal(env.GH_CONFIG_DIR, join(ws, '.nano-gh-anon'), 'isolated config dir set');
+    assert.ok(existsSync(env.GH_CONFIG_DIR), 'isolated config dir created');
+    assert.equal(env.GH_PROMPT_DISABLED, '1');
+    assert.equal(env.GH_NO_UPDATE_NOTIFIER, '1');
+  } finally {
+    rmSync(ws, { recursive: true, force: true });
+    for (const [k, v] of Object.entries(prev)) {
+      if (v === undefined) delete process.env[k]; else process.env[k] = v;
+    }
+  }
+});
+
+test('ghAuthEnv: no-token path fails closed — GH_CONFIG_DIR is set even when the dir cannot be created', () => {
+  // Point the workspace at a *file*, so join(file, .nano-gh-anon) cannot be
+  // created (ENOTDIR). GH_CONFIG_DIR must still be set so gh fails closed
+  // rather than falling back to the operator's on-disk credentials.
+  const base = mkdtempSync(join(tmpdir(), 'nano-ghauth-fc-'));
+  const asFile = join(base, 'not-a-dir');
+  writeFileSync(asFile, 'x');
+  try {
+    const env = ghAuthEnv(undefined, asFile);
+    const expected = join(asFile, '.nano-gh-anon');
+    assert.equal(env.GH_CONFIG_DIR, expected, 'GH_CONFIG_DIR set despite mkdir failure');
+    assert.ok(!existsSync(expected), 'dir was genuinely not creatable');
+    assert.equal(env.GH_TOKEN, undefined);
+  } finally {
+    rmSync(base, { recursive: true, force: true });
+  }
 });

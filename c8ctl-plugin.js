@@ -2565,22 +2565,26 @@ function ghUserIdentity() {
 // Preferring the operator's real identity means autonomous commits are authored
 // by the human running the fleet (who has signed any CLA) rather than an
 // anonymous bot that hasn't; the agent's own authorship is recorded as a PR
-// comment (see postAgentAttribution) instead of forged onto the commit. The gh
-// lookup is performed at most once and only when git config didn't supply the
-// field. `gitIdentity`/`ghIdentity` are injectable for testing.
+// comment (see postAgentAttribution) instead of forged onto the commit. Both the
+// git-config and gh lookups are lazy and performed at most once each, and only
+// when a higher-precedence source didn't already supply the field — so explicit
+// GIT_AUTHOR_* env fully short-circuits them (no `git config`/`gh` spawns, hence
+// no added latency or failure modes when the override is present).
+// `gitIdentity`/`ghIdentity` are injectable for testing.
 function resolveCommitterIdentity({ gitIdentity = hostGitIdentity, ghIdentity = ghUserIdentity } = {}) {
   const envName = process.env.GIT_AUTHOR_NAME || '';
   const envEmail = process.env.GIT_AUTHOR_EMAIL || '';
-  const g = gitIdentity() || { name: '', email: '' };
+  let g = null;
+  const gitOnce = () => (g ??= (gitIdentity() || { name: '', email: '' }));
   let gh = null;
   const ghOnce = () => (gh ??= (ghIdentity() || { name: '', email: '' }));
 
-  const name = envName || g.name || ghOnce().name || 'nano-agent';
-  const email = envEmail || g.email || ghOnce().email || 'nano-agent@users.noreply.github.com';
+  const name = envName || gitOnce().name || ghOnce().name || 'nano-agent';
+  const email = envEmail || gitOnce().email || ghOnce().email || 'nano-agent@users.noreply.github.com';
 
   const source =
     (envName || envEmail) ? 'env'
-      : (g.name || g.email) ? 'git-global'
+      : (g && (g.name || g.email)) ? 'git-global'
         : (gh && (gh.name || gh.email)) ? 'gh'
           : 'fallback';
   return { name, email, source };
@@ -2768,7 +2772,14 @@ function postAgentAttribution({ workspaceDir, token, number, agentName = AGENT_A
   try {
     const existing = spawnSync('gh', ['pr', 'view', String(number), '--json', 'comments', '--jq', '.comments[].body'],
       { cwd: workspaceDir, env, encoding: 'utf8', timeout: 30_000 });
-    if (existing.status === 0 && (existing.stdout || '').includes(ATTRIBUTION_MARKER)) {
+    // Idempotency hinges on reliably reading the existing comments: if we cannot
+    // verify whether the marker is already present (transient gh failure — rate
+    // limit, auth glitch, timeout), do NOT post. Posting blind would let repeated
+    // convergence rounds spam duplicate attribution comments. Bail out instead.
+    if (existing.status !== 0) {
+      return { posted: false, error: redactToken(existing.stderr || existing.stdout, token).trim().slice(0, 200) || `gh pr view failed (exit ${existing.status ?? 'null'})` };
+    }
+    if ((existing.stdout || '').includes(ATTRIBUTION_MARKER)) {
       return { posted: false, reason: 'exists' };
     }
     const body = `${ATTRIBUTION_MARKER}\n`

@@ -747,15 +747,21 @@ test('resolveCommitterIdentity: prefers operator identity over the nano-agent fa
     assert.deepEqual({ name: fallback.name, email: fallback.email, source: fallback.source },
       { name: 'nano-agent', email: 'nano-agent@users.noreply.github.com', source: 'fallback' });
 
-    // Explicit GIT_AUTHOR_* env overrides everything (per field).
+    // Explicit GIT_AUTHOR_* env overrides everything (per field), and neither the
+    // git-config nor gh lookups are consulted when env fully supplies both fields.
     process.env.GIT_AUTHOR_NAME = 'Env Name';
     process.env.GIT_AUTHOR_EMAIL = 'env@example.com';
+    ghCalls = 0;
+    let gitCalls = 0;
+    const gitSpy = () => { gitCalls++; return { name: 'Ada', email: 'ada@example.com' }; };
     const fromEnv = resolveCommitterIdentity({
-      gitIdentity: () => ({ name: 'Ada', email: 'ada@example.com' }),
+      gitIdentity: gitSpy,
       ghIdentity: gh,
     });
     assert.deepEqual({ name: fromEnv.name, email: fromEnv.email, source: fromEnv.source },
       { name: 'Env Name', email: 'env@example.com', source: 'env' });
+    assert.equal(gitCalls, 0, 'git config not consulted when env supplies both fields');
+    assert.equal(ghCalls, 0, 'gh not consulted when env supplies both fields');
   } finally {
     if (savedName === undefined) delete process.env.GIT_AUTHOR_NAME; else process.env.GIT_AUTHOR_NAME = savedName;
     if (savedEmail === undefined) delete process.env.GIT_AUTHOR_EMAIL; else process.env.GIT_AUTHOR_EMAIL = savedEmail;

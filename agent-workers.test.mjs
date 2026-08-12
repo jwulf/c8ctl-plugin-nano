@@ -45,6 +45,7 @@ import {
   reconcileAgentPr,
   reapAgentRunDirs,
   authUrl,
+  githubCloneToken,
   redactToken,
   ProvisionError,
   AGENT_TASK_NS,
@@ -193,6 +194,73 @@ test('resolveJobSecrets: allowPr pulls the github default credential', () => {
   } finally {
     delete process.env.GITHUB_TOKEN;
   }
+});
+
+test('resolveJobSecrets: allowPr pulls the github default credential from gh when GITHUB_TOKEN is absent', () => {
+  const resolver = makeSecretResolver('host');
+  const saved = process.env.GITHUB_TOKEN;
+  delete process.env.GITHUB_TOKEN;
+  try {
+    const env = normalizeTaskEnvelope(
+      {
+        [`${AGENT_TASK_NS}.repository.url`]: 'https://github.com/o/r.git',
+        [`${AGENT_TASK_NS}.task.allowPr`]: 'true',
+      },
+      {},
+    );
+    const { resolved, missing } = resolveJobSecrets(resolver, env, { ghAuthToken: () => 'gh-cli-tok' });
+    assert.equal(resolved.GITHUB_TOKEN, 'gh-cli-tok');
+    assert.deepEqual(missing, []);
+  } finally {
+    if (saved === undefined) delete process.env.GITHUB_TOKEN;
+    else process.env.GITHUB_TOKEN = saved;
+  }
+});
+
+test('resolveJobSecrets: a custom github authRef does NOT fall back to gh (stays missing)', () => {
+  const resolver = makeSecretResolver('host');
+  const env = normalizeTaskEnvelope(
+    {
+      [`${AGENT_TASK_NS}.repository.url`]: 'https://github.com/o/r.git',
+      [`${AGENT_TASK_NS}.repository.authRef`]: 'MY_PAT',
+      [`${AGENT_TASK_NS}.task.allowPr`]: 'true',
+    },
+    {},
+  );
+  const { missing } = resolveJobSecrets(resolver, env, { ghAuthToken: () => 'gh-cli-tok' });
+  assert.deepEqual(missing, ['MY_PAT']);
+});
+
+test('githubCloneToken: env GITHUB_TOKEN wins over gh fallback', () => {
+  const resolver = makeSecretResolver('host');
+  const saved = process.env.GITHUB_TOKEN;
+  process.env.GITHUB_TOKEN = 'env-tok';
+  try {
+    const tok = githubCloneToken({ provider: 'github', authRef: undefined, secretResolver: resolver, ghAuthToken: () => 'gh-tok' });
+    assert.equal(tok, 'env-tok');
+  } finally {
+    if (saved === undefined) delete process.env.GITHUB_TOKEN;
+    else process.env.GITHUB_TOKEN = saved;
+  }
+});
+
+test('githubCloneToken: falls back to gh when the default credential is absent', () => {
+  const resolver = makeSecretResolver('host');
+  const saved = process.env.GITHUB_TOKEN;
+  delete process.env.GITHUB_TOKEN;
+  try {
+    const tok = githubCloneToken({ provider: 'github', authRef: undefined, secretResolver: resolver, ghAuthToken: () => 'gh-tok' });
+    assert.equal(tok, 'gh-tok');
+  } finally {
+    if (saved === undefined) delete process.env.GITHUB_TOKEN;
+    else process.env.GITHUB_TOKEN = saved;
+  }
+});
+
+test('githubCloneToken: a custom authRef never borrows the gh login', () => {
+  const resolver = makeSecretResolver('host');
+  const tok = githubCloneToken({ provider: 'github', authRef: 'MY_PAT', secretResolver: resolver, ghAuthToken: () => 'gh-tok' });
+  assert.equal(tok, null);
 });
 
 test('makeSecretResolver rejects unknown kinds', () => {

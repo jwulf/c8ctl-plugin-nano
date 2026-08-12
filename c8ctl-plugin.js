@@ -2295,20 +2295,29 @@ function makeSecretResolver(kind) {
 // Resolve the names a job needs (setup.secretRefs, plus the repo/PR credential
 // when allowPr). Returns resolved values + a list of names that were missing so
 // the caller can fail the job with a clear provisioning error.
-function resolveJobSecrets(resolver, envelope) {
+function resolveJobSecrets(resolver, envelope, { ghAuthToken = ghAuthTokenFromCli } = {}) {
   const names = new Set();
   for (const n of envelope.setup?.secretRefs || []) if (n) names.add(n);
-  if (envelope.task?.allowPr) {
-    const provider = envelope.repository?.provider || 'github';
-    const authRef = envelope.repository?.authRef || (provider === 'github' ? 'GITHUB_TOKEN' : undefined);
-    if (authRef) names.add(authRef);
-  }
   const resolved = {};
   const missing = [];
   for (const name of names) {
     const v = resolver.resolve(name);
     if (v === undefined) missing.push(name);
     else resolved[name] = v;
+  }
+  // The github clone/push credential is resolved with a gh-CLI fallback so a
+  // default GITHUB_TOKEN isn't reported "missing" merely because it isn't in the
+  // env when `gh auth login` provides it. A custom authRef stays strict.
+  if (envelope.task?.allowPr) {
+    const provider = envelope.repository?.provider || 'github';
+    const authRef = envelope.repository?.authRef;
+    const ghAuthRef = authRef || (provider === 'github' ? 'GITHUB_TOKEN' : undefined);
+    if (ghAuthRef) {
+      names.add(ghAuthRef);
+      const token = githubCloneToken({ provider, authRef, secretResolver: resolver, ghAuthToken });
+      if (token) resolved[ghAuthRef] = token;
+      else missing.push(ghAuthRef);
+    }
   }
   return { resolved, missing, names: [...names] };
 }
@@ -2458,6 +2467,38 @@ class ProvisionError extends Error {}
 // an absent-token clone genuinely anonymous.
 function credArgs() {
   return ['-c', 'credential.helper='];
+}
+
+// Fall back to the `gh` CLI's stored credential when GITHUB_TOKEN is not exported
+// to the env. Most interactive setups authenticate with `gh auth login` (keychain)
+// rather than an env var, so an env-only secret resolver yields no token and a
+// private/internal clone fails with "could not read Username". Best effort: returns
+// a trimmed token, or null when gh is missing / not logged in. The token is fed to
+// git via GIT_ASKPASS only (never argv/URL/helper), preserving the ephemeral-token
+// guarantee.
+function ghAuthTokenFromCli() {
+  try {
+    const r = spawnSync('gh', ['auth', 'token'], { encoding: 'utf8', timeout: 10_000 });
+    const tok = r.status === 0 ? (r.stdout || '').trim() : '';
+    return tok || null;
+  } catch {
+    return null;
+  }
+}
+
+// Resolve the github clone/push credential. The default credential (env
+// GITHUB_TOKEN) falls back to the gh CLI's stored token so `gh auth login`
+// setups work without exporting GITHUB_TOKEN. A custom `authRef` is honored
+// strictly (env/secret resolver only, no gh fallback) so a misconfigured named
+// secret surfaces as missing rather than silently borrowing the operator's gh
+// login. `ghAuthToken` is injectable for testing. Returns a token or null.
+function githubCloneToken({ provider, authRef, secretResolver, ghAuthToken = ghAuthTokenFromCli }) {
+  const prov = provider || 'github';
+  const usesDefault = prov === 'github' && !authRef;
+  const name = authRef || (prov === 'github' ? 'GITHUB_TOKEN' : null);
+  let token = name ? (secretResolver.resolve(name) || null) : null;
+  if (!token && usesDefault) token = ghAuthToken() || null;
+  return token;
 }
 
 // Clone repo into <runDir>/workspace and check out / create the working branch.
@@ -3295,8 +3336,8 @@ async function workAgent(req, flags) {
         let repoToken = null;
         if (hasRepo) {
           const provider = envelope.repository.provider || 'github';
-          const authRef = envelope.repository.authRef || (provider === 'github' ? 'GITHUB_TOKEN' : null);
-          if (authRef) repoToken = secretResolver.resolve(authRef) || null; // optional: absent → anonymous clone
+          const authRef = envelope.repository.authRef;
+          repoToken = githubCloneToken({ provider, authRef, secretResolver }); // absent → anonymous clone
           try {
             mkdirSync(agentRunsRoot(), { recursive: true });
             runDir = mkdtempSync(join(agentRunsRoot(), 'run-'));
@@ -6217,6 +6258,8 @@ export {
   reconcileAgentPr,
   reapAgentRunDirs,
   authUrl,
+  githubCloneToken,
+  ghAuthTokenFromCli,
   redactToken,
   agentRunsRoot,
   ProvisionError,

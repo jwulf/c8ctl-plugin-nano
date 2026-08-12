@@ -3902,6 +3902,12 @@ const SUPERVISOR_PROBE_RESPONSE_TIMEOUT_MS = 2_000;
 // Hard cap on a single connection's inbound buffer, so a misbehaving client
 // can't grow the daemon's memory without bound with a newline-free frame.
 const SUPERVISOR_MAX_FRAME_BYTES = 1 << 20; // 1 MiB
+// How often the daemon re-samples worker activity to push a refreshed status to
+// attached consoles. The push is change-gated (see supervisorStatusSignature),
+// so a quiet fleet stays silent; only real transitions (idle↔busy, a new job,
+// restart/exit) reprint the table. `NANO_SUPERVISOR_MONITOR_MS=0` disables the
+// live refresh (falling back to the attach-time snapshot + lifecycle events).
+const SUPERVISOR_MONITOR_INTERVAL_MS = 1_000;
 
 // The `nano work` flags forwarded verbatim to each spawned child.
 // kind: 'value' → `--flag v`; 'boolean' → `--flag`; 'list' → repeated `--flag v`.
@@ -4184,6 +4190,33 @@ function summarizeSupervisorWorker(w, now = Date.now()) {
   };
 }
 
+/**
+ * A stable fingerprint of the fleet's *observable* state for change detection.
+ * Deliberately excludes ticking durations (uptimeMs, per-job sinceMs) so that a
+ * merely-elapsing clock doesn't count as a change — only real transitions (a
+ * worker going up/down, idle↔busy, picking up/finishing a job, a restart) alter
+ * the signature. The daemon uses this to push a refreshed status to attached
+ * consoles only when something actually changed, keeping a quiet fleet silent.
+ * `workers` is an array of `summarizeSupervisorWorker` results.
+ */
+function supervisorStatusSignature(workers) {
+  const list = Array.isArray(workers) ? workers : [];
+  return JSON.stringify(
+    list.map((w) => [
+      w.id,
+      w.profile ?? '',
+      w.state,
+      w.pid ?? 0,
+      Number(w.restarts) || 0,
+      w.lastExit ?? '',
+      w.activity ? w.activity.state : null,
+      w.activity
+        ? w.activity.jobs.map((j) => `${j.key}\u0000${j.type ?? ''}`).sort()
+        : null,
+    ]),
+  );
+}
+
 /** One-line JOB cell for a status row: the serviced job key, `idle`, or `-`. */
 function supervisorJobCell(w) {
   if (w.state !== 'running') return '-';
@@ -4338,6 +4371,10 @@ async function runSupervisorDaemon() {
   const workers = new Map();
   const attachClients = new Set();
   let shuttingDown = false;
+  // Live-view monitor: tracks the last-broadcast fleet signature so we push a
+  // refreshed status to attached consoles only on real change (see below).
+  let monitorTimer = null;
+  let lastMonitorSig = null;
 
   // Daemon-wide mutation serialization: `add`/`remove`/`restart` must not
   // interleave, or two clients racing the same worker could each spawn an
@@ -4501,11 +4538,15 @@ async function runSupervisorDaemon() {
     return [...workers.values()].filter((w) => w.profile === t).map((w) => w.id);
   };
 
-  const statusFrame = (final) => ({
+  // `pub` lets a caller that has already sampled the fleet (e.g. the monitor
+  // tick, which needs the snapshot to compute its change signature) reuse that
+  // exact snapshot for the frame — so the broadcast payload is guaranteed to
+  // match the signature that decided to send it, with no second re-sample.
+  const statusFrame = (final, pub) => ({
     ok: true,
     type: 'status',
     daemon: { pid: process.pid, startedAt, socket: socketPath, logFile: daemonLogFile },
-    workers: [...workers.values()].map(workerPublic),
+    workers: pub || [...workers.values()].map(workerPublic),
     ...(final ? { final: true } : {}),
   });
 
@@ -4515,6 +4556,7 @@ async function runSupervisorDaemon() {
     // Let any in-flight mutation finish before we snapshot the worker set, so
     // an add/restart racing the shutdown can't leave an orphaned child behind.
     try { await opQueue; } catch { /* mutation already logged */ }
+    if (monitorTimer) { try { clearInterval(monitorTimer); } catch { /* ignore */ } monitorTimer = null; }
     dlog(`received ${signal || 'stop'} — stopping ${workers.size} worker(s)`);
     await Promise.all([...workers.keys()].map((id) => stopWorker(id)));
     broadcast({ type: 'event', event: 'daemon-stop' });
@@ -4654,6 +4696,37 @@ async function runSupervisorDaemon() {
   process.once('SIGINT', () => shutdown('SIGINT'));
   dlog(`supervisor daemon up (pid ${process.pid}) — control ${socketPath}`);
   persist();
+
+  // Live-view refresh: periodically re-sample worker activity and push a fresh
+  // status to attached consoles, but only when the fleet's observable state
+  // actually changed since the last push (idle↔busy, a new/finished job, a
+  // restart/exit). This keeps an attached `supervisor` console current without
+  // spamming a quiet fleet. The signature always tracks the latest state (even
+  // with no clients attached) so an idle-fleet attach — whose snapshot already
+  // matches the tracked signature — won't provoke a redundant reprint for
+  // everyone on the next tick. (A change that lands in the sub-tick window
+  // *between* a tick and a fresh attach can still yield one extra identical
+  // frame to the newcomer; that reprint is required to inform the already-
+  // attached clients of the change, and is harmless — same content, re-rendered.)
+  // Env-gated: NANO_SUPERVISOR_MONITOR_MS=0 disables; otherwise it's the cadence.
+  const monitorMs = (() => {
+    const raw = process.env.NANO_SUPERVISOR_MONITOR_MS;
+    if (raw == null || raw === '') return SUPERVISOR_MONITOR_INTERVAL_MS;
+    const n = Number(raw);
+    return Number.isFinite(n) && n >= 0 ? Math.floor(n) : SUPERVISOR_MONITOR_INTERVAL_MS;
+  })();
+  if (monitorMs > 0) {
+    lastMonitorSig = supervisorStatusSignature([...workers.values()].map(workerPublic));
+    monitorTimer = setInterval(() => {
+      if (shuttingDown) return;
+      const pub = [...workers.values()].map(workerPublic);
+      const sig = supervisorStatusSignature(pub);
+      const changed = sig !== lastMonitorSig;
+      lastMonitorSig = sig;
+      if (changed && attachClients.size > 0) broadcast(statusFrame(false, pub));
+    }, monitorMs);
+    if (typeof monitorTimer.unref === 'function') monitorTimer.unref();
+  }
 
   // Keep the event loop alive indefinitely; the server holds it, but add an
   // explicit never-resolving guard so a transient server close can't exit us.
@@ -4986,10 +5059,12 @@ async function attachSupervisorConsole(state) {
   sock.write(encodeFrame({ op: 'attach' }));
 
   let buf = '';
+  let rl = null;
   sock.on('data', (chunk) => {
     buf += chunk;
     const { frames, rest } = decodeFrames(buf);
     buf = rest;
+    if (frames.length === 0) return;
     for (const frame of frames) {
       if (frame.type === 'status') {
         out('');
@@ -5010,9 +5085,13 @@ async function attachSupervisorConsole(state) {
         out(`! ${frame.error}`);
       }
     }
+    // A pushed frame writes straight to stdout, stepping on the readline prompt
+    // and any half-typed command. Re-render the prompt (preserving the input
+    // buffer) so an async live-view refresh doesn't corrupt what the user typed.
+    if (rl) { try { rl.prompt(true); } catch { /* ignore */ } }
   });
 
-  const rl = createReadline({ input: process.stdin, output: process.stdout, prompt: 'supervisor> ' });
+  rl = createReadline({ input: process.stdin, output: process.stdout, prompt: 'supervisor> ' });
   rl.prompt();
 
   await new Promise((resolve) => {
@@ -6519,6 +6598,7 @@ export {
   formatDuration,
   summarizeSupervisorWorker,
   formatSupervisorStatus,
+  supervisorStatusSignature,
   supervisorJobCell,
   supervisorWorkerActivityFile,
   WORK_FORWARD_FLAGS,

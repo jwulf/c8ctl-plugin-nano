@@ -24,6 +24,7 @@ import {
   formatDuration,
   summarizeSupervisorWorker,
   formatSupervisorStatus,
+  supervisorStatusSignature,
   supervisorJobCell,
   supervisorWorkerActivityFile,
   WORK_FORWARD_FLAGS,
@@ -436,4 +437,66 @@ test('summarizeSupervisorWorker surfaces a live worker\'s serviced job from its 
   // No marker at all → idle-with-no-report (null), rendered as '?'.
   const other = summarizeSupervisorWorker({ id: 'never-reported', profile: 'x', pid: process.pid });
   assert.equal(other.activity, null);
+});
+
+// --- supervisorStatusSignature (live-view change detection) ----------------
+
+// Build a public worker view the way the daemon does, but without touching the
+// on-disk activity marker: pass activity inline via a fake summarize input by
+// constructing the shape summarizeSupervisorWorker returns.
+const pub = ({ id = 'w', profile = id, state = 'running', pid = 1, restarts = 0, lastExit = null, activity = null }) =>
+  ({ id, profile, pid, state, restarts, uptimeMs: 0, lastExit, args: [], activity });
+
+test('supervisorStatusSignature is stable across ticking durations', () => {
+  const a = pub({ activity: { state: 'busy', jobs: [{ key: 'pr.review', type: 'senior', sinceMs: 1000 }] } });
+  const b = pub({ activity: { state: 'busy', jobs: [{ key: 'pr.review', type: 'senior', sinceMs: 99999 }] } });
+  // Different uptime / job age must NOT change the signature.
+  a.uptimeMs = 5; b.uptimeMs = 500000;
+  assert.equal(supervisorStatusSignature([a]), supervisorStatusSignature([b]));
+});
+
+test('supervisorStatusSignature changes when a worker goes idle -> busy', () => {
+  const idle = pub({ activity: { state: 'idle', jobs: [] } });
+  const busy = pub({ activity: { state: 'busy', jobs: [{ key: 'pr.finalize', type: null, sinceMs: 1 }] } });
+  assert.notEqual(supervisorStatusSignature([idle]), supervisorStatusSignature([busy]));
+});
+
+test('supervisorStatusSignature changes when the serviced job key changes', () => {
+  const one = pub({ activity: { state: 'busy', jobs: [{ key: 'pr.review', type: 's', sinceMs: 1 }] } });
+  const two = pub({ activity: { state: 'busy', jobs: [{ key: 'pr.persist', type: 's', sinceMs: 1 }] } });
+  assert.notEqual(supervisorStatusSignature([one]), supervisorStatusSignature([two]));
+});
+
+test('supervisorStatusSignature is order-insensitive for concurrent jobs', () => {
+  const j = (keys) => pub({ activity: { state: 'busy', jobs: keys.map((k, i) => ({ key: k, type: null, sinceMs: i })) } });
+  assert.equal(
+    supervisorStatusSignature([j(['a', 'b'])]),
+    supervisorStatusSignature([j(['b', 'a'])]),
+  );
+});
+
+test('supervisorStatusSignature reflects state, restarts, pid and lastExit changes', () => {
+  const base = pub({ pid: 10, restarts: 0, lastExit: null });
+  assert.notEqual(supervisorStatusSignature([base]), supervisorStatusSignature([pub({ pid: 11, restarts: 0, lastExit: null })]));
+  assert.notEqual(supervisorStatusSignature([base]), supervisorStatusSignature([pub({ pid: 10, restarts: 1, lastExit: null })]));
+  assert.notEqual(supervisorStatusSignature([base]), supervisorStatusSignature([pub({ pid: 10, restarts: 0, lastExit: 'code 1' })]));
+  assert.notEqual(supervisorStatusSignature([base]), supervisorStatusSignature([pub({ state: 'down', pid: 10 })]));
+});
+
+test('supervisorStatusSignature tracks the worker set (add/remove)', () => {
+  const a = pub({ id: 'a' });
+  const b = pub({ id: 'b' });
+  assert.notEqual(supervisorStatusSignature([a]), supervisorStatusSignature([a, b]));
+  assert.equal(supervisorStatusSignature([]), supervisorStatusSignature([]));
+});
+
+test('supervisorStatusSignature tracks a profile change on the same worker id', () => {
+  const before = pub({ id: 'a', profile: 'reviewer' });
+  const after = pub({ id: 'a', profile: 'coder' });
+  assert.notEqual(supervisorStatusSignature([before]), supervisorStatusSignature([after]));
+});
+
+test('supervisorStatusSignature tolerates a non-array input', () => {
+  assert.equal(supervisorStatusSignature(null), '[]');
+  assert.equal(supervisorStatusSignature(undefined), '[]');
 });

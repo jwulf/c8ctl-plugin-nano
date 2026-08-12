@@ -444,8 +444,8 @@ test('summarizeSupervisorWorker surfaces a live worker\'s serviced job from its 
 // Build a public worker view the way the daemon does, but without touching the
 // on-disk activity marker: pass activity inline via a fake summarize input by
 // constructing the shape summarizeSupervisorWorker returns.
-const pub = ({ id = 'w', state = 'running', pid = 1, restarts = 0, lastExit = null, activity = null }) =>
-  ({ id, profile: id, pid, state, restarts, uptimeMs: 0, lastExit, args: [], activity });
+const pub = ({ id = 'w', profile = id, state = 'running', pid = 1, restarts = 0, lastExit = null, activity = null }) =>
+  ({ id, profile, pid, state, restarts, uptimeMs: 0, lastExit, args: [], activity });
 
 test('supervisorStatusSignature is stable across ticking durations', () => {
   const a = pub({ activity: { state: 'busy', jobs: [{ key: 'pr.review', type: 'senior', sinceMs: 1000 }] } });
@@ -488,6 +488,12 @@ test('supervisorStatusSignature tracks the worker set (add/remove)', () => {
   const b = pub({ id: 'b' });
   assert.notEqual(supervisorStatusSignature([a]), supervisorStatusSignature([a, b]));
   assert.equal(supervisorStatusSignature([]), supervisorStatusSignature([]));
+});
+
+test('supervisorStatusSignature tracks a profile change on the same worker id', () => {
+  const before = pub({ id: 'a', profile: 'reviewer' });
+  const after = pub({ id: 'a', profile: 'coder' });
+  assert.notEqual(supervisorStatusSignature([before]), supervisorStatusSignature([after]));
 });
 
 test('supervisorStatusSignature tolerates a non-array input', () => {

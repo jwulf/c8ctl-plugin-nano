@@ -49,6 +49,7 @@ import {
   githubCloneToken,
   primeGhAuthToken,
   ghAuthTokenFromCli,
+  ghAuthEnv,
   redactToken,
   ProvisionError,
   AGENT_TASK_NS,
@@ -1385,4 +1386,69 @@ test('resolveAssignInputs: positional name with only --capabilities (no capabili
   );
   assert.equal(name, 'reviewer');
   assert.equal(incomingRaw, 'docs');
+});
+
+test('ghAuthEnv: token path sets the job token and non-interactive flags', () => {
+  const prev = { GH_TOKEN: process.env.GH_TOKEN, GITHUB_TOKEN: process.env.GITHUB_TOKEN };
+  process.env.GH_TOKEN = 'ambient-operator';
+  process.env.GITHUB_TOKEN = 'ambient-operator-2';
+  try {
+    const env = ghAuthEnv('job-token', '/tmp/does-not-matter');
+    assert.equal(env.GH_TOKEN, 'job-token', 'job token takes precedence over ambient');
+    assert.equal(env.GH_PROMPT_DISABLED, '1');
+    assert.equal(env.GH_NO_UPDATE_NOTIFIER, '1');
+    // A provided token short-circuits, so no anonymous config-dir isolation.
+    assert.equal(env.GH_CONFIG_DIR, undefined);
+  } finally {
+    if (prev.GH_TOKEN === undefined) delete process.env.GH_TOKEN; else process.env.GH_TOKEN = prev.GH_TOKEN;
+    if (prev.GITHUB_TOKEN === undefined) delete process.env.GITHUB_TOKEN; else process.env.GITHUB_TOKEN = prev.GITHUB_TOKEN;
+  }
+});
+
+test('ghAuthEnv: no-token path scrubs ambient credentials and isolates GH_CONFIG_DIR', () => {
+  const prev = {
+    GH_TOKEN: process.env.GH_TOKEN,
+    GITHUB_TOKEN: process.env.GITHUB_TOKEN,
+    GH_ENTERPRISE_TOKEN: process.env.GH_ENTERPRISE_TOKEN,
+    GITHUB_ENTERPRISE_TOKEN: process.env.GITHUB_ENTERPRISE_TOKEN,
+  };
+  process.env.GH_TOKEN = 'ambient-operator';
+  process.env.GITHUB_TOKEN = 'ambient-operator-2';
+  process.env.GH_ENTERPRISE_TOKEN = 'ambient-ent';
+  process.env.GITHUB_ENTERPRISE_TOKEN = 'ambient-ent-2';
+  const ws = mkdtempSync(join(tmpdir(), 'nano-ghauth-'));
+  try {
+    const env = ghAuthEnv(undefined, ws);
+    assert.equal(env.GH_TOKEN, undefined, 'GH_TOKEN scrubbed');
+    assert.equal(env.GITHUB_TOKEN, undefined, 'GITHUB_TOKEN scrubbed');
+    assert.equal(env.GH_ENTERPRISE_TOKEN, undefined, 'GH_ENTERPRISE_TOKEN scrubbed');
+    assert.equal(env.GITHUB_ENTERPRISE_TOKEN, undefined, 'GITHUB_ENTERPRISE_TOKEN scrubbed');
+    assert.equal(env.GH_CONFIG_DIR, join(ws, '.nano-gh-anon'), 'isolated config dir set');
+    assert.ok(existsSync(env.GH_CONFIG_DIR), 'isolated config dir created');
+    assert.equal(env.GH_PROMPT_DISABLED, '1');
+    assert.equal(env.GH_NO_UPDATE_NOTIFIER, '1');
+  } finally {
+    rmSync(ws, { recursive: true, force: true });
+    for (const [k, v] of Object.entries(prev)) {
+      if (v === undefined) delete process.env[k]; else process.env[k] = v;
+    }
+  }
+});
+
+test('ghAuthEnv: no-token path fails closed — GH_CONFIG_DIR is set even when the dir cannot be created', () => {
+  // Point the workspace at a *file*, so join(file, .nano-gh-anon) cannot be
+  // created (ENOTDIR). GH_CONFIG_DIR must still be set so gh fails closed
+  // rather than falling back to the operator's on-disk credentials.
+  const base = mkdtempSync(join(tmpdir(), 'nano-ghauth-fc-'));
+  const asFile = join(base, 'not-a-dir');
+  writeFileSync(asFile, 'x');
+  try {
+    const env = ghAuthEnv(undefined, asFile);
+    const expected = join(asFile, '.nano-gh-anon');
+    assert.equal(env.GH_CONFIG_DIR, expected, 'GH_CONFIG_DIR set despite mkdir failure');
+    assert.ok(!existsSync(expected), 'dir was genuinely not creatable');
+    assert.equal(env.GH_TOKEN, undefined);
+  } finally {
+    rmSync(base, { recursive: true, force: true });
+  }
 });

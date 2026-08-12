@@ -2753,13 +2753,18 @@ function ghAuthEnv(token, workspaceDir) {
     return env;
   }
   for (const k of ['GH_TOKEN', 'GITHUB_TOKEN', 'GH_ENTERPRISE_TOKEN', 'GITHUB_ENTERPRISE_TOKEN']) delete env[k];
+  // Fail closed: always point gh at an isolated (empty) config dir so it can
+  // never fall back to the operator's on-disk config/keychain. Set GH_CONFIG_DIR
+  // unconditionally — even if mkdirSync fails, gh reading a missing/empty dir
+  // errors out rather than silently authenticating as the operator, preserving
+  // the "token-less job cannot act as the operator" guarantee.
+  const dir = join(workspaceDir || tmpdir(), '.nano-gh-anon');
+  env.GH_CONFIG_DIR = dir;
   try {
-    const dir = join(workspaceDir || tmpdir(), '.nano-gh-anon');
     mkdirSync(dir, { recursive: true });
-    env.GH_CONFIG_DIR = dir;
   } catch {
-    // Best effort: even without an isolated config dir the token scrub above
-    // still applies. Fall through so PR-side calls can still run.
+    // Directory couldn't be created; GH_CONFIG_DIR still points at it so gh
+    // fails closed rather than using ambient operator credentials.
   }
   return env;
 }
@@ -6474,6 +6479,7 @@ export {
   githubCloneToken,
   ghAuthTokenFromCli,
   primeGhAuthToken,
+  ghAuthEnv,
   redactToken,
   agentRunsRoot,
   ProvisionError,

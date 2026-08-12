@@ -241,7 +241,8 @@ test('resolveJobSecrets: GITHUB_TOKEN in secretRefs is not left in missing when 
   }
 });
 
-test('resolveJobSecrets: a custom github authRef does NOT fall back to gh (stays missing)', () => {  const resolver = makeSecretResolver('host');
+test('resolveJobSecrets: a custom github authRef does NOT fall back to gh (stays missing)', () => {
+  const resolver = makeSecretResolver('host');
   const env = normalizeTaskEnvelope(
     {
       [`${AGENT_TASK_NS}.repository.url`]: 'https://github.com/o/r.git',

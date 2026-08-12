@@ -2490,14 +2490,25 @@ function credArgs() {
 // a trimmed token, or null when gh is missing / not logged in. The token is fed to
 // git via GIT_ASKPASS only (never argv/URL/helper), preserving the ephemeral-token
 // guarantee.
+// Memoized for the process lifetime: this is a synchronous spawnSync (up to a
+// 10s timeout) that can be reached per job, and jobs may run concurrently
+// (maxParallelJobs > 1), so consult the CLI at most once per worker run rather
+// than blocking every handler. A sentinel distinguishes "not yet computed" from
+// a cached null (gh missing / not logged in).
+const GH_AUTH_TOKEN_UNSET = Symbol('gh-auth-token-unset');
+let ghAuthTokenCache = GH_AUTH_TOKEN_UNSET;
 function ghAuthTokenFromCli() {
+  if (ghAuthTokenCache !== GH_AUTH_TOKEN_UNSET) return ghAuthTokenCache;
+  let token = null;
   try {
     const r = spawnSync('gh', ['auth', 'token'], { encoding: 'utf8', timeout: 10_000 });
     const tok = r.status === 0 ? (r.stdout || '').trim() : '';
-    return tok || null;
+    token = tok || null;
   } catch {
-    return null;
+    token = null;
   }
+  ghAuthTokenCache = token;
+  return token;
 }
 
 // Normalize a repository authRef into one of three intents. Trimming matters so

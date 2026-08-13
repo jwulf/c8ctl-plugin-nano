@@ -7017,7 +7017,7 @@ export const metadata = {
         { command: 'c8ctl nano assign reviewer code-review,testing', description: 'Grant more capabilities (comma-separated, like hire) to an existing hire — additive; running workers hot-reload it' },
         { command: 'c8ctl nano work reviewer', description: 'Spawn Nano job workers for the "reviewer" profile and poll for work' },
         { command: 'c8ctl nano work coder --sandbox docker --image ghcr.io/acme/agent:1', description: 'Run jobs in isolated containers with disk-hygiene reaping' },
-        { command: 'NANO_AGENTIC_URL=http://localhost:8080 NANO_AGENTIC_TOKEN=… NANO_AGENTIC_CREDENTIAL=… c8ctl nano work reviewer', description: 'Enrol the worker on the app\'s same-port /agentic channel so it appears live (presence + relay terminals) on the Workforce visibility page' },
+        { command: 'NANO_AGENTIC_URL=http://localhost:8080 NANO_AGENTIC_TOKEN=<identity-token> NANO_AGENTIC_CREDENTIAL=<capability-cred> c8ctl nano work reviewer', description: 'Enrol the worker on the app\'s same-port /agentic channel so it appears live (presence + relay terminals) on the Workforce visibility page' },
         { command: 'c8ctl nano supervisor start --worker reviewer --worker coder', description: 'Start a detached supervisor managing several workers from one terminal' },
         { command: 'c8ctl nano supervisor', description: 'Attach an interactive console to the supervisor (detach with Ctrl-D, leaving it running)' },
         { command: 'c8ctl nano supervisor status', description: 'List supervised workers (pid, state, serviced job / idle, restarts, uptime) without the console' },

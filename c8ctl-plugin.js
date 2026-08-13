@@ -2936,10 +2936,6 @@ function spawnCaptureOneShot({ command, args = [], shell = false, detached = fal
     let settled = false;
     let timer = null;
     let idleTimer = null;
-    // C3 (#42): when a relay session is attached, wire steer-in from the cockpit
-    // into the child's stdin. Detached in finish() so the frame subscription
-    // never outlives the child.
-    let detachSteer = null;
 
     // Live "spy" tee (--stream): mirror the child's output line-by-line to a
     // caller-supplied emitter (the worker routes these through c8ctl's
@@ -2977,7 +2973,6 @@ function spawnCaptureOneShot({ command, args = [], shell = false, detached = fal
       settled = true;
       if (timer) clearTimeout(timer);
       if (idleTimer) clearTimeout(idleTimer);
-      if (detachSteer) { try { detachSteer(); } catch { /* best effort */ } detachSteer = null; }
       if (teeOut) teeOut('', true);
       if (teeErr) teeErr('', true);
       resolve(result);
@@ -3043,14 +3038,11 @@ function spawnCaptureOneShot({ command, args = [], shell = false, detached = fal
     });
 
     child.stdin.on('error', () => {});
-    // C3 (#42): route cockpit steer-in into the child's stdin. Pipe-mode roles
-    // still stream + accept steer (a PTY changes I/O semantics but not the relay
-    // contract). Guard every write — a closed stdin must never crash the worker.
-    if (relayTap) {
-      detachSteer = relayTap.attachSteer((data) => {
-        try { child.stdin.write(typeof data === 'string' ? data : Buffer.from(data)); } catch { /* stdin closed */ }
-      });
-    }
+    // C3 (#42): pipe mode is one-shot — the job is written to stdin which is then
+    // closed (below), so there is no open channel to feed later steer-in frames
+    // into. We therefore do NOT attach steer-in here: steer-in requires a PTY
+    // (see spawnCapturePty), where stdin stays open for the life of the child.
+    // Pipe-mode roles still stream their output on the relay lane via the tee.
     try {
       if (stdinData != null) child.stdin.write(stdinData);
       child.stdin.end();
@@ -3082,8 +3074,8 @@ function loadPtyModule() {
  * the container executor; Windows conpty is out of scope for this slice).
  */
 function ptyAvailable(ptyFactory) {
-  if (ptyFactory) return true;
   if (process.platform === 'win32') return false;
+  if (ptyFactory) return true;
   return loadPtyModule() != null;
 }
 

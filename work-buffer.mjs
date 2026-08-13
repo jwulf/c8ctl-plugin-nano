@@ -172,11 +172,13 @@ export function createBufferMonitor(channel, opts = {}) {
       state.atCapacityEvents += 1;
       if (!state.atCapacity) {
         // Transition into the at-capacity state — warn ONCE so the operator sees
-        // the bound is now shedding the least-important frames (bulk relay
-        // before interactive before control), but we don't spam every sample.
+        // the bound is full and further low-priority frames may be dropped
+        // (bulk relay before interactive before control), but we don't spam
+        // every sample. We only observe depth, so we don't assert a drop has
+        // already happened: depth can reach capacity before any overflow.
         try {
           log.warn?.(
-            `agentic outbound buffer at capacity (${d}/${capacity} frames): the hub is unreachable and the bound is now shedding the lowest-priority frames. Raise NANO_AGENTIC_BUFFER_CAPACITY for a longer expected outage.`,
+            `agentic outbound buffer full (${d}/${capacity} frames): the hub is unreachable and further low-priority frames may be dropped until it reconnects. Raise NANO_AGENTIC_BUFFER_CAPACITY for a longer expected outage.`,
           );
         } catch {
           /* a logger failure must never break sampling */

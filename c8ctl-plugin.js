@@ -5789,6 +5789,183 @@ function compareSemver(a, b) {
   return 0;
 }
 
+// ---------------------------------------------------------------------------
+// Update changelog. `update --check` (and the pre-pull path of a real update)
+// shows what changed between the installed release and latest. The authoritative
+// source is this plugin's PUBLIC GitHub Releases — semantic-release records the
+// generated notes there (@semantic-release/github). The committed CHANGELOG.md
+// is deliberately NOT maintained (the release config dropped the changelog/git
+// plugins so it never pushes to the protected `main`) and isn't even in the npm
+// `files`, so it can't be the source. Every lookup here is best-effort and
+// non-blocking: any failure (offline, rate-limited, private) degrades to a link,
+// never to a failed `update`.
+// ---------------------------------------------------------------------------
+
+/** `owner/repo` parsed from the plugin package's `repository` field (null if absent). */
+function githubRepoSlug() {
+  try {
+    const pkg = JSON.parse(readFileSync(join(pluginDir, 'package.json'), 'utf8'));
+    const raw = pkg?.repository?.url ?? (typeof pkg?.repository === 'string' ? pkg.repository : '');
+    const m = String(raw).match(/github\.com[/:]([^/\s]+\/[^/\s]+?)(?:\.git)?(?:[/#?].*)?$/i);
+    return m ? m[1] : null;
+  } catch {
+    return null;
+  }
+}
+
+/**
+ * Keep only the releases strictly newer than `currentVersion` and no newer than
+ * `latestVersion` (when known), newest-first. Pure over its `releases` input (an
+ * array of GitHub release objects) so it is unit-testable without a network call.
+ */
+function filterReleasesSince(releases, currentVersion, latestVersion) {
+  if (!Array.isArray(releases)) return [];
+  const items = [];
+  for (const r of releases) {
+    if (!r || r.draft || r.prerelease) continue;
+    const tag = r.tag_name || r.name || '';
+    const norm = String(tag).replace(/^v/, '');
+    // Require a plain vX.Y.Z tag: a prerelease/build suffix (e.g. -rc.1, +meta)
+    // must exclude the release rather than be normalised away into the window.
+    if (!/^\d+\.\d+\.\d+$/.test(norm)) continue;
+    const ver = norm;
+    if (!currentVersion || compareSemver(ver, currentVersion) <= 0) continue;
+    if (latestVersion && compareSemver(ver, latestVersion) > 0) continue;
+    items.push({ version: ver, tag, body: r.body || '', url: r.html_url || '' });
+  }
+  items.sort((a, b) => compareSemver(b.version, a.version));
+  return items;
+}
+
+/**
+ * Render one semantic-release release body to tight terminal lines: drop the
+ * redundant `# [x.y.z](…)` header, turn `### Features` into a `Features:` label,
+ * flatten `* **scope:** subject ([abc](url))` bullets to `• scope: subject`
+ * (stripping any `([label](url))` commit/PR link groups and inlining any
+ * remaining `[text](url)` as its text). Returns an array of already-indented lines.
+ */
+function renderReleaseBody(body) {
+  const out = [];
+  for (const line of String(body).split(/\r?\n/)) {
+    if (/^#{1,2}\s+\[?\d+\.\d+\.\d+/.test(line)) continue; // redundant version header
+    const heading = line.match(/^#{2,3}\s+(.*\S)\s*$/);
+    if (heading) {
+      out.push(`    ${heading[1]}:`);
+      continue;
+    }
+    const bullet = line.match(/^\s*[*-]\s+(.*)$/);
+    if (bullet) {
+      let text = bullet[1]
+        .replace(/\s*\(\[[^\]]*\]\([^)]*\)\)/g, '') // ([label](url)) commit/PR link groups
+        .replace(/\[([^\]]*)\]\([^)]*\)/g, '$1') // inline [text](url) -> text
+        .replace(/\*\*(.*?)\*\*/g, '$1') // **scope** -> scope
+        .replace(/\s+/g, ' ')
+        .trim();
+      if (text) out.push(`      \u2022 ${text}`);
+    }
+  }
+  return out;
+}
+
+/** Cap on release pages walked, so a repo with a huge history can never hang the walk. */
+const RELEASE_PAGE_LIMIT = 20;
+
+/**
+ * True once a page contains a published (non-draft/non-prerelease) vX.Y.Z release
+ * at or below `current`. Because the releases API returns newest-first, everything
+ * after that point is older than the installed version, so the walk can stop.
+ */
+function reachedInstalledRelease(page, current) {
+  if (!current || !Array.isArray(page)) return false;
+  for (const r of page) {
+    if (!r || r.draft || r.prerelease) continue;
+    const norm = String(r.tag_name || r.name || '').replace(/^v/, '');
+    if (!/^\d+\.\d+\.\d+$/.test(norm)) continue;
+    if (compareSemver(norm, current) <= 0) return true;
+  }
+  return false;
+}
+
+/**
+ * Fetch this plugin's GitHub releases newer than `current` (best-effort; null on
+ * any failure). Paginates newest-first, stopping as soon as it reaches the
+ * installed release (or a bounded page cap), so the window stays accurate even
+ * when the installed version is far behind and there are >100 releases since.
+ */
+async function fetchReleaseNotesSince(slug, current, latest, timeoutMs = 5000) {
+  if (!slug) return null;
+  try {
+    const ctrl = new AbortController();
+    const timer = setTimeout(() => ctrl.abort(), timeoutMs);
+    const headers = {
+      accept: 'application/vnd.github+json',
+      'user-agent': 'c8ctl-plugin-nano',
+      'x-github-api-version': '2022-11-28',
+    };
+    const token = process.env.GH_TOKEN || process.env.GITHUB_TOKEN;
+    if (token) headers.authorization = `Bearer ${token}`;
+    try {
+      const all = [];
+      for (let page = 1; page <= RELEASE_PAGE_LIMIT; page++) {
+        const res = await fetch(
+          `https://api.github.com/repos/${slug}/releases?per_page=100&page=${page}`,
+          { headers, redirect: 'follow', signal: ctrl.signal },
+        );
+        if (!res.ok) return null;
+        const arr = await res.json();
+        if (!Array.isArray(arr) || arr.length === 0) break;
+        all.push(...arr);
+        // Newest-first: once we hit the installed release (or a short final
+        // page), everything remaining is older than `current` — stop early.
+        if (arr.length < 100 || reachedInstalledRelease(arr, current)) break;
+      }
+      return filterReleasesSince(all, current, latest);
+    } finally {
+      clearTimeout(timer);
+    }
+  } catch {
+    return null;
+  }
+}
+
+/**
+ * Print the changelog between the installed release and `latest`. Best-effort:
+ * on any fetch failure it prints a single line pointing at the releases page and
+ * returns, so it can never block or fail an `update`.
+ */
+async function printChangelogSince(_name, current, latest) {
+  const logger = getLogger();
+  const slug = githubRepoSlug();
+  const releasesUrl = slug ? `https://github.com/${slug}/releases` : null;
+  const releases = await fetchReleaseNotesSince(slug, current, latest);
+
+  if (releases === null) {
+    if (releasesUrl) logger.info(`See what changed: ${releasesUrl}`);
+    logger.info('');
+    return;
+  }
+  if (releases.length === 0) {
+    // Nothing resolved between the two (only a build-metadata bump, or a
+    // degraded resolution: current is null / tags don't match vX.Y.Z). Point
+    // at the releases page so the best-effort feature still leaves a trail.
+    if (releasesUrl) logger.info(`See what changed: ${releasesUrl}`);
+    logger.info('');
+    return;
+  }
+
+  logger.info(`What's changed since v${current ?? '?'}:`);
+  logger.info('');
+  for (const rel of releases) {
+    logger.info(`  v${rel.version}`);
+    const lines = renderReleaseBody(rel.body);
+    if (lines.length === 0) logger.info('      (no notes)');
+    else for (const l of lines) logger.info(l);
+    logger.info('');
+  }
+  if (releasesUrl) logger.info(`Full release notes: ${releasesUrl}`);
+  logger.info('');
+}
+
 /**
  * Resolve how npm must be spawned on the given platform. Spawning `npm`
  * directly is not portable: on Windows npm is a `npm.cmd` shim, so bare
@@ -5921,7 +6098,8 @@ function manualUpdateCommand(name, info) {
   return `  npm install -g ${name}@latest`;
 }
 
-function updatePlugin(req) {
+async function updatePlugin(req) {
+  const logger = getLogger();
   const { name, version: current } = pluginPackage();
 
   // The nano server binary ships with the plugin as its platform package
@@ -5942,44 +6120,47 @@ function updatePlugin(req) {
   const info = pluginInstallInfo();
   const manual = manualUpdateCommand(name, info);
 
-  console.log(`Installed: ${name} v${current ?? '?'}${nanoNote}`);
+  logger.info(`Installed: ${name} v${current ?? '?'}${nanoNote}`);
 
   let latest;
   try {
     latest = npmLatestVersion(name);
   } catch (err) {
-    console.log(`Could not check npm for updates: ${err.message}`);
-    console.log('Pull the latest release manually with:');
-    console.log(manual);
+    logger.info(`Could not check npm for updates: ${err.message}`);
+    logger.info('Pull the latest release manually with:');
+    logger.info(manual);
     return;
   }
-  console.log(`Latest:    ${name} v${latest}  (npm)`);
-  console.log('');
+  logger.info(`Latest:    ${name} v${latest}  (npm)`);
+  logger.info('');
 
   if (current && compareSemver(current, latest) >= 0) {
     if (!nanoBin) {
       // Plugin is current but npm never fetched the matching server binary.
-      console.log('Plugin is current, but the nano server binary is not installed for this platform.');
-      console.log('Provision it by reinstalling the plugin so npm fetches the platform package:');
-      console.log('  c8ctl sync plugin');
+      logger.info('Plugin is current, but the nano server binary is not installed for this platform.');
+      logger.info('Provision it by reinstalling the plugin so npm fetches the platform package:');
+      logger.info('  c8ctl sync plugin');
       return;
     }
-    console.log('Already on the latest release — nothing to do.');
+    logger.info('Already on the latest release — nothing to do.');
     return;
   }
 
-  console.log(`Update available: v${current ?? '?'} -> v${latest}`);
+  logger.info(`Update available: v${current ?? '?'} -> v${latest}`);
+  logger.info('');
+
+  await printChangelogSince(name, current, latest);
 
   if (req.check) {
-    console.log('Run `c8ctl nano update` to pull it (or manually):');
-    console.log(manual);
+    logger.info('Run `c8ctl nano update` to pull it (or manually):');
+    logger.info(manual);
     return;
   }
 
   if (info.mode === 'local') {
-    console.log('This plugin runs from a local checkout, so it cannot self-update in place.');
-    console.log('Update it with:');
-    console.log(manual);
+    logger.info('This plugin runs from a local checkout, so it cannot self-update in place.');
+    logger.info('Update it with:');
+    logger.info(manual);
     return;
   }
 
@@ -5988,8 +6169,8 @@ function updatePlugin(req) {
       ? ['install', `${name}@${latest}`, '--prefix', info.prefix]
       : ['install', '-g', `${name}@${latest}`];
   const where = info.mode === 'managed' ? 'the c8ctl plugin store' : "npm's global prefix";
-  console.log(`Pulling ${name}@${latest} into ${where}...`);
-  console.log('');
+  logger.info(`Pulling ${name}@${latest} into ${where}...`);
+  logger.info('');
   try {
     runNpm(installArgs, { stdio: 'inherit' });
   } catch (err) {
@@ -6006,14 +6187,14 @@ function updatePlugin(req) {
       `npm ${installArgs.join(' ')} failed${code}. ${hint}`,
     );
   }
-  console.log('');
+  logger.info('');
   if (info.mode === 'managed') {
-    console.log(`Updated to v${latest}. The new plugin and bundled nano server load on your next c8ctl command.`);
+    logger.info(`Updated to v${latest}. The new plugin and bundled nano server load on your next c8ctl command.`);
   } else {
-    console.log(`Updated to v${latest}.`);
+    logger.info(`Updated to v${latest}.`);
   }
-  console.log('Restart any running cluster to use the new server binary:');
-  console.log('  c8ctl nano restart');
+  logger.info('Restart any running cluster to use the new server binary:');
+  logger.info('  c8ctl nano restart');
 }
 
 // ---------------------------------------------------------------------------
@@ -7061,6 +7242,7 @@ function parseProcessosRequest(args, flags) {
 export { resolveBinary, findBinary, launcherEnvMarkers };
 export { setConfig, unsetConfig, readConfig, writeConfig, getConfigFile, SETTING_ALIASES };
 export { buildNpmInvocation };
+export { compareSemver, githubRepoSlug, filterReleasesSince, renderReleaseBody };
 export {
   webConsoleUrl,
   consoleLinkLabel,
@@ -7190,7 +7372,7 @@ export const metadata = {
         { command: 'c8ctl nano set model-dir <path>', description: 'Set the workspace dir (models + workers)' },
         { command: 'c8ctl nano config', description: 'Show current plugin configuration and paths' },
         { command: 'c8ctl nano update', description: 'Pull the latest published nano release (re-installs via npm)' },
-        { command: 'c8ctl nano update --check', description: 'Check whether a newer nano release is available' },
+        { command: 'c8ctl nano update --check', description: 'Check for a newer nano release and show the changelog since the installed version (no install)' },
         { command: 'c8ctl nano hire', description: 'Interactively create a CLI agent worker profile (name, rank, command, model, capabilities)' },
         { command: 'c8ctl nano hire --name reviewer --rank senior --command copilot --model gpt-5 --capabilities code-review,testing', description: 'Create a profile non-interactively' },
         { command: 'c8ctl nano hire --name coder --rank senior --command copilot --arg --allow-all', description: 'Hire copilot with a command-line switch (copilot --allow-all)' },
@@ -7247,7 +7429,7 @@ export const commands = {
       purge: { type: 'boolean', description: 'stop/restart: also delete per-node engine data' },
       force: { type: 'boolean', description: 'start: stop any existing cluster first' },
       workspace: { type: 'boolean', description: 'clean: also delete the workspace (models + workers)' },
-      check: { type: 'boolean', description: 'update: only report whether a new release is available; do not install' },
+      check: { type: 'boolean', description: 'update: report whether a new release is available (with the changelog since the installed version); do not install' },
       binary: { type: 'string', description: 'Path to the nanobpmn server binary' },
       name: { type: 'string', description: 'work/supervisor add: worker name (auto ‹host›-‹profile›-‹random› if omitted); hire/assign: agent profile name' },
       rank: { type: 'string', description: 'hire: agent rank (principal|senior|junior|decider)' },
@@ -7326,7 +7508,7 @@ export const commands = {
             showConfig();
             break;
           case 'update':
-            updatePlugin(req);
+            await updatePlugin(req);
             break;
           case 'hire':
             await hireWorker(req, flags);

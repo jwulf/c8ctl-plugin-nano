@@ -125,6 +125,11 @@ const READINESS_TIMEOUT_MS = 60_000;
 const READINESS_POLL_MS = 500;
 const HEALTH_TIMEOUT_MS = 1_500;
 const STOP_GRACE_MS = 8_000;
+// Upper bound on one `--auto` engine-read reconcile (enumerate deployed
+// definitions + fetch each BPMN). A read that stalls past this is treated as a
+// transient failure so the running poller set is KEPT and, crucially, shutdown
+// — which awaits the in-flight reconcile — can never hang on a wedged engine.
+const AUTO_ENGINE_READ_TIMEOUT_MS = 15_000;
 const PROCESSOS_STATE_FILE = 'processos.json';
 const SUPERVISOR_STATE_FILE = 'supervisor.json';
 const PROCESSOS_DEFAULT_PORT = 8090;
@@ -2489,10 +2494,26 @@ async function defaultC8RestReader(restConfig) {
 
 // Resolve the desired job-type set for `--auto`: all deployed agent job types
 // read from the engine, optionally scoped to one process-id/prefix. A test may
-// inject an in-memory `readerFactory` to drive it without a live engine.
-async function resolveAutoJobTypes({ restConfig, scope = '', readerFactory } = {}) {
-  const reader = readerFactory ? await readerFactory() : await defaultC8RestReader(restConfig);
-  return readDeployedAgentJobTypes(reader, { scope });
+// inject an in-memory `readerFactory` to drive it without a live engine. The
+// whole read is time-bounded (`timeoutMs`, 0 disables) and a timeout rejects
+// with a clear error, so a stalled engine read settles the awaited promise
+// (KEEP the running set) instead of wedging the reconcile — and, via shutdown's
+// `await inFlightReconcile`, wedging `Ctrl-C`/SIGTERM.
+async function resolveAutoJobTypes({ restConfig, scope = '', readerFactory, timeoutMs = AUTO_ENGINE_READ_TIMEOUT_MS } = {}) {
+  const read = (async () => {
+    const reader = readerFactory ? await readerFactory() : await defaultC8RestReader(restConfig);
+    return readDeployedAgentJobTypes(reader, { scope });
+  })();
+  if (!(timeoutMs > 0)) return read;
+  let timer;
+  const timeout = new Promise((_resolve, reject) => {
+    timer = setTimeout(() => reject(new Error(`engine read timed out after ${timeoutMs}ms`)), timeoutMs);
+  });
+  try {
+    return await Promise.race([read, timeout]);
+  } finally {
+    clearTimeout(timer);
+  }
 }
 
 // Build the content endpoint. Per issue #63 / nano-bpm #759 the non-binary
@@ -4661,7 +4682,13 @@ const WORK_FORWARD_FLAGS = {
 function reconstructWorkArgs(flags) {
   const out = [];
   if (!flags || typeof flags !== 'object') return out;
+  // `--auto-scope` is meaningless without `--auto` — `workAgent` exits fast with
+  // "--auto-scope requires --auto". Forwarding the orphan flag to a supervised
+  // worker would guarantee an immediate crash/restart loop, so drop it here at
+  // the forwarding boundary when `--auto` is not truthy (mirrors that guard).
+  const autoOn = flags.auto === true || flags.auto === 'true';
   for (const [name, kind] of Object.entries(WORK_FORWARD_FLAGS)) {
+    if (name === 'auto-scope' && !autoOn) continue;
     const v = flags[name];
     if (v === undefined || v === null) continue;
     if (kind === 'boolean') {

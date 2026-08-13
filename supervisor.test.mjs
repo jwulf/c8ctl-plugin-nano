@@ -53,7 +53,11 @@ test('reconstructWorkArgs repeats list flags once per item', () => {
 
 test('reconstructWorkArgs forwards --auto and --auto-scope to supervised workers', () => {
   assert.deepEqual(reconstructWorkArgs({ auto: true }), ['--auto']);
-  assert.deepEqual(reconstructWorkArgs({ auto: false, 'auto-scope': 'my-app' }), ['--auto-scope', 'my-app']);
+  // --auto-scope without --auto is dropped: forwarding the orphan flag would
+  // make the supervised worker exit fast ("--auto-scope requires --auto") and
+  // wedge the supervisor into a crash/restart loop.
+  assert.deepEqual(reconstructWorkArgs({ auto: false, 'auto-scope': 'my-app' }), []);
+  assert.deepEqual(reconstructWorkArgs({ 'auto-scope': 'my-app' }), []);
   assert.deepEqual(
     reconstructWorkArgs({ auto: true, 'auto-scope': 'my-app' }),
     ['--auto', '--auto-scope', 'my-app'],

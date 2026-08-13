@@ -129,3 +129,15 @@ test('resolveAutoJobTypes surfaces engine-read failure (so the caller can KEEP t
   });
   await assert.rejects(resolveAutoJobTypes({ readerFactory }), /engine unreachable/);
 });
+
+test('resolveAutoJobTypes rejects on a stalled engine read (time-bounded so shutdown never hangs)', async () => {
+  const readerFactory = () => ({
+    // Never settles — models an engine REST call that stalls indefinitely.
+    searchProcessDefinitionKeys() { return new Promise(() => {}); },
+    async getProcessDefinitionXml() { return ''; },
+  });
+  await assert.rejects(
+    resolveAutoJobTypes({ readerFactory, timeoutMs: 20 }),
+    /engine read timed out after 20ms/,
+  );
+});

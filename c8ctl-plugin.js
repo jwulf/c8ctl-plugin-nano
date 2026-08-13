@@ -4537,9 +4537,15 @@ async function workAgent(req, flags) {
   let autoPollTimer = null;
   if (autoMode) {
     // Self-standing interval poll (not watchFile) since the desired set is
-    // derived from the engine, not the on-disk profile. `reconcile()` coalesces
-    // overlapping passes, so a slow engine read can't stack up reconciles.
+    // derived from the engine, not the on-disk profile. Skip a tick while a
+    // reconcile is already in flight: calling reconcile() then would set
+    // reconcileRequested and make the in-flight pass loop back-to-back, so an
+    // engine read that consistently outlasts AUTO_POLL_INTERVAL_MS would run
+    // reconciles as fast as the read completes and hammer the broker. Skipping
+    // keeps polling rate-limited to the configured interval regardless of
+    // engine-read latency; the next tick re-reads the latest engine state.
     autoPollTimer = setInterval(() => {
+      if (inFlightReconcile) return;
       reconcile().catch((err) => logger.warn(`--auto reconcile failed: ${err?.message || err}`));
     }, AUTO_POLL_INTERVAL_MS);
     if (typeof autoPollTimer.unref === 'function') autoPollTimer.unref();

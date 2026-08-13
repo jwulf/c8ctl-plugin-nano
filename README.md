@@ -219,6 +219,64 @@ name is generated, so two `work reviewer` processes never collide at the
 broker. (`--name` names the worker; the profile to run is always the
 positional argument.)
 
+### Live agent visibility: the `/agentic` channel + live terminals
+
+A running worker can appear **live on the Workforce visibility page** and stream
+its agents' terminals to an operator's cockpit. This rides the app's agentic
+channel (ADR 0056), served **same-port** on the app's own HTTP base URL at path
+**`/agentic`** — not a sidecar, so there's no extra port to open.
+
+**Connecting.** Enrolment is opt-in: a worker only connects when it has both an
+ADR 0028 **identity token** and a **capability credential** (the same `?token=…`
+pattern the blackboard uses). Point it at the app and hand it the two secrets via
+env (or persisted config); the channel URL defaults to the configured nano URL:
+
+```bash
+# Enrol this worker on the app's same-port /agentic channel
+export NANO_AGENTIC_URL=http://localhost:8080     # app base URL; channel is served at /agentic
+export NANO_AGENTIC_TOKEN=<identity-token>         # ADR 0028 identity
+export NANO_AGENTIC_CREDENTIAL=<capability-cred>   # capability credential
+c8ctl nano work reviewer
+#   agentic channel: announcing presence as ‹worker› on ws://localhost:8080/agentic?token=***&capability=***
+```
+
+Without both secrets the worker runs **exactly as before, off the channel** — no
+visibility, no relay, nothing else changes. A valid identity + capability
+connects; an invalid identity is rejected (unauthorized) and a missing capability
+is rejected (forbidden).
+
+**How presence appears.** On connect the worker **announces** its identity, its
+`host`, and the set of `jobKey`s it is currently running, then **heartbeats** to
+stay live and **re-announces** after a reconnect so its row survives a hub
+restart. When `work` stops it **deregisters cleanly**, so the worker disappears
+from the visibility page on exit.
+
+**Opting a role into a live terminal (PTY vs pipe).** Each role chooses whether
+its agent harness runs on a full **PTY** (a real terminal — streamed on the relay
+lane and **steerable**: an operator's keystrokes reach the running agent) or a
+plain **pipe** (streamed, not interactive). It's a **per-role opt-in**, set on
+the hire profile and defaulting to `pipe`:
+
+```bash
+# Hire a role whose harness runs on a full, steerable PTY
+c8ctl nano hire --name coder --rank senior --command copilot --terminal pty
+
+# Override the mode for a one-off worker without re-hiring
+NANO_AGENTIC_TERMINAL=pipe c8ctl nano work coder
+```
+
+A PTY needs the optional native `node-pty` dependency; where it can't be
+allocated (not installed, or Windows) a `pty` role **gracefully falls back to a
+pipe** that still relays. Each job's terminal streams on its own relay stream
+named `job:‹jobKey›`, so output and steer-in are routed from the `jobKey` alone.
+
+**Surviving a hub outage.** A worker that starts **before** the app, or survives
+a **hub restart**, buffers its outbound frames in a **bounded** local ring and
+**drains them in order** on reconnect (no loss or reorder within the bound). The
+bound is operator-tunable for a long expected outage; raise it with
+`NANO_AGENTIC_BUFFER_CAPACITY` (frames). When the bound is hit the worker warns
+rather than silently shedding.
+
 ### Live profile reload (no restart on `assign`)
 
 A running `c8ctl nano work <name>` **watches** the profile it is servicing. When

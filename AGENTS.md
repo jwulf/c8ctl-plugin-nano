@@ -89,6 +89,50 @@ SDK client (job workers) — do **not** add the SDK as a dependency or use raw
   daemon never runs a worker loop itself. Forwarded flags come from
   `WORK_FORWARD_FLAGS` via `reconstructWorkArgs` (only real `work` flags).
 
+## Agentic worker channel (`work` enrolment, presence / relay / buffer)
+
+The agent-visibility plane (ADR 0056) lets an enrolled `nano work` worker report
+presence, relay its live terminal, and survive a hub outage. It is opt-in: absent
+`NANO_AGENTIC_URL`/`TOKEN`/`CREDENTIAL` (`resolveAgenticConfig`), `work` runs
+exactly as before. The seam lives in `agentic.mjs`, `agentic-loader-hook.mjs`,
+`work-channel.mjs`, `work-relay.mjs`, and `work-buffer.mjs`.
+
+- **One import surface — `loadAgenticClient()` in `agentic.mjs`.** The published
+  `@nanobpm/urban-agent-client` `dist` imports raw TypeScript from
+  `@nanobpm/agentic/source/*`, which stock Node refuses to type-strip under
+  `node_modules` (`ERR_UNSUPPORTED_NODE_MODULES_TYPE_STRIPPING`) — so a bare
+  import throws at runtime. `loadAgenticClient()` registers a source→dist resolve
+  hook (`agentic-loader-hook.mjs`) exactly once, then imports the client. **Import
+  the client ONLY through `loadAgenticClient()`; never reach for
+  `@nanobpm/urban-agent-client` directly and never re-register the hook.** This is
+  enforced by `agentic-import-surface.test.mjs` (a hookless second import passes
+  its own CI in isolation but throws once merged).
+- **Attach to the one `WorkChannel`, don't open a second connection.**
+  `createWorkChannel()` is wired once in `workAgent`. Extend that holder:
+  `ch.relayLane().relay(stream, chunk)` (bulk lane, PTY frames),
+  `ch.onConnect/onReconnect/onDisconnect(fn)`, and `ch.client` — the sole
+  `AgenticClient`, whose bounded outbound ring (`bufferCapacity`, QoS-correct
+  overflow, strict-lane-order drain on reconnect) already *is* the outage buffer.
+  Don't add a parallel buffer; tune the existing bound via
+  `NANO_AGENTIC_BUFFER_CAPACITY`.
+- **`work` is a dense single-surface region.** Presence, relay, and buffer all
+  attach to the same `workAgent`/`runAgentJob` block and the same channel client.
+  Parallel changes here collide on merge even when each is green alone — extend
+  the shared seam, don't re-create it.
+- **`node-pty` is an OPTIONAL native dep, lazily required in `spawnCapturePty`.**
+  Terminal mode is per-role (`hire --terminal pty|pipe`, default `pipe`;
+  `NANO_AGENTIC_TERMINAL` overrides at work time). When `node-pty` is *absent*,
+  `pty` degrades to a pipe that still relays. **Caveat:** a PTY spawn *failure* at
+  runtime (e.g. a sandbox that denies `posix_spawnp` — restricted macOS) does not
+  yet fall back to a pipe, so the "falls back when node-pty is unavailable" test
+  is environment-sensitive (green on Linux CI, can fail on such hosts). Tests that
+  must be deterministic everywhere inject a fake PTY factory rather than relying
+  on `node-pty`'s presence.
+- **Gotcha — anchor flush/backlog capture on the DISCONNECT side.**
+  `ch.client.onDrain` fires *before* the `WorkChannel` `onConnect`/`onReconnect`
+  listeners settle (the ring pumps right after open, listeners settle after), so
+  capturing backlog on the reconnect side races and under-counts.
+
 ## How a cluster is modelled
 
 - Each nanobpmn node is the single server binary, configured by env vars:

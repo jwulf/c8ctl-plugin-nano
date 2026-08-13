@@ -50,6 +50,7 @@ import {
   finalizeGit,
   reconcileAgentPr,
   resolveCommitterIdentity,
+  isPlaceholderEmail,
   reapAgentRunDirs,
   authUrl,
   githubCloneToken,
@@ -959,6 +960,69 @@ test('resolveCommitterIdentity: prefers operator identity over the nano-agent fa
       { name: 'Env Name', email: 'env@example.com', source: 'env' });
     assert.equal(gitCalls, 0, 'git config not consulted when env supplies both fields');
     assert.equal(ghCalls, 0, 'gh not consulted when env supplies both fields');
+  } finally {
+    if (savedName === undefined) delete process.env.GIT_AUTHOR_NAME; else process.env.GIT_AUTHOR_NAME = savedName;
+    if (savedEmail === undefined) delete process.env.GIT_AUTHOR_EMAIL; else process.env.GIT_AUTHOR_EMAIL = savedEmail;
+  }
+});
+
+test('isPlaceholderEmail: rejects non-routable placeholders, accepts real addresses', () => {
+  // Non-routable / unattributable placeholders → rejected.
+  assert.equal(isPlaceholderEmail('trial-merge@nano.local'), true);
+  assert.equal(isPlaceholderEmail('agent@foo.local'), true);
+  assert.equal(isPlaceholderEmail('x@build.internal'), true);
+  assert.equal(isPlaceholderEmail('root@localhost'), true);
+  assert.equal(isPlaceholderEmail('no-at-sign'), true);
+  assert.equal(isPlaceholderEmail('  bob@nano.local  '), true, 'whitespace-trimmed before matching');
+  assert.equal(isPlaceholderEmail('BOB@Nano.Local'), true, 'case-insensitive');
+  // Real, routable addresses (incl. GitHub noreply) → accepted.
+  assert.equal(isPlaceholderEmail('ada@example.com'), false);
+  assert.equal(isPlaceholderEmail('12345+octocat@users.noreply.github.com'), false);
+  // Empty is not a "placeholder" — it is an absent field handled by per-field
+  // fallthrough, so it must NOT invalidate a source outright.
+  assert.equal(isPlaceholderEmail(''), false);
+  assert.equal(isPlaceholderEmail(undefined), false);
+});
+
+test('resolveCommitterIdentity: a *@nano.local (or non-routable) author is never applied', () => {
+  const savedName = process.env.GIT_AUTHOR_NAME;
+  const savedEmail = process.env.GIT_AUTHOR_EMAIL;
+  try {
+    // The exact bug: launcher injects a placeholder GIT_AUTHOR_*. It must NOT be
+    // stamped onto a commit — fall through to the gh-authenticated identity.
+    process.env.GIT_AUTHOR_NAME = 'trial-merge';
+    process.env.GIT_AUTHOR_EMAIL = 'trial-merge@nano.local';
+    const fromGh = resolveCommitterIdentity({
+      gitIdentity: () => ({ name: '', email: '' }),
+      ghIdentity: () => ({ name: 'octocat', email: '12345+octocat@users.noreply.github.com' }),
+    });
+    assert.deepEqual(
+      { name: fromGh.name, email: fromGh.email, source: fromGh.source },
+      { name: 'octocat', email: '12345+octocat@users.noreply.github.com', source: 'gh' },
+      'placeholder env author is discarded whole (no Frankenstein name), gh identity wins');
+
+    // With no gh identity either, it falls all the way to the marked bot fallback —
+    // never the *@nano.local placeholder.
+    const fallback = resolveCommitterIdentity({
+      gitIdentity: () => ({ name: '', email: '' }),
+      ghIdentity: () => ({ name: '', email: '' }),
+    });
+    assert.equal(fallback.email.endsWith('@nano.local'), false);
+    assert.deepEqual(
+      { name: fallback.name, email: fallback.email, source: fallback.source },
+      { name: 'nano-agent', email: 'nano-agent@users.noreply.github.com', source: 'fallback' });
+
+    // A placeholder coming from git-global config is likewise rejected in favour
+    // of the gh identity — the guard secures the whole class, not just env.
+    delete process.env.GIT_AUTHOR_NAME;
+    delete process.env.GIT_AUTHOR_EMAIL;
+    const overGitPlaceholder = resolveCommitterIdentity({
+      gitIdentity: () => ({ name: 'trial-merge', email: 'trial-merge@nano.local' }),
+      ghIdentity: () => ({ name: 'octocat', email: '12345+octocat@users.noreply.github.com' }),
+    });
+    assert.deepEqual(
+      { name: overGitPlaceholder.name, email: overGitPlaceholder.email, source: overGitPlaceholder.source },
+      { name: 'octocat', email: '12345+octocat@users.noreply.github.com', source: 'gh' });
   } finally {
     if (savedName === undefined) delete process.env.GIT_AUTHOR_NAME; else process.env.GIT_AUTHOR_NAME = savedName;
     if (savedEmail === undefined) delete process.env.GIT_AUTHOR_EMAIL; else process.env.GIT_AUTHOR_EMAIL = savedEmail;

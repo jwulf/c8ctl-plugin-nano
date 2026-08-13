@@ -3013,7 +3013,7 @@ function spawnCaptureOneShot({ command, args = [], shell = false, detached = fal
       armIdle();
       const buf = Buffer.isBuffer(d) ? d : Buffer.from(d);
       if (teeOut) teeOut(buf.toString('utf8'), false);
-      if (relayTap) relayTap.onData(buf);
+      if (relayTap && typeof relayTap.onData === 'function') relayTap.onData(buf);
       const remaining = MAX_CAPTURE_BYTES - stdoutBytes;
       if (remaining <= 0) { stdoutTruncated = true; return; }
       if (buf.length > remaining) { stdoutChunks.push(buf.subarray(0, remaining)); stdoutBytes = MAX_CAPTURE_BYTES; stdoutTruncated = true; }
@@ -3023,7 +3023,7 @@ function spawnCaptureOneShot({ command, args = [], shell = false, detached = fal
       armIdle();
       const buf = Buffer.isBuffer(d) ? d : Buffer.from(d);
       if (teeErr) teeErr(buf.toString('utf8'), false);
-      if (relayTap) relayTap.onData(buf);
+      if (relayTap && typeof relayTap.onData === 'function') relayTap.onData(buf);
       const remaining = MAX_CAPTURE_BYTES - stderrBytes;
       if (remaining <= 0) { stderrTruncated = true; return; }
       if (buf.length > remaining) { stderrChunks.push(buf.subarray(0, remaining)); stderrBytes = MAX_CAPTURE_BYTES; stderrTruncated = true; }
@@ -3167,7 +3167,7 @@ function spawnCapturePty({ command, args = [], cwd, env, stdinData, timeoutMs, i
       armIdle();
       const buf = Buffer.isBuffer(d) ? d : Buffer.from(String(d), 'utf8');
       if (teeSink) tee(buf.toString('utf8'), false);
-      if (relayTap) relayTap.onData(buf);
+      if (relayTap && typeof relayTap.onData === 'function') relayTap.onData(buf);
       const remaining = MAX_CAPTURE_BYTES - bytes;
       if (remaining <= 0) { truncated = true; return; }
       if (buf.length > remaining) { chunks.push(buf.subarray(0, remaining)); bytes = MAX_CAPTURE_BYTES; truncated = true; }
@@ -3180,7 +3180,7 @@ function spawnCapturePty({ command, args = [], cwd, env, stdinData, timeoutMs, i
 
     // Steer-in: write cockpit bytes straight into the PTY so an operator can
     // drive the running agent.
-    if (relayTap) {
+    if (relayTap && typeof relayTap.attachSteer === 'function') {
       detachSteer = relayTap.attachSteer((data) => {
         try { term.write(typeof data === 'string' ? data : Buffer.from(data).toString('utf8')); } catch { /* term gone */ }
       });

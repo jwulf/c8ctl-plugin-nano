@@ -6057,6 +6057,7 @@ function manualUpdateCommand(name, info) {
 }
 
 async function updatePlugin(req) {
+  const logger = getLogger();
   const { name, version: current } = pluginPackage();
 
   // The nano server binary ships with the plugin as its platform package
@@ -6077,47 +6078,47 @@ async function updatePlugin(req) {
   const info = pluginInstallInfo();
   const manual = manualUpdateCommand(name, info);
 
-  console.log(`Installed: ${name} v${current ?? '?'}${nanoNote}`);
+  logger.info(`Installed: ${name} v${current ?? '?'}${nanoNote}`);
 
   let latest;
   try {
     latest = npmLatestVersion(name);
   } catch (err) {
-    console.log(`Could not check npm for updates: ${err.message}`);
-    console.log('Pull the latest release manually with:');
-    console.log(manual);
+    logger.info(`Could not check npm for updates: ${err.message}`);
+    logger.info('Pull the latest release manually with:');
+    logger.info(manual);
     return;
   }
-  console.log(`Latest:    ${name} v${latest}  (npm)`);
-  console.log('');
+  logger.info(`Latest:    ${name} v${latest}  (npm)`);
+  logger.info('');
 
   if (current && compareSemver(current, latest) >= 0) {
     if (!nanoBin) {
       // Plugin is current but npm never fetched the matching server binary.
-      console.log('Plugin is current, but the nano server binary is not installed for this platform.');
-      console.log('Provision it by reinstalling the plugin so npm fetches the platform package:');
-      console.log('  c8ctl sync plugin');
+      logger.info('Plugin is current, but the nano server binary is not installed for this platform.');
+      logger.info('Provision it by reinstalling the plugin so npm fetches the platform package:');
+      logger.info('  c8ctl sync plugin');
       return;
     }
-    console.log('Already on the latest release — nothing to do.');
+    logger.info('Already on the latest release — nothing to do.');
     return;
   }
 
-  console.log(`Update available: v${current ?? '?'} -> v${latest}`);
-  console.log('');
+  logger.info(`Update available: v${current ?? '?'} -> v${latest}`);
+  logger.info('');
 
   await printChangelogSince(name, current, latest);
 
   if (req.check) {
-    console.log('Run `c8ctl nano update` to pull it (or manually):');
-    console.log(manual);
+    logger.info('Run `c8ctl nano update` to pull it (or manually):');
+    logger.info(manual);
     return;
   }
 
   if (info.mode === 'local') {
-    console.log('This plugin runs from a local checkout, so it cannot self-update in place.');
-    console.log('Update it with:');
-    console.log(manual);
+    logger.info('This plugin runs from a local checkout, so it cannot self-update in place.');
+    logger.info('Update it with:');
+    logger.info(manual);
     return;
   }
 
@@ -6126,8 +6127,8 @@ async function updatePlugin(req) {
       ? ['install', `${name}@${latest}`, '--prefix', info.prefix]
       : ['install', '-g', `${name}@${latest}`];
   const where = info.mode === 'managed' ? 'the c8ctl plugin store' : "npm's global prefix";
-  console.log(`Pulling ${name}@${latest} into ${where}...`);
-  console.log('');
+  logger.info(`Pulling ${name}@${latest} into ${where}...`);
+  logger.info('');
   try {
     runNpm(installArgs, { stdio: 'inherit' });
   } catch (err) {
@@ -6144,14 +6145,14 @@ async function updatePlugin(req) {
       `npm ${installArgs.join(' ')} failed${code}. ${hint}`,
     );
   }
-  console.log('');
+  logger.info('');
   if (info.mode === 'managed') {
-    console.log(`Updated to v${latest}. The new plugin and bundled nano server load on your next c8ctl command.`);
+    logger.info(`Updated to v${latest}. The new plugin and bundled nano server load on your next c8ctl command.`);
   } else {
-    console.log(`Updated to v${latest}.`);
+    logger.info(`Updated to v${latest}.`);
   }
-  console.log('Restart any running cluster to use the new server binary:');
-  console.log('  c8ctl nano restart');
+  logger.info('Restart any running cluster to use the new server binary:');
+  logger.info('  c8ctl nano restart');
 }
 
 // ---------------------------------------------------------------------------

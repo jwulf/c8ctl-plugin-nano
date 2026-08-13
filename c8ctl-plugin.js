@@ -5867,7 +5867,31 @@ function renderReleaseBody(body) {
   return out;
 }
 
-/** Fetch this plugin's GitHub releases newer than `current` (best-effort; null on any failure). */
+/** Cap on release pages walked, so a repo with a huge history can never hang the walk. */
+const RELEASE_PAGE_LIMIT = 20;
+
+/**
+ * True once a page contains a published (non-draft/non-prerelease) vX.Y.Z release
+ * at or below `current`. Because the releases API returns newest-first, everything
+ * after that point is older than the installed version, so the walk can stop.
+ */
+function reachedInstalledRelease(page, current) {
+  if (!current || !Array.isArray(page)) return false;
+  for (const r of page) {
+    if (!r || r.draft || r.prerelease) continue;
+    const norm = String(r.tag_name || r.name || '').replace(/^v/, '');
+    if (!/^\d+\.\d+\.\d+$/.test(norm)) continue;
+    if (compareSemver(norm, current) <= 0) return true;
+  }
+  return false;
+}
+
+/**
+ * Fetch this plugin's GitHub releases newer than `current` (best-effort; null on
+ * any failure). Paginates newest-first, stopping as soon as it reaches the
+ * installed release (or a bounded page cap), so the window stays accurate even
+ * when the installed version is far behind and there are >100 releases since.
+ */
 async function fetchReleaseNotesSince(slug, current, latest, timeoutMs = 5000) {
   if (!slug) return null;
   try {
@@ -5880,14 +5904,25 @@ async function fetchReleaseNotesSince(slug, current, latest, timeoutMs = 5000) {
     };
     const token = process.env.GH_TOKEN || process.env.GITHUB_TOKEN;
     if (token) headers.authorization = `Bearer ${token}`;
-    const res = await fetch(`https://api.github.com/repos/${slug}/releases?per_page=100`, {
-      headers,
-      redirect: 'follow',
-      signal: ctrl.signal,
-    }).finally(() => clearTimeout(timer));
-    if (!res.ok) return null;
-    const arr = await res.json();
-    return filterReleasesSince(arr, current, latest);
+    try {
+      const all = [];
+      for (let page = 1; page <= RELEASE_PAGE_LIMIT; page++) {
+        const res = await fetch(
+          `https://api.github.com/repos/${slug}/releases?per_page=100&page=${page}`,
+          { headers, redirect: 'follow', signal: ctrl.signal },
+        );
+        if (!res.ok) return null;
+        const arr = await res.json();
+        if (!Array.isArray(arr) || arr.length === 0) break;
+        all.push(...arr);
+        // Newest-first: once we hit the installed release (or a short final
+        // page), everything remaining is older than `current` — stop early.
+        if (arr.length < 100 || reachedInstalledRelease(arr, current)) break;
+      }
+      return filterReleasesSince(all, current, latest);
+    } finally {
+      clearTimeout(timer);
+    }
   } catch {
     return null;
   }

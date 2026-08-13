@@ -51,6 +51,15 @@ test('reconstructWorkArgs repeats list flags once per item', () => {
   );
 });
 
+test('reconstructWorkArgs forwards --auto and --auto-scope to supervised workers', () => {
+  assert.deepEqual(reconstructWorkArgs({ auto: true }), ['--auto']);
+  assert.deepEqual(reconstructWorkArgs({ auto: false, 'auto-scope': 'my-app' }), ['--auto-scope', 'my-app']);
+  assert.deepEqual(
+    reconstructWorkArgs({ auto: true, 'auto-scope': 'my-app' }),
+    ['--auto', '--auto-scope', 'my-app'],
+  );
+});
+
 test('reconstructWorkArgs ignores unknown flags and empty strings', () => {
   assert.deepEqual(reconstructWorkArgs({ nope: 'x', sandbox: '' }), []);
   assert.deepEqual(reconstructWorkArgs(null), []);

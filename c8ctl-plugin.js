@@ -3997,7 +3997,7 @@ async function workAgent(req, flags) {
           if (linked) {
             basePromptOverride = linked.basePrompt;
             promptResourceKey = linked.resourceKey;
-            logger.info(`[${jobType}] job ${job.jobKey} base prompt from linked resource key ${promptResourceKey} (linkName=${linked.linkName}, ${String(basePromptOverride).length} bytes)`);
+            logger.info(`[${jobType}] job ${job.jobKey} base prompt from linked resource key ${promptResourceKey} (linkName=${linked.linkName}, ${Buffer.byteLength(String(basePromptOverride), 'utf8')} bytes)`);
           }
         } catch (err) {
           const retries = Math.max(0, (Number(job.retries) || 1) - 1);

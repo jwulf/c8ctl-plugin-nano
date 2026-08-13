@@ -138,10 +138,11 @@ export function createBufferMonitor(channel, opts = {}) {
   // down — set at disconnect (and at creation if we start disconnected), and
   // cleared when the outage's backlog finishes flushing (the client's next
   // onDrain) or when a (re)connect finds nothing was buffered. The client fires
-  // its buffer-drained event BEFORE our lifecycle connect/reconnect listeners
-  // settle, so flush detection MUST be anchored on the disconnect side, not the
-  // reconnect side. `outageBacklogPeak` is the deepest the buffer got during the
-  // current outage — what we report as the flushed frame count.
+  // our lifecycle connect/reconnect listeners BEFORE it pumps the ring (and thus
+  // before its buffer-drained event), so settleOnOpen captures the pre-drain
+  // backlog into `outageBacklogPeak` and the subsequent onDrain records it.
+  // `outageBacklogPeak` is the deepest the buffer got during the current
+  // outage — what we report as the flushed frame count.
   let buffering = false;
   let outageBacklogPeak = 0;
   let sampleTimer = null;
@@ -203,10 +204,11 @@ export function createBufferMonitor(channel, opts = {}) {
     sample();
   };
 
-  // A (re)connect happened. The client drains the backlog right after opening
-  // and its onDrain (which records the flush) fires before this settles, so by
-  // here a non-empty outage has already been flushed. If we are still buffering
-  // with an empty buffer, the outage carried nothing to flush — just clear it.
+  // A (re)connect happened. The client fires this listener BEFORE it pumps the
+  // ring, so depth() here is the pre-drain backlog (captured below); the
+  // client's onDrain then fires and records the completed flush. If we are still
+  // buffering and the buffer is already empty, the outage carried nothing to
+  // flush — just clear it.
   const settleOnOpen = () => {
     stopSampler();
     // Capture the pre-drain backlog. The client fires our connect/reconnect

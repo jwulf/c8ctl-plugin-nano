@@ -246,7 +246,7 @@ connects; an invalid identity is rejected (unauthorized) and a missing capabilit
 is rejected (forbidden).
 
 **How presence appears.** On connect the worker **announces** its identity, its
-`host`, and the set of `jobKey`s it is currently running, then **heartbeats** to
+`host`, and the set of `jobKeys` it is currently running, then **heartbeats** to
 stay live and **re-announces** after a reconnect so its row survives a hub
 restart. When `work` stops it **deregisters cleanly**, so the worker disappears
 from the visibility page on exit.

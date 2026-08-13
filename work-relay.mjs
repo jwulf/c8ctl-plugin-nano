@@ -144,7 +144,11 @@ export function createRelaySession({ channel, jobKey, logger } = {}) {
     }
   };
 
-  let detachFrame = null;
+  // Each attachSteer call owns its own subscription + detach fn; close() tears
+  // down every one. Tracking them individually (rather than a single shared
+  // handle) means a second attachSteer can't clobber an earlier subscription's
+  // detach — every returned fn detaches exactly the subscription it created.
+  const activeDetaches = new Set();
   const attachSteer = (write) => {
     if (typeof write !== 'function') return () => {};
     const client = channel.client;
@@ -153,7 +157,7 @@ export function createRelaySession({ channel, jobKey, logger } = {}) {
       // no-op rather than a crash; output relay still works.
       return () => {};
     }
-    detachFrame = client.onFrame((frame) => {
+    const detachFrame = client.onFrame((frame) => {
       const chunk = parseInboundRelayChunk(frame, stream);
       if (chunk === null) return;
       try {
@@ -166,21 +170,23 @@ export function createRelaySession({ channel, jobKey, logger } = {}) {
         }
       }
     });
-    return () => {
+    let detached = false;
+    const detach = () => {
+      if (detached) return;
+      detached = true;
+      activeDetaches.delete(detach);
       try {
         detachFrame?.();
-      } finally {
-        detachFrame = null;
+      } catch {
+        /* swallow */
       }
     };
+    activeDetaches.add(detach);
+    return detach;
   };
 
   const close = () => {
-    try {
-      detachFrame?.();
-    } finally {
-      detachFrame = null;
-    }
+    for (const detach of [...activeDetaches]) detach();
   };
 
   return { stream, relay, attachSteer, close };

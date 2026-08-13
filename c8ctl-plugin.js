@@ -3075,7 +3075,10 @@ function loadPtyModule() {
  */
 function ptyAvailable(ptyFactory) {
   if (process.platform === 'win32') return false;
-  if (ptyFactory) return true;
+  // An injected factory only counts if it actually looks like a node-pty
+  // factory (has a spawn()); a bad injection degrades to the pipe fallback
+  // rather than routing to the PTY path and failing the job.
+  if (ptyFactory) return typeof ptyFactory.spawn === 'function';
   return loadPtyModule() != null;
 }
 
@@ -3774,11 +3777,13 @@ async function workAgent(req, flags) {
   }
 
   // C3 (#42): the role's live-terminal mode — a full PTY (streamed on the relay
-  // lane, steerable) or a plain pipe. Honors the vocab's per-role opt-in read
-  // off the hire profile (`terminal: pty|pipe`), with an env override for a
-  // one-off worker (`NANO_AGENTIC_TERMINAL`). PTY relay only engages when the
-  // worker is enrolled on the channel; without it the worker runs on pipes
-  // exactly as before.
+  // lane when a relay session exists, steerable) or a plain pipe. Honors the
+  // vocab's per-role opt-in read off the hire profile (`terminal: pty|pipe`),
+  // with an env override for a one-off worker (`NANO_AGENTIC_TERMINAL`). The PTY
+  // itself is allocated locally regardless of enrollment; relay streaming (and
+  // steer-in) only engages when the worker is enrolled on the channel, so
+  // without the channel there's simply no relay tap — the harness still runs on
+  // the chosen local transport.
   const envTerminal = (process.env.NANO_AGENTIC_TERMINAL || '').trim().toLowerCase();
   const roleTerminal = (envTerminal === 'pty' || envTerminal === 'pipe')
     ? envTerminal
@@ -3922,7 +3927,8 @@ async function workAgent(req, flags) {
             streamPrefix: `[${jobType} ${job.jobKey}] `,
             args: effectiveArgs,
             // C3 (#42): a full PTY for a role that opted in, else a pipe. Both
-            // stream on the relay lane; only a PTY is interactively steerable.
+            // stream on the relay lane when a relay session exists (skipped when
+            // relaySession is null); only a PTY is interactively steerable.
             terminal: roleTerminal,
             relaySession,
             // Route the --stream tee through c8ctl's output-mode-aware logger so

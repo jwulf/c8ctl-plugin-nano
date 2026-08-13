@@ -232,6 +232,34 @@ test('resolveBrokerRestConfig: env base URL + optional bearer token', () => {
   }
 });
 
+test('resolveBrokerRestConfig: agentic token only forwarded when same-origin as REST URL', () => {
+  const keys = ['NANO_REST_URL', 'NANO_BASE_URL', 'NANO_REST_TOKEN', 'NANO_AGENTIC_URL', 'NANO_AGENTIC_TOKEN'];
+  const prev = Object.fromEntries(keys.map((k) => [k, process.env[k]]));
+  try {
+    for (const k of keys) delete process.env[k];
+    // Different-origin REST host with only an agentic token set: no leak.
+    process.env.NANO_REST_URL = 'http://broker:9999';
+    process.env.NANO_AGENTIC_URL = 'http://hub:8080';
+    process.env.NANO_AGENTIC_TOKEN = 'identity-tok';
+    let cfg = resolveBrokerRestConfig(process.env);
+    assert.equal(cfg.baseUrl, 'http://broker:9999');
+    assert.equal(cfg.token, '', 'agentic token must not leak to a different-origin REST host');
+    // Same-origin single-token deployment: agentic token IS forwarded.
+    process.env.NANO_AGENTIC_URL = 'http://broker:9999';
+    cfg = resolveBrokerRestConfig(process.env);
+    assert.equal(cfg.token, 'identity-tok');
+    // An explicit REST token always wins regardless of origin.
+    process.env.NANO_AGENTIC_URL = 'http://hub:8080';
+    process.env.NANO_REST_TOKEN = 'rest-tok';
+    cfg = resolveBrokerRestConfig(process.env);
+    assert.equal(cfg.token, 'rest-tok');
+  } finally {
+    for (const k of keys) {
+      if (prev[k] === undefined) delete process.env[k]; else process.env[k] = prev[k];
+    }
+  }
+});
+
 test('fetchLinkedResourceContent: GETs /content/binary and decodes UTF-8 (with bearer when set)', async () => {
   const calls = [];
   const fetchImpl = async (url, init) => {

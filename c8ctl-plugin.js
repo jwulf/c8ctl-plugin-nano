@@ -2350,6 +2350,18 @@ function pickLinkedResource(linkedResources, linkName = DEFAULT_PROMPT_LINK_NAME
 // persisted config, falling back to the default localhost port). A local nano
 // cluster is unauthenticated, so the token is optional; when set (e.g. against a
 // secured gateway) it is sent as a Bearer credential.
+// Same-origin test for two URLs (protocol + host + port). Returns false if
+// either string is missing or unparseable, so a token is never forwarded to an
+// endpoint we can't positively confirm matches.
+function sameOrigin(a, b) {
+  if (!a || !b) return false;
+  try {
+    return new URL(a).origin === new URL(b).origin;
+  } catch {
+    return false;
+  }
+}
+
 function resolveBrokerRestConfig(env = process.env) {
   // readConfig() swallows parse/IO errors and never throws (returns {}), so no
   // local try/catch is needed here.
@@ -2359,11 +2371,22 @@ function resolveBrokerRestConfig(env = process.env) {
     env.NANO_BASE_URL ||
     cfg.nanoUrl ||
     DEFAULT_NANO_URL;
-  const token =
-    env.NANO_REST_TOKEN ||
-    env.NANO_AGENTIC_TOKEN ||
-    cfg.agenticToken ||
-    '';
+  // An explicit REST token always wins. The agentic identity token is only a
+  // fallback for single-token deployments where the broker REST endpoint IS the
+  // agentic endpoint — so only forward it when the REST base URL is same-origin
+  // as the agentic URL. This prevents leaking the identity token to a different
+  // NANO_REST_URL host when no REST token is set (see resolveAgenticConfig).
+  let token = env.NANO_REST_TOKEN || '';
+  if (!token) {
+    const agenticToken = env.NANO_AGENTIC_TOKEN || cfg.agenticToken || '';
+    const agenticUrl =
+      env.NANO_AGENTIC_URL ||
+      cfg.agenticUrl ||
+      cfg.nanoUrl ||
+      env.NANO_BASE_URL ||
+      DEFAULT_NANO_URL;
+    if (agenticToken && sameOrigin(baseUrl, agenticUrl)) token = agenticToken;
+  }
   return { baseUrl, token };
 }
 

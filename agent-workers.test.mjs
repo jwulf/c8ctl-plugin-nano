@@ -12,6 +12,12 @@ import { join } from 'node:path';
 import {
   normalizeTaskEnvelope,
   collectEnvelopeFrom,
+  parseLinkedResources,
+  pickLinkedResource,
+  resolveBrokerRestConfig,
+  resourceContentUrl,
+  fetchLinkedResourceContent,
+  resolveLinkedPrompt,
   coerceBool,
   coerceInt,
   deepMerge,
@@ -54,6 +60,8 @@ import {
   ProvisionError,
   AGENT_TASK_NS,
   AGENT_RESULT_KEY,
+  LINKED_RESOURCES_HEADER,
+  DEFAULT_PROMPT_LINK_NAME,
   RESULT_SENTINEL,
   RESERVED_RESULT_KEYS,
   SANDBOXES,
@@ -144,6 +152,166 @@ test('normalizeTaskEnvelope: appendPrompt also composes onto a base delivered as
   const env = normalizeTaskEnvelope({}, { prompt: 'BASE', appendPrompt: '+MORE' });
   assert.equal(env.task.prompt, 'BASE+MORE');
 });
+
+// ---- Linked resources → live agent prompt (issue #63) ---------------------
+
+test('normalizeTaskEnvelope: basePromptOverride (linked resource) wins over the header task.prompt', () => {
+  const env = normalizeTaskEnvelope(
+    { [`${AGENT_TASK_NS}.task.prompt`]: 'BAKED HEADER PROMPT' },
+    { [`${AGENT_TASK_NS}.task.appendPrompt`]: '\n\n---\n\nEXTRA' },
+    { basePromptOverride: 'LIVE RESOURCE PROMPT' },
+  );
+  // The override supplies the base; appendPrompt still concatenates verbatim.
+  assert.equal(env.task.prompt, 'LIVE RESOURCE PROMPT\n\n---\n\nEXTRA');
+});
+
+test('normalizeTaskEnvelope: a null/absent basePromptOverride falls back to the header chain', () => {
+  const headers = { [`${AGENT_TASK_NS}.task.prompt`]: 'BAKED' };
+  assert.equal(normalizeTaskEnvelope(headers, {}, { basePromptOverride: null }).task.prompt, 'BAKED');
+  assert.equal(normalizeTaskEnvelope(headers, {}, {}).task.prompt, 'BAKED');
+  assert.equal(normalizeTaskEnvelope(headers, {}).task.prompt, 'BAKED');
+});
+
+test('normalizeTaskEnvelope: an empty-string basePromptOverride wins (resource resolved to empty)', () => {
+  const env = normalizeTaskEnvelope(
+    { [`${AGENT_TASK_NS}.task.prompt`]: 'BAKED' },
+    {},
+    { basePromptOverride: '' },
+  );
+  assert.equal(env.task.prompt, '');
+});
+
+test('parseLinkedResources: parses a JSON-string header, an array, and tolerates junk', () => {
+  const arr = [{ resourceKey: '42', resourceType: 'RESOURCE', linkName: 'prompt' }];
+  assert.deepEqual(parseLinkedResources({ [LINKED_RESOURCES_HEADER]: JSON.stringify(arr) }), arr);
+  assert.deepEqual(parseLinkedResources({ [LINKED_RESOURCES_HEADER]: arr }), arr);
+  assert.deepEqual(parseLinkedResources({}), []);
+  assert.deepEqual(parseLinkedResources({ [LINKED_RESOURCES_HEADER]: '' }), []);
+  assert.deepEqual(parseLinkedResources({ [LINKED_RESOURCES_HEADER]: 'not json' }), []);
+  assert.deepEqual(parseLinkedResources({ [LINKED_RESOURCES_HEADER]: '{"not":"array"}' }), []);
+  // entries without a resourceKey are dropped
+  assert.deepEqual(parseLinkedResources({ [LINKED_RESOURCES_HEADER]: '[{"linkName":"prompt"}]' }), []);
+});
+
+test('pickLinkedResource: selects the entry whose linkName matches (default prompt)', () => {
+  const list = [
+    { resourceKey: '1', linkName: 'schema' },
+    { resourceKey: '2', linkName: 'prompt' },
+    { resourceKey: '3', linkName: 'prompt' },
+  ];
+  assert.equal(pickLinkedResource(list).resourceKey, '2'); // first match wins
+  assert.equal(pickLinkedResource(list, 'schema').resourceKey, '1');
+  assert.equal(pickLinkedResource(list, 'absent'), null);
+  assert.equal(pickLinkedResource([]), null);
+  assert.equal(DEFAULT_PROMPT_LINK_NAME, 'prompt');
+});
+
+test('resourceContentUrl: builds the /content/binary endpoint, trimming a trailing slash', () => {
+  assert.equal(
+    resourceContentUrl('http://localhost:8080/', '42'),
+    'http://localhost:8080/v2/resources/42/content/binary',
+  );
+  assert.equal(
+    resourceContentUrl('http://localhost:8080', 'abc'),
+    'http://localhost:8080/v2/resources/abc/content/binary',
+  );
+});
+
+test('resolveBrokerRestConfig: env base URL + optional bearer token', () => {
+  const prev = { u: process.env.NANO_REST_URL, b: process.env.NANO_BASE_URL, t: process.env.NANO_REST_TOKEN, at: process.env.NANO_AGENTIC_TOKEN };
+  try {
+    process.env.NANO_REST_URL = 'http://broker:9999';
+    process.env.NANO_REST_TOKEN = 'tok-123';
+    const cfg = resolveBrokerRestConfig(process.env);
+    assert.equal(cfg.baseUrl, 'http://broker:9999');
+    assert.equal(cfg.token, 'tok-123');
+  } finally {
+    for (const [k, v] of [['NANO_REST_URL', prev.u], ['NANO_BASE_URL', prev.b], ['NANO_REST_TOKEN', prev.t], ['NANO_AGENTIC_TOKEN', prev.at]]) {
+      if (v === undefined) delete process.env[k]; else process.env[k] = v;
+    }
+  }
+});
+
+test('fetchLinkedResourceContent: GETs /content/binary and decodes UTF-8 (with bearer when set)', async () => {
+  const calls = [];
+  const fetchImpl = async (url, init) => {
+    calls.push({ url, init });
+    return { ok: true, status: 200, text: async () => 'LIVE PROMPT BODY' };
+  };
+  const body = await fetchLinkedResourceContent('77', { baseUrl: 'http://b', token: 'T', fetchImpl });
+  assert.equal(body, 'LIVE PROMPT BODY');
+  assert.equal(calls.length, 1);
+  assert.equal(calls[0].url, 'http://b/v2/resources/77/content/binary');
+  assert.equal(calls[0].init.method, 'GET');
+  assert.equal(calls[0].init.headers.Authorization, 'Bearer T');
+});
+
+test('fetchLinkedResourceContent: no Authorization header when unauthenticated', async () => {
+  let seen;
+  const fetchImpl = async (_url, init) => { seen = init; return { ok: true, status: 200, text: async () => 'x' }; };
+  await fetchLinkedResourceContent('1', { baseUrl: 'http://b', token: '', fetchImpl });
+  assert.equal(seen.headers.Authorization, undefined);
+});
+
+test('fetchLinkedResourceContent: a non-2xx (e.g. 406/404) throws a provisioning error', async () => {
+  const fetchImpl = async () => ({ ok: false, status: 406, text: async () => '' });
+  await assert.rejects(
+    () => fetchLinkedResourceContent('9', { baseUrl: 'http://b', fetchImpl }),
+    /prompt resource 9 fetch failed: HTTP 406/,
+  );
+});
+
+test('fetchLinkedResourceContent: a network error throws a provisioning error', async () => {
+  const fetchImpl = async () => { throw new Error('ECONNREFUSED'); };
+  await assert.rejects(
+    () => fetchLinkedResourceContent('9', { baseUrl: 'http://b', fetchImpl }),
+    /prompt resource 9 fetch failed: ECONNREFUSED/,
+  );
+});
+
+test('resolveLinkedPrompt: returns null when the job declares no prompt link (fallback path)', async () => {
+  const fetchImpl = async () => { throw new Error('should not be called'); };
+  const out = await resolveLinkedPrompt({}, { baseUrl: 'http://b', fetchImpl });
+  assert.equal(out, null);
+  const out2 = await resolveLinkedPrompt(
+    { [LINKED_RESOURCES_HEADER]: '[{"resourceKey":"5","linkName":"schema"}]' },
+    { baseUrl: 'http://b', fetchImpl },
+  );
+  assert.equal(out2, null);
+});
+
+test('resolveLinkedPrompt: fetches the prompt-linked resource and returns its content + key', async () => {
+  const fetchImpl = async (url) => {
+    assert.equal(url, 'http://b/v2/resources/42/content/binary');
+    return { ok: true, status: 200, text: async () => '# Live prompt' };
+  };
+  const out = await resolveLinkedPrompt(
+    { [LINKED_RESOURCES_HEADER]: JSON.stringify([{ resourceKey: '42', resourceType: 'RESOURCE', linkName: 'prompt' }]) },
+    { baseUrl: 'http://b', fetchImpl },
+  );
+  assert.equal(out.basePrompt, '# Live prompt');
+  assert.equal(out.resourceKey, '42');
+  assert.equal(out.linkName, 'prompt');
+});
+
+test('resolveLinkedPrompt: a declared-but-unfetchable prompt resource propagates the provisioning error', async () => {
+  const fetchImpl = async () => ({ ok: false, status: 404, text: async () => '' });
+  await assert.rejects(
+    () => resolveLinkedPrompt(
+      { [LINKED_RESOURCES_HEADER]: JSON.stringify([{ resourceKey: '7', linkName: 'prompt' }]) },
+      { baseUrl: 'http://b', fetchImpl },
+    ),
+    /prompt resource 7 fetch failed: HTTP 404/,
+  );
+});
+
+test('buildResultEnvelope: records the resolved promptResourceKey for audit', () => {
+  const withKey = buildResultEnvelope({ ok: true, stdout: '' }, { sandbox: 'none', promptResourceKey: '42' });
+  assert.equal(withKey.promptResourceKey, '42');
+  const without = buildResultEnvelope({ ok: true, stdout: '' }, { sandbox: 'none' });
+  assert.equal('promptResourceKey' in without, false);
+});
+
 
 test('normalizeTaskEnvelope: no repository when url absent', () => {
   const env = normalizeTaskEnvelope({}, {});

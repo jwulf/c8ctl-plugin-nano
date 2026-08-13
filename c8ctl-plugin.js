@@ -2072,6 +2072,15 @@ function killTree(child) {
 // envelope is written back on the job's completion variables.
 const AGENT_TASK_NS = 'io.nanobpm.agentTask';
 const AGENT_RESULT_KEY = 'io.nanobpm.agentResult';
+// Zeebe/Camunda-parity linked resources (issue #63). At job activation the
+// engine resolves each declared `<zeebe:linkedResource resourceId … linkName>`
+// to the LATEST deployed key and delivers this custom header: a JSON array of
+// `{ resourceKey, resourceType, linkName }`. The header carries the key, not the
+// content — the worker fetches the bytes over the broker REST API. The entry
+// whose `linkName` matches DEFAULT_PROMPT_LINK_NAME supplies the agent's base
+// prompt (live-updatable by redeploying just the resource).
+const LINKED_RESOURCES_HEADER = 'linkedResources';
+const DEFAULT_PROMPT_LINK_NAME = 'prompt';
 const TASK_ENVELOPE_SCHEMA_VERSION = 1;
 // The result-envelope version is intentionally independent of the task-envelope
 // version so the two contracts can evolve separately without silently coupling.
@@ -2236,7 +2245,13 @@ function collectEnvelopeFrom(source) {
 
 // Normalize the assembled envelope to schema v1, coercing header string values
 // (element templates write everything as strings) into bool/int as needed.
-function normalizeTaskEnvelope(customHeaders, variables) {
+//
+// `opts.basePromptOverride` (issue #63): when a `linkName: prompt` linked
+// resource resolves, its fetched content is passed here and WINS over the
+// header-baked `task.prompt` / `variables.prompt` / `variables.task` chain. The
+// FEEL-composed `appendPrompt` concatenation is unchanged — it still appends to
+// whatever base was resolved.
+function normalizeTaskEnvelope(customHeaders, variables, opts = {}) {
   const raw = deepMerge(collectEnvelopeFrom(customHeaders), collectEnvelopeFrom(variables));
   const str = (v) => (v == null ? undefined : String(v));
   const env = {
@@ -2272,9 +2287,12 @@ function normalizeTaskEnvelope(customHeaders, variables) {
   };
 
   const task = isPlainObject(raw.task) ? raw.task : {};
-  // Base prompt: the reserved `task.prompt` (typically a model header filled at deploy time),
-  // else a plain `prompt`/`task` job variable (the pre-header delivery path).
-  const basePrompt = str(task.prompt) ?? str(variables?.prompt) ?? str(variables?.task);
+  // Base prompt: an override supplied by a resolved `linkName: prompt` linked
+  // resource (issue #63) wins; else the reserved `task.prompt` (typically a model
+  // header filled at deploy time), else a plain `prompt`/`task` job variable (the
+  // pre-header delivery path).
+  const overrideBase = opts && opts.basePromptOverride != null ? String(opts.basePromptOverride) : undefined;
+  const basePrompt = overrideBase ?? str(task.prompt) ?? str(variables?.prompt) ?? str(variables?.task);
   // Verbatim dynamic append: a header-delivered base prompt can't be composed in FEEL, so a task
   // may supply per-instance context (e.g. plan-revision feedback, a per-task brief) via the
   // reserved `task.appendPrompt`, or a plain `appendPrompt` variable. It is concatenated onto the
@@ -2297,7 +2315,109 @@ function normalizeTaskEnvelope(customHeaders, variables) {
   return env;
 }
 
-// ---- Secret resolution (pluggable; only host-env implemented for now) ------
+// ---- Linked resources → live agent prompt (issue #63) ----------------------
+// A job's `linkedResources` activation header carries KEYS (not content); the
+// worker resolves each to the LATEST deployed bytes over the broker REST API, so
+// an agent prompt can be updated by redeploying one Markdown resource — no
+// process redeploy, no harness restart.
+
+// Parse the `linkedResources` custom header off an activated job. The engine
+// delivers a JSON array; element-template/header transport stringifies it. Also
+// tolerate an already-parsed array. Anything malformed/absent → [] (fallback
+// path). Never throws.
+function parseLinkedResources(customHeaders) {
+  if (!isPlainObject(customHeaders)) return [];
+  const raw = customHeaders[LINKED_RESOURCES_HEADER];
+  if (raw == null) return [];
+  let val = raw;
+  if (typeof raw === 'string') {
+    if (!raw.trim()) return [];
+    try { val = JSON.parse(raw); } catch { return []; }
+  }
+  if (!Array.isArray(val)) return [];
+  return val.filter((e) => isPlainObject(e) && e.resourceKey != null);
+}
+
+// Select the linked resource that supplies the base prompt: the first entry
+// whose `linkName` matches (default `prompt`). Returns the entry or null.
+function pickLinkedResource(linkedResources, linkName = DEFAULT_PROMPT_LINK_NAME) {
+  if (!Array.isArray(linkedResources)) return null;
+  return linkedResources.find((e) => isPlainObject(e) && String(e.linkName) === String(linkName)) || null;
+}
+
+// The broker REST base URL + optional bearer the harness uses to fetch resource
+// content — the SAME nano endpoint the worker already talks to (env wins over
+// persisted config, falling back to the default localhost port). A local nano
+// cluster is unauthenticated, so the token is optional; when set (e.g. against a
+// secured gateway) it is sent as a Bearer credential.
+function resolveBrokerRestConfig(env = process.env) {
+  let cfg = {};
+  try { cfg = readConfig() || {}; } catch { cfg = {}; }
+  const baseUrl =
+    env.NANO_REST_URL ||
+    env.NANO_BASE_URL ||
+    cfg.nanoUrl ||
+    DEFAULT_NANO_URL;
+  const token =
+    env.NANO_REST_TOKEN ||
+    env.NANO_AGENTIC_TOKEN ||
+    cfg.agenticToken ||
+    '';
+  return { baseUrl, token };
+}
+
+// Build the content endpoint. Per issue #63 / nano-bpm #759 the non-binary
+// `/content` variant is deprecated for non-RPA types (Markdown → 406), so the
+// worker always fetches `/content/binary`.
+function resourceContentUrl(baseUrl, resourceKey) {
+  const base = String(baseUrl || '').replace(/\/+$/, '');
+  return `${base}/v2/resources/${encodeURIComponent(String(resourceKey))}/content/binary`;
+}
+
+// Fetch a linked resource's bytes and decode UTF-8. A non-2xx or network error
+// is surfaced as a ProvisionError so the caller fails the job with a clear
+// provisioning message (never runs an agent with a silently-empty prompt).
+async function fetchLinkedResourceContent(resourceKey, opts = {}) {
+  const { baseUrl, token, fetchImpl = fetch, timeoutMs = 15_000 } = opts;
+  const url = resourceContentUrl(baseUrl, resourceKey);
+  const controller = new AbortController();
+  const timer = timeoutMs > 0 ? setTimeout(() => controller.abort(), timeoutMs) : null;
+  let res;
+  try {
+    const headers = { Accept: 'application/octet-stream' };
+    if (token) headers.Authorization = `Bearer ${token}`;
+    res = await fetchImpl(url, { method: 'GET', headers, signal: controller.signal });
+  } catch (err) {
+    throw new ProvisionError(`prompt resource ${resourceKey} fetch failed: ${err && err.message ? err.message : String(err)}`);
+  } finally {
+    if (timer) clearTimeout(timer);
+  }
+  if (!res || !res.ok) {
+    const status = res ? res.status : '?';
+    throw new ProvisionError(`prompt resource ${resourceKey} fetch failed: HTTP ${status} from ${url}`);
+  }
+  try {
+    return await res.text();
+  } catch (err) {
+    throw new ProvisionError(`prompt resource ${resourceKey} decode failed: ${err && err.message ? err.message : String(err)}`);
+  }
+}
+
+// Resolve the base prompt from a `linkName: prompt` linked resource, if the job
+// declares one. Returns `{ basePrompt, resourceKey }` when a prompt resource is
+// present and fetched, or null when no such entry exists (→ fall back to the
+// header-baked task.prompt chain). Throws a ProvisionError when a declared
+// prompt resource cannot be fetched — a provisioning failure, not a silent
+// empty-prompt run.
+async function resolveLinkedPrompt(customHeaders, opts = {}) {
+  const { linkName = DEFAULT_PROMPT_LINK_NAME, baseUrl, token, fetchImpl, timeoutMs } = opts;
+  const entry = pickLinkedResource(parseLinkedResources(customHeaders), linkName);
+  if (!entry) return null;
+  const resourceKey = entry.resourceKey;
+  const basePrompt = await fetchLinkedResourceContent(resourceKey, { baseUrl, token, fetchImpl, timeoutMs });
+  return { basePrompt, resourceKey, resourceType: entry.resourceType ?? null, linkName: String(linkName) };
+}
+
 // Secrets are referenced by NAME, never by value, in the model. A resolver maps
 // a name → value at run time. The wrapper injects them into the child ENV, so
 // values never appear in argv or `docker inspect`.
@@ -3416,7 +3536,7 @@ function runAgentJob(profile, job, opts = {}) {
 
 // Shape the io.nanobpm.agentResult output envelope. When a repository was
 // provisioned (increment 2a), the `git` block adds branch/commits/push/PR facts.
-function buildResultEnvelope(result, { sandbox, image, git, result: agentResult } = {}) {
+function buildResultEnvelope(result, { sandbox, image, git, result: agentResult, promptResourceKey } = {}) {
   const status = result.ok ? 'completed' : (result.timedOut ? 'timedOut' : 'failed');
   const env = {
     schemaVersion: RESULT_ENVELOPE_SCHEMA_VERSION,
@@ -3430,6 +3550,10 @@ function buildResultEnvelope(result, { sandbox, image, git, result: agentResult 
     signal: result.signal ?? null,
     error: result.error ?? null,
   };
+  // Audit (issue #63): record which linked-resource key supplied the base prompt.
+  // The engine only keeps `latest` per resourceId (no pinning), so recording the
+  // resolved key is the only reproducibility handle for which prompt version ran.
+  if (promptResourceKey != null) env.promptResourceKey = String(promptResourceKey);
   // The agent's structured result (as returned via $AGENT_RESULT_FILE / sentinel),
   // preserved verbatim for auditability even when merged into the completion vars.
   if (isPlainObject(agentResult)) env.result = agentResult;
@@ -3685,6 +3809,10 @@ async function workAgent(req, flags) {
   const jobTypes = [...new Set([...matrix, ...extraJobTypes])];
   const camunda = globalThis.c8ctl.createClient();
 
+  // Broker REST endpoint for live linked-resource prompts (issue #63) — the same
+  // nano endpoint this worker already talks to. Resolved once at startup.
+  const restConfig = resolveBrokerRestConfig();
+
   logger.info(`Putting "${name}" [${profile.rank}] to work → ${buildAgentCommandLine(profile.command, effectiveArgs)}`);
   logger.info(`  worker: ${workerName}`);
   logger.info(`  model: ${profile.model || '(none)'}; capabilities: ${profile.capabilities.join(', ') || '(none)'}`);
@@ -3853,9 +3981,33 @@ async function workAgent(req, flags) {
           }
         }
 
+        // Live agent prompt (issue #63): if the job declares a `linkName: prompt`
+        // linked resource, fetch its LATEST deployed content and use it as the
+        // base prompt (it wins over the header-baked task.prompt). A declared
+        // prompt resource that can't be fetched is a provisioning failure — fail
+        // (retryable) rather than run an agent with an empty prompt.
+        let promptResourceKey = null;
+        let basePromptOverride;
+        try {
+          const linked = await resolveLinkedPrompt(job.customHeaders ?? {}, {
+            baseUrl: restConfig.baseUrl,
+            token: restConfig.token,
+          });
+          if (linked) {
+            basePromptOverride = linked.basePrompt;
+            promptResourceKey = linked.resourceKey;
+            logger.info(`[${jobType}] job ${job.jobKey} base prompt from linked resource key ${promptResourceKey} (linkName=${linked.linkName}, ${String(basePromptOverride).length} bytes)`);
+          }
+        } catch (err) {
+          const retries = Math.max(0, (Number(job.retries) || 1) - 1);
+          const msg = err instanceof ProvisionError ? err.message : `prompt resource fetch failed: ${err.message}`;
+          logger.warn(`[${jobType}] job ${job.jobKey} not provisioned — ${msg}; retries left ${retries}`);
+          return job.fail({ errorMessage: msg.slice(0, 2000), retries, retryBackOff: 15_000 });
+        }
+
         // Assemble + normalize the task envelope from headers (defaults) and
         // variables (overrides), then resolve any secrets it references.
-        const envelope = normalizeTaskEnvelope(job.customHeaders ?? {}, job.variables ?? {});
+        const envelope = normalizeTaskEnvelope(job.customHeaders ?? {}, job.variables ?? {}, { basePromptOverride });
         const { resolved, missing, names } = resolveJobSecrets(secretResolver, envelope);
         if (missing.length > 0) {
           const retries = Math.max(0, (Number(job.retries) || 1) - 1);
@@ -4000,7 +4152,7 @@ async function workAgent(req, flags) {
         if (resultDir) { try { rmSync(resultDir, { recursive: true, force: true }); } catch { /* best effort */ } liveRunDirs.delete(resultDir); }
         const resultVars = sanitizeResultVars(rawResult);
 
-        const resultEnvelope = buildResultEnvelope(result, { sandbox, image, git: gitResult, result: rawResult });
+        const resultEnvelope = buildResultEnvelope(result, { sandbox, image, git: gitResult, result: rawResult, promptResourceKey });
         if (result.ok) {
           const gitNote = gitResult
             ? ` [${gitResult.branch ? `branch ${gitResult.branch}` : 'detached HEAD'}: ${gitResult.commits.length} commit(s), ${gitResult.branch ? (gitResult.pushed ? 'pushed' : (gitResult.pushError ? 'push FAILED' : 'not pushed')) : 'no branch to push'}${gitResult.pr?.found ? `, PR #${gitResult.pr.number}` : ''}]`
@@ -6894,6 +7046,12 @@ export {
 export {
   normalizeTaskEnvelope,
   collectEnvelopeFrom,
+  parseLinkedResources,
+  pickLinkedResource,
+  resolveBrokerRestConfig,
+  resourceContentUrl,
+  fetchLinkedResourceContent,
+  resolveLinkedPrompt,
   coerceBool,
   coerceInt,
   deepMerge,
@@ -6940,6 +7098,8 @@ export {
   derivePollTimeoutMs,
   AGENT_TASK_NS,
   AGENT_RESULT_KEY,
+  LINKED_RESOURCES_HEADER,
+  DEFAULT_PROMPT_LINK_NAME,
   RESULT_SENTINEL,
   RESERVED_RESULT_KEYS,
   SANDBOXES,

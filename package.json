@@ -25,6 +25,7 @@
     "agentic.mjs",
     "agentic-loader-hook.mjs",
     "work-channel.mjs",
+    "work-relay.mjs",
     "nanobpmn-binary.json",
     "README.md"
   ],
@@ -52,5 +53,8 @@
   "dependencies": {
     "@nanobpm/agentic": "^0.1.0",
     "@nanobpm/urban-agent-client": "^0.1.0"
+  },
+  "optionalDependencies": {
+    "node-pty": "^1.0.0"
   }
 }

@@ -3027,6 +3027,20 @@ function provisionRepo({ envelope, token, runDir, timeoutMs = 120_000 }) {
   const committer = resolveCommitterIdentity();
   runGit(['config', 'user.name', committer.name], { cwd: workspaceDir, env: gitEnv });
   runGit(['config', 'user.email', committer.email], { cwd: workspaceDir, env: gitEnv });
+  // Config alone is not enough: git honours GIT_AUTHOR_*/GIT_COMMITTER_* OVER
+  // user.name/user.email config, so a placeholder GIT_AUTHOR_EMAIL inherited from
+  // the launch environment (e.g. `trial-merge@nano.local`) would still be stamped
+  // onto commits even though we just wrote a clean identity into config. Pin all
+  // four env vars to the resolved (already placeholder-sanitized) identity so
+  // EVERY commit — finalizeGit's own rebase commits (which run with gitEnv) and
+  // the harness's commits (extraEnv below carries these into harnessEnv) — uses
+  // it deterministically, and a non-routable `*@nano.local` author can never be
+  // written. When GIT_AUTHOR_* already held a real identity, resolveCommitterIdentity
+  // returned it verbatim, so this is a no-op in that case.
+  gitEnv.GIT_AUTHOR_NAME = committer.name;
+  gitEnv.GIT_AUTHOR_EMAIL = committer.email;
+  gitEnv.GIT_COMMITTER_NAME = committer.name;
+  gitEnv.GIT_COMMITTER_EMAIL = committer.email;
 
   // Determine the working branch. With branch.create we make a real branch.
   // Otherwise we're on whatever the clone checked out: a branch only if
@@ -3047,7 +3061,7 @@ function provisionRepo({ envelope, token, runDir, timeoutMs = 120_000 }) {
   // `git rev-parse HEAD` on an unborn branch (freshly cloned empty repo) exits
   // non-zero and echoes the literal "HEAD" on stdout — treat that as "no base
   // commit" (empty startSha) rather than a bogus revision.
-  return { workspaceDir, gitEnv, startSha: sha.status === 0 ? (sha.stdout || '').trim() : '', workingBranch, detached: !workingBranch, ref: target || '', remote: redactToken(repo.url, token) };
+  return { workspaceDir, gitEnv, committer, startSha: sha.status === 0 ? (sha.stdout || '').trim() : '', workingBranch, detached: !workingBranch, ref: target || '', remote: redactToken(repo.url, token) };
 }
 
 // Look up a PR for this branch (2a does NOT open it — the harness does, driven
@@ -4283,6 +4297,15 @@ async function workAgent(req, flags) {
               AGENT_REPO_URL: provisioned.remote,
               AGENT_REPO_BRANCH: provisioned.workingBranch || '',
               AGENT_REPO_REF: provisioned.ref || '',
+              // Pin the harness's commit identity to the resolved (placeholder-
+              // sanitized) committer so the agent's own `git commit` can't be
+              // hijacked by a placeholder GIT_AUTHOR_* inherited from process.env
+              // (git honours these over user.name/user.email config). Layered via
+              // extraEnv so they override any inherited placeholder in harnessEnv.
+              GIT_AUTHOR_NAME: provisioned.committer.name,
+              GIT_AUTHOR_EMAIL: provisioned.committer.email,
+              GIT_COMMITTER_NAME: provisioned.committer.name,
+              GIT_COMMITTER_EMAIL: provisioned.committer.email,
             };
           } catch (err) {
             if (runDir) { try { rmSync(runDir, { recursive: true, force: true }); } catch { /* best effort */ } liveRunDirs.delete(runDir); }

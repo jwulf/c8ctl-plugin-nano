@@ -1061,6 +1061,55 @@ test('provisionRepo stamps the operator identity onto the workspace (commits as 
   }
 });
 
+test('provisionRepo pins GIT_AUTHOR_*/GIT_COMMITTER_* env so a placeholder author is never stamped over config', { skip: !gitOk }, () => {
+  const { root, origin } = makeOriginRepo();
+  const runDir = mkdtempSync(join(root, 'run-'));
+  const savedName = process.env.GIT_AUTHOR_NAME;
+  const savedEmail = process.env.GIT_AUTHOR_EMAIL;
+  const savedCName = process.env.GIT_COMMITTER_NAME;
+  const savedCEmail = process.env.GIT_COMMITTER_EMAIL;
+  try {
+    // The launcher injects a non-routable placeholder author. Git honours
+    // GIT_AUTHOR_* over user.name/user.email config, so without pinning it would
+    // be stamped onto commits despite the clean identity config carries.
+    process.env.GIT_AUTHOR_NAME = 'trial-merge';
+    process.env.GIT_AUTHOR_EMAIL = 'trial-merge@nano.local';
+    delete process.env.GIT_COMMITTER_NAME;
+    delete process.env.GIT_COMMITTER_EMAIL;
+    const envelope = {
+      schemaVersion: 1,
+      repository: { provider: 'github', url: origin, submodules: false },
+      branch: { base: 'main', create: 'feat/pin', push: false },
+      setup: { commands: [], env: {}, secretRefs: [] },
+      task: { allowPr: false },
+    };
+    const prov = provisionRepo({ envelope, token: null, runDir });
+    // The resolved committer is placeholder-free, and gitEnv pins all four vars to it.
+    assert.ok(!isPlaceholderEmail(prov.committer.email), 'resolved committer email is routable');
+    assert.equal(prov.gitEnv.GIT_AUTHOR_NAME, prov.committer.name);
+    assert.equal(prov.gitEnv.GIT_AUTHOR_EMAIL, prov.committer.email);
+    assert.equal(prov.gitEnv.GIT_COMMITTER_NAME, prov.committer.name);
+    assert.equal(prov.gitEnv.GIT_COMMITTER_EMAIL, prov.committer.email);
+    // A commit made with the provisioned gitEnv (as finalizeGit's rebase would)
+    // stamps the resolved identity, NOT the placeholder GIT_AUTHOR_* env.
+    const env = { ...prov.gitEnv };
+    writeFileSync(join(prov.workspaceDir, 'B.txt'), 'y\n');
+    spawnSync('git', ['add', '-A'], { cwd: prov.workspaceDir, env, encoding: 'utf8' });
+    spawnSync('git', ['commit', '-q', '-m', 'change'], { cwd: prov.workspaceDir, env, encoding: 'utf8' });
+    const stamped = spawnSync('git', ['log', '-1', '--format=%ae%n%ce'], { cwd: prov.workspaceDir, env, encoding: 'utf8' }).stdout.trim().split('\n');
+    for (const addr of stamped) {
+      assert.notEqual(addr, 'trial-merge@nano.local', 'placeholder author/committer email is never stamped');
+      assert.ok(!isPlaceholderEmail(addr), `stamped email ${addr} is routable`);
+    }
+  } finally {
+    if (savedName === undefined) delete process.env.GIT_AUTHOR_NAME; else process.env.GIT_AUTHOR_NAME = savedName;
+    if (savedEmail === undefined) delete process.env.GIT_AUTHOR_EMAIL; else process.env.GIT_AUTHOR_EMAIL = savedEmail;
+    if (savedCName === undefined) delete process.env.GIT_COMMITTER_NAME; else process.env.GIT_COMMITTER_NAME = savedCName;
+    if (savedCEmail === undefined) delete process.env.GIT_COMMITTER_EMAIL; else process.env.GIT_COMMITTER_EMAIL = savedCEmail;
+    rmSync(root, { recursive: true, force: true });
+  }
+});
+
 test('finalizeGit does not push when the harness produced no commits', { skip: !gitOk }, () => {
   const { root, origin } = makeOriginRepo();
   const runDir = mkdtempSync(join(root, 'run-'));

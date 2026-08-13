@@ -209,7 +209,17 @@ export function createBufferMonitor(channel, opts = {}) {
   // with an empty buffer, the outage carried nothing to flush — just clear it.
   const settleOnOpen = () => {
     stopSampler();
-    if (buffering && depth() === 0) {
+    // Capture the pre-drain backlog. The client fires our connect/reconnect
+    // listeners BEFORE it pumps the ring (see the module header), so depth()
+    // here is the backlog about to flush. Recording it into the outage peak
+    // makes the flush count (onDrain) reflect the real drained depth even when
+    // no periodic sample happened to catch the peak — under production
+    // timer-based sampling a short outage would otherwise leave the peak at 0
+    // and fall back to 1.
+    const d = depth();
+    if (d > state.highWaterMark) state.highWaterMark = d;
+    if (buffering && d > outageBacklogPeak) outageBacklogPeak = d;
+    if (buffering && d === 0) {
       buffering = false;
       outageBacklogPeak = 0;
     }

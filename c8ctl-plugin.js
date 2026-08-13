@@ -3458,7 +3458,7 @@ function buildResultEnvelope(result, { sandbox, image, git, result: agentResult 
  * and a capability credential are present (enrolment) — absent either, it runs
  * exactly as before, off the visibility page. Returns `null` when not enrolled.
  *
- * @returns {{ url: string, token: string, credential: string } | null}
+ * @returns {{ url: string, token: string, credential: string, bufferCapacity: number } | null}
  */
 function resolveAgenticConfig() {
   const cfg = readConfig();

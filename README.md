@@ -392,8 +392,32 @@ composed in FEEL, a task may supply per-instance context via **`task.appendPromp
 separator/preamble), so a null/empty append leaves the base untouched. This lets the
 static prompt live in a model header/side-car while the dynamic tail (e.g. plan-revision
 feedback, a per-task brief) is built per instance.
+
+**Live prompts via linked resources.** A service task can declare a Zeebe/Camunda-parity
+**linked resource** for its prompt instead of baking it into a model header:
+
+```xml
+<zeebe:linkedResources>
+  <zeebe:linkedResource resourceId="plan.md" bindingType="latest" linkName="prompt"/>
+</zeebe:linkedResources>
+```
+
+At job activation the engine resolves the `resourceId` to the **latest** deployed key and
+delivers a `linkedResources` custom header (`[{resourceKey, resourceType, linkName}]`). The
+header carries the **key, not the content** — the worker fetches the bytes over the broker
+REST API (`GET /v2/resources/{resourceKey}/content/binary`, reusing the same nano endpoint
+the worker already talks to; override with `NANO_REST_URL`/`NANO_REST_TOKEN`) and uses the
+UTF-8 content as the **base prompt**. The entry whose `linkName` is `prompt` wins over the
+header-baked `task.prompt` chain; `appendPrompt` still composes onto it. Redeploying just
+the resource updates the prompt for the **next activation** — no process redeploy, no
+worker restart. Jobs without `linkedResources` behave exactly as before (fallback chain).
+A declared prompt resource that can't be fetched **fails the job** (retryable provisioning
+error) rather than running an agent with an empty prompt, and the resolved `resourceKey` is
+logged and echoed on the output envelope as `promptResourceKey` for audit (the engine keeps
+only `latest`, so the key is the reproducibility handle).
+
 On completion the plugin writes an **output envelope** back under
-`io.nanobpm.agentResult` (`{schemaVersion, status, sandbox, image, output, truncated, stderrTruncated, exitCode, signal, error}`). When a repository was
+`io.nanobpm.agentResult` (`{schemaVersion, status, sandbox, image, output, truncated, stderrTruncated, exitCode, signal, error, promptResourceKey?}`). When a repository was
 provisioned (below) it also carries `{repository, branch, baseSha, headSha, commits[], pushed, pushError?, gitError?, pr?}`.
 
 **Git provisioning (host).** When `--sandbox none` (the default) and the envelope

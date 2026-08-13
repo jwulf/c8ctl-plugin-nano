@@ -3172,7 +3172,7 @@ function spawnCapturePty({ command, args = [], cwd, env, stdinData, timeoutMs, i
     });
 
     term.onExit(({ exitCode, signal }) => {
-      finish({ ok: exitCode === 0, exitCode: typeof exitCode === 'number' ? exitCode : null, signal: signal ?? null, stdout: joinCapped(chunks), stderr: '', truncated, stderrTruncated: false });
+      finish({ ok: exitCode === 0, exitCode: typeof exitCode === 'number' ? exitCode : null, signal: signal || null, stdout: joinCapped(chunks), stderr: '', truncated, stderrTruncated: false });
     });
 
     // Steer-in: write cockpit bytes straight into the PTY so an operator can

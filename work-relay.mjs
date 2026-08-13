@@ -127,7 +127,11 @@ export function createRelaySession({ channel, jobKey, logger } = {}) {
 
   const relay = (chunk) => {
     if (chunk == null) return;
-    const text = typeof chunk === 'string' ? chunk : Buffer.from(chunk).toString('utf8');
+    const text = typeof chunk === 'string'
+      ? chunk
+      : Buffer.isBuffer(chunk)
+        ? chunk.toString('utf8')
+        : Buffer.from(chunk).toString('utf8');
     if (text === '') return;
     try {
       sink.relay(stream, text);

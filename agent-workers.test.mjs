@@ -50,6 +50,7 @@ import {
   finalizeGit,
   reconcileAgentPr,
   resolveCommitterIdentity,
+  isPlaceholderEmail,
   reapAgentRunDirs,
   authUrl,
   githubCloneToken,
@@ -965,6 +966,107 @@ test('resolveCommitterIdentity: prefers operator identity over the nano-agent fa
   }
 });
 
+test('isPlaceholderEmail: rejects non-routable placeholders, accepts real addresses', () => {
+  // Non-routable / unattributable placeholders → rejected.
+  assert.equal(isPlaceholderEmail('trial-merge@nano.local'), true);
+  assert.equal(isPlaceholderEmail('agent@foo.local'), true);
+  assert.equal(isPlaceholderEmail('x@build.internal'), true);
+  assert.equal(isPlaceholderEmail('root@localhost'), true);
+  assert.equal(isPlaceholderEmail('no-at-sign'), true);
+  assert.equal(isPlaceholderEmail('user@'), true, 'empty domain — not routable');
+  assert.equal(isPlaceholderEmail('@example.com'), true, 'empty local part — not attributable');
+  assert.equal(isPlaceholderEmail('  bob@nano.local  '), true, 'whitespace-trimmed before matching');
+  assert.equal(isPlaceholderEmail('BOB@Nano.Local'), true, 'case-insensitive');
+  // Real, routable addresses (incl. GitHub noreply) → accepted.
+  assert.equal(isPlaceholderEmail('ada@example.com'), false);
+  assert.equal(isPlaceholderEmail('12345+octocat@users.noreply.github.com'), false);
+  // Empty is not a "placeholder" — it is an absent field handled by per-field
+  // fallthrough, so it must NOT invalidate a source outright.
+  assert.equal(isPlaceholderEmail(''), false);
+  assert.equal(isPlaceholderEmail(undefined), false);
+});
+
+test('resolveCommitterIdentity: a *@nano.local (or non-routable) author is never applied', () => {
+  const savedName = process.env.GIT_AUTHOR_NAME;
+  const savedEmail = process.env.GIT_AUTHOR_EMAIL;
+  try {
+    // The exact bug: launcher injects a placeholder GIT_AUTHOR_*. It must NOT be
+    // stamped onto a commit — fall through to the gh-authenticated identity.
+    process.env.GIT_AUTHOR_NAME = 'trial-merge';
+    process.env.GIT_AUTHOR_EMAIL = 'trial-merge@nano.local';
+    const fromGh = resolveCommitterIdentity({
+      gitIdentity: () => ({ name: '', email: '' }),
+      ghIdentity: () => ({ name: 'octocat', email: '12345+octocat@users.noreply.github.com' }),
+    });
+    assert.deepEqual(
+      { name: fromGh.name, email: fromGh.email, source: fromGh.source },
+      { name: 'octocat', email: '12345+octocat@users.noreply.github.com', source: 'gh' },
+      'placeholder env author is discarded whole (no Frankenstein name), gh identity wins');
+
+    // With no gh identity either, it falls all the way to the marked bot fallback —
+    // never the *@nano.local placeholder.
+    const fallback = resolveCommitterIdentity({
+      gitIdentity: () => ({ name: '', email: '' }),
+      ghIdentity: () => ({ name: '', email: '' }),
+    });
+    assert.equal(fallback.email.endsWith('@nano.local'), false);
+    assert.deepEqual(
+      { name: fallback.name, email: fallback.email, source: fallback.source },
+      { name: 'nano-agent', email: 'nano-agent@users.noreply.github.com', source: 'fallback' });
+
+    // A placeholder coming from git-global config is likewise rejected in favour
+    // of the gh identity — the guard secures the whole class, not just env.
+    delete process.env.GIT_AUTHOR_NAME;
+    delete process.env.GIT_AUTHOR_EMAIL;
+    const overGitPlaceholder = resolveCommitterIdentity({
+      gitIdentity: () => ({ name: 'trial-merge', email: 'trial-merge@nano.local' }),
+      ghIdentity: () => ({ name: 'octocat', email: '12345+octocat@users.noreply.github.com' }),
+    });
+    assert.deepEqual(
+      { name: overGitPlaceholder.name, email: overGitPlaceholder.email, source: overGitPlaceholder.source },
+      { name: 'octocat', email: '12345+octocat@users.noreply.github.com', source: 'gh' });
+  } finally {
+    if (savedName === undefined) delete process.env.GIT_AUTHOR_NAME; else process.env.GIT_AUTHOR_NAME = savedName;
+    if (savedEmail === undefined) delete process.env.GIT_AUTHOR_EMAIL; else process.env.GIT_AUTHOR_EMAIL = savedEmail;
+  }
+});
+
+test('resolveCommitterIdentity: whitespace-only name/email fields fall through as absent', () => {
+  const savedName = process.env.GIT_AUTHOR_NAME;
+  const savedEmail = process.env.GIT_AUTHOR_EMAIL;
+  try {
+    // A launcher that injects space-padded/whitespace-only GIT_AUTHOR_* must not
+    // have that blank value treated as "present" — it would block per-field
+    // fallthrough and get stamped as an invalid commit identity. Blank fields
+    // behave like absent, so the git-global identity fills them per field.
+    process.env.GIT_AUTHOR_NAME = '   ';
+    process.env.GIT_AUTHOR_EMAIL = '   ';
+    const filled = resolveCommitterIdentity({
+      gitIdentity: () => ({ name: 'Grace Hopper', email: 'grace@example.com' }),
+      ghIdentity: () => ({ name: 'octocat', email: '12345+octocat@users.noreply.github.com' }),
+    });
+    assert.deepEqual(
+      { name: filled.name, email: filled.email, source: filled.source },
+      { name: 'Grace Hopper', email: 'grace@example.com', source: 'git-global' },
+      'whitespace-only env fields are treated as absent and filled from git-global');
+
+    // Space-padded but otherwise valid fields are trimmed rather than stamped raw.
+    process.env.GIT_AUTHOR_NAME = '  Ada Lovelace  ';
+    process.env.GIT_AUTHOR_EMAIL = '  ada@example.com  ';
+    const trimmed = resolveCommitterIdentity({
+      gitIdentity: () => ({ name: '', email: '' }),
+      ghIdentity: () => ({ name: '', email: '' }),
+    });
+    assert.deepEqual(
+      { name: trimmed.name, email: trimmed.email, source: trimmed.source },
+      { name: 'Ada Lovelace', email: 'ada@example.com', source: 'env' },
+      'space-padded env fields are trimmed, not stamped with surrounding whitespace');
+  } finally {
+    if (savedName === undefined) delete process.env.GIT_AUTHOR_NAME; else process.env.GIT_AUTHOR_NAME = savedName;
+    if (savedEmail === undefined) delete process.env.GIT_AUTHOR_EMAIL; else process.env.GIT_AUTHOR_EMAIL = savedEmail;
+  }
+});
+
 test('provisionRepo stamps the operator identity onto the workspace (commits as the human)', { skip: !gitOk }, () => {
   const { root, origin } = makeOriginRepo();
   const runDir = mkdtempSync(join(root, 'run-'));
@@ -991,6 +1093,55 @@ test('provisionRepo stamps the operator identity onto the workspace (commits as 
   } finally {
     if (savedName === undefined) delete process.env.GIT_AUTHOR_NAME; else process.env.GIT_AUTHOR_NAME = savedName;
     if (savedEmail === undefined) delete process.env.GIT_AUTHOR_EMAIL; else process.env.GIT_AUTHOR_EMAIL = savedEmail;
+    rmSync(root, { recursive: true, force: true });
+  }
+});
+
+test('provisionRepo pins GIT_AUTHOR_*/GIT_COMMITTER_* env so a placeholder author is never stamped over config', { skip: !gitOk }, () => {
+  const { root, origin } = makeOriginRepo();
+  const runDir = mkdtempSync(join(root, 'run-'));
+  const savedName = process.env.GIT_AUTHOR_NAME;
+  const savedEmail = process.env.GIT_AUTHOR_EMAIL;
+  const savedCName = process.env.GIT_COMMITTER_NAME;
+  const savedCEmail = process.env.GIT_COMMITTER_EMAIL;
+  try {
+    // The launcher injects a non-routable placeholder author. Git honours
+    // GIT_AUTHOR_* over user.name/user.email config, so without pinning it would
+    // be stamped onto commits despite the clean identity config carries.
+    process.env.GIT_AUTHOR_NAME = 'trial-merge';
+    process.env.GIT_AUTHOR_EMAIL = 'trial-merge@nano.local';
+    delete process.env.GIT_COMMITTER_NAME;
+    delete process.env.GIT_COMMITTER_EMAIL;
+    const envelope = {
+      schemaVersion: 1,
+      repository: { provider: 'github', url: origin, submodules: false },
+      branch: { base: 'main', create: 'feat/pin', push: false },
+      setup: { commands: [], env: {}, secretRefs: [] },
+      task: { allowPr: false },
+    };
+    const prov = provisionRepo({ envelope, token: null, runDir });
+    // The resolved committer is placeholder-free, and gitEnv pins all four vars to it.
+    assert.ok(!isPlaceholderEmail(prov.committer.email), 'resolved committer email is routable');
+    assert.equal(prov.gitEnv.GIT_AUTHOR_NAME, prov.committer.name);
+    assert.equal(prov.gitEnv.GIT_AUTHOR_EMAIL, prov.committer.email);
+    assert.equal(prov.gitEnv.GIT_COMMITTER_NAME, prov.committer.name);
+    assert.equal(prov.gitEnv.GIT_COMMITTER_EMAIL, prov.committer.email);
+    // A commit made with the provisioned gitEnv (as finalizeGit's rebase would)
+    // stamps the resolved identity, NOT the placeholder GIT_AUTHOR_* env.
+    const env = { ...prov.gitEnv };
+    writeFileSync(join(prov.workspaceDir, 'B.txt'), 'y\n');
+    spawnSync('git', ['add', '-A'], { cwd: prov.workspaceDir, env, encoding: 'utf8' });
+    spawnSync('git', ['commit', '-q', '-m', 'change'], { cwd: prov.workspaceDir, env, encoding: 'utf8' });
+    const stamped = spawnSync('git', ['log', '-1', '--format=%ae%n%ce'], { cwd: prov.workspaceDir, env, encoding: 'utf8' }).stdout.trim().split('\n');
+    for (const addr of stamped) {
+      assert.notEqual(addr, 'trial-merge@nano.local', 'placeholder author/committer email is never stamped');
+      assert.ok(!isPlaceholderEmail(addr), `stamped email ${addr} is routable`);
+    }
+  } finally {
+    if (savedName === undefined) delete process.env.GIT_AUTHOR_NAME; else process.env.GIT_AUTHOR_NAME = savedName;
+    if (savedEmail === undefined) delete process.env.GIT_AUTHOR_EMAIL; else process.env.GIT_AUTHOR_EMAIL = savedEmail;
+    if (savedCName === undefined) delete process.env.GIT_COMMITTER_NAME; else process.env.GIT_COMMITTER_NAME = savedCName;
+    if (savedCEmail === undefined) delete process.env.GIT_COMMITTER_EMAIL; else process.env.GIT_COMMITTER_EMAIL = savedCEmail;
     rmSync(root, { recursive: true, force: true });
   }
 });

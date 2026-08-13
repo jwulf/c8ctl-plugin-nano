@@ -2853,9 +2853,55 @@ function ghUserIdentity() {
   }
 }
 
+// Reject a commit-author email that can't be attributed to a real account and
+// can't receive mail — a `*@nano.local` (or other non-routable) placeholder
+// injected by the launch environment. Such an address produces UNVERIFIED
+// commits that look like a person but map to no GitHub user, so the harness must
+// never stamp it onto a commit; it falls through to the next identity source
+// instead. An EMPTY email is NOT a placeholder — it is an absent field handled
+// by ordinary per-field fallthrough, so it does not invalidate its source.
+// Matching is trim + case-insensitive.
+function isPlaceholderEmail(email) {
+  const e = String(email || '').trim().toLowerCase();
+  if (!e) return false; // absent — handled by per-field fallthrough, not a placeholder
+  const at = e.lastIndexOf('@');
+  if (at < 0) return true; // no domain at all — not a routable address
+  const local = e.slice(0, at);
+  const domain = e.slice(at + 1);
+  // Malformed addresses missing a local part (`@example.com`) or a domain
+  // (`user@`) can't be routed or attributed either — reject them too.
+  if (!local || !domain) return true;
+  // Non-routable mDNS/host-local TLDs and the loopback host: unattributable and
+  // undeliverable, so never a legitimate commit author.
+  return domain === 'localhost'
+    || domain.endsWith('.local')
+    || domain.endsWith('.internal');
+}
+
+// Coerce one identity source into a usable { name, email }. When the source's
+// email is a non-routable placeholder we discard the WHOLE candidate (both
+// fields) rather than just the email — otherwise a placeholder-derived name
+// (e.g. `trial-merge`) would be stitched onto a borrowed email from a lower
+// source, forging a Frankenstein author. An empty email is preserved as-is so
+// ordinary per-field fill still works (e.g. git supplies a name, gh the email).
+// Fields are trimmed so a whitespace-only/space-padded name or email behaves
+// like "absent" (empty) rather than a truthy value that would block per-field
+// fallthrough and get stamped as an invalid commit identity — this matches
+// isPlaceholderEmail, which already normalizes via trim().
+function sanitizeIdentity(id) {
+  const name = String((id && id.name) || '').trim();
+  const email = String((id && id.email) || '').trim();
+  if (isPlaceholderEmail(email)) return { name: '', email: '' };
+  return { name, email };
+}
+
 // Resolve the committer identity the harness stamps onto the cloned workspace.
-// Per-field precedence: explicit GIT_AUTHOR_* env → the operator's global git
+// Source precedence: explicit GIT_AUTHOR_* env → the operator's global git
 // config → the gh-authenticated GitHub user → the `nano-agent` fallback.
+// Precedence is per-field only for ABSENT fields (an empty name/email falls
+// through to the next source); a source whose email is a non-routable
+// placeholder is discarded WHOLE by sanitizeIdentity (name included), so in that
+// case its name does not participate in per-field fill (see sanitizeIdentity).
 // Preferring the operator's real identity means autonomous commits are authored
 // by the human running the fleet (who has signed any CLA) rather than an
 // anonymous bot that hasn't; the agent's own authorship is recorded as a PR
@@ -2864,20 +2910,22 @@ function ghUserIdentity() {
 // when a higher-precedence source didn't already supply the field — so explicit
 // GIT_AUTHOR_* env fully short-circuits them (no `git config`/`gh` spawns, hence
 // no added latency or failure modes when the override is present).
-// `gitIdentity`/`ghIdentity` are injectable for testing.
+// Every candidate source is passed through sanitizeIdentity, so a non-routable
+// `*@nano.local` placeholder from ANY source (env, git-global) is discarded and
+// falls through to the gh identity / marked bot fallback — never stamped onto a
+// commit. `gitIdentity`/`ghIdentity` are injectable for testing.
 function resolveCommitterIdentity({ gitIdentity = hostGitIdentity, ghIdentity = ghUserIdentity } = {}) {
-  const envName = process.env.GIT_AUTHOR_NAME || '';
-  const envEmail = process.env.GIT_AUTHOR_EMAIL || '';
+  const env = sanitizeIdentity({ name: process.env.GIT_AUTHOR_NAME || '', email: process.env.GIT_AUTHOR_EMAIL || '' });
   let g = null;
-  const gitOnce = () => (g ??= (gitIdentity() || { name: '', email: '' }));
+  const gitOnce = () => (g ??= sanitizeIdentity(gitIdentity() || {}));
   let gh = null;
-  const ghOnce = () => (gh ??= (ghIdentity() || { name: '', email: '' }));
+  const ghOnce = () => (gh ??= sanitizeIdentity(ghIdentity() || {}));
 
-  const name = envName || gitOnce().name || ghOnce().name || 'nano-agent';
-  const email = envEmail || gitOnce().email || ghOnce().email || 'nano-agent@users.noreply.github.com';
+  const name = env.name || gitOnce().name || ghOnce().name || 'nano-agent';
+  const email = env.email || gitOnce().email || ghOnce().email || 'nano-agent@users.noreply.github.com';
 
   const source =
-    (envName || envEmail) ? 'env'
+    (env.name || env.email) ? 'env'
       : (g && (g.name || g.email)) ? 'git-global'
         : (gh && (gh.name || gh.email)) ? 'gh'
           : 'fallback';
@@ -2983,6 +3031,20 @@ function provisionRepo({ envelope, token, runDir, timeoutMs = 120_000 }) {
   const committer = resolveCommitterIdentity();
   runGit(['config', 'user.name', committer.name], { cwd: workspaceDir, env: gitEnv });
   runGit(['config', 'user.email', committer.email], { cwd: workspaceDir, env: gitEnv });
+  // Config alone is not enough: git honours GIT_AUTHOR_*/GIT_COMMITTER_* OVER
+  // user.name/user.email config, so a placeholder GIT_AUTHOR_EMAIL inherited from
+  // the launch environment (e.g. `trial-merge@nano.local`) would still be stamped
+  // onto commits even though we just wrote a clean identity into config. Pin all
+  // four env vars to the resolved (already placeholder-sanitized) identity so
+  // EVERY commit — finalizeGit's own rebase commits (which run with gitEnv) and
+  // the harness's commits (extraEnv below carries these into harnessEnv) — uses
+  // it deterministically, and a non-routable `*@nano.local` author can never be
+  // written. When GIT_AUTHOR_* already held a real identity, resolveCommitterIdentity
+  // returned it verbatim, so this is a no-op in that case.
+  gitEnv.GIT_AUTHOR_NAME = committer.name;
+  gitEnv.GIT_AUTHOR_EMAIL = committer.email;
+  gitEnv.GIT_COMMITTER_NAME = committer.name;
+  gitEnv.GIT_COMMITTER_EMAIL = committer.email;
 
   // Determine the working branch. With branch.create we make a real branch.
   // Otherwise we're on whatever the clone checked out: a branch only if
@@ -3003,7 +3065,7 @@ function provisionRepo({ envelope, token, runDir, timeoutMs = 120_000 }) {
   // `git rev-parse HEAD` on an unborn branch (freshly cloned empty repo) exits
   // non-zero and echoes the literal "HEAD" on stdout — treat that as "no base
   // commit" (empty startSha) rather than a bogus revision.
-  return { workspaceDir, gitEnv, startSha: sha.status === 0 ? (sha.stdout || '').trim() : '', workingBranch, detached: !workingBranch, ref: target || '', remote: redactToken(repo.url, token) };
+  return { workspaceDir, gitEnv, committer, startSha: sha.status === 0 ? (sha.stdout || '').trim() : '', workingBranch, detached: !workingBranch, ref: target || '', remote: redactToken(repo.url, token) };
 }
 
 // Look up a PR for this branch (2a does NOT open it — the harness does, driven
@@ -4239,6 +4301,15 @@ async function workAgent(req, flags) {
               AGENT_REPO_URL: provisioned.remote,
               AGENT_REPO_BRANCH: provisioned.workingBranch || '',
               AGENT_REPO_REF: provisioned.ref || '',
+              // Pin the harness's commit identity to the resolved (placeholder-
+              // sanitized) committer so the agent's own `git commit` can't be
+              // hijacked by a placeholder GIT_AUTHOR_* inherited from process.env
+              // (git honours these over user.name/user.email config). Layered via
+              // extraEnv so they override any inherited placeholder in harnessEnv.
+              GIT_AUTHOR_NAME: provisioned.committer.name,
+              GIT_AUTHOR_EMAIL: provisioned.committer.email,
+              GIT_COMMITTER_NAME: provisioned.committer.name,
+              GIT_COMMITTER_EMAIL: provisioned.committer.email,
             };
           } catch (err) {
             if (runDir) { try { rmSync(runDir, { recursive: true, force: true }); } catch { /* best effort */ } liveRunDirs.delete(runDir); }
@@ -7506,6 +7577,7 @@ export {
   finalizeGit,
   reconcileAgentPr,
   resolveCommitterIdentity,
+  isPlaceholderEmail,
   postAgentAttribution,
   reapAgentRunDirs,
   authUrl,

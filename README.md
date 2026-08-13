@@ -265,9 +265,11 @@ c8ctl nano hire --name coder --rank senior --command copilot --terminal pty
 NANO_AGENTIC_TERMINAL=pipe c8ctl nano work coder
 ```
 
-A PTY needs the optional native `node-pty` dependency; where it can't be
-allocated (not installed, or Windows) a `pty` role **gracefully falls back to a
-pipe** that still relays. Each job's terminal streams on its own relay stream
+A PTY needs the optional native `node-pty` dependency; when it is
+**unavailable** (not installed, or Windows) a `pty` role **gracefully falls
+back to a pipe** that still relays. (If `node-pty` is present but a PTY can't be
+spawned at runtime, that job fails rather than falling back.) Each job's terminal
+streams on its own relay stream
 named `job:‹jobKey›`, so output and steer-in are routed from the `jobKey` alone.
 
 **Surviving a hub outage.** A worker that starts **before** the app, or survives

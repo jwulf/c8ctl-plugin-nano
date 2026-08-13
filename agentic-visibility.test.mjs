@@ -248,6 +248,7 @@ test('the visibility plane composes end-to-end: presence + jobKey-tagged PTY rel
   // C2: clean deregister on exit — the worker disappears from the page.
   session.close();
   await ch.stop('worker stopped');
+  await tick();
   const dereg = t.framesOf('deregister').at(-1);
   assert.equal(dereg.payload.instance, 'reviewer-1');
   assert.equal(dereg.payload.reason, 'worker stopped');

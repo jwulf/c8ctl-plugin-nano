@@ -973,6 +973,8 @@ test('isPlaceholderEmail: rejects non-routable placeholders, accepts real addres
   assert.equal(isPlaceholderEmail('x@build.internal'), true);
   assert.equal(isPlaceholderEmail('root@localhost'), true);
   assert.equal(isPlaceholderEmail('no-at-sign'), true);
+  assert.equal(isPlaceholderEmail('user@'), true, 'empty domain — not routable');
+  assert.equal(isPlaceholderEmail('@example.com'), true, 'empty local part — not attributable');
   assert.equal(isPlaceholderEmail('  bob@nano.local  '), true, 'whitespace-trimmed before matching');
   assert.equal(isPlaceholderEmail('BOB@Nano.Local'), true, 'case-insensitive');
   // Real, routable addresses (incl. GitHub noreply) → accepted.

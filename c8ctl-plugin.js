@@ -2866,7 +2866,11 @@ function isPlaceholderEmail(email) {
   if (!e) return false; // absent — handled by per-field fallthrough, not a placeholder
   const at = e.lastIndexOf('@');
   if (at < 0) return true; // no domain at all — not a routable address
+  const local = e.slice(0, at);
   const domain = e.slice(at + 1);
+  // Malformed addresses missing a local part (`@example.com`) or a domain
+  // (`user@`) can't be routed or attributed either — reject them too.
+  if (!local || !domain) return true;
   // Non-routable mDNS/host-local TLDs and the loopback host: unattributable and
   // undeliverable, so never a legitimate commit author.
   return domain === 'localhost'

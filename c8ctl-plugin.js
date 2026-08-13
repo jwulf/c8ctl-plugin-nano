@@ -58,6 +58,7 @@ import { createInterface } from 'node:readline/promises';
 import { createInterface as createReadline } from 'node:readline';
 import { platformForHost } from './platforms.mjs';
 import { createWorkChannel, redactAgenticUrl, buildAgenticUrl } from './work-channel.mjs';
+import { createRelaySession, roleTerminalMode } from './work-relay.mjs';
 
 const requireFromHere = createRequire(import.meta.url);
 const pluginDir = dirname(fileURLToPath(import.meta.url));
@@ -1514,6 +1515,11 @@ function showConfig() {
 
 const RANKS = ['principal', 'senior', 'junior', 'decider'];
 
+// C3 (#42): a role's live-terminal mode — a full PTY (streamed + steerable) or a
+// plain pipe. Default is `pipe` (the safe non-interactive default); `pty` is
+// opt-in per role because a TTY changes the harness's I/O semantics.
+const TERMINAL_MODES = ['pipe', 'pty'];
+
 /** Normalize a capability list: trim, drop empties, de-dupe, sort (canonical). */
 function normalizeCapabilities(input) {
   const raw = Array.isArray(input)
@@ -1732,6 +1738,10 @@ function normalizeStoredProfile(name, profile) {
   if (CONTAINER_SANDBOXES.has(sandbox) && !image) {
     return { error: `profile "${name}" uses sandbox "${sandbox}" but has no image` };
   }
+  // C3 (#42): live-terminal mode. Tolerant — an unknown/legacy value falls back
+  // to the safe `pipe` default rather than failing the whole profile.
+  const terminalRaw = typeof profile.terminal === 'string' ? profile.terminal.trim().toLowerCase() : '';
+  const terminal = TERMINAL_MODES.includes(terminalRaw) ? terminalRaw : 'pipe';
   return {
     profile: {
       name,
@@ -1742,6 +1752,7 @@ function normalizeStoredProfile(name, profile) {
       capabilities: normalizeCapabilities(profile.capabilities),
       sandbox,
       image,
+      terminal,
       env: normalizeEnvMap(profile.env),
     },
   };
@@ -1859,7 +1870,8 @@ async function hireWorker(req, flags) {
     logger.info('Hired agent profiles:');
     for (const name of names.sort()) {
       const p = hires[name];
-      logger.info(`  ${name}  [${p.rank}]  ${buildAgentCommandLine(p.command, p.args)}  (model: ${p.model || '-'}; caps: ${normalizeCapabilities(p.capabilities).join(', ') || '-'})`);
+      const term = String(p.terminal || '').trim().toLowerCase() === 'pty' ? '; terminal: pty' : '';
+      logger.info(`  ${name}  [${p.rank}]  ${buildAgentCommandLine(p.command, p.args)}  (model: ${p.model || '-'}; caps: ${normalizeCapabilities(p.capabilities).join(', ') || '-'}${term})`);
     }
     logger.info('');
     logger.info('Put one to work with: c8ctl nano work <name>');
@@ -1875,6 +1887,7 @@ async function hireWorker(req, flags) {
   let capabilities = flags?.capabilities !== undefined ? flags.capabilities : undefined;
   let sandbox = flags?.sandbox !== undefined ? String(flags.sandbox).trim().toLowerCase() : undefined;
   let image = flags?.image !== undefined ? String(flags.image).trim() : undefined;
+  let terminal = flags?.terminal !== undefined ? String(flags.terminal).trim().toLowerCase() : undefined;
   // Structured command-line switches appended to the command when spawned, e.g.
   // `--arg --allow-all` for `copilot`. Repeatable; each --arg is one argv token.
   const commandArgs = normalizeArgList(flags?.arg);
@@ -1952,11 +1965,17 @@ async function hireWorker(req, flags) {
   if (capabilities === undefined) capabilities = '';
   if (sandbox === undefined || sandbox === '') sandbox = 'none';
   if (image === undefined) image = '';
+  if (terminal === undefined || terminal === '') terminal = 'pipe';
 
   if (!SANDBOXES.includes(sandbox)) {
     logger.error(`Invalid --sandbox "${sandbox}". Use one of: ${SANDBOXES.join(', ')}`);
     process.exit(1);
   }
+  if (!TERMINAL_MODES.includes(terminal)) {
+    logger.error(`Invalid --terminal "${terminal}". Use one of: ${TERMINAL_MODES.join(', ')}`);
+    process.exit(1);
+  }
+
   if (CONTAINER_SANDBOXES.has(sandbox) && !image) {
     logger.error(`--sandbox ${sandbox} requires --image <ref> (the container image the agent runs in).`);
     process.exit(1);
@@ -1985,6 +2004,7 @@ async function hireWorker(req, flags) {
     capabilities: normalizeCapabilities(capabilities),
     sandbox,
     image: image || '',
+    terminal,
     env: profileEnv,
     createdAt: new Date().toISOString(),
   };
@@ -1996,6 +2016,7 @@ async function hireWorker(req, flags) {
   logger.info(`  capabilities: ${profile.capabilities.join(', ') || '(none)'}`);
   if (profile.args.length > 0) logger.info(`  args: ${profile.args.map(shQuote).join(' ')}`);
   logger.info(`  sandbox: ${profile.sandbox}${CONTAINER_SANDBOXES.has(profile.sandbox) ? ` (image ${profile.image})` : ''}`);
+  logger.info(`  live terminal: ${profile.terminal}${profile.terminal === 'pty' ? ' (streamed + steerable on the relay lane)' : ''}`);
   const envKeys = Object.keys(profile.env);
   if (envKeys.length > 0) logger.info(`  env: ${envKeys.join(', ')}`);
   logger.info(`  job types (${matrix.length}): ${matrix.join('  ')}`);
@@ -2903,7 +2924,7 @@ const MAX_CAPTURE_BYTES = 1_048_576; // 1 MiB per stream
 // Spawn a child, pipe `stdinData`, capture byte-capped stdout/stderr, enforce a
 // timeout (invoking `onTimeout(child)` to tear the child down), and resolve to a
 // uniform result. Used by both the host and container executors.
-function spawnCaptureOneShot({ command, args = [], shell = false, detached = false, cwd, env, stdinData, timeoutMs, idleTimeoutMs, onTimeout, stream = false, streamPrefix = '', onStreamOut, onStreamErr }) {
+function spawnCaptureOneShot({ command, args = [], shell = false, detached = false, cwd, env, stdinData, timeoutMs, idleTimeoutMs, onTimeout, stream = false, streamPrefix = '', onStreamOut, onStreamErr, relayTap = null }) {
   return new Promise((resolve) => {
     let child;
     const stdoutChunks = [];
@@ -2915,6 +2936,10 @@ function spawnCaptureOneShot({ command, args = [], shell = false, detached = fal
     let settled = false;
     let timer = null;
     let idleTimer = null;
+    // C3 (#42): when a relay session is attached, wire steer-in from the cockpit
+    // into the child's stdin. Detached in finish() so the frame subscription
+    // never outlives the child.
+    let detachSteer = null;
 
     // Live "spy" tee (--stream): mirror the child's output line-by-line to a
     // caller-supplied emitter (the worker routes these through c8ctl's
@@ -2952,6 +2977,7 @@ function spawnCaptureOneShot({ command, args = [], shell = false, detached = fal
       settled = true;
       if (timer) clearTimeout(timer);
       if (idleTimer) clearTimeout(idleTimer);
+      if (detachSteer) { try { detachSteer(); } catch { /* best effort */ } detachSteer = null; }
       if (teeOut) teeOut('', true);
       if (teeErr) teeErr('', true);
       resolve(result);
@@ -2992,6 +3018,7 @@ function spawnCaptureOneShot({ command, args = [], shell = false, detached = fal
       armIdle();
       const buf = Buffer.isBuffer(d) ? d : Buffer.from(d);
       if (teeOut) teeOut(buf.toString('utf8'), false);
+      if (relayTap) relayTap.onData(buf);
       const remaining = MAX_CAPTURE_BYTES - stdoutBytes;
       if (remaining <= 0) { stdoutTruncated = true; return; }
       if (buf.length > remaining) { stdoutChunks.push(buf.subarray(0, remaining)); stdoutBytes = MAX_CAPTURE_BYTES; stdoutTruncated = true; }
@@ -3001,6 +3028,7 @@ function spawnCaptureOneShot({ command, args = [], shell = false, detached = fal
       armIdle();
       const buf = Buffer.isBuffer(d) ? d : Buffer.from(d);
       if (teeErr) teeErr(buf.toString('utf8'), false);
+      if (relayTap) relayTap.onData(buf);
       const remaining = MAX_CAPTURE_BYTES - stderrBytes;
       if (remaining <= 0) { stderrTruncated = true; return; }
       if (buf.length > remaining) { stderrChunks.push(buf.subarray(0, remaining)); stderrBytes = MAX_CAPTURE_BYTES; stderrTruncated = true; }
@@ -3015,10 +3043,161 @@ function spawnCaptureOneShot({ command, args = [], shell = false, detached = fal
     });
 
     child.stdin.on('error', () => {});
+    // C3 (#42): route cockpit steer-in into the child's stdin. Pipe-mode roles
+    // still stream + accept steer (a PTY changes I/O semantics but not the relay
+    // contract). Guard every write — a closed stdin must never crash the worker.
+    if (relayTap) {
+      detachSteer = relayTap.attachSteer((data) => {
+        try { child.stdin.write(typeof data === 'string' ? data : Buffer.from(data)); } catch { /* stdin closed */ }
+      });
+    }
     try {
       if (stdinData != null) child.stdin.write(stdinData);
       child.stdin.end();
     } catch { /* 'error' handler resolves on failure */ }
+  });
+}
+
+// ---- PTY capture (C3 #42 — full terminal for roles opted into `terminal: pty`)
+// node-pty is a NATIVE, OPTIONAL dependency: a role that runs its harness on a
+// real PTY needs it, but the vast majority of workers run on plain pipes, and we
+// must never let a missing/failed native build break `npm install` or the test
+// suite on stock Node. It is therefore an optionalDependency, lazily required
+// only when a PTY role actually runs, and memoized. Returns null when it is not
+// installed so the caller can fall back to a pipe.
+let ptyModuleCache; // undefined = not tried; null = unavailable; object = loaded
+function loadPtyModule() {
+  if (ptyModuleCache !== undefined) return ptyModuleCache;
+  try {
+    ptyModuleCache = requireFromHere('node-pty');
+  } catch {
+    ptyModuleCache = null;
+  }
+  return ptyModuleCache;
+}
+
+/**
+ * Whether a real PTY can be allocated on this host: node-pty is installed AND we
+ * are on a POSIX platform (the PTY path spawns `sh -c <commandLine>`, mirroring
+ * the container executor; Windows conpty is out of scope for this slice).
+ */
+function ptyAvailable(ptyFactory) {
+  if (ptyFactory) return true;
+  if (process.platform === 'win32') return false;
+  return loadPtyModule() != null;
+}
+
+// Spawn the harness on a PTY, capture byte-capped output for the job result,
+// tee every chunk to the relay tap (framed + jobKey-tagged by the caller), and
+// feed steer-in bytes back into the PTY. Same result contract as
+// spawnCaptureOneShot. A PTY merges stdout+stderr into one stream, so stderr is
+// always '' here; that is expected for a live terminal. `ptyFactory` is
+// injectable for tests (defaults to node-pty).
+function spawnCapturePty({ command, args = [], cwd, env, stdinData, timeoutMs, idleTimeoutMs, cols = 120, rows = 30, ptyFactory, relayTap = null, stream = false, streamPrefix = '', onStreamOut }) {
+  return new Promise((resolve) => {
+    const factory = ptyFactory || loadPtyModule();
+    if (!factory || typeof factory.spawn !== 'function') {
+      resolve({ ok: false, exitCode: null, stdout: '', stderr: '', error: 'node-pty is not available; cannot allocate a PTY (install node-pty or use terminal: pipe)', truncated: false, stderrTruncated: false });
+      return;
+    }
+
+    const chunks = [];
+    let bytes = 0;
+    let truncated = false;
+    let settled = false;
+    let timer = null;
+    let idleTimer = null;
+    let detachSteer = null;
+    let term;
+
+    // Live "spy" tee (--stream), line-buffered, mirroring spawnCaptureOneShot.
+    const STREAM_TEE_LINE_CAP = 64 * 1024;
+    let teePartial = '';
+    const teeSink = stream ? (onStreamOut || ((line) => process.stdout.write(`${line}\n`))) : null;
+    const tee = (text, final) => {
+      if (!teeSink) return;
+      teePartial += text;
+      let nl;
+      while ((nl = teePartial.indexOf('\n')) !== -1) {
+        teeSink(`${streamPrefix}${teePartial.slice(0, nl)}`);
+        teePartial = teePartial.slice(nl + 1);
+      }
+      while (teePartial.length >= STREAM_TEE_LINE_CAP) {
+        teeSink(`${streamPrefix}${teePartial.slice(0, STREAM_TEE_LINE_CAP)}`);
+        teePartial = teePartial.slice(STREAM_TEE_LINE_CAP);
+      }
+      if (final && teePartial) { teeSink(`${streamPrefix}${teePartial}`); teePartial = ''; }
+    };
+
+    const killTerm = () => {
+      try { term?.kill(); } catch { /* already gone */ }
+    };
+
+    const finish = (result) => {
+      if (settled) return;
+      settled = true;
+      if (timer) clearTimeout(timer);
+      if (idleTimer) clearTimeout(idleTimer);
+      if (detachSteer) { try { detachSteer(); } catch { /* best effort */ } detachSteer = null; }
+      if (teeSink) tee('', true);
+      resolve(result);
+    };
+
+    try {
+      term = factory.spawn(command, args, { name: 'xterm-256color', cols, rows, cwd, env });
+    } catch (err) {
+      finish({ ok: false, exitCode: null, stdout: '', stderr: '', error: `pty spawn failed: ${err?.message || err}`, truncated: false, stderrTruncated: false });
+      return;
+    }
+
+    timer = timeoutMs && timeoutMs > 0
+      ? setTimeout(() => {
+          killTerm();
+          finish({ ok: false, exitCode: null, stdout: joinCapped(chunks), stderr: '', error: `timed out after ${timeoutMs}ms`, timedOut: true, truncated, stderrTruncated: false });
+        }, timeoutMs)
+      : null;
+
+    const armIdle = () => {
+      if (settled) return;
+      if (!(idleTimeoutMs && idleTimeoutMs > 0)) return;
+      if (idleTimer) clearTimeout(idleTimer);
+      idleTimer = setTimeout(() => {
+        killTerm();
+        finish({ ok: false, exitCode: null, stdout: joinCapped(chunks), stderr: '', error: `no output for ${idleTimeoutMs}ms (idle)`, timedOut: true, idle: true, truncated, stderrTruncated: false });
+      }, idleTimeoutMs);
+    };
+    armIdle();
+
+    term.onData((d) => {
+      armIdle();
+      const buf = Buffer.isBuffer(d) ? d : Buffer.from(String(d), 'utf8');
+      if (teeSink) tee(buf.toString('utf8'), false);
+      if (relayTap) relayTap.onData(buf);
+      const remaining = MAX_CAPTURE_BYTES - bytes;
+      if (remaining <= 0) { truncated = true; return; }
+      if (buf.length > remaining) { chunks.push(buf.subarray(0, remaining)); bytes = MAX_CAPTURE_BYTES; truncated = true; }
+      else { chunks.push(buf); bytes += buf.length; }
+    });
+
+    term.onExit(({ exitCode, signal }) => {
+      finish({ ok: exitCode === 0, exitCode: typeof exitCode === 'number' ? exitCode : null, signal: signal ?? null, stdout: joinCapped(chunks), stderr: '', truncated, stderrTruncated: false });
+    });
+
+    // Steer-in: write cockpit bytes straight into the PTY so an operator can
+    // drive the running agent.
+    if (relayTap) {
+      detachSteer = relayTap.attachSteer((data) => {
+        try { term.write(typeof data === 'string' ? data : Buffer.from(data).toString('utf8')); } catch { /* term gone */ }
+      });
+    }
+
+    // Deliver the task envelope on the PTY, then an EOT (Ctrl-D) so a harness
+    // that reads its payload from stdin sees an end-of-input, while the PTY
+    // itself stays open for interactive steer-in.
+    try {
+      if (stdinData != null) term.write(String(stdinData));
+      term.write('\x04');
+    } catch { /* onExit resolves on failure */ }
   });
 }
 
@@ -3101,7 +3280,7 @@ function startLockExtender(job, windowMs, intervalMs, tag, logger) {
  * Both paths resolve to the same result contract.
  */
 function runAgentJob(profile, job, opts = {}) {
-  const { timeoutMs, idleTimeoutMs, envelope, sandbox = 'none', image, runId, secretEnv = {}, passThroughSecretNames = [], cwd, extraEnv = {}, profileEnv = {}, resultFile, stream = false, streamPrefix = '', onStreamOut, onStreamErr, args: commandArgs } = opts;
+  const { timeoutMs, idleTimeoutMs, envelope, sandbox = 'none', image, runId, secretEnv = {}, passThroughSecretNames = [], cwd, extraEnv = {}, profileEnv = {}, resultFile, stream = false, streamPrefix = '', onStreamOut, onStreamErr, args: commandArgs, terminal = 'pipe', relaySession = null, ptyFactory } = opts;
   const payload = JSON.stringify(buildAgentPayload(profile, job, envelope));
   const agentEnv = baseAgentEnv(profile, job);
   // The harness command line: the profile command plus its structured switches
@@ -3114,6 +3293,16 @@ function runAgentJob(profile, job, opts = {}) {
   // resolved secrets are layered on top so user env can never shadow them.
   const staticEnv = { ...normalizeEnvMap(profileEnv), ...normalizeEnvMap(envelope?.setup?.env) };
 
+  // C3 (#42): when a relay session is present, tap the harness terminal onto the
+  // relay lane (framed + tagged with this job's jobKey) and accept steer-in. The
+  // tap is inert when there is no session, preserving legacy behaviour exactly.
+  const relayTap = relaySession
+    ? {
+        onData: (buf) => relaySession.relay(buf),
+        attachSteer: (write) => relaySession.attachSteer(write),
+      }
+    : null;
+
   if (!CONTAINER_SANDBOXES.has(sandbox)) {
     // Host: hand the agent the result file by its real path.
     // Defense in depth: --arg tokens are POSIX single-quoted, which cmd.exe on
@@ -3124,6 +3313,29 @@ function runAgentJob(profile, job, opts = {}) {
       return Promise.resolve({ ok: false, exitCode: null, stdout: '', stderr: '', error: 'command-line args (--arg) are not supported for host execution on Windows; use a container sandbox or bake switches into the command', truncated: false, stderrTruncated: false });
     }
     const resultEnv = resultFile ? { [AGENT_RESULT_FILE_ENV]: resultFile } : {};
+    const harnessEnv = { ...process.env, ...staticEnv, ...secretEnv, ...agentEnv, ...extraEnv, ...resultEnv };
+
+    // A role opted into a full PTY (`terminal: pty`) runs the harness on a real
+    // terminal when one can be allocated — so its live output streams as a true
+    // terminal and cockpit steer-in reaches it. Falls back to a pipe (still
+    // relayed) when node-pty is unavailable or on Windows.
+    if (terminal === 'pty' && ptyAvailable(ptyFactory)) {
+      return spawnCapturePty({
+        command: 'sh',
+        args: ['-c', commandLine],
+        cwd,
+        env: harnessEnv,
+        stdinData: payload,
+        timeoutMs,
+        idleTimeoutMs,
+        ptyFactory,
+        relayTap,
+        stream,
+        streamPrefix,
+        onStreamOut,
+      });
+    }
+
     return spawnCaptureOneShot({
       command: commandLine,
       shell: true,
@@ -3133,7 +3345,7 @@ function runAgentJob(profile, job, opts = {}) {
       cwd,
       // Reserved harness env (AGENT_* + the result-file path) is layered AFTER
       // resolved secrets so a task-supplied secret NAME can never shadow it.
-      env: { ...process.env, ...staticEnv, ...secretEnv, ...agentEnv, ...extraEnv, ...resultEnv },
+      env: harnessEnv,
       stdinData: payload,
       timeoutMs,
       idleTimeoutMs,
@@ -3142,6 +3354,7 @@ function runAgentJob(profile, job, opts = {}) {
       streamPrefix,
       onStreamOut,
       onStreamErr,
+      relayTap,
     });
   }
 
@@ -3197,6 +3410,7 @@ function runAgentJob(profile, job, opts = {}) {
     streamPrefix,
     onStreamOut,
     onStreamErr,
+    relayTap,
     onTimeout: (child) => {
       try { spawnSync(engine, ['rm', '-f', containerName], { timeout: 15_000 }); } catch { /* best effort */ }
       try { killTree(child); } catch { /* best effort */ }
@@ -3567,6 +3781,20 @@ async function workAgent(req, flags) {
     logger.info('  agentic channel: not enrolled (set NANO_AGENTIC_URL + NANO_AGENTIC_TOKEN + NANO_AGENTIC_CREDENTIAL to appear on the visibility page).');
   }
 
+  // C3 (#42): the role's live-terminal mode — a full PTY (streamed on the relay
+  // lane, steerable) or a plain pipe. Honors the vocab's per-role opt-in read
+  // off the hire profile (`terminal: pty|pipe`), with an env override for a
+  // one-off worker (`NANO_AGENTIC_TERMINAL`). PTY relay only engages when the
+  // worker is enrolled on the channel; without it the worker runs on pipes
+  // exactly as before.
+  const envTerminal = (process.env.NANO_AGENTIC_TERMINAL || '').trim().toLowerCase();
+  const roleTerminal = (envTerminal === 'pty' || envTerminal === 'pipe')
+    ? envTerminal
+    : roleTerminalMode(profile);
+  if (workChannel) {
+    logger.info(`  live terminal: ${roleTerminal === 'pty' ? 'PTY (streamed + steerable)' : 'pipe (streamed)'} on the relay lane.`);
+  }
+
   // A per-job-type worker factory. Captures all the CLI-local + profile context
   // in closure scope so the profile watcher below can (re)spawn a poller for any
   // job type on demand without re-reading the flags.
@@ -3658,6 +3886,19 @@ async function workAgent(req, flags) {
 
         let result;
         let gitResult = null;
+        // C3 (#42): the per-job live-terminal relay session. Streams this job's
+        // harness terminal on the relay lane tagged with its jobKey, and accepts
+        // steer-in. Only when the worker is enrolled on the channel; closed in
+        // the finally so its inbound-frame subscription never leaks across jobs.
+        let relaySession = null;
+        if (workChannel) {
+          try {
+            relaySession = createRelaySession({ channel: workChannel, jobKey: job.jobKey, logger });
+          } catch (err) {
+            relaySession = null;
+            logger.warn(`[${jobType}] job ${job.jobKey}: relay session unavailable (${err?.message || err}); continuing without live terminal.`);
+          }
+        }
         // Private structured-result channel: hand the agent a file (outside any
         // repo clone so it can't be `git add`ed) to write its job-result vars to.
         let resultDir = null;
@@ -3688,6 +3929,10 @@ async function workAgent(req, flags) {
             stream,
             streamPrefix: `[${jobType} ${job.jobKey}] `,
             args: effectiveArgs,
+            // C3 (#42): a full PTY for a role that opted in, else a pipe. Both
+            // stream on the relay lane; only a PTY is interactively steerable.
+            terminal: roleTerminal,
+            relaySession,
             // Route the --stream tee through c8ctl's output-mode-aware logger so
             // spying never corrupts a structured/JSON output mode.
             onStreamOut: stream ? (line) => logger.info(line) : undefined,
@@ -3716,6 +3961,9 @@ async function workAgent(req, flags) {
           if (isContainer) liveRunIds.delete(runId);
           if (runDir && !keepRuns) { try { rmSync(runDir, { recursive: true, force: true }); } catch { /* best effort */ } }
           if (runDir) liveRunDirs.delete(runDir);
+          // Detach the relay session's inbound-frame subscription so it never
+          // outlives the job or leaks a steer listener across jobs.
+          if (relaySession) { try { relaySession.close(); } catch { /* best effort */ } }
         }
 
         // Read the agent's structured result: the file it wrote, else a stdout
@@ -6638,6 +6886,7 @@ export {
   diskBudgetOk,
   containerEngineAvailable,
   runAgentJob,
+  spawnCapturePty,
   startLockExtender,
   provisionRepo,
   finalizeGit,
@@ -6793,6 +7042,7 @@ export const commands = {
       capabilities: { type: 'string', description: 'hire/assign: comma-separated capability list' },
       sandbox: { type: 'string', description: 'hire/work: execution sandbox none|docker|podman (default none). Containers isolate each job.' },
       image: { type: 'string', description: 'hire/work: container image the agent runs in (required for --sandbox docker|podman)' },
+      terminal: { type: 'string', description: 'hire: live-terminal mode for this role — pty (full terminal, streamed + steerable on the relay lane) or pipe (default). NANO_AGENTIC_TERMINAL overrides at work time.' },
       env: { type: 'string', multiple: true, description: 'hire/work: static env var for the harness as NAME=VALUE (repeatable); persisted on hire, work extends/overrides. E.g. permission toggles.' },
       'secret-resolver': { type: 'string', description: 'work: secret resolver for task secretRefs (host = process env; default host)' },
       'reap-age': { type: 'string', description: 'work: age in ms before a finished agent container or job workspace is reaped (default 3600000)' },
@@ -6964,7 +7214,7 @@ function printUsage() {
   console.log('  c8ctl nano unset <bin|model-dir>');
   console.log('  c8ctl nano config');
   console.log('  c8ctl nano update [--check]');
-  console.log('  c8ctl nano hire [--name <n>] [--rank <r>] [--command <c>] [--arg <switch> ...] [--model <m>] [--capabilities <a,b>] [--sandbox none|docker|podman] [--image <ref>] [--env NAME=VALUE ...] [--list]');
+  console.log('  c8ctl nano hire [--name <n>] [--rank <r>] [--command <c>] [--arg <switch> ...] [--model <m>] [--capabilities <a,b>] [--sandbox none|docker|podman] [--image <ref>] [--terminal pty|pipe] [--env NAME=VALUE ...] [--list]');
   console.log('  c8ctl nano assign <profileName> <cap[,cap...]> [--name <n>] [--capabilities <a,b>]');
   console.log('  c8ctl nano work <profileName> [--arg <switch> ...] [--max-parallel <n>] [--recovery-window <ms>] [--idle-timeout <ms>] [--job-timeout <ms>] [--poll-timeout <ms>] [--job-type <token> ...] [--sandbox none|docker|podman] [--image <ref>] [--env NAME=VALUE ...] [--secret-resolver host] [--min-free-mb <n>] [--clone-timeout <ms>] [--keep-runs] [--stream]');
   console.log('  c8ctl nano supervisor [start|status|add|remove|restart|stop|logs|attach] ... (manage many workers from one terminal)');
@@ -7008,6 +7258,7 @@ function printUsage() {
   console.log('  --capabilities <a,b> hire/assign: comma-separated capability list');
   console.log('  --sandbox <s>        hire/work: execution sandbox none|docker|podman (default none)');
   console.log('  --image <ref>        hire/work: container image the agent runs in (required for docker|podman)');
+  console.log('  --terminal <m>       hire: live-terminal mode pty|pipe (default pipe); pty streams a steerable terminal on the relay lane');
   console.log('  --env NAME=VALUE     hire/work: static env var for the harness (repeatable); persisted on hire, work extends/overrides');
   console.log('  --list               hire: list existing agent profiles instead of creating one');
   console.log('  --max-parallel <n>   work: max concurrent jobs per worker (default 1)');

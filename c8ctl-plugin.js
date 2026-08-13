@@ -5909,7 +5909,14 @@ async function printChangelogSince(_name, current, latest) {
     logger.info('');
     return;
   }
-  if (releases.length === 0) return; // nothing between the two (e.g. only a build-metadata bump)
+  if (releases.length === 0) {
+    // Nothing resolved between the two (only a build-metadata bump, or a
+    // degraded resolution: current is null / tags don't match vX.Y.Z). Point
+    // at the releases page so the best-effort feature still leaves a trail.
+    if (releasesUrl) logger.info(`See what changed: ${releasesUrl}`);
+    logger.info('');
+    return;
+  }
 
   logger.info(`What's changed since v${current ?? '?'}:`);
   logger.info('');

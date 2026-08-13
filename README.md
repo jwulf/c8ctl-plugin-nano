@@ -237,7 +237,7 @@ export NANO_AGENTIC_URL=http://localhost:8080     # app base URL; channel is ser
 export NANO_AGENTIC_TOKEN=<identity-token>         # ADR 0028 identity
 export NANO_AGENTIC_CREDENTIAL=<capability-cred>   # capability credential
 c8ctl nano work reviewer
-#   agentic channel: announcing presence as ‹worker› on ws://localhost:8080/agentic?token=***&capability=***
+#   agentic channel: announcing presence as ‹worker› on ws://localhost:8080/agentic
 ```
 
 Without both secrets the worker runs **exactly as before, off the channel** — no

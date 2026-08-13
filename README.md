@@ -212,6 +212,54 @@ c8ctl nano work reviewer --max-parallel 2 --recovery-window 300000
 c8ctl nano work reviewer --name reviewer-eu  # name this worker (else auto ‹host›-‹profile›-‹random›)
 ```
 
+#### Zero-config enrolment: `--auto` (serve every deployed agent job type)
+
+`--auto` is the **"Borland Delphi on your machine"** onboarding ramp: skip the
+capability wiring entirely and subscribe the worker to **all deployed *agent*
+job types**, read straight from the engine.
+
+```bash
+c8ctl nano work coder --auto                  # serve every agent job type on the engine
+c8ctl nano work coder --auto --auto-scope my-app   # scope to one app/network (process-id prefix)
+```
+
+How it works and why it needs no wiring:
+
+- **Engine-read demand.** The worker already holds the engine (C8 REST) endpoint
+  from its c8ctl profile. `--auto` enumerates the deployed process definitions
+  (`process-definitions/search` → `/{key}/xml`) and scans their
+  `<zeebe:taskDefinition type>` leaves for the job types the engine matches. The
+  engine is the guaranteed shared rendezvous: if a worker can execute an app's
+  agent jobs at all, it and the app are already on the same engine, so *what
+  agent job types exist* is answerable from that engine alone — **no cross-machine
+  app discovery, no app enrol endpoint, no channel connection**.
+- **Agent-task header filter.** Not every service task is an agent task —
+  connectors and record-keepers (e.g. `pr.record-plan`) are plain workers.
+  `--auto` keeps only leaves whose service task carries an
+  **`io.nanobpm.agentTask.`** task header (e.g. `senior:plan` carries
+  `io.nanobpm.agentTask.task.prompt`; a record-keeper does not).
+- **One poller per agent job type, reconciled on change.** It opens one poller
+  per agent job type and re-reads the engine periodically, adding pollers for
+  newly deployed agent processes and draining pollers for undeployed ones — the
+  same in-place reconcile the profile watch uses, sourced from the engine instead
+  of the profile.
+- **Raw job-type grammar.** The job type the engine matches (`senior:plan`) is
+  advertised **verbatim** — colon-named types are not forced through any
+  dot-grammar.
+
+`--auto` is **mutually exclusive** with capability-resolved serving: it bypasses
+the rank×capability matrix (any `--job-type` extras are still added). The prompt
+a worker needs already rides the job header (`io.nanobpm.agentTask.task.prompt`)
+plus per-instance context, so a generic `--auto` worker needs no baked
+specialisation.
+
+> **Trust.** Engine-read has **no capability gate** — an `--auto` worker will
+> serve *any* deployed agent job on its engine. That is the accepted trade for the
+> local/zero-config target; capability-gated serving is the specialised
+> (capability-declared) enrolment path. Use `--auto-scope <process-id | prefix>`
+> to narrow the blast radius to one app/network.
+
+
 The optional `--name` sets **this worker's name** — the `workerName` it
 registers under at the broker (`‹name›:‹jobType›`) and how it shows up in
 supervisor status/logs. Omit it and a distinct `‹host›-‹profile›-‹random›`

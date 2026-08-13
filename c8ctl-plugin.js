@@ -125,6 +125,11 @@ const READINESS_TIMEOUT_MS = 60_000;
 const READINESS_POLL_MS = 500;
 const HEALTH_TIMEOUT_MS = 1_500;
 const STOP_GRACE_MS = 8_000;
+// Upper bound on one `--auto` engine-read reconcile (enumerate deployed
+// definitions + fetch each BPMN). A read that stalls past this is treated as a
+// transient failure so the running poller set is KEPT and, crucially, shutdown
+// — which awaits the in-flight reconcile — can never hang on a wedged engine.
+const AUTO_ENGINE_READ_TIMEOUT_MS = 15_000;
 const PROCESSOS_STATE_FILE = 'processos.json';
 const SUPERVISOR_STATE_FILE = 'supervisor.json';
 const PROCESSOS_DEFAULT_PORT = 8090;
@@ -2390,6 +2395,127 @@ function resolveBrokerRestConfig(env = process.env) {
   return { baseUrl, token };
 }
 
+// ---------------------------------------------------------------------------
+// `nano work --auto`: zero-config engine-read enrolment (issue #66).
+//
+// Subscribe a generic worker to ALL deployed *agent* job types by reading the
+// demand straight from the engine (C8 REST) the worker already talks to — no
+// capability, no app enrol endpoint, no hub rendezvous. The engine is the
+// guaranteed shared rendezvous: if a worker can execute an app's agent jobs at
+// all, it and the app are already on the same engine, so "what agent job types
+// exist" is answerable from that engine alone.
+//
+// `@nanobpm/agentic/demand` already reads deployed `taskDefinition` leaves over
+// C8 REST (`process-definitions/search` → `/{key}/xml`), but its scanner reads
+// type/element/process only. Not every service task is an agent task — plain
+// connectors and record-keepers (e.g. `pr.record-plan`) are ordinary workers.
+// The demand scanner is therefore extended HERE to read `zeebe:taskHeaders` and
+// keep only leaves whose service task carries an `io.nanobpm.agentTask.` header
+// (e.g. `senior:plan` carries `io.nanobpm.agentTask.task.prompt`; a record-keeper
+// does not). Advertise the raw job-type string the engine matches (`senior:plan`)
+// verbatim — colon-named types are NOT forced through the agentic dot-grammar.
+// ---------------------------------------------------------------------------
+
+// True iff a serviceTask body carries a `zeebe:taskHeader` under the agent-task
+// namespace — the marker that distinguishes an agent task from a plain
+// connector / record-keeper. Matches the exact `io.nanobpm.agentTask` key and
+// any flattened `io.nanobpm.agentTask.*` dotpath key (element templates emit the
+// latter, e.g. `io.nanobpm.agentTask.task.prompt`).
+function serviceTaskHasAgentHeader(body) {
+  const headerRe = /<zeebe:header\b[^>]*\bkey\s*=\s*"([^"]*)"/g;
+  let m;
+  while ((m = headerRe.exec(body)) !== null) {
+    const key = m[1];
+    if (key === AGENT_TASK_NS || key.startsWith(`${AGENT_TASK_NS}.`)) return true;
+  }
+  return false;
+}
+
+// Scan one deployed BPMN document for its *agent* task-definition leaves: every
+// `<bpmn:serviceTask>` carrying BOTH a non-empty `<zeebe:taskDefinition type>`
+// AND an `io.nanobpm.agentTask.` task header. Returns `{ taskType, process }`
+// leaves in first-occurrence order. This is the header-aware extension of the
+// demand package's `scanTaskDefinitions` (which reads type/element/process only).
+function scanAgentTaskLeaves(xml) {
+  const source = String(xml || '');
+  const procMatch = source.match(/<bpmn:process\b[^>]*\bid\s*=\s*"([^"]*)"/);
+  const proc = procMatch ? procMatch[1] : '';
+  const out = [];
+  const blockRe = /<bpmn:serviceTask\b[^>]*>([\s\S]*?)<\/bpmn:serviceTask>/g;
+  let block;
+  while ((block = blockRe.exec(source)) !== null) {
+    const body = block[1];
+    const tdMatch = body.match(/<zeebe:taskDefinition\b[^>]*>/);
+    if (!tdMatch) continue;
+    const typeMatch = tdMatch[0].match(/\btype\s*=\s*"([^"]*)"/);
+    const taskType = typeMatch ? typeMatch[1] : '';
+    if (!taskType) continue;
+    if (!serviceTaskHasAgentHeader(body)) continue;
+    out.push({ taskType, process: proc });
+  }
+  return out;
+}
+
+// Read the distinct deployed *agent* job types through a demand C8RestReader
+// seam: enumerate the deployed definitions, fetch each one's BPMN XML, scan the
+// agent leaves, and return the distinct job types in first-occurrence order. An
+// optional `scope` narrows to one app/network — kept only when the leaf's
+// `bpmn:process` id equals or is prefixed by the scope string.
+async function readDeployedAgentJobTypes(reader, { scope = '' } = {}) {
+  const keys = await reader.searchProcessDefinitionKeys();
+  const seen = new Set();
+  const out = [];
+  for (const key of keys) {
+    const xml = await reader.getProcessDefinitionXml(key);
+    for (const leaf of scanAgentTaskLeaves(xml)) {
+      if (scope && !(leaf.process === scope || leaf.process.startsWith(scope))) continue;
+      if (seen.has(leaf.taskType)) continue;
+      seen.add(leaf.taskType);
+      out.push(leaf.taskType);
+    }
+  }
+  return out;
+}
+
+// Build the live C8 v2 REST reader from the broker REST config. `httpC8RestReader`
+// appends `/process-definitions/...` to its `restAddress`, and the C8 v2 API is
+// mounted under `/v2` on the broker (same base the linked-resource fetch uses),
+// so the reader's address is `<baseUrl>/v2`. The demand module is imported lazily
+// through the single agentic surface (`agentic.mjs`) so the whole agentic module
+// graph only loads when `--auto` is actually used.
+async function defaultC8RestReader(restConfig) {
+  const { demand } = await import('./agentic.mjs');
+  const base = String(restConfig?.baseUrl || DEFAULT_NANO_URL).replace(/\/+$/, '');
+  return demand.httpC8RestReader({
+    restAddress: `${base}/v2`,
+    token: restConfig?.token ? restConfig.token : undefined,
+  });
+}
+
+// Resolve the desired job-type set for `--auto`: all deployed agent job types
+// read from the engine, optionally scoped to one process-id/prefix. A test may
+// inject an in-memory `readerFactory` to drive it without a live engine. The
+// whole read is time-bounded (`timeoutMs`, 0 disables) and a timeout rejects
+// with a clear error, so a stalled engine read settles the awaited promise
+// (KEEP the running set) instead of wedging the reconcile — and, via shutdown's
+// `await inFlightReconcile`, wedging `Ctrl-C`/SIGTERM.
+async function resolveAutoJobTypes({ restConfig, scope = '', readerFactory, timeoutMs = AUTO_ENGINE_READ_TIMEOUT_MS } = {}) {
+  const read = (async () => {
+    const reader = readerFactory ? await readerFactory() : await defaultC8RestReader(restConfig);
+    return readDeployedAgentJobTypes(reader, { scope });
+  })();
+  if (!(timeoutMs > 0)) return read;
+  let timer;
+  const timeout = new Promise((_resolve, reject) => {
+    timer = setTimeout(() => reject(new Error(`engine read timed out after ${timeoutMs}ms`)), timeoutMs);
+  });
+  try {
+    return await Promise.race([read, timeout]);
+  } finally {
+    clearTimeout(timer);
+  }
+}
+
 // Build the content endpoint. Per issue #63 / nano-bpm #759 the non-binary
 // `/content` variant is deprecated for non-RPA types (Markdown → 406), so the
 // worker always fetches `/content/binary`.
@@ -3830,12 +3956,49 @@ async function workAgent(req, flags) {
     logger.error(jobTypeErrors.join('; '));
     process.exit(1);
   }
-  const jobTypes = [...new Set([...matrix, ...extraJobTypes])];
+  // Zero-config engine-read enrolment (issue #66). `--auto` subscribes this
+  // worker to ALL deployed *agent* job types read straight from the engine —
+  // no capability, no app enrol endpoint, no channel connection. It is the
+  // mutually-exclusive counterpart to capability-resolved SERVE: in `--auto`
+  // the rank×capability matrix is bypassed entirely (any deployed agent job is
+  // served, gated only by the `io.nanobpm.agentTask.` task header), and the
+  // desired set is reconciled by polling the engine rather than watching the
+  // profile. `--auto-scope <process-id|prefix>` narrows the blast radius to one
+  // app/network; without it, every agent job type on the engine is served.
+  //
+  // TRUST: engine-read has no capability gate — a `--auto` worker will serve any
+  // deployed agent job on its engine. That is the accepted trade for the
+  // local/zero-config target; capability-gated serving is the specialised path.
+  const autoMode = coerceBool(flags?.auto, false);
+  const autoScope = flags?.['auto-scope'] ? String(flags['auto-scope']).trim() : '';
+  if (!autoMode && autoScope) {
+    logger.error('--auto-scope requires --auto (it narrows the engine-read agent job types).');
+    process.exit(1);
+  }
   const camunda = globalThis.c8ctl.createClient();
 
   // Broker REST endpoint for live linked-resource prompts (issue #63) — the same
-  // nano endpoint this worker already talks to. Resolved once at startup.
+  // nano endpoint this worker already talks to. Resolved once at startup, and
+  // reused as the C8 REST source for `--auto`'s engine-read enrolment.
   const restConfig = resolveBrokerRestConfig();
+
+  // The desired job-type set. In `--auto` it is engine-read (∪ any --job-type
+  // extras); otherwise it is the rank×capability matrix (∪ extras). The initial
+  // engine read is best-effort — a transient failure starts the worker with no
+  // auto pollers and the poll reconcile below fills them in on the next pass,
+  // rather than refusing to start.
+  let jobTypes;
+  if (autoMode) {
+    try {
+      const autoTypes = await resolveAutoJobTypes({ restConfig, scope: autoScope });
+      jobTypes = [...new Set([...autoTypes, ...extraJobTypes])];
+    } catch (err) {
+      logger.warn(`--auto: initial engine read failed (${err?.message || err}); starting with no auto pollers — will retry on the next poll.`);
+      jobTypes = [...new Set(extraJobTypes)];
+    }
+  } else {
+    jobTypes = [...new Set([...matrix, ...extraJobTypes])];
+  }
 
   logger.info(`Putting "${name}" [${profile.rank}] to work → ${buildAgentCommandLine(profile.command, effectiveArgs)}`);
   logger.info(`  worker: ${workerName}`);
@@ -3843,6 +4006,9 @@ async function workAgent(req, flags) {
   logger.info(`  sandbox: ${sandbox}${isContainer ? ` (image ${image})` : ''}`);
   const profileEnvKeys = Object.keys(profileEnv);
   if (profileEnvKeys.length > 0) logger.info(`  harness env: ${profileEnvKeys.join(', ')}`);
+  if (autoMode) {
+    logger.info(`  enrolment: --auto (zero-config engine read${autoScope ? `, scope "${autoScope}"` : ', all agent job types'}) — no capability gate; serves any deployed agent job on this engine.`);
+  }
   const extraNote = extraJobTypes.length > 0 ? ` (${extraJobTypes.length} via --job-type)` : '';
   logger.info(`  listening on ${jobTypes.length} job type(s)${extraNote}: ${jobTypes.join('  ')}`);
   logger.info(`  max parallel: ${maxParallelJobs}; recovery window: ${recoveryWindowMs}ms; idle timeout: ${idleTimeoutMs}ms; hard cap: ${hardCapMs > 0 ? `${hardCapMs}ms` : 'off'}; poll timeout: ${pollTimeoutMs}ms`);
@@ -4248,12 +4414,20 @@ async function workAgent(req, flags) {
 
   for (const jobType of jobTypes) spawnJobType(jobType);
 
-  // ---- Live profile watch: reconcile the poller set when the watched profile's
-  // job types change (e.g. `c8ctl nano assign <name> …`) — start pollers for
-  // added types, gracefully drain pollers for removed types — without a restart
-  // and without disturbing unchanged types' in-flight work. ----
+  // ---- Live reconcile: keep the poller set in step with the desired job-type
+  // set — start pollers for added types, gracefully drain pollers for removed
+  // types — without a restart and without disturbing unchanged types' in-flight
+  // work. The DESIRED set comes from one of two sources depending on mode:
+  //   - default: the watched profile's rank×capability matrix (∪ --job-type),
+  //     reconciled when the on-disk profile changes (e.g. `nano assign`);
+  //   - --auto:  the engine's deployed *agent* job types, reconciled by polling
+  //     the engine (the deployed set changes as apps deploy/undeploy). ----
   const configFile = getConfigFile();
   const WATCH_INTERVAL_MS = 1500;
+  // How often `--auto` re-reads the engine's deployed agent job types to pick up
+  // newly deployed / undeployed agent processes. Deploys are occasional, so a
+  // few seconds of latency is fine; the read is a couple of cheap C8 REST calls.
+  const AUTO_POLL_INTERVAL_MS = 5000;
   let reconciling = false;
   // Set when a profile change arrives while a reconcile is already in flight, so
   // we run one more pass after the current drain completes instead of dropping
@@ -4263,10 +4437,21 @@ async function workAgent(req, flags) {
   // before snapshotting `workers` (avoids double-stops / missed drains).
   let inFlightReconcile = null;
 
-  // Desired job types from the CURRENT on-disk profile (matrix ∪ --job-type
-  // extras). Returns { skip } for a transient/torn read, a vanished profile, or
-  // an invalid edit — callers must then KEEP the running set, never tear down.
-  const desiredJobTypes = () => {
+  // Desired job types. In `--auto` this is the engine's deployed agent job types
+  // (∪ --job-type extras), read fresh each pass; a transient engine-read failure
+  // returns { skip } so the running set is KEPT, never torn down. Otherwise it is
+  // the CURRENT on-disk profile's matrix (∪ extras), with { skip } for a
+  // transient/torn read, a vanished profile, or an invalid edit — callers must
+  // then KEEP the running set, never tear down.
+  const desiredJobTypes = async () => {
+    if (autoMode) {
+      try {
+        const autoTypes = await resolveAutoJobTypes({ restConfig, scope: autoScope });
+        return { jobTypes: [...new Set([...autoTypes, ...extraJobTypes])] };
+      } catch (err) {
+        return { skip: `engine read failed: ${err?.message || err}` };
+      }
+    }
     let stored;
     try {
       stored = readHiresStrict()[name];
@@ -4309,9 +4494,11 @@ async function workAgent(req, flags) {
   };
 
   const runReconcilePass = async () => {
-      const desired = desiredJobTypes();
+      const desired = await desiredJobTypes();
       if (desired.skip) {
-        if (desired.skip === 'deleted') {
+        if (autoMode) {
+          logger.warn(`--auto reconcile skipped — ${desired.skip}; keeping the current ${workers.size} worker(s) running.`);
+        } else if (desired.skip === 'deleted') {
           logger.warn(`Profile "${name}" is gone from config — keeping the current ${workers.size} worker(s) running.`);
         } else {
           logger.warn(`Profile "${name}" reload skipped — ${desired.skip}; keeping current workers.`);
@@ -4320,7 +4507,8 @@ async function workAgent(req, flags) {
       }
       const { added, removed } = diffJobTypes([...workers.keys()], desired.jobTypes);
       if (added.length === 0 && removed.length === 0) return;
-      logger.info(`Profile "${name}" changed — reconciling job types (+${added.length} / -${removed.length}).`);
+      const source = autoMode ? 'engine deployed set' : `Profile "${name}"`;
+      logger.info(`${source} changed — reconciling job types (+${added.length} / -${removed.length}).`);
       for (const jt of added) {
         spawnJobType(jt);
         logger.info(`  + now listening on ${jt}`);
@@ -4344,37 +4532,58 @@ async function workAgent(req, flags) {
       logger.info(`  now listening on ${workers.size} job type(s): ${[...workers.keys()].join('  ')}`);
   };
 
-  // `watchFile` (polling stat) is deliberate over `fs.watch`: it survives the
-  // atomic temp+rename that `writeConfig` does (fs.watch would rebind to the old
-  // inode and go silent), and it's uniform across platforms. Profile edits are
-  // rare + manual, so a ~1.5s poll latency is fine.
-  watchFile(configFile, { interval: WATCH_INTERVAL_MS }, (curr, prev) => {
-    // Fires each interval; act only on real changes. Compare mtime, ctime and
-    // size, not mtime alone: on filesystems with coarse mtime resolution (or two
-    // edits within one mtime tick) mtimeMs can be unchanged while size/ctimeMs
-    // differ, and an mtime-only guard would skip a genuine profile update.
-    if (
-      curr.mtimeMs === prev.mtimeMs &&
-      curr.ctimeMs === prev.ctimeMs &&
-      curr.size === prev.size
-    ) return;
-    // `reconcile()` owns the `inFlightReconcile` handle: a change arriving while
-    // a reconcile is already running coalesces into the current pass and returns
-    // that same in-flight promise, so shutdown always waits for the real one.
-    reconcile().catch((err) => logger.warn(`profile reload failed: ${err?.message || err}`));
-  });
+  // Reconcile trigger. In `--auto` a periodic engine poll re-reads the deployed
+  // agent job types; otherwise a profile-file watch fires on profile edits.
+  let autoPollTimer = null;
+  if (autoMode) {
+    // Self-standing interval poll (not watchFile) since the desired set is
+    // derived from the engine, not the on-disk profile. Skip a tick while a
+    // reconcile is already in flight: calling reconcile() then would set
+    // reconcileRequested and make the in-flight pass loop back-to-back, so an
+    // engine read that consistently outlasts AUTO_POLL_INTERVAL_MS would run
+    // reconciles as fast as the read completes and hammer the broker. Skipping
+    // keeps polling rate-limited to the configured interval regardless of
+    // engine-read latency; the next tick re-reads the latest engine state.
+    autoPollTimer = setInterval(() => {
+      if (inFlightReconcile) return;
+      reconcile().catch((err) => logger.warn(`--auto reconcile failed: ${err?.message || err}`));
+    }, AUTO_POLL_INTERVAL_MS);
+    if (typeof autoPollTimer.unref === 'function') autoPollTimer.unref();
+  } else {
+    // `watchFile` (polling stat) is deliberate over `fs.watch`: it survives the
+    // atomic temp+rename that `writeConfig` does (fs.watch would rebind to the old
+    // inode and go silent), and it's uniform across platforms. Profile edits are
+    // rare + manual, so a ~1.5s poll latency is fine.
+    watchFile(configFile, { interval: WATCH_INTERVAL_MS }, (curr, prev) => {
+      // Fires each interval; act only on real changes. Compare mtime, ctime and
+      // size, not mtime alone: on filesystems with coarse mtime resolution (or two
+      // edits within one mtime tick) mtimeMs can be unchanged while size/ctimeMs
+      // differ, and an mtime-only guard would skip a genuine profile update.
+      if (
+        curr.mtimeMs === prev.mtimeMs &&
+        curr.ctimeMs === prev.ctimeMs &&
+        curr.size === prev.size
+      ) return;
+      // `reconcile()` owns the `inFlightReconcile` handle: a change arriving while
+      // a reconcile is already running coalesces into the current pass and returns
+      // that same in-flight promise, so shutdown always waits for the real one.
+      reconcile().catch((err) => logger.warn(`profile reload failed: ${err?.message || err}`));
+    });
+  }
 
   // Keep the process alive until a stop signal, then drain gracefully.
   await new Promise((resolve) => {
     const stop = async (signal) => {
       if (draining) return;
       draining = true;
-      // Stop watching first so no new reconcile can be triggered, then wait for
-      // any in-flight reconcile to finish before snapshotting `workers` — this
-      // prevents double-stops, missed drains, or a wrong worker count on exit.
-      unwatchFile(configFile);
+      // Stop the reconcile trigger first so no new reconcile can be triggered,
+      // then wait for any in-flight reconcile to finish before snapshotting
+      // `workers` — this prevents double-stops, missed drains, or a wrong worker
+      // count on exit.
+      if (autoPollTimer) clearInterval(autoPollTimer);
+      else unwatchFile(configFile);
       if (inFlightReconcile) {
-        logger.info('Waiting for in-flight profile reconcile to finish before shutdown…');
+        logger.info('Waiting for in-flight reconcile to finish before shutdown…');
         await inFlightReconcile;
       }
       const list = [...workers.values()];
@@ -4465,6 +4674,8 @@ const WORK_FORWARD_FLAGS = {
   'clone-timeout': 'value',
   'keep-runs': 'boolean',
   stream: 'boolean',
+  auto: 'boolean',
+  'auto-scope': 'value',
   arg: 'list',
   env: 'list',
   'job-type': 'list',
@@ -4477,11 +4688,21 @@ const WORK_FORWARD_FLAGS = {
 function reconstructWorkArgs(flags) {
   const out = [];
   if (!flags || typeof flags !== 'object') return out;
+  // `--auto-scope` is meaningless without `--auto` — `workAgent` exits fast with
+  // "--auto-scope requires --auto". Forwarding the orphan flag to a supervised
+  // worker would guarantee an immediate crash/restart loop, so drop it here at
+  // the forwarding boundary when `--auto` is not truthy (mirrors that guard).
+  // Parse booleans through `coerceBool()` so forwarding matches `workAgent`'s
+  // parsing semantics — c8ctl may pass boolean flags as strings like `'1'`,
+  // `'yes'` or `'on'`, and treating only `true`/`'true'` as enabled would
+  // silently drop `--auto`/`--keep-runs`/`--stream` for supervised workers.
+  const autoOn = coerceBool(flags.auto, false);
   for (const [name, kind] of Object.entries(WORK_FORWARD_FLAGS)) {
+    if (name === 'auto-scope' && !autoOn) continue;
     const v = flags[name];
     if (v === undefined || v === null) continue;
     if (kind === 'boolean') {
-      if (v === true || v === 'true') out.push(`--${name}`);
+      if (coerceBool(v, false)) out.push(`--${name}`);
     } else if (kind === 'list') {
       const items = Array.isArray(v) ? v : [v];
       for (const item of items) {
@@ -7301,6 +7522,10 @@ export {
   jobTypeMatrix,
   diffJobTypes,
   parseJobTypeFlags,
+  serviceTaskHasAgentHeader,
+  scanAgentTaskLeaves,
+  readDeployedAgentJobTypes,
+  resolveAutoJobTypes,
   derivePollTimeoutMs,
   AGENT_TASK_NS,
   AGENT_RESULT_KEY,
@@ -7382,6 +7607,8 @@ export const metadata = {
         { command: 'c8ctl nano hire --name coder --rank senior --command copilot --terminal pty', description: 'Opt this role into a full, steerable live terminal (PTY) streamed on the agentic relay lane (default: pipe)' },
         { command: 'c8ctl nano assign reviewer code-review,testing', description: 'Grant more capabilities (comma-separated, like hire) to an existing hire — additive; running workers hot-reload it' },
         { command: 'c8ctl nano work reviewer', description: 'Spawn Nano job workers for the "reviewer" profile and poll for work' },
+        { command: 'c8ctl nano work coder --auto', description: 'Zero-config: serve every deployed agent job type read straight from the engine — no capability, no wiring (great for a local single-tenant plane)' },
+        { command: 'c8ctl nano work coder --auto --auto-scope my-app', description: 'Zero-config, scoped to one app: serve only agent job types deployed under process ids prefixed "my-app"' },
         { command: 'c8ctl nano work coder --sandbox docker --image ghcr.io/acme/agent:1', description: 'Run jobs in isolated containers with disk-hygiene reaping' },
         { command: 'NANO_AGENTIC_URL=http://localhost:8080 NANO_AGENTIC_TOKEN=<identity-token> NANO_AGENTIC_CREDENTIAL=<capability-cred> c8ctl nano work reviewer', description: 'Enrol the worker on the app\'s same-port /agentic channel so it appears live (presence + relay terminals) on the Workforce visibility page' },
         { command: 'c8ctl nano supervisor start --worker reviewer --worker coder', description: 'Start a detached supervisor managing several workers from one terminal' },
@@ -7456,6 +7683,8 @@ export const commands = {
       'lock-grace': { type: 'string', description: 'work: DEPRECATED and ignored — the broker lock is now auto-managed via --recovery-window.' },
       'poll-timeout': { type: 'string', description: 'work: broker long-poll window in ms each activateJobs request is held open (fewer reconnects → fewer transient connect errors); default 30000, 0 = broker default, negative = return immediately' },
       'job-type': { type: 'string', multiple: true, description: 'work: extra job type to service alongside the rank×capability matrix (repeatable)' },
+      auto: { type: 'boolean', description: 'work: zero-config enrolment — serve ALL deployed agent job types read straight from the engine (no capability, no app enrol endpoint, no channel). Mutually exclusive with capability-resolved serving; has NO capability gate (serves any deployed agent job on the engine).' },
+      'auto-scope': { type: 'string', description: 'work: with --auto, narrow the served agent job types to those whose bpmn:process id equals or is prefixed by this value (one app/network). Default: all agent job types on the engine.' },
       worker: { type: 'string', multiple: true, description: 'supervisor start: profile to launch as a supervised worker (repeatable)' },
       instances: { type: 'string', description: `supervisor add: spawn N distinct auto-named instances of the profile in one call (default 1, max ${MAX_ADD_INSTANCES}; cannot combine with --name)` },
       attach: { type: 'boolean', description: 'supervisor start: attach the interactive console after starting the daemon' },
@@ -7613,7 +7842,7 @@ function printUsage() {
   console.log('  c8ctl nano update [--check]');
   console.log('  c8ctl nano hire [--name <n>] [--rank <r>] [--command <c>] [--arg <switch> ...] [--model <m>] [--capabilities <a,b>] [--sandbox none|docker|podman] [--image <ref>] [--terminal pty|pipe] [--env NAME=VALUE ...] [--list]');
   console.log('  c8ctl nano assign <profileName> <cap[,cap...]> [--name <n>] [--capabilities <a,b>]');
-  console.log('  c8ctl nano work <profileName> [--arg <switch> ...] [--max-parallel <n>] [--recovery-window <ms>] [--idle-timeout <ms>] [--job-timeout <ms>] [--poll-timeout <ms>] [--job-type <token> ...] [--sandbox none|docker|podman] [--image <ref>] [--env NAME=VALUE ...] [--secret-resolver host] [--min-free-mb <n>] [--clone-timeout <ms>] [--keep-runs] [--stream]');
+  console.log('  c8ctl nano work <profileName> [--auto [--auto-scope <p>]] [--arg <switch> ...] [--max-parallel <n>] [--recovery-window <ms>] [--idle-timeout <ms>] [--job-timeout <ms>] [--poll-timeout <ms>] [--job-type <token> ...] [--sandbox none|docker|podman] [--image <ref>] [--env NAME=VALUE ...] [--secret-resolver host] [--min-free-mb <n>] [--clone-timeout <ms>] [--keep-runs] [--stream]');
   console.log('  c8ctl nano supervisor [start|status|add|remove|restart|stop|logs|attach] ... (manage many workers from one terminal)');
   console.log('');
   console.log('Subcommands:');
@@ -7660,6 +7889,8 @@ function printUsage() {
   console.log('  --list               hire: list existing agent profiles instead of creating one');
   console.log('  --max-parallel <n>   work: max concurrent jobs per worker (default 1)');
   console.log('  --job-type <token>   work: extra job type to service alongside the rank×capability matrix (repeatable)');
+  console.log('  --auto               work: zero-config enrolment — serve ALL deployed agent job types read from the engine (no capability, no app enrol endpoint, no channel). NO capability gate: serves any deployed agent job on the engine.');
+  console.log('  --auto-scope <p>     work: with --auto, narrow to agent job types whose bpmn:process id equals or is prefixed by <p> (one app/network); default all');
   console.log('  --recovery-window <ms> work: broker activation-lock window, auto-refreshed while the agent runs; also the node-loss reclaim time (default 300000)');
   console.log('  --idle-timeout <ms>  work: max silence (no agent stdout/stderr) before the harness is killed as wedged and the job reclaimed (default 300000)');
   console.log('  --job-timeout <ms>   work: OPTIONAL absolute hard cap on total harness runtime; killed past this (default 0 = unlimited)');

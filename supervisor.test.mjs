@@ -44,10 +44,37 @@ test('reconstructWorkArgs emits boolean flags only when true, with no value', ()
   assert.deepEqual(reconstructWorkArgs({ stream: 'true' }), ['--stream']);
 });
 
+test('reconstructWorkArgs parses booleans via coerceBool (string spellings)', () => {
+  // c8ctl may pass boolean flags as strings; forwarding must match workAgent's
+  // coerceBool semantics so `'1'`/`'yes'`/`'on'` still enable the flag and
+  // `'0'`/`'no'`/`'off'` still drop it.
+  assert.deepEqual(reconstructWorkArgs({ stream: '1', 'keep-runs': 'yes' }), ['--keep-runs', '--stream']);
+  assert.deepEqual(reconstructWorkArgs({ stream: 'on' }), ['--stream']);
+  assert.deepEqual(reconstructWorkArgs({ stream: '0', 'keep-runs': 'off' }), []);
+  // A truthy string spelling of --auto also gates --auto-scope forwarding.
+  assert.deepEqual(
+    reconstructWorkArgs({ auto: 'on', 'auto-scope': 'my-app' }),
+    ['--auto', '--auto-scope', 'my-app'],
+  );
+});
+
 test('reconstructWorkArgs repeats list flags once per item', () => {
   assert.deepEqual(
     reconstructWorkArgs({ 'job-type': ['a:b', 'c:d'], env: 'X=1' }),
     ['--env', 'X=1', '--job-type', 'a:b', '--job-type', 'c:d'],
+  );
+});
+
+test('reconstructWorkArgs forwards --auto and --auto-scope to supervised workers', () => {
+  assert.deepEqual(reconstructWorkArgs({ auto: true }), ['--auto']);
+  // --auto-scope without --auto is dropped: forwarding the orphan flag would
+  // make the supervised worker exit fast ("--auto-scope requires --auto") and
+  // wedge the supervisor into a crash/restart loop.
+  assert.deepEqual(reconstructWorkArgs({ auto: false, 'auto-scope': 'my-app' }), []);
+  assert.deepEqual(reconstructWorkArgs({ 'auto-scope': 'my-app' }), []);
+  assert.deepEqual(
+    reconstructWorkArgs({ auto: true, 'auto-scope': 'my-app' }),
+    ['--auto', '--auto-scope', 'my-app'],
   );
 });
 

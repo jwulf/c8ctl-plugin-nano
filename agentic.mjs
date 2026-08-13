@@ -75,6 +75,19 @@ export * as relay from '@nanobpm/agentic/relay';
 export * as transcript from '@nanobpm/agentic/transcript';
 
 // ---------------------------------------------------------------------------
+// Demand read — @nanobpm/agentic/demand.
+//
+// The read-only C8 REST mirror of the engine's deployed `taskDefinition` leaves
+// (ADR 0056 S4). `nano work --auto` (jwulf/c8ctl-plugin-nano#66) consumes its
+// `httpC8RestReader` to enumerate deployed process definitions and read each
+// one's BPMN XML straight from the engine the worker already talks to — the
+// zero-config enrolment source. The header-filter that narrows those leaves to
+// *agent* job types lives in the plugin (`scanAgentTaskLeaves`), extending the
+// package's type/element/process-only scanner with a `zeebe:taskHeaders` read.
+// ---------------------------------------------------------------------------
+export * as demand from '@nanobpm/agentic/demand';
+
+// ---------------------------------------------------------------------------
 // Worker-side channel client — @nanobpm/urban-agent-client.
 //
 // The client's published `dist/protocol.js` imports the contract from

@@ -59,6 +59,7 @@ import { createInterface as createReadline } from 'node:readline';
 import { platformForHost } from './platforms.mjs';
 import { createWorkChannel, redactAgenticUrl, buildAgenticUrl } from './work-channel.mjs';
 import { createRelaySession, roleTerminalMode } from './work-relay.mjs';
+import { createBufferMonitor, resolveBufferCapacity } from './work-buffer.mjs';
 
 const requireFromHere = createRequire(import.meta.url);
 const pluginDir = dirname(fileURLToPath(import.meta.url));
@@ -3469,7 +3470,13 @@ function resolveAgenticConfig() {
   const token = process.env.NANO_AGENTIC_TOKEN || cfg.agenticToken || '';
   const credential = process.env.NANO_AGENTIC_CREDENTIAL || cfg.agenticCredential || '';
   if (!url || !token || !credential) return null;
-  return { url, token, credential };
+  // Outbound hub-down buffer bound (frames). Operator-tunable (C4, #43) so a
+  // long expected outage can be given more headroom; resolveBufferCapacity
+  // validates it to a positive integer and falls back to the client default.
+  const bufferCapacity = resolveBufferCapacity(
+    process.env.NANO_AGENTIC_BUFFER_CAPACITY ?? cfg.agenticBufferCapacity,
+  );
+  return { url, token, credential, bufferCapacity };
 }
 
 /**
@@ -3720,6 +3727,8 @@ async function workAgent(req, flags) {
   // recorders can refresh presence with the live job set as jobs start/end.
   /** @type {import('./work-channel.mjs').WorkChannel | null} */
   let workChannel = null;
+  /** @type {import('./work-buffer.mjs').BufferMonitor | null} */
+  let bufferMonitor = null;
   // Maintain `activeJobs` unconditionally: it feeds both the supervisor activity
   // file (gated inside writeActivity) AND the agentic presence frame's live
   // jobKey set, so a standalone worker (no NANO_SUPERVISOR_ACTIVITY_FILE) still
@@ -3763,13 +3772,22 @@ async function workAgent(req, flags) {
         url: agenticCfg.url,
         token: agenticCfg.token,
         credential: agenticCfg.credential,
+        bufferCapacity: agenticCfg.bufferCapacity,
         logger,
       });
       const shown = redactAgenticUrl(buildAgenticUrl(agenticCfg.url, {}));
       logger.info(`  agentic channel: announcing presence as ${workerName} on ${shown}`);
+      // C4 (#43): observe the client's built-in outbound buffer across the
+      // channel lifecycle — surface a high-water mark and warn when the bound
+      // is hit so a hub outage that starts shedding frames is never silent.
+      bufferMonitor = createBufferMonitor(workChannel, {
+        capacity: agenticCfg.bufferCapacity,
+        logger,
+      });
     } catch (err) {
       // Never let a channel failure stop the worker from doing its actual job.
       workChannel = null;
+      bufferMonitor = null;
       logger.warn(`  agentic channel unavailable (${err?.message || err}); continuing without visibility.`);
     }
   } else {
@@ -4189,6 +4207,10 @@ async function workAgent(req, flags) {
       // from the page only once its jobs have drained. Best-effort — a channel
       // teardown must never hang shutdown.
       if (workChannel) {
+        // Stop the buffer monitor first so its sampler can't fire mid-teardown.
+        try {
+          bufferMonitor?.stop();
+        } catch { /* best effort */ }
         try {
           await workChannel.stop(`worker stopped (${signal})`);
           logger.info('Deregistered from the agentic visibility channel.');

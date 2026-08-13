@@ -26,6 +26,7 @@
     "agentic-loader-hook.mjs",
     "work-channel.mjs",
     "work-relay.mjs",
+    "work-buffer.mjs",
     "nanobpmn-binary.json",
     "README.md"
   ],

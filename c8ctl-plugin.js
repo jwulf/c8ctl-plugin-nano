@@ -2351,8 +2351,9 @@ function pickLinkedResource(linkedResources, linkName = DEFAULT_PROMPT_LINK_NAME
 // cluster is unauthenticated, so the token is optional; when set (e.g. against a
 // secured gateway) it is sent as a Bearer credential.
 function resolveBrokerRestConfig(env = process.env) {
-  let cfg = {};
-  try { cfg = readConfig() || {}; } catch { cfg = {}; }
+  // readConfig() swallows parse/IO errors and never throws (returns {}), so no
+  // local try/catch is needed here.
+  const cfg = readConfig() || {};
   const baseUrl =
     env.NANO_REST_URL ||
     env.NANO_BASE_URL ||

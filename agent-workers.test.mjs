@@ -1031,6 +1031,42 @@ test('resolveCommitterIdentity: a *@nano.local (or non-routable) author is never
   }
 });
 
+test('resolveCommitterIdentity: whitespace-only name/email fields fall through as absent', () => {
+  const savedName = process.env.GIT_AUTHOR_NAME;
+  const savedEmail = process.env.GIT_AUTHOR_EMAIL;
+  try {
+    // A launcher that injects space-padded/whitespace-only GIT_AUTHOR_* must not
+    // have that blank value treated as "present" — it would block per-field
+    // fallthrough and get stamped as an invalid commit identity. Blank fields
+    // behave like absent, so the git-global identity fills them per field.
+    process.env.GIT_AUTHOR_NAME = '   ';
+    process.env.GIT_AUTHOR_EMAIL = '   ';
+    const filled = resolveCommitterIdentity({
+      gitIdentity: () => ({ name: 'Grace Hopper', email: 'grace@example.com' }),
+      ghIdentity: () => ({ name: 'octocat', email: '12345+octocat@users.noreply.github.com' }),
+    });
+    assert.deepEqual(
+      { name: filled.name, email: filled.email, source: filled.source },
+      { name: 'Grace Hopper', email: 'grace@example.com', source: 'git-global' },
+      'whitespace-only env fields are treated as absent and filled from git-global');
+
+    // Space-padded but otherwise valid fields are trimmed rather than stamped raw.
+    process.env.GIT_AUTHOR_NAME = '  Ada Lovelace  ';
+    process.env.GIT_AUTHOR_EMAIL = '  ada@example.com  ';
+    const trimmed = resolveCommitterIdentity({
+      gitIdentity: () => ({ name: '', email: '' }),
+      ghIdentity: () => ({ name: '', email: '' }),
+    });
+    assert.deepEqual(
+      { name: trimmed.name, email: trimmed.email, source: trimmed.source },
+      { name: 'Ada Lovelace', email: 'ada@example.com', source: 'env' },
+      'space-padded env fields are trimmed, not stamped with surrounding whitespace');
+  } finally {
+    if (savedName === undefined) delete process.env.GIT_AUTHOR_NAME; else process.env.GIT_AUTHOR_NAME = savedName;
+    if (savedEmail === undefined) delete process.env.GIT_AUTHOR_EMAIL; else process.env.GIT_AUTHOR_EMAIL = savedEmail;
+  }
+});
+
 test('provisionRepo stamps the operator identity onto the workspace (commits as the human)', { skip: !gitOk }, () => {
   const { root, origin } = makeOriginRepo();
   const runDir = mkdtempSync(join(root, 'run-'));

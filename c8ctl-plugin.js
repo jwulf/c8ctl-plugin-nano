@@ -2884,9 +2884,13 @@ function isPlaceholderEmail(email) {
 // (e.g. `trial-merge`) would be stitched onto a borrowed email from a lower
 // source, forging a Frankenstein author. An empty email is preserved as-is so
 // ordinary per-field fill still works (e.g. git supplies a name, gh the email).
+// Fields are trimmed so a whitespace-only/space-padded name or email behaves
+// like "absent" (empty) rather than a truthy value that would block per-field
+// fallthrough and get stamped as an invalid commit identity — this matches
+// isPlaceholderEmail, which already normalizes via trim().
 function sanitizeIdentity(id) {
-  const name = (id && id.name) || '';
-  const email = (id && id.email) || '';
+  const name = String((id && id.name) || '').trim();
+  const email = String((id && id.email) || '').trim();
   if (isPlaceholderEmail(email)) return { name: '', email: '' };
   return { name, email };
 }

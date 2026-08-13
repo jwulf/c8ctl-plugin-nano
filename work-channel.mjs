@@ -36,6 +36,7 @@ const DEFAULT_HEARTBEAT_MS = 10_000;
 // before the app from losing its early presence/relay frames.
 const DEFAULT_BUFFER_CAPACITY = 1024;
 
+export { DEFAULT_BUFFER_CAPACITY };
 /**
  * Build the worker's agentic-channel WebSocket URL from the app's HTTP base URL
  * plus the ADR 0028 identity token and capability credential, carried as query

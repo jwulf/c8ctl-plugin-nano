@@ -3777,18 +3777,27 @@ async function workAgent(req, flags) {
       });
       const shown = redactAgenticUrl(buildAgenticUrl(agenticCfg.url, {}));
       logger.info(`  agentic channel: announcing presence as ${workerName} on ${shown}`);
-      // C4 (#43): observe the client's built-in outbound buffer across the
-      // channel lifecycle — surface a high-water mark and warn when the bound
-      // is hit so a hub outage that starts shedding frames is never silent.
-      bufferMonitor = createBufferMonitor(workChannel, {
-        capacity: agenticCfg.bufferCapacity,
-        logger,
-      });
     } catch (err) {
       // Never let a channel failure stop the worker from doing its actual job.
       workChannel = null;
-      bufferMonitor = null;
       logger.warn(`  agentic channel unavailable (${err?.message || err}); continuing without visibility.`);
+    }
+    // C4 (#43): observe the client's built-in outbound buffer across the
+    // channel lifecycle — surface a high-water mark and warn when the bound
+    // is hit so a hub outage that starts shedding frames is never silent. The
+    // monitor is observability-only, so keep it OUTSIDE the channel try/catch:
+    // a monitor failure must never null out a healthy channel and take down
+    // presence/visibility.
+    if (workChannel) {
+      try {
+        bufferMonitor = createBufferMonitor(workChannel, {
+          capacity: agenticCfg.bufferCapacity,
+          logger,
+        });
+      } catch (err) {
+        bufferMonitor = null;
+        logger.warn(`  agentic buffer monitor unavailable (${err?.message || err}); channel presence still active.`);
+      }
     }
   } else {
     logger.info('  agentic channel: not enrolled (set NANO_AGENTIC_URL + NANO_AGENTIC_TOKEN + NANO_AGENTIC_CREDENTIAL to appear on the visibility page).');

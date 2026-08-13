@@ -37,7 +37,12 @@
 // channel, and it never produces frames of its own. It is pure observation over
 // the one connected client.
 
-const DEFAULT_BUFFER_CAPACITY = 1024;
+// The outbound-ring bound (frames) the client buffers while the hub is
+// unreachable. Single-sourced from the transport seam (`work-channel.mjs`),
+// which applies it to the client, so the "falls back to the client default"
+// contract stays accurate from one edit — no drift-prone second literal here.
+import { DEFAULT_BUFFER_CAPACITY } from './work-channel.mjs';
+
 const DEFAULT_SAMPLE_INTERVAL_MS = 1_000;
 
 export { DEFAULT_BUFFER_CAPACITY };

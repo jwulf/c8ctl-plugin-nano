@@ -32,7 +32,7 @@
   },
   "license": "MIT",
   "engines": {
-    "node": ">=18"
+    "node": ">=22.6"
   },
   "c8ctl": {
     "defaults": {

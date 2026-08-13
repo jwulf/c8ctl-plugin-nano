@@ -57,6 +57,7 @@ import { fileURLToPath } from 'node:url';
 import { createInterface } from 'node:readline/promises';
 import { createInterface as createReadline } from 'node:readline';
 import { platformForHost } from './platforms.mjs';
+import { createWorkChannel, redactAgenticUrl, buildAgenticUrl } from './work-channel.mjs';
 
 const requireFromHere = createRequire(import.meta.url);
 const pluginDir = dirname(fileURLToPath(import.meta.url));
@@ -3237,6 +3238,32 @@ function buildResultEnvelope(result, { sandbox, image, git, result: agentResult 
 }
 
 /**
+ * Resolve the agentic-visibility channel connection target + credentials for a
+ * worker (ADR 0056 — slice C2). The channel is served same-port on the app's own
+ * HTTP base URL at `/agentic`; the identity token + capability credential follow
+ * the blackboard's `?token=…` pattern.
+ *
+ * Env wins over persisted config; the base URL falls back to the configured nano
+ * URL (the app's own port). A worker only connects when BOTH an identity token
+ * and a capability credential are present (enrolment) — absent either, it runs
+ * exactly as before, off the visibility page. Returns `null` when not enrolled.
+ *
+ * @returns {{ url: string, token: string, credential: string } | null}
+ */
+function resolveAgenticConfig() {
+  const cfg = readConfig();
+  const url = process.env.NANO_AGENTIC_URL
+    || cfg.agenticUrl
+    || cfg.nanoUrl
+    || process.env.NANO_BASE_URL
+    || DEFAULT_NANO_URL;
+  const token = process.env.NANO_AGENTIC_TOKEN || cfg.agenticToken || '';
+  const credential = process.env.NANO_AGENTIC_CREDENTIAL || cfg.agenticCredential || '';
+  if (!url || !token || !credential) return null;
+  return { url, token, credential };
+}
+
+/**
  * work — turn a hire profile into live Nano job workers (one per job-type in
  * the rank×capability matrix) and poll for work in the foreground until Ctrl-C.
  * Uses the c8ctl-provided SDK client (globalThis.c8ctl.createClient()).
@@ -3480,18 +3507,65 @@ async function workAgent(req, flags) {
       /* best effort — activity is advisory, never fail a job over it */
     }
   };
+  // The agentic-visibility channel, wired below. Declared here so the job
+  // recorders can refresh presence with the live job set as jobs start/end.
+  /** @type {import('./work-channel.mjs').WorkChannel | null} */
+  let workChannel = null;
+  // Maintain `activeJobs` unconditionally: it feeds both the supervisor activity
+  // file (gated inside writeActivity) AND the agentic presence frame's live
+  // jobKey set, so a standalone worker (no NANO_SUPERVISOR_ACTIVITY_FILE) still
+  // reports its current jobs on the visibility page.
   const recordJobStart = (job, jobType) => {
-    if (!activityFile) return;
     activeJobs.set(String(job.jobKey), { type: jobType, since: Date.now() });
     writeActivity();
+    workChannel?.refreshPresence();
   };
   const recordJobEnd = (job) => {
-    if (!activityFile) return;
     activeJobs.delete(String(job.jobKey));
     writeActivity();
+    workChannel?.refreshPresence();
   };
   // Seed an initial idle marker so status reports 'idle' immediately after spawn.
   writeActivity();
+
+  // ---- Agentic visibility channel (ADR 0056 — slice C2, #41) ----------------
+  // Connect this worker to the app's same-port `/agentic` channel and announce
+  // presence (identity, host, live jobs), heartbeat, and deregister on exit, so
+  // it appears live on the Workforce visibility page. This is the SINGLE place
+  // the connected+authenticated channel client is instantiated in `work`: the
+  // sibling slices C3 (PTY relay, #42) and C4 (buffer, #43) attach to the
+  // accessors on `workChannel` (relay-lane sink + connect/disconnect/reconnect
+  // lifecycle events) rather than opening their own connection.
+  //
+  // Enrolment is opt-in: without an identity token + capability credential the
+  // worker runs exactly as before, off the channel (see resolveAgenticConfig).
+  const agenticCfg = resolveAgenticConfig();
+  if (agenticCfg) {
+    try {
+      workChannel = await createWorkChannel({
+        instance: workerName,
+        host: hostname(),
+        capability: {
+          cognition: profile.rank,
+          family: profile.model || undefined,
+          host: hostname(),
+        },
+        listJobKeys: () => [...activeJobs.keys()],
+        url: agenticCfg.url,
+        token: agenticCfg.token,
+        credential: agenticCfg.credential,
+        logger,
+      });
+      const shown = redactAgenticUrl(buildAgenticUrl(agenticCfg.url, {}));
+      logger.info(`  agentic channel: announcing presence as ${workerName} on ${shown}`);
+    } catch (err) {
+      // Never let a channel failure stop the worker from doing its actual job.
+      workChannel = null;
+      logger.warn(`  agentic channel unavailable (${err?.message || err}); continuing without visibility.`);
+    }
+  } else {
+    logger.info('  agentic channel: not enrolled (set NANO_AGENTIC_URL + NANO_AGENTIC_TOKEN + NANO_AGENTIC_CREDENTIAL to appear on the visibility page).');
+  }
 
   // A per-job-type worker factory. Captures all the CLI-local + profile context
   // in closure scope so the profile watcher below can (re)spawn a poller for any
@@ -3864,6 +3938,17 @@ async function workAgent(req, flags) {
         logger.warn(`${stopFailures} of ${list.length} worker(s) did not stop cleanly; some connections may still be open.`);
       } else {
         logger.info('All workers stopped.');
+      }
+      // Deregister from the visibility channel LAST, so the worker disappears
+      // from the page only once its jobs have drained. Best-effort — a channel
+      // teardown must never hang shutdown.
+      if (workChannel) {
+        try {
+          await workChannel.stop(`worker stopped (${signal})`);
+          logger.info('Deregistered from the agentic visibility channel.');
+        } catch (err) {
+          logger.warn(`agentic channel deregister failed: ${err?.message || err}`);
+        }
       }
       resolve();
     };

@@ -15,6 +15,10 @@
 // this repo's consumption in lock-step with the hub — see
 // `agentic-conformance.test.mjs`.
 
+// Node's module-customization registrar, used lazily by `loadAgenticClient()`
+// to install the source→dist resolve hook before the worker client loads.
+import { register as moduleRegister } from 'node:module';
+
 // ---------------------------------------------------------------------------
 // Wire contract — @nanobpm/agentic/protocol (S0, the single source of truth).
 // The codec, routing-token grammar, vocab schema and per-family payload
@@ -80,13 +84,35 @@ export * as transcript from '@nanobpm/agentic/transcript';
 // (ERR_UNSUPPORTED_NODE_MODULES_TYPE_STRIPPING), so a *static* re-export of the
 // client would make this whole surface fail to load. To keep C0's surface
 // loadable everywhere while still routing all client consumption through one
-// swap point, the client is exposed behind a lazy async loader. The slice that
-// actually opens the channel (C2, #41) awaits it from the code path that runs
-// under the appropriate loader/build.
+// swap point, the client is exposed behind a lazy async loader.
+//
+// C2 (#41) resolves that constraint HERE, at the single swap point: before the
+// client's module graph loads, `loadAgenticClient()` registers a resolve hook
+// (`agentic-loader-hook.mjs`) that redirects the client's raw-`.ts`
+// `@nanobpm/agentic/source/*` imports to the compiled `@nanobpm/agentic/*`
+// `dist` exports. Source and dist are the same S0 contract (one shared
+// conformance corpus), so the client loads and runs under stock Node with no
+// change in behaviour. When the client is republished to import agentic's dist
+// directly, the redirect self-neutralises.
 //
 // @typedef {import('@nanobpm/urban-agent-client')} AgenticClientModule
 /** @type {Promise<AgenticClientModule> | undefined} */
 let clientModulePromise;
+
+// Guards single registration of the source→dist resolve hook (idempotent).
+let sourceRedirectRegistered = false;
+
+/**
+ * Register the `@nanobpm/agentic/source/*` → `dist` resolve hook exactly once,
+ * so the worker client is importable under stock Node. Safe to call repeatedly;
+ * only the first call registers. Runs before any `import()` of the client so the
+ * hook is active for the client's whole module graph.
+ */
+function ensureClientLoadable() {
+  if (sourceRedirectRegistered) return;
+  sourceRedirectRegistered = true;
+  moduleRegister('./agentic-loader-hook.mjs', import.meta.url);
+}
 
 /**
  * Load the published worker-side agentic channel client
@@ -100,6 +126,7 @@ let clientModulePromise;
  */
 export function loadAgenticClient() {
   if (clientModulePromise === undefined) {
+    ensureClientLoadable();
     clientModulePromise = import('@nanobpm/urban-agent-client');
   }
   return clientModulePromise;

@@ -23,6 +23,8 @@
     "c8ctl-plugin.js",
     "platforms.mjs",
     "agentic.mjs",
+    "agentic-loader-hook.mjs",
+    "work-channel.mjs",
     "nanobpmn-binary.json",
     "README.md"
   ],

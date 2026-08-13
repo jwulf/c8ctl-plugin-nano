@@ -4686,13 +4686,17 @@ function reconstructWorkArgs(flags) {
   // "--auto-scope requires --auto". Forwarding the orphan flag to a supervised
   // worker would guarantee an immediate crash/restart loop, so drop it here at
   // the forwarding boundary when `--auto` is not truthy (mirrors that guard).
-  const autoOn = flags.auto === true || flags.auto === 'true';
+  // Parse booleans through `coerceBool()` so forwarding matches `workAgent`'s
+  // parsing semantics — c8ctl may pass boolean flags as strings like `'1'`,
+  // `'yes'` or `'on'`, and treating only `true`/`'true'` as enabled would
+  // silently drop `--auto`/`--keep-runs`/`--stream` for supervised workers.
+  const autoOn = coerceBool(flags.auto, false);
   for (const [name, kind] of Object.entries(WORK_FORWARD_FLAGS)) {
     if (name === 'auto-scope' && !autoOn) continue;
     const v = flags[name];
     if (v === undefined || v === null) continue;
     if (kind === 'boolean') {
-      if (v === true || v === 'true') out.push(`--${name}`);
+      if (coerceBool(v, false)) out.push(`--${name}`);
     } else if (kind === 'list') {
       const items = Array.isArray(v) ? v : [v];
       for (const item of items) {

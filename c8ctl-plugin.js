@@ -2892,8 +2892,12 @@ function sanitizeIdentity(id) {
 }
 
 // Resolve the committer identity the harness stamps onto the cloned workspace.
-// Per-field precedence: explicit GIT_AUTHOR_* env → the operator's global git
+// Source precedence: explicit GIT_AUTHOR_* env → the operator's global git
 // config → the gh-authenticated GitHub user → the `nano-agent` fallback.
+// Precedence is per-field only for ABSENT fields (an empty name/email falls
+// through to the next source); a source whose email is a non-routable
+// placeholder is discarded WHOLE by sanitizeIdentity (name included), so in that
+// case its name does not participate in per-field fill (see sanitizeIdentity).
 // Preferring the operator's real identity means autonomous commits are authored
 // by the human running the fleet (who has signed any CLA) rather than an
 // anonymous bot that hasn't; the agent's own authorship is recorded as a PR

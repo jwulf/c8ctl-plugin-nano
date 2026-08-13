@@ -5841,8 +5841,8 @@ function filterReleasesSince(releases, currentVersion, latestVersion) {
  * Render one semantic-release release body to tight terminal lines: drop the
  * redundant `# [x.y.z](…)` header, turn `### Features` into a `Features:` label,
  * flatten `* **scope:** subject ([abc](url))` bullets to `• scope: subject`
- * (stripping the trailing commit/PR link groups and inlining any remaining
- * `[text](url)` as its text). Returns an array of already-indented lines.
+ * (stripping any `([label](url))` commit/PR link groups and inlining any
+ * remaining `[text](url)` as its text). Returns an array of already-indented lines.
  */
 function renderReleaseBody(body) {
   const out = [];
@@ -5856,7 +5856,7 @@ function renderReleaseBody(body) {
     const bullet = line.match(/^\s*[*-]\s+(.*)$/);
     if (bullet) {
       let text = bullet[1]
-        .replace(/\s*\(\[[^\]]*\]\([^)]*\)\)/g, '') // trailing ([label](url)) link groups
+        .replace(/\s*\(\[[^\]]*\]\([^)]*\)\)/g, '') // ([label](url)) commit/PR link groups
         .replace(/\[([^\]]*)\]\([^)]*\)/g, '$1') // inline [text](url) -> text
         .replace(/\*\*(.*?)\*\*/g, '$1') // **scope** -> scope
         .replace(/\s+/g, ' ')
@@ -5898,7 +5898,7 @@ async function fetchReleaseNotesSince(slug, current, latest, timeoutMs = 5000) {
  * on any fetch failure it prints a single line pointing at the releases page and
  * returns, so it can never block or fail an `update`.
  */
-async function printChangelogSince(name, current, latest) {
+async function printChangelogSince(_name, current, latest) {
   const logger = getLogger();
   const slug = githubRepoSlug();
   const releasesUrl = slug ? `https://github.com/${slug}/releases` : null;

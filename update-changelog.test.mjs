@@ -38,7 +38,7 @@ test('filterReleasesSince: skips drafts, pre-releases, and non-semver / malforme
   const releases = [
     REL('v1.31.0'),
     REL('v1.32.0', 'draft', { draft: true }),
-    REL('v1.33.0-rc.1'), // pre-release tag → normalised to 1.33.0 but > latest, filtered by window
+    REL('v1.33.0-rc.1'), // pre-release tag → not a plain vX.Y.Z, excluded by strict tag validation
     REL('nightly'),
     REL(''),
     { name: 'no tag field' },

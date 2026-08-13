@@ -48,6 +48,26 @@ test('filterReleasesSince: skips drafts, pre-releases, and non-semver / malforme
   assert.deepEqual(got, ['1.31.0']);
 });
 
+test('filterReleasesSince: excludes a pre-release even when it falls inside the window', () => {
+  const releases = [
+    REL('v1.31.0'),
+    REL('v1.30.5-rc.1'), // in-window by version, but a pre-release tag → excluded
+    REL('v1.30.8', 'flagged', { prerelease: true }), // in-window, but prerelease:true → excluded
+  ];
+  const got = filterReleasesSince(releases, '1.30.0', '1.31.0').map((r) => r.version);
+  assert.deepEqual(got, ['1.31.0']);
+});
+
+test('filterReleasesSince: excludes a pre-release inside the window even with no known latest', () => {
+  const releases = [
+    REL('v2.0.0'),
+    REL('v1.9.0-beta.2'), // pre-release tag → excluded despite being newer than installed
+    REL('v1.8.5', '', { prerelease: true }), // prerelease:true → excluded
+  ];
+  const got = filterReleasesSince(releases, '1.8.0', null).map((r) => r.version);
+  assert.deepEqual(got, ['2.0.0']);
+});
+
 test('filterReleasesSince: with no known latest, returns everything newer than installed', () => {
   const releases = [REL('v2.0.0'), REL('v1.9.0'), REL('v1.8.0')];
   const got = filterReleasesSince(releases, '1.8.0', null).map((r) => r.version);

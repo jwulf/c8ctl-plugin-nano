@@ -5822,10 +5822,13 @@ function filterReleasesSince(releases, currentVersion, latestVersion) {
   if (!Array.isArray(releases)) return [];
   const items = [];
   for (const r of releases) {
-    if (!r || r.draft) continue;
+    if (!r || r.draft || r.prerelease) continue;
     const tag = r.tag_name || r.name || '';
-    const ver = String(tag).replace(/^v/, '').split(/[-+]/)[0];
-    if (!/^\d+\.\d+\.\d+$/.test(ver)) continue;
+    const norm = String(tag).replace(/^v/, '');
+    // Require a plain vX.Y.Z tag: a prerelease/build suffix (e.g. -rc.1, +meta)
+    // must exclude the release rather than be normalised away into the window.
+    if (!/^\d+\.\d+\.\d+$/.test(norm)) continue;
+    const ver = norm;
     if (!currentVersion || compareSemver(ver, currentVersion) <= 0) continue;
     if (latestVersion && compareSemver(ver, latestVersion) > 0) continue;
     items.push({ version: ver, tag, body: r.body || '', url: r.html_url || '' });
@@ -5881,8 +5884,7 @@ async function fetchReleaseNotesSince(slug, current, latest, timeoutMs = 5000) {
       headers,
       redirect: 'follow',
       signal: ctrl.signal,
-    });
-    clearTimeout(timer);
+    }).finally(() => clearTimeout(timer));
     if (!res.ok) return null;
     const arr = await res.json();
     return filterReleasesSince(arr, current, latest);
@@ -5897,28 +5899,29 @@ async function fetchReleaseNotesSince(slug, current, latest, timeoutMs = 5000) {
  * returns, so it can never block or fail an `update`.
  */
 async function printChangelogSince(name, current, latest) {
+  const logger = getLogger();
   const slug = githubRepoSlug();
   const releasesUrl = slug ? `https://github.com/${slug}/releases` : null;
   const releases = await fetchReleaseNotesSince(slug, current, latest);
 
   if (releases === null) {
-    if (releasesUrl) console.log(`See what changed: ${releasesUrl}`);
-    console.log('');
+    if (releasesUrl) logger.info(`See what changed: ${releasesUrl}`);
+    logger.info('');
     return;
   }
   if (releases.length === 0) return; // nothing between the two (e.g. only a build-metadata bump)
 
-  console.log(`What's changed since v${current ?? '?'}:`);
-  console.log('');
+  logger.info(`What's changed since v${current ?? '?'}:`);
+  logger.info('');
   for (const rel of releases) {
-    console.log(`  v${rel.version}`);
+    logger.info(`  v${rel.version}`);
     const lines = renderReleaseBody(rel.body);
-    if (lines.length === 0) console.log('      (no notes)');
-    else for (const l of lines) console.log(l);
-    console.log('');
+    if (lines.length === 0) logger.info('      (no notes)');
+    else for (const l of lines) logger.info(l);
+    logger.info('');
   }
-  if (releasesUrl) console.log(`Full release notes: ${releasesUrl}`);
-  console.log('');
+  if (releasesUrl) logger.info(`Full release notes: ${releasesUrl}`);
+  logger.info('');
 }
 
 /**

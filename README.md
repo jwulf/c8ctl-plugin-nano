@@ -696,7 +696,7 @@ release onto a machine that already has nano installed:
 
 ```bash
 c8ctl nano update          # check npm for a newer release and install it
-c8ctl nano update --check  # only report whether an update is available
+c8ctl nano update --check  # report whether an update is available (no install)
 ```
 
 `update` compares the installed plugin version against the latest published on
@@ -705,6 +705,15 @@ npm. When a newer release exists it reinstalls the package globally
 with it. It only ever drives npm — it never touches the private upstream source —
 so it works for any npm-installed user. After updating, restart any running
 cluster (`c8ctl nano restart`) so it picks up the new binary.
+
+Whenever an update is available, `update` (and `update --check`) also prints a
+**changelog of what changed since the installed release** — the per-version
+"Features" / "Bug Fixes" notes pulled from the plugin's public
+[GitHub Releases](https://github.com/jwulf/c8ctl-plugin-nano/releases) (where
+semantic-release records them). This lookup is best-effort and non-blocking: if
+GitHub is unreachable or rate-limited it degrades to a link to the releases page
+and the update proceeds normally. Set `GH_TOKEN` (or `GITHUB_TOKEN`) to raise the
+unauthenticated API rate limit.
 
 If the plugin is running from a local checkout rather than a global npm install,
 `update` prints the manual command instead of reinstalling in place.

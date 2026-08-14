@@ -274,24 +274,36 @@ its agents' terminals to an operator's cockpit. This rides the app's agentic
 channel (ADR 0056), served **same-port** on the app's own HTTP base URL at path
 **`/agentic`** — not a sidecar, so there's no extra port to open.
 
-**Connecting.** Enrolment is opt-in: a worker only connects when it has both an
-ADR 0028 **identity token** and a **capability credential** (the same `?token=…`
-pattern the blackboard uses). Point it at the app and hand it the two secrets via
-env (or persisted config); the channel URL defaults to the configured nano URL:
+**Connecting — on by default (local-first).** Nano is designed for local use, so
+visibility is **on by default**. Run a worker against a local app and it appears
+live with **zero configuration** — it joins the channel with a well-known
+localhost token in **LOCAL mode** (no credential, same-machine only):
 
 ```bash
-# Enrol this worker on the app's same-port /agentic channel
+# LOCAL mode (default): appears live with no secrets
 export NANO_AGENTIC_URL=http://localhost:8080     # app base URL; channel is served at /agentic
+c8ctl nano work reviewer
+#   agentic channel (local): announcing presence as ‹worker› on ws://localhost:8080/agentic
+```
+
+**Secure mode (opt-in).** For a shared/remote deployment, enrol the worker with an
+ADR 0028 **identity token** and a **capability credential** (the same `?token=…`
+pattern the blackboard uses). Setting either switches the worker into SECURE mode,
+which requires **both** (fail closed if only one is set):
+
+```bash
+# SECURE mode: real enrolment
+export NANO_AGENTIC_URL=http://localhost:8080
 export NANO_AGENTIC_TOKEN=<identity-token>         # ADR 0028 identity
 export NANO_AGENTIC_CREDENTIAL=<capability-cred>   # capability credential
 c8ctl nano work reviewer
-#   agentic channel: announcing presence as ‹worker› on ws://localhost:8080/agentic
+#   agentic channel (secure): announcing presence as ‹worker› on ws://localhost:8080/agentic
 ```
 
-Without both secrets the worker runs **exactly as before, off the channel** — no
-visibility, no relay, nothing else changes. A valid identity + capability
-connects; an invalid identity is rejected (unauthorized) and a missing capability
-is rejected (forbidden).
+To opt out entirely, set `NANO_AGENTIC=off` (or persisted `agentic: false`) — the
+worker then runs with **no visibility, no relay, nothing else changed**. In secure
+mode a valid identity + capability connects; an invalid identity is rejected
+(unauthorized) and a missing capability is rejected (forbidden).
 
 **How presence appears.** On connect the worker **announces** its identity, its
 `host`, and the set of `jobKeys` it is currently running, then **heartbeats** to

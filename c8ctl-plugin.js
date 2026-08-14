@@ -3834,6 +3834,11 @@ function resolveAgenticConfig() {
     ?? (cfg.agentic === false ? 'off' : cfg.agentic);
   if (/^(0|off|false|no)$/i.test(String(offSetting ?? ''))) return null;
 
+  // An explicit agentic target (env NANO_AGENTIC_URL or persisted `agenticUrl`)
+  // is used verbatim and short-circuits hub auto-discovery (#75). When neither is
+  // set the URL below is the ENGINE base (nanoUrl → NANO_BASE_URL → default), off
+  // which `resolveAgenticTarget()` discovers the embedded app's own /agentic port.
+  const explicitUrl = !!(process.env.NANO_AGENTIC_URL || cfg.agenticUrl);
   const url = process.env.NANO_AGENTIC_URL
     || cfg.agenticUrl
     || cfg.nanoUrl
@@ -3853,11 +3858,192 @@ function resolveAgenticConfig() {
   // enrolment — require BOTH halves, fail closed if only one is present.
   if (token || credential) {
     if (!token || !credential) return null;
-    return { url, token, credential, bufferCapacity, secure: true };
+    return { url, token, credential, bufferCapacity, secure: true, explicitUrl };
   }
 
   // LOCAL mode (default): well-known localhost token, no capability credential.
-  return { url, token: LOCAL_AGENTIC_TOKEN, credential: '', bufferCapacity, secure: false };
+  return { url, token: LOCAL_AGENTIC_TOKEN, credential: '', bufferCapacity, secure: false, explicitUrl };
+}
+
+// Total budget for zero-config hub auto-discovery (#75): the projects-API read
+// and every WS upgrade probe must degrade to a "not discoverable" advisory
+// within this window so discovery never meaningfully delays job polling.
+const AGENTIC_DISCOVERY_TIMEOUT_MS = 2_000;
+
+/**
+ * Normalise the engine's `GET /console/api/projects` payload into the running
+ * embedded apps that advertise an agentic UI port. Accepts the shapes the
+ * console may serve — a keyed map (`{ "Nano_Workforce": { appUi } }`), a bare
+ * array (`[{ name, appUi }]`), or a wrapped array (`{ projects: [...] }`) — and
+ * keeps only apps with `appUi.enabled === true` and a positive integer
+ * `appUi.port`. Anything else (a Camunda engine, an API-only gateway, malformed
+ * JSON) yields `[]`.
+ *
+ * @param {unknown} projects the parsed projects-API body
+ * @returns {Array<{ project: string, port: number, label?: string }>}
+ */
+function normalizeProjectApps(projects) {
+  if (!projects || typeof projects !== 'object') return [];
+  let entries;
+  if (Array.isArray(projects)) {
+    entries = projects.map((p) => [p?.name ?? p?.project ?? p?.id, p]);
+  } else if (Array.isArray(projects.projects)) {
+    entries = projects.projects.map((p) => [p?.name ?? p?.project ?? p?.id, p]);
+  } else {
+    entries = Object.entries(projects);
+  }
+  const apps = [];
+  for (const [name, proj] of entries) {
+    const ui = proj?.appUi;
+    if (ui && ui.enabled === true && Number.isInteger(ui.port) && ui.port > 0) {
+      apps.push({
+        project: String(name ?? ui.label ?? ui.port),
+        port: ui.port,
+        label: ui.label,
+      });
+    }
+  }
+  return apps;
+}
+
+/**
+ * Probe whether an embedded app's own loopback `/agentic` endpoint answers a
+ * WebSocket upgrade. Connects to `ws://127.0.0.1:<port>/agentic?token=…` and
+ * resolves `true` only if the socket opens within `timeoutMs`; a refused
+ * connection, the console proxy's deliberate `501`, a `404`, or a timeout all
+ * resolve `false`. Loopback-only and self-cleaning — the probe socket is closed
+ * as soon as the outcome is known. Never throws.
+ *
+ * @param {number} port the app's direct loopback port (`appUi.port`)
+ * @param {{ token?: string, WebSocketImpl?: Function, timeoutMs?: number }} [opts]
+ * @returns {Promise<boolean>}
+ */
+function probeAgenticChannel(port, {
+  token = LOCAL_AGENTIC_TOKEN,
+  WebSocketImpl = globalThis.WebSocket,
+  timeoutMs = AGENTIC_DISCOVERY_TIMEOUT_MS,
+} = {}) {
+  if (typeof WebSocketImpl !== 'function') return Promise.resolve(false);
+  const url = `ws://127.0.0.1:${port}/agentic?token=${encodeURIComponent(token)}`;
+  return new Promise((resolve) => {
+    let done = false;
+    let ws;
+    const finish = (ok) => {
+      if (done) return;
+      done = true;
+      clearTimeout(timer);
+      try { ws?.close(); } catch { /* best-effort cleanup */ }
+      resolve(ok);
+    };
+    const timer = setTimeout(() => finish(false), timeoutMs);
+    try {
+      ws = new WebSocketImpl(url);
+      ws.onopen = () => finish(true);
+      ws.onerror = () => finish(false);
+      ws.onclose = () => finish(false);
+    } catch {
+      finish(false);
+    }
+  });
+}
+
+/**
+ * Auto-discover the embedded nwf agentic hub(s) reachable from an engine base
+ * URL (#75). Reads `GET <engine>/console/api/projects`, keeps the apps that
+ * advertise an agentic UI port, and WS-probes each app's direct loopback
+ * `/agentic` to confirm the channel is actually served there (bypassing the
+ * WS-incapable console proxy). Loopback-only, time-bounded, and fail-open: any
+ * error — not a nano engine (Camunda), network failure, malformed body, or an
+ * overall timeout — degrades to `[]` so the worker's real job is never blocked.
+ *
+ * @param {string} engineBaseUrl the engine base URL (e.g. `http://localhost:8080`)
+ * @param {{ token?: string, fetchImpl?: Function, wsProbe?: Function, timeoutMs?: number }} [opts]
+ * @returns {Promise<Array<{ project: string, port: number, label?: string }>>}
+ */
+async function discoverAgenticHubs(engineBaseUrl, {
+  token = LOCAL_AGENTIC_TOKEN,
+  fetchImpl = globalThis.fetch,
+  wsProbe = probeAgenticChannel,
+  timeoutMs = AGENTIC_DISCOVERY_TIMEOUT_MS,
+} = {}) {
+  if (typeof fetchImpl !== 'function' || typeof engineBaseUrl !== 'string' || !engineBaseUrl.trim()) {
+    return [];
+  }
+  const base = engineBaseUrl.replace(/\/+$/, '');
+  let projects;
+  const controller = new AbortController();
+  const timer = setTimeout(() => controller.abort(), timeoutMs);
+  try {
+    const res = await fetchImpl(`${base}/console/api/projects`, { signal: controller.signal });
+    if (!res || !res.ok) return [];
+    projects = await res.json();
+  } catch {
+    return [];
+  } finally {
+    clearTimeout(timer);
+  }
+  const apps = normalizeProjectApps(projects);
+  if (apps.length === 0) return [];
+  // Probe candidate ports concurrently under one shared timeout budget.
+  const settled = await Promise.all(apps.map(async (app) => {
+    try {
+      return (await wsProbe(app.port, { token, timeoutMs })) ? app : null;
+    } catch {
+      return null;
+    }
+  }));
+  return settled.filter(Boolean);
+}
+
+/**
+ * Resolve the final agentic-channel target for a worker, running zero-config hub
+ * auto-discovery when no explicit target is configured (#75). Layered on top of
+ * {@link resolveAgenticConfig}:
+ *
+ *   - `{ status: 'off' }` — visibility disabled (off-switch) or SECURE mode
+ *     half-configured. No discovery attempted.
+ *   - `{ status: 'connect', config }` — a target to connect to. Either the
+ *     explicit `NANO_AGENTIC_URL`/`agenticUrl` verbatim (no discovery), or the
+ *     single discovered app's direct `ws://127.0.0.1:<port>/agentic` loopback.
+ *   - `{ status: 'ambiguous', message, candidates }` — two+ apps expose a
+ *     channel. Hard stop for the worker: it must not silently pick one.
+ *   - `{ status: 'advisory', message }` — nothing discoverable (zero matches,
+ *     no projects API / not a nano engine, or discovery error/timeout). The
+ *     worker continues doing real work with no channel.
+ *
+ * @param {{ fetchImpl?: Function, wsProbe?: Function, timeoutMs?: number }} [opts]
+ * @returns {Promise<{ status: string, config?: object, message?: string, candidates?: Array }>}
+ */
+async function resolveAgenticTarget(opts = {}) {
+  const base = resolveAgenticConfig();
+  if (!base) return { status: 'off' };
+  // Explicit target wins verbatim and skips discovery entirely.
+  if (base.explicitUrl) return { status: 'connect', config: base };
+
+  const hubs = await discoverAgenticHubs(base.url, { token: base.token, ...opts });
+
+  if (hubs.length === 1) {
+    const { project, port } = hubs[0];
+    return {
+      status: 'connect',
+      config: { ...base, url: `http://127.0.0.1:${port}`, discovered: { project, port } },
+    };
+  }
+  if (hubs.length > 1) {
+    const list = hubs.map((h) => `${h.project} → :${h.port}`).join(', ');
+    return {
+      status: 'ambiguous',
+      candidates: hubs,
+      message: `multiple embedded apps expose an agentic channel (${list}); refusing to guess. `
+        + 'Disambiguate by setting NANO_AGENTIC_URL=http://127.0.0.1:<port> (or persisted agenticUrl) to the one you want.',
+    };
+  }
+  return {
+    status: 'advisory',
+    message: `agentic visibility was not discoverable at ${base.url} — the embedded app port could `
+      + 'not be found (not a nano engine, or its console projects API is absent). Set '
+      + 'NANO_AGENTIC_URL=http://127.0.0.1:<appUi.port> to enable the visibility channel. Continuing without it.',
+  };
 }
 
 /**
@@ -4184,7 +4370,26 @@ async function workAgent(req, flags) {
   // worker joins with the well-known localhost token and no credential; SECURE
   // mode (NANO_AGENTIC_TOKEN + NANO_AGENTIC_CREDENTIAL) sends a real ADR 0028
   // identity + capability; NANO_AGENTIC=off disables it (see resolveAgenticConfig).
-  const agenticCfg = resolveAgenticConfig();
+  const agenticTarget = await resolveAgenticTarget({ logger });
+  let agenticCfg = null;
+  switch (agenticTarget.status) {
+    case 'connect':
+      agenticCfg = agenticTarget.config;
+      break;
+    case 'ambiguous':
+      // The operator ran with visibility on-by-default but the hub is
+      // unresolved — a misconfiguration to fix, not to guess through. Hard stop.
+      logger.error(`  agentic visibility is ambiguous: ${agenticTarget.message}`);
+      process.exit(1);
+      break;
+    case 'advisory':
+      logger.info(`  agentic channel: ${agenticTarget.message}`);
+      break;
+    case 'off':
+    default:
+      logger.info('  agentic channel: disabled — either the off-switch is set (NANO_AGENTIC=off or persisted agentic:false), or SECURE mode is half-configured (set BOTH NANO_AGENTIC_TOKEN + NANO_AGENTIC_CREDENTIAL). Clear the off-switch to use default LOCAL visibility.');
+      break;
+  }
   if (agenticCfg) {
     try {
       workChannel = await createWorkChannel({
@@ -4204,6 +4409,9 @@ async function workAgent(req, flags) {
       });
       const shown = redactAgenticUrl(buildAgenticUrl(agenticCfg.url, {}));
       const mode = agenticCfg.secure ? 'secure' : 'local';
+      if (agenticCfg.discovered) {
+        logger.info(`  agentic channel: auto-discovered ${agenticCfg.discovered.project} on the embedded app port :${agenticCfg.discovered.port} (bypassing the WS-incapable console proxy).`);
+      }
       logger.info(`  agentic channel (${mode}): announcing presence as ${workerName} on ${shown}`);
     } catch (err) {
       // Never let a channel failure stop the worker from doing its actual job.
@@ -4227,8 +4435,6 @@ async function workAgent(req, flags) {
         logger.warn(`  agentic buffer monitor unavailable (${err?.message || err}); channel presence still active.`);
       }
     }
-  } else {
-    logger.info('  agentic channel: disabled — either the off-switch is set (NANO_AGENTIC=off or persisted agentic:false), or SECURE mode is half-configured (set BOTH NANO_AGENTIC_TOKEN + NANO_AGENTIC_CREDENTIAL). Clear the off-switch to use default LOCAL visibility.');
   }
 
   // C3 (#42): the role's live-terminal mode — a full PTY (streamed on the relay
@@ -7604,6 +7810,7 @@ export { resolveBinary, findBinary, launcherEnvMarkers };
 export { setConfig, unsetConfig, readConfig, writeConfig, getConfigFile, SETTING_ALIASES };
 export { buildNpmInvocation };
 export { resolveAgenticConfig, LOCAL_AGENTIC_TOKEN };
+export { resolveAgenticTarget, discoverAgenticHubs, probeAgenticChannel, normalizeProjectApps };
 export { compareSemver, githubRepoSlug, filterReleasesSince, renderReleaseBody };
 export {
   webConsoleUrl,

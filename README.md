@@ -289,6 +289,35 @@ c8ctl nano work reviewer
 #   agentic channel (local): announcing presence as ‹worker› on ws://localhost:8080/agentic
 ```
 
+**Zero-config hub auto-discovery.** You usually don't even set `NANO_AGENTIC_URL`.
+When nwf runs **embedded**, the engine (`:8080`) serves the console but the
+`/agentic` channel is served by the **embedded app on its own loopback port**
+(e.g. `:3000`); the engine's console proxy deliberately refuses WebSocket
+upgrades (nanobpmn ADR 0057 §3 → `501`), so the channel is unreachable via the
+engine URL. With **no** agentic target configured, `work` therefore
+**auto-discovers** it: it reads `GET <engine>/console/api/projects` and, for each
+running app that advertises an agentic UI port (`appUi.enabled === true` and
+`appUi.port`), probes that app's direct `ws://127.0.0.1:<port>/agentic`. Discovery
+is **loopback-only** and **time-bounded** (≤2s) and never meaningfully delays job
+polling.
+
+- **Exactly one app →** the worker connects directly to
+  `ws://127.0.0.1:<appUi.port>/agentic` (bypassing the WS-incapable console proxy)
+  and appears live with **zero configuration**.
+- **Two or more apps →** the worker **does not guess**: it prints an `ambiguous`
+  error naming each discovered `project → :port` and **stops**. Pin the one you
+  want and re-run: `export NANO_AGENTIC_URL=http://127.0.0.1:<port>` (or persist
+  `agenticUrl`).
+- **Nothing discoverable (e.g. pointed at Camunda, or an API-only gateway) →** the
+  worker prints a one-line advisory naming `NANO_AGENTIC_URL` and **continues
+  doing real work** with the channel simply absent — discovery never fails the
+  worker's actual job.
+
+Setting `NANO_AGENTIC_URL` (or persisted `agenticUrl`) **skips discovery** and is
+used **verbatim** — so an explicit target always wins, and it's also how you
+disambiguate when several apps are running. `NANO_AGENTIC=off` disables the
+channel entirely and attempts **no** discovery.
+
 **Secure mode (opt-in).** For a shared/remote deployment, enrol the worker with an
 ADR 0028 **identity token** and a **capability credential** (the same `?token=…`
 pattern the blackboard uses). Setting either switches the worker into SECURE mode,

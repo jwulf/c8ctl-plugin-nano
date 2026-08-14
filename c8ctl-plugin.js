@@ -137,8 +137,10 @@ const DEFAULT_NANO_URL = 'http://localhost:8080';
 
 // The well-known identity token used for LOCAL agentic visibility (security opt-in). Nano is
 // local-first: on the operator's own machine a `nano work` worker joins the visibility channel with
-// zero configuration, so it presents this constant, well-known localhost token — NOT a secret; it
-// only gates same-machine dev traffic. Kept in lock-step with the hub constant in
+// zero configuration, so it presents this constant, well-known localhost token — NOT a secret. The
+// worker does not enforce any loopback restriction itself (it presents this token to whatever
+// NANO_AGENTIC_URL is configured); same-machine gating is enforced by the hub, which only honours
+// this well-known token for local/loopback connections. Kept in lock-step with the hub constant in
 // nanobpm/nano-workforce (`app/agentic/channel.ts` LOCAL_AGENTIC_TOKEN). In secure mode (a real
 // NANO_AGENTIC_TOKEN + NANO_AGENTIC_CREDENTIAL) this is never used.
 const LOCAL_AGENTIC_TOKEN = 'nano-local';
@@ -4215,7 +4217,7 @@ async function workAgent(req, flags) {
       }
     }
   } else {
-    logger.info('  agentic channel: not enrolled (set NANO_AGENTIC_URL + NANO_AGENTIC_TOKEN + NANO_AGENTIC_CREDENTIAL to appear on the visibility page).');
+    logger.info('  agentic channel: disabled — either NANO_AGENTIC=off, or SECURE mode is half-configured (set BOTH NANO_AGENTIC_TOKEN + NANO_AGENTIC_CREDENTIAL). Unset NANO_AGENTIC to use default LOCAL visibility.');
   }
 
   // C3 (#42): the role's live-terminal mode — a full PTY (streamed on the relay

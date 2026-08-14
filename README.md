@@ -277,7 +277,10 @@ channel (ADR 0056), served **same-port** on the app's own HTTP base URL at path
 **Connecting — on by default (local-first).** Nano is designed for local use, so
 visibility is **on by default**. Run a worker against a local app and it appears
 live with **zero configuration** — it joins the channel with a well-known
-localhost token in **LOCAL mode** (no credential, same-machine only):
+localhost token in **LOCAL mode** (no credential). The worker presents this
+token to whatever `NANO_AGENTIC_URL` you point it at; the same-machine
+restriction is enforced by the **hub**, which only honours the well-known LOCAL
+token for local/loopback connections:
 
 ```bash
 # LOCAL mode (default): appears live with no secrets

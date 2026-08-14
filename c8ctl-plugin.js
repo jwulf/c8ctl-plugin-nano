@@ -4217,7 +4217,7 @@ async function workAgent(req, flags) {
       }
     }
   } else {
-    logger.info('  agentic channel: disabled — either NANO_AGENTIC=off, or SECURE mode is half-configured (set BOTH NANO_AGENTIC_TOKEN + NANO_AGENTIC_CREDENTIAL). Unset NANO_AGENTIC to use default LOCAL visibility.');
+    logger.info('  agentic channel: disabled — either the off-switch is set (NANO_AGENTIC=off or persisted agentic:false), or SECURE mode is half-configured (set BOTH NANO_AGENTIC_TOKEN + NANO_AGENTIC_CREDENTIAL). Clear the off-switch to use default LOCAL visibility.');
   }
 
   // C3 (#42): the role's live-terminal mode — a full PTY (streamed on the relay
@@ -7571,6 +7571,7 @@ function parseProcessosRequest(args, flags) {
 export { resolveBinary, findBinary, launcherEnvMarkers };
 export { setConfig, unsetConfig, readConfig, writeConfig, getConfigFile, SETTING_ALIASES };
 export { buildNpmInvocation };
+export { resolveAgenticConfig, LOCAL_AGENTIC_TOKEN };
 export { compareSemver, githubRepoSlug, filterReleasesSince, renderReleaseBody };
 export {
   webConsoleUrl,

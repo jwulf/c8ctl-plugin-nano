@@ -161,6 +161,17 @@ function getLogger() {
     warn: console.warn,
     error: console.error,
     debug: () => {},
+    // Primary command output, written to stdout as-is (mirrors the c8ctl host
+    // logger's `output()`). Used for preformatted, non-structured content such
+    // as the supervisor status table, whose newlines must survive verbatim.
+    // Uses `process.stdout.write` (not `console.log`) so the content is emitted
+    // literally — `console.log` applies `util.format` (mangling stray `%`
+    // sequences) and would append its own newline; here we add exactly one
+    // trailing newline when the text lacks one.
+    output: (msg) => {
+      const s = typeof msg === 'string' ? msg : String(msg);
+      process.stdout.write(s.endsWith('\n') ? s : s + '\n');
+    },
   };
 }
 
@@ -1244,7 +1255,7 @@ function logsCluster(req) {
   const proc = spawn('tail', tailArgs, { stdio: ['ignore', 'inherit', 'inherit'] });
   proc.on('error', (err) => {
     logger.error(`Failed to read logs: ${err.message}`);
-    logger.info(`Log files:\n  ${files.join('\n  ')}`);
+    logger.output(`Log files:\n  ${files.join('\n  ')}`);
   });
 }
 
@@ -5094,6 +5105,27 @@ function formatSupervisorStatus(status) {
   return lines.join('\n');
 }
 
+/**
+ * Print a preformatted supervisor status table as primary command output.
+ *
+ * Preformatted, multi-line text MUST go through the logger's `output()`
+ * channel, never `info()`. In `--output json` mode the c8ctl host logger wraps
+ * an `info()` message in a JSON envelope (`{"status":"info","message":"…"}`),
+ * which escapes every newline to a literal `\n` and collapses the aligned table
+ * onto a single line — the exact breakage this guards against. `output()` writes
+ * the content to stdout verbatim in every output mode (like `raw` command
+ * output), so the table renders correctly regardless of mode. Falls back to
+ * `info()` for a logger without `output()`, and to `console.log` if `logger`
+ * is null/undefined or lacks `info()` (defensive; both the c8ctl host logger
+ * and this plugin's fallback logger provide `output()`).
+ */
+function printSupervisorStatus(logger, status) {
+  const text = formatSupervisorStatus(status);
+  if (logger && typeof logger.output === 'function') logger.output(text);
+  else if (logger && typeof logger.info === 'function') logger.info(text);
+  else console.log(text);
+}
+
 function readSupervisorState() {
   const file = getSupervisorStateFile();
   if (!existsSync(file)) return null;
@@ -5727,7 +5759,7 @@ async function supervisorStatusCmd() {
       const res = await supervisorRequest({ op: 'status' }, { socketPath: getSupervisorSocketPath(), timeoutMs: 500, responseTimeoutMs: SUPERVISOR_PROBE_RESPONSE_TIMEOUT_MS });
       if (res && res.ok) {
         try { writeSupervisorState(stateFromStatus(res, getSupervisorSocketPath())); } catch { /* best effort */ }
-        logger.info(formatSupervisorStatus(res));
+        printSupervisorStatus(logger, res);
         return;
       }
     } catch { /* no live daemon on the socket — genuinely down */ }
@@ -5743,13 +5775,13 @@ async function supervisorStatusCmd() {
   }
   try {
     const res = await supervisorRequest({ op: 'status' });
-    if (res.ok) { logger.info(formatSupervisorStatus(res)); return; }
+    if (res.ok) { printSupervisorStatus(logger, res); return; }
   } catch { /* fall back to state file below */ }
   // Socket unreachable but pid alive — render from the last persisted state.
-  logger.info(formatSupervisorStatus({
+  printSupervisorStatus(logger, {
     daemon: { pid: running.pid, startedAt: running.startedAt, socket: running.socket },
     workers: (running.workers || []).map((w) => summarizeSupervisorWorker(w)),
-  }));
+  });
 }
 
 async function supervisorAddCmd(req, flags) {
@@ -5862,7 +5894,7 @@ function supervisorLogsCmd(req) {
     if (follow) logger.warn('`--follow` is not supported without `tail` on this platform; printing the current tail only.');
     try {
       const lines = readFileSync(file, 'utf-8').split('\n');
-      logger.info(lines.slice(-200).join('\n'));
+      logger.output(lines.slice(-200).join('\n'));
     } catch (err) { logger.error(`Could not read ${file}: ${err.message}`); }
   });
 }
@@ -7624,6 +7656,7 @@ export {
   formatDuration,
   summarizeSupervisorWorker,
   formatSupervisorStatus,
+  printSupervisorStatus,
   supervisorStatusSignature,
   supervisorJobCell,
   supervisorWorkerActivityFile,

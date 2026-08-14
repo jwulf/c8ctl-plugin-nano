@@ -164,7 +164,14 @@ function getLogger() {
     // Primary command output, written to stdout as-is (mirrors the c8ctl host
     // logger's `output()`). Used for preformatted, non-structured content such
     // as the supervisor status table, whose newlines must survive verbatim.
-    output: console.log,
+    // Uses `process.stdout.write` (not `console.log`) so the content is emitted
+    // literally — `console.log` applies `util.format` (mangling stray `%`
+    // sequences) and would append its own newline; here we add exactly one
+    // trailing newline when the text lacks one.
+    output: (msg) => {
+      const s = typeof msg === 'string' ? msg : String(msg);
+      process.stdout.write(s.endsWith('\n') ? s : s + '\n');
+    },
   };
 }
 
@@ -5108,13 +5115,15 @@ function formatSupervisorStatus(status) {
  * onto a single line — the exact breakage this guards against. `output()` writes
  * the content to stdout verbatim in every output mode (like `raw` command
  * output), so the table renders correctly regardless of mode. Falls back to
- * `info()` only for a logger without `output()` (defensive; both the c8ctl host
- * logger and this plugin's fallback logger provide it).
+ * `info()` for a logger without `output()`, and to `console.log` if `logger`
+ * is null/undefined or lacks `info()` (defensive; both the c8ctl host logger
+ * and this plugin's fallback logger provide `output()`).
  */
 function printSupervisorStatus(logger, status) {
   const text = formatSupervisorStatus(status);
   if (logger && typeof logger.output === 'function') logger.output(text);
-  else logger.info(text);
+  else if (logger && typeof logger.info === 'function') logger.info(text);
+  else console.log(text);
 }
 
 function readSupervisorState() {

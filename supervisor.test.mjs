@@ -24,6 +24,7 @@ import {
   formatDuration,
   summarizeSupervisorWorker,
   formatSupervisorStatus,
+  printSupervisorStatus,
   supervisorStatusSignature,
   supervisorJobCell,
   supervisorWorkerActivityFile,
@@ -404,6 +405,72 @@ test('formatSupervisorStatus guides the operator when there are no workers', () 
   const text = formatSupervisorStatus({ daemon: { pid: process.pid }, workers: [] });
   assert.match(text, /No workers/);
   assert.match(text, /supervisor add/);
+});
+
+// --- printSupervisorStatus (output-channel regression guard) ----------------
+//
+// Regression guard for the "literal \n, no line-wrapping" defect: the aligned
+// status table was printed via logger.info(), and in `--output json` mode the
+// c8ctl host logger JSON-wraps an info message, escaping every real newline to a
+// two-character `\n` and collapsing the table onto one line. The fix routes the
+// table through logger.output() (verbatim in every mode). These tests fake the
+// host logger's real json-mode semantics so a revert to info() fails here.
+
+/** Faithful stand-in for the c8ctl host logger in `--output json` mode. */
+function fakeJsonModeLogger() {
+  const stdout = [];
+  return {
+    stdout,
+    // info(): host wraps + JSON.stringifies (escapes newlines) — the buggy path.
+    info(message) { stdout.push(JSON.stringify({ status: 'info', message })); },
+    warn() {},
+    error() {},
+    debug() {},
+    // output(): host writes primary content to stdout as-is in every mode.
+    output(content) { stdout.push(String(content)); },
+  };
+}
+
+const SAMPLE_STATUS = {
+  daemon: { pid: process.pid, startedAt: new Date().toISOString(), socket: '/tmp/x.sock' },
+  workers: [
+    summarizeSupervisorWorker({ id: 'reviewer', profile: 'reviewer', pid: process.pid, restarts: 0 }, Date.now()),
+    summarizeSupervisorWorker({ id: 'coder', profile: 'coder', pid: 2 ** 30, restarts: 1 }, Date.now()),
+  ],
+};
+
+test('printSupervisorStatus renders real newlines in json mode (not escaped literals)', () => {
+  const logger = fakeJsonModeLogger();
+  printSupervisorStatus(logger, SAMPLE_STATUS);
+
+  const emitted = logger.stdout.join('');
+  // The table must survive verbatim: multiple real lines...
+  assert.ok(emitted.split('\n').length > 2, 'status table should span multiple real lines');
+  assert.match(emitted, /reviewer/);
+  assert.match(emitted, /coder/);
+  // ...and must NOT be JSON-wrapped nor contain a literal backslash-n sequence.
+  assert.doesNotMatch(emitted, /\\n/, 'newlines must not be escaped to literal \\n');
+  assert.doesNotMatch(emitted, /"status":"info"/, 'table must not be wrapped in a json info envelope');
+});
+
+test('printSupervisorStatus routes preformatted output through logger.output()', () => {
+  let outputCalls = 0;
+  let infoCalls = 0;
+  const logger = {
+    info() { infoCalls++; },
+    warn() {}, error() {}, debug() {},
+    output() { outputCalls++; },
+  };
+  printSupervisorStatus(logger, SAMPLE_STATUS);
+  assert.equal(outputCalls, 1, 'should use output() for preformatted table');
+  assert.equal(infoCalls, 0, 'must not use info() for preformatted table');
+});
+
+test('printSupervisorStatus falls back to info() for a logger without output()', () => {
+  let captured = null;
+  const logger = { info(m) { captured = m; }, warn() {}, error() {}, debug() {} };
+  printSupervisorStatus(logger, SAMPLE_STATUS);
+  assert.match(captured, /reviewer/);
 });
 
 // --- supervisorJobCell (per-job activity rendering) ------------------------

@@ -135,6 +135,16 @@ const SUPERVISOR_STATE_FILE = 'supervisor.json';
 const PROCESSOS_DEFAULT_PORT = 8090;
 const DEFAULT_NANO_URL = 'http://localhost:8080';
 
+// The well-known identity token used for LOCAL agentic visibility (security opt-in). Nano is
+// local-first: on the operator's own machine a `nano work` worker joins the visibility channel with
+// zero configuration, so it presents this constant, well-known localhost token — NOT a secret. The
+// worker does not enforce any loopback restriction itself (it presents this token to whatever
+// NANO_AGENTIC_URL is configured); same-machine gating is enforced by the hub, which only honours
+// this well-known token for local/loopback connections. Kept in lock-step with the hub constant in
+// nanobpm/nano-workforce (`app/agentic/channel.ts` LOCAL_AGENTIC_TOKEN). In secure mode (a real
+// NANO_AGENTIC_TOKEN + NANO_AGENTIC_CREDENTIAL) this is never used.
+const LOCAL_AGENTIC_TOKEN = 'nano-local';
+
 // Passive update notifier (npm-style): refresh the latest published version
 // from the registry in a detached background process at most once per day, and
 // surface a one-line "update available" notice at most once per day. Never
@@ -3800,30 +3810,54 @@ function buildResultEnvelope(result, { sandbox, image, git, result: agentResult,
  * HTTP base URL at `/agentic`; the identity token + capability credential follow
  * the blackboard's `?token=…` pattern.
  *
- * Env wins over persisted config; the base URL falls back to the configured nano
- * URL (the app's own port). A worker only connects when BOTH an identity token
- * and a capability credential are present (enrolment) — absent either, it runs
- * exactly as before, off the visibility page. Returns `null` when not enrolled.
+ * Local-first (security opt-in). Nano is designed for local use, so visibility is
+ * ON BY DEFAULT:
+ *   - LOCAL mode (default): no credentials configured — the worker connects with
+ *     the well-known localhost token ({@link LOCAL_AGENTIC_TOKEN}) and no
+ *     capability credential, so it appears live with zero configuration (the hub's
+ *     matching LOCAL mode accepts it).
+ *   - SECURE mode: set NANO_AGENTIC_TOKEN + NANO_AGENTIC_CREDENTIAL (or the
+ *     persisted `agenticToken`/`agenticCredential`) — an ADR 0028 identity token
+ *     AND a capability credential are then sent (enrolment). If only one is set the
+ *     config is incomplete and we stay off (fail closed), returning `null`.
+ *   - OFF: NANO_AGENTIC=off (or 0/false/no), or persisted `agentic:false`.
  *
- * @returns {{ url: string, token: string, credential: string, bufferCapacity: number } | null}
+ * Env wins over persisted config; the base URL falls back to the configured nano
+ * URL (the app's own port). Returns `null` only when disabled or half-configured.
+ *
+ * @returns {{ url: string, token: string, credential: string, bufferCapacity: number, secure: boolean } | null}
  */
 function resolveAgenticConfig() {
   const cfg = readConfig();
+  // Explicit off-switch (env wins). Lets an operator fully opt out of visibility.
+  const offSetting = process.env.NANO_AGENTIC
+    ?? (cfg.agentic === false ? 'off' : cfg.agentic);
+  if (/^(0|off|false|no)$/i.test(String(offSetting ?? ''))) return null;
+
   const url = process.env.NANO_AGENTIC_URL
     || cfg.agenticUrl
     || cfg.nanoUrl
     || process.env.NANO_BASE_URL
     || DEFAULT_NANO_URL;
+  if (!url) return null;
   const token = process.env.NANO_AGENTIC_TOKEN || cfg.agenticToken || '';
   const credential = process.env.NANO_AGENTIC_CREDENTIAL || cfg.agenticCredential || '';
-  if (!url || !token || !credential) return null;
   // Outbound hub-down buffer bound (frames). Operator-tunable (C4, #43) so a
   // long expected outage can be given more headroom; resolveBufferCapacity
   // validates it to a positive integer and falls back to the client default.
   const bufferCapacity = resolveBufferCapacity(
     process.env.NANO_AGENTIC_BUFFER_CAPACITY ?? cfg.agenticBufferCapacity,
   );
-  return { url, token, credential, bufferCapacity };
+
+  // SECURE mode: any explicit credential configured means the operator opted into
+  // enrolment — require BOTH halves, fail closed if only one is present.
+  if (token || credential) {
+    if (!token || !credential) return null;
+    return { url, token, credential, bufferCapacity, secure: true };
+  }
+
+  // LOCAL mode (default): well-known localhost token, no capability credential.
+  return { url, token: LOCAL_AGENTIC_TOKEN, credential: '', bufferCapacity, secure: false };
 }
 
 /**
@@ -4146,8 +4180,10 @@ async function workAgent(req, flags) {
   // accessors on `workChannel` (relay-lane sink + connect/disconnect/reconnect
   // lifecycle events) rather than opening their own connection.
   //
-  // Enrolment is opt-in: without an identity token + capability credential the
-  // worker runs exactly as before, off the channel (see resolveAgenticConfig).
+  // Local-first (security opt-in): visibility is ON BY DEFAULT. In LOCAL mode the
+  // worker joins with the well-known localhost token and no credential; SECURE
+  // mode (NANO_AGENTIC_TOKEN + NANO_AGENTIC_CREDENTIAL) sends a real ADR 0028
+  // identity + capability; NANO_AGENTIC=off disables it (see resolveAgenticConfig).
   const agenticCfg = resolveAgenticConfig();
   if (agenticCfg) {
     try {
@@ -4167,7 +4203,8 @@ async function workAgent(req, flags) {
         logger,
       });
       const shown = redactAgenticUrl(buildAgenticUrl(agenticCfg.url, {}));
-      logger.info(`  agentic channel: announcing presence as ${workerName} on ${shown}`);
+      const mode = agenticCfg.secure ? 'secure' : 'local';
+      logger.info(`  agentic channel (${mode}): announcing presence as ${workerName} on ${shown}`);
     } catch (err) {
       // Never let a channel failure stop the worker from doing its actual job.
       workChannel = null;
@@ -4191,7 +4228,7 @@ async function workAgent(req, flags) {
       }
     }
   } else {
-    logger.info('  agentic channel: not enrolled (set NANO_AGENTIC_URL + NANO_AGENTIC_TOKEN + NANO_AGENTIC_CREDENTIAL to appear on the visibility page).');
+    logger.info('  agentic channel: disabled — either the off-switch is set (NANO_AGENTIC=off or persisted agentic:false), or SECURE mode is half-configured (set BOTH NANO_AGENTIC_TOKEN + NANO_AGENTIC_CREDENTIAL). Clear the off-switch to use default LOCAL visibility.');
   }
 
   // C3 (#42): the role's live-terminal mode — a full PTY (streamed on the relay
@@ -7566,6 +7603,7 @@ function parseProcessosRequest(args, flags) {
 export { resolveBinary, findBinary, launcherEnvMarkers };
 export { setConfig, unsetConfig, readConfig, writeConfig, getConfigFile, SETTING_ALIASES };
 export { buildNpmInvocation };
+export { resolveAgenticConfig, LOCAL_AGENTIC_TOKEN };
 export { compareSemver, githubRepoSlug, filterReleasesSince, renderReleaseBody };
 export {
   webConsoleUrl,

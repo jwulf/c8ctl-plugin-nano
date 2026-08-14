@@ -3871,6 +3871,24 @@ function resolveAgenticConfig() {
 const AGENTIC_DISCOVERY_TIMEOUT_MS = 2_000;
 
 /**
+ * Is `hostname` a loopback address? Discovery reads the engine's projects API
+ * and then probes `127.0.0.1:<advertised port>`, so it must only run against a
+ * loopback engine — otherwise a remote engine's response would steer a local
+ * port probe, breaking the loopback-only guarantee (#75/#76). Accepts
+ * `localhost`, the IPv4 loopback block `127.0.0.0/8`, and IPv6 `::1` (with or
+ * without URL brackets); case-insensitive and trimmed.
+ *
+ * @param {string} hostname a URL hostname (e.g. `127.0.0.1`, `localhost`, `[::1]`)
+ * @returns {boolean}
+ */
+function isLoopbackHost(hostname) {
+  const h = String(hostname || '').trim().toLowerCase().replace(/^\[|\]$/g, '');
+  if (!h) return false;
+  if (h === 'localhost' || h === '::1') return true;
+  return /^127(?:\.\d{1,3}){3}$/.test(h);
+}
+
+/**
  * Normalise the engine's `GET /console/api/projects` payload into the running
  * embedded apps that advertise an agentic UI port. Accepts the shapes the
  * console may serve — a keyed map (`{ "Nano_Workforce": { appUi } }`), a bare
@@ -3952,9 +3970,12 @@ function probeAgenticChannel(port, {
  * URL (#75). Reads `GET <engine>/console/api/projects`, keeps the apps that
  * advertise an agentic UI port, and WS-probes each app's direct loopback
  * `/agentic` to confirm the channel is actually served there (bypassing the
- * WS-incapable console proxy). Loopback-only, time-bounded, and fail-open: any
- * error — not a nano engine (Camunda), network failure, malformed body, or an
- * overall timeout — degrades to `[]` so the worker's real job is never blocked.
+ * WS-incapable console proxy). Loopback-only (the engine host itself must be
+ * loopback, since the response steers a local port probe), enforces a single
+ * shared time budget across the fetch + probes, and is fail-open: any error —
+ * not a nano engine (Camunda), a non-loopback engine, network failure,
+ * malformed body, or an overall timeout — degrades to `[]` so the worker's real
+ * job is never blocked.
  *
  * @param {string} engineBaseUrl the engine base URL (e.g. `http://localhost:8080`)
  * @param {{ token?: string, fetchImpl?: Function, wsProbe?: Function, timeoutMs?: number }} [opts]
@@ -3970,6 +3991,21 @@ async function discoverAgenticHubs(engineBaseUrl, {
     return [];
   }
   const base = engineBaseUrl.replace(/\/+$/, '');
+  // Loopback-only: discovery probes 127.0.0.1:<port> using a port advertised by
+  // the engine's projects API, so a non-loopback (remote) engine could steer a
+  // local port probe. Refuse discovery unless the engine host is loopback (#76).
+  let host;
+  try {
+    host = new URL(base).hostname;
+  } catch {
+    return [];
+  }
+  if (!isLoopbackHost(host)) return [];
+  // Single discovery budget: the projects fetch and the WS probes share ONE
+  // deadline, so total discovery can't approach 2× timeoutMs (the fetch could
+  // consume ~timeoutMs and then each probe was previously given a fresh full
+  // budget). Probes get only the time left after the fetch (#76).
+  const deadline = Date.now() + timeoutMs;
   let projects;
   const controller = new AbortController();
   const timer = setTimeout(() => controller.abort(), timeoutMs);
@@ -3984,10 +4020,12 @@ async function discoverAgenticHubs(engineBaseUrl, {
   }
   const apps = normalizeProjectApps(projects);
   if (apps.length === 0) return [];
-  // Probe candidate ports concurrently under one shared timeout budget.
+  const remainingMs = deadline - Date.now();
+  if (remainingMs <= 0) return [];
+  // Probe candidate ports concurrently within the remaining shared budget.
   const settled = await Promise.all(apps.map(async (app) => {
     try {
-      return (await wsProbe(app.port, { token, timeoutMs })) ? app : null;
+      return (await wsProbe(app.port, { token, timeoutMs: remainingMs })) ? app : null;
     } catch {
       return null;
     }
@@ -7810,7 +7848,7 @@ export { resolveBinary, findBinary, launcherEnvMarkers };
 export { setConfig, unsetConfig, readConfig, writeConfig, getConfigFile, SETTING_ALIASES };
 export { buildNpmInvocation };
 export { resolveAgenticConfig, LOCAL_AGENTIC_TOKEN };
-export { resolveAgenticTarget, discoverAgenticHubs, probeAgenticChannel, normalizeProjectApps };
+export { resolveAgenticTarget, discoverAgenticHubs, probeAgenticChannel, normalizeProjectApps, isLoopbackHost };
 export { compareSemver, githubRepoSlug, filterReleasesSince, renderReleaseBody };
 export {
   webConsoleUrl,

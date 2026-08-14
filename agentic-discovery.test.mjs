@@ -17,6 +17,7 @@ import {
   discoverAgenticHubs,
   probeAgenticChannel,
   normalizeProjectApps,
+  isLoopbackHost,
   LOCAL_AGENTIC_TOKEN,
 } from './c8ctl-plugin.js';
 
@@ -141,6 +142,76 @@ test('discoverAgenticHubs fails open to [] when the fetch throws (network/timeou
     wsProbe: probeUpgrades(3000),
   });
   assert.deepEqual(hubs, []);
+});
+
+// Loopback-only guard (#76): a remote/non-loopback engine must never steer a
+// local 127.0.0.1 port probe — discovery short-circuits before it even fetches.
+test('discoverAgenticHubs refuses a non-loopback engine host without probing (loopback-only)', async () => {
+  let fetched = false;
+  let probed = false;
+  const hubs = await discoverAgenticHubs('http://remote.example.com:8080', {
+    fetchImpl: async () => { fetched = true; return { ok: true, json: async () => NANO_WORKFORCE }; },
+    wsProbe: async () => { probed = true; return true; },
+  });
+  assert.deepEqual(hubs, []);
+  assert.equal(fetched, false, 'must not fetch a non-loopback engine');
+  assert.equal(probed, false, 'must not probe when the engine host is non-loopback');
+});
+
+test('discoverAgenticHubs allows every loopback host form (127.x, ::1)', async () => {
+  for (const engine of ['http://127.0.0.1:8080', 'http://127.5.6.7:8080', 'http://[::1]:8080']) {
+    const hubs = await discoverAgenticHubs(engine, {
+      fetchImpl: fetchReturning(NANO_WORKFORCE),
+      wsProbe: probeUpgrades(3000),
+    });
+    assert.deepEqual(hubs.map((h) => h.port), [3000], `expected discovery for ${engine}`);
+  }
+});
+
+// Single shared time budget (#76): the fetch and the probes must not each get a
+// fresh full timeout. The injected probe records the budget it was handed; after
+// a fetch that consumes most of the window, the probe budget must be the small
+// remainder — never the full timeoutMs.
+test('discoverAgenticHubs shares one deadline across fetch + probes (no 2x budget)', async () => {
+  let handedTimeout;
+  const hubs = await discoverAgenticHubs('http://localhost:8080', {
+    timeoutMs: 200,
+    fetchImpl: async () => {
+      await new Promise((r) => setTimeout(r, 120)); // consume >half the budget
+      return { ok: true, json: async () => NANO_WORKFORCE };
+    },
+    wsProbe: async (_port, { timeoutMs } = {}) => { handedTimeout = timeoutMs; return true; },
+  });
+  assert.deepEqual(hubs.map((h) => h.port), [3000]);
+  assert.ok(handedTimeout < 200, `probe budget ${handedTimeout} should be the remainder, not the full 200`);
+  assert.ok(handedTimeout > 0, 'probe budget should still be positive when time remains');
+});
+
+test('discoverAgenticHubs skips probing when the fetch exhausts the whole budget', async () => {
+  let probed = false;
+  const hubs = await discoverAgenticHubs('http://localhost:8080', {
+    timeoutMs: 40,
+    fetchImpl: async () => {
+      await new Promise((r) => setTimeout(r, 60)); // outlasts the budget
+      return { ok: true, json: async () => NANO_WORKFORCE };
+    },
+    wsProbe: async () => { probed = true; return true; },
+  });
+  assert.deepEqual(hubs, []);
+  assert.equal(probed, false, 'no budget left → do not probe');
+});
+
+// ---------------------------------------------------------------------------
+// isLoopbackHost — address classification
+// ---------------------------------------------------------------------------
+
+test('isLoopbackHost accepts localhost / 127.0.0.0-8 / ::1 and rejects everything else', () => {
+  for (const h of ['localhost', 'LOCALHOST', '127.0.0.1', '127.1.2.3', '::1', '[::1]']) {
+    assert.equal(isLoopbackHost(h), true, `${h} should be loopback`);
+  }
+  for (const h of ['example.com', '10.0.0.1', '192.168.1.5', '128.0.0.1', '', undefined, 'localhost.evil.com']) {
+    assert.equal(isLoopbackHost(h), false, `${h} should not be loopback`);
+  }
 });
 
 // ---------------------------------------------------------------------------

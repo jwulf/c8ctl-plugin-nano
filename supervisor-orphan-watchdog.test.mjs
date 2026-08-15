@@ -23,6 +23,54 @@ function isPidAlive(pid) {
   try { process.kill(pid, 0); return true; } catch (err) { return err.code === 'EPERM'; }
 }
 
+// Fast, deterministic unit tests of the watchdog's *initial* orphan verdict,
+// using the injectable `readPpid` seam so cases a normal test process can't
+// reproduce (its own ppid is never 1) are still covered. `intervalMs` is huge
+// so only the synchronous initial check runs; each returns a canceller we call.
+test('watchdog: explicit daemon pid that is alive does not reap', { skip: osPlatform() === 'win32' }, async () => {
+  const mod = await import(pluginUrl);
+  let reaped = false;
+  // A real, alive parent (this process's own parent) with our ppid unchanged.
+  const cancel = mod.installParentDeathWatchdog({
+    intervalMs: 1 << 30, parentPid: process.ppid, readPpid: () => process.ppid, onOrphan: () => { reaped = true; },
+  });
+  assert.equal(reaped, false, 'a worker whose recorded daemon is still its live parent must not self-reap');
+  cancel();
+});
+
+test('watchdog: daemon running as PID 1 (container entrypoint) does not falsely reap', { skip: osPlatform() === 'win32' }, async () => {
+  const mod = await import(pluginUrl);
+  let reaped = false;
+  // Daemon is PID 1 and is genuinely this worker's parent (ppid === 1). PID 1
+  // is always alive, so this must NOT be treated as orphaned — the regression
+  // Copilot flagged: the "pid 1 means orphaned" shortcut must be fallback-only.
+  const cancel = mod.installParentDeathWatchdog({
+    intervalMs: 1 << 30, parentPid: 1, readPpid: () => 1, onOrphan: () => { reaped = true; },
+  });
+  assert.equal(reaped, false, 'a worker legitimately parented by a PID-1 daemon must not self-reap');
+  cancel();
+});
+
+test('watchdog: reparented away from the recorded daemon reaps immediately', { skip: osPlatform() === 'win32' }, async () => {
+  const mod = await import(pluginUrl);
+  let reaped = false;
+  // Recorded daemon pid X, but we now report ppid 1 → reparented to init.
+  mod.installParentDeathWatchdog({
+    intervalMs: 1 << 30, parentPid: process.pid, readPpid: () => 1, onOrphan: () => { reaped = true; },
+  });
+  assert.equal(reaped, true, 'a worker reparented off its recorded daemon must self-reap immediately');
+});
+
+test('watchdog: fallback ppid of 1 (no explicit daemon pid) reaps immediately', { skip: osPlatform() === 'win32' }, async () => {
+  const mod = await import(pluginUrl);
+  let reaped = false;
+  // No explicit parentPid and ppid is init → orphaned with no daemon to watch.
+  mod.installParentDeathWatchdog({
+    intervalMs: 1 << 30, readPpid: () => 1, onOrphan: () => { reaped = true; },
+  });
+  assert.equal(reaped, true, 'a fallback ppid of 1 means already orphaned → self-reap');
+});
+
 // Reparent-to-init (the watchdog's signal) is a POSIX semantic; the watchdog
 // no-ops on Windows, so there is nothing to assert there.
 test('supervisor: ungraceful daemon death lets a supervised worker self-reap', { skip: osPlatform() === 'win32' }, async (t) => {

@@ -5534,21 +5534,31 @@ function waitForChildExit(child, timeoutMs) {
  * equivalent lifecycle tie and are out of scope here (matching the daemon's
  * other `win32` guards). Returns a canceller so callers/tests can stop it.
  */
-function installParentDeathWatchdog({ intervalMs = 2000, parentPid, onOrphan } = {}) {
+function installParentDeathWatchdog({ intervalMs = 2000, parentPid, onOrphan, readPpid } = {}) {
   if (osPlatform() === 'win32') return () => {};
-  // Prefer the daemon pid the spawn recorded; fall back to the current parent.
-  const watched = Number.isInteger(parentPid) && parentPid > 0 ? parentPid : process.ppid;
+  // `readPpid` is an injectable seam (defaults to the live value) so the pid-1
+  // container case — which a normal test process can't reproduce, since its own
+  // ppid is never 1 — is unit-testable.
+  const ppid = typeof readPpid === 'function' ? readPpid : () => process.ppid;
+  // Prefer the daemon pid the spawn recorded (`explicit`); fall back to the
+  // current parent. An explicit pid is authoritative even if it is 1 — the
+  // daemon may legitimately run as PID 1 (a container entrypoint) — so we must
+  // NOT treat that as "orphaned". A *fallback* ppid of 1, by contrast, means we
+  // were already reparented to init with no daemon left to watch.
+  const explicit = Number.isInteger(parentPid) && parentPid > 0;
+  const watched = explicit ? parentPid : ppid();
   const orphaned = typeof onOrphan === 'function' ? onOrphan : () => process.exit(0);
   const isOrphan = () => {
     // Reparented away from the daemon (typically to init, pid 1) → orphaned.
-    if (process.ppid !== watched) return true;
+    if (ppid() !== watched) return true;
     // Defensive: the daemon pid is gone even though ppid still names it (a
     // zombie/racey read). ESRCH ⇒ gone; EPERM ⇒ alive but not ours to signal.
     try { process.kill(watched, 0); return false; } catch (err) { return err.code !== 'EPERM'; }
   };
-  // Orphaned already (daemon died before we armed, or no real parent to watch):
-  // self-reap now rather than idle forever.
-  if (watched === 1 || isOrphan()) { orphaned(); return () => {}; }
+  // Orphaned already — self-reap now rather than idle forever. Either we fell
+  // back to ppid and it is already init (no known parent), or the recorded
+  // daemon is verifiably gone/reparented (e.g. it died before we armed).
+  if ((!explicit && watched === 1) || isOrphan()) { orphaned(); return () => {}; }
   const timer = setInterval(() => { if (isOrphan()) { clearInterval(timer); orphaned(); } }, intervalMs);
   if (typeof timer.unref === 'function') timer.unref();
   return () => { try { clearInterval(timer); } catch { /* ignore */ } };

@@ -188,7 +188,7 @@ function supplyView(frames) {
 // The live `work` runtime: activateJobs → harness PTY → relay → supply/cockpit.
 // ===========================================================================
 
-test('the live work runtime: a job activation drives runAgentJob → PTY → relay → supply, with steer-in and clean deregister', async () => {
+test('the live work runtime: a job activation drives runAgentJob → PTY → relay → supply, with steer-in and clean deregister', { skip: process.platform === 'win32' }, async () => {
   const t = makeTransportDouble();
 
   // The worker's live job set — the SAME `activeJobs` map + refreshPresence seam
@@ -303,7 +303,7 @@ test('the live work runtime: a job activation drives runAgentJob → PTY → rel
 // is producing must not lose the job's terminal — it drains in order on connect.
 // ===========================================================================
 
-test('a hub outage during a live job buffers the harness terminal and drains it in order on reconnect (C4), via runAgentJob', async () => {
+test('a hub outage during a live job buffers the harness terminal and drains it in order on reconnect (C4), via runAgentJob', { skip: process.platform === 'win32' }, async () => {
   const t = makeGatedTransport();
   const job = { jobKey: '900', type: 'senior:feature', variables: {} };
   const activeJobs = new Map([[String(job.jobKey), { type: job.type, since: Date.now() }]]);

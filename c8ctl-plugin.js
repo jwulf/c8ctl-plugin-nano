@@ -2578,6 +2578,31 @@ async function fetchLinkedResourceContent(resourceKey, opts = {}) {
   }
 }
 
+// Preferred content path: fetch a resource's content via the typed SDK client
+// method when the injected client exposes it (SDK v10+ adds
+// getResourceContentBinary; the pinned ^9.1.0 has only the deprecated
+// getResourceContent, which 406s for generic Markdown resources). Returns the
+// decoded UTF-8 string on success, or null when the client lacks the method (→
+// caller falls back to the raw /content/binary fetch). A non-2xx makes the SDK
+// throw (ThrowOnError), which the caller catches and falls back from — the raw
+// fetch stays the authority for provisioning-error semantics during the
+// transition. See issue #79.
+async function fetchResourceContentViaClient(camunda, resourceKey) {
+  if (!camunda || typeof camunda.getResourceContentBinary !== 'function') return null;
+  // v10 signature: (input, consistencyManagement, options?) → Blob | File.
+  // waitUpToMs:0 opts out of eventual-consistency polling — the prompt is already
+  // deployed by the time a job carrying its resourceKey is activated.
+  const content = await camunda.getResourceContentBinary(
+    { resourceKey },
+    { consistency: { waitUpToMs: 0 } },
+  );
+  if (content == null) return null;
+  if (typeof content === 'string') return content;
+  if (typeof content.text === 'function') return await content.text();
+  if (typeof content.arrayBuffer === 'function') return Buffer.from(await content.arrayBuffer()).toString('utf8');
+  return String(content);
+}
+
 // Resolve the base prompt from a `linkName: prompt` linked resource, if the job
 // declares one. Returns `{ basePrompt, resourceKey }` when a prompt resource is
 // present and fetched, or null when no such entry exists (→ fall back to the
@@ -2585,11 +2610,23 @@ async function fetchLinkedResourceContent(resourceKey, opts = {}) {
 // prompt resource cannot be fetched — a provisioning failure, not a silent
 // empty-prompt run.
 async function resolveLinkedPrompt(customHeaders, opts = {}) {
-  const { linkName = DEFAULT_PROMPT_LINK_NAME, baseUrl, token, authHeaders, fetchImpl, timeoutMs } = opts;
+  const { linkName = DEFAULT_PROMPT_LINK_NAME, camunda, baseUrl, token, authHeaders, fetchImpl, timeoutMs } = opts;
   const entry = pickLinkedResource(parseLinkedResources(customHeaders), linkName);
   if (!entry) return null;
   const resourceKey = entry.resourceKey;
-  const basePrompt = await fetchLinkedResourceContent(resourceKey, { baseUrl, token, authHeaders, fetchImpl, timeoutMs });
+  // Prefer the typed SDK client method (getResourceContentBinary, SDK v10+): it
+  // reuses the activating client, so it needs no separate base-URL/auth plumbing.
+  // Fall back to the raw /content/binary fetch when the client lacks the method
+  // (SDK ^9.1.0) or the typed path errors. See issue #79.
+  let basePrompt = null;
+  try {
+    basePrompt = await fetchResourceContentViaClient(camunda, resourceKey);
+  } catch {
+    basePrompt = null;
+  }
+  if (basePrompt == null) {
+    basePrompt = await fetchLinkedResourceContent(resourceKey, { baseUrl, token, authHeaders, fetchImpl, timeoutMs });
+  }
   return { basePrompt, resourceKey, resourceType: entry.resourceType ?? null, linkName: String(linkName) };
 }
 
@@ -2609,11 +2646,11 @@ function normalizeRestBase(addr) {
 // escape hatch. Both getConfig()/getAuthHeaders() are guarded so an older or
 // atypical client runtime degrades to the override/legacy path rather than throw.
 //
-// TODO: once c8ctl bumps @camunda8/orchestration-cluster-api to v10 (10.0.0-alpha
-// exposes the typed camunda.getResourceContentBinary({resourceKey}) → Blob), drop
-// this raw /content/binary fetch and call that method directly. The pinned ^9.1.0
-// SDK only exposes the deprecated getResourceContent, which 406s for generic
-// (Markdown) prompt resources — see camunda/orchestration-cluster-api-js.
+// NOTE: this base/auth derivation feeds only the RAW-fetch fallback.
+// resolveLinkedPrompt now prefers the typed camunda.getResourceContentBinary()
+// when the injected client exposes it (SDK v10+), which needs none of this. Once
+// the c8ctl host ships the v10 SDK universally, this raw path (and its base/auth
+// plumbing) can be retired — tracked in issue #79.
 async function resolveLinkedPromptSource(camunda, env = process.env) {
   let baseUrl = env.NANO_REST_URL || '';
   if (!baseUrl && camunda && typeof camunda.getConfig === 'function') {
@@ -4580,11 +4617,14 @@ async function workAgent(req, flags) {
         let promptResourceKey = null;
         let basePromptOverride;
         try {
-          // Fetch the prompt from the broker the SDK client is connected to,
-          // deriving base URL + auth from that client (not restConfig, whose base
-          // defaults to localhost) — the resourceKey is broker-local.
+          // Prefer the typed SDK method (getResourceContentBinary) when this
+          // client exposes it (v10+); otherwise fetch from the broker the client
+          // is connected to, deriving base URL + auth from that client (not
+          // restConfig, whose base defaults to localhost) — resourceKey is
+          // broker-local.
           const promptSource = await resolveLinkedPromptSource(camunda);
           const linked = await resolveLinkedPrompt(job.customHeaders ?? {}, {
+            camunda,
             baseUrl: promptSource.baseUrl || restConfig.baseUrl,
             authHeaders: promptSource.authHeaders,
             token: restConfig.token,
@@ -7916,6 +7956,7 @@ export {
   resolveBrokerRestConfig,
   resourceContentUrl,
   fetchLinkedResourceContent,
+  fetchResourceContentViaClient,
   resolveLinkedPrompt,
   resolveLinkedPromptSource,
   normalizeRestBase,

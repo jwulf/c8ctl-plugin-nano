@@ -18,6 +18,8 @@ import {
   resourceContentUrl,
   fetchLinkedResourceContent,
   resolveLinkedPrompt,
+  resolveLinkedPromptSource,
+  normalizeRestBase,
   coerceBool,
   coerceInt,
   deepMerge,
@@ -332,6 +334,73 @@ test('resolveLinkedPrompt: a declared-but-unfetchable prompt resource propagates
     ),
     /prompt resource 7 fetch failed: HTTP 404/,
   );
+});
+
+test('fetchLinkedResourceContent: authHeaders map wins over token and is forwarded verbatim', async () => {
+  let seen;
+  const fetchImpl = async (_url, init) => { seen = init; return { ok: true, status: 200, text: async () => 'x' }; };
+  await fetchLinkedResourceContent('1', {
+    baseUrl: 'http://b',
+    token: 'IGNORED',
+    authHeaders: { Authorization: 'Bearer FROM_CLIENT', 'X-Extra': '1' },
+    fetchImpl,
+  });
+  assert.equal(seen.headers.Authorization, 'Bearer FROM_CLIENT');
+  assert.equal(seen.headers['X-Extra'], '1');
+});
+
+test('fetchLinkedResourceContent: an empty authHeaders map means unauthenticated (no Authorization)', async () => {
+  let seen;
+  const fetchImpl = async (_url, init) => { seen = init; return { ok: true, status: 200, text: async () => 'x' }; };
+  // A NONE-auth client returns {}; it must win over a stray token → no header sent.
+  await fetchLinkedResourceContent('1', { baseUrl: 'http://b', token: 'STRAY', authHeaders: {}, fetchImpl });
+  assert.equal(seen.headers.Authorization, undefined);
+});
+
+test('normalizeRestBase: strips trailing slashes and an optional /v2 so resourceContentUrl re-adds it once', () => {
+  assert.equal(normalizeRestBase('http://merlin.local:8080/v2'), 'http://merlin.local:8080');
+  assert.equal(normalizeRestBase('http://merlin.local:8080/v2/'), 'http://merlin.local:8080');
+  assert.equal(normalizeRestBase('http://merlin.local:8080/'), 'http://merlin.local:8080');
+  assert.equal(normalizeRestBase('http://merlin.local:8080'), 'http://merlin.local:8080');
+  // Round-trip: the normalized base yields exactly one /v2 in the content URL.
+  assert.equal(
+    resourceContentUrl(normalizeRestBase('http://merlin.local:8080/v2'), '42'),
+    'http://merlin.local:8080/v2/resources/42/content/binary',
+  );
+});
+
+test('resolveLinkedPromptSource: derives base + auth from the activating client', async () => {
+  const camunda = {
+    getConfig: () => ({ restAddress: 'http://merlin.local:8080/v2' }),
+    getAuthHeaders: async () => ({ Authorization: 'Bearer CLIENT_TOKEN' }),
+  };
+  const src = await resolveLinkedPromptSource(camunda, {});
+  assert.equal(src.baseUrl, 'http://merlin.local:8080');
+  assert.deepEqual(src.authHeaders, { Authorization: 'Bearer CLIENT_TOKEN' });
+});
+
+test('resolveLinkedPromptSource: NANO_REST_URL / NANO_REST_TOKEN override the client (operator escape hatch)', async () => {
+  const camunda = {
+    getConfig: () => ({ restAddress: 'http://should-not-use:8080' }),
+    getAuthHeaders: async () => ({ Authorization: 'Bearer CLIENT' }),
+  };
+  const src = await resolveLinkedPromptSource(camunda, {
+    NANO_REST_URL: 'http://override:9000',
+    NANO_REST_TOKEN: 'OP',
+  });
+  assert.equal(src.baseUrl, 'http://override:9000');
+  assert.deepEqual(src.authHeaders, { Authorization: 'Bearer OP' });
+});
+
+test('resolveLinkedPromptSource: a client without getConfig/getAuthHeaders degrades gracefully (no throw)', async () => {
+  const src = await resolveLinkedPromptSource({}, {});
+  assert.equal(src.baseUrl, '');
+  assert.equal(src.authHeaders, undefined);
+  // A throwing client is swallowed, not propagated.
+  const throwing = { getConfig: () => { throw new Error('boom'); }, getAuthHeaders: async () => { throw new Error('boom'); } };
+  const src2 = await resolveLinkedPromptSource(throwing, {});
+  assert.equal(src2.baseUrl, '');
+  assert.equal(src2.authHeaders, undefined);
 });
 
 test('buildResultEnvelope: records the resolved promptResourceKey for audit', () => {

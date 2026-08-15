@@ -17,6 +17,7 @@ import {
   resolveBrokerRestConfig,
   resourceContentUrl,
   fetchLinkedResourceContent,
+  fetchResourceContentViaClient,
   resolveLinkedPrompt,
   resolveLinkedPromptSource,
   normalizeRestBase,
@@ -401,6 +402,65 @@ test('resolveLinkedPromptSource: a client without getConfig/getAuthHeaders degra
   const src2 = await resolveLinkedPromptSource(throwing, {});
   assert.equal(src2.baseUrl, '');
   assert.equal(src2.authHeaders, undefined);
+});
+
+test('fetchResourceContentViaClient: null when the client lacks getResourceContentBinary (SDK <v10)', async () => {
+  assert.equal(await fetchResourceContentViaClient({}, '42'), null);
+  assert.equal(await fetchResourceContentViaClient(null, '42'), null);
+});
+
+test('fetchResourceContentViaClient: uses the typed method and decodes a Blob-like body', async () => {
+  const calls = [];
+  const camunda = {
+    getResourceContentBinary: async (input, consistency) => {
+      calls.push({ input, consistency });
+      return { text: async () => '# Typed prompt' }; // Blob-like
+    },
+  };
+  const out = await fetchResourceContentViaClient(camunda, '42');
+  assert.equal(out, '# Typed prompt');
+  assert.deepEqual(calls[0].input, { resourceKey: '42' });
+  assert.deepEqual(calls[0].consistency, { consistency: { waitUpToMs: 0 } });
+});
+
+test('fetchResourceContentViaClient: decodes an arrayBuffer body and passes through a string body', async () => {
+  const bufClient = { getResourceContentBinary: async () => ({ arrayBuffer: async () => Buffer.from('BYTES', 'utf8') }) };
+  assert.equal(await fetchResourceContentViaClient(bufClient, '1'), 'BYTES');
+  const strClient = { getResourceContentBinary: async () => 'RAW STRING' };
+  assert.equal(await fetchResourceContentViaClient(strClient, '1'), 'RAW STRING');
+});
+
+test('resolveLinkedPrompt: prefers the typed client method over the raw fetch when available', async () => {
+  const fetchImpl = async () => { throw new Error('raw fetch should not be called'); };
+  const camunda = { getResourceContentBinary: async () => ({ text: async () => '# From client' }) };
+  const out = await resolveLinkedPrompt(
+    { [LINKED_RESOURCES_HEADER]: JSON.stringify([{ resourceKey: '42', linkName: 'prompt' }]) },
+    { camunda, baseUrl: 'http://b', fetchImpl },
+  );
+  assert.equal(out.basePrompt, '# From client');
+  assert.equal(out.resourceKey, '42');
+});
+
+test('resolveLinkedPrompt: falls back to the raw fetch when the typed method is absent', async () => {
+  const fetchImpl = async (url) => {
+    assert.equal(url, 'http://b/v2/resources/42/content/binary');
+    return { ok: true, status: 200, text: async () => '# From raw fetch' };
+  };
+  const out = await resolveLinkedPrompt(
+    { [LINKED_RESOURCES_HEADER]: JSON.stringify([{ resourceKey: '42', linkName: 'prompt' }]) },
+    { camunda: {}, baseUrl: 'http://b', fetchImpl }, // client lacks getResourceContentBinary
+  );
+  assert.equal(out.basePrompt, '# From raw fetch');
+});
+
+test('resolveLinkedPrompt: a throwing typed method falls back to the raw fetch (raw stays the error authority)', async () => {
+  const fetchImpl = async () => ({ ok: true, status: 200, text: async () => '# Recovered via raw' });
+  const camunda = { getResourceContentBinary: async () => { throw new Error('typed path boom'); } };
+  const out = await resolveLinkedPrompt(
+    { [LINKED_RESOURCES_HEADER]: JSON.stringify([{ resourceKey: '42', linkName: 'prompt' }]) },
+    { camunda, baseUrl: 'http://b', fetchImpl },
+  );
+  assert.equal(out.basePrompt, '# Recovered via raw');
 });
 
 test('buildResultEnvelope: records the resolved promptResourceKey for audit', () => {

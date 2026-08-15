@@ -4404,6 +4404,16 @@ async function workAgent(req, flags) {
   // path via NANO_SUPERVISOR_ACTIVITY_FILE; a standalone `nano work` has no such
   // env var and writes nothing (this is entirely advisory).
   const activityFile = process.env.NANO_SUPERVISOR_ACTIVITY_FILE || null;
+  // Supervised workers (spawned by the daemon, hence NANO_SUPERVISOR_ACTIVITY_FILE)
+  // arm a parent-death watchdog: if the daemon dies *ungracefully* (SIGKILL /
+  // crash / its host force-killed) it can't run its child-reaping shutdown, and
+  // this worker would otherwise idle forever as an orphan reparented to init.
+  // The watchdog makes the child self-exit the moment it is reparented. A
+  // standalone `nano work` (no activity file) keeps classic nohup semantics.
+  if (activityFile) {
+    const daemonPid = Number.parseInt(process.env.NANO_SUPERVISOR_DAEMON_PID ?? '', 10);
+    installParentDeathWatchdog({ parentPid: Number.isInteger(daemonPid) ? daemonPid : undefined });
+  }
   const activeJobs = new Map(); // jobKey -> { type, since (ms epoch) }
   const writeActivity = () => {
     if (!activityFile) return;
@@ -5549,6 +5559,63 @@ function waitForChildExit(child, timeoutMs) {
   });
 }
 
+/**
+ * Self-terminate a supervised worker if its parent daemon dies *ungracefully*.
+ *
+ * The daemon reaps its `nano work` children on a clean stop/SIGTERM/SIGINT (see
+ * `shutdown`). But a `SIGKILL`, a crash, or the daemon's host process being
+ * force-killed cannot run that path, and the children — spawned attached, with
+ * no controlling TTY — would otherwise survive forever as orphans reparented to
+ * init (ppid 1). That is exactly how a test/agent run that force-kills its
+ * supervisor leaks a whole idle worker fleet.
+ *
+ * The watchdog closes that gap from the child's side. The parent to watch is the
+ * daemon pid the spawn recorded (`parentPid`, forwarded via
+ * NANO_SUPERVISOR_DAEMON_PID) rather than a late `process.ppid` sample: a worker
+ * whose ~async startup (an 8k-line dynamic import) is outrun by the daemon's
+ * death is *already* reparented to init by the time it arms, so a bare
+ * `process.ppid` read would miss the very race that leaks. Given the known pid,
+ * the worker self-reaps whenever it is reparented away from it OR that pid is
+ * gone — and does so *immediately* if it was orphaned during its own startup.
+ *
+ * The poll timer is unref'd so it never keeps an otherwise-idle worker alive;
+ * the real work loop (or, in tests, an explicit keep-alive) holds the event loop
+ * open while the worker is meant to run.
+ *
+ * Unix-only: reparent-to-init is a POSIX semantic; Windows job objects are the
+ * equivalent lifecycle tie and are out of scope here (matching the daemon's
+ * other `win32` guards). Returns a canceller so callers/tests can stop it.
+ */
+function installParentDeathWatchdog({ intervalMs = 2000, parentPid, onOrphan, readPpid } = {}) {
+  if (osPlatform() === 'win32') return () => {};
+  // `readPpid` is an injectable seam (defaults to the live value) so the pid-1
+  // container case — which a normal test process can't reproduce, since its own
+  // ppid is never 1 — is unit-testable.
+  const ppid = typeof readPpid === 'function' ? readPpid : () => process.ppid;
+  // Prefer the daemon pid the spawn recorded (`explicit`); fall back to the
+  // current parent. An explicit pid is authoritative even if it is 1 — the
+  // daemon may legitimately run as PID 1 (a container entrypoint) — so we must
+  // NOT treat that as "orphaned". A *fallback* ppid of 1, by contrast, means we
+  // were already reparented to init with no daemon left to watch.
+  const explicit = Number.isInteger(parentPid) && parentPid > 0;
+  const watched = explicit ? parentPid : ppid();
+  const orphaned = typeof onOrphan === 'function' ? onOrphan : () => process.exit(0);
+  const isOrphan = () => {
+    // Reparented away from the daemon (typically to init, pid 1) → orphaned.
+    if (ppid() !== watched) return true;
+    // Defensive: the daemon pid is gone even though ppid still names it (a
+    // zombie/racey read). ESRCH ⇒ gone; EPERM ⇒ alive but not ours to signal.
+    try { process.kill(watched, 0); return false; } catch (err) { return err.code !== 'EPERM'; }
+  };
+  // Orphaned already — self-reap now rather than idle forever. Either we fell
+  // back to ppid and it is already init (no known parent), or the recorded
+  // daemon is verifiably gone/reparented (e.g. it died before we armed).
+  if ((!explicit && watched === 1) || isOrphan()) { orphaned(); return () => {}; }
+  const timer = setInterval(() => { if (isOrphan()) { clearInterval(timer); orphaned(); } }, intervalMs);
+  if (typeof timer.unref === 'function') timer.unref();
+  return () => { try { clearInterval(timer); } catch { /* ignore */ } };
+}
+
 // --- Daemon ----------------------------------------------------------------
 
 /**
@@ -5622,8 +5689,12 @@ async function runSupervisorDaemon() {
     // supervisor id, so the same profile launched twice is distinct end-to-end.
     // NANO_SUPERVISOR_ACTIVITY_FILE tells the child where to report per-job
     // activity for `supervisor status` (idle vs the job key it is servicing).
+    // NANO_SUPERVISOR_DAEMON_PID hands the child our pid so its parent-death
+    // watchdog can self-reap if we die ungracefully (SIGKILL/crash) and can't
+    // run the child-draining shutdown — even if we die mid-startup, before the
+    // child reparents to init.
     const child = spawn(exec, [entry, 'nano', 'work', w.profile, '--name', w.id, ...w.args], {
-      env: { ...process.env, NANO_SUPERVISOR_ACTIVITY_FILE: activityFile },
+      env: { ...process.env, NANO_SUPERVISOR_ACTIVITY_FILE: activityFile, NANO_SUPERVISOR_DAEMON_PID: String(process.pid) },
       stdio: ['ignore', fd, fd],
     });
     if (typeof fd === 'number') { try { closeSync(fd); } catch { /* dup'd into child */ } }
@@ -5889,6 +5960,11 @@ async function runSupervisorDaemon() {
 
   process.once('SIGTERM', () => shutdown('SIGTERM'));
   process.once('SIGINT', () => shutdown('SIGINT'));
+  // SIGHUP (controlling terminal/session gone) must also drain children rather
+  // than let Node's default terminate the daemon and orphan the fleet. SIGKILL
+  // and hard crashes still can't run this — the per-worker parent-death
+  // watchdog is the backstop for those.
+  process.once('SIGHUP', () => shutdown('SIGHUP'));
   dlog(`supervisor daemon up (pid ${process.pid}) — control ${socketPath}`);
   persist();
 
@@ -7998,6 +8074,7 @@ export {
   supervisorJobCell,
   supervisorWorkerActivityFile,
   WORK_FORWARD_FLAGS,
+  installParentDeathWatchdog,
   runSupervisorDaemon,
   startSupervisorDaemon,
   supervisorRequest,

@@ -2549,14 +2549,18 @@ function resourceContentUrl(baseUrl, resourceKey) {
 // is surfaced as a ProvisionError so the caller fails the job with a clear
 // provisioning message (never runs an agent with a silently-empty prompt).
 async function fetchLinkedResourceContent(resourceKey, opts = {}) {
-  const { baseUrl, token, fetchImpl = fetch, timeoutMs = 15_000 } = opts;
+  const { baseUrl, token, authHeaders, fetchImpl = fetch, timeoutMs = 15_000 } = opts;
   const url = resourceContentUrl(baseUrl, resourceKey);
   const controller = new AbortController();
   const timer = timeoutMs > 0 ? setTimeout(() => controller.abort(), timeoutMs) : null;
   let res;
   try {
     const headers = { Accept: 'application/octet-stream' };
-    if (token) headers.Authorization = `Bearer ${token}`;
+    // A ready-made auth-headers map (from the activating SDK client's
+    // getAuthHeaders(), covering OAuth/basic/none) wins over a bare token. An
+    // empty map means unauthenticated — deliberately no Authorization header.
+    if (authHeaders && typeof authHeaders === 'object') Object.assign(headers, authHeaders);
+    else if (token) headers.Authorization = `Bearer ${token}`;
     res = await fetchImpl(url, { method: 'GET', headers, signal: controller.signal });
   } catch (err) {
     throw new ProvisionError(`prompt resource ${resourceKey} fetch failed: ${err && err.message ? err.message : String(err)}`);
@@ -2581,12 +2585,55 @@ async function fetchLinkedResourceContent(resourceKey, opts = {}) {
 // prompt resource cannot be fetched — a provisioning failure, not a silent
 // empty-prompt run.
 async function resolveLinkedPrompt(customHeaders, opts = {}) {
-  const { linkName = DEFAULT_PROMPT_LINK_NAME, baseUrl, token, fetchImpl, timeoutMs } = opts;
+  const { linkName = DEFAULT_PROMPT_LINK_NAME, baseUrl, token, authHeaders, fetchImpl, timeoutMs } = opts;
   const entry = pickLinkedResource(parseLinkedResources(customHeaders), linkName);
   if (!entry) return null;
   const resourceKey = entry.resourceKey;
-  const basePrompt = await fetchLinkedResourceContent(resourceKey, { baseUrl, token, fetchImpl, timeoutMs });
+  const basePrompt = await fetchLinkedResourceContent(resourceKey, { baseUrl, token, authHeaders, fetchImpl, timeoutMs });
   return { basePrompt, resourceKey, resourceType: entry.resourceType ?? null, linkName: String(linkName) };
+}
+
+// Normalize a client-configured REST address for use as a linked-resource fetch
+// base. The SDK's restAddress may or may not already include the `/v2` API
+// prefix (CAMUNDA_REST_ADDRESS accepts either); resourceContentUrl re-adds it,
+// so strip a trailing `/v2` (and any trailing slashes) to avoid a double `/v2`.
+function normalizeRestBase(addr) {
+  return String(addr || '').replace(/\/+$/, '').replace(/\/v2$/i, '');
+}
+
+// Derive the linked-resource fetch base URL + auth headers from the SAME SDK
+// client that activated the job. A linked-resource `resourceKey` is broker-local,
+// so prompt content must be fetched from the broker this worker is connected to
+// — never a localhost default (the cause of "prompt resource N fetch failed").
+// An explicit NANO_REST_URL / NANO_REST_TOKEN override still wins as an operator
+// escape hatch. Both getConfig()/getAuthHeaders() are guarded so an older or
+// atypical client runtime degrades to the override/legacy path rather than throw.
+//
+// TODO: once c8ctl bumps @camunda8/orchestration-cluster-api to v10 (10.0.0-alpha
+// exposes the typed camunda.getResourceContentBinary({resourceKey}) → Blob), drop
+// this raw /content/binary fetch and call that method directly. The pinned ^9.1.0
+// SDK only exposes the deprecated getResourceContent, which 406s for generic
+// (Markdown) prompt resources — see camunda/orchestration-cluster-api-js.
+async function resolveLinkedPromptSource(camunda, env = process.env) {
+  let baseUrl = env.NANO_REST_URL || '';
+  if (!baseUrl && camunda && typeof camunda.getConfig === 'function') {
+    try {
+      baseUrl = normalizeRestBase(camunda.getConfig().restAddress);
+    } catch {
+      // ignore — fall back to the legacy resolveBrokerRestConfig base below
+    }
+  }
+  let authHeaders;
+  if (env.NANO_REST_TOKEN) {
+    authHeaders = { Authorization: `Bearer ${env.NANO_REST_TOKEN}` };
+  } else if (camunda && typeof camunda.getAuthHeaders === 'function') {
+    try {
+      authHeaders = await camunda.getAuthHeaders();
+    } catch {
+      authHeaders = undefined;
+    }
+  }
+  return { baseUrl, authHeaders };
 }
 
 // Secrets are referenced by NAME, never by value, in the model. A resolver maps
@@ -4533,8 +4580,13 @@ async function workAgent(req, flags) {
         let promptResourceKey = null;
         let basePromptOverride;
         try {
+          // Fetch the prompt from the broker the SDK client is connected to,
+          // deriving base URL + auth from that client (not restConfig, whose base
+          // defaults to localhost) — the resourceKey is broker-local.
+          const promptSource = await resolveLinkedPromptSource(camunda);
           const linked = await resolveLinkedPrompt(job.customHeaders ?? {}, {
-            baseUrl: restConfig.baseUrl,
+            baseUrl: promptSource.baseUrl || restConfig.baseUrl,
+            authHeaders: promptSource.authHeaders,
             token: restConfig.token,
           });
           if (linked) {
@@ -7865,6 +7917,8 @@ export {
   resourceContentUrl,
   fetchLinkedResourceContent,
   resolveLinkedPrompt,
+  resolveLinkedPromptSource,
+  normalizeRestBase,
   coerceBool,
   coerceInt,
   deepMerge,

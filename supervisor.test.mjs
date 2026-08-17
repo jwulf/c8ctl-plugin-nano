@@ -727,7 +727,7 @@ test('live view: a second status MUTATES in place (erase codes), not a reprinted
   // In-place repaint issues a cursor-up (moveCursor) + clear-to-end before the
   // redraw — the proof it erased the old block rather than appending a new one.
   assert.match(second, /\x1b\[\d+A/, 'moves the cursor up over the previous block');
-  assert.match(second, /\x1b\[0J/, 'clears from the cursor to the end of screen');
+  assert.match(second, /\x1b\[0?J/, 'clears from the cursor to the end of screen');
   assert.equal(view.blockRows(), firstRows, 'the block keeps the same height');
 });
 

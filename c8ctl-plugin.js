@@ -33,6 +33,8 @@ import {
   existsSync,
   mkdirSync,
   openSync,
+  copyFileSync,
+  statSync,
   readFileSync,
   writeFileSync,
   appendFileSync,
@@ -7304,6 +7306,147 @@ async function downloadProcessosBinary(url, dest) {
   return dest;
 }
 
+// --- Pre-upgrade read-model backup -----------------------------------------
+// A schema-changing gateway release can reproject the SQLite read model and
+// silently drop completed process-instance history (see nano-bpm#831). Until
+// the engine ships non-destructive migrations, the launcher is the last line of
+// defence: before we swap the binary for a different version, snapshot each
+// per-node read model so the pre-upgrade state is always recoverable.
+
+/** How many prior pre-upgrade backups to keep per node (bounds disk use). */
+const READ_MODEL_BACKUP_RING = 5;
+
+/** Filesystem-safe tag for the version being replaced (for the backup name). */
+function sanitizeVersionTag(v) {
+  const s = String(v ?? '').trim() || 'unknown';
+  return s.replace(/[^A-Za-z0-9._-]+/g, '-');
+}
+
+/** Copy `src` to `dest` when it exists; best-effort (sidecars may be absent). */
+function copyIfExists(src, dest) {
+  try {
+    if (existsSync(src)) {
+      copyFileSync(src, dest);
+      return true;
+    }
+  } catch {
+    /* a missing/locked sidecar must never fail the backup */
+  }
+  return false;
+}
+
+/**
+ * Snapshot every per-node read model before an upgrade swaps the gateway
+ * binary. For each `<dataDir>/node-*` that has a `read-model.sqlite`, copy it —
+ * plus its `-wal` sidecar (WAL mode keeps uncheckpointed pages there) and the
+ * `-shm` shared-memory index — to a timestamped file under a
+ * `read-model-backups/` subdir. We also grab the coherent point-in-time set
+ * (`snapshot.*.bin` + `journal.head`) when present, and prune to a bounded ring
+ * of prior backups. Best-effort: any failure is logged and swallowed so it can
+ * never block the upgrade itself.
+ *
+ * @param {string|null} oldVersion  version being replaced (used in the filename)
+ * @param {number} ring             prior backups to keep per node
+ * @returns {string[]} paths of the primary `.sqlite` copies written
+ */
+function backupReadModelsBeforeUpgrade(oldVersion, ring = READ_MODEL_BACKUP_RING) {
+  const logger = getLogger();
+  const dataDir = getDataDir();
+  const written = [];
+
+  let nodeDirs;
+  try {
+    nodeDirs = readdirSync(dataDir, { withFileTypes: true })
+      .filter((d) => d.isDirectory() && d.name.startsWith('node-'))
+      .map((d) => d.name);
+  } catch {
+    return written; // no data dir yet — nothing to back up
+  }
+
+  const ts = new Date().toISOString().replace(/[:.]/g, '-');
+  const verTag = sanitizeVersionTag(oldVersion);
+
+  for (const node of nodeDirs) {
+    const nodeDir = join(dataDir, node);
+    const readModel = join(nodeDir, 'read-model.sqlite');
+    if (!existsSync(readModel)) continue; // in-memory node, or never projected
+
+    const backupDir = join(nodeDir, 'read-model-backups');
+    const stem = `read-model.pre-upgrade-${verTag}-${ts}`;
+    try {
+      mkdirSync(backupDir, { recursive: true });
+
+      // Primary DB + its WAL/SHM sidecars (uncheckpointed pages live in -wal).
+      const destSqlite = join(backupDir, `${stem}.sqlite`);
+      copyFileSync(readModel, destSqlite);
+      written.push(destSqlite);
+      copyIfExists(join(nodeDir, 'read-model.sqlite-wal'), join(backupDir, `${stem}.sqlite-wal`));
+      copyIfExists(join(nodeDir, 'read-model.sqlite-shm'), join(backupDir, `${stem}.sqlite-shm`));
+
+      // Coherent point-in-time set: journal head + latest snapshot bins.
+      copyIfExists(join(nodeDir, 'journal.head'), join(backupDir, `${stem}.journal.head`));
+      for (const f of readdirSync(nodeDir)) {
+        if (/^snapshot\..*\.bin$/.test(f)) {
+          copyIfExists(join(nodeDir, f), join(backupDir, `${stem}.${f}`));
+        }
+      }
+
+      logger.info(`Backed up read model before upgrade: ${destSqlite}`);
+      pruneReadModelBackups(backupDir, ring, logger);
+    } catch (err) {
+      logger.warn(
+        `Read-model backup for ${node} failed (continuing upgrade): ${err?.message ?? err}`,
+      );
+    }
+  }
+  return written;
+}
+
+/**
+ * Keep only the newest `ring` pre-upgrade backup sets in `backupDir`, deleting
+ * the oldest. A "set" is all files sharing a `read-model.pre-upgrade-*` stem
+ * (the `.sqlite` plus its `-wal`/`-shm`/`journal.head`/`snapshot.*` siblings),
+ * identified by the primary `.sqlite` file and ordered by its mtime.
+ */
+function pruneReadModelBackups(backupDir, ring = READ_MODEL_BACKUP_RING, logger = getLogger()) {
+  if (!(ring > 0)) return;
+  let entries;
+  try {
+    entries = readdirSync(backupDir);
+  } catch {
+    return;
+  }
+
+  const stems = entries
+    .filter((f) => f.startsWith('read-model.pre-upgrade-') && f.endsWith('.sqlite'))
+    .map((f) => f.slice(0, -'.sqlite'.length));
+  if (stems.length <= ring) return;
+
+  const withTime = stems.map((stem) => {
+    let mtime = 0;
+    try {
+      mtime = statSync(join(backupDir, `${stem}.sqlite`)).mtimeMs;
+    } catch {
+      /* fall back to 0 so an unreadable set sorts oldest and is dropped first */
+    }
+    return { stem, mtime };
+  });
+  withTime.sort((a, b) => a.mtime - b.mtime);
+
+  for (const { stem } of withTime.slice(0, withTime.length - ring)) {
+    for (const f of entries) {
+      if (f === `${stem}.sqlite` || f.startsWith(`${stem}.`)) {
+        try {
+          rmSync(join(backupDir, f), { force: true });
+        } catch {
+          /* best-effort prune */
+        }
+      }
+    }
+    logger.info(`Pruned old read-model backup set: ${join(backupDir, stem)}.*`);
+  }
+}
+
 /**
  * Resolve the ProcessOS binary to run, downloading it on demand when the user
  * has a PROCESSOS_DOWNLOAD_URL but no local copy yet. Resolution:
@@ -7334,6 +7477,19 @@ async function resolveProcessosBinary(req) {
       const logger = getLogger();
       if (haveCached && remoteVer) {
         logger.info(`Updating ProcessOS ${haveVer ?? '?'} -> ${remoteVer} ...`);
+      }
+      // Before swapping the binary for a different version, snapshot each
+      // node's read model so a schema-changing release can never silently
+      // destroy completed-instance history (issue #85). First download of a
+      // fresh install (no cached copy) is not an upgrade, so it is skipped.
+      if (haveCached) {
+        try {
+          backupReadModelsBeforeUpgrade(haveVer);
+        } catch (err) {
+          logger.warn(
+            `Pre-upgrade read-model backup failed (continuing upgrade): ${err?.message ?? err}`,
+          );
+        }
       }
       await downloadProcessosBinary(processosBinaryUrl(dlUrl), cached);
       // Record what we fetched so the update notifier/status can compare later.
@@ -7973,6 +8129,12 @@ function parseProcessosRequest(args, flags) {
 // Internal helpers exported for tests/tooling only. c8ctl consumes just
 // `metadata` and `commands`; these named exports are inert to it.
 export { resolveBinary, findBinary, launcherEnvMarkers };
+export {
+  backupReadModelsBeforeUpgrade,
+  pruneReadModelBackups,
+  sanitizeVersionTag,
+  READ_MODEL_BACKUP_RING,
+};
 export { setConfig, unsetConfig, readConfig, writeConfig, getConfigFile, SETTING_ALIASES };
 export { buildNpmInvocation };
 export { resolveAgenticConfig, LOCAL_AGENTIC_TOKEN };

@@ -55,7 +55,7 @@ import { join, isAbsolute, resolve as resolvePath, dirname, basename, sep } from
 import { createRequire } from 'node:module';
 import { fileURLToPath } from 'node:url';
 import { createInterface } from 'node:readline/promises';
-import { createInterface as createReadline } from 'node:readline';
+import { createInterface as createReadline, cursorTo as rlCursorTo, moveCursor as rlMoveCursor, clearScreenDown as rlClearScreenDown } from 'node:readline';
 import { platformForHost } from './platforms.mjs';
 import { createWorkChannel, redactAgenticUrl, buildAgenticUrl } from './work-channel.mjs';
 import { createRelaySession, roleTerminalMode } from './work-relay.mjs';
@@ -5081,6 +5081,12 @@ const SUPERVISOR_MAX_FRAME_BYTES = 1 << 20; // 1 MiB
 // live refresh (falling back to the attach-time snapshot + lifecycle events).
 const SUPERVISOR_MONITOR_INTERVAL_MS = 1_000;
 
+// How often an *attached* console re-ages and repaints its pinned status block
+// locally, so UPTIME / job-age advance even while the fleet is quiet and the
+// daemon's change-gated push stays silent (issue #83). Pure client-side; no
+// extra daemon traffic.
+const SUPERVISOR_LIVE_TICK_MS = 5_000;
+
 // The `nano work` flags forwarded verbatim to each spawned child.
 // kind: 'value' → `--flag v`; 'boolean' → `--flag`; 'list' → repeated `--flag v`.
 const WORK_FORWARD_FLAGS = {
@@ -5343,10 +5349,15 @@ function formatDuration(ms) {
 /** Project a live/stored worker record to a status row (pure w.r.t. `now`). */
 function summarizeSupervisorWorker(w, now = Date.now()) {
   const alive = isPidAlive(w.pid);
-  const uptimeMs = alive && w.startedAt ? Math.max(0, now - new Date(w.startedAt).getTime()) : 0;
+  // Absolute base epoch (ms) the worker started, so an attached console can
+  // re-age `uptimeMs` locally on each tick (see reageSupervisorStatus) without
+  // the daemon re-broadcasting. `uptimeMs` is the value at snapshot time; it and
+  // `startedAtMs` are kept in lock-step here so a consumer can use either.
+  const startedAtMs = alive && w.startedAt ? new Date(w.startedAt).getTime() : null;
+  const uptimeMs = startedAtMs != null ? Math.max(0, now - startedAtMs) : 0;
   // Per-job activity (supervised workers only). Guard on pid so a stale marker
   // left by a previous incarnation can't show a dead job as in-flight.
-  let activity = null; // { state: 'busy'|'idle', jobs: [{ key, type, sinceMs }] }
+  let activity = null; // { state: 'busy'|'idle', jobs: [{ key, type, sinceMs, sinceEpochMs }] }
   if (alive) {
     const act = readWorkerActivity(w.id);
     if (act && act.pid === w.pid) {
@@ -5354,7 +5365,10 @@ function summarizeSupervisorWorker(w, now = Date.now()) {
         ? act.jobs.map((j) => ({
             key: String(j.key),
             type: j.type ?? null,
+            // Both the snapshot-time duration and its absolute base, so the
+            // console can re-age the job cell locally (mirrors uptimeMs above).
             sinceMs: Number.isFinite(j.since) ? Math.max(0, now - j.since) : null,
+            sinceEpochMs: Number.isFinite(j.since) ? j.since : null,
           }))
         : [];
       activity = { state: jobs.length > 0 ? 'busy' : 'idle', jobs };
@@ -5368,6 +5382,7 @@ function summarizeSupervisorWorker(w, now = Date.now()) {
     state: w.stopping ? 'stopping' : alive ? 'running' : 'down',
     restarts: Number(w.restarts) || 0,
     uptimeMs,
+    startedAtMs,
     lastExit: w.lastExit ?? null,
     args: Array.isArray(w.args) ? w.args : [],
     activity,
@@ -5411,6 +5426,132 @@ function supervisorJobCell(w) {
   const dur = first.sinceMs != null ? ` (${formatDuration(first.sinceMs)})` : '';
   const more = rest.length > 0 ? ` +${rest.length}` : '';
   return `${first.key}${more}${dur}`;
+}
+
+/**
+ * Re-age a supervisor status snapshot to `now`, recomputing the ticking
+ * durations (`uptimeMs`, per-job `sinceMs`) from the absolute base epochs the
+ * daemon includes (`startedAtMs`, `sinceEpochMs`). This lets an attached
+ * console tick UPTIME / job-age locally on its own timer — no re-broadcast —
+ * so a quiet-but-busy fleet's clocks still advance. Pure: returns a new object,
+ * never mutates its input. Workers whose base epoch is absent (an older daemon,
+ * or a down worker with no start) keep their snapshot-time value. Non-array /
+ * non-object shapes pass through untouched, so it is safe on any frame.
+ */
+function reageSupervisorStatus(status, now = Date.now()) {
+  if (!status || typeof status !== 'object') return status;
+  const workers = Array.isArray(status.workers) ? status.workers : null;
+  if (!workers) return status;
+  return {
+    ...status,
+    workers: workers.map((w) => {
+      if (!w || typeof w !== 'object') return w;
+      const uptimeMs =
+        typeof w.startedAtMs === 'number' ? Math.max(0, now - w.startedAtMs) : w.uptimeMs;
+      let activity = w.activity;
+      if (activity && Array.isArray(activity.jobs)) {
+        activity = {
+          ...activity,
+          jobs: activity.jobs.map((j) =>
+            j && typeof j === 'object' && typeof j.sinceEpochMs === 'number'
+              ? { ...j, sinceMs: Math.max(0, now - j.sinceEpochMs) }
+              : j,
+          ),
+        };
+      }
+      return { ...w, uptimeMs, activity };
+    }),
+  };
+}
+
+/**
+ * Clamp a line to `width` display columns, appending `…` when it is truncated,
+ * so a pinned in-place status block keeps one logical line per terminal row —
+ * the invariant the console's redraw cursor-math depends on (a wrapped row
+ * would desync the up-count). `width < 1` or a non-finite width is treated as
+ * "no clamp". Pure.
+ */
+function clampToWidth(line, width) {
+  const s = String(line ?? '');
+  if (!Number.isFinite(width) || width < 1 || s.length <= width) return s;
+  if (width === 1) return '…';
+  return s.slice(0, width - 1) + '…';
+}
+
+/**
+ * A pinned in-place status "block" for the attached `supervisor>` console
+ * (issue #83). Instead of appending a fresh table on every change, it keeps a
+ * single block just above the readline prompt and *mutates it in place*:
+ * `status()` / `repaint()` erase the previously-painted rows (cursor up N +
+ * clear-to-end) and redraw, so the table updates without scrolling a new copy
+ * into the backlog. `write()` emits scrolling history (events, command replies)
+ * above the block. Durations are re-aged to `now()` on every paint (see
+ * reageSupervisorStatus) so a ~5s tick advances UPTIME / job-age with no
+ * re-broadcast. On a non-TTY (`isTty === false`) there is no cursor addressing:
+ * `status()` appends the table and `write()` is a plain line — the classic
+ * behavior. Each block line is clamped to the terminal width so one logical
+ * line is exactly one terminal row, keeping the erase cursor-math exact.
+ *
+ * Dependencies are injected (stream, columns getter, prompt refresh, clock) so
+ * the render orchestration is unit-testable against a fake capturing stream.
+ */
+function createSupervisorLiveView({
+  stream,
+  isTty,
+  columns = () => 80,
+  refreshPrompt = () => {},
+  now = () => Date.now(),
+}) {
+  let lastStatus = null;
+  let blockLines = 0; // terminal rows the block currently occupies
+
+  const blockText = () => {
+    if (!lastStatus) return '';
+    const cols = columns();
+    return formatSupervisorStatus(reageSupervisorStatus(lastStatus, now()))
+      .split('\n')
+      .map((l) => clampToWidth(l, cols))
+      .join('\n');
+  };
+
+  // Erase the painted block (if any) + the prompt line, leaving the cursor at
+  // column 0 on the row where the block should restart.
+  const erase = () => {
+    rlCursorTo(stream, 0);
+    if (blockLines > 0) rlMoveCursor(stream, 0, -blockLines);
+    rlClearScreenDown(stream);
+  };
+
+  // Draw the (re-aged) block, then re-render the prompt below it.
+  const draw = () => {
+    const text = blockText();
+    if (text) { stream.write(text + '\n'); blockLines = text.split('\n').length; }
+    else blockLines = 0;
+    refreshPrompt();
+  };
+
+  return {
+    /** New snapshot → mutate the block in place (TTY) or append it (non-TTY). */
+    status(frame) {
+      lastStatus = frame;
+      if (isTty) { erase(); draw(); }
+      else { stream.write('\n'); stream.write(formatSupervisorStatus(reageSupervisorStatus(frame, now())) + '\n'); }
+    },
+    /** Repaint the current snapshot re-aged to now (the ~5s tick / resize). */
+    repaint() { if (isTty && lastStatus) { erase(); draw(); } },
+    /** Scrolling history above the block; a plain append on a non-TTY. */
+    write(text) {
+      const s = String(text);
+      if (!isTty) { stream.write(s + '\n'); return; }
+      erase();
+      stream.write(s + '\n');
+      draw();
+    },
+    /** Rows the block currently occupies (test/inspection). */
+    blockRows() { return blockLines; },
+    /** Whether a snapshot has been received (test/inspection). */
+    hasStatus() { return lastStatus != null; },
+  };
 }
 
 /** Render a supervisor status object as an aligned text table. */
@@ -6324,13 +6465,27 @@ async function attachSupervisorConsole(state) {
     process.exit(1);
   }
 
-  const out = (s) => process.stdout.write(s + '\n');
+  const outStream = process.stdout;
+  // The pinned in-place block needs cursor addressing; on a non-TTY / dumb
+  // terminal we fall back to the classic append-and-scroll behavior.
+  const isTty = !!outStream.isTTY && process.env.TERM !== 'dumb';
+
+  let rl = null;
+  const termCols = () => (Number.isFinite(outStream.columns) ? outStream.columns : 80);
+  const view = createSupervisorLiveView({
+    stream: outStream,
+    isTty,
+    columns: termCols,
+    refreshPrompt: () => { if (rl) { try { rl.prompt(true); } catch { /* ignore */ } } },
+  });
+  // All scrolling output (intro, events, command replies) goes ABOVE the block.
+  const out = (s) => view.write(s);
+
   out('Attached to nano worker supervisor. Type "help" for commands.');
   out('Detach (leave it running) with "detach" or Ctrl-D; tear it down with "stop".');
   sock.write(encodeFrame({ op: 'attach' }));
 
   let buf = '';
-  let rl = null;
   sock.on('data', (chunk) => {
     buf += chunk;
     const { frames, rest } = decodeFrames(buf);
@@ -6338,8 +6493,9 @@ async function attachSupervisorConsole(state) {
     if (frames.length === 0) return;
     for (const frame of frames) {
       if (frame.type === 'status') {
-        out('');
-        out(formatSupervisorStatus(frame));
+        // Mutate the pinned block in place (TTY) or append (non-TTY) — never a
+        // reprinted table stacking up in the scrollback.
+        view.status(frame);
       } else if (frame.type === 'event') {
         const w = frame.worker;
         if (frame.event === 'worker-start') out(`• worker ${w.id} started (pid ${w.pid}).`);
@@ -6356,18 +6512,35 @@ async function attachSupervisorConsole(state) {
         out(`! ${frame.error}`);
       }
     }
-    // A pushed frame writes straight to stdout, stepping on the readline prompt
-    // and any half-typed command. Re-render the prompt (preserving the input
-    // buffer) so an async live-view refresh doesn't corrupt what the user typed.
-    if (rl) { try { rl.prompt(true); } catch { /* ignore */ } }
+    // TTY: repaint the pinned block so a status-only push (the ~1s monitor) is
+    // reflected and the freshest snapshot ends up on screen. Non-TTY: nudge the
+    // prompt so an async push doesn't leave the input line half-rendered.
+    if (isTty) view.repaint();
+    else if (rl) { try { rl.prompt(true); } catch { /* ignore */ } }
   });
 
   rl = createReadline({ input: process.stdin, output: process.stdout, prompt: 'supervisor> ' });
+
+  // Local ~5s tick: re-age the block so UPTIME / job-age advance even when the
+  // fleet is quiet (the daemon's change-gated push stays silent). And reflow the
+  // block on terminal resize so a narrower window re-clamps cleanly.
+  let tickTimer = null;
+  let onResize = null;
+  if (isTty) {
+    tickTimer = setInterval(() => view.repaint(), SUPERVISOR_LIVE_TICK_MS);
+    if (typeof tickTimer.unref === 'function') tickTimer.unref();
+    onResize = () => view.repaint();
+    outStream.on('resize', onResize);
+  }
   rl.prompt();
 
   await new Promise((resolve) => {
     let stopping = false;
-    const finish = () => { try { rl.close(); } catch { /* ignore */ } try { sock.end(); } catch { /* ignore */ } resolve(); };
+    const finish = () => {
+      if (tickTimer) { try { clearInterval(tickTimer); } catch { /* ignore */ } tickTimer = null; }
+      if (onResize) { try { outStream.off('resize', onResize); } catch { /* ignore */ } onResize = null; }
+      try { rl.close(); } catch { /* ignore */ } try { sock.end(); } catch { /* ignore */ } resolve();
+    };
 
     sock.on('close', () => { if (!stopping) out('\nSupervisor connection closed.'); finish(); });
 
@@ -8069,6 +8242,9 @@ export {
   formatDuration,
   summarizeSupervisorWorker,
   formatSupervisorStatus,
+  reageSupervisorStatus,
+  clampToWidth,
+  createSupervisorLiveView,
   printSupervisorStatus,
   supervisorStatusSignature,
   supervisorJobCell,

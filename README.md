@@ -1112,7 +1112,9 @@ For every `…/data/node-<i>/` that has a `read-model.sqlite`, the launcher copi
 it — together with its `-wal` sidecar (WAL mode keeps uncheckpointed pages there)
 and `-shm` index, plus the coherent point-in-time set `journal.head` and
 `snapshot.*.bin` — into a `read-model-backups/` subdir under that node, named
-`read-model.pre-upgrade-<oldver>-<timestamp>.sqlite`. The backup path is logged
+`read-model.pre-upgrade-<oldver>-<timestamp>-<rand>.sqlite` (the `<rand>` token
+keeps two backups that land in the same millisecond from colliding). The backup
+path is logged
 at INFO, and a bounded ring (the last **5** upgrades per node) is retained;
 older sets are pruned. The backup is best-effort: a failure is logged and never
 blocks the upgrade.
@@ -1130,7 +1132,7 @@ ls -t "$NODE/read-model-backups"/read-model.pre-upgrade-*.sqlite
 
 # 3. Replace the live read-model files with the chosen backup set. Remove the
 #    stale WAL/SHM first so SQLite does not replay them over the restored DB.
-STEM="$NODE/read-model-backups/read-model.pre-upgrade-<oldver>-<timestamp>"
+STEM="$NODE/read-model-backups/read-model.pre-upgrade-<oldver>-<timestamp>-<rand>"
 rm -f "$NODE/read-model.sqlite" "$NODE/read-model.sqlite-wal" "$NODE/read-model.sqlite-shm"
 cp "$STEM.sqlite" "$NODE/read-model.sqlite"
 [ -f "$STEM.sqlite-wal" ] && cp "$STEM.sqlite-wal" "$NODE/read-model.sqlite-wal"

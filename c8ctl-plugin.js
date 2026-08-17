@@ -7371,6 +7371,10 @@ function backupReadModelsBeforeUpgrade(oldVersion, ring = READ_MODEL_BACKUP_RING
   }
 
   const ts = new Date().toISOString().replace(/[:.]/g, '-');
+  // Append a short random token so two backup runs landing in the same
+  // millisecond (parallel starts, or a retry loop) can't derive an identical
+  // stem and clobber each other's pre-upgrade set.
+  const uniq = randomBytes(3).toString('hex');
   const verTag = sanitizeVersionTag(oldVersion);
 
   for (const node of nodeDirs) {
@@ -7379,7 +7383,7 @@ function backupReadModelsBeforeUpgrade(oldVersion, ring = READ_MODEL_BACKUP_RING
     if (!existsSync(readModel)) continue; // in-memory node, or never projected
 
     const backupDir = join(nodeDir, 'read-model-backups');
-    const stem = `read-model.pre-upgrade-${verTag}-${ts}`;
+    const stem = `read-model.pre-upgrade-${verTag}-${ts}-${uniq}`;
     try {
       mkdirSync(backupDir, { recursive: true });
 

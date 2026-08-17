@@ -24,6 +24,9 @@ import {
   formatDuration,
   summarizeSupervisorWorker,
   formatSupervisorStatus,
+  reageSupervisorStatus,
+  clampToWidth,
+  createSupervisorLiveView,
   printSupervisorStatus,
   supervisorStatusSignature,
   supervisorJobCell,
@@ -593,4 +596,211 @@ test('supervisorStatusSignature tracks a profile change on the same worker id', 
 test('supervisorStatusSignature tolerates a non-array input', () => {
   assert.equal(supervisorStatusSignature(null), '[]');
   assert.equal(supervisorStatusSignature(undefined), '[]');
+});
+
+// --- summarizeSupervisorWorker carries absolute base epochs -----------------
+// The pinned in-place console re-ages durations locally on its own tick, so the
+// snapshot must expose the absolute base times (not just the snapshot-time
+// durations) for uptime and each in-flight job. (issue #83)
+
+test('summarizeSupervisorWorker exposes startedAtMs for a live worker', () => {
+  const now = Date.now();
+  const startedAt = new Date(now - 5000).toISOString();
+  const w = summarizeSupervisorWorker({ id: 'reviewer', profile: 'reviewer', pid: process.pid, startedAt, restarts: 0 }, now);
+  assert.equal(w.startedAtMs, new Date(startedAt).getTime());
+  assert.equal(w.uptimeMs, 5000);
+});
+
+test('summarizeSupervisorWorker leaves startedAtMs null for a down worker', () => {
+  const w = summarizeSupervisorWorker({ id: 'coder', profile: 'coder', pid: 2 ** 30, restarts: 1 }, Date.now());
+  assert.equal(w.startedAtMs, null);
+  assert.equal(w.uptimeMs, 0);
+});
+
+// --- reageSupervisorStatus --------------------------------------------------
+
+test('reageSupervisorStatus recomputes uptimeMs from startedAtMs at the new now', () => {
+  const startedAtMs = 1_000_000;
+  const status = { daemon: { pid: 1 }, workers: [{ id: 'a', state: 'running', startedAtMs, uptimeMs: 0, activity: null }] };
+  const reaged = reageSupervisorStatus(status, startedAtMs + 42_000);
+  assert.equal(reaged.workers[0].uptimeMs, 42_000);
+  // Pure: input is untouched.
+  assert.equal(status.workers[0].uptimeMs, 0);
+});
+
+test('reageSupervisorStatus re-ages each in-flight job from its sinceEpochMs', () => {
+  const now0 = 5_000_000;
+  const status = {
+    workers: [{
+      id: 'a', state: 'running', startedAtMs: now0 - 1000, uptimeMs: 1000,
+      activity: { state: 'busy', jobs: [{ key: 'job:1', type: 't', sinceMs: 0, sinceEpochMs: now0 }] },
+    }],
+  };
+  const reaged = reageSupervisorStatus(status, now0 + 12_000);
+  assert.equal(reaged.workers[0].activity.jobs[0].sinceMs, 12_000);
+  assert.equal(status.workers[0].activity.jobs[0].sinceMs, 0); // unmutated
+});
+
+test('reageSupervisorStatus keeps the snapshot value when no absolute base is present', () => {
+  const status = { workers: [{ id: 'a', state: 'running', uptimeMs: 7777, activity: { state: 'busy', jobs: [{ key: 'j', sinceMs: 42 }] } }] };
+  const reaged = reageSupervisorStatus(status, Date.now());
+  assert.equal(reaged.workers[0].uptimeMs, 7777);
+  assert.equal(reaged.workers[0].activity.jobs[0].sinceMs, 42);
+});
+
+test('reageSupervisorStatus passes non-object / no-workers frames through untouched', () => {
+  assert.equal(reageSupervisorStatus(null, 1), null);
+  const noWorkers = { daemon: { pid: 1 } };
+  assert.equal(reageSupervisorStatus(noWorkers, 1), noWorkers);
+});
+
+test('reageSupervisorStatus output still renders through formatSupervisorStatus', () => {
+  const now0 = 9_000_000;
+  const status = {
+    daemon: { pid: process.pid },
+    workers: [summarizeSupervisorWorker({ id: 'reviewer', profile: 'reviewer', pid: process.pid, startedAt: new Date(now0).toISOString(), restarts: 0 }, now0)],
+  };
+  const text = formatSupervisorStatus(reageSupervisorStatus(status, now0 + 3661_000));
+  assert.match(text, /reviewer/);
+  assert.match(text, /1h1m/); // 3661s ≈ 1h1m — proof the re-aged uptime rendered
+});
+
+// --- clampToWidth (keeps one logical line per terminal row) ------------------
+
+test('clampToWidth truncates with an ellipsis past the width', () => {
+  assert.equal(clampToWidth('abcdefgh', 5), 'abcd…');
+});
+
+test('clampToWidth leaves a line within the width untouched', () => {
+  assert.equal(clampToWidth('abc', 5), 'abc');
+  assert.equal(clampToWidth('abcde', 5), 'abcde');
+});
+
+test('clampToWidth treats a non-positive / non-finite width as no clamp', () => {
+  assert.equal(clampToWidth('abcdef', 0), 'abcdef');
+  assert.equal(clampToWidth('abcdef', NaN), 'abcdef');
+  assert.equal(clampToWidth('abcdef', Infinity), 'abcdef');
+});
+
+test('clampToWidth collapses to a lone ellipsis at width 1', () => {
+  assert.equal(clampToWidth('abc', 1), '…');
+});
+
+// --- createSupervisorLiveView (pinned in-place block, issue #83) -------------
+// A fake stream captures every write so we can assert the render orchestration
+// without a real terminal. readline's cursor helpers emit ANSI escapes to the
+// stream (they don't require an actual TTY), so the erase sequence is visible.
+
+function fakeStream(cols = 200) {
+  const chunks = [];
+  return {
+    columns: cols,
+    write: (s) => { chunks.push(String(s)); return true; },
+    all: () => chunks.join(''),
+    clear: () => { chunks.length = 0; },
+  };
+}
+
+function statusFixture(now, { uptimeBaseMs = 1000 } = {}) {
+  return {
+    daemon: { pid: process.pid, startedAt: new Date(now).toISOString() },
+    workers: [
+      summarizeSupervisorWorker(
+        { id: 'reviewer', profile: 'reviewer', pid: process.pid, startedAt: new Date(now - uptimeBaseMs).toISOString(), restarts: 0 },
+        now,
+      ),
+    ],
+  };
+}
+
+test('live view: a second status MUTATES in place (erase codes), not a reprinted table', () => {
+  const stream = fakeStream();
+  const view = createSupervisorLiveView({ stream, isTty: true, columns: () => stream.columns, now: () => 1_000_000 });
+
+  view.status(statusFixture(1_000_000));
+  const firstRows = view.blockRows();
+  assert.ok(firstRows > 0, 'the block occupies at least one row after the first status');
+
+  stream.clear();
+  view.status(statusFixture(1_000_000));
+  const second = stream.all();
+  // In-place repaint issues a cursor-up (moveCursor) + clear-to-end before the
+  // redraw — the proof it erased the old block rather than appending a new one.
+  assert.match(second, /\x1b\[\d+A/, 'moves the cursor up over the previous block');
+  assert.match(second, /\x1b\[0?J/, 'clears from the cursor to the end of screen');
+  assert.equal(view.blockRows(), firstRows, 'the block keeps the same height');
+});
+
+test('live view: repaint re-ages UPTIME so a quiet fleet still ticks', () => {
+  const stream = fakeStream();
+  let clock = 5_000_000;
+  const view = createSupervisorLiveView({ stream, isTty: true, columns: () => stream.columns, now: () => clock });
+
+  // Worker started 1s before the first snapshot → UPTIME shows 1s.
+  view.status(statusFixture(5_000_000, { uptimeBaseMs: 1000 }));
+  stream.clear();
+
+  // 1 hour later, a bare repaint (no new frame) must advance UPTIME locally.
+  clock += 3_600_000;
+  view.repaint();
+  assert.match(stream.all(), /1h/, 'UPTIME advanced on a local repaint with no new status');
+});
+
+test('live view: write() scrolls history above the block and repaints it', () => {
+  const stream = fakeStream();
+  const view = createSupervisorLiveView({ stream, isTty: true, columns: () => stream.columns, now: () => 1 });
+  view.status(statusFixture(1_000_000));
+  stream.clear();
+
+  view.write('• worker reviewer started (pid 42).');
+  const out = stream.all();
+  assert.match(out, /worker reviewer started/, 'the history line is emitted');
+  assert.match(out, /reviewer/, 'the block is redrawn beneath the history line');
+  // The history line precedes the redrawn block (block stays pinned at bottom).
+  assert.ok(out.indexOf('started (pid 42)') < out.lastIndexOf('PROFILE'), 'history scrolls above the pinned block');
+});
+
+test('live view: non-TTY appends the table and never emits cursor escapes', () => {
+  const stream = fakeStream();
+  const view = createSupervisorLiveView({ stream, isTty: false, columns: () => stream.columns, now: () => 1_000_000 });
+  view.status(statusFixture(1_000_000));
+  view.status(statusFixture(1_000_000));
+  const out = stream.all();
+  assert.doesNotMatch(out, /\x1b\[/, 'no ANSI cursor addressing on a non-TTY');
+  // Two snapshots → the table rendered twice (classic append behavior).
+  assert.equal(out.match(/PROFILE/g).length, 2, 'each non-TTY status appends a fresh table');
+});
+
+test('live view: repaint before any status is a no-op', () => {
+  const stream = fakeStream();
+  const view = createSupervisorLiveView({ stream, isTty: true, columns: () => stream.columns });
+  view.repaint();
+  assert.equal(stream.all(), '', 'nothing painted before the first snapshot');
+  assert.equal(view.hasStatus(), false);
+});
+
+test('live view: block lines are clamped to the terminal width', () => {
+  const stream = fakeStream(24); // narrow terminal
+  const view = createSupervisorLiveView({ stream, isTty: true, columns: () => stream.columns, now: () => 1_000_000 });
+  view.status(statusFixture(1_000_000));
+  // Every emitted block line (ignoring bare-escape/newline writes) fits the width.
+  for (const line of stream.all().split('\n')) {
+    const visible = line.replace(/\x1b\[[0-9;]*[A-Za-z]/g, '');
+    assert.ok(visible.length <= 24, `line within width: ${JSON.stringify(visible)}`);
+  }
+});
+
+test('summarizeSupervisorWorker: an invalid startedAt yields null (not NaN) startedAtMs', () => {
+  const row = summarizeSupervisorWorker(
+    { id: 'w', profile: 'p', pid: process.pid, startedAt: 'not-a-date', restarts: 0 },
+    1_000_000,
+  );
+  assert.equal(row.startedAtMs, null, 'a non-parseable startedAt normalizes to null');
+  assert.equal(row.uptimeMs, 0, 'uptime is 0, never NaN');
+});
+
+test('reageSupervisorStatus: a NaN base epoch does not poison uptime', () => {
+  const status = { workers: [{ id: 'w', state: 'running', startedAtMs: NaN, uptimeMs: 42 }] };
+  const out = reageSupervisorStatus(status, 9_999);
+  assert.equal(out.workers[0].uptimeMs, 42, 'falls back to the snapshot uptime when the base is not finite');
 });

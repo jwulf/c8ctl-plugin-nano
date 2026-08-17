@@ -149,7 +149,8 @@ test('prunes to a bounded ring, keeping the newest sets', () => {
 test('backup enforces the default ring across repeated upgrades', () => {
   withHome((HOME) => {
     const nodeDir = seedNode(HOME, 'node-0', { 'read-model.sqlite': 'DB' });
-    // Run more upgrades than the ring; timestamps embed a coarse second, so
+    // Run more upgrades than the ring; each backup's timestamp includes
+    // milliseconds (toISOString) so the sets are uniquely named per iteration —
     // pass an explicit small ring to make the assertion deterministic here.
     for (let i = 0; i < READ_MODEL_BACKUP_RING + 3; i++) {
       backupReadModelsBeforeUpgrade(`1.0.${i}`, 3);

@@ -7322,15 +7322,22 @@ function sanitizeVersionTag(v) {
   return s.replace(/[^A-Za-z0-9._-]+/g, '-');
 }
 
-/** Copy `src` to `dest` when it exists; best-effort (sidecars may be absent). */
-function copyIfExists(src, dest) {
+/**
+ * Copy `src` to `dest` when it exists; best-effort (sidecars may be absent).
+ * A genuinely absent sidecar is fine and stays silent, but a sidecar that
+ * exists yet cannot be copied (permissions/lock) is logged as a warning so an
+ * incomplete backup never passes unnoticed — a missing/locked sidecar must
+ * still never fail the backup itself.
+ */
+function copyIfExists(src, dest, logger) {
+  if (!existsSync(src)) return false;
   try {
-    if (existsSync(src)) {
-      copyFileSync(src, dest);
-      return true;
-    }
-  } catch {
-    /* a missing/locked sidecar must never fail the backup */
+    copyFileSync(src, dest);
+    return true;
+  } catch (err) {
+    logger?.warn?.(
+      `Read-model backup: could not copy ${src} (continuing): ${err?.message ?? err}`,
+    );
   }
   return false;
 }
@@ -7380,14 +7387,14 @@ function backupReadModelsBeforeUpgrade(oldVersion, ring = READ_MODEL_BACKUP_RING
       const destSqlite = join(backupDir, `${stem}.sqlite`);
       copyFileSync(readModel, destSqlite);
       written.push(destSqlite);
-      copyIfExists(join(nodeDir, 'read-model.sqlite-wal'), join(backupDir, `${stem}.sqlite-wal`));
-      copyIfExists(join(nodeDir, 'read-model.sqlite-shm'), join(backupDir, `${stem}.sqlite-shm`));
+      copyIfExists(join(nodeDir, 'read-model.sqlite-wal'), join(backupDir, `${stem}.sqlite-wal`), logger);
+      copyIfExists(join(nodeDir, 'read-model.sqlite-shm'), join(backupDir, `${stem}.sqlite-shm`), logger);
 
       // Coherent point-in-time set: journal head + latest snapshot bins.
-      copyIfExists(join(nodeDir, 'journal.head'), join(backupDir, `${stem}.journal.head`));
+      copyIfExists(join(nodeDir, 'journal.head'), join(backupDir, `${stem}.journal.head`), logger);
       for (const f of readdirSync(nodeDir)) {
         if (/^snapshot\..*\.bin$/.test(f)) {
-          copyIfExists(join(nodeDir, f), join(backupDir, `${stem}.${f}`));
+          copyIfExists(join(nodeDir, f), join(backupDir, `${stem}.${f}`), logger);
         }
       }
 

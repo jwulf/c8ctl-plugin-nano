@@ -1124,7 +1124,7 @@ stopped):
 # 1. Stop the cluster so nothing is writing the read model.
 c8ctl nano stop
 
-# 2. Pick the pre-upgrade backup you want to restore (newest shown last).
+# 2. Pick the pre-upgrade backup you want to restore (newest shown first).
 NODE=~/Library/Application\ Support/c8ctl-nano/data/node-0   # adjust per platform/node
 ls -t "$NODE/read-model-backups"/read-model.pre-upgrade-*.sqlite
 

@@ -789,3 +789,18 @@ test('live view: block lines are clamped to the terminal width', () => {
     assert.ok(visible.length <= 24, `line within width: ${JSON.stringify(visible)}`);
   }
 });
+
+test('summarizeSupervisorWorker: an invalid startedAt yields null (not NaN) startedAtMs', () => {
+  const row = summarizeSupervisorWorker(
+    { id: 'w', profile: 'p', pid: process.pid, startedAt: 'not-a-date', restarts: 0 },
+    1_000_000,
+  );
+  assert.equal(row.startedAtMs, null, 'a non-parseable startedAt normalizes to null');
+  assert.equal(row.uptimeMs, 0, 'uptime is 0, never NaN');
+});
+
+test('reageSupervisorStatus: a NaN base epoch does not poison uptime', () => {
+  const status = { workers: [{ id: 'w', state: 'running', startedAtMs: NaN, uptimeMs: 42 }] };
+  const out = reageSupervisorStatus(status, 9_999);
+  assert.equal(out.workers[0].uptimeMs, 42, 'falls back to the snapshot uptime when the base is not finite');
+});

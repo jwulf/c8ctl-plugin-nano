@@ -5353,7 +5353,8 @@ function summarizeSupervisorWorker(w, now = Date.now()) {
   // re-age `uptimeMs` locally on each tick (see reageSupervisorStatus) without
   // the daemon re-broadcasting. `uptimeMs` is the value at snapshot time; it and
   // `startedAtMs` are kept in lock-step here so a consumer can use either.
-  const startedAtMs = alive && w.startedAt ? new Date(w.startedAt).getTime() : null;
+  const startedAtEpoch = alive && w.startedAt ? new Date(w.startedAt).getTime() : null;
+  const startedAtMs = Number.isFinite(startedAtEpoch) ? startedAtEpoch : null;
   const uptimeMs = startedAtMs != null ? Math.max(0, now - startedAtMs) : 0;
   // Per-job activity (supervised workers only). Guard on pid so a stale marker
   // left by a previous incarnation can't show a dead job as in-flight.
@@ -5447,13 +5448,13 @@ function reageSupervisorStatus(status, now = Date.now()) {
     workers: workers.map((w) => {
       if (!w || typeof w !== 'object') return w;
       const uptimeMs =
-        typeof w.startedAtMs === 'number' ? Math.max(0, now - w.startedAtMs) : w.uptimeMs;
+        Number.isFinite(w.startedAtMs) ? Math.max(0, now - w.startedAtMs) : w.uptimeMs;
       let activity = w.activity;
       if (activity && Array.isArray(activity.jobs)) {
         activity = {
           ...activity,
           jobs: activity.jobs.map((j) =>
-            j && typeof j === 'object' && typeof j.sinceEpochMs === 'number'
+            j && typeof j === 'object' && Number.isFinite(j.sinceEpochMs)
               ? { ...j, sinceMs: Math.max(0, now - j.sinceEpochMs) }
               : j,
           ),
@@ -6512,11 +6513,13 @@ async function attachSupervisorConsole(state) {
         out(`! ${frame.error}`);
       }
     }
-    // TTY: repaint the pinned block so a status-only push (the ~1s monitor) is
-    // reflected and the freshest snapshot ends up on screen. Non-TTY: nudge the
-    // prompt so an async push doesn't leave the input line half-rendered.
-    if (isTty) view.repaint();
-    else if (rl) { try { rl.prompt(true); } catch { /* ignore */ } }
+    // Every frame above routes through view.status() or view.write(), each of
+    // which already erases+redraws the pinned block and refreshes the prompt in
+    // TTY mode — so an extra repaint here would just duplicate that work (and
+    // flicker at the ~1s monitor cadence). On a non-TTY there is no block to
+    // redraw, so only nudge the prompt so an async push doesn't leave the input
+    // line half-rendered.
+    if (!isTty && rl) { try { rl.prompt(true); } catch { /* ignore */ } }
   });
 
   rl = createReadline({ input: process.stdin, output: process.stdout, prompt: 'supervisor> ' });

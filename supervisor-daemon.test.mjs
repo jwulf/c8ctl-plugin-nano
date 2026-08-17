@@ -44,15 +44,19 @@ function restoreEnv(key, prev) {
 // real exported daemon and `nano work` to a dependency-free stand-in. Every
 // idle stand-in arms the *real* exported parent-death watchdog (the same one
 // workAgent installs for a supervised worker), watching the daemon pid the
-// spawn recorded in NANO_SUPERVISOR_DAEMON_PID. This is what keeps these
-// integration tests from leaking workers: if the daemon — or the whole test
-// runner — dies ungracefully (SIGKILL / crash / a killed `node --test`, so
+// spawn recorded in NANO_SUPERVISOR_DAEMON_PID. On Unix this is what keeps
+// these integration tests from leaking workers: if the daemon — or the whole
+// test runner — dies ungracefully (SIGKILL / crash / a killed `node --test`, so
 // `t.after` never runs), the stand-in self-reaps instead of orphaning to init.
-// A fast intervalMs keeps the reap prompt. Options: `recordArgv` also records
-// the child's own argv to `<workArgvDir>/<pid>.json` (so tests can assert on
-// spawn flags); `ignoreSigterm` traps SIGTERM to force the daemon's SIGKILL
-// path on restart; `crash` exits immediately (code 1) with no watchdog.
+// (The watchdog is a no-op on win32, where these tests do not run the detached
+// daemon path.) A fast intervalMs keeps the reap prompt. Options: `recordArgv`
+// also records the child's own argv to `<workArgvDir>/<pid>.json` (so tests can
+// assert on spawn flags); `ignoreSigterm` traps SIGTERM to force the daemon's
+// SIGKILL path on restart; `crash` exits immediately (code 1) with no watchdog.
 function writeShim(shimPath, { recordArgv = false, workArgvDir = null, ignoreSigterm = false, crash = false } = {}) {
+  if (recordArgv && typeof workArgvDir !== 'string') {
+    throw new Error('writeShim: recordArgv requires a string workArgvDir path');
+  }
   const lines = [];
   if (recordArgv) {
     lines.push(

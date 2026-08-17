@@ -40,6 +40,58 @@ function restoreEnv(key, prev) {
   else process.env[key] = prev;
 }
 
+// Build a fake "c8ctl entry" shim: routes `nano supervisor __daemon` to the
+// real exported daemon and `nano work` to a dependency-free stand-in. Every
+// idle stand-in arms the *real* exported parent-death watchdog (the same one
+// workAgent installs for a supervised worker), watching the daemon pid the
+// spawn recorded in NANO_SUPERVISOR_DAEMON_PID. On Unix this is what keeps
+// these integration tests from leaking workers: if the daemon — or the whole
+// test runner — dies ungracefully (SIGKILL / crash / a killed `node --test`, so
+// `t.after` never runs), the stand-in self-reaps instead of orphaning to init.
+// (The watchdog is a no-op on win32, where these tests do not run the detached
+// daemon path.) A fast intervalMs keeps the reap prompt. Options: `recordArgv`
+// also records the child's own argv to `<workArgvDir>/<pid>.json` (so tests can
+// assert on spawn flags); `ignoreSigterm` traps SIGTERM to force the daemon's
+// SIGKILL path on restart; `crash` exits immediately (code 1) with no watchdog.
+function writeShim(shimPath, { recordArgv = false, workArgvDir = null, ignoreSigterm = false, crash = false } = {}) {
+  if (recordArgv && typeof workArgvDir !== 'string') {
+    throw new Error('writeShim: recordArgv requires a string workArgvDir path');
+  }
+  const lines = [];
+  if (recordArgv) {
+    lines.push(
+      `import { writeFileSync, mkdirSync } from 'node:fs';`,
+      `import { join } from 'node:path';`,
+    );
+  }
+  lines.push(
+    `const argv = process.argv.slice(2);`,
+    `if (argv[0] === 'nano' && argv[1] === 'supervisor' && argv[2] === '__daemon') {`,
+    `  const mod = await import(${JSON.stringify(pluginUrl)});`,
+    `  await mod.runSupervisorDaemon();`,
+    `} else if (argv[0] === 'nano' && argv[1] === 'work') {`,
+  );
+  if (recordArgv) {
+    lines.push(
+      `  try { mkdirSync(${JSON.stringify(workArgvDir)}, { recursive: true }); ` +
+      `writeFileSync(join(${JSON.stringify(workArgvDir)}, process.pid + '.json'), JSON.stringify(argv)); } catch {}`,
+    );
+  }
+  if (crash) {
+    lines.push(`  process.exit(1); // crash immediately`);
+  } else {
+    if (ignoreSigterm) lines.push(`  process.on('SIGTERM', () => {}); // force the SIGKILL path on restart`);
+    lines.push(
+      `  const { installParentDeathWatchdog } = await import(${JSON.stringify(pluginUrl)});`,
+      `  const dp = Number.parseInt(process.env.NANO_SUPERVISOR_DAEMON_PID ?? '', 10);`,
+      `  installParentDeathWatchdog({ intervalMs: 100, parentPid: Number.isInteger(dp) ? dp : undefined });`,
+      `  setInterval(() => {}, 1 << 30); // idle keep-alive until the watchdog fires`,
+    );
+  }
+  lines.push(`}`);
+  writeFileSync(shimPath, lines.join('\n'));
+}
+
 test('supervisor daemon: start → add → status → remove → stop', async (t) => {
   const HOME = mkdtempSync(join(tmpdir(), 'c8ctl-sup-it-'));
   const prevHome = process.env.C8CTL_NANO_HOME;
@@ -58,19 +110,7 @@ test('supervisor daemon: start → add → status → remove → stop', async (t
   // Kept dependency-free so it works under `node <shim>`.
   const workArgvDir = join(HOME, 'work-argv');
   const shim = join(HOME, 'fake-entry.mjs');
-  writeFileSync(shim, [
-    `import { writeFileSync, mkdirSync } from 'node:fs';`,
-    `import { join } from 'node:path';`,
-    `const argv = process.argv.slice(2);`,
-    `if (argv[0] === 'nano' && argv[1] === 'supervisor' && argv[2] === '__daemon') {`,
-    `  const mod = await import(${JSON.stringify(pluginUrl)});`,
-    `  await mod.runSupervisorDaemon();`,
-    `} else if (argv[0] === 'nano' && argv[1] === 'work') {`,
-    `  try { mkdirSync(${JSON.stringify(workArgvDir)}, { recursive: true }); ` +
-    `writeFileSync(join(${JSON.stringify(workArgvDir)}, process.pid + '.json'), JSON.stringify(argv)); } catch {}`,
-    `  setInterval(() => {}, 1 << 30); // idle worker stand-in until killed`,
-    `}`,
-  ].join('\n'));
+  writeShim(shim, { recordArgv: true, workArgvDir });
   process.env.C8CTL_NANO_ENTRY = shim;
 
   const mod = await import(pluginUrl);
@@ -194,15 +234,7 @@ test('supervisor daemon: restarts a crashing worker', async (t) => {
 
   // The `work` stand-in exits immediately (code 1) → the daemon must restart it.
   const shim = join(HOME, 'fake-entry.mjs');
-  writeFileSync(shim, [
-    `const argv = process.argv.slice(2);`,
-    `if (argv[0] === 'nano' && argv[1] === 'supervisor' && argv[2] === '__daemon') {`,
-    `  const mod = await import(${JSON.stringify(pluginUrl)});`,
-    `  await mod.runSupervisorDaemon();`,
-    `} else if (argv[0] === 'nano' && argv[1] === 'work') {`,
-    `  process.exit(1); // crash immediately`,
-    `}`,
-  ].join('\n'));
+  writeShim(shim, { crash: true });
   process.env.C8CTL_NANO_ENTRY = shim;
 
   const mod = await import(pluginUrl);
@@ -243,16 +275,7 @@ test('supervisor daemon: restart swaps the child without a spurious restart bump
   // Idle worker stand-in that ignores SIGTERM, so `restart` must SIGKILL it and
   // the (late) old-child exit must NOT be misattributed to the new child.
   const shim = join(HOME, 'fake-entry.mjs');
-  writeFileSync(shim, [
-    `const argv = process.argv.slice(2);`,
-    `if (argv[0] === 'nano' && argv[1] === 'supervisor' && argv[2] === '__daemon') {`,
-    `  const mod = await import(${JSON.stringify(pluginUrl)});`,
-    `  await mod.runSupervisorDaemon();`,
-    `} else if (argv[0] === 'nano' && argv[1] === 'work') {`,
-    `  process.on('SIGTERM', () => {}); // force the SIGKILL path on restart`,
-    `  setInterval(() => {}, 1 << 30);`,
-    `}`,
-  ].join('\n'));
+  writeShim(shim, { ignoreSigterm: true });
   process.env.C8CTL_NANO_ENTRY = shim;
 
   const mod = await import(pluginUrl);
@@ -298,15 +321,7 @@ test('supervisor daemon: adopts a live daemon when the state file is missing', a
     hires: { faker: { name: 'faker', rank: 'senior', command: 'true', model: '', capabilities: [] } },
   }));
   const shim = join(HOME, 'fake-entry.mjs');
-  writeFileSync(shim, [
-    `const argv = process.argv.slice(2);`,
-    `if (argv[0] === 'nano' && argv[1] === 'supervisor' && argv[2] === '__daemon') {`,
-    `  const mod = await import(${JSON.stringify(pluginUrl)});`,
-    `  await mod.runSupervisorDaemon();`,
-    `} else if (argv[0] === 'nano' && argv[1] === 'work') {`,
-    `  setInterval(() => {}, 1 << 30);`,
-    `}`,
-  ].join('\n'));
+  writeShim(shim, {});
   process.env.C8CTL_NANO_ENTRY = shim;
 
   const mod = await import(pluginUrl);
@@ -348,19 +363,7 @@ test('supervisor add --instances N: spawns N distinct auto-named workers, forwar
   // each spawned child got the forwarded work flag and NOT `--instances`.
   const workArgvDir = join(HOME, 'work-argv');
   const shim = join(HOME, 'fake-entry.mjs');
-  writeFileSync(shim, [
-    `import { writeFileSync, mkdirSync } from 'node:fs';`,
-    `import { join } from 'node:path';`,
-    `const argv = process.argv.slice(2);`,
-    `if (argv[0] === 'nano' && argv[1] === 'supervisor' && argv[2] === '__daemon') {`,
-    `  const mod = await import(${JSON.stringify(pluginUrl)});`,
-    `  await mod.runSupervisorDaemon();`,
-    `} else if (argv[0] === 'nano' && argv[1] === 'work') {`,
-    `  try { mkdirSync(${JSON.stringify(workArgvDir)}, { recursive: true }); ` +
-    `writeFileSync(join(${JSON.stringify(workArgvDir)}, process.pid + '.json'), JSON.stringify(argv)); } catch {}`,
-    `  setInterval(() => {}, 1 << 30);`,
-    `}`,
-  ].join('\n'));
+  writeShim(shim, { recordArgv: true, workArgvDir });
   process.env.C8CTL_NANO_ENTRY = shim;
 
   const mod = await import(pluginUrl);

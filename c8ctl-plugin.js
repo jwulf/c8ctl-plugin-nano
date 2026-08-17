@@ -7390,7 +7390,7 @@ function backupReadModelsBeforeUpgrade(oldVersion, ring = READ_MODEL_BACKUP_RING
       copyIfExists(join(nodeDir, 'read-model.sqlite-wal'), join(backupDir, `${stem}.sqlite-wal`), logger);
       copyIfExists(join(nodeDir, 'read-model.sqlite-shm'), join(backupDir, `${stem}.sqlite-shm`), logger);
 
-      // Coherent point-in-time set: journal head + latest snapshot bins.
+      // Coherent point-in-time set: journal head + all snapshot bins.
       copyIfExists(join(nodeDir, 'journal.head'), join(backupDir, `${stem}.journal.head`), logger);
       for (const f of readdirSync(nodeDir)) {
         if (/^snapshot\..*\.bin$/.test(f)) {

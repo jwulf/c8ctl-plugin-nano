@@ -1098,6 +1098,53 @@ non-interactive shells, in CI, and when `NO_UPDATE_NOTIFIER` /
 `NANO_NO_UPDATE_NOTIFIER` is set. To update, stop and start ProcessOS again — a
 downloaded binary re-fetches the latest build; a `set bin` binary updates itself.
 
+### Pre-upgrade read-model backup & restore
+
+A schema-changing gateway release can reproject the SQLite read model and, in
+the worst case, silently drop completed process-instance history (root cause and
+durable fix tracked in `nano-bpm#831`). As a safety net, whenever `start`
+downloads a **different** ProcessOS version over an existing cached binary — a
+true upgrade — the launcher first snapshots each per-node read model **before**
+swapping the binary. First installs (no cached copy yet) are not upgrades, so
+they skip the backup.
+
+For every `…/data/node-<i>/` that has a `read-model.sqlite`, the launcher copies
+it — together with its `-wal` sidecar (WAL mode keeps uncheckpointed pages there)
+and `-shm` index, plus the coherent point-in-time set `journal.head` and
+`snapshot.*.bin` — into a `read-model-backups/` subdir under that node, named
+`read-model.pre-upgrade-<oldver>-<timestamp>-<rand>.sqlite` (the `<rand>` token
+keeps two backups that land in the same millisecond from colliding). The backup
+path is logged
+at INFO, and a bounded ring (the last **5** upgrades per node) is retained;
+older sets are pruned. The backup is best-effort: a failure is logged and never
+blocks the upgrade.
+
+To restore a node's read model from a backup (do this while the node is
+stopped):
+
+```bash
+# 1. Stop the cluster so nothing is writing the read model.
+c8ctl nano stop
+
+# 2. Pick the pre-upgrade backup you want to restore (newest shown first).
+NODE=~/Library/Application\ Support/c8ctl-nano/data/node-0   # adjust per platform/node
+ls -t "$NODE/read-model-backups"/read-model.pre-upgrade-*.sqlite
+
+# 3. Replace the live read-model files with the chosen backup set. Remove the
+#    stale WAL/SHM first so SQLite does not replay them over the restored DB.
+STEM="$NODE/read-model-backups/read-model.pre-upgrade-<oldver>-<timestamp>-<rand>"
+rm -f "$NODE/read-model.sqlite" "$NODE/read-model.sqlite-wal" "$NODE/read-model.sqlite-shm"
+cp "$STEM.sqlite" "$NODE/read-model.sqlite"
+[ -f "$STEM.sqlite-wal" ] && cp "$STEM.sqlite-wal" "$NODE/read-model.sqlite-wal"
+
+# 4. Start the cluster again.
+c8ctl nano start
+```
+
+> On Linux the data dir defaults to `~/.local/share/c8ctl-nano/data`, on Windows
+> to `%LOCALAPPDATA%\c8ctl-nano\data` (override the root with `C8CTL_NANO_HOME`).
+
+
 On a successful `start` the summary leads with the landing page:
 
 ```

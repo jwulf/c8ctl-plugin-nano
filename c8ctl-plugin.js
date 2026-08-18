@@ -3135,11 +3135,13 @@ function provisionRepo({ envelope, token, runDir, timeoutMs = 120_000 }) {
     // The SHA may not be present under a shallow clone of the default branch —
     // fetch it explicitly (best effort), then check it out (detached HEAD).
     const fetch = runGit([...credArgs(), 'fetch', '--no-tags', 'origin', target], { cwd: workspaceDir, env: gitEnv, timeoutMs });
-    const co = runGit(['checkout', '--detach', target], { cwd: workspaceDir, env: gitEnv });
+    const co = runGit(['checkout', '--detach', target], { cwd: workspaceDir, env: gitEnv, timeoutMs });
     if (co.status !== 0) {
       // Prefer the failing checkout's own output, but fall back to the fetch's
-      // (a timeout/fatal there is the real cause the checkout can't recover from).
-      const source = (co.stderr || co.stdout) ? co : fetch;
+      // (a timeout/fatal there is the real cause the checkout can't recover from)
+      // ONLY when fetch actually failed — a succeeded fetch (status 0) is not the
+      // cause, and reporting it would yield a misleading "exit 0" message.
+      const source = (co.stderr || co.stdout || fetch.status === 0) ? co : fetch;
       throw new ProvisionError(describeGitFailure(`git checkout ${target}`, source, { token, timeoutMs }));
     }
   }
@@ -3175,7 +3177,7 @@ function provisionRepo({ envelope, token, runDir, timeoutMs = 120_000 }) {
   // finalizeGit skips the push/PR reconcile instead of pushing a bogus ref.
   let workingBranch = null;
   if (envelope.branch?.create) {
-    const cb = runGit(['checkout', '-B', envelope.branch.create], { cwd: workspaceDir, env: gitEnv });
+    const cb = runGit(['checkout', '-B', envelope.branch.create], { cwd: workspaceDir, env: gitEnv, timeoutMs });
     if (cb.status !== 0) throw new ProvisionError(describeGitFailure(`git checkout -B ${envelope.branch.create}`, cb, { token, timeoutMs }));
     workingBranch = envelope.branch.create;
   } else {

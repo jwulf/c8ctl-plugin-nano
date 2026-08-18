@@ -3180,6 +3180,14 @@ function provisionRepo({ envelope, token, runDir, timeoutMs = 120_000 }) {
   // branch, not misread as a SHA. When a `sha` is given we clone `branchName`
   // (if any — the branch that should contain it) then fetch + detach onto it.
   const commitSha = repo.sha || '';
+  // `sha` pins a raw commit and is passed to `git fetch origin <sha>` /
+  // `git checkout --detach <sha>`. Validate it is a hex commit id (7–40 chars)
+  // before use: this fails a misconfigured envelope fast and, because a hex id
+  // can never start with `-`, forecloses a value being (mis)parsed as a git
+  // option.
+  if (commitSha && !/^[0-9a-f]{7,40}$/i.test(commitSha)) {
+    throw new ProvisionError(`invalid repository.sha ${JSON.stringify(commitSha)} — expected a hex commit id (7–40 chars)`);
+  }
   const isSha = !!commitSha;
   // Per-envelope timeout override (backstop for giant monorepos that approach the
   // default cap even when shallow); falls back to the caller-supplied timeout.
@@ -3205,7 +3213,7 @@ function provisionRepo({ envelope, token, runDir, timeoutMs = 120_000 }) {
       // context) so a timeout is still diagnosable, not an opaque wall-clock hit.
       const detail = gitErrorDetail(clone, token);
       const detailNote = detail && detail !== 'unknown error' ? ` — last git output: ${detail}` : '';
-      throw new ProvisionError(`git clone timed out after ${effectiveTimeoutMs}ms — the repo may be too large, or the network stalled; raise repository.cloneTimeoutMs or scope the clone with filter/singleBranch/depth${detailNote}`);
+      throw new ProvisionError(`git clone timed out after ${effectiveTimeoutMs}ms — the repo may be too large, or the network stalled; raise the timeout (repository.cloneTimeoutMs in the envelope, or the worker's --clone-timeout flag) or scope the clone with filter/singleBranch/depth${detailNote}`);
     }
     throw new ProvisionError(`git clone failed: ${gitErrorDetail(clone, token)}`);
   }

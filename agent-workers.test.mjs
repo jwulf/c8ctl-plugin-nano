@@ -964,6 +964,29 @@ test('provisionRepo checks out a commit SHA via repository.sha (detached, not vi
   }
 });
 
+test('provisionRepo rejects a non-hex repository.sha with a ProvisionError (issue #91 review)', { skip: !gitOk }, () => {
+  const { root, origin } = makeOriginRepo();
+  const runDir = mkdtempSync(join(root, 'run-'));
+  try {
+    for (const badSha of ['--upload-pack=evil', 'not-a-sha', 'zzzz', 'HEAD~1']) {
+      const envelope = {
+        schemaVersion: 1,
+        repository: { provider: 'github', url: origin, sha: badSha, submodules: false },
+        branch: { base: '', create: '', push: false },
+        setup: { commands: [], env: {}, secretRefs: [] },
+        task: { allowPr: false },
+      };
+      assert.throws(() => provisionRepo({ envelope, token: null, runDir }), (err) => {
+        assert.ok(err instanceof ProvisionError, `${badSha} throws ProvisionError`);
+        assert.match(err.message, /repository\.sha/, 'names the offending field');
+        return true;
+      }, `non-hex sha ${JSON.stringify(badSha)} is rejected fast`);
+    }
+  } finally {
+    rmSync(root, { recursive: true, force: true });
+  }
+});
+
 test('provisionRepo treats a hex-like ref as a branch, not a SHA (issue #91 review)', { skip: !gitOk }, () => {
   const { root, origin } = makeOriginRepo();
   // A legitimately-named branch whose name looks like a hex SHA. The old

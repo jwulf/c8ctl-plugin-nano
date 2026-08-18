@@ -3863,10 +3863,11 @@ function buildResultEnvelope(result, { sandbox, image, git, result: agentResult,
  *     the well-known localhost token ({@link LOCAL_AGENTIC_TOKEN}) and no
  *     capability credential, so it appears live with zero configuration (the hub's
  *     matching LOCAL mode accepts it).
- *   - SECURE mode: set NANO_AGENTIC_TOKEN + NANO_AGENTIC_CREDENTIAL (or the
- *     persisted `agenticToken`/`agenticCredential`) — an ADR 0028 identity token
- *     AND a capability credential are then sent (enrolment). If only one is set the
- *     config is incomplete and we stay off (fail closed), returning `null`.
+ *   - SECURE mode: set NANO_AGENTIC_TOKEN (or the persisted `agenticToken`) — a
+ *     real per-peer identity token is then sent (enrolment). The capability
+ *     credential was removed from the hub contract (it was accept-any, pure
+ *     friction), so NANO_AGENTIC_CREDENTIAL is OPTIONAL and forwarded only if
+ *     still configured; a credential set WITHOUT a token is ignored (LOCAL mode).
  *   - OFF: NANO_AGENTIC=off (or 0/false/no), or persisted `agentic:false`.
  *
  * Env wins over persisted config; the base URL falls back to the configured nano
@@ -3901,14 +3902,16 @@ function resolveAgenticConfig() {
     process.env.NANO_AGENTIC_BUFFER_CAPACITY ?? cfg.agenticBufferCapacity,
   );
 
-  // SECURE mode: any explicit credential configured means the operator opted into
-  // enrolment — require BOTH halves, fail closed if only one is present.
-  if (token || credential) {
-    if (!token || !credential) return null;
+  // SECURE mode: an explicit identity token means the operator opted into a real
+  // per-peer secret. The capability credential was removed from the hub contract
+  // (accept-any → pure friction), so it is OPTIONAL — forwarded only if still
+  // configured. A credential set without a token is meaningless and falls through
+  // to LOCAL mode.
+  if (token) {
     return { url, token, credential, bufferCapacity, secure: true, explicitUrl };
   }
 
-  // LOCAL mode (default): well-known localhost token, no capability credential.
+  // LOCAL mode (default): well-known token, no capability credential.
   return { url, token: LOCAL_AGENTIC_TOKEN, credential: '', bufferCapacity, secure: false, explicitUrl };
 }
 

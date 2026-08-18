@@ -86,7 +86,15 @@ test('env NANO_AGENTIC wins over a persisted agentic:false off-switch', () => {
   assert.equal(cfg.token, LOCAL_AGENTIC_TOKEN);
 });
 
-test('SECURE mode: both token + credential are passed through with secure:true', () => {
+test('SECURE mode: an identity token alone selects secure:true (credential optional)', () => {
+  const cfg = withEnv({ NANO_AGENTIC_TOKEN: 'ident-secret' }, null, resolveAgenticConfig);
+  assert.ok(cfg);
+  assert.equal(cfg.secure, true);
+  assert.equal(cfg.token, 'ident-secret');
+  assert.equal(cfg.credential, '');
+});
+
+test('SECURE mode: a still-configured credential is forwarded alongside the token', () => {
   const cfg = withEnv(
     { NANO_AGENTIC_TOKEN: 'ident-secret', NANO_AGENTIC_CREDENTIAL: 'cap-cred' },
     null,
@@ -98,12 +106,15 @@ test('SECURE mode: both token + credential are passed through with secure:true',
   assert.equal(cfg.credential, 'cap-cred');
 });
 
-test('SECURE half-configured fails closed (only token, or only credential) → null', () => {
-  assert.equal(withEnv({ NANO_AGENTIC_TOKEN: 'ident-only' }, null, resolveAgenticConfig), null);
-  assert.equal(withEnv({ NANO_AGENTIC_CREDENTIAL: 'cred-only' }, null, resolveAgenticConfig), null);
+test('a credential without an identity token is ignored → LOCAL mode', () => {
+  const cfg = withEnv({ NANO_AGENTIC_CREDENTIAL: 'cred-only' }, null, resolveAgenticConfig);
+  assert.ok(cfg);
+  assert.equal(cfg.secure, false);
+  assert.equal(cfg.token, LOCAL_AGENTIC_TOKEN);
+  assert.equal(cfg.credential, '');
 });
 
-test('persisted agenticToken + agenticCredential also select SECURE mode', () => {
+test('persisted agenticToken selects SECURE mode (credential optional)', () => {
   const cfg = withEnv({}, { agenticToken: 't', agenticCredential: 'c' }, resolveAgenticConfig);
   assert.ok(cfg);
   assert.equal(cfg.secure, true);

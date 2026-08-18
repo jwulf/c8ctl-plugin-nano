@@ -2835,7 +2835,17 @@ function runGit(args, { cwd, env, timeoutMs = 120_000 } = {}) {
     // that as `timedOut` so callers can report a timeout instead of an
     // uninformative "exit 128" (ties to #89).
     const timedOut = !!(r.error && r.error.code === 'ETIMEDOUT');
-    return { status: r.status ?? (r.signal ? 128 : null), stdout: r.stdout || '', stderr: r.stderr || '', signal: r.signal || null, timedOut, timeoutMs };
+    // A non-timeout spawn failure (e.g. ENOENT when `git` is missing, EACCES)
+    // comes back via `r.error` with empty stdout/stderr; discarding
+    // `r.error.message` leaves callers reporting an empty/"unknown error"
+    // detail. Fold the spawn error (code + message) into stderr so
+    // `gitErrorDetail` still surfaces something actionable.
+    let stderr = r.stderr || '';
+    if (r.error && !timedOut) {
+      const spawnMsg = [r.error.code, r.error.message].filter(Boolean).join(': ');
+      stderr = [stderr.trim(), spawnMsg].filter(Boolean).join('\n');
+    }
+    return { status: r.status ?? (r.signal ? 128 : null), stdout: r.stdout || '', stderr, signal: r.signal || null, timedOut, timeoutMs };
   } catch (err) {
     return { status: null, stdout: '', stderr: err.message, signal: null, timedOut: false, timeoutMs };
   }

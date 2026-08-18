@@ -274,13 +274,14 @@ its agents' terminals to an operator's cockpit. This rides the app's agentic
 channel (ADR 0056), served **same-port** on the app's own HTTP base URL at path
 **`/agentic`** — not a sidecar, so there's no extra port to open.
 
-**Connecting — on by default (local-first).** Nano is designed for local use, so
-visibility is **on by default**. Run a worker against a local app and it appears
-live with **zero configuration** — it joins the channel with a well-known
-localhost token in **LOCAL mode** (no credential). The worker presents this
-token to whatever `NANO_AGENTIC_URL` you point it at; the same-machine
-restriction is enforced by the **hub**, which only honours the well-known LOCAL
-token for local/loopback connections:
+**Connecting — on by default (LAN-first).** Nano is designed to run on a trusted
+network, so visibility is **on by default**. Run a worker against a Nano app and it
+appears live with **zero configuration** — it joins the channel with a well-known
+token in **LOCAL mode** (no secret). The worker presents this token to whatever
+`NANO_AGENTIC_URL` you point it at; the hub honours the well-known LOCAL token from
+**any origin** (matching the open trusted-LAN posture of the engine itself), so a
+worker on another box on the LAN appears live too — exposure is governed by the
+server's bind address, not by a shared secret:
 
 ```bash
 # LOCAL mode (default): appears live with no secrets
@@ -318,24 +319,35 @@ used **verbatim** — so an explicit target always wins, and it's also how you
 disambiguate when several apps are running. `NANO_AGENTIC=off` disables the
 channel entirely and attempts **no** discovery.
 
-**Secure mode (opt-in).** For a shared/remote deployment, enrol the worker with an
-ADR 0028 **identity token** and a **capability credential** (the same `?token=…`
-pattern the blackboard uses). Setting either switches the worker into SECURE mode,
-which requires **both** (fail closed if only one is set):
+**Secure mode (opt-in).** For a deployment where you want the visibility channel
+authenticated (rather than open on the LAN), start the server **and** every worker
+box with the **same** `NANO_AGENTIC_SECRET` — same env-var name, same value on both
+sides (Tab A → Slot A). The worker presents it as its identity token and the hub
+verifies it against its own `NANO_AGENTIC_SECRET`. Setting it switches the worker
+into SECURE mode:
 
 ```bash
-# SECURE mode: real enrolment
+# SECURE mode: same NANO_AGENTIC_SECRET on the server and every worker box
 export NANO_AGENTIC_URL=http://localhost:8080
-export NANO_AGENTIC_TOKEN=<identity-token>         # ADR 0028 identity
-export NANO_AGENTIC_CREDENTIAL=<capability-cred>   # capability credential
+export NANO_AGENTIC_SECRET=<shared-secret>         # must equal the server's NANO_AGENTIC_SECRET
 c8ctl nano work reviewer
 #   agentic channel (secure): announcing presence as ‹worker› on ws://localhost:8080/agentic
 ```
 
+The shared secret can also be **persisted** (via config) as `agenticSecret`, so it
+need not be exported into the environment on every run; env still wins over the
+persisted value.
+
+The legacy `NANO_AGENTIC_TOKEN` env var (and persisted `agenticToken`) is still
+accepted as a **deprecated alias** for the shared secret. The **capability
+credential** (`NANO_AGENTIC_CREDENTIAL`) is no longer required — it was removed from
+the hub contract (it was accept-any, pure friction). It remains **optional** and is
+forwarded only if still configured, for forward-compatibility with a future per-peer
+capability verifier.
+
 To opt out entirely, set `NANO_AGENTIC=off` (or persisted `agentic: false`) — the
 worker then runs with **no visibility, no relay, nothing else changed**. In secure
-mode a valid identity + capability connects; an invalid identity is rejected
-(unauthorized) and a missing capability is rejected (forbidden).
+mode a matching secret connects; a wrong secret is rejected (unauthorized).
 
 **How presence appears.** On connect the worker **announces** its identity, its
 `host`, and the set of `jobKeys` it is currently running, then **heartbeats** to

@@ -138,13 +138,13 @@ const PROCESSOS_DEFAULT_PORT = 8090;
 const DEFAULT_NANO_URL = 'http://localhost:8080';
 
 // The well-known identity token used for LOCAL agentic visibility (security opt-in). Nano is
-// local-first: on the operator's own machine a `nano work` worker joins the visibility channel with
-// zero configuration, so it presents this constant, well-known localhost token — NOT a secret. The
-// worker does not enforce any loopback restriction itself (it presents this token to whatever
-// NANO_AGENTIC_URL is configured); same-machine gating is enforced by the hub, which only honours
-// this well-known token for local/loopback connections. Kept in lock-step with the hub constant in
-// nanobpm/nano-workforce (`app/agentic/channel.ts` LOCAL_AGENTIC_TOKEN). In secure mode (a real
-// NANO_AGENTIC_TOKEN + NANO_AGENTIC_CREDENTIAL) this is never used.
+// local-first: a `nano work` worker joins the visibility channel with zero configuration, so it
+// presents this constant, well-known LOCAL token — NOT a secret. The worker does not enforce any
+// loopback restriction itself (it presents this token to whatever NANO_AGENTIC_URL is configured);
+// the hub honours this well-known token from any origin (matching the open trusted-LAN posture of
+// the engine itself). Kept in lock-step with the hub constant in nanobpm/nano-workforce
+// (`app/agentic/channel.ts` LOCAL_AGENTIC_TOKEN). In secure mode (a real NANO_AGENTIC_SECRET) this
+// is never used.
 const LOCAL_AGENTIC_TOKEN = 'nano-local';
 
 // Passive update notifier (npm-style): refresh the latest published version
@@ -2399,14 +2399,18 @@ function resolveBrokerRestConfig(env = process.env) {
     env.NANO_BASE_URL ||
     cfg.nanoUrl ||
     DEFAULT_NANO_URL;
-  // An explicit REST token always wins. The agentic identity token is only a
+  // An explicit REST token always wins. The agentic identity secret is only a
   // fallback for single-token deployments where the broker REST endpoint IS the
   // agentic endpoint — so only forward it when the REST base URL is same-origin
-  // as the agentic URL. This prevents leaking the identity token to a different
+  // as the agentic URL. This prevents leaking the identity secret to a different
   // NANO_REST_URL host when no REST token is set (see resolveAgenticConfig).
   let token = env.NANO_REST_TOKEN || '';
   if (!token) {
-    const agenticToken = env.NANO_AGENTIC_TOKEN || cfg.agenticToken || '';
+    const agenticToken = env.NANO_AGENTIC_SECRET
+      || cfg.agenticSecret
+      || env.NANO_AGENTIC_TOKEN
+      || cfg.agenticToken
+      || '';
     const agenticUrl =
       env.NANO_AGENTIC_URL ||
       cfg.agenticUrl ||
@@ -3862,19 +3866,24 @@ function buildResultEnvelope(result, { sandbox, image, git, result: agentResult,
  * Local-first (security opt-in). Nano is designed for local use, so visibility is
  * ON BY DEFAULT:
  *   - LOCAL mode (default): no credentials configured — the worker connects with
- *     the well-known localhost token ({@link LOCAL_AGENTIC_TOKEN}) and no
- *     capability credential, so it appears live with zero configuration (the hub's
- *     matching LOCAL mode accepts it).
- *   - SECURE mode: set NANO_AGENTIC_TOKEN + NANO_AGENTIC_CREDENTIAL (or the
- *     persisted `agenticToken`/`agenticCredential`) — an ADR 0028 identity token
- *     AND a capability credential are then sent (enrolment). If only one is set the
- *     config is incomplete and we stay off (fail closed), returning `null`.
+ *     the well-known LOCAL token ({@link LOCAL_AGENTIC_TOKEN}) and no capability
+ *     credential, so it appears live with zero configuration (the hub honours this
+ *     well-known token from any origin on a trusted LAN).
+ *   - SECURE mode: set NANO_AGENTIC_SECRET — the SAME env var name and value the
+ *     server is started with (Tab A → Slot A). The worker presents it as its
+ *     identity token and the hub verifies it against its own NANO_AGENTIC_SECRET.
+ *     The legacy NANO_AGENTIC_TOKEN name (and persisted `agenticToken`) is still
+ *     accepted as a deprecated alias. The capability credential was removed from
+ *     the hub contract (it was accept-any, pure friction), so NANO_AGENTIC_CREDENTIAL
+ *     is OPTIONAL and forwarded only if still configured; a credential set WITHOUT a
+ *     secret is ignored (LOCAL mode).
  *   - OFF: NANO_AGENTIC=off (or 0/false/no), or persisted `agentic:false`.
  *
  * Env wins over persisted config; the base URL falls back to the configured nano
- * URL (the app's own port). Returns `null` only when disabled or half-configured.
+ * URL (the app's own port) and ultimately DEFAULT_NANO_URL, so it is never empty.
+ * Returns `null` only when disabled (the off-switch).
  *
- * @returns {{ url: string, token: string, credential: string, bufferCapacity: number, secure: boolean } | null}
+ * @returns {{ url: string, token: string, credential: string, bufferCapacity: number, secure: boolean, explicitUrl: boolean } | null}
  */
 function resolveAgenticConfig() {
   const cfg = readConfig();
@@ -3893,8 +3902,16 @@ function resolveAgenticConfig() {
     || cfg.nanoUrl
     || process.env.NANO_BASE_URL
     || DEFAULT_NANO_URL;
-  if (!url) return null;
-  const token = process.env.NANO_AGENTIC_TOKEN || cfg.agenticToken || '';
+  // SECURE-mode shared secret. Named NANO_AGENTIC_SECRET to match the server's env
+  // var EXACTLY (Tab A → Slot A): set the same name + value on the server and every
+  // worker box. The worker presents it as its identity token; the hub verifies it
+  // against its own NANO_AGENTIC_SECRET. NANO_AGENTIC_TOKEN / `agenticToken` remain
+  // as a deprecated alias.
+  const secret = process.env.NANO_AGENTIC_SECRET
+    || cfg.agenticSecret
+    || process.env.NANO_AGENTIC_TOKEN
+    || cfg.agenticToken
+    || '';
   const credential = process.env.NANO_AGENTIC_CREDENTIAL || cfg.agenticCredential || '';
   // Outbound hub-down buffer bound (frames). Operator-tunable (C4, #43) so a
   // long expected outage can be given more headroom; resolveBufferCapacity
@@ -3903,14 +3920,16 @@ function resolveAgenticConfig() {
     process.env.NANO_AGENTIC_BUFFER_CAPACITY ?? cfg.agenticBufferCapacity,
   );
 
-  // SECURE mode: any explicit credential configured means the operator opted into
-  // enrolment — require BOTH halves, fail closed if only one is present.
-  if (token || credential) {
-    if (!token || !credential) return null;
-    return { url, token, credential, bufferCapacity, secure: true, explicitUrl };
+  // SECURE mode: an explicit shared secret means the operator opted into a real
+  // per-peer secret. The capability credential was removed from the hub contract
+  // (accept-any → pure friction), so it is OPTIONAL — forwarded only if still
+  // configured. A credential set without a secret is meaningless and falls through
+  // to LOCAL mode.
+  if (secret) {
+    return { url, token: secret, credential, bufferCapacity, secure: true, explicitUrl };
   }
 
-  // LOCAL mode (default): well-known localhost token, no capability credential.
+  // LOCAL mode (default): well-known token, no capability credential.
   return { url, token: LOCAL_AGENTIC_TOKEN, credential: '', bufferCapacity, secure: false, explicitUrl };
 }
 
@@ -4464,9 +4483,9 @@ async function workAgent(req, flags) {
   // lifecycle events) rather than opening their own connection.
   //
   // Local-first (security opt-in): visibility is ON BY DEFAULT. In LOCAL mode the
-  // worker joins with the well-known localhost token and no credential; SECURE
-  // mode (NANO_AGENTIC_TOKEN + NANO_AGENTIC_CREDENTIAL) sends a real ADR 0028
-  // identity + capability; NANO_AGENTIC=off disables it (see resolveAgenticConfig).
+  // worker joins with the well-known LOCAL token and no credential; SECURE mode
+  // (NANO_AGENTIC_SECRET) sends a real per-peer shared secret as the identity;
+  // NANO_AGENTIC=off disables it (see resolveAgenticConfig).
   const agenticTarget = await resolveAgenticTarget({ logger });
   let agenticCfg = null;
   switch (agenticTarget.status) {
@@ -4484,7 +4503,7 @@ async function workAgent(req, flags) {
       break;
     case 'off':
     default:
-      logger.info('  agentic channel: disabled — either the off-switch is set (NANO_AGENTIC=off or persisted agentic:false), or SECURE mode is half-configured (set BOTH NANO_AGENTIC_TOKEN + NANO_AGENTIC_CREDENTIAL). Clear the off-switch to use default LOCAL visibility.');
+      logger.info('  agentic channel: disabled — the off-switch is set (NANO_AGENTIC=off or persisted agentic:false). Clear it to use default LOCAL visibility.');
       break;
   }
   if (agenticCfg) {
@@ -8481,7 +8500,7 @@ export const metadata = {
         { command: 'c8ctl nano work coder --auto', description: 'Zero-config: serve every deployed agent job type read straight from the engine — no capability, no wiring (great for a local single-tenant plane)' },
         { command: 'c8ctl nano work coder --auto --auto-scope my-app', description: 'Zero-config, scoped to one app: serve only agent job types deployed under process ids prefixed "my-app"' },
         { command: 'c8ctl nano work coder --sandbox docker --image ghcr.io/acme/agent:1', description: 'Run jobs in isolated containers with disk-hygiene reaping' },
-        { command: 'NANO_AGENTIC_URL=http://localhost:8080 NANO_AGENTIC_TOKEN=<identity-token> NANO_AGENTIC_CREDENTIAL=<capability-cred> c8ctl nano work reviewer', description: 'Enrol the worker on the app\'s same-port /agentic channel so it appears live (presence + relay terminals) on the Workforce visibility page' },
+        { command: 'NANO_AGENTIC_URL=http://localhost:8080 NANO_AGENTIC_SECRET=<shared-secret> c8ctl nano work reviewer', description: 'Enrol the worker on the app\'s same-port /agentic channel in SECURE mode (same NANO_AGENTIC_SECRET as the server) so it appears live (presence + relay terminals) on the Workforce visibility page' },
         { command: 'c8ctl nano supervisor start --worker reviewer --worker coder', description: 'Start a detached supervisor managing several workers from one terminal' },
         { command: 'c8ctl nano supervisor', description: 'Attach an interactive console to the supervisor (detach with Ctrl-D, leaving it running)' },
         { command: 'c8ctl nano supervisor status', description: 'List supervised workers (pid, state, serviced job / idle, restarts, uptime) without the console' },

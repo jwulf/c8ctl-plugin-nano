@@ -303,29 +303,34 @@ test('a worker that starts before the app buffers presence + relay and drains in
 // The documented same-port /agentic connection + auth gate.
 // ===========================================================================
 
-test('the documented same-port /agentic URL carries the identity + capability the hub authenticator enforces', () => {
+test('the documented same-port /agentic URL carries the identity the hub authenticator enforces (capability optional)', () => {
   const url = buildAgenticUrl('http://localhost:8080', { token: 'ident-secret', credential: 'cap-cred' });
   const u = new URL(url);
   assert.equal(u.pathname, '/agentic', 'served same-port at /agentic (ADR 0056)');
   assert.equal(u.protocol, 'ws:');
 
-  const auth = agenticChannel.sharedSecretAuthenticator({ secret: 'ident-secret' });
+  // SECURE mode requires only the shared-secret identity token; the capability
+  // credential was removed from the hub contract (it was accept-any friction) and
+  // is now legacy/optional. Construct the authenticator credential-optional to
+  // mirror the shipped hub's secret-only SECURE mode.
+  const auth = agenticChannel.sharedSecretAuthenticator({ secret: 'ident-secret', requireCredential: false });
   const handshake = (link) => ({ query: Object.fromEntries(new URL(link).searchParams.entries()), remote: '127.0.0.1' });
 
-  // valid identity + capability connects
+  // valid identity connects; an optional capability is still carried through when present
   const okRes = auth(handshake(url));
   assert.equal(okRes.ok, true);
   assert.equal(okRes.grant.capability, 'cap-cred');
 
-  // invalid identity rejected (unauthorized)
+  // invalid identity rejected (unauthorized) — the shared secret is still enforced
   const badIdent = buildAgenticUrl('http://localhost:8080', { token: 'WRONG', credential: 'cap-cred' });
   assert.equal(auth(handshake(badIdent)).ok, false);
   assert.equal(auth(handshake(badIdent)).code, agenticChannel.AUTH_UNAUTHORIZED);
 
-  // missing capability rejected (forbidden)
+  // missing capability is ACCEPTED in secret-only SECURE mode (capability is optional)
   const noCap = buildAgenticUrl('http://localhost:8080', { token: 'ident-secret', credential: '' });
-  assert.equal(auth(handshake(noCap)).ok, false);
-  assert.equal(auth(handshake(noCap)).code, agenticChannel.AUTH_FORBIDDEN);
+  const noCapRes = auth(handshake(noCap));
+  assert.equal(noCapRes.ok, true, 'secret-only SECURE mode: a missing capability credential is accepted');
+  assert.equal(noCapRes.grant.capability, undefined, 'no capability is granted when none is presented');
 
   // secrets are redacted in the logged URL
   assert.doesNotMatch(redactAgenticUrl(url), /ident-secret|cap-cred/);
@@ -366,8 +371,9 @@ test('README documents the /agentic channel connection, presence, PTY-vs-pipe op
   // same-port channel connection
   assert.match(readme, /\/agentic/, 'documents the same-port /agentic channel path');
   assert.match(readme, /NANO_AGENTIC_URL/, 'documents the channel connection env');
-  assert.match(readme, /NANO_AGENTIC_TOKEN/, 'documents the identity token env');
-  assert.match(readme, /NANO_AGENTIC_CREDENTIAL/, 'documents the capability credential env');
+  assert.match(readme, /NANO_AGENTIC_TOKEN/, 'documents the deprecated identity-token alias env');
+  assert.match(readme, /NANO_AGENTIC_SECRET/, 'documents the shared-secret identity env (the primary SECURE-mode knob)');
+  assert.match(readme, /NANO_AGENTIC_CREDENTIAL/, 'documents the optional/legacy capability credential env');
   // presence appearance
   assert.match(readme, /presence/i, 'documents how presence appears');
   assert.match(readme, /visibility page/i, 'documents the Workforce visibility page');

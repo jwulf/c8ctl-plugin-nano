@@ -140,6 +140,14 @@ test('persisted agenticSecret selects SECURE mode (credential optional)', () => 
   assert.equal(cfg.credential, 'c');
 });
 
+test('persisted legacy agenticToken alias still selects SECURE mode', () => {
+  const cfg = withEnv({}, { agenticToken: 'legacy-persisted' }, resolveAgenticConfig);
+  assert.ok(cfg);
+  assert.equal(cfg.secure, true);
+  assert.equal(cfg.token, 'legacy-persisted');
+  assert.equal(cfg.credential, '');
+});
+
 test('base URL falls back through env, config, then the default', () => {
   assert.equal(
     withEnv({ NANO_AGENTIC_URL: 'http://host:9000' }, null, resolveAgenticConfig).url,

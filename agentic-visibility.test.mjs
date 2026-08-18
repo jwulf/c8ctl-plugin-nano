@@ -373,6 +373,7 @@ test('README documents the /agentic channel connection, presence, PTY-vs-pipe op
   assert.match(readme, /NANO_AGENTIC_URL/, 'documents the channel connection env');
   assert.match(readme, /NANO_AGENTIC_TOKEN/, 'documents the deprecated identity-token alias env');
   assert.match(readme, /NANO_AGENTIC_SECRET/, 'documents the shared-secret identity env (the primary SECURE-mode knob)');
+  assert.match(readme, /NANO_AGENTIC_CREDENTIAL/, 'documents the optional/legacy capability credential env');
   // presence appearance
   assert.match(readme, /presence/i, 'documents how presence appears');
   assert.match(readme, /visibility page/i, 'documents the Workforce visibility page');

@@ -3874,10 +3874,10 @@ function buildResultEnvelope(result, { sandbox, image, git, result: agentResult,
  *   - OFF: NANO_AGENTIC=off (or 0/false/no), or persisted `agentic:false`.
  *
  * Env wins over persisted config; the base URL falls back to the configured nano
- * URL (the app's own port). Returns `null` only when disabled (the off-switch) or
- * when no base URL can be resolved.
+ * URL (the app's own port) and ultimately DEFAULT_NANO_URL, so it is never empty.
+ * Returns `null` only when disabled (the off-switch).
  *
- * @returns {{ url: string, token: string, credential: string, bufferCapacity: number, secure: boolean } | null}
+ * @returns {{ url: string, token: string, credential: string, bufferCapacity: number, secure: boolean, explicitUrl: boolean } | null}
  */
 function resolveAgenticConfig() {
   const cfg = readConfig();

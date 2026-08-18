@@ -3181,7 +3181,7 @@ function provisionRepo({ envelope, token, runDir, timeoutMs = 120_000 }) {
   const clone = runGit(cloneArgs, { env: gitEnv, timeoutMs: effectiveTimeoutMs });
   if (clone.status !== 0) {
     if (clone.timedOut) {
-      throw new ProvisionError(`git clone timed out after ${effectiveTimeoutMs}ms — repo too large for the clone timeout; raise repository.cloneTimeoutMs or scope the clone with filter/singleBranch/depth`);
+      throw new ProvisionError(`git clone timed out after ${effectiveTimeoutMs}ms — the repo may be too large, or the network stalled; raise repository.cloneTimeoutMs or scope the clone with filter/singleBranch/depth`);
     }
     throw new ProvisionError(`git clone failed: ${gitErrorDetail(clone, token)}`);
   }

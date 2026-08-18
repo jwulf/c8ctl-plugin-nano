@@ -544,7 +544,7 @@ the harness:
    one that looks hex-like) and is mapped into `refs/remotes/origin/<baseRef>`;
    **`baseSha`** is the field for a raw commit SHA (fetched by id, exposed as the
    SHA itself). A `--depth 1 --single-branch` of only the head otherwise has NO
-   base and NO merge-base, so a naive `git diff main` fails). A failed base fetch
+   base and NO merge-base, so a naive `git diff main` fails. A failed base fetch
    is **non-fatal** — the head clone still succeeds and
    the failure is logged. **`cloneTimeoutMs`** overrides the clone/fetch timeout
    per envelope (default 120s, or the `--clone-timeout` worker flag) as a backstop

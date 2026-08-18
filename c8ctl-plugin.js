@@ -2397,14 +2397,18 @@ function resolveBrokerRestConfig(env = process.env) {
     env.NANO_BASE_URL ||
     cfg.nanoUrl ||
     DEFAULT_NANO_URL;
-  // An explicit REST token always wins. The agentic identity token is only a
+  // An explicit REST token always wins. The agentic identity secret is only a
   // fallback for single-token deployments where the broker REST endpoint IS the
   // agentic endpoint — so only forward it when the REST base URL is same-origin
-  // as the agentic URL. This prevents leaking the identity token to a different
+  // as the agentic URL. This prevents leaking the identity secret to a different
   // NANO_REST_URL host when no REST token is set (see resolveAgenticConfig).
   let token = env.NANO_REST_TOKEN || '';
   if (!token) {
-    const agenticToken = env.NANO_AGENTIC_TOKEN || cfg.agenticToken || '';
+    const agenticToken = env.NANO_AGENTIC_SECRET
+      || cfg.agenticSecret
+      || env.NANO_AGENTIC_TOKEN
+      || cfg.agenticToken
+      || '';
     const agenticUrl =
       env.NANO_AGENTIC_URL ||
       cfg.agenticUrl ||
@@ -4498,7 +4502,7 @@ async function workAgent(req, flags) {
       break;
     case 'off':
     default:
-      logger.info('  agentic channel: disabled — either the off-switch is set (NANO_AGENTIC=off or persisted agentic:false), or SECURE mode is half-configured (set BOTH NANO_AGENTIC_TOKEN + NANO_AGENTIC_CREDENTIAL). Clear the off-switch to use default LOCAL visibility.');
+      logger.info('  agentic channel: disabled — the off-switch is set (NANO_AGENTIC=off or persisted agentic:false). Clear it to use default LOCAL visibility.');
       break;
   }
   if (agenticCfg) {

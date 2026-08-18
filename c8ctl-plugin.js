@@ -3181,7 +3181,11 @@ function provisionRepo({ envelope, token, runDir, timeoutMs = 120_000 }) {
   const clone = runGit(cloneArgs, { env: gitEnv, timeoutMs: effectiveTimeoutMs });
   if (clone.status !== 0) {
     if (clone.timedOut) {
-      throw new ProvisionError(`git clone timed out after ${effectiveTimeoutMs}ms — the repo may be too large, or the network stalled; raise repository.cloneTimeoutMs or scope the clone with filter/singleBranch/depth`);
+      // Preserve whatever git managed to print before SIGTERM (plus exit/signal
+      // context) so a timeout is still diagnosable, not an opaque wall-clock hit.
+      const detail = gitErrorDetail(clone, token);
+      const detailNote = detail && detail !== 'unknown error' ? ` — last git output: ${detail}` : '';
+      throw new ProvisionError(`git clone timed out after ${effectiveTimeoutMs}ms — the repo may be too large, or the network stalled; raise repository.cloneTimeoutMs or scope the clone with filter/singleBranch/depth${detailNote}`);
     }
     throw new ProvisionError(`git clone failed: ${gitErrorDetail(clone, token)}`);
   }
@@ -3226,10 +3230,14 @@ function provisionRepo({ envelope, token, runDir, timeoutMs = 120_000 }) {
     }
     const bf = runGit(fetchArgs, { cwd: workspaceDir, env: gitEnv, timeoutMs: effectiveTimeoutMs });
     if (bf.status !== 0) {
+      // Name the base target (branch vs sha) so the warning is actionable when
+      // multiple refs are in play, and preserve git's output/context in both the
+      // timeout and non-timeout paths.
+      const baseLabel = `${isBaseSha ? 'sha' : 'branch'} ${baseTarget}`;
       base = '';
       baseFetchError = bf.timedOut
-        ? `base fetch timed out after ${effectiveTimeoutMs}ms`
-        : gitErrorDetail(bf, token, 300);
+        ? `base fetch (${baseLabel}) timed out after ${effectiveTimeoutMs}ms: ${gitErrorDetail(bf, token, 300)}`
+        : `base fetch (${baseLabel}) failed: ${gitErrorDetail(bf, token, 300)}`;
     }
   }
 

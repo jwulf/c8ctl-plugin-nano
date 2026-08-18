@@ -3238,35 +3238,35 @@ function provisionRepo({ envelope, token, runDir, timeoutMs = 120_000 }) {
   if (repo.baseSha && repo.baseRef) {
     baseFetchError = `ambiguous base: both baseRef (${repo.baseRef}) and baseSha (${repo.baseSha}) set — provide only one`;
   } else {
-  const baseTarget = repo.baseSha || repo.baseRef;
-  if (baseTarget) {
-    const isBaseSha = !!repo.baseSha;
-    const fetchArgs = [...credArgs(), 'fetch', '--no-tags'];
-    if (repo.depth && repo.depth > 0) fetchArgs.push('--depth', String(repo.depth));
-    if (repo.filter) fetchArgs.push(`--filter=${repo.filter}`);
-    if (isBaseSha) {
-      // A raw sha can't be mapped to a stable name — fetch it (updates FETCH_HEAD)
-      // and expose the sha itself as the diff base.
-      fetchArgs.push('origin', baseTarget);
-      base = baseTarget;
-    } else {
-      // Map the branch onto refs/remotes/origin/<baseRef> so `origin/<base>`
-      // resolves for the reviewer even on a single-branch clone.
-      fetchArgs.push('origin', `+${baseTarget}:refs/remotes/origin/${baseTarget}`);
-      base = `origin/${baseTarget}`;
+    const baseTarget = repo.baseSha || repo.baseRef;
+    if (baseTarget) {
+      const isBaseSha = !!repo.baseSha;
+      const fetchArgs = [...credArgs(), 'fetch', '--no-tags'];
+      if (repo.depth && repo.depth > 0) fetchArgs.push('--depth', String(repo.depth));
+      if (repo.filter) fetchArgs.push(`--filter=${repo.filter}`);
+      if (isBaseSha) {
+        // A raw sha can't be mapped to a stable name — fetch it (updates FETCH_HEAD)
+        // and expose the sha itself as the diff base.
+        fetchArgs.push('origin', baseTarget);
+        base = baseTarget;
+      } else {
+        // Map the branch onto refs/remotes/origin/<baseRef> so `origin/<base>`
+        // resolves for the reviewer even on a single-branch clone.
+        fetchArgs.push('origin', `+${baseTarget}:refs/remotes/origin/${baseTarget}`);
+        base = `origin/${baseTarget}`;
+      }
+      const bf = runGit(fetchArgs, { cwd: workspaceDir, env: gitEnv, timeoutMs: effectiveTimeoutMs });
+      if (bf.status !== 0) {
+        // Name the base target (branch vs sha) so the warning is actionable when
+        // multiple refs are in play, and preserve git's output/context in both the
+        // timeout and non-timeout paths.
+        const baseLabel = `${isBaseSha ? 'sha' : 'branch'} ${baseTarget}`;
+        base = '';
+        baseFetchError = bf.timedOut
+          ? `base fetch (${baseLabel}) timed out after ${effectiveTimeoutMs}ms: ${gitErrorDetail(bf, token, 300)}`
+          : `base fetch (${baseLabel}) failed: ${gitErrorDetail(bf, token, 300)}`;
+      }
     }
-    const bf = runGit(fetchArgs, { cwd: workspaceDir, env: gitEnv, timeoutMs: effectiveTimeoutMs });
-    if (bf.status !== 0) {
-      // Name the base target (branch vs sha) so the warning is actionable when
-      // multiple refs are in play, and preserve git's output/context in both the
-      // timeout and non-timeout paths.
-      const baseLabel = `${isBaseSha ? 'sha' : 'branch'} ${baseTarget}`;
-      base = '';
-      baseFetchError = bf.timedOut
-        ? `base fetch (${baseLabel}) timed out after ${effectiveTimeoutMs}ms: ${gitErrorDetail(bf, token, 300)}`
-        : `base fetch (${baseLabel}) failed: ${gitErrorDetail(bf, token, 300)}`;
-    }
-  }
   }
 
   // Give the harness a committer identity in case it commits (many do). Prefer

@@ -3141,8 +3141,12 @@ function provisionRepo({ envelope, token, runDir, timeoutMs = 120_000 }) {
       // (a timeout/fatal there is the real cause the checkout can't recover from)
       // ONLY when fetch actually failed — a succeeded fetch (status 0) is not the
       // cause, and reporting it would yield a misleading "exit 0" message.
-      const source = (co.stderr || co.stdout || fetch.status === 0) ? co : fetch;
-      throw new ProvisionError(describeGitFailure(`git checkout ${target}`, source, { token, timeoutMs }));
+      const useCheckout = !!(co.stderr || co.stdout || fetch.status === 0);
+      const source = useCheckout ? co : fetch;
+      // Label the failure with the action whose output we actually report, so a
+      // fetch timeout/fatal isn't misreported as a checkout failure.
+      const action = useCheckout ? `git checkout ${target}` : `git fetch origin ${target}`;
+      throw new ProvisionError(describeGitFailure(action, source, { token, timeoutMs }));
     }
   }
 

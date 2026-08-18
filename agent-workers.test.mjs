@@ -1049,12 +1049,15 @@ test('provisionRepo: an anonymous credential-less clone fails fast with a fatal 
   const root = mkdtempSync(join(tmpdir(), 'nano-git-'));
   const runDir = mkdtempSync(join(root, 'run-'));
   try {
+    // Deterministic + offline: a non-existent local path (no network). On the
+    // anonymous path provisionRepo sets GIT_TERMINAL_PROMPT=0 and strips every
+    // askpass helper, so git must emit a `fatal:` at once instead of blocking on
+    // a credential prompt to the timeout. Asserting the fail-fast behaviour here
+    // (rather than hitting github.com) keeps the test hermetic and CI-stable.
+    const missing = join(root, 'does-not-exist.git');
     const envelope = {
       schemaVersion: 1,
-      // A private-looking https remote we can't authenticate to: with
-      // GIT_TERMINAL_PROMPT=0 and no askpass, git must emit a `fatal:` at once
-      // rather than blocking on a credential prompt to the 120s timeout.
-      repository: { provider: 'github', url: 'https://github.com/jwulf/this-repo-does-not-exist-nano-89.git', submodules: false },
+      repository: { provider: 'github', url: missing, submodules: false },
       branch: { base: '', create: '', push: false },
       setup: { commands: [], env: {}, secretRefs: [] },
       task: { allowPr: false },

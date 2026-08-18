@@ -221,22 +221,24 @@ test('resourceContentUrl: builds the /content/binary endpoint, trimming a traili
 });
 
 test('resolveBrokerRestConfig: env base URL + optional bearer token', () => {
-  const prev = { u: process.env.NANO_REST_URL, b: process.env.NANO_BASE_URL, t: process.env.NANO_REST_TOKEN, at: process.env.NANO_AGENTIC_TOKEN };
+  const keys = ['NANO_REST_URL', 'NANO_BASE_URL', 'NANO_REST_TOKEN', 'NANO_AGENTIC_URL', 'NANO_AGENTIC_SECRET', 'NANO_AGENTIC_TOKEN'];
+  const prev = Object.fromEntries(keys.map((k) => [k, process.env[k]]));
   try {
+    for (const k of keys) delete process.env[k];
     process.env.NANO_REST_URL = 'http://broker:9999';
     process.env.NANO_REST_TOKEN = 'tok-123';
     const cfg = resolveBrokerRestConfig(process.env);
     assert.equal(cfg.baseUrl, 'http://broker:9999');
     assert.equal(cfg.token, 'tok-123');
   } finally {
-    for (const [k, v] of [['NANO_REST_URL', prev.u], ['NANO_BASE_URL', prev.b], ['NANO_REST_TOKEN', prev.t], ['NANO_AGENTIC_TOKEN', prev.at]]) {
-      if (v === undefined) delete process.env[k]; else process.env[k] = v;
+    for (const k of keys) {
+      if (prev[k] === undefined) delete process.env[k]; else process.env[k] = prev[k];
     }
   }
 });
 
 test('resolveBrokerRestConfig: agentic token only forwarded when same-origin as REST URL', () => {
-  const keys = ['NANO_REST_URL', 'NANO_BASE_URL', 'NANO_REST_TOKEN', 'NANO_AGENTIC_URL', 'NANO_AGENTIC_TOKEN'];
+  const keys = ['NANO_REST_URL', 'NANO_BASE_URL', 'NANO_REST_TOKEN', 'NANO_AGENTIC_URL', 'NANO_AGENTIC_SECRET', 'NANO_AGENTIC_TOKEN'];
   const prev = Object.fromEntries(keys.map((k) => [k, process.env[k]]));
   try {
     for (const k of keys) delete process.env[k];

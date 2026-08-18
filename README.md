@@ -334,6 +334,10 @@ c8ctl nano work reviewer
 #   agentic channel (secure): announcing presence as ‹worker› on ws://localhost:8080/agentic
 ```
 
+The shared secret can also be **persisted** (via config) as `agenticSecret`, so it
+need not be exported into the environment on every run; env still wins over the
+persisted value.
+
 The legacy `NANO_AGENTIC_TOKEN` env var (and persisted `agenticToken`) is still
 accepted as a **deprecated alias** for the shared secret. The **capability
 credential** (`NANO_AGENTIC_CREDENTIAL`) is no longer required — it was removed from

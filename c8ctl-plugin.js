@@ -3900,7 +3900,6 @@ function resolveAgenticConfig() {
     || cfg.nanoUrl
     || process.env.NANO_BASE_URL
     || DEFAULT_NANO_URL;
-  if (!url) return null;
   // SECURE-mode shared secret. Named NANO_AGENTIC_SECRET to match the server's env
   // var EXACTLY (Tab A → Slot A): set the same name + value on the server and every
   // worker box. The worker presents it as its identity token; the hub verifies it

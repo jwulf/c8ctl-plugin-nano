@@ -50,6 +50,8 @@ import {
   startLockExtender,
   provisionRepo,
   finalizeGit,
+  describeGitFailure,
+  boundGitOutput,
   reconcileAgentPr,
   resolveCommitterIdentity,
   isPlaceholderEmail,
@@ -971,6 +973,80 @@ test('provisionRepo throws a ProvisionError (redacted) on clone failure', { skip
       assert.equal(err.message.includes('supersecret'), false, 'token must be redacted from errors');
       return true;
     });
+  } finally {
+    rmSync(root, { recursive: true, force: true });
+  }
+});
+
+test('describeGitFailure reports a timeout-kill (SIGTERM) with the duration and preserves last output', () => {
+  const msg = describeGitFailure('git clone', {
+    status: 128,
+    signal: 'SIGTERM',
+    stdout: "Cloning into '/tmp/ws'...",
+    stderr: '',
+  }, { token: null, timeoutMs: 120_000 });
+  assert.match(msg, /timed out/, 'must say it timed out');
+  assert.match(msg, /after 120s/, 'must state how long');
+  assert.match(msg, /SIGTERM/, 'must name the kill signal');
+  assert.match(msg, /Cloning into/, 'must preserve the last flushed git output');
+  assert.doesNotMatch(msg, /failed \(exit/, 'a timeout must not be reported as a plain exit failure');
+});
+
+test('describeGitFailure captures BOTH streams so a fatal on stdout survives a noisy stderr', () => {
+  // stderr carries only git's useless progress line; the real reason is on stdout.
+  const msg = describeGitFailure('git clone', {
+    status: 128,
+    signal: null,
+    stderr: "Cloning into '/tmp/ws'...",
+    stdout: 'fatal: could not read Username for https://github.com: terminal prompts disabled',
+  }, { token: null, timeoutMs: 120_000 });
+  assert.match(msg, /failed \(exit 128\)/, 'a git-reported failure names the exit code');
+  assert.match(msg, /fatal: could not read Username/, 'the real reason on stdout must survive');
+});
+
+test('describeGitFailure redacts the token from both streams', () => {
+  const msg = describeGitFailure('git clone', {
+    status: 128,
+    signal: null,
+    stderr: 'fatal: unable to access https://x-access-token:supersecret@github.com/o/r',
+    stdout: 'supersecret leaked here too',
+  }, { token: 'supersecret', timeoutMs: 120_000 });
+  assert.equal(msg.includes('supersecret'), false, 'token must never appear in the failure reason');
+});
+
+test('boundGitOutput keeps head+tail instead of decapitating a long multiline error', () => {
+  const head = 'fatal: the real reason is right here at the top';
+  const tail = 'hint: and important recovery detail lives at the very bottom';
+  const long = head + '\n' + 'x'.repeat(2000) + '\n' + tail;
+  const bounded = boundGitOutput(long, 500);
+  assert.ok(bounded.length <= 500 + 8, 'stays within the bound');
+  assert.match(bounded, /the real reason is right here/, 'keeps the head');
+  assert.match(bounded, /recovery detail lives at the very bottom/, 'keeps the tail');
+  assert.match(bounded, /\[…\]/, 'marks the elision');
+});
+
+test('provisionRepo: an anonymous credential-less clone fails fast with a fatal reason (no hang)', { skip: !gitOk }, () => {
+  const root = mkdtempSync(join(tmpdir(), 'nano-git-'));
+  const runDir = mkdtempSync(join(root, 'run-'));
+  try {
+    const envelope = {
+      schemaVersion: 1,
+      // A private-looking https remote we can't authenticate to: with
+      // GIT_TERMINAL_PROMPT=0 and no askpass, git must emit a `fatal:` at once
+      // rather than blocking on a credential prompt to the 120s timeout.
+      repository: { provider: 'github', url: 'https://github.com/jwulf/this-repo-does-not-exist-nano-89.git', submodules: false },
+      branch: { base: '', create: '', push: false },
+      setup: { commands: [], env: {}, secretRefs: [] },
+      task: { allowPr: false },
+    };
+    const started = Date.now();
+    assert.throws(() => provisionRepo({ envelope, token: null, runDir, timeoutMs: 60_000 }), (err) => {
+      assert.ok(err instanceof ProvisionError);
+      assert.match(err.message, /git clone/);
+      assert.doesNotMatch(err.message, /timed out/, 'a credential-less clone must fail fast, not time out');
+      return true;
+    });
+    assert.ok(Date.now() - started < 55_000, 'must fail well before the timeout');
   } finally {
     rmSync(root, { recursive: true, force: true });
   }

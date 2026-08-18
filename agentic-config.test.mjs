@@ -31,6 +31,7 @@ process.on('exit', () => {
 const AGENTIC_ENV = [
   'NANO_AGENTIC',
   'NANO_AGENTIC_URL',
+  'NANO_AGENTIC_SECRET',
   'NANO_AGENTIC_TOKEN',
   'NANO_AGENTIC_CREDENTIAL',
   'NANO_AGENTIC_BUFFER_CAPACITY',
@@ -86,27 +87,44 @@ test('env NANO_AGENTIC wins over a persisted agentic:false off-switch', () => {
   assert.equal(cfg.token, LOCAL_AGENTIC_TOKEN);
 });
 
-test('SECURE mode: an identity token alone selects secure:true (credential optional)', () => {
+test('SECURE mode: NANO_AGENTIC_SECRET alone selects secure:true (credential optional)', () => {
+  const cfg = withEnv({ NANO_AGENTIC_SECRET: 'shared-secret' }, null, resolveAgenticConfig);
+  assert.ok(cfg);
+  assert.equal(cfg.secure, true);
+  assert.equal(cfg.token, 'shared-secret');
+  assert.equal(cfg.credential, '');
+});
+
+test('SECURE mode: legacy NANO_AGENTIC_TOKEN is accepted as a deprecated alias', () => {
   const cfg = withEnv({ NANO_AGENTIC_TOKEN: 'ident-secret' }, null, resolveAgenticConfig);
   assert.ok(cfg);
   assert.equal(cfg.secure, true);
   assert.equal(cfg.token, 'ident-secret');
-  assert.equal(cfg.credential, '');
 });
 
-test('SECURE mode: a still-configured credential is forwarded alongside the token', () => {
+test('SECURE mode: NANO_AGENTIC_SECRET wins over the legacy NANO_AGENTIC_TOKEN alias', () => {
   const cfg = withEnv(
-    { NANO_AGENTIC_TOKEN: 'ident-secret', NANO_AGENTIC_CREDENTIAL: 'cap-cred' },
+    { NANO_AGENTIC_SECRET: 'shared-secret', NANO_AGENTIC_TOKEN: 'legacy' },
+    null,
+    resolveAgenticConfig,
+  );
+  assert.ok(cfg);
+  assert.equal(cfg.token, 'shared-secret');
+});
+
+test('SECURE mode: a still-configured credential is forwarded alongside the secret', () => {
+  const cfg = withEnv(
+    { NANO_AGENTIC_SECRET: 'shared-secret', NANO_AGENTIC_CREDENTIAL: 'cap-cred' },
     null,
     resolveAgenticConfig,
   );
   assert.ok(cfg);
   assert.equal(cfg.secure, true);
-  assert.equal(cfg.token, 'ident-secret');
+  assert.equal(cfg.token, 'shared-secret');
   assert.equal(cfg.credential, 'cap-cred');
 });
 
-test('a credential without an identity token is ignored → LOCAL mode', () => {
+test('a credential without a shared secret is ignored → LOCAL mode', () => {
   const cfg = withEnv({ NANO_AGENTIC_CREDENTIAL: 'cred-only' }, null, resolveAgenticConfig);
   assert.ok(cfg);
   assert.equal(cfg.secure, false);
@@ -114,11 +132,11 @@ test('a credential without an identity token is ignored → LOCAL mode', () => {
   assert.equal(cfg.credential, '');
 });
 
-test('persisted agenticToken selects SECURE mode (credential optional)', () => {
-  const cfg = withEnv({}, { agenticToken: 't', agenticCredential: 'c' }, resolveAgenticConfig);
+test('persisted agenticSecret selects SECURE mode (credential optional)', () => {
+  const cfg = withEnv({}, { agenticSecret: 's', agenticCredential: 'c' }, resolveAgenticConfig);
   assert.ok(cfg);
   assert.equal(cfg.secure, true);
-  assert.equal(cfg.token, 't');
+  assert.equal(cfg.token, 's');
   assert.equal(cfg.credential, 'c');
 });
 

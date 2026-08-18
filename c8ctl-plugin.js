@@ -3863,11 +3863,14 @@ function buildResultEnvelope(result, { sandbox, image, git, result: agentResult,
  *     the well-known localhost token ({@link LOCAL_AGENTIC_TOKEN}) and no
  *     capability credential, so it appears live with zero configuration (the hub's
  *     matching LOCAL mode accepts it).
- *   - SECURE mode: set NANO_AGENTIC_TOKEN (or the persisted `agenticToken`) — a
- *     real per-peer identity token is then sent (enrolment). The capability
- *     credential was removed from the hub contract (it was accept-any, pure
- *     friction), so NANO_AGENTIC_CREDENTIAL is OPTIONAL and forwarded only if
- *     still configured; a credential set WITHOUT a token is ignored (LOCAL mode).
+ *   - SECURE mode: set NANO_AGENTIC_SECRET — the SAME env var name and value the
+ *     server is started with (Tab A → Slot A). The worker presents it as its
+ *     identity token and the hub verifies it against its own NANO_AGENTIC_SECRET.
+ *     The legacy NANO_AGENTIC_TOKEN name (and persisted `agenticToken`) is still
+ *     accepted as a deprecated alias. The capability credential was removed from
+ *     the hub contract (it was accept-any, pure friction), so NANO_AGENTIC_CREDENTIAL
+ *     is OPTIONAL and forwarded only if still configured; a credential set WITHOUT a
+ *     secret is ignored (LOCAL mode).
  *   - OFF: NANO_AGENTIC=off (or 0/false/no), or persisted `agentic:false`.
  *
  * Env wins over persisted config; the base URL falls back to the configured nano
@@ -3893,7 +3896,16 @@ function resolveAgenticConfig() {
     || process.env.NANO_BASE_URL
     || DEFAULT_NANO_URL;
   if (!url) return null;
-  const token = process.env.NANO_AGENTIC_TOKEN || cfg.agenticToken || '';
+  // SECURE-mode shared secret. Named NANO_AGENTIC_SECRET to match the server's env
+  // var EXACTLY (Tab A → Slot A): set the same name + value on the server and every
+  // worker box. The worker presents it as its identity token; the hub verifies it
+  // against its own NANO_AGENTIC_SECRET. NANO_AGENTIC_TOKEN / `agenticToken` remain
+  // as a deprecated alias.
+  const secret = process.env.NANO_AGENTIC_SECRET
+    || cfg.agenticSecret
+    || process.env.NANO_AGENTIC_TOKEN
+    || cfg.agenticToken
+    || '';
   const credential = process.env.NANO_AGENTIC_CREDENTIAL || cfg.agenticCredential || '';
   // Outbound hub-down buffer bound (frames). Operator-tunable (C4, #43) so a
   // long expected outage can be given more headroom; resolveBufferCapacity
@@ -3902,13 +3914,13 @@ function resolveAgenticConfig() {
     process.env.NANO_AGENTIC_BUFFER_CAPACITY ?? cfg.agenticBufferCapacity,
   );
 
-  // SECURE mode: an explicit identity token means the operator opted into a real
+  // SECURE mode: an explicit shared secret means the operator opted into a real
   // per-peer secret. The capability credential was removed from the hub contract
   // (accept-any → pure friction), so it is OPTIONAL — forwarded only if still
-  // configured. A credential set without a token is meaningless and falls through
+  // configured. A credential set without a secret is meaningless and falls through
   // to LOCAL mode.
-  if (token) {
-    return { url, token, credential, bufferCapacity, secure: true, explicitUrl };
+  if (secret) {
+    return { url, token: secret, credential, bufferCapacity, secure: true, explicitUrl };
   }
 
   // LOCAL mode (default): well-known token, no capability credential.

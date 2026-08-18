@@ -136,13 +136,13 @@ const PROCESSOS_DEFAULT_PORT = 8090;
 const DEFAULT_NANO_URL = 'http://localhost:8080';
 
 // The well-known identity token used for LOCAL agentic visibility (security opt-in). Nano is
-// local-first: on the operator's own machine a `nano work` worker joins the visibility channel with
-// zero configuration, so it presents this constant, well-known localhost token — NOT a secret. The
-// worker does not enforce any loopback restriction itself (it presents this token to whatever
-// NANO_AGENTIC_URL is configured); same-machine gating is enforced by the hub, which only honours
-// this well-known token for local/loopback connections. Kept in lock-step with the hub constant in
-// nanobpm/nano-workforce (`app/agentic/channel.ts` LOCAL_AGENTIC_TOKEN). In secure mode (a real
-// NANO_AGENTIC_TOKEN + NANO_AGENTIC_CREDENTIAL) this is never used.
+// local-first: a `nano work` worker joins the visibility channel with zero configuration, so it
+// presents this constant, well-known LOCAL token — NOT a secret. The worker does not enforce any
+// loopback restriction itself (it presents this token to whatever NANO_AGENTIC_URL is configured);
+// the hub honours this well-known token from any origin (matching the open trusted-LAN posture of
+// the engine itself). Kept in lock-step with the hub constant in nanobpm/nano-workforce
+// (`app/agentic/channel.ts` LOCAL_AGENTIC_TOKEN). In secure mode (a real NANO_AGENTIC_SECRET) this
+// is never used.
 const LOCAL_AGENTIC_TOKEN = 'nano-local';
 
 // Passive update notifier (npm-style): refresh the latest published version
@@ -3860,9 +3860,9 @@ function buildResultEnvelope(result, { sandbox, image, git, result: agentResult,
  * Local-first (security opt-in). Nano is designed for local use, so visibility is
  * ON BY DEFAULT:
  *   - LOCAL mode (default): no credentials configured — the worker connects with
- *     the well-known localhost token ({@link LOCAL_AGENTIC_TOKEN}) and no
- *     capability credential, so it appears live with zero configuration (the hub's
- *     matching LOCAL mode accepts it).
+ *     the well-known LOCAL token ({@link LOCAL_AGENTIC_TOKEN}) and no capability
+ *     credential, so it appears live with zero configuration (the hub honours this
+ *     well-known token from any origin on a trusted LAN).
  *   - SECURE mode: set NANO_AGENTIC_SECRET — the SAME env var name and value the
  *     server is started with (Tab A → Slot A). The worker presents it as its
  *     identity token and the hub verifies it against its own NANO_AGENTIC_SECRET.
@@ -3874,7 +3874,8 @@ function buildResultEnvelope(result, { sandbox, image, git, result: agentResult,
  *   - OFF: NANO_AGENTIC=off (or 0/false/no), or persisted `agentic:false`.
  *
  * Env wins over persisted config; the base URL falls back to the configured nano
- * URL (the app's own port). Returns `null` only when disabled or half-configured.
+ * URL (the app's own port). Returns `null` only when disabled (the off-switch) or
+ * when no base URL can be resolved.
  *
  * @returns {{ url: string, token: string, credential: string, bufferCapacity: number, secure: boolean } | null}
  */
@@ -4477,9 +4478,9 @@ async function workAgent(req, flags) {
   // lifecycle events) rather than opening their own connection.
   //
   // Local-first (security opt-in): visibility is ON BY DEFAULT. In LOCAL mode the
-  // worker joins with the well-known localhost token and no credential; SECURE
-  // mode (NANO_AGENTIC_TOKEN + NANO_AGENTIC_CREDENTIAL) sends a real ADR 0028
-  // identity + capability; NANO_AGENTIC=off disables it (see resolveAgenticConfig).
+  // worker joins with the well-known LOCAL token and no credential; SECURE mode
+  // (NANO_AGENTIC_SECRET) sends a real per-peer shared secret as the identity;
+  // NANO_AGENTIC=off disables it (see resolveAgenticConfig).
   const agenticTarget = await resolveAgenticTarget({ logger });
   let agenticCfg = null;
   switch (agenticTarget.status) {

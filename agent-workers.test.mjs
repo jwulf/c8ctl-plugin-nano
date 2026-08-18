@@ -263,6 +263,37 @@ test('resolveBrokerRestConfig: agentic token only forwarded when same-origin as 
   }
 });
 
+test('resolveBrokerRestConfig: NANO_AGENTIC_SECRET honours same-origin gate and outranks legacy token', () => {
+  const keys = ['NANO_REST_URL', 'NANO_BASE_URL', 'NANO_REST_TOKEN', 'NANO_AGENTIC_URL', 'NANO_AGENTIC_SECRET', 'NANO_AGENTIC_TOKEN'];
+  const prev = Object.fromEntries(keys.map((k) => [k, process.env[k]]));
+  try {
+    for (const k of keys) delete process.env[k];
+    // (1) Different-origin REST host with only the identity secret set: no leak.
+    process.env.NANO_REST_URL = 'http://broker:9999';
+    process.env.NANO_AGENTIC_URL = 'http://hub:8080';
+    process.env.NANO_AGENTIC_SECRET = 'ident-secret';
+    let cfg = resolveBrokerRestConfig(process.env);
+    assert.equal(cfg.token, '', 'agentic secret must not leak to a different-origin REST host');
+    // (2) Same-origin single-token deployment: the identity secret IS forwarded.
+    process.env.NANO_AGENTIC_URL = 'http://broker:9999';
+    cfg = resolveBrokerRestConfig(process.env);
+    assert.equal(cfg.token, 'ident-secret', 'agentic secret forwarded same-origin');
+    // (3) Secret outranks the legacy NANO_AGENTIC_TOKEN alias when both are set.
+    process.env.NANO_AGENTIC_TOKEN = 'legacy-tok';
+    cfg = resolveBrokerRestConfig(process.env);
+    assert.equal(cfg.token, 'ident-secret', 'NANO_AGENTIC_SECRET wins over the legacy NANO_AGENTIC_TOKEN alias');
+    // An explicit REST token still wins over everything, regardless of origin.
+    process.env.NANO_AGENTIC_URL = 'http://hub:8080';
+    process.env.NANO_REST_TOKEN = 'rest-tok';
+    cfg = resolveBrokerRestConfig(process.env);
+    assert.equal(cfg.token, 'rest-tok');
+  } finally {
+    for (const k of keys) {
+      if (prev[k] === undefined) delete process.env[k]; else process.env[k] = prev[k];
+    }
+  }
+});
+
 test('fetchLinkedResourceContent: GETs /content/binary and decodes UTF-8 (with bearer when set)', async () => {
   const calls = [];
   const fetchImpl = async (url, init) => {

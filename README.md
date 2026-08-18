@@ -485,7 +485,7 @@ stdin payload as `task`:
 Element templates emit flat dotpath header keys (strings); the plugin expands
 them into a nested object and coerces `"true"/"false"` → bool and numeric
 strings → int. The normalized shape is
-`{ schemaVersion, repository{provider,url,ref,depth,submodules,authRef}, branch{base,create,push}, setup{commands,env,secretRefs}, task{prompt,promptFile,maxIterations,timeoutMs,allowPr,prBase} }`.
+`{ schemaVersion, repository{provider,url,ref,sha,depth,singleBranch,filter,baseRef,baseSha,cloneTimeoutMs,submodules,authRef}, branch{base,create,push}, setup{commands,env,secretRefs}, task{prompt,promptFile,maxIterations,timeoutMs,allowPr,prBase} }`.
 
 **Prompt = base + optional verbatim append.** The agent's prompt resolves to
 `task.prompt` (typically a model header filled at deploy time), falling back to a
@@ -531,8 +531,33 @@ the harness:
 1. resolve the optional repo credential (`repository.authRef`, or `GITHUB_TOKEN`
    for GitHub) — absent ⇒ anonymous clone;
 2. `git clone` (honouring `depth`/`submodules`, and `repository.ref`/`branch.base`
-   as the checkout target) into a throwaway workspace under
-   `<state>/agent-runs/run-*`;
+   as the checkout target). **`ref` is always a branch/tag name** (there is no hex
+   heuristic, so a legitimately hex-named branch like `deadbeef` is cloned via
+   `--branch`, never misread as a commit); to pin a **raw commit** use the
+   dedicated **`repository.sha`** field, which clones `ref`/`branch.base` (if any)
+   then fetches + checks the commit out as a detached HEAD. The clone lands in a
+   throwaway workspace under `<state>/agent-runs/run-*`. For a **huge monorepo**
+   the clone envelope can be
+   scoped so it finishes inside the clone timeout: **`singleBranch`** adds
+   `--single-branch` (fetch only `ref`, not every branch — a plain `clone --branch`
+   still pulls all branches/history); **`filter`** (e.g. `"blob:none"`) adds
+   `--filter=<spec>` for a partial/treeless clone (full commit graph, lazy blobs —
+   so `merge-base`/`git diff base...head` still work); **`baseRef`**/**`baseSha`**
+   additionally `git fetch` the base (respecting `depth`/`filter`) so a
+   single-branch/shallow clone can still diff `base...head` (exported as
+   `AGENT_REPO_BASE`). **`baseRef`** is always treated as a branch/tag name (even
+   one that looks hex-like) and is mapped into `refs/remotes/origin/<baseRef>`;
+   **`baseSha`** is the field for a raw commit SHA (fetched by id, exposed as the
+   SHA itself). `baseRef` and `baseSha` are **mutually exclusive** — setting both
+   is ambiguous, so the base fetch is skipped and a non-fatal `baseFetchError`
+   records the misconfiguration. A `--depth 1 --single-branch` of only the head
+   otherwise has NO
+   base and NO merge-base, so a naive `git diff main` fails. A failed base fetch
+   is **non-fatal** — the head clone still succeeds and
+   the failure is logged. **`cloneTimeoutMs`** overrides the clone/fetch timeout
+   per envelope (default 120s, or the `--clone-timeout` worker flag) as a backstop
+   for repos big enough to approach the cap even when shallow; a timeout is now
+   reported *as a timeout* rather than an opaque `exit 128`;
 3. create `branch.create` (if set) off that target;
 4. set a **committer identity** on the workspace, preferring the operator's own
    (`GIT_AUTHOR_*` env → global `git config user.name/email` → the
@@ -540,8 +565,8 @@ the harness:
    none resolve — so autonomous commits are authored by the human running the
    fleet (who has signed any CLA/DCO), not an anonymous bot;
 5. run the harness **in the workspace** (`cwd`), with `AGENT_WORKSPACE`,
-   `AGENT_REPO_URL`, `AGENT_REPO_BRANCH`, `AGENT_REPO_REF` exported and the job
-   envelope on stdin;
+   `AGENT_REPO_URL`, `AGENT_REPO_BRANCH`, `AGENT_REPO_REF`, `AGENT_REPO_BASE`
+   exported and the job envelope on stdin;
 6. on success, enumerate new commits, `git push` the branch when `branch.push`
    (default true), and — when `task.allowPr` — **reconcile the PR the agent
    opened** for the branch (`gh pr list --head <branch>`; `openedBy` reports the

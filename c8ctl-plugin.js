@@ -2799,6 +2799,52 @@ function runGit(args, { cwd, env, timeoutMs = 120_000 } = {}) {
   }
 }
 
+// Bound a git output string without decapitating it: a hard `.slice(0, max)`
+// drops the tail, but the real reason can live at either end of a long
+// multiline git error (the `fatal:` up top, wrapping/hint detail below). Keep a
+// head+tail window joined by an elision marker so both survive.
+function boundGitOutput(text, max = 500) {
+  const s = String(text ?? '').trim();
+  if (s.length <= max) return s;
+  const marker = ' […] ';
+  // When max is too small to fit even the elision marker the head+tail budget
+  // goes negative, making the slices behave unexpectedly and return MORE than
+  // max — so hard-cap to max (never below zero) in that degenerate case.
+  if (max <= marker.length) return s.slice(0, Math.max(0, max));
+  const budget = max - marker.length;
+  const head = Math.ceil(budget * 0.6);
+  const tail = budget - head;
+  return `${s.slice(0, head)}${marker}${s.slice(s.length - tail)}`;
+}
+
+// Build an informative, token-redacted failure reason from a runGit result.
+// Two things the old `stderr || stdout`.slice(0,500) message threw away:
+//   1. On a timeout Node SIGTERM-kills git (status→128, signal='SIGTERM') — say
+//      so, and after how long, instead of surfacing only git's flushed
+//      "Cloning into '…'..." progress line as if it were the failure.
+//   2. `stderr || stdout` let a non-empty-but-useless stderr mask a real reason
+//      on stdout — capture BOTH streams (stderr then stdout) so either survives.
+function describeGitFailure(action, result, { token, timeoutMs } = {}) {
+  const combined = boundGitOutput(
+    redactToken([result && result.stderr, result && result.stdout].filter(Boolean).join('\n'), token),
+  );
+  // spawnSync's timeout kill lands as SIGTERM (its default killSignal); runGit
+  // maps the null status to 128. Only SIGTERM means "timed out" — any OTHER
+  // signal (e.g. SIGKILL from an OOM kill) is a distinct termination that we
+  // must not misreport as a timeout.
+  const signal = result && result.signal;
+  if (signal === 'SIGTERM') {
+    const secs = timeoutMs ? Math.round(timeoutMs / 1000) : null;
+    const dur = secs ? ` after ${secs}s` : '';
+    return `${action} timed out${dur} (SIGTERM)${combined ? `; last output: ${combined}` : ''}`;
+  }
+  if (signal) {
+    return `${action} terminated by signal ${signal}${combined ? `: ${combined}` : ''}`;
+  }
+  const exit = result && result.status != null ? result.status : '?';
+  return `${action} failed (exit ${exit})${combined ? `: ${combined}` : ''}`;
+}
+
 // Write a GIT_ASKPASS helper that echoes $GIT_TOKEN, so the token reaches git
 // via the child's ENV — never on argv or in the remote URL. Uses a Node helper
 // (askpass.js reads GIT_TOKEN and writes it verbatim), launched by a per-OS
@@ -3082,17 +3128,25 @@ function provisionRepo({ envelope, token, runDir, timeoutMs = 120_000 }) {
 
   const clone = runGit(cloneArgs, { env: gitEnv, timeoutMs });
   if (clone.status !== 0) {
-    throw new ProvisionError(`git clone failed: ${redactToken(clone.stderr || clone.stdout, token).trim().slice(0, 500) || `exit ${clone.status}`}`);
+    throw new ProvisionError(describeGitFailure('git clone', clone, { token, timeoutMs }));
   }
 
   if (isSha) {
     // The SHA may not be present under a shallow clone of the default branch —
     // fetch it explicitly (best effort), then check it out (detached HEAD).
     const fetch = runGit([...credArgs(), 'fetch', '--no-tags', 'origin', target], { cwd: workspaceDir, env: gitEnv, timeoutMs });
-    const co = runGit(['checkout', '--detach', target], { cwd: workspaceDir, env: gitEnv });
+    const co = runGit(['checkout', '--detach', target], { cwd: workspaceDir, env: gitEnv, timeoutMs });
     if (co.status !== 0) {
-      const why = redactToken(co.stderr || fetch.stderr, token).trim().slice(0, 300);
-      throw new ProvisionError(`git checkout ${target} failed: ${why || `exit ${co.status}`}`);
+      // Prefer the failing checkout's own output, but fall back to the fetch's
+      // (a timeout/fatal there is the real cause the checkout can't recover from)
+      // ONLY when fetch actually failed — a succeeded fetch (status 0) is not the
+      // cause, and reporting it would yield a misleading "exit 0" message.
+      const useCheckout = !!(co.stderr || co.stdout || fetch.status === 0);
+      const source = useCheckout ? co : fetch;
+      // Label the failure with the action whose output we actually report, so a
+      // fetch timeout/fatal isn't misreported as a checkout failure.
+      const action = useCheckout ? `git checkout ${target}` : `git fetch origin ${target}`;
+      throw new ProvisionError(describeGitFailure(action, source, { token, timeoutMs }));
     }
   }
 
@@ -3127,8 +3181,8 @@ function provisionRepo({ envelope, token, runDir, timeoutMs = 120_000 }) {
   // finalizeGit skips the push/PR reconcile instead of pushing a bogus ref.
   let workingBranch = null;
   if (envelope.branch?.create) {
-    const cb = runGit(['checkout', '-B', envelope.branch.create], { cwd: workspaceDir, env: gitEnv });
-    if (cb.status !== 0) throw new ProvisionError(`git checkout -B ${envelope.branch.create} failed: ${redactToken(cb.stderr, token).trim().slice(0, 300)}`);
+    const cb = runGit(['checkout', '-B', envelope.branch.create], { cwd: workspaceDir, env: gitEnv, timeoutMs });
+    if (cb.status !== 0) throw new ProvisionError(describeGitFailure(`git checkout -B ${envelope.branch.create}`, cb, { token, timeoutMs }));
     workingBranch = envelope.branch.create;
   } else {
     const head = runGit(['rev-parse', '--abbrev-ref', 'HEAD'], { cwd: workspaceDir, env: gitEnv });
@@ -3278,9 +3332,10 @@ function finalizeGit({ workspaceDir, gitEnv, startSha, workingBranch, envelope, 
   if (!workingBranch) {
     out.detached = true; // clone landed on a tag/sha ⇒ no branch to push
   } else if (coerceBool(envelope.branch?.push, true) && out.commits.length > 0) {
-    const push = runGit([...credArgs(), 'push', '--set-upstream', 'origin', workingBranch], { cwd: workspaceDir, env: gitEnv });
+    const pushTimeoutMs = 120_000; // matches runGit's default; surfaced in a timeout reason
+    const push = runGit([...credArgs(), 'push', '--set-upstream', 'origin', workingBranch], { cwd: workspaceDir, env: gitEnv, timeoutMs: pushTimeoutMs });
     if (push.status === 0) out.pushed = true;
-    else out.pushError = redactToken(push.stderr || push.stdout, token).trim().slice(0, 300) || `push exit ${push.status}`;
+    else out.pushError = describeGitFailure('git push', push, { token, timeoutMs: pushTimeoutMs });
   }
 
   if (workingBranch && envelope.task?.allowPr) {
@@ -8388,6 +8443,8 @@ export {
   startLockExtender,
   provisionRepo,
   finalizeGit,
+  describeGitFailure,
+  boundGitOutput,
   reconcileAgentPr,
   resolveCommitterIdentity,
   isPlaceholderEmail,

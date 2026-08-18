@@ -2295,6 +2295,19 @@ function normalizeTaskEnvelope(customHeaders, variables, opts = {}) {
       url: str(repo.url),
       ref: str(repo.ref),
       depth: coerceInt(repo.depth, undefined),
+      // Scope the fetch to just `ref` (independent of depth) for callers that want
+      // full history of one branch but not every branch of a huge monorepo.
+      singleBranch: coerceBool(repo.singleBranch, false),
+      // Partial/treeless clone spec (e.g. "blob:none"): full commit graph with
+      // lazy blob fetch, so `merge-base` / `git diff base...head` still work.
+      filter: str(repo.filter),
+      // When a base branch/sha is supplied we additionally fetch it so a
+      // single-branch/shallow clone can still diff `base...head`.
+      baseRef: str(repo.baseRef),
+      baseSha: str(repo.baseSha),
+      // Per-envelope override of the clone/fetch timeout (ms) — a backstop for
+      // repos big enough to approach the default 120s cap even when shallow.
+      cloneTimeoutMs: coerceInt(repo.cloneTimeoutMs, undefined),
       submodules: coerceBool(repo.submodules, false),
       authRef: str(repo.authRef),
     };
@@ -2793,9 +2806,14 @@ function redactToken(text, token) {
 function runGit(args, { cwd, env, timeoutMs = 120_000 } = {}) {
   try {
     const r = spawnSync('git', args, { cwd, env, encoding: 'utf8', timeout: timeoutMs });
-    return { status: r.status ?? (r.signal ? 128 : null), stdout: r.stdout || '', stderr: r.stderr || '', signal: r.signal || null };
+    // spawnSync does not throw on timeout — it returns with `error.code` set to
+    // 'ETIMEDOUT' and the child SIGTERM-killed (signal set, status null). Surface
+    // that as `timedOut` so callers can report a timeout instead of an
+    // uninformative "exit 128" (ties to #89).
+    const timedOut = !!(r.error && r.error.code === 'ETIMEDOUT');
+    return { status: r.status ?? (r.signal ? 128 : null), stdout: r.stdout || '', stderr: r.stderr || '', signal: r.signal || null, timedOut, timeoutMs };
   } catch (err) {
-    return { status: null, stdout: '', stderr: err.message, signal: null };
+    return { status: null, stdout: '', stderr: err.message, signal: null, timedOut: false, timeoutMs };
   }
 }
 
@@ -3119,23 +3137,36 @@ function provisionRepo({ envelope, token, runDir, timeoutMs = 120_000 }) {
   // `git clone --branch` accepts a branch or tag name but NOT a raw commit SHA.
   // For a SHA we clone the default branch, then fetch + check it out below.
   const isSha = !!target && /^[0-9a-f]{7,40}$/i.test(target);
+  // Per-envelope timeout override (backstop for giant monorepos that approach the
+  // default cap even when shallow); falls back to the caller-supplied timeout.
+  const effectiveTimeoutMs = (repo.cloneTimeoutMs && repo.cloneTimeoutMs > 0) ? repo.cloneTimeoutMs : timeoutMs;
   const cloneArgs = [...credArgs(), 'clone', '--no-tags'];
   if (repo.depth && repo.depth > 0) cloneArgs.push('--depth', String(repo.depth));
+  // `--single-branch` restricts the fetch to just `ref` — a plain `clone --branch`
+  // still downloads every branch and all history. `--depth` implies this, but
+  // honor it independently for a full-history single-branch clone.
+  if (repo.singleBranch) cloneArgs.push('--single-branch');
+  // Partial (blob-filtered) clone: full commit graph, lazy blobs — best fit for
+  // reviewing a PR on a monorepo where a full checkout blows the timeout.
+  if (repo.filter) cloneArgs.push(`--filter=${repo.filter}`);
   if (repo.submodules) cloneArgs.push('--recurse-submodules');
   if (target && !isSha) cloneArgs.push('--branch', target);
   const remote = authUrl(repo.url, repo.provider || 'github', !!token);
   cloneArgs.push(remote, workspaceDir);
 
-  const clone = runGit(cloneArgs, { env: gitEnv, timeoutMs });
+  const clone = runGit(cloneArgs, { env: gitEnv, timeoutMs: effectiveTimeoutMs });
   if (clone.status !== 0) {
-    throw new ProvisionError(describeGitFailure('git clone', clone, { token, timeoutMs }));
+    if (clone.timedOut) {
+      throw new ProvisionError(`git clone timed out after ${effectiveTimeoutMs}ms — repo too large for the clone timeout; raise repository.cloneTimeoutMs or scope the clone with filter/singleBranch/depth`);
+    }
+    throw new ProvisionError(describeGitFailure('git clone', clone, { token, timeoutMs: effectiveTimeoutMs }));
   }
 
   if (isSha) {
     // The SHA may not be present under a shallow clone of the default branch —
     // fetch it explicitly (best effort), then check it out (detached HEAD).
-    const fetch = runGit([...credArgs(), 'fetch', '--no-tags', 'origin', target], { cwd: workspaceDir, env: gitEnv, timeoutMs });
-    const co = runGit(['checkout', '--detach', target], { cwd: workspaceDir, env: gitEnv, timeoutMs });
+    const fetch = runGit([...credArgs(), 'fetch', '--no-tags', 'origin', target], { cwd: workspaceDir, env: gitEnv, timeoutMs: effectiveTimeoutMs });
+    const co = runGit(['checkout', '--detach', target], { cwd: workspaceDir, env: gitEnv });
     if (co.status !== 0) {
       // Prefer the failing checkout's own output, but fall back to the fetch's
       // (a timeout/fatal there is the real cause the checkout can't recover from)
@@ -3147,6 +3178,39 @@ function provisionRepo({ envelope, token, runDir, timeoutMs = 120_000 }) {
       // fetch timeout/fatal isn't misreported as a checkout failure.
       const action = useCheckout ? `git checkout ${target}` : `git fetch origin ${target}`;
       throw new ProvisionError(describeGitFailure(action, source, { token, timeoutMs }));
+    }
+  }
+
+  // Optional base fetch: with a single-branch/shallow clone the head has no base
+  // and no merge-base, so a naive `git diff <base>` fails. When a base branch or
+  // sha is supplied, fetch it (respecting depth/filter) into a remote-tracking
+  // ref so the harness can compute `git diff origin/<base>...HEAD`. Best-effort:
+  // a failed base fetch is recorded, not fatal (the head clone still succeeded).
+  let base = '';
+  let baseFetchError;
+  const baseTarget = repo.baseSha || repo.baseRef;
+  if (baseTarget) {
+    const isBaseSha = !!repo.baseSha || /^[0-9a-f]{7,40}$/i.test(baseTarget);
+    const fetchArgs = [...credArgs(), 'fetch', '--no-tags'];
+    if (repo.depth && repo.depth > 0) fetchArgs.push('--depth', String(repo.depth));
+    if (repo.filter) fetchArgs.push(`--filter=${repo.filter}`);
+    if (isBaseSha) {
+      // A raw sha can't be mapped to a stable name — fetch it (updates FETCH_HEAD)
+      // and expose the sha itself as the diff base.
+      fetchArgs.push('origin', baseTarget);
+      base = baseTarget;
+    } else {
+      // Map the branch onto refs/remotes/origin/<baseRef> so `origin/<base>`
+      // resolves for the reviewer even on a single-branch clone.
+      fetchArgs.push('origin', `+${baseTarget}:refs/remotes/origin/${baseTarget}`);
+      base = `origin/${baseTarget}`;
+    }
+    const bf = runGit(fetchArgs, { cwd: workspaceDir, env: gitEnv, timeoutMs: effectiveTimeoutMs });
+    if (bf.status !== 0) {
+      base = '';
+      baseFetchError = bf.timedOut
+        ? `base fetch timed out after ${effectiveTimeoutMs}ms`
+        : (redactToken(bf.stderr || bf.stdout, token).trim().slice(0, 300) || `exit ${bf.status}`);
     }
   }
 
@@ -3193,7 +3257,7 @@ function provisionRepo({ envelope, token, runDir, timeoutMs = 120_000 }) {
   // `git rev-parse HEAD` on an unborn branch (freshly cloned empty repo) exits
   // non-zero and echoes the literal "HEAD" on stdout — treat that as "no base
   // commit" (empty startSha) rather than a bogus revision.
-  return { workspaceDir, gitEnv, committer, startSha: sha.status === 0 ? (sha.stdout || '').trim() : '', workingBranch, detached: !workingBranch, ref: target || '', remote: redactToken(repo.url, token) };
+  return { workspaceDir, gitEnv, committer, startSha: sha.status === 0 ? (sha.stdout || '').trim() : '', workingBranch, detached: !workingBranch, ref: target || '', base, baseFetchError, remote: redactToken(repo.url, token) };
 }
 
 // Look up a PR for this branch (2a does NOT open it — the harness does, driven
@@ -4725,12 +4789,19 @@ async function workAgent(req, flags) {
             runDir = mkdtempSync(join(agentRunsRoot(), 'run-'));
             liveRunDirs.add(runDir);
             provisioned = provisionRepo({ envelope, token: repoToken, runDir, timeoutMs: cloneTimeoutMs });
+            if (provisioned.baseFetchError) {
+              logger.warn(`[${jobType}] job ${job.jobKey} base fetch failed — ${provisioned.baseFetchError}; base...head diffs may be unavailable`);
+            }
             cwd = provisioned.workspaceDir;
             extraEnv = {
               AGENT_WORKSPACE: provisioned.workspaceDir,
               AGENT_REPO_URL: provisioned.remote,
               AGENT_REPO_BRANCH: provisioned.workingBranch || '',
               AGENT_REPO_REF: provisioned.ref || '',
+              // The fetched base ref (e.g. `origin/main` or a base sha) for
+              // computing `git diff <base>...HEAD`; empty when none was requested
+              // or the base fetch failed (see provisioned.baseFetchError).
+              AGENT_REPO_BASE: provisioned.base || '',
               // Pin the harness's commit identity to the resolved (placeholder-
               // sanitized) committer so the agent's own `git commit` can't be
               // hijacked by a placeholder GIT_AUTHOR_* inherited from process.env

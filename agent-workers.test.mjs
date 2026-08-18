@@ -130,6 +130,36 @@ test('normalizeTaskEnvelope: variables override headers, coercion applied', () =
   assert.equal(env.task.prompt, 'do the thing');
 });
 
+test('normalizeTaskEnvelope: maps branch-scoped/partial clone fields (issue #91)', () => {
+  const headers = {
+    [`${AGENT_TASK_NS}.repository.url`]: 'https://github.com/o/r.git',
+  };
+  const variables = {
+    [`${AGENT_TASK_NS}.repository.singleBranch`]: 'true',
+    [`${AGENT_TASK_NS}.repository.filter`]: 'blob:none',
+    [`${AGENT_TASK_NS}.repository.depth`]: '1',
+    [`${AGENT_TASK_NS}.repository.baseRef`]: 'main',
+    [`${AGENT_TASK_NS}.repository.baseSha`]: 'deadbeef',
+    [`${AGENT_TASK_NS}.repository.cloneTimeoutMs`]: '600000',
+  };
+  const env = normalizeTaskEnvelope(headers, variables);
+  assert.equal(env.repository.singleBranch, true, 'string "true" coerces to boolean');
+  assert.equal(env.repository.filter, 'blob:none');
+  assert.equal(env.repository.depth, 1);
+  assert.equal(env.repository.baseRef, 'main');
+  assert.equal(env.repository.baseSha, 'deadbeef');
+  assert.equal(env.repository.cloneTimeoutMs, 600000, 'string coerces to int');
+});
+
+test('normalizeTaskEnvelope: new clone fields default to today’s behavior when absent', () => {
+  const env = normalizeTaskEnvelope({ [`${AGENT_TASK_NS}.repository.url`]: 'https://github.com/o/r.git' }, {});
+  assert.equal(env.repository.singleBranch, false, 'absent singleBranch is false');
+  assert.equal(env.repository.filter, undefined, 'absent filter is undefined');
+  assert.equal(env.repository.baseRef, undefined);
+  assert.equal(env.repository.baseSha, undefined);
+  assert.equal(env.repository.cloneTimeoutMs, undefined);
+});
+
 test('normalizeTaskEnvelope: appendPrompt (reserved) is concatenated verbatim onto the header base', () => {
   const headers = { [`${AGENT_TASK_NS}.task.prompt`]: 'BASE PROMPT' };
   const variables = { [`${AGENT_TASK_NS}.task.appendPrompt`]: '\n\n---\n\nEXTRA' };
@@ -926,6 +956,65 @@ test('provisionRepo checks out a commit SHA ref (detached, not via --branch)', {
     assert.equal(prov.workingBranch, null, 'a SHA checkout has no branch');
     assert.equal(prov.detached, true);
     assert.equal(prov.ref, firstSha, 'exposes the effective SHA ref');
+  } finally {
+    rmSync(root, { recursive: true, force: true });
+  }
+});
+
+test('provisionRepo honors singleBranch + filter and fetches the base for a base...head diff (issue #91)', { skip: !gitOk }, () => {
+  const { root, origin } = makeOriginRepo();
+  // Add a feature branch with an extra commit on top of main.
+  const wc = mkdtempSync(join(root, 'wc2-'));
+  g(['clone', '-q', origin, wc], undefined);
+  g(['config', 'user.name', 'seed'], wc);
+  g(['config', 'user.email', 'seed@example.com'], wc);
+  g(['checkout', '-q', '-b', 'feat/x'], wc);
+  writeFileSync(join(wc, 'feature.txt'), 'feature\n');
+  g(['add', '-A'], wc);
+  g(['commit', '-q', '-m', 'feature commit'], wc);
+  g(['push', '-q', 'origin', 'feat/x'], wc);
+  const runDir = mkdtempSync(join(root, 'run-'));
+  try {
+    const envelope = {
+      schemaVersion: 1,
+      repository: { provider: 'github', url: origin, ref: 'feat/x', singleBranch: true, filter: 'blob:none', baseRef: 'main', submodules: false },
+      branch: { base: '', create: '', push: false },
+      setup: { commands: [], env: {}, secretRefs: [] },
+      task: { allowPr: false },
+    };
+    const prov = provisionRepo({ envelope, token: null, runDir });
+    assert.ok(existsSync(join(prov.workspaceDir, 'feature.txt')), 'the feature branch is checked out');
+    // singleBranch restricts the fetch refspec to just the ref branch.
+    const fetchRefspecs = g(['config', '--get-all', 'remote.origin.fetch'], prov.workspaceDir);
+    assert.match(fetchRefspecs, /feat\/x/, 'single-branch clone tracks only the ref branch');
+    // filter records a partial-clone filter on the remote.
+    assert.equal(g(['config', 'remote.origin.partialclonefilter'], prov.workspaceDir), 'blob:none', 'partial clone filter is set');
+    // The base was fetched and is exposed for a base...head diff.
+    assert.equal(prov.base, 'origin/main');
+    assert.equal(prov.baseFetchError, undefined, 'base fetch succeeded');
+    assert.match(g(['rev-parse', 'origin/main'], prov.workspaceDir), /^[0-9a-f]{40}$/, 'origin/main resolves after the base fetch');
+    const diff = g(['diff', '--name-only', 'origin/main...HEAD'], prov.workspaceDir);
+    assert.equal(diff, 'feature.txt', 'base...head diff computes the feature change');
+  } finally {
+    rmSync(root, { recursive: true, force: true });
+  }
+});
+
+test('provisionRepo records a non-fatal baseFetchError when the base ref is missing (issue #91)', { skip: !gitOk }, () => {
+  const { root, origin } = makeOriginRepo();
+  const runDir = mkdtempSync(join(root, 'run-'));
+  try {
+    const envelope = {
+      schemaVersion: 1,
+      repository: { provider: 'github', url: origin, ref: 'main', singleBranch: true, baseRef: 'no-such-base', submodules: false },
+      branch: { base: '', create: 'feat/y', push: false },
+      setup: { commands: [], env: {}, secretRefs: [] },
+      task: { allowPr: false },
+    };
+    const prov = provisionRepo({ envelope, token: null, runDir });
+    assert.ok(existsSync(join(prov.workspaceDir, 'README.md')), 'the head clone still succeeded');
+    assert.equal(prov.base, '', 'no usable base when the base fetch fails');
+    assert.ok(prov.baseFetchError, 'a missing base ref is reported, not thrown');
   } finally {
     rmSync(root, { recursive: true, force: true });
   }

@@ -2807,6 +2807,10 @@ function boundGitOutput(text, max = 500) {
   const s = String(text ?? '').trim();
   if (s.length <= max) return s;
   const marker = ' […] ';
+  // When max is too small to fit even the elision marker the head+tail budget
+  // goes negative, making the slices behave unexpectedly and return MORE than
+  // max — so hard-cap to max (never below zero) in that degenerate case.
+  if (max <= marker.length) return s.slice(0, Math.max(0, max));
   const budget = max - marker.length;
   const head = Math.ceil(budget * 0.6);
   const tail = budget - head;
@@ -2824,13 +2828,18 @@ function describeGitFailure(action, result, { token, timeoutMs } = {}) {
   const combined = boundGitOutput(
     redactToken([result && result.stderr, result && result.stdout].filter(Boolean).join('\n'), token),
   );
-  // spawnSync's timeout kill lands as SIGTERM; runGit maps the null status to 128.
-  const timedOut = !!result && (result.signal === 'SIGTERM' || (result.status === 128 && !!result.signal));
-  if (timedOut) {
+  // spawnSync's timeout kill lands as SIGTERM (its default killSignal); runGit
+  // maps the null status to 128. Only SIGTERM means "timed out" — any OTHER
+  // signal (e.g. SIGKILL from an OOM kill) is a distinct termination that we
+  // must not misreport as a timeout.
+  const signal = result && result.signal;
+  if (signal === 'SIGTERM') {
     const secs = timeoutMs ? Math.round(timeoutMs / 1000) : null;
     const dur = secs ? ` after ${secs}s` : '';
-    const sig = result.signal ? ` (${result.signal})` : '';
-    return `${action} timed out${dur}${sig}${combined ? `; last output: ${combined}` : ''}`;
+    return `${action} timed out${dur} (SIGTERM)${combined ? `; last output: ${combined}` : ''}`;
+  }
+  if (signal) {
+    return `${action} terminated by signal ${signal}${combined ? `: ${combined}` : ''}`;
   }
   const exit = result && result.status != null ? result.status : '?';
   return `${action} failed (exit ${exit})${combined ? `: ${combined}` : ''}`;
@@ -3167,7 +3176,7 @@ function provisionRepo({ envelope, token, runDir, timeoutMs = 120_000 }) {
   let workingBranch = null;
   if (envelope.branch?.create) {
     const cb = runGit(['checkout', '-B', envelope.branch.create], { cwd: workspaceDir, env: gitEnv });
-    if (cb.status !== 0) throw new ProvisionError(describeGitFailure(`git checkout -B ${envelope.branch.create}`, cb, { token }));
+    if (cb.status !== 0) throw new ProvisionError(describeGitFailure(`git checkout -B ${envelope.branch.create}`, cb, { token, timeoutMs }));
     workingBranch = envelope.branch.create;
   } else {
     const head = runGit(['rev-parse', '--abbrev-ref', 'HEAD'], { cwd: workspaceDir, env: gitEnv });
@@ -3317,9 +3326,10 @@ function finalizeGit({ workspaceDir, gitEnv, startSha, workingBranch, envelope, 
   if (!workingBranch) {
     out.detached = true; // clone landed on a tag/sha ⇒ no branch to push
   } else if (coerceBool(envelope.branch?.push, true) && out.commits.length > 0) {
-    const push = runGit([...credArgs(), 'push', '--set-upstream', 'origin', workingBranch], { cwd: workspaceDir, env: gitEnv });
+    const pushTimeoutMs = 120_000; // matches runGit's default; surfaced in a timeout reason
+    const push = runGit([...credArgs(), 'push', '--set-upstream', 'origin', workingBranch], { cwd: workspaceDir, env: gitEnv, timeoutMs: pushTimeoutMs });
     if (push.status === 0) out.pushed = true;
-    else out.pushError = describeGitFailure('git push', push, { token });
+    else out.pushError = describeGitFailure('git push', push, { token, timeoutMs: pushTimeoutMs });
   }
 
   if (workingBranch && envelope.task?.allowPr) {

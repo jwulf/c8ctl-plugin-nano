@@ -1019,10 +1019,30 @@ test('boundGitOutput keeps head+tail instead of decapitating a long multiline er
   const tail = 'hint: and important recovery detail lives at the very bottom';
   const long = head + '\n' + 'x'.repeat(2000) + '\n' + tail;
   const bounded = boundGitOutput(long, 500);
-  assert.ok(bounded.length <= 500 + 8, 'stays within the bound');
+  assert.ok(bounded.length <= 500, 'stays within the bound');
   assert.match(bounded, /the real reason is right here/, 'keeps the head');
   assert.match(bounded, /recovery detail lives at the very bottom/, 'keeps the tail');
   assert.match(bounded, /\[…\]/, 'marks the elision');
+});
+
+test('boundGitOutput never exceeds max even when max is smaller than the elision marker', () => {
+  const long = 'x'.repeat(2000);
+  for (const max of [0, 1, 3, 5, 6, 7]) {
+    const bounded = boundGitOutput(long, max);
+    assert.ok(bounded.length <= max, `max=${max}: stays within the bound (got ${bounded.length})`);
+  }
+});
+
+test('describeGitFailure reports a non-timeout signal (e.g. SIGKILL) as a termination, not a timeout', () => {
+  const msg = describeGitFailure('git clone', {
+    status: 128,
+    signal: 'SIGKILL',
+    stdout: 'fatal: out of memory',
+    stderr: '',
+  }, { token: null, timeoutMs: 120_000 });
+  assert.match(msg, /terminated by signal SIGKILL/, 'must name the signal');
+  assert.doesNotMatch(msg, /timed out/, 'a SIGKILL/OOM kill must not be reported as a timeout');
+  assert.match(msg, /out of memory/, 'must preserve the captured output');
 });
 
 test('provisionRepo: an anonymous credential-less clone fails fast with a fatal reason (no hang)', { skip: !gitOk }, () => {

@@ -2803,6 +2803,30 @@ function redactToken(text, token) {
   return s.replace(/(https?:\/\/)[^@/\s]+@/gi, '$1');
 }
 
+// Build an operator-actionable diagnostic from one or more runGit results.
+// git splits its output unpredictably across stdout/stderr, so preferring one
+// stream (`stderr || stdout`) can drop the only useful line — the root of the
+// "stub reason"/"opaque exit 128" incidents. Combine BOTH streams of every
+// command, redact the token, and always append status/signal context (from the
+// last, i.e. failing, command) so an empty-output failure still says something.
+function gitErrorDetail(results, token, limit = 500) {
+  const list = Array.isArray(results) ? results : [results];
+  const body = redactToken(
+    list
+      .flatMap((r) => [r?.stderr, r?.stdout])
+      .map((s) => String(s ?? '').trim())
+      .filter(Boolean)
+      .join('\n'),
+    token,
+  ).trim().slice(0, limit);
+  const last = list[list.length - 1] || {};
+  const ctx = [];
+  if (last.status != null) ctx.push(`exit ${last.status}`);
+  if (last.signal) ctx.push(`signal ${last.signal}`);
+  const ctxStr = ctx.length ? `(${ctx.join(', ')})` : '';
+  return [body, ctxStr].filter(Boolean).join(' ') || 'unknown error';
+}
+
 function runGit(args, { cwd, env, timeoutMs = 120_000 } = {}) {
   try {
     const r = spawnSync('git', args, { cwd, env, encoding: 'utf8', timeout: timeoutMs });
@@ -3159,7 +3183,7 @@ function provisionRepo({ envelope, token, runDir, timeoutMs = 120_000 }) {
     if (clone.timedOut) {
       throw new ProvisionError(`git clone timed out after ${effectiveTimeoutMs}ms — repo too large for the clone timeout; raise repository.cloneTimeoutMs or scope the clone with filter/singleBranch/depth`);
     }
-    throw new ProvisionError(describeGitFailure('git clone', clone, { token, timeoutMs: effectiveTimeoutMs }));
+    throw new ProvisionError(`git clone failed: ${gitErrorDetail(clone, token)}`);
   }
 
   if (isSha) {
@@ -3168,16 +3192,11 @@ function provisionRepo({ envelope, token, runDir, timeoutMs = 120_000 }) {
     const fetch = runGit([...credArgs(), 'fetch', '--no-tags', 'origin', target], { cwd: workspaceDir, env: gitEnv, timeoutMs: effectiveTimeoutMs });
     const co = runGit(['checkout', '--detach', target], { cwd: workspaceDir, env: gitEnv });
     if (co.status !== 0) {
-      // Prefer the failing checkout's own output, but fall back to the fetch's
-      // (a timeout/fatal there is the real cause the checkout can't recover from)
-      // ONLY when fetch actually failed — a succeeded fetch (status 0) is not the
-      // cause, and reporting it would yield a misleading "exit 0" message.
-      const useCheckout = !!(co.stderr || co.stdout || fetch.status === 0);
-      const source = useCheckout ? co : fetch;
-      // Label the failure with the action whose output we actually report, so a
-      // fetch timeout/fatal isn't misreported as a checkout failure.
-      const action = useCheckout ? `git checkout ${target}` : `git fetch origin ${target}`;
-      throw new ProvisionError(describeGitFailure(action, source, { token, timeoutMs }));
+      // Combine the fetch + checkout output (the real reason often lives in the
+      // fetch), and annotate a fetch timeout explicitly so a slow `git fetch
+      // origin <sha>` is not misread as an opaque checkout failure.
+      const fetchNote = fetch.timedOut ? ` (preceding git fetch origin ${target} timed out after ${effectiveTimeoutMs}ms)` : '';
+      throw new ProvisionError(`git checkout ${target} failed: ${gitErrorDetail([fetch, co], token, 300)}${fetchNote}`);
     }
   }
 
@@ -3190,7 +3209,7 @@ function provisionRepo({ envelope, token, runDir, timeoutMs = 120_000 }) {
   let baseFetchError;
   const baseTarget = repo.baseSha || repo.baseRef;
   if (baseTarget) {
-    const isBaseSha = !!repo.baseSha || /^[0-9a-f]{7,40}$/i.test(baseTarget);
+    const isBaseSha = !!repo.baseSha;
     const fetchArgs = [...credArgs(), 'fetch', '--no-tags'];
     if (repo.depth && repo.depth > 0) fetchArgs.push('--depth', String(repo.depth));
     if (repo.filter) fetchArgs.push(`--filter=${repo.filter}`);
@@ -3210,7 +3229,7 @@ function provisionRepo({ envelope, token, runDir, timeoutMs = 120_000 }) {
       base = '';
       baseFetchError = bf.timedOut
         ? `base fetch timed out after ${effectiveTimeoutMs}ms`
-        : (redactToken(bf.stderr || bf.stdout, token).trim().slice(0, 300) || `exit ${bf.status}`);
+        : gitErrorDetail(bf, token, 300);
     }
   }
 

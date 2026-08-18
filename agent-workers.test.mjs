@@ -1000,6 +1000,42 @@ test('provisionRepo honors singleBranch + filter and fetches the base for a base
   }
 });
 
+test('provisionRepo treats a hex-like baseRef as a branch, not a SHA (issue #91 review)', { skip: !gitOk }, () => {
+  const { root, origin } = makeOriginRepo();
+  // A legitimately-named branch whose name looks like a hex SHA. The heuristic
+  // "any hex-looking baseRef is a SHA" would fetch it by id and skip creating
+  // refs/remotes/origin/<baseRef>, breaking origin/<base> diffs.
+  const hexBranch = 'deadbeef';
+  const wc = mkdtempSync(join(root, 'wc-hex-'));
+  g(['clone', '-q', origin, wc], undefined);
+  g(['config', 'user.name', 'seed'], wc);
+  g(['config', 'user.email', 'seed@example.com'], wc);
+  g(['checkout', '-q', '-b', hexBranch], wc);
+  g(['push', '-q', 'origin', hexBranch], wc);
+  g(['checkout', '-q', '-b', 'feat/x', 'main'], wc);
+  writeFileSync(join(wc, 'feature.txt'), 'feature\n');
+  g(['add', '-A'], wc);
+  g(['commit', '-q', '-m', 'feature commit'], wc);
+  g(['push', '-q', 'origin', 'feat/x'], wc);
+  const runDir = mkdtempSync(join(root, 'run-'));
+  try {
+    const envelope = {
+      schemaVersion: 1,
+      repository: { provider: 'github', url: origin, ref: 'feat/x', singleBranch: true, baseRef: hexBranch, submodules: false },
+      branch: { base: '', create: '', push: false },
+      setup: { commands: [], env: {}, secretRefs: [] },
+      task: { allowPr: false },
+    };
+    const prov = provisionRepo({ envelope, token: null, runDir });
+    assert.equal(prov.baseFetchError, undefined, 'the hex-like branch fetch succeeded');
+    assert.equal(prov.base, `origin/${hexBranch}`, 'baseRef maps to origin/<baseRef>, not a raw sha');
+    assert.match(g(['rev-parse', `origin/${hexBranch}`], prov.workspaceDir), /^[0-9a-f]{40}$/, 'refs/remotes/origin/<baseRef> was created');
+  } finally {
+    rmSync(root, { recursive: true, force: true });
+  }
+});
+
+
 test('provisionRepo records a non-fatal baseFetchError when the base ref is missing (issue #91)', { skip: !gitOk }, () => {
   const { root, origin } = makeOriginRepo();
   const runDir = mkdtempSync(join(root, 'run-'));

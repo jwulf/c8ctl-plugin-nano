@@ -538,11 +538,14 @@ the harness:
    still pulls all branches/history); **`filter`** (e.g. `"blob:none"`) adds
    `--filter=<spec>` for a partial/treeless clone (full commit graph, lazy blobs —
    so `merge-base`/`git diff base...head` still work); **`baseRef`**/**`baseSha`**
-   additionally `git fetch` the base (respecting `depth`/`filter`) into
-   `refs/remotes/origin/<baseRef>` so a single-branch/shallow clone can still diff
-   `base...head` (exported as `AGENT_REPO_BASE`; a `--depth 1 --single-branch` of
-   only the head otherwise has NO base and NO merge-base, so a naive `git diff main`
-   fails). A failed base fetch is **non-fatal** — the head clone still succeeds and
+   additionally `git fetch` the base (respecting `depth`/`filter`) so a
+   single-branch/shallow clone can still diff `base...head` (exported as
+   `AGENT_REPO_BASE`). **`baseRef`** is always treated as a branch/tag name (even
+   one that looks hex-like) and is mapped into `refs/remotes/origin/<baseRef>`;
+   **`baseSha`** is the field for a raw commit SHA (fetched by id, exposed as the
+   SHA itself). A `--depth 1 --single-branch` of only the head otherwise has NO
+   base and NO merge-base, so a naive `git diff main` fails). A failed base fetch
+   is **non-fatal** — the head clone still succeeds and
    the failure is logged. **`cloneTimeoutMs`** overrides the clone/fetch timeout
    per envelope (default 120s, or the `--clone-timeout` worker flag) as a backstop
    for repos big enough to approach the cap even when shallow; a timeout is now

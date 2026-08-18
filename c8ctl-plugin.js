@@ -2294,6 +2294,11 @@ function normalizeTaskEnvelope(customHeaders, variables, opts = {}) {
       provider: (str(repo.provider) || 'github').toLowerCase(),
       url: str(repo.url),
       ref: str(repo.ref),
+      // Dedicated field for a raw commit SHA to check out (detached), mirroring
+      // baseSha/baseRef. `ref` is ALWAYS a branch/tag name — there is no hex
+      // heuristic — so a legitimately hex-named branch (e.g. `deadbeef`) is
+      // never misread as a commit; pin a commit via `sha` instead.
+      sha: str(repo.sha),
       depth: coerceInt(repo.depth, undefined),
       // Scope the fetch to just `ref` (independent of depth) for callers that want
       // full history of one branch but not every branch of a huge monorepo.
@@ -3167,10 +3172,15 @@ function provisionRepo({ envelope, token, runDir, timeoutMs = 120_000 }) {
     gitEnv.GIT_CONFIG_GLOBAL = devNull;
   }
 
-  const target = repo.ref || envelope.branch?.base || '';
-  // `git clone --branch` accepts a branch or tag name but NOT a raw commit SHA.
-  // For a SHA we clone the default branch, then fetch + check it out below.
-  const isSha = !!target && /^[0-9a-f]{7,40}$/i.test(target);
+  const branchName = repo.ref || envelope.branch?.base || '';
+  // A raw commit is requested ONLY via the dedicated `repository.sha` field —
+  // the sole unambiguous way to pin a commit. `ref` (→ `branchName`) is ALWAYS a
+  // branch/tag name and is passed to `git clone --branch`; there is no hex
+  // heuristic, so a legitimately hex-named branch like `deadbeef` is cloned as a
+  // branch, not misread as a SHA. When a `sha` is given we clone `branchName`
+  // (if any — the branch that should contain it) then fetch + detach onto it.
+  const commitSha = repo.sha || '';
+  const isSha = !!commitSha;
   // Per-envelope timeout override (backstop for giant monorepos that approach the
   // default cap even when shallow); falls back to the caller-supplied timeout.
   const effectiveTimeoutMs = (repo.cloneTimeoutMs && repo.cloneTimeoutMs > 0) ? repo.cloneTimeoutMs : timeoutMs;
@@ -3184,7 +3194,7 @@ function provisionRepo({ envelope, token, runDir, timeoutMs = 120_000 }) {
   // reviewing a PR on a monorepo where a full checkout blows the timeout.
   if (repo.filter) cloneArgs.push(`--filter=${repo.filter}`);
   if (repo.submodules) cloneArgs.push('--recurse-submodules');
-  if (target && !isSha) cloneArgs.push('--branch', target);
+  if (branchName) cloneArgs.push('--branch', branchName);
   const remote = authUrl(repo.url, repo.provider || 'github', !!token);
   cloneArgs.push(remote, workspaceDir);
 
@@ -3201,16 +3211,16 @@ function provisionRepo({ envelope, token, runDir, timeoutMs = 120_000 }) {
   }
 
   if (isSha) {
-    // The SHA may not be present under a shallow clone of the default branch —
-    // fetch it explicitly (best effort), then check it out (detached HEAD).
-    const fetch = runGit([...credArgs(), 'fetch', '--no-tags', 'origin', target], { cwd: workspaceDir, env: gitEnv, timeoutMs: effectiveTimeoutMs });
-    const co = runGit(['checkout', '--detach', target], { cwd: workspaceDir, env: gitEnv });
+    // The SHA may not be present under a shallow clone of the branch — fetch it
+    // explicitly (best effort), then check it out (detached HEAD).
+    const fetch = runGit([...credArgs(), 'fetch', '--no-tags', 'origin', commitSha], { cwd: workspaceDir, env: gitEnv, timeoutMs: effectiveTimeoutMs });
+    const co = runGit(['checkout', '--detach', commitSha], { cwd: workspaceDir, env: gitEnv });
     if (co.status !== 0) {
       // Combine the fetch + checkout output (the real reason often lives in the
       // fetch), and annotate a fetch timeout explicitly so a slow `git fetch
       // origin <sha>` is not misread as an opaque checkout failure.
-      const fetchNote = fetch.timedOut ? ` (preceding git fetch origin ${target} timed out after ${effectiveTimeoutMs}ms)` : '';
-      throw new ProvisionError(`git checkout ${target} failed: ${gitErrorDetail([fetch, co], token, 300)}${fetchNote}`);
+      const fetchNote = fetch.timedOut ? ` (preceding git fetch origin ${commitSha} timed out after ${effectiveTimeoutMs}ms)` : '';
+      throw new ProvisionError(`git checkout ${commitSha} failed: ${gitErrorDetail([fetch, co], token, 300)}${fetchNote}`);
     }
   }
 
@@ -3221,6 +3231,13 @@ function provisionRepo({ envelope, token, runDir, timeoutMs = 120_000 }) {
   // a failed base fetch is recorded, not fatal (the head clone still succeeded).
   let base = '';
   let baseFetchError;
+  // `baseRef` (branch/tag) and `baseSha` (raw commit) are mutually exclusive — a
+  // caller picks one. If BOTH are set the envelope is ambiguous, so rather than
+  // silently preferring one (a surprising `base...head` diff), skip the base
+  // fetch and record a non-fatal diagnostic so the misconfiguration is visible.
+  if (repo.baseSha && repo.baseRef) {
+    baseFetchError = `ambiguous base: both baseRef (${repo.baseRef}) and baseSha (${repo.baseSha}) set — provide only one`;
+  } else {
   const baseTarget = repo.baseSha || repo.baseRef;
   if (baseTarget) {
     const isBaseSha = !!repo.baseSha;
@@ -3249,6 +3266,7 @@ function provisionRepo({ envelope, token, runDir, timeoutMs = 120_000 }) {
         ? `base fetch (${baseLabel}) timed out after ${effectiveTimeoutMs}ms: ${gitErrorDetail(bf, token, 300)}`
         : `base fetch (${baseLabel}) failed: ${gitErrorDetail(bf, token, 300)}`;
     }
+  }
   }
 
   // Give the harness a committer identity in case it commits (many do). Prefer
@@ -3294,7 +3312,7 @@ function provisionRepo({ envelope, token, runDir, timeoutMs = 120_000 }) {
   // `git rev-parse HEAD` on an unborn branch (freshly cloned empty repo) exits
   // non-zero and echoes the literal "HEAD" on stdout — treat that as "no base
   // commit" (empty startSha) rather than a bogus revision.
-  return { workspaceDir, gitEnv, committer, startSha: sha.status === 0 ? (sha.stdout || '').trim() : '', workingBranch, detached: !workingBranch, ref: target || '', base, baseFetchError, remote: redactToken(repo.url, token) };
+  return { workspaceDir, gitEnv, committer, startSha: sha.status === 0 ? (sha.stdout || '').trim() : '', workingBranch, detached: !workingBranch, ref: commitSha || branchName || '', base, baseFetchError, remote: redactToken(repo.url, token) };
 }
 
 // Look up a PR for this branch (2a does NOT open it — the harness does, driven

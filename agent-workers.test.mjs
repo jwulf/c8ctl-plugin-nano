@@ -140,6 +140,7 @@ test('normalizeTaskEnvelope: maps branch-scoped/partial clone fields (issue #91)
     [`${AGENT_TASK_NS}.repository.depth`]: '1',
     [`${AGENT_TASK_NS}.repository.baseRef`]: 'main',
     [`${AGENT_TASK_NS}.repository.baseSha`]: 'deadbeef',
+    [`${AGENT_TASK_NS}.repository.sha`]: 'cafebabe',
     [`${AGENT_TASK_NS}.repository.cloneTimeoutMs`]: '600000',
   };
   const env = normalizeTaskEnvelope(headers, variables);
@@ -148,6 +149,7 @@ test('normalizeTaskEnvelope: maps branch-scoped/partial clone fields (issue #91)
   assert.equal(env.repository.depth, 1);
   assert.equal(env.repository.baseRef, 'main');
   assert.equal(env.repository.baseSha, 'deadbeef');
+  assert.equal(env.repository.sha, 'cafebabe', 'dedicated commit-sha field is carried through');
   assert.equal(env.repository.cloneTimeoutMs, 600000, 'string coerces to int');
 });
 
@@ -157,6 +159,7 @@ test('normalizeTaskEnvelope: new clone fields default to today’s behavior when
   assert.equal(env.repository.filter, undefined, 'absent filter is undefined');
   assert.equal(env.repository.baseRef, undefined);
   assert.equal(env.repository.baseSha, undefined);
+  assert.equal(env.repository.sha, undefined);
   assert.equal(env.repository.cloneTimeoutMs, undefined);
 });
 
@@ -930,7 +933,7 @@ test('finalizeGit pushes the first commit into an empty repo (no base sha)', { s
   }
 });
 
-test('provisionRepo checks out a commit SHA ref (detached, not via --branch)', { skip: !gitOk }, () => {
+test('provisionRepo checks out a commit SHA via repository.sha (detached, not via --branch)', { skip: !gitOk }, () => {
   const { root, origin } = makeOriginRepo();
   // add a second commit so we can pin the FIRST one by SHA
   const wc = mkdtempSync(join(root, 'wc-'));
@@ -946,7 +949,7 @@ test('provisionRepo checks out a commit SHA ref (detached, not via --branch)', {
   try {
     const envelope = {
       schemaVersion: 1,
-      repository: { provider: 'github', url: origin, ref: firstSha, submodules: false },
+      repository: { provider: 'github', url: origin, sha: firstSha, submodules: false },
       branch: { base: '', create: '', push: false },
       setup: { commands: [], env: {}, secretRefs: [] },
       task: { allowPr: false },
@@ -956,6 +959,40 @@ test('provisionRepo checks out a commit SHA ref (detached, not via --branch)', {
     assert.equal(prov.workingBranch, null, 'a SHA checkout has no branch');
     assert.equal(prov.detached, true);
     assert.equal(prov.ref, firstSha, 'exposes the effective SHA ref');
+  } finally {
+    rmSync(root, { recursive: true, force: true });
+  }
+});
+
+test('provisionRepo treats a hex-like ref as a branch, not a SHA (issue #91 review)', { skip: !gitOk }, () => {
+  const { root, origin } = makeOriginRepo();
+  // A legitimately-named branch whose name looks like a hex SHA. The old
+  // "any hex-looking ref is a SHA" heuristic would skip `--branch`, then
+  // `git fetch origin deadbeef` / `git checkout --detach deadbeef` would fail.
+  const hexBranch = 'deadbeef';
+  const wc = mkdtempSync(join(root, 'wc-hexref-'));
+  g(['clone', '-q', origin, wc], undefined);
+  g(['config', 'user.name', 'seed'], wc);
+  g(['config', 'user.email', 'seed@example.com'], wc);
+  g(['checkout', '-q', '-b', hexBranch], wc);
+  writeFileSync(join(wc, 'hexbranch.txt'), 'hex\n');
+  g(['add', '-A'], wc);
+  g(['commit', '-q', '-m', 'hex branch commit'], wc);
+  g(['push', '-q', 'origin', hexBranch], wc);
+  const runDir = mkdtempSync(join(root, 'run-'));
+  try {
+    const envelope = {
+      schemaVersion: 1,
+      repository: { provider: 'github', url: origin, ref: hexBranch, submodules: false },
+      branch: { base: '', create: '', push: false },
+      setup: { commands: [], env: {}, secretRefs: [] },
+      task: { allowPr: false },
+    };
+    const prov = provisionRepo({ envelope, token: null, runDir });
+    assert.ok(existsSync(join(prov.workspaceDir, 'hexbranch.txt')), 'the hex-named branch is checked out via --branch');
+    assert.equal(prov.workingBranch, hexBranch, 'HEAD is on the branch, not a detached SHA');
+    assert.equal(prov.detached, false, 'a hex-named branch ref is not a detached checkout');
+    assert.equal(prov.ref, hexBranch, 'exposes the branch ref, not a raw sha');
   } finally {
     rmSync(root, { recursive: true, force: true });
   }
@@ -1051,6 +1088,29 @@ test('provisionRepo records a non-fatal baseFetchError when the base ref is miss
     assert.ok(existsSync(join(prov.workspaceDir, 'README.md')), 'the head clone still succeeded');
     assert.equal(prov.base, '', 'no usable base when the base fetch fails');
     assert.ok(prov.baseFetchError, 'a missing base ref is reported, not thrown');
+  } finally {
+    rmSync(root, { recursive: true, force: true });
+  }
+});
+
+test('provisionRepo records a non-fatal baseFetchError (and skips the fetch) when both baseRef and baseSha are set (issue #91 review)', { skip: !gitOk }, () => {
+  const { root, origin } = makeOriginRepo();
+  const runDir = mkdtempSync(join(root, 'run-'));
+  try {
+    const envelope = {
+      schemaVersion: 1,
+      // Ambiguous envelope: baseRef and baseSha are mutually exclusive. Rather
+      // than silently prefer one (a surprising base...head diff), skip the fetch
+      // and surface the ambiguity as a non-fatal diagnostic.
+      repository: { provider: 'github', url: origin, ref: 'main', singleBranch: true, baseRef: 'main', baseSha: 'deadbeef', submodules: false },
+      branch: { base: '', create: '', push: false },
+      setup: { commands: [], env: {}, secretRefs: [] },
+      task: { allowPr: false },
+    };
+    const prov = provisionRepo({ envelope, token: null, runDir });
+    assert.ok(existsSync(join(prov.workspaceDir, 'README.md')), 'the head clone still succeeded');
+    assert.equal(prov.base, '', 'no base is chosen when the envelope is ambiguous');
+    assert.match(prov.baseFetchError, /ambiguous base.*baseRef.*baseSha/, 'the ambiguity is reported, not thrown');
   } finally {
     rmSync(root, { recursive: true, force: true });
   }

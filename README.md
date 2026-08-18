@@ -485,7 +485,7 @@ stdin payload as `task`:
 Element templates emit flat dotpath header keys (strings); the plugin expands
 them into a nested object and coerces `"true"/"false"` → bool and numeric
 strings → int. The normalized shape is
-`{ schemaVersion, repository{provider,url,ref,depth,singleBranch,filter,baseRef,baseSha,cloneTimeoutMs,submodules,authRef}, branch{base,create,push}, setup{commands,env,secretRefs}, task{prompt,promptFile,maxIterations,timeoutMs,allowPr,prBase} }`.
+`{ schemaVersion, repository{provider,url,ref,sha,depth,singleBranch,filter,baseRef,baseSha,cloneTimeoutMs,submodules,authRef}, branch{base,create,push}, setup{commands,env,secretRefs}, task{prompt,promptFile,maxIterations,timeoutMs,allowPr,prBase} }`.
 
 **Prompt = base + optional verbatim append.** The agent's prompt resolves to
 `task.prompt` (typically a model header filled at deploy time), falling back to a
@@ -531,8 +531,13 @@ the harness:
 1. resolve the optional repo credential (`repository.authRef`, or `GITHUB_TOKEN`
    for GitHub) — absent ⇒ anonymous clone;
 2. `git clone` (honouring `depth`/`submodules`, and `repository.ref`/`branch.base`
-   as the checkout target) into a throwaway workspace under
-   `<state>/agent-runs/run-*`. For a **huge monorepo** the clone envelope can be
+   as the checkout target). **`ref` is always a branch/tag name** (there is no hex
+   heuristic, so a legitimately hex-named branch like `deadbeef` is cloned via
+   `--branch`, never misread as a commit); to pin a **raw commit** use the
+   dedicated **`repository.sha`** field, which clones `ref`/`branch.base` (if any)
+   then fetches + checks the commit out as a detached HEAD. The clone lands in a
+   throwaway workspace under `<state>/agent-runs/run-*`. For a **huge monorepo**
+   the clone envelope can be
    scoped so it finishes inside the clone timeout: **`singleBranch`** adds
    `--single-branch` (fetch only `ref`, not every branch — a plain `clone --branch`
    still pulls all branches/history); **`filter`** (e.g. `"blob:none"`) adds
@@ -543,7 +548,10 @@ the harness:
    `AGENT_REPO_BASE`). **`baseRef`** is always treated as a branch/tag name (even
    one that looks hex-like) and is mapped into `refs/remotes/origin/<baseRef>`;
    **`baseSha`** is the field for a raw commit SHA (fetched by id, exposed as the
-   SHA itself). A `--depth 1 --single-branch` of only the head otherwise has NO
+   SHA itself). `baseRef` and `baseSha` are **mutually exclusive** — setting both
+   is ambiguous, so the base fetch is skipped and a non-fatal `baseFetchError`
+   records the misconfiguration. A `--depth 1 --single-branch` of only the head
+   otherwise has NO
    base and NO merge-base, so a naive `git diff main` fails. A failed base fetch
    is **non-fatal** — the head clone still succeeds and
    the failure is logged. **`cloneTimeoutMs`** overrides the clone/fetch timeout

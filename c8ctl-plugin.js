@@ -4886,12 +4886,17 @@ async function workAgent(req, flags) {
       // Track the live connection state on the activity marker so the
       // supervisor shows connected↔disconnected transitions (#99). onConnect
       // fires only for listeners present at first open, so also reconcile the
-      // already-open case synchronously via connected().
+      // already-open case synchronously via connected(). If the socket opened
+      // and then dropped inside the createWorkChannel() await window (before
+      // these listeners existed), connected() is false but everConnected() is
+      // true — record that as `disconnected` rather than leaving it stuck at
+      // `connecting`.
       const markAgentic = (status) => { agenticState = { ...agenticState, status }; writeActivity(); };
       workChannel.onConnect(() => markAgentic('connected'));
       workChannel.onReconnect(() => markAgentic('connected'));
       workChannel.onDisconnect(() => markAgentic('disconnected'));
       if (workChannel.connected()) markAgentic('connected');
+      else if (workChannel.everConnected()) markAgentic('disconnected');
     } catch (err) {
       // Never let a channel failure stop the worker from doing its actual job.
       workChannel = null;
@@ -8942,7 +8947,7 @@ export const metadata = {
         { command: 'NANO_AGENTIC_URL=http://localhost:8080 NANO_AGENTIC_SECRET=<shared-secret> c8ctl nano work reviewer', description: 'Enrol the worker on the app\'s same-port /agentic channel in SECURE mode (same NANO_AGENTIC_SECRET as the server) so it appears live (presence + relay terminals) on the Workforce visibility page' },
         { command: 'c8ctl nano supervisor start --worker reviewer --worker coder', description: 'Start a detached supervisor managing several workers from one terminal' },
         { command: 'c8ctl nano supervisor', description: 'Attach an interactive console to the supervisor (detach with Ctrl-D, leaving it running)' },
-        { command: 'c8ctl nano supervisor status', description: 'List supervised workers (pid, state, serviced job / idle, restarts, uptime) without the console' },
+        { command: 'c8ctl nano supervisor status', description: 'List supervised workers (state, ENGINE + AGENTIC visibility diagnostics, serviced job / idle, pid, restarts, uptime) without the console' },
         { command: 'c8ctl nano supervisor add decider --max-parallel 2', description: 'Add a supervised worker (forwarding work flags) to the running supervisor' },
         { command: 'c8ctl nano supervisor add reviewer --instances 3', description: 'Add 3 distinct auto-named instances of a profile in one call' },
         { command: 'c8ctl nano supervisor restart reviewer', description: 'Restart a supervised worker by id or profile' },

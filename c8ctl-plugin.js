@@ -4171,6 +4171,21 @@ function isLoopbackHost(hostname) {
 }
 
 /**
+ * Format a hostname for the authority component of a `ws://`/`http://` URL:
+ * a bare IPv6 literal (contains `:`, not already bracketed) must be wrapped in
+ * `[…]`, everything else is used verbatim. `URL.hostname` yields IPv6 without
+ * brackets, so a discovered/normalized `::1` would otherwise build an invalid
+ * `ws://::1:3000/…`.
+ *
+ * @param {string} host a hostname from `URL.hostname` or a normalized loopback
+ * @returns {string}
+ */
+function wsHostPart(host) {
+  const h = String(host || '');
+  return h.includes(':') && !h.startsWith('[') ? `[${h}]` : h;
+}
+
+/**
  * Normalise the engine's `GET /console/api/projects` payload into the running
  * embedded apps that advertise an agentic UI port. Accepts the shapes the
  * console may serve — a keyed map (`{ "Nano_Workforce": { appUi } }`), a bare
@@ -4219,12 +4234,13 @@ function normalizeProjectApps(projects) {
  * @returns {Promise<boolean>}
  */
 function probeAgenticChannel(port, {
+  host = '127.0.0.1',
   token = LOCAL_AGENTIC_TOKEN,
   WebSocketImpl = globalThis.WebSocket,
   timeoutMs = AGENTIC_DISCOVERY_TIMEOUT_MS,
 } = {}) {
   if (typeof WebSocketImpl !== 'function') return Promise.resolve(false);
-  const url = `ws://127.0.0.1:${port}/agentic?token=${encodeURIComponent(token)}`;
+  const url = `ws://${wsHostPart(host)}:${port}/agentic?token=${encodeURIComponent(token)}`;
   return new Promise((resolve) => {
     let done = false;
     let ws;
@@ -4249,19 +4265,21 @@ function probeAgenticChannel(port, {
 
 /**
  * Auto-discover the embedded nwf agentic hub(s) reachable from an engine base
- * URL (#75). Reads `GET <engine>/console/api/projects`, keeps the apps that
- * advertise an agentic UI port, and WS-probes each app's direct loopback
- * `/agentic` to confirm the channel is actually served there (bypassing the
- * WS-incapable console proxy). Loopback-only (the engine host itself must be
- * loopback, since the response steers a local port probe), enforces a single
- * shared time budget across the fetch + probes, and is fail-open: any error —
- * not a nano engine (Camunda), a non-loopback engine, network failure,
- * malformed body, or an overall timeout — degrades to `[]` so the worker's real
- * job is never blocked.
+ * URL (#75, #96). Reads `GET <engine>/console/api/projects`, keeps the apps that
+ * advertise an agentic UI port, and WS-probes each app's `/agentic` **on the
+ * engine's own host** to confirm the channel is actually served there (bypassing
+ * the WS-incapable console proxy). Works cross-machine on a trusted LAN: a
+ * loopback engine probes `127.0.0.1`, a remote engine (e.g. `merlin.local`)
+ * probes that same host — the port is taken from the projects API but the host is
+ * always the engine's, so a rogue projects API can never steer a probe at the
+ * worker's own loopback (#76). Enforces a single shared time budget across the
+ * fetch + probes, and is fail-open: any error — not a nano engine (Camunda),
+ * network failure, malformed body, or an overall timeout — degrades to `[]` so
+ * the worker's real job is never blocked.
  *
- * @param {string} engineBaseUrl the engine base URL (e.g. `http://localhost:8080`)
+ * @param {string} engineBaseUrl the engine base URL (e.g. `http://merlin.local:8080`)
  * @param {{ token?: string, fetchImpl?: Function, wsProbe?: Function, timeoutMs?: number }} [opts]
- * @returns {Promise<Array<{ project: string, port: number, label?: string }>>}
+ * @returns {Promise<Array<{ project: string, port: number, label?: string, host: string }>>}
  */
 async function discoverAgenticHubs(engineBaseUrl, {
   token = LOCAL_AGENTIC_TOKEN,
@@ -4273,16 +4291,21 @@ async function discoverAgenticHubs(engineBaseUrl, {
     return [];
   }
   const base = engineBaseUrl.replace(/\/+$/, '');
-  // Loopback-only: discovery probes 127.0.0.1:<port> using a port advertised by
-  // the engine's projects API, so a non-loopback (remote) engine could steer a
-  // local port probe. Refuse discovery unless the engine host is loopback (#76).
+  // Discover against the ENGINE's own host — the app is embedded in the engine,
+  // so its /agentic port lives on the same host the worker already trusts as its
+  // engine (that's where it pulls jobs from). A loopback engine keeps probing
+  // 127.0.0.1 (unchanged local behaviour); a remote/LAN engine (e.g.
+  // merlin.local) steers the probe back to ITSELF, never at the worker's own
+  // loopback services — which was the actual #76 concern (a rogue projects API
+  // making the worker probe its own localhost). So the port comes from the
+  // engine's projects API, but the HOST is always the engine's, never guessed.
   let host;
   try {
     host = new URL(base).hostname;
   } catch {
     return [];
   }
-  if (!isLoopbackHost(host)) return [];
+  const probeHost = isLoopbackHost(host) ? '127.0.0.1' : host;
   // Single discovery budget: the projects fetch and the WS probes share ONE
   // deadline, so total discovery can't approach 2× timeoutMs (the fetch could
   // consume ~timeoutMs and then each probe was previously given a fresh full
@@ -4304,10 +4327,13 @@ async function discoverAgenticHubs(engineBaseUrl, {
   if (apps.length === 0) return [];
   const remainingMs = deadline - Date.now();
   if (remainingMs <= 0) return [];
-  // Probe candidate ports concurrently within the remaining shared budget.
+  // Probe candidate ports concurrently within the remaining shared budget. Each
+  // surviving hub carries the engine host so the caller builds the right URL.
   const settled = await Promise.all(apps.map(async (app) => {
     try {
-      return (await wsProbe(app.port, { token, timeoutMs: remainingMs })) ? app : null;
+      return (await wsProbe(app.port, { host: probeHost, token, timeoutMs: remainingMs }))
+        ? { ...app, host: probeHost }
+        : null;
     } catch {
       return null;
     }
@@ -4324,7 +4350,8 @@ async function discoverAgenticHubs(engineBaseUrl, {
  *     half-configured. No discovery attempted.
  *   - `{ status: 'connect', config }` — a target to connect to. Either the
  *     explicit `NANO_AGENTIC_URL`/`agenticUrl` verbatim (no discovery), or the
- *     single discovered app's direct `ws://127.0.0.1:<port>/agentic` loopback.
+ *     single discovered app's `ws://<engineHost>:<port>/agentic` (loopback for a
+ *     local engine, the engine's LAN host for a remote one).
  *   - `{ status: 'ambiguous', message, candidates }` — two+ apps expose a
  *     channel. Hard stop for the worker: it must not silently pick one.
  *   - `{ status: 'advisory', message }` — nothing discoverable (zero matches,
@@ -4342,11 +4369,23 @@ async function resolveAgenticTarget(opts = {}) {
 
   const hubs = await discoverAgenticHubs(base.url, { token: base.token, ...opts });
 
+  // The host to suggest in operator-facing messages: the engine's own host, so a
+  // remote-engine advisory names the reachable LAN host rather than 127.0.0.1.
+  let suggestHost = '127.0.0.1';
+  try {
+    const h = new URL(base.url).hostname;
+    suggestHost = isLoopbackHost(h) ? '127.0.0.1' : h;
+  } catch { /* keep the loopback default */ }
+
   if (hubs.length === 1) {
-    const { project, port } = hubs[0];
+    const { project, port, host } = hubs[0];
     return {
       status: 'connect',
-      config: { ...base, url: `http://127.0.0.1:${port}`, discovered: { project, port } },
+      config: {
+        ...base,
+        url: `http://${wsHostPart(host)}:${port}`,
+        discovered: { project, port, host },
+      },
     };
   }
   if (hubs.length > 1) {
@@ -4355,14 +4394,14 @@ async function resolveAgenticTarget(opts = {}) {
       status: 'ambiguous',
       candidates: hubs,
       message: `multiple embedded apps expose an agentic channel (${list}); refusing to guess. `
-        + 'Disambiguate by setting NANO_AGENTIC_URL=http://127.0.0.1:<port> (or persisted agenticUrl) to the one you want.',
+        + `Disambiguate by setting NANO_AGENTIC_URL=http://${suggestHost}:<port> (or persisted agenticUrl) to the one you want.`,
     };
   }
   return {
     status: 'advisory',
     message: `agentic visibility was not discoverable at ${base.url} — the embedded app port could `
       + 'not be found (not a nano engine, or its console projects API is absent). Set '
-      + 'NANO_AGENTIC_URL=http://127.0.0.1:<appUi.port> to enable the visibility channel. Continuing without it.',
+      + `NANO_AGENTIC_URL=http://${suggestHost}:<appUi.port> to enable the visibility channel. Continuing without it.`,
   };
 }
 
@@ -4744,7 +4783,8 @@ async function workAgent(req, flags) {
       const shown = redactAgenticUrl(buildAgenticUrl(agenticCfg.url, {}));
       const mode = agenticCfg.secure ? 'secure' : 'local';
       if (agenticCfg.discovered) {
-        logger.info(`  agentic channel: auto-discovered ${agenticCfg.discovered.project} on the embedded app port :${agenticCfg.discovered.port} (bypassing the WS-incapable console proxy).`);
+        const d = agenticCfg.discovered;
+        logger.info(`  agentic channel: auto-discovered ${d.project} on the app's /agentic port ${d.host}:${d.port} (bypassing the WS-incapable console proxy).`);
       }
       logger.info(`  agentic channel (${mode}): announcing presence as ${workerName} on ${shown}`);
     } catch (err) {

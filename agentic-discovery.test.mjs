@@ -144,18 +144,30 @@ test('discoverAgenticHubs fails open to [] when the fetch throws (network/timeou
   assert.deepEqual(hubs, []);
 });
 
-// Loopback-only guard (#76): a remote/non-loopback engine must never steer a
-// local 127.0.0.1 port probe — discovery short-circuits before it even fetches.
-test('discoverAgenticHubs refuses a non-loopback engine host without probing (loopback-only)', async () => {
-  let fetched = false;
-  let probed = false;
-  const hubs = await discoverAgenticHubs('http://remote.example.com:8080', {
-    fetchImpl: async () => { fetched = true; return { ok: true, json: async () => NANO_WORKFORCE }; },
-    wsProbe: async () => { probed = true; return true; },
+// Cross-LAN discovery (#96): a remote/non-loopback engine is discovered against
+// the ENGINE's own host (never the worker's loopback), so a worker on another
+// box finds the hub. The probe is handed the engine host and the surviving hub
+// carries it for the caller to build the URL.
+test('discoverAgenticHubs discovers a remote (LAN) engine against the engine host', async () => {
+  let fetchedUrl;
+  let probedHost;
+  const hubs = await discoverAgenticHubs('http://merlin.local:8080', {
+    fetchImpl: async (url) => { fetchedUrl = url; return { ok: true, json: async () => NANO_WORKFORCE }; },
+    wsProbe: async (_port, { host } = {}) => { probedHost = host; return true; },
   });
-  assert.deepEqual(hubs, []);
-  assert.equal(fetched, false, 'must not fetch a non-loopback engine');
-  assert.equal(probed, false, 'must not probe when the engine host is non-loopback');
+  assert.deepEqual(hubs, [{ project: 'Nano_Workforce', port: 3000, label: 'Nano Workforce', host: 'merlin.local' }]);
+  assert.equal(fetchedUrl, 'http://merlin.local:8080/console/api/projects', 'reads the remote engine projects API');
+  assert.equal(probedHost, 'merlin.local', 'probes the engine host, not the worker loopback');
+});
+
+test('discoverAgenticHubs normalizes a loopback engine host to 127.0.0.1 in the probe + hub', async () => {
+  let probedHost;
+  const hubs = await discoverAgenticHubs('http://localhost:8080', {
+    fetchImpl: fetchReturning(NANO_WORKFORCE),
+    wsProbe: async (_port, { host } = {}) => { probedHost = host; return true; },
+  });
+  assert.equal(probedHost, '127.0.0.1');
+  assert.equal(hubs[0].host, '127.0.0.1');
 });
 
 test('discoverAgenticHubs allows every loopback host form (127.x, ::1)', async () => {
@@ -273,7 +285,15 @@ test('single-match discovery connects to the direct loopback port with the local
   assert.equal(res.status, 'connect');
   assert.equal(res.config.url, 'http://127.0.0.1:3000');
   assert.equal(res.config.token, LOCAL_AGENTIC_TOKEN);
-  assert.deepEqual(res.config.discovered, { project: 'Nano_Workforce', port: 3000 });
+  assert.deepEqual(res.config.discovered, { project: 'Nano_Workforce', port: 3000, host: '127.0.0.1' });
+});
+
+test('single-match discovery against a remote LAN engine connects to the engine host (#96)', async () => {
+  const res = await withEnv({}, { nanoUrl: 'http://merlin.local:8080' }, () =>
+    resolveAgenticTarget({ fetchImpl: fetchReturning(NANO_WORKFORCE), wsProbe: probeUpgrades(3000) }));
+  assert.equal(res.status, 'connect');
+  assert.equal(res.config.url, 'http://merlin.local:3000');
+  assert.deepEqual(res.config.discovered, { project: 'Nano_Workforce', port: 3000, host: 'merlin.local' });
 });
 
 test('two+ discovered apps bail with an ambiguous message naming project→port', async () => {

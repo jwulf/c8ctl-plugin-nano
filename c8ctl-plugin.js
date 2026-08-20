@@ -4172,10 +4172,10 @@ function isLoopbackHost(hostname) {
 
 /**
  * Format a hostname for the authority component of a `ws://`/`http://` URL:
- * a bare IPv6 literal (contains `:`, not already bracketed) must be wrapped in
- * `[…]`, everything else is used verbatim. `URL.hostname` yields IPv6 without
- * brackets, so a discovered/normalized `::1` would otherwise build an invalid
- * `ws://::1:3000/…`.
+ * a bare IPv6 literal (contains `:`, not already bracketed) is wrapped in `[…]`,
+ * everything else is used verbatim. Idempotent — an already-bracketed host is
+ * left as-is. Guards against building an invalid `ws://::1:3000/…` when a raw or
+ * normalized IPv6 host (e.g. the `::1` constant) has not been bracketed.
  *
  * @param {string} host a hostname from `URL.hostname` or a normalized loopback
  * @returns {string}

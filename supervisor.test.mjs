@@ -30,6 +30,8 @@ import {
   printSupervisorStatus,
   supervisorStatusSignature,
   supervisorJobCell,
+  supervisorEngineCell,
+  supervisorAgenticCell,
   supervisorWorkerActivityFile,
   WORK_FORWARD_FLAGS,
 } from './c8ctl-plugin.js';
@@ -541,8 +543,8 @@ test('summarizeSupervisorWorker surfaces a live worker\'s serviced job from its 
 // Build a public worker view the way the daemon does, but without touching the
 // on-disk activity marker: pass activity inline via a fake summarize input by
 // constructing the shape summarizeSupervisorWorker returns.
-const pub = ({ id = 'w', profile = id, state = 'running', pid = 1, restarts = 0, lastExit = null, activity = null }) =>
-  ({ id, profile, pid, state, restarts, uptimeMs: 0, lastExit, args: [], activity });
+const pub = ({ id = 'w', profile = id, state = 'running', pid = 1, restarts = 0, lastExit = null, activity = null, engine = null, agentic = null }) =>
+  ({ id, profile, pid, state, restarts, uptimeMs: 0, lastExit, args: [], activity, engine, agentic });
 
 test('supervisorStatusSignature is stable across ticking durations', () => {
   const a = pub({ activity: { state: 'busy', jobs: [{ key: 'pr.review', type: 'senior', sinceMs: 1000 }] } });
@@ -617,7 +619,105 @@ test('summarizeSupervisorWorker leaves startedAtMs null for a down worker', () =
   assert.equal(w.uptimeMs, 0);
 });
 
-// --- reageSupervisorStatus --------------------------------------------------
+// --- engine + agentic channel visibility (issue #99) -----------------------
+// A supervised worker reports which engine it polls and its agentic-visibility
+// channel status in its activity marker, so `supervisor status` (and the
+// interactive live view, which shares formatSupervisorStatus) show whether
+// presence actually reached the Workforce hub — the signal missing behind
+// "workers are connected to the engine but the Cockpit is empty".
+
+test('summarizeSupervisorWorker surfaces engine + agentic status from the marker', async (t) => {
+  const { mkdtempSync, mkdirSync, writeFileSync, rmSync } = await import('node:fs');
+  const { tmpdir } = await import('node:os');
+  const { join, dirname } = await import('node:path');
+  const home = mkdtempSync(join(tmpdir(), 'c8ctl-agentic-'));
+  const prev = process.env.C8CTL_NANO_HOME;
+  process.env.C8CTL_NANO_HOME = home;
+  t.after(() => {
+    if (prev === undefined) delete process.env.C8CTL_NANO_HOME; else process.env.C8CTL_NANO_HOME = prev;
+    try { rmSync(home, { recursive: true, force: true }); } catch { /* best effort */ }
+  });
+
+  const file = supervisorWorkerActivityFile('reviewer');
+  mkdirSync(dirname(file), { recursive: true });
+  writeFileSync(file, JSON.stringify({
+    pid: process.pid,
+    busy: false,
+    jobs: [],
+    engine: 'http://merlin.local:8080',
+    agentic: { status: 'connected', mode: 'local', url: 'ws://merlin.local:3000/agentic', discovered: { project: 'Workforce', port: 3000, host: 'merlin.local' } },
+  }));
+  const row = summarizeSupervisorWorker({ id: 'reviewer', profile: 'reviewer', pid: process.pid });
+  assert.equal(row.engine, 'http://merlin.local:8080');
+  assert.equal(row.agentic.status, 'connected');
+  assert.equal(row.agentic.mode, 'local');
+  assert.equal(row.agentic.discovered.host, 'merlin.local');
+
+  // A stale-pid marker is ignored for engine/agentic too (not just jobs).
+  writeFileSync(file, JSON.stringify({ pid: 999999999, engine: 'http://stale:8080', agentic: { status: 'connected' } }));
+  const guarded = summarizeSupervisorWorker({ id: 'reviewer', profile: 'reviewer', pid: process.pid });
+  assert.equal(guarded.engine, null);
+  assert.equal(guarded.agentic, null);
+});
+
+test('summarizeSupervisorWorker leaves engine/agentic null for a down worker', () => {
+  const row = summarizeSupervisorWorker({ id: 'coder', profile: 'coder', pid: 2 ** 30, restarts: 1 });
+  assert.equal(row.engine, null);
+  assert.equal(row.agentic, null);
+});
+
+test('supervisorEngineCell shows the engine authority (host:port), — when down, ? when not reporting', () => {
+  assert.equal(supervisorEngineCell({ state: 'running', activity: { state: 'idle', jobs: [] }, engine: 'http://merlin.local:8080' }), 'merlin.local:8080');
+  assert.equal(supervisorEngineCell({ state: 'down', activity: null, engine: null }), '-');
+  assert.equal(supervisorEngineCell({ state: 'running', activity: null, engine: null }), '?');
+  // A reporting worker on an older build (marker without engine) → ?
+  assert.equal(supervisorEngineCell({ state: 'running', activity: { state: 'idle', jobs: [] }, engine: null }), '?');
+  // A non-URL engine string falls back to the raw value.
+  assert.equal(supervisorEngineCell({ state: 'running', activity: { state: 'idle', jobs: [] }, engine: 'localhost:8080' }), 'localhost:8080');
+});
+
+test('supervisorAgenticCell shows the channel status word, — when down, ? when not reporting', () => {
+  const cell = (agentic, extra = {}) => supervisorAgenticCell({ state: 'running', activity: { state: 'idle', jobs: [] }, agentic, ...extra });
+  assert.equal(cell({ status: 'connected' }), 'connected');
+  assert.equal(cell({ status: 'connecting' }), 'connecting');
+  assert.equal(cell({ status: 'disconnected' }), 'disconnected');
+  assert.equal(cell({ status: 'advisory' }), 'advisory');
+  assert.equal(cell({ status: 'off' }), 'off');
+  assert.equal(supervisorAgenticCell({ state: 'down', activity: null, agentic: null }), '-');
+  assert.equal(supervisorAgenticCell({ state: 'running', activity: null, agentic: null }), '?');
+  // Reporting worker on an older build (marker without agentic) → ?
+  assert.equal(cell(null), '?');
+});
+
+test('formatSupervisorStatus renders ENGINE and AGENTIC columns with values', () => {
+  const now = Date.now();
+  const worker = {
+    id: 'rev', profile: 'rev', pid: process.pid, state: 'running', restarts: 0,
+    uptimeMs: 1000, lastExit: null, args: [],
+    activity: { state: 'idle', jobs: [] },
+    engine: 'http://merlin.local:8080',
+    agentic: { status: 'connected', mode: 'local' },
+  };
+  const text = formatSupervisorStatus({ daemon: { pid: process.pid }, workers: [worker] });
+  assert.match(text, /ENGINE/);
+  assert.match(text, /AGENTIC/);
+  assert.match(text, /merlin\.local:8080/);
+  assert.match(text, /connected/);
+});
+
+test('supervisorStatusSignature changes on an agentic status transition', () => {
+  const connecting = pub({ activity: { state: 'idle', jobs: [] }, agentic: { status: 'connecting' } });
+  const connected = pub({ activity: { state: 'idle', jobs: [] }, agentic: { status: 'connected' } });
+  assert.notEqual(supervisorStatusSignature([connecting]), supervisorStatusSignature([connected]));
+});
+
+test('supervisorStatusSignature changes when the polled engine changes', () => {
+  const a = pub({ engine: 'http://merlin.local:8080' });
+  const b = pub({ engine: 'http://omarchy.local:8080' });
+  assert.notEqual(supervisorStatusSignature([a]), supervisorStatusSignature([b]));
+});
+
+
 
 test('reageSupervisorStatus recomputes uptimeMs from startedAtMs at the new now', () => {
   const startedAtMs = 1_000_000;

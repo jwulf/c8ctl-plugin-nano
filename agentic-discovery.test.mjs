@@ -296,6 +296,14 @@ test('single-match discovery against a remote LAN engine connects to the engine 
   assert.deepEqual(res.config.discovered, { project: 'Nano_Workforce', port: 3000, host: 'merlin.local' });
 });
 
+test('single-match discovery brackets an IPv6 engine host in the resolved URL (#96)', async () => {
+  const res = await withEnv({}, { nanoUrl: 'http://[2001:db8::1]:8080' }, () =>
+    resolveAgenticTarget({ fetchImpl: fetchReturning(NANO_WORKFORCE), wsProbe: probeUpgrades(3000) }));
+  assert.equal(res.status, 'connect');
+  assert.equal(res.config.url, 'http://[2001:db8::1]:3000');
+  assert.equal(res.config.discovered.host, '[2001:db8::1]');
+});
+
 test('two+ discovered apps bail with an ambiguous message naming project→port', async () => {
   const twoApps = {
     Nano_Workforce: { appUi: { enabled: true, port: 3000, label: 'Nano Workforce' } },

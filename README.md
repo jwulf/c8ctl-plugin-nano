@@ -303,7 +303,8 @@ the engine's own host** — a local engine keeps probing `127.0.0.1`, while a
 remote/LAN engine (e.g. `merlin.local:8080`) steers the probe back at *itself*
 (`merlin.local:<port>`), never at the worker's own loopback services. It is
 **time-bounded** (≤2s) and never meaningfully delays job polling. The discovered
-host and port are printed for debugging.
+host and port are printed for debugging. (An IPv6 literal engine host is bracketed
+in the URL authority, e.g. `ws://[2001:db8::1]:3000/agentic`.)
 
 - **Exactly one app →** the worker connects directly to
   `ws://<engine-host>:<appUi.port>/agentic` (bypassing the WS-incapable console

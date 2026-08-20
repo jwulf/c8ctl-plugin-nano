@@ -4222,15 +4222,16 @@ function normalizeProjectApps(projects) {
 }
 
 /**
- * Probe whether an embedded app's own loopback `/agentic` endpoint answers a
- * WebSocket upgrade. Connects to `ws://127.0.0.1:<port>/agentic?token=…` and
+ * Probe whether an embedded app's `/agentic` endpoint answers a WebSocket
+ * upgrade. Connects to `ws://<host>:<port>/agentic?token=…` (host defaults to
+ * `127.0.0.1`; a bare IPv6 literal is bracketed for the URL authority) and
  * resolves `true` only if the socket opens within `timeoutMs`; a refused
  * connection, the console proxy's deliberate `501`, a `404`, or a timeout all
- * resolve `false`. Loopback-only and self-cleaning — the probe socket is closed
- * as soon as the outcome is known. Never throws.
+ * resolve `false`. Self-cleaning — the probe socket is closed as soon as the
+ * outcome is known. Never throws.
  *
- * @param {number} port the app's direct loopback port (`appUi.port`)
- * @param {{ token?: string, WebSocketImpl?: Function, timeoutMs?: number }} [opts]
+ * @param {number} port the app's direct agentic port (`appUi.port`)
+ * @param {{ host?: string, token?: string, WebSocketImpl?: Function, timeoutMs?: number }} [opts]
  * @returns {Promise<boolean>}
  */
 function probeAgenticChannel(port, {
@@ -4369,12 +4370,13 @@ async function resolveAgenticTarget(opts = {}) {
 
   const hubs = await discoverAgenticHubs(base.url, { token: base.token, ...opts });
 
-  // The host to suggest in operator-facing messages: the engine's own host, so a
+  // The host to suggest in operator-facing messages: the engine's own host
+  // (bracketed if an IPv6 literal, so the suggested URL authority is valid), so a
   // remote-engine advisory names the reachable LAN host rather than 127.0.0.1.
   let suggestHost = '127.0.0.1';
   try {
     const h = new URL(base.url).hostname;
-    suggestHost = isLoopbackHost(h) ? '127.0.0.1' : h;
+    suggestHost = wsHostPart(isLoopbackHost(h) ? '127.0.0.1' : h);
   } catch { /* keep the loopback default */ }
 
   if (hubs.length === 1) {
@@ -4784,7 +4786,7 @@ async function workAgent(req, flags) {
       const mode = agenticCfg.secure ? 'secure' : 'local';
       if (agenticCfg.discovered) {
         const d = agenticCfg.discovered;
-        logger.info(`  agentic channel: auto-discovered ${d.project} on the app's /agentic port ${d.host}:${d.port} (bypassing the WS-incapable console proxy).`);
+        logger.info(`  agentic channel: auto-discovered ${d.project} on the app's /agentic port ${wsHostPart(d.host)}:${d.port} (bypassing the WS-incapable console proxy).`);
       }
       logger.info(`  agentic channel (${mode}): announcing presence as ${workerName} on ${shown}`);
     } catch (err) {

@@ -15,6 +15,7 @@ import {
   parseLinkedResources,
   pickLinkedResource,
   resolveBrokerRestConfig,
+  resolveAutoRestConfig,
   resourceContentUrl,
   fetchLinkedResourceContent,
   resolveLinkedPrompt,
@@ -469,6 +470,92 @@ test('resolveLinkedPromptSource: a client without getConfig/getAuthHeaders degra
   const src2 = await resolveLinkedPromptSource(throwing, {});
   assert.equal(src2.baseUrl, '');
   assert.equal(src2.authHeaders, undefined);
+});
+
+// ---------------------------------------------------------------------------
+// resolveAutoRestConfig — the `--auto` engine-read base must follow the ACTIVE
+// c8ctl profile (the same client that activates jobs), never a localhost
+// default (jwulf/c8ctl-plugin-nano#93). Run each case under a throwaway
+// C8CTL_NANO_HOME with no config.json so readConfig() yields {} (no stray
+// cfg.nanoUrl), and with the NANO_* env override keys cleared.
+// ---------------------------------------------------------------------------
+const AUTO_ENV_KEYS = [
+  'NANO_REST_URL', 'NANO_BASE_URL', 'NANO_REST_TOKEN',
+  'NANO_AGENTIC_URL', 'NANO_AGENTIC_SECRET', 'NANO_AGENTIC_TOKEN',
+];
+
+function withCleanAutoHome(fn) {
+  const home = mkdtempSync(join(tmpdir(), 'c8ctl-auto-route-'));
+  const prevHome = process.env.C8CTL_NANO_HOME;
+  const prevEnv = Object.fromEntries(AUTO_ENV_KEYS.map((k) => [k, process.env[k]]));
+  process.env.C8CTL_NANO_HOME = home;
+  for (const k of AUTO_ENV_KEYS) delete process.env[k];
+  try {
+    return fn(home);
+  } finally {
+    if (prevHome === undefined) delete process.env.C8CTL_NANO_HOME; else process.env.C8CTL_NANO_HOME = prevHome;
+    for (const k of AUTO_ENV_KEYS) { if (prevEnv[k] === undefined) delete process.env[k]; else process.env[k] = prevEnv[k]; }
+    rmSync(home, { recursive: true, force: true });
+  }
+}
+
+// RED (route): with no explicit override, the `--auto` reader base is derived
+// from the activating client's profile REST address, NOT http://localhost:8080.
+test('resolveAutoRestConfig: derives the base from the active c8ctl profile (not localhost)', () => {
+  withCleanAutoHome(() => {
+    const camunda = { getConfig: () => ({ restAddress: 'http://merlin.local:8080/v2' }) };
+    const cfg = resolveAutoRestConfig(camunda, process.env);
+    assert.equal(cfg.baseUrl, 'http://merlin.local:8080');
+    assert.notEqual(cfg.baseUrl, 'http://localhost:8080');
+  });
+});
+
+// GUARD (parity): the `--auto` job-type reader and the job-activation client
+// MUST resolve to the same base URL for a given profile — they must never
+// diverge. defaultC8RestReader builds its restAddress as `${baseUrl}/v2`, so
+// that reconstructed address must equal the client's own restAddress.
+test('resolveAutoRestConfig: reader base matches the job-activation client base (no divergence)', () => {
+  withCleanAutoHome(() => {
+    const restAddress = 'http://merlin.local:8080/v2';
+    const camunda = { getConfig: () => ({ restAddress }) };
+    const cfg = resolveAutoRestConfig(camunda, process.env);
+    // Mirror defaultC8RestReader's `${base}/v2` construction.
+    const readerAddress = `${String(cfg.baseUrl).replace(/\/+$/, '')}/v2`;
+    assert.equal(readerAddress, restAddress);
+  });
+});
+
+// An explicit NANO_REST_URL / NANO_BASE_URL / cfg.nanoUrl override still wins
+// over the profile (operator escape hatch) — matching resolveBrokerRestConfig
+// precedence and the workaround documented in the issue.
+test('resolveAutoRestConfig: explicit NANO_REST_URL overrides the profile', () => {
+  withCleanAutoHome(() => {
+    process.env.NANO_REST_URL = 'http://override:9000';
+    const camunda = { getConfig: () => ({ restAddress: 'http://merlin.local:8080/v2' }) };
+    const cfg = resolveAutoRestConfig(camunda, process.env);
+    assert.equal(cfg.baseUrl, 'http://override:9000');
+  });
+});
+
+test('resolveAutoRestConfig: cfg.nanoUrl override (the documented band-aid) wins over the profile', () => {
+  withCleanAutoHome((home) => {
+    writeFileSync(join(home, 'config.json'), JSON.stringify({ nanoUrl: 'http://from-config:8080' }));
+    const camunda = { getConfig: () => ({ restAddress: 'http://merlin.local:8080/v2' }) };
+    const cfg = resolveAutoRestConfig(camunda, process.env);
+    assert.equal(cfg.baseUrl, 'http://from-config:8080');
+  });
+});
+
+// A client without getConfig (or one that throws) degrades to the localhost
+// default rather than throwing — the reader is still constructed, and the poll
+// loop retries.
+test('resolveAutoRestConfig: degrades to the localhost default when the client exposes no restAddress', () => {
+  withCleanAutoHome(() => {
+    assert.equal(resolveAutoRestConfig({}, process.env).baseUrl, 'http://localhost:8080');
+    assert.equal(resolveAutoRestConfig(null, process.env).baseUrl, 'http://localhost:8080');
+    const throwing = { getConfig: () => { throw new Error('boom'); } };
+    assert.equal(resolveAutoRestConfig(throwing, process.env).baseUrl, 'http://localhost:8080');
+  });
 });
 
 test('buildResultEnvelope: records the resolved promptResourceKey for audit', () => {

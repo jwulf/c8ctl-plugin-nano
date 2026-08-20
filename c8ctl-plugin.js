@@ -4408,17 +4408,12 @@ async function resolveAgenticTarget(opts = {}) {
 }
 
 /**
- * Map a resolved `resolveAgenticTarget` result to the INITIAL agentic-channel
- * state persisted on the supervisor activity marker (#99). Pure so the marker
- * producer's state transitions are unit-testable without a live broker/SDK
- * client — a regression here would leave every supervised worker stuck at
- * `?`/`starting`, which the reader/renderer tests can't catch. `connected`/
- * `disconnected` are layered on top of this base by the channel lifecycle
- * (a `{ ...state, status }` merge). The `ambiguous` status is a hard-stop
- * handled by the caller (never reaches the marker), so it degrades to `off`
- * here. `safeUrl` mirrors the caller's defensive display-URL builder.
- * @param {{ status?: string, config?: any, message?: string }} target
- * @param {(u: string) => (string|null)} [safeUrl]
+ * Collapse an agentic disconnect/failure detail into the single short string the
+ * marker's `agentic.message` field carries (#99 contract). Accepts the close
+ * `info` the work channel's onDisconnect passes (transport-dependent shape, e.g.
+ * `{ code, reason, local }`), a thrown Error, or a bare string.
+ * @param {unknown} x diagnostic input (close info, Error, or string)
+ * @returns {string|null} a human-readable reason, or null when nothing useful
  */
 function normalizeAgenticMessage(x) {
   // Collapse an agentic disconnect/failure detail into the single short string
@@ -4443,6 +4438,19 @@ function normalizeAgenticMessage(x) {
   return String(x);
 }
 
+/**
+ * Map a resolved `resolveAgenticTarget` result to the INITIAL agentic-channel
+ * state persisted on the supervisor activity marker (#99). Pure so the marker
+ * producer's state transitions are unit-testable without a live broker/SDK
+ * client — a regression here would leave every supervised worker stuck at
+ * `?`/`starting`, which the reader/renderer tests can't catch. `connected`/
+ * `disconnected` are layered on top of this base by the channel lifecycle
+ * (a `{ ...state, status }` merge). The `ambiguous` status is a hard-stop
+ * handled by the caller (never reaches the marker), so it degrades to `off`
+ * here. `safeUrl` mirrors the caller's defensive display-URL builder.
+ * @param {{ status?: string, config?: any, message?: string }} target
+ * @param {(u: string) => (string|null)} [safeUrl]
+ */
 function agenticStateForTarget(target, safeUrl = (u) => u) {
   switch (target?.status) {
     case 'connect': {

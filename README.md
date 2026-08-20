@@ -333,6 +333,7 @@ one of:
 
 | AGENTIC | meaning |
 | --- | --- |
+| `starting` | transient: the worker just spawned and hasn't resolved its channel target yet (pre-`connecting`) |
 | `connected` | presence is live on the hub — you should see this worker in the Cockpit |
 | `connecting` | resolved a hub, socket not open yet (or the hub is unreachable) |
 | `disconnected` | the channel dropped (hub restart/outage) — it auto-reconnects |

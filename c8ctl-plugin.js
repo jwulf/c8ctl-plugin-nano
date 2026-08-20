@@ -4699,7 +4699,20 @@ async function workAgent(req, flags) {
   // channel status, both surfaced to `supervisor status` via the activity
   // marker (#99). `agenticState` starts 'starting' and is updated once the
   // channel target is resolved and again on each connect/disconnect below.
-  const workerEngine = restConfig?.baseUrl || null;
+  // The engine must name the ACTUAL polling authority: jobs are activated by
+  // `camunda.createJobWorker()` against the active c8ctl profile engine
+  // (`camunda.getConfig().restAddress`), whereas `restConfig` can honor the
+  // auxiliary NANO_REST_URL/NANO_BASE_URL/nanoUrl overrides (for `--auto`
+  // reads). Derive from the profile engine, using restConfig only as a
+  // fallback, so the column can't advertise an override host jobs aren't
+  // polled from.
+  const workerEngine = (() => {
+    try {
+      const profileBase = normalizeRestBase(camunda?.getConfig?.()?.restAddress);
+      if (profileBase) return profileBase;
+    } catch { /* degrade to the auxiliary REST config below */ }
+    return restConfig?.baseUrl || null;
+  })();
   let agenticState = { status: 'starting' };
   const writeActivity = () => {
     if (!activityFile) return;
@@ -4753,6 +4766,15 @@ async function workAgent(req, flags) {
   // NANO_AGENTIC=off disables it (see resolveAgenticConfig).
   const agenticTarget = await resolveAgenticTarget({ logger });
   let agenticCfg = null;
+  // buildAgenticUrl can throw on a malformed/unsupported explicit NANO_AGENTIC_URL.
+  // This is only the display URL for the activity marker, so compute it
+  // defensively: a bad URL must be recorded as a channel failure (via the
+  // createWorkChannel try/catch below), never crash the worker before it — which
+  // would violate the best-effort channel contract and cause a restart loop.
+  const safeAgenticDisplayUrl = (u) => {
+    try { return redactAgenticUrl(buildAgenticUrl(u, {})); }
+    catch { return null; }
+  };
   switch (agenticTarget.status) {
     case 'connect':
       agenticCfg = agenticTarget.config;
@@ -4762,7 +4784,7 @@ async function workAgent(req, flags) {
       agenticState = {
         status: 'connecting',
         mode: agenticCfg.secure ? 'secure' : 'local',
-        url: redactAgenticUrl(buildAgenticUrl(agenticCfg.url, {})),
+        url: safeAgenticDisplayUrl(agenticCfg.url),
         discovered: agenticCfg.discovered || null,
       };
       break;

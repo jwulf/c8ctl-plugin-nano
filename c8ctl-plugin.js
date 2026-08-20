@@ -2408,11 +2408,16 @@ function sameOrigin(a, b) {
   }
 }
 
-function resolveBrokerRestConfig(env = process.env) {
+function resolveBrokerRestConfig(env = process.env, opts = {}) {
   // readConfig() swallows parse/IO errors and never throws (returns {}), so no
   // local try/catch is needed here.
   const cfg = readConfig() || {};
+  // `opts.baseUrl` lets a caller pin the effective base (e.g. the active c8ctl
+  // profile's REST address — see resolveAutoRestConfig) while still running it
+  // through the SAME token same-origin gate below, so the token logic stays
+  // single-sourced (never duplicated per call site).
   const baseUrl =
+    opts.baseUrl ||
     env.NANO_REST_URL ||
     env.NANO_BASE_URL ||
     cfg.nanoUrl ||
@@ -2438,6 +2443,33 @@ function resolveBrokerRestConfig(env = process.env) {
     if (agenticToken && sameOrigin(baseUrl, agenticUrl)) token = agenticToken;
   }
   return { baseUrl, token };
+}
+
+// Resolve the C8 REST config the `--auto` engine-read reader is built from.
+// This is the job-type-read analogue of resolveLinkedPromptSource: an explicit
+// NANO_REST_URL / NANO_BASE_URL / cfg.nanoUrl override still wins (operator
+// escape hatch), but with NONE of those set the base is derived from the SAME
+// c8ctl client that activates jobs (its getConfig().restAddress) rather than the
+// localhost default — so a worker that can activate jobs against a profile
+// engine can also read the deployed job types from it. Without this, an `--auto`
+// worker on an active remote profile reads from http://localhost:8080, finds no
+// engine, discovers 0 job types, and crash-loops (jwulf/c8ctl-plugin-nano#93).
+// Falls back to resolveBrokerRestConfig's localhost default only when the client
+// exposes no usable restAddress. The token same-origin gate lives in
+// resolveBrokerRestConfig (re-run against the profile base), never duplicated.
+function resolveAutoRestConfig(camunda, env = process.env) {
+  const cfg = readConfig() || {};
+  const hasExplicitBase = Boolean(env.NANO_REST_URL || env.NANO_BASE_URL || cfg.nanoUrl);
+  if (!hasExplicitBase && camunda && typeof camunda.getConfig === 'function') {
+    let profileBase = '';
+    try {
+      profileBase = normalizeRestBase(camunda.getConfig()?.restAddress);
+    } catch {
+      // ignore — degrade to the resolveBrokerRestConfig (localhost) default below
+    }
+    if (profileBase) return resolveBrokerRestConfig(env, { baseUrl: profileBase });
+  }
+  return resolveBrokerRestConfig(env);
 }
 
 // ---------------------------------------------------------------------------
@@ -4558,10 +4590,14 @@ async function workAgent(req, flags) {
   }
   const camunda = globalThis.c8ctl.createClient();
 
-  // Broker REST endpoint for live linked-resource prompts (issue #63) — the same
-  // nano endpoint this worker already talks to. Resolved once at startup, and
-  // reused as the C8 REST source for `--auto`'s engine-read enrolment.
-  const restConfig = resolveBrokerRestConfig();
+  // Broker REST endpoint for live linked-resource prompts (issue #63) and the
+  // C8 REST source for `--auto`'s engine-read enrolment. Derived from the SAME
+  // client that activates jobs (its profile REST address) when no explicit
+  // NANO_REST_URL/NANO_BASE_URL/cfg.nanoUrl override is set — so a worker that
+  // can activate jobs against the active profile engine also reads job types
+  // from it, instead of a localhost default that crash-loops when nothing is
+  // listening on :8080 (jwulf/c8ctl-plugin-nano#93). Resolved once at startup.
+  const restConfig = resolveAutoRestConfig(camunda);
 
   // The desired job-type set. In `--auto` it is engine-read (∪ any --job-type
   // extras); otherwise it is the rank×capability matrix (∪ extras). The initial
@@ -5183,7 +5219,16 @@ async function workAgent(req, flags) {
       if (inFlightReconcile) return;
       reconcile().catch((err) => logger.warn(`--auto reconcile failed: ${err?.message || err}`));
     }, AUTO_POLL_INTERVAL_MS);
-    if (typeof autoPollTimer.unref === 'function') autoPollTimer.unref();
+    // Deliberately REF'd (unlike the reaper/run-dir hygiene timers, which are
+    // unref'd): in `--auto` this poll IS the retry loop, and it must keep the
+    // process alive even with zero pollers. When the INITIAL engine read fails
+    // (transient miss, or the engine isn't up yet) the worker registers 0
+    // pollers; nothing else holds the event loop open (the SDK client with no
+    // job workers doesn't, and the hygiene timers are unref'd), so an unref'd
+    // poll timer would let the process exit 0 — the observed crash-loop under a
+    // supervisor (jwulf/c8ctl-plugin-nano#93). Keeping it ref'd makes the worker
+    // stay up and re-read on the next poll, exactly as the initial-read warning
+    // promises. Shutdown clears it (clearInterval), so Ctrl-C/SIGTERM still exit.
   } else {
     // `watchFile` (polling stat) is deliberate over `fs.watch`: it survives the
     // atomic temp+rename that `writeConfig` does (fs.watch would rebind to the old
@@ -8547,6 +8592,7 @@ export {
   parseLinkedResources,
   pickLinkedResource,
   resolveBrokerRestConfig,
+  resolveAutoRestConfig,
   resourceContentUrl,
   fetchLinkedResourceContent,
   resolveLinkedPrompt,
@@ -8602,6 +8648,7 @@ export {
   scanAgentTaskLeaves,
   readDeployedAgentJobTypes,
   resolveAutoJobTypes,
+  workAgent,
   derivePollTimeoutMs,
   AGENT_TASK_NS,
   AGENT_RESULT_KEY,

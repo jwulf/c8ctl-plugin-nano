@@ -33,6 +33,7 @@ import {
   supervisorEngineCell,
   supervisorAgenticCell,
   agenticStateForTarget,
+  normalizeAgenticMessage,
   buildActivityPayload,
   supervisorWorkerActivityFile,
   WORK_FORWARD_FLAGS,
@@ -753,21 +754,41 @@ test('agenticStateForTarget maps off/advisory/connect the way the marker produce
 test('agenticStateForTarget connect state layers into connect/disconnect transitions', () => {
   // The channel lifecycle merges a status word onto the base state
   // (`{ ...state, status }`); assert connect→disconnect preserves the carried
-  // target fields and that a failure reason can ride alongside.
+  // target fields and that a failure message can ride alongside under the
+  // contract `agentic.message` field (#99).
   const base = agenticStateForTarget({ status: 'connect', config: { secure: false, url: 'ws://h/agentic', discovered: { project: 'WF' } } });
   const connected = { ...base, status: 'connected' };
   assert.equal(connected.status, 'connected');
   assert.equal(connected.mode, 'local');
   assert.deepEqual(connected.discovered, { project: 'WF' });
 
-  const disconnected = { ...base, status: 'disconnected', reason: 'ECONNREFUSED' };
+  const disconnected = { ...base, status: 'disconnected', message: 'ECONNREFUSED' };
   assert.equal(disconnected.status, 'disconnected');
-  assert.equal(disconnected.reason, 'ECONNREFUSED');
+  assert.equal(disconnected.message, 'ECONNREFUSED');
   // The carried target fields survive the transition so the cell can still show WHERE.
   assert.deepEqual(disconnected.discovered, { project: 'WF' });
   // The renderer still reduces either transition to the status word.
   assert.equal(supervisorAgenticCell({ state: 'running', activity: { state: 'idle', jobs: [] }, agentic: connected }), 'connected');
   assert.equal(supervisorAgenticCell({ state: 'running', activity: { state: 'idle', jobs: [] }, agentic: disconnected }), 'disconnected');
+});
+
+test('normalizeAgenticMessage collapses close-info / errors into the contract message field', () => {
+  // The marker's diagnostic field is `agentic.message` (#99) on BOTH the live
+  // onDisconnect path (close `info`) and the create-failure catch path (Error),
+  // so a hub drop explains WHY. Nothing useful → null (a clean status word).
+  assert.equal(normalizeAgenticMessage(null), null);
+  assert.equal(normalizeAgenticMessage(undefined), null);
+  assert.equal(normalizeAgenticMessage(''), null);
+  assert.equal(normalizeAgenticMessage('  boom  '), 'boom');
+  assert.equal(normalizeAgenticMessage(new Error('ECONNREFUSED')), 'ECONNREFUSED');
+  // Close-info shapes the transport passes to onDisconnect.
+  assert.equal(normalizeAgenticMessage({ code: 1006, reason: 'abnormal' }), 'abnormal (code 1006)');
+  assert.equal(normalizeAgenticMessage({ reason: 'going away' }), 'going away');
+  assert.equal(normalizeAgenticMessage({ code: 1011 }), 'close code 1011');
+  assert.equal(normalizeAgenticMessage({ local: true }), 'closed locally');
+  assert.equal(normalizeAgenticMessage({ local: false }), 'connection dropped');
+  // An info object with nothing to say → null, so the marker just shows the status.
+  assert.equal(normalizeAgenticMessage({}), null);
 });
 
 // --- buildActivityPayload: the marker payload the producer WRITES ------------

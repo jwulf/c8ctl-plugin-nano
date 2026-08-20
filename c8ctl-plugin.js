@@ -4420,6 +4420,29 @@ async function resolveAgenticTarget(opts = {}) {
  * @param {{ status?: string, config?: any, message?: string }} target
  * @param {(u: string) => (string|null)} [safeUrl]
  */
+function normalizeAgenticMessage(x) {
+  // Collapse an agentic disconnect/failure detail into the single short string
+  // the marker's `agentic.message` field carries (#99 contract). Accepts the
+  // close `info` the work channel's onDisconnect passes (transport-dependent
+  // shape, e.g. `{ code, reason, local }`), a thrown Error, or a bare string,
+  // and returns a human-readable reason or null when there is nothing useful.
+  if (x == null) return null;
+  if (typeof x === 'string') return x.trim() || null;
+  if (x instanceof Error) return x.message ? String(x.message) : String(x);
+  if (typeof x === 'object') {
+    const reason = typeof x.reason === 'string' ? x.reason.trim() : '';
+    const code = x.code != null && x.code !== '' ? String(x.code) : '';
+    if (reason && code) return `${reason} (code ${code})`;
+    if (reason) return reason;
+    if (code) return `close code ${code}`;
+    if (x.message) return String(x.message);
+    if (x.local === true) return 'closed locally';
+    if (x.local === false) return 'connection dropped';
+    return null;
+  }
+  return String(x);
+}
+
 function agenticStateForTarget(target, safeUrl = (u) => u) {
   switch (target?.status) {
     case 'connect': {
@@ -4890,11 +4913,13 @@ async function workAgent(req, flags) {
       // and then dropped inside the createWorkChannel() await window (before
       // these listeners existed), connected() is false but everConnected() is
       // true — record that as `disconnected` rather than leaving it stuck at
-      // `connecting`.
-      const markAgentic = (status) => { agenticState = { ...agenticState, status }; writeActivity(); };
+      // `connecting`. A close carries a normalized diagnostic under the contract
+      // `agentic.message` field (not `reason`) so a hub drop explains WHY; a
+      // fresh (re)connect clears any stale message.
+      const markAgentic = (status, message = null) => { agenticState = { ...agenticState, status, message }; writeActivity(); };
       workChannel.onConnect(() => markAgentic('connected'));
       workChannel.onReconnect(() => markAgentic('connected'));
-      workChannel.onDisconnect(() => markAgentic('disconnected'));
+      workChannel.onDisconnect((info) => markAgentic('disconnected', normalizeAgenticMessage(info)));
       if (workChannel.connected()) markAgentic('connected');
       else if (workChannel.everConnected()) markAgentic('disconnected');
     } catch (err) {
@@ -4902,7 +4927,9 @@ async function workAgent(req, flags) {
       workChannel = null;
       // Retain the failure reason on the marker so the supervisor can show WHY
       // presence dropped (bad URL, refused socket, …), not just `disconnected`.
-      agenticState = { ...agenticState, status: 'disconnected', reason: err?.message ? String(err.message) : String(err) };
+      // The contract diagnostic field is `agentic.message` (#99), matching the
+      // live-disconnect path above — keep the key consistent, not `reason`.
+      agenticState = { ...agenticState, status: 'disconnected', message: normalizeAgenticMessage(err) };
       writeActivity();
       logger.warn(`  agentic channel unavailable (${err?.message || err}); continuing without visibility.`);
     }
@@ -8886,6 +8913,7 @@ export {
   supervisorEngineCell,
   supervisorAgenticCell,
   agenticStateForTarget,
+  normalizeAgenticMessage,
   buildActivityPayload,
   supervisorWorkerActivityFile,
   WORK_FORWARD_FLAGS,

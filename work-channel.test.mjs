@@ -296,6 +296,67 @@ test('lifecycle events: onConnect fires once, onDisconnect on close, onReconnect
   await ch.stop();
 });
 
+test('everConnected() distinguishes "never opened" from "opened then dropped" (initial-close reconcile)', async () => {
+  const t = makeTransportDouble();
+  const ch = await createWorkChannel({
+    ...BASE,
+    instance: 'ever-1',
+    host: 'h',
+    heartbeatIntervalMs: 0,
+    transport: t.factory,
+  });
+  // Before the socket's macrotask open fires: never connected yet.
+  assert.equal(ch.connected(), false);
+  assert.equal(ch.everConnected(), false, 'not yet opened → still connecting, not disconnected');
+
+  await tick();
+  assert.equal(ch.connected(), true);
+  assert.equal(ch.everConnected(), true, 'opened → everConnected latches true');
+
+  // Hub drops the connection: connected() flips back to false, but everConnected()
+  // stays true so a late subscriber reconciles this as `disconnected`, not `connecting`.
+  t.dropCurrent();
+  await tick();
+  assert.equal(ch.connected(), false);
+  assert.equal(ch.everConnected(), true, 'opened-then-dropped stays everConnected → disconnected reconcile');
+
+  await ch.stop();
+});
+
+test('a late subscriber reconciles an open→drop that landed before it subscribed (guards startWork 4931-4932)', async () => {
+  const t = makeTransportDouble();
+  const ch = await createWorkChannel({
+    ...BASE,
+    instance: 'late-sub-1',
+    host: 'h',
+    heartbeatIntervalMs: 0,
+    transport: t.factory,
+  });
+  // Drive the full open→drop cycle BEFORE any caller subscribes — this is the
+  // exact race startWork's synchronous reconcile at c8ctl-plugin.js:4931-4932
+  // handles: the socket opened and dropped inside the createWorkChannel() await
+  // window, so onDisconnect never fires for a listener registered afterwards.
+  await tick(); // socket opens → everConnected latches true
+  t.dropCurrent(); // hub drops it before we subscribe
+  await tick();
+
+  // A subscriber added only now must NOT retroactively fire: the close already
+  // happened, so the marker cannot rely on the event alone…
+  let lateDisconnects = 0;
+  ch.onDisconnect(() => {
+    lateDisconnects += 1;
+  });
+  await tick();
+  assert.equal(lateDisconnects, 0, 'a close that predates the subscription does not replay');
+
+  // …it must reconcile synchronously from the accessors instead, which is exactly
+  // what startWork does: connected() === false && everConnected() === true → disconnected.
+  assert.equal(ch.connected(), false, 'still down after the pre-subscribe drop');
+  assert.equal(ch.everConnected(), true, 'opened-then-dropped → reconcile to disconnected, not connecting');
+
+  await ch.stop();
+});
+
 test('presence is re-announced after a reconnect so the row survives a hub restart', async () => {
   const t = makeTransportDouble();
   const ch = await createWorkChannel({

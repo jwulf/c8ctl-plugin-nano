@@ -4408,6 +4408,93 @@ async function resolveAgenticTarget(opts = {}) {
 }
 
 /**
+ * Collapse an agentic disconnect/failure detail into the single short string the
+ * marker's `agentic.message` field carries (#99 contract). Accepts the close
+ * `info` the work channel's onDisconnect passes (transport-dependent shape, e.g.
+ * `{ code, reason, local }`), a thrown Error, or a bare string.
+ * @param {unknown} x diagnostic input (close info, Error, or string)
+ * @returns {string|null} a human-readable reason, or null when nothing useful
+ */
+function normalizeAgenticMessage(x) {
+  // Collapse an agentic disconnect/failure detail into the single short string
+  // the marker's `agentic.message` field carries (#99 contract). Accepts the
+  // close `info` the work channel's onDisconnect passes (transport-dependent
+  // shape, e.g. `{ code, reason, local }`), a thrown Error, or a bare string,
+  // and returns a human-readable reason or null when there is nothing useful.
+  if (x == null) return null;
+  if (typeof x === 'string') return x.trim() || null;
+  if (x instanceof Error) return x.message ? String(x.message) : String(x);
+  if (typeof x === 'object') {
+    const reason = typeof x.reason === 'string' ? x.reason.trim() : '';
+    const code = x.code != null && x.code !== '' ? String(x.code) : '';
+    if (reason && code) return `${reason} (code ${code})`;
+    if (reason) return reason;
+    if (code) return `close code ${code}`;
+    if (x.message) return String(x.message);
+    if (x.local === true) return 'closed locally';
+    if (x.local === false) return 'connection dropped';
+    return null;
+  }
+  return String(x);
+}
+
+/**
+ * Map a resolved `resolveAgenticTarget` result to the INITIAL agentic-channel
+ * state persisted on the supervisor activity marker (#99). Pure so the marker
+ * producer's state transitions are unit-testable without a live broker/SDK
+ * client — a regression here would leave every supervised worker stuck at
+ * `?`/`starting`, which the reader/renderer tests can't catch. `connected`/
+ * `disconnected` are layered on top of this base by the channel lifecycle
+ * (a `{ ...state, status }` merge). The `ambiguous` status is a hard-stop
+ * handled by the caller (never reaches the marker), so it degrades to `off`
+ * here. `safeUrl` mirrors the caller's defensive display-URL builder.
+ * @param {{ status?: string, config?: any, message?: string }} target
+ * @param {(u: string) => (string|null)} [safeUrl]
+ */
+function agenticStateForTarget(target, safeUrl = (u) => u) {
+  switch (target?.status) {
+    case 'connect': {
+      const cfg = target.config || {};
+      return {
+        status: 'connecting',
+        mode: cfg.secure ? 'secure' : 'local',
+        url: safeUrl(cfg.url),
+        discovered: cfg.discovered || null,
+      };
+    }
+    case 'advisory':
+      // Retain the discovery diagnostic so the supervisor can distinguish a
+      // missing projects API, a timeout, or a non-Nano endpoint (#99).
+      return { status: 'advisory', message: target.message || null };
+    case 'off':
+    default:
+      return { status: 'off' };
+  }
+}
+
+/**
+ * Build the supervisor activity-marker payload the worker atomically writes for
+ * `supervisor status`. Pure so the producer's field set is unit-testable without
+ * spawning a worker: the reader/renderer tests exercise a hand-written marker and
+ * `agenticStateForTarget` in isolation, so a regression that dropped `engine` or
+ * `agentic` from THIS payload — leaving every supervised worker's Engine/Agentic
+ * column stuck at `?` — would otherwise slip through. `jobs` is the live active-job
+ * list; `busy` is derived so callers can't desync it from `jobs`.
+ * @param {{ pid:number, updatedAt:number, jobs:Array<{key:string,type:string,since:number}>, engine:(string|null), agentic:object }} fields
+ */
+function buildActivityPayload({ pid, updatedAt, jobs, engine, agentic }) {
+  const jobList = Array.isArray(jobs) ? jobs : [];
+  return {
+    pid,
+    updatedAt,
+    busy: jobList.length > 0,
+    jobs: jobList,
+    engine: engine ?? null,
+    agentic,
+  };
+}
+
+/**
  * work — turn a hire profile into live Nano job workers (one per job-type in
  * the rank×capability matrix) and poll for work in the foreground until Ctrl-C.
  * Uses the c8ctl-provided SDK client (globalThis.c8ctl.createClient()).
@@ -4695,10 +4782,29 @@ async function workAgent(req, flags) {
     installParentDeathWatchdog({ parentPid: Number.isInteger(daemonPid) ? daemonPid : undefined });
   }
   const activeJobs = new Map(); // jobKey -> { type, since (ms epoch) }
+  // Which engine this worker polls jobs from + the live agentic-visibility
+  // channel status, both surfaced to `supervisor status` via the activity
+  // marker (#99). `agenticState` starts 'starting' and is updated once the
+  // channel target is resolved and again on each connect/disconnect below.
+  // The engine must name the ACTUAL polling authority: jobs are activated by
+  // `camunda.createJobWorker()` against the active c8ctl profile engine
+  // (`camunda.getConfig().restAddress`), whereas `restConfig` can honor the
+  // auxiliary NANO_REST_URL/NANO_BASE_URL/nanoUrl overrides (for `--auto`
+  // reads). Derive from the profile engine, using restConfig only as a
+  // fallback, so the column can't advertise an override host jobs aren't
+  // polled from.
+  const workerEngine = (() => {
+    try {
+      const profileBase = normalizeRestBase(camunda?.getConfig?.()?.restAddress);
+      if (profileBase) return profileBase;
+    } catch { /* degrade to the auxiliary REST config below */ }
+    return restConfig?.baseUrl || null;
+  })();
+  let agenticState = { status: 'starting' };
   const writeActivity = () => {
     if (!activityFile) return;
     const jobs = [...activeJobs.entries()].map(([key, v]) => ({ key, type: v.type, since: v.since }));
-    const payload = { pid: process.pid, updatedAt: Date.now(), busy: jobs.length > 0, jobs };
+    const payload = buildActivityPayload({ pid: process.pid, updatedAt: Date.now(), jobs, engine: workerEngine, agentic: agenticState });
     const tmp = `${activityFile}.${process.pid}.tmp`;
     try {
       mkdirSync(dirname(activityFile), { recursive: true });
@@ -4747,9 +4853,22 @@ async function workAgent(req, flags) {
   // NANO_AGENTIC=off disables it (see resolveAgenticConfig).
   const agenticTarget = await resolveAgenticTarget({ logger });
   let agenticCfg = null;
+  // buildAgenticUrl can throw on a malformed/unsupported explicit NANO_AGENTIC_URL.
+  // This is only the display URL for the activity marker, so compute it
+  // defensively: a bad URL must be recorded as a channel failure (via the
+  // createWorkChannel try/catch below), never crash the worker before it — which
+  // would violate the best-effort channel contract and cause a restart loop.
+  const safeAgenticDisplayUrl = (u) => {
+    try { return redactAgenticUrl(buildAgenticUrl(u, {})); }
+    catch { return null; }
+  };
   switch (agenticTarget.status) {
     case 'connect':
       agenticCfg = agenticTarget.config;
+      // 'connecting' until the socket actually opens (wired on the channel
+      // lifecycle below). Carry the resolved mode/target/discovery so the
+      // supervisor can show WHERE presence is being announced (#99).
+      agenticState = agenticStateForTarget(agenticTarget, safeAgenticDisplayUrl);
       break;
     case 'ambiguous':
       // The operator ran with visibility on-by-default but the hub is
@@ -4758,13 +4877,19 @@ async function workAgent(req, flags) {
       process.exit(1);
       break;
     case 'advisory':
+      agenticState = agenticStateForTarget(agenticTarget);
       logger.info(`  agentic channel: ${agenticTarget.message}`);
       break;
     case 'off':
     default:
+      agenticState = agenticStateForTarget(agenticTarget);
       logger.info('  agentic channel: disabled — the off-switch is set (NANO_AGENTIC=off or persisted agentic:false). Clear it to use default LOCAL visibility.');
       break;
   }
+  // Persist the resolved channel state to the activity marker now, so
+  // `supervisor status` reflects connecting/advisory/off immediately, before
+  // the socket opens (or without a channel at all).
+  writeActivity();
   if (agenticCfg) {
     try {
       workChannel = await createWorkChannel({
@@ -4789,9 +4914,31 @@ async function workAgent(req, flags) {
         logger.info(`  agentic channel: auto-discovered ${d.project} on the app's /agentic port ${wsHostPart(d.host)}:${d.port} (bypassing the WS-incapable console proxy).`);
       }
       logger.info(`  agentic channel (${mode}): announcing presence as ${workerName} on ${shown}`);
+      // Track the live connection state on the activity marker so the
+      // supervisor shows connected↔disconnected transitions (#99). onConnect
+      // fires only for listeners present at first open, so also reconcile the
+      // already-open case synchronously via connected(). If the socket opened
+      // and then dropped inside the createWorkChannel() await window (before
+      // these listeners existed), connected() is false but everConnected() is
+      // true — record that as `disconnected` rather than leaving it stuck at
+      // `connecting`. A close carries a normalized diagnostic under the contract
+      // `agentic.message` field (not `reason`) so a hub drop explains WHY; a
+      // fresh (re)connect clears any stale message.
+      const markAgentic = (status, message = null) => { agenticState = { ...agenticState, status, message }; writeActivity(); };
+      workChannel.onConnect(() => markAgentic('connected'));
+      workChannel.onReconnect(() => markAgentic('connected'));
+      workChannel.onDisconnect((info) => markAgentic('disconnected', normalizeAgenticMessage(info)));
+      if (workChannel.connected()) markAgentic('connected');
+      else if (workChannel.everConnected()) markAgentic('disconnected');
     } catch (err) {
       // Never let a channel failure stop the worker from doing its actual job.
       workChannel = null;
+      // Retain the failure reason on the marker so the supervisor can show WHY
+      // presence dropped (bad URL, refused socket, …), not just `disconnected`.
+      // The contract diagnostic field is `agentic.message` (#99), matching the
+      // live-disconnect path above — keep the key consistent, not `reason`.
+      agenticState = { ...agenticState, status: 'disconnected', message: normalizeAgenticMessage(err) };
+      writeActivity();
       logger.warn(`  agentic channel unavailable (${err?.message || err}); continuing without visibility.`);
     }
     // C4 (#43): observe the client's built-in outbound buffer across the
@@ -5656,6 +5803,8 @@ function summarizeSupervisorWorker(w, now = Date.now()) {
   // Per-job activity (supervised workers only). Guard on pid so a stale marker
   // left by a previous incarnation can't show a dead job as in-flight.
   let activity = null; // { state: 'busy'|'idle', jobs: [{ key, type, sinceMs, sinceEpochMs }] }
+  let engine = null; // job-polling engine base URL this worker reported (#99)
+  let agentic = null; // { status, mode, url, discovered } agentic-channel state (#99)
   if (alive) {
     const act = readWorkerActivity(w.id);
     if (act && act.pid === w.pid) {
@@ -5670,6 +5819,10 @@ function summarizeSupervisorWorker(w, now = Date.now()) {
           }))
         : [];
       activity = { state: jobs.length > 0 ? 'busy' : 'idle', jobs };
+      // Engine + agentic-channel status ride the same pid-guarded marker, so a
+      // stale incarnation can't show a dead worker as connected to a hub.
+      engine = typeof act.engine === 'string' && act.engine ? act.engine : null;
+      agentic = act.agentic && typeof act.agentic === 'object' ? act.agentic : null;
     }
     // No marker (or a stale-pid one): leave activity null → rendered as unknown.
   }
@@ -5684,6 +5837,8 @@ function summarizeSupervisorWorker(w, now = Date.now()) {
     lastExit: w.lastExit ?? null,
     args: Array.isArray(w.args) ? w.args : [],
     activity,
+    engine,
+    agentic,
   };
 }
 
@@ -5710,6 +5865,10 @@ function supervisorStatusSignature(workers) {
       w.activity
         ? w.activity.jobs.map((j) => `${j.key}\u0000${j.type ?? ''}`).sort()
         : null,
+      // Engine + agentic-channel status: a connect/disconnect or an engine
+      // change is a real transition that must repaint attached consoles (#99).
+      w.engine ?? '',
+      w.agentic ? (w.agentic.status ?? '') : null,
     ]),
   );
 }
@@ -5724,6 +5883,37 @@ function supervisorJobCell(w) {
   const dur = first.sinceMs != null ? ` (${formatDuration(first.sinceMs)})` : '';
   const more = rest.length > 0 ? ` +${rest.length}` : '';
   return `${first.key}${more}${dur}`;
+}
+
+/**
+ * ENGINE cell: the authority (host:port) of the engine this worker polls jobs
+ * from, so an operator can see cross-machine fleets at a glance. `-` for a
+ * down/stopping worker, `?` for a live worker not (yet) reporting or on an
+ * older build whose marker predates this field. A non-URL engine string falls
+ * back to the raw value.
+ */
+function supervisorEngineCell(w) {
+  if (w.state !== 'running') return '-';
+  if (!w.activity) return '?'; // alive but not reporting
+  if (!w.engine) return '?'; // reporting, but marker predates the engine field
+  try {
+    const host = new URL(w.engine).host;
+    return host || String(w.engine); // a scheme-less string parses host-empty
+  } catch { return String(w.engine); }
+}
+
+/**
+ * AGENTIC cell: the visibility-channel status word
+ * (`connected`/`connecting`/`disconnected`/`advisory`/`off`/`starting`), so an
+ * operator can tell whether presence actually reached the Workforce hub. `-`
+ * for a down/stopping worker, `?` for a live worker not (yet) reporting or on an
+ * older build whose marker predates this field.
+ */
+function supervisorAgenticCell(w) {
+  if (w.state !== 'running') return '-';
+  if (!w.activity) return '?'; // alive but not reporting
+  if (!w.agentic || !w.agentic.status) return '?'; // marker predates the agentic field
+  return String(w.agentic.status);
 }
 
 /**
@@ -5871,14 +6061,19 @@ function formatSupervisorStatus(status) {
     id: String(w.id),
     profile: String(w.profile),
     state: String(w.state),
+    engine: supervisorEngineCell(w),
+    agentic: supervisorAgenticCell(w),
     job: supervisorJobCell(w),
     pid: w.pid ? String(w.pid) : '-',
     restarts: String(w.restarts),
     uptime: w.state === 'running' ? formatDuration(w.uptimeMs) : '-',
     last: w.lastExit ? String(w.lastExit) : '-',
   }));
-  const head = { id: 'ID', profile: 'PROFILE', state: 'STATE', job: 'JOB', pid: 'PID', restarts: 'RESTARTS', uptime: 'UPTIME', last: 'LAST EXIT' };
-  const cols = ['id', 'profile', 'state', 'job', 'pid', 'restarts', 'uptime', 'last'];
+  // ENGINE + AGENTIC sit early (just after STATE) so the pinned live view's
+  // width clamp (which trims from the right) drops the least-critical columns
+  // (LAST EXIT, UPTIME) first and keeps the visibility diagnostics visible.
+  const head = { id: 'ID', profile: 'PROFILE', state: 'STATE', engine: 'ENGINE', agentic: 'AGENTIC', job: 'JOB', pid: 'PID', restarts: 'RESTARTS', uptime: 'UPTIME', last: 'LAST EXIT' };
+  const cols = ['id', 'profile', 'state', 'engine', 'agentic', 'job', 'pid', 'restarts', 'uptime', 'last'];
   const width = {};
   for (const c of cols) width[c] = Math.max(head[c].length, ...rows.map((r) => r[c].length));
   const fmt = (r) => '  ' + cols.map((c) => r[c].padEnd(width[c])).join('  ');
@@ -8723,6 +8918,11 @@ export {
   printSupervisorStatus,
   supervisorStatusSignature,
   supervisorJobCell,
+  supervisorEngineCell,
+  supervisorAgenticCell,
+  agenticStateForTarget,
+  normalizeAgenticMessage,
+  buildActivityPayload,
   supervisorWorkerActivityFile,
   WORK_FORWARD_FLAGS,
   installParentDeathWatchdog,
@@ -8783,7 +8983,7 @@ export const metadata = {
         { command: 'NANO_AGENTIC_URL=http://localhost:8080 NANO_AGENTIC_SECRET=<shared-secret> c8ctl nano work reviewer', description: 'Enrol the worker on the app\'s same-port /agentic channel in SECURE mode (same NANO_AGENTIC_SECRET as the server) so it appears live (presence + relay terminals) on the Workforce visibility page' },
         { command: 'c8ctl nano supervisor start --worker reviewer --worker coder', description: 'Start a detached supervisor managing several workers from one terminal' },
         { command: 'c8ctl nano supervisor', description: 'Attach an interactive console to the supervisor (detach with Ctrl-D, leaving it running)' },
-        { command: 'c8ctl nano supervisor status', description: 'List supervised workers (pid, state, serviced job / idle, restarts, uptime) without the console' },
+        { command: 'c8ctl nano supervisor status', description: 'List supervised workers (state, ENGINE + AGENTIC visibility diagnostics, serviced job / idle, pid, restarts, uptime) without the console' },
         { command: 'c8ctl nano supervisor add decider --max-parallel 2', description: 'Add a supervised worker (forwarding work flags) to the running supervisor' },
         { command: 'c8ctl nano supervisor add reviewer --instances 3', description: 'Add 3 distinct auto-named instances of a profile in one call' },
         { command: 'c8ctl nano supervisor restart reviewer', description: 'Restart a supervised worker by id or profile' },

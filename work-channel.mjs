@@ -118,6 +118,7 @@ function presenceCapability(capability, jobs) {
  * @property {(fn: (info: object) => void) => () => void} onDisconnect subscribe to channel close
  * @property {(fn: () => void) => () => void} onReconnect subscribe to reconnects (every open after the first)
  * @property {() => boolean} connected whether the channel is currently open
+ * @property {() => boolean} everConnected whether the channel has ever opened (stays true after a later close)
  * @property {() => number} buffered outbound frames currently buffered awaiting the channel
  * @property {(reason?: string) => Promise<void>} stop deregister + close cleanly
  */
@@ -272,6 +273,12 @@ export async function createWorkChannel(opts) {
     onReconnect: subscribe(reconnectListeners),
     onDisconnect: subscribe(disconnectListeners),
     connected: () => client.connected,
+    // Whether the channel has ever opened (even if it has since closed). Lets a
+    // late subscriber tell "still connecting, never opened" (false) apart from
+    // "opened then dropped before I subscribed" (true), so an initial close that
+    // fires inside the createWorkChannel() await window is reconciled to
+    // `disconnected` rather than left stuck at `connecting`.
+    everConnected: () => hasConnected,
     buffered: () => client.buffered,
     async stop(reason = 'worker stopped') {
       try {

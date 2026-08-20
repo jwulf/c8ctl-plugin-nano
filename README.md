@@ -324,6 +324,27 @@ used **verbatim** — so an explicit target always wins, and it's also how you
 disambiguate when several apps are running. `NANO_AGENTIC=off` disables the
 channel entirely and attempts **no** discovery.
 
+**Seeing it work — `supervisor status`.** Supervised workers report both the
+engine they poll and their agentic-channel state to `c8ctl nano supervisor
+status` (and the interactive console), so you don't have to read raw worker logs
+to tell whether presence actually reached the Workforce hub. The table gains an
+`ENGINE` column (the engine's `host:port`) and an `AGENTIC` column whose value is
+one of:
+
+| AGENTIC | meaning |
+| --- | --- |
+| `starting` | transient: the worker just spawned and hasn't resolved its channel target yet (pre-`connecting`) |
+| `connected` | presence is live on the hub — you should see this worker in the Cockpit |
+| `connecting` | resolved a hub, socket not open yet (or the hub is unreachable) |
+| `disconnected` | an established channel dropped (hub restart/outage) — it auto-reconnects; also set if the channel failed to start (bad URL/refused socket), in which case it stays disconnected until the worker restarts |
+| `advisory` | nothing discoverable at the engine — **not** in the Cockpit; set `NANO_AGENTIC_URL` |
+| `off` | visibility disabled (`NANO_AGENTIC=off`) |
+| `?` | a live worker not yet reporting, or an older build predating these fields |
+
+If workers show `advisory` (or stay `connecting`) while jobs still run, that's the
+"connected to the engine but empty Cockpit" case: point them at the app with
+`export NANO_AGENTIC_URL=http://<engine-host>:<appUi.port>` (e.g. `:3000`).
+
 **Secure mode (opt-in).** For a deployment where you want the visibility channel
 authenticated (rather than open on the LAN), start the server **and** every worker
 box with the **same** `NANO_AGENTIC_SECRET` — same env-var name, same value on both

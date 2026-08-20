@@ -38,12 +38,15 @@
 
 import { test } from 'node:test';
 import assert from 'node:assert/strict';
+import { writeFileSync, readFileSync, rmSync, mkdirSync } from 'node:fs';
+import { tmpdir } from 'node:os';
+import { join, dirname } from 'node:path';
 
 import { decodeFrame, encodeFrame } from './agentic.mjs';
 import { createWorkChannel } from './work-channel.mjs';
 import { createRelaySession, relayStreamName } from './work-relay.mjs';
 import { createBufferMonitor } from './work-buffer.mjs';
-import { runAgentJob } from './c8ctl-plugin.js';
+import { runAgentJob, buildActivityPayload, normalizeAgenticMessage } from './c8ctl-plugin.js';
 
 const tick = (ms = 5) => new Promise((r) => setTimeout(r, ms));
 const BASE = { url: 'http://localhost:8080', token: 'ident-secret', credential: 'cap-cred' };
@@ -86,6 +89,16 @@ function makeTransportDouble() {
       const conn = conns[conns.length - 1];
       if (!conn || conn.closed) throw new Error('no open connection to deliver an inbound frame');
       conn.hooks.onFrame(encodeFrame(frame));
+    },
+    // Simulate a REMOTE drop of the currently-open connection (a hub outage),
+    // firing onClose({ local:false }) so the channel's onDisconnect fan-out runs —
+    // exactly the close `workAgent`'s live-disconnect marker path reacts to.
+    dropCurrent() {
+      const conn = conns[conns.length - 1];
+      if (conn && !conn.closed) {
+        conn.closed = true;
+        conn.hooks.onClose({ local: false });
+      }
     },
   };
 }
@@ -359,4 +372,87 @@ test('a hub outage during a live job buffers the harness terminal and drains it 
   session.close();
   monitor.stop();
   await ch.stop();
+});
+
+// ===========================================================================
+// The live-connection MARKER wiring (#99): the channel lifecycle callbacks the
+// `work` runtime subscribes (onConnect/onReconnect/onDisconnect) must rewrite
+// the pid-guarded supervisor activity marker `agentic.status`, so a supervised
+// worker's Agentic column tracks connected↔disconnected instead of sticking at
+// `starting`/`connecting`. The sibling unit tests cover the pure state mapper
+// (`agenticStateForTarget`) and the payload builder (`buildActivityPayload`) in
+// isolation, and `work-channel.test.mjs` covers the channel's own connect/drop
+// semantics — but none proves the marker-write GLUE those callbacks run. This
+// composes that exact wiring (c8ctl-plugin.js ~4927-4932) over the REAL channel
+// on a transport double and asserts the transitions land on the marker FILE,
+// read back the same way `readWorkerActivity` reads it.
+// ===========================================================================
+
+test('the live channel lifecycle rewrites the pid-guarded agentic marker: starting → connected → disconnected', async () => {
+  const t = makeTransportDouble();
+  const activityFile = join(tmpdir(), `nano-agentic-marker-${process.pid}-${Date.now()}.json`);
+
+  // Reconstruct `workAgent`'s marker producer EXACTLY: an `agenticState` that
+  // starts 'starting', a `writeActivity` that atomically writes the pid-stamped
+  // payload via the SHARED `buildActivityPayload`, and the `markAgentic` merge
+  // the lifecycle callbacks call. Read back with the same JSON.parse the
+  // supervisor's `readWorkerActivity` uses, so we assert on the on-disk marker.
+  let agenticState = { status: 'starting' };
+  const writeActivity = () => {
+    const payload = buildActivityPayload({
+      pid: process.pid, updatedAt: Date.now(), jobs: [], engine: 'http://engine', agentic: agenticState,
+    });
+    const tmp = `${activityFile}.${process.pid}.tmp`;
+    mkdirSync(dirname(activityFile), { recursive: true });
+    writeFileSync(tmp, JSON.stringify(payload), { mode: 0o600 });
+    rmSync(activityFile, { force: true });
+    writeFileSync(activityFile, readFileSync(tmp));
+    rmSync(tmp, { force: true });
+  };
+  const readMarker = () => JSON.parse(readFileSync(activityFile, 'utf-8'));
+  const markAgentic = (status, message = null) => { agenticState = { ...agenticState, status, message }; writeActivity(); };
+
+  try {
+    writeActivity(); // seed the initial 'starting' marker, exactly as workAgent does
+    assert.equal(readMarker().agentic.status, 'starting', 'marker seeds at starting before the channel attaches');
+    assert.equal(readMarker().pid, process.pid, 'the marker is stamped with THIS pid (the supervisor pid-guards on it)');
+
+    const ch = await createWorkChannel({
+      ...BASE,
+      instance: 'reviewer-marker',
+      host: 'ci-box',
+      listJobKeys: () => [],
+      heartbeatIntervalMs: 0,
+      transport: t.factory,
+    });
+
+    // The EXACT wiring `workAgent` installs (c8ctl-plugin.js ~4927-4932).
+    ch.onConnect(() => markAgentic('connected'));
+    ch.onReconnect(() => markAgentic('connected'));
+    ch.onDisconnect((info) => markAgentic('disconnected', normalizeAgenticMessage(info)));
+    if (ch.connected()) markAgentic('connected');
+    else if (ch.everConnected()) markAgentic('disconnected');
+
+    // First open → onConnect → marker reconciles to 'connected', no stale message.
+    await tick();
+    assert.equal(ch.connected(), true, 'the channel opened');
+    assert.equal(readMarker().agentic.status, 'connected', 'onConnect rewrote the marker to connected');
+    assert.equal(readMarker().agentic.message, null, 'a fresh connect carries no stale disconnect message');
+
+    // A remote hub drop → onDisconnect → marker flips to 'disconnected' WITH the
+    // normalized diagnostic (contract `agentic.message`), not stuck at connected.
+    t.dropCurrent();
+    await tick();
+    assert.equal(readMarker().agentic.status, 'disconnected', 'onDisconnect rewrote the marker to disconnected');
+    assert.equal(readMarker().agentic.message, 'connection dropped', 'the close diagnostic rides the marker message field');
+
+    // onReconnect runs the IDENTICAL `markAgentic('connected')` glue as onConnect
+    // (proven above); driving a real reopen here would only re-time-couple this
+    // test to the client's reconnect backoff, so the recovery path is covered by
+    // construction + `work-channel.test.mjs`'s own reconnect coverage.
+
+    await ch.stop('worker stopped');
+  } finally {
+    rmSync(activityFile, { force: true });
+  }
 });

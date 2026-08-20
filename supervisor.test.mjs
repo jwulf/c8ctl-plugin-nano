@@ -32,6 +32,7 @@ import {
   supervisorJobCell,
   supervisorEngineCell,
   supervisorAgenticCell,
+  agenticStateForTarget,
   supervisorWorkerActivityFile,
   WORK_FORWARD_FLAGS,
 } from './c8ctl-plugin.js';
@@ -709,6 +710,63 @@ test('supervisorStatusSignature changes on an agentic status transition', () => 
   const connecting = pub({ activity: { state: 'idle', jobs: [] }, agentic: { status: 'connecting' } });
   const connected = pub({ activity: { state: 'idle', jobs: [] }, agentic: { status: 'connected' } });
   assert.notEqual(supervisorStatusSignature([connecting]), supervisorStatusSignature([connected]));
+});
+
+// --- agenticStateForTarget: the activity-marker PRODUCER (issue #99) --------
+// The reader/renderer tests above prove a well-formed marker renders; these
+// cover the seam that WRITES it, so a regression that leaves supervised workers
+// stuck at `?`/`starting` is caught even though the readers pass.
+test('agenticStateForTarget maps off/advisory/connect the way the marker producer writes them', () => {
+  // off — the off-switch is set.
+  assert.deepEqual(agenticStateForTarget({ status: 'off' }), { status: 'off' });
+
+  // advisory — retains the discovery diagnostic message (missing API / timeout /
+  // non-Nano endpoint) so the supervisor can tell them apart, not just `advisory`.
+  assert.deepEqual(
+    agenticStateForTarget({ status: 'advisory', message: 'projects API absent' }),
+    { status: 'advisory', message: 'projects API absent' },
+  );
+  // advisory with no message still records the key (null), never undefined.
+  assert.deepEqual(agenticStateForTarget({ status: 'advisory' }), { status: 'advisory', message: null });
+
+  // connect — 'connecting' until the socket opens, carrying mode/url/discovery.
+  const secure = agenticStateForTarget(
+    { status: 'connect', config: { secure: true, url: 'wss://hub/agentic', discovered: { project: 'WF', port: 3000, host: 'h' } } },
+    (u) => `redacted:${u}`,
+  );
+  assert.deepEqual(secure, {
+    status: 'connecting',
+    mode: 'secure',
+    url: 'redacted:wss://hub/agentic',
+    discovered: { project: 'WF', port: 3000, host: 'h' },
+  });
+  const local = agenticStateForTarget({ status: 'connect', config: { secure: false, url: 'ws://h/agentic' } });
+  assert.equal(local.status, 'connecting');
+  assert.equal(local.mode, 'local');
+  assert.equal(local.discovered, null);
+
+  // ambiguous is a caller hard-stop that never reaches the marker → degrades to off.
+  assert.deepEqual(agenticStateForTarget({ status: 'ambiguous', message: 'x' }), { status: 'off' });
+});
+
+test('agenticStateForTarget connect state layers into connect/disconnect transitions', () => {
+  // The channel lifecycle merges a status word onto the base state
+  // (`{ ...state, status }`); assert connect→disconnect preserves the carried
+  // target fields and that a failure reason can ride alongside.
+  const base = agenticStateForTarget({ status: 'connect', config: { secure: false, url: 'ws://h/agentic', discovered: { project: 'WF' } } });
+  const connected = { ...base, status: 'connected' };
+  assert.equal(connected.status, 'connected');
+  assert.equal(connected.mode, 'local');
+  assert.deepEqual(connected.discovered, { project: 'WF' });
+
+  const disconnected = { ...base, status: 'disconnected', reason: 'ECONNREFUSED' };
+  assert.equal(disconnected.status, 'disconnected');
+  assert.equal(disconnected.reason, 'ECONNREFUSED');
+  // The carried target fields survive the transition so the cell can still show WHERE.
+  assert.deepEqual(disconnected.discovered, { project: 'WF' });
+  // The renderer still reduces either transition to the status word.
+  assert.equal(supervisorAgenticCell({ state: 'running', activity: { state: 'idle', jobs: [] }, agentic: connected }), 'connected');
+  assert.equal(supervisorAgenticCell({ state: 'running', activity: { state: 'idle', jobs: [] }, agentic: disconnected }), 'disconnected');
 });
 
 test('supervisorStatusSignature changes when the polled engine changes', () => {

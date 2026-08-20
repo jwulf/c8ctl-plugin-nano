@@ -4408,6 +4408,40 @@ async function resolveAgenticTarget(opts = {}) {
 }
 
 /**
+ * Map a resolved `resolveAgenticTarget` result to the INITIAL agentic-channel
+ * state persisted on the supervisor activity marker (#99). Pure so the marker
+ * producer's state transitions are unit-testable without a live broker/SDK
+ * client — a regression here would leave every supervised worker stuck at
+ * `?`/`starting`, which the reader/renderer tests can't catch. `connected`/
+ * `disconnected` are layered on top of this base by the channel lifecycle
+ * (a `{ ...state, status }` merge). The `ambiguous` status is a hard-stop
+ * handled by the caller (never reaches the marker), so it degrades to `off`
+ * here. `safeUrl` mirrors the caller's defensive display-URL builder.
+ * @param {{ status?: string, config?: any, message?: string }} target
+ * @param {(u: string) => (string|null)} [safeUrl]
+ */
+function agenticStateForTarget(target, safeUrl = (u) => u) {
+  switch (target?.status) {
+    case 'connect': {
+      const cfg = target.config || {};
+      return {
+        status: 'connecting',
+        mode: cfg.secure ? 'secure' : 'local',
+        url: safeUrl(cfg.url),
+        discovered: cfg.discovered || null,
+      };
+    }
+    case 'advisory':
+      // Retain the discovery diagnostic so the supervisor can distinguish a
+      // missing projects API, a timeout, or a non-Nano endpoint (#99).
+      return { status: 'advisory', message: target.message || null };
+    case 'off':
+    default:
+      return { status: 'off' };
+  }
+}
+
+/**
  * work — turn a hire profile into live Nano job workers (one per job-type in
  * the rank×capability matrix) and poll for work in the foreground until Ctrl-C.
  * Uses the c8ctl-provided SDK client (globalThis.c8ctl.createClient()).
@@ -4781,12 +4815,7 @@ async function workAgent(req, flags) {
       // 'connecting' until the socket actually opens (wired on the channel
       // lifecycle below). Carry the resolved mode/target/discovery so the
       // supervisor can show WHERE presence is being announced (#99).
-      agenticState = {
-        status: 'connecting',
-        mode: agenticCfg.secure ? 'secure' : 'local',
-        url: safeAgenticDisplayUrl(agenticCfg.url),
-        discovered: agenticCfg.discovered || null,
-      };
+      agenticState = agenticStateForTarget(agenticTarget, safeAgenticDisplayUrl);
       break;
     case 'ambiguous':
       // The operator ran with visibility on-by-default but the hub is
@@ -4795,12 +4824,12 @@ async function workAgent(req, flags) {
       process.exit(1);
       break;
     case 'advisory':
-      agenticState = { status: 'advisory' };
+      agenticState = agenticStateForTarget(agenticTarget);
       logger.info(`  agentic channel: ${agenticTarget.message}`);
       break;
     case 'off':
     default:
-      agenticState = { status: 'off' };
+      agenticState = agenticStateForTarget(agenticTarget);
       logger.info('  agentic channel: disabled — the off-switch is set (NANO_AGENTIC=off or persisted agentic:false). Clear it to use default LOCAL visibility.');
       break;
   }
@@ -4844,7 +4873,9 @@ async function workAgent(req, flags) {
     } catch (err) {
       // Never let a channel failure stop the worker from doing its actual job.
       workChannel = null;
-      agenticState = { ...agenticState, status: 'disconnected' };
+      // Retain the failure reason on the marker so the supervisor can show WHY
+      // presence dropped (bad URL, refused socket, …), not just `disconnected`.
+      agenticState = { ...agenticState, status: 'disconnected', reason: err?.message ? String(err.message) : String(err) };
       writeActivity();
       logger.warn(`  agentic channel unavailable (${err?.message || err}); continuing without visibility.`);
     }
@@ -8827,6 +8858,7 @@ export {
   supervisorJobCell,
   supervisorEngineCell,
   supervisorAgenticCell,
+  agenticStateForTarget,
   supervisorWorkerActivityFile,
   WORK_FORWARD_FLAGS,
   installParentDeathWatchdog,

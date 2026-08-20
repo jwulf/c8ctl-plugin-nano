@@ -4442,6 +4442,28 @@ function agenticStateForTarget(target, safeUrl = (u) => u) {
 }
 
 /**
+ * Build the supervisor activity-marker payload the worker atomically writes for
+ * `supervisor status`. Pure so the producer's field set is unit-testable without
+ * spawning a worker: the reader/renderer tests exercise a hand-written marker and
+ * `agenticStateForTarget` in isolation, so a regression that dropped `engine` or
+ * `agentic` from THIS payload — leaving every supervised worker's Engine/Agentic
+ * column stuck at `?` — would otherwise slip through. `jobs` is the live active-job
+ * list; `busy` is derived so callers can't desync it from `jobs`.
+ * @param {{ pid:number, updatedAt:number, jobs:Array<{key:string,type:string,since:number}>, engine:(string|null), agentic:object }} fields
+ */
+function buildActivityPayload({ pid, updatedAt, jobs, engine, agentic }) {
+  const jobList = Array.isArray(jobs) ? jobs : [];
+  return {
+    pid,
+    updatedAt,
+    busy: jobList.length > 0,
+    jobs: jobList,
+    engine: engine ?? null,
+    agentic,
+  };
+}
+
+/**
  * work — turn a hire profile into live Nano job workers (one per job-type in
  * the rank×capability matrix) and poll for work in the foreground until Ctrl-C.
  * Uses the c8ctl-provided SDK client (globalThis.c8ctl.createClient()).
@@ -4751,7 +4773,7 @@ async function workAgent(req, flags) {
   const writeActivity = () => {
     if (!activityFile) return;
     const jobs = [...activeJobs.entries()].map(([key, v]) => ({ key, type: v.type, since: v.since }));
-    const payload = { pid: process.pid, updatedAt: Date.now(), busy: jobs.length > 0, jobs, engine: workerEngine, agentic: agenticState };
+    const payload = buildActivityPayload({ pid: process.pid, updatedAt: Date.now(), jobs, engine: workerEngine, agentic: agenticState });
     const tmp = `${activityFile}.${process.pid}.tmp`;
     try {
       mkdirSync(dirname(activityFile), { recursive: true });
@@ -8859,6 +8881,7 @@ export {
   supervisorEngineCell,
   supervisorAgenticCell,
   agenticStateForTarget,
+  buildActivityPayload,
   supervisorWorkerActivityFile,
   WORK_FORWARD_FLAGS,
   installParentDeathWatchdog,

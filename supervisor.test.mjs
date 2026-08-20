@@ -33,6 +33,7 @@ import {
   supervisorEngineCell,
   supervisorAgenticCell,
   agenticStateForTarget,
+  buildActivityPayload,
   supervisorWorkerActivityFile,
   WORK_FORWARD_FLAGS,
 } from './c8ctl-plugin.js';
@@ -767,6 +768,48 @@ test('agenticStateForTarget connect state layers into connect/disconnect transit
   // The renderer still reduces either transition to the status word.
   assert.equal(supervisorAgenticCell({ state: 'running', activity: { state: 'idle', jobs: [] }, agentic: connected }), 'connected');
   assert.equal(supervisorAgenticCell({ state: 'running', activity: { state: 'idle', jobs: [] }, agentic: disconnected }), 'disconnected');
+});
+
+// --- buildActivityPayload: the marker payload the producer WRITES ------------
+// agenticStateForTarget above covers the agentic-status field; this covers the
+// whole marker object writeActivity() serializes, so a regression that dropped
+// `engine` or `agentic` (leaving the Engine/Agentic columns stuck at `?`) or
+// desynced `busy` from `jobs` is caught even though the reader/renderer tests
+// pass on a hand-written marker.
+test('buildActivityPayload carries engine + agentic and derives busy from jobs', () => {
+  // Idle: no jobs → busy:false, engine + agentic present verbatim.
+  const idle = buildActivityPayload({
+    pid: 4242,
+    updatedAt: 1000,
+    jobs: [],
+    engine: 'http://localhost:8080',
+    agentic: { status: 'connected', mode: 'local' },
+  });
+  assert.deepEqual(idle, {
+    pid: 4242,
+    updatedAt: 1000,
+    busy: false,
+    jobs: [],
+    engine: 'http://localhost:8080',
+    agentic: { status: 'connected', mode: 'local' },
+  });
+
+  // Busy: jobs present → busy:true; the live job list rides through untouched.
+  const jobs = [{ key: '99', type: 'senior:pr-review', since: 500 }];
+  const busy = buildActivityPayload({
+    pid: 7, updatedAt: 2000, jobs, engine: null, agentic: { status: 'starting' },
+  });
+  assert.equal(busy.busy, true);
+  assert.deepEqual(busy.jobs, jobs);
+  // engine is always recorded (null, never undefined) so the reader sees the key.
+  assert.equal(busy.engine, null);
+  assert.ok('engine' in busy);
+  assert.deepEqual(busy.agentic, { status: 'starting' });
+
+  // A missing/non-array jobs list degrades to empty + idle, never throws.
+  const noJobs = buildActivityPayload({ pid: 1, updatedAt: 3, jobs: undefined, engine: 'e', agentic: { status: 'off' } });
+  assert.deepEqual(noJobs.jobs, []);
+  assert.equal(noJobs.busy, false);
 });
 
 test('supervisorStatusSignature changes when the polled engine changes', () => {

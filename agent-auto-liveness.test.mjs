@@ -15,6 +15,7 @@
 import { test } from 'node:test';
 import assert from 'node:assert/strict';
 import { spawn } from 'node:child_process';
+import { createServer } from 'node:net';
 import { mkdtempSync, writeFileSync, rmSync } from 'node:fs';
 import { tmpdir } from 'node:os';
 import { join } from 'node:path';
@@ -58,10 +59,19 @@ test('nano work --auto: a failed INITIAL engine read keeps the worker alive (no 
   writeFileSync(join(HOME, 'config.json'), JSON.stringify({
     hires: { faker: { name: 'faker', rank: 'senior', command: 'true', model: '', capabilities: [] } },
   }));
+
+  // Stand up a local TCP server on an EPHEMERAL port that immediately drops every
+  // connection. Pointing the worker's engine read at this port forces a
+  // deterministic connection failure (socket hang up / reset) regardless of the
+  // host's environment — unlike a fixed well-known port (e.g. 9/discard), which
+  // can actually be listening and make the test flaky or skip the failure path.
+  const deadServer = createServer((sock) => { sock.destroy(); });
+  await new Promise((resolve) => deadServer.listen(0, '127.0.0.1', resolve));
+  t.after(() => { try { deadServer.close(); } catch { /* ignore */ } });
+  const deadPort = deadServer.address().port;
+
   const harness = join(HOME, 'harness.mjs');
-  // Port 9 (discard) is effectively never listening — the initial engine read
-  // there fails fast with a connection error, driving the 0-poller path.
-  writeFileSync(harness, harnessSource(9));
+  writeFileSync(harness, harnessSource(deadPort));
 
   const child = spawn(process.execPath, [harness], {
     env: (() => {

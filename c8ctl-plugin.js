@@ -2511,6 +2511,12 @@ function resolveAutoRestConfig(camunda, env = process.env) {
 // stays a pure, synchronous function; `readDeployedAgentJobTypes` supplies the
 // real one from the lazily-imported demand surface (`agentic.mjs`).
 function scanAgentTaskLeaves(xml, scanTaskDefinitions) {
+  if (typeof scanTaskDefinitions !== 'function') {
+    throw new TypeError(
+      'scanAgentTaskLeaves: `scanTaskDefinitions` must be an injected function ' +
+        `(got ${typeof scanTaskDefinitions}); pass demand.scanTaskDefinitions from ./agentic.mjs`
+    );
+  }
   return scanTaskDefinitions(String(xml || ''))
     .filter((leaf) => leaf.agentic)
     .map((leaf) => ({ taskType: leaf.taskType, process: leaf.process }));

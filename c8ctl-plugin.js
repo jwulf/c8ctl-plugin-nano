@@ -2493,7 +2493,8 @@ function resolveAutoRestConfig(camunda, env = process.env) {
 // verbatim — colon-named types are NOT forced through the agentic dot-grammar.
 // ---------------------------------------------------------------------------
 
-// True iff a serviceTask body carries a `zeebe:taskHeader` under the agent-task
+// True iff a serviceTask body carries a `zeebe:header` (inside its
+// `zeebe:taskHeaders`) under the agent-task
 // namespace — the LEGACY marker that distinguishes an agent task from a plain
 // connector / record-keeper. Matches the exact `io.nanobpm.agentTask` key and
 // any flattened `io.nanobpm.agentTask.*` dotpath key (element templates emit the

@@ -2483,82 +2483,37 @@ function resolveAutoRestConfig(camunda, env = process.env) {
 // exist" is answerable from that engine alone.
 //
 // `@nanobpm/agentic/demand` already reads deployed `taskDefinition` leaves over
-// C8 REST (`process-definitions/search` → `/{key}/xml`), but its scanner reads
-// type/element/process only. Not every service task is an agent task — plain
-// connectors and record-keepers (e.g. `pr.record-plan`) are ordinary workers.
-// The demand scanner is therefore extended HERE to read `zeebe:taskHeaders` and
-// keep only leaves whose service task carries an `io.nanobpm.agentTask.` header
-// (e.g. `senior:plan` carries `io.nanobpm.agentTask.task.prompt`; a record-keeper
-// does not). Advertise the raw job-type string the engine matches (`senior:plan`)
-// verbatim — colon-named types are NOT forced through the agentic dot-grammar.
+// C8 REST (`process-definitions/search` → `/{key}/xml`). As of
+// `@nanobpm/agentic@0.4.0` its `scanTaskDefinitions(xml)` tags every leaf with a
+// canonical `agentic: boolean` — true iff the service task declares a
+// `<zeebe:linkedResource … linkName="prompt">` base-prompt side-car (its internal
+// `hasPromptLink`). That flag is the SINGLE SOURCE OF TRUTH for agentic-ness (see
+// the package's `demand/taskdef.d.ts` and nano-workforce SPEC "Agent job
+// contract"): every external agent task delivers its base prompt through a
+// `linkName="prompt"` linked resource, and no in-process worker task does. Not
+// every service task is an agent task — plain connectors and record-keepers
+// (e.g. `pr.record-plan`) are ordinary workers, and they carry no prompt link.
+//
+// Per AGENTS.md "Derivation Over Duplication: No Drift Surfaces", this plugin
+// CONSUMES that flag rather than re-implementing the scan, so the detector can
+// never drift out of lock-step with the package again (as it did in #95, when a
+// local copy keyed on the legacy `io.nanobpm.agentTask` header missed the current
+// linked-prompt marker). Advertise the raw job-type string the engine matches
+// (`senior:plan`) verbatim — colon-named types are NOT forced through the agentic
+// dot-grammar.
 // ---------------------------------------------------------------------------
 
-// True iff a serviceTask body carries a `zeebe:header` (inside its
-// `zeebe:taskHeaders`) under the agent-task
-// namespace — the LEGACY marker that distinguishes an agent task from a plain
-// connector / record-keeper. Matches the exact `io.nanobpm.agentTask` key and
-// any flattened `io.nanobpm.agentTask.*` dotpath key (element templates emit the
-// latter, e.g. `io.nanobpm.agentTask.task.prompt`). Older deployments carry this;
-// the current `@nanobpm/workflow` toolchain emits the linked-prompt marker below
-// instead, so BOTH must be recognised (jwulf/c8ctl-plugin-nano#95).
-function serviceTaskHasAgentHeader(body) {
-  const headerRe = /<zeebe:header\b[^>]*\bkey\s*=\s*"([^"]*)"/g;
-  let m;
-  while ((m = headerRe.exec(body)) !== null) {
-    const key = m[1];
-    if (key === AGENT_TASK_NS || key.startsWith(`${AGENT_TASK_NS}.`)) return true;
-  }
-  return false;
-}
-
-// True iff a serviceTask body links a prompt resource — the CURRENT canonical
-// agent-task marker emitted by `@nanobpm/workflow` / the Urban toolchain:
-// `<zeebe:linkedResource … resourceType="GenericScript" linkName="prompt" />`.
-// An agent task links the model/prompt the harness runs; a plain connector /
-// record-keeper does not. Matched by the `linkName="prompt"` binding (attribute
-// order-independent) so a compiled model with no `io.nanobpm.agentTask` header
-// is still discovered (jwulf/c8ctl-plugin-nano#95). Kept in lock-step with the
-// authored nano-workforce models (resources/processes/*.bpmn), where every
-// `senior:*` service task carries this binding and none carry the legacy header.
-// NOTE: this mirrors `@nanobpm/agentic@0.4.0`'s released `scanTaskDefinitions`
-// `agentic` flag (its internal `hasPromptLink`); #102 tracks replacing this local
-// copy by consuming that detector once the `^0.1.0 → ^0.4.0` bump is vetted.
-function serviceTaskHasLinkedPrompt(body) {
-  const re = new RegExp(`<zeebe:linkedResource\\b[^>]*\\blinkName\\s*=\\s*"${DEFAULT_PROMPT_LINK_NAME}"`);
-  return re.test(String(body || ''));
-}
-
-// True iff a serviceTask is an *agent* task — by EITHER the legacy
-// `io.nanobpm.agentTask.*` header OR the current linked-prompt marker. Either
-// alone is sufficient; deployments in the wild carry one or the other.
-function serviceTaskIsAgentTask(body) {
-  return serviceTaskHasAgentHeader(body) || serviceTaskHasLinkedPrompt(body);
-}
-
-// Scan one deployed BPMN document for its *agent* task-definition leaves: every
-// `<bpmn:serviceTask>` carrying BOTH a non-empty `<zeebe:taskDefinition type>`
-// AND an agent-task marker (legacy `io.nanobpm.agentTask.` header OR a
+// Scan one deployed BPMN document for its *agent* task-definition leaves: the
+// subset of `@nanobpm/agentic` `demand.scanTaskDefinitions(xml)` leaves whose
+// canonical `agentic` flag is set (i.e. the service task declares a
 // `linkName="prompt"` linked resource). Returns `{ taskType, process }` leaves in
-// first-occurrence order. This is the agent-aware extension of the demand
-// package's `scanTaskDefinitions` (which reads type/element/process only).
-function scanAgentTaskLeaves(xml) {
-  const source = String(xml || '');
-  const procMatch = source.match(/<bpmn:process\b[^>]*\bid\s*=\s*"([^"]*)"/);
-  const proc = procMatch ? procMatch[1] : '';
-  const out = [];
-  const blockRe = /<bpmn:serviceTask\b[^>]*>([\s\S]*?)<\/bpmn:serviceTask>/g;
-  let block;
-  while ((block = blockRe.exec(source)) !== null) {
-    const body = block[1];
-    const tdMatch = body.match(/<zeebe:taskDefinition\b[^>]*>/);
-    if (!tdMatch) continue;
-    const typeMatch = tdMatch[0].match(/\btype\s*=\s*"([^"]*)"/);
-    const taskType = typeMatch ? typeMatch[1] : '';
-    if (!taskType) continue;
-    if (!serviceTaskIsAgentTask(body)) continue;
-    out.push({ taskType, process: proc });
-  }
-  return out;
+// first-occurrence order. The published `scanTaskDefinitions` is INJECTED so this
+// stays a pure, synchronous function; `readDeployedAgentJobTypes` supplies the
+// real one from the lazily-imported demand surface (`agentic.mjs`).
+function scanAgentTaskLeaves(xml, scanTaskDefinitions) {
+  return scanTaskDefinitions(String(xml || ''))
+    .filter((leaf) => leaf.agentic)
+    .map((leaf) => ({ taskType: leaf.taskType, process: leaf.process }));
 }
 
 // Read the distinct deployed *agent* job types through a demand C8RestReader
@@ -2567,12 +2522,13 @@ function scanAgentTaskLeaves(xml) {
 // optional `scope` narrows to one app/network — kept only when the leaf's
 // `bpmn:process` id equals or is prefixed by the scope string.
 async function readDeployedAgentJobTypes(reader, { scope = '' } = {}) {
+  const { demand } = await import('./agentic.mjs');
   const keys = await reader.searchProcessDefinitionKeys();
   const seen = new Set();
   const out = [];
   for (const key of keys) {
     const xml = await reader.getProcessDefinitionXml(key);
-    for (const leaf of scanAgentTaskLeaves(xml)) {
+    for (const leaf of scanAgentTaskLeaves(xml, demand.scanTaskDefinitions)) {
       if (scope && !(leaf.process === scope || leaf.process.startsWith(scope))) continue;
       if (seen.has(leaf.taskType)) continue;
       seen.add(leaf.taskType);
@@ -4730,7 +4686,9 @@ async function workAgent(req, flags) {
   // no capability, no app enrol endpoint, no channel connection. It is the
   // mutually-exclusive counterpart to capability-resolved SERVE: in `--auto`
   // the rank×capability matrix is bypassed entirely (any deployed agent job is
-  // served, gated only by the `io.nanobpm.agentTask.` task header), and the
+  // served, gated only by the leaf's canonical `agentic` flag — the
+  // `linkName="prompt"` linked-resource marker read by
+  // `@nanobpm/agentic`'s demand scanner), and the
   // desired set is reconciled by polling the engine rather than watching the
   // profile. `--auto-scope <process-id|prefix>` narrows the blast radius to one
   // app/network; without it, every agent job type on the engine is served.
@@ -8909,9 +8867,6 @@ export {
   jobTypeMatrix,
   diffJobTypes,
   parseJobTypeFlags,
-  serviceTaskHasAgentHeader,
-  serviceTaskHasLinkedPrompt,
-  serviceTaskIsAgentTask,
   scanAgentTaskLeaves,
   readDeployedAgentJobTypes,
   resolveAutoJobTypes,

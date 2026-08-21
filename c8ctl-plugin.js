@@ -2493,11 +2493,14 @@ function resolveAutoRestConfig(camunda, env = process.env) {
 // verbatim — colon-named types are NOT forced through the agentic dot-grammar.
 // ---------------------------------------------------------------------------
 
-// True iff a serviceTask body carries a `zeebe:taskHeader` under the agent-task
-// namespace — the marker that distinguishes an agent task from a plain
+// True iff a serviceTask body carries a `zeebe:header` (inside its
+// `zeebe:taskHeaders`) under the agent-task
+// namespace — the LEGACY marker that distinguishes an agent task from a plain
 // connector / record-keeper. Matches the exact `io.nanobpm.agentTask` key and
 // any flattened `io.nanobpm.agentTask.*` dotpath key (element templates emit the
-// latter, e.g. `io.nanobpm.agentTask.task.prompt`).
+// latter, e.g. `io.nanobpm.agentTask.task.prompt`). Older deployments carry this;
+// the current `@nanobpm/workflow` toolchain emits the linked-prompt marker below
+// instead, so BOTH must be recognised (jwulf/c8ctl-plugin-nano#95).
 function serviceTaskHasAgentHeader(body) {
   const headerRe = /<zeebe:header\b[^>]*\bkey\s*=\s*"([^"]*)"/g;
   let m;
@@ -2508,11 +2511,36 @@ function serviceTaskHasAgentHeader(body) {
   return false;
 }
 
+// True iff a serviceTask body links a prompt resource — the CURRENT canonical
+// agent-task marker emitted by `@nanobpm/workflow` / the Urban toolchain:
+// `<zeebe:linkedResource … resourceType="GenericScript" linkName="prompt" />`.
+// An agent task links the model/prompt the harness runs; a plain connector /
+// record-keeper does not. Matched by the `linkName="prompt"` binding (attribute
+// order-independent) so a compiled model with no `io.nanobpm.agentTask` header
+// is still discovered (jwulf/c8ctl-plugin-nano#95). Kept in lock-step with the
+// authored nano-workforce models (resources/processes/*.bpmn), where every
+// `senior:*` service task carries this binding and none carry the legacy header.
+// NOTE: this mirrors `@nanobpm/agentic@0.4.0`'s released `scanTaskDefinitions`
+// `agentic` flag (its internal `hasPromptLink`); #102 tracks replacing this local
+// copy by consuming that detector once the `^0.1.0 → ^0.4.0` bump is vetted.
+function serviceTaskHasLinkedPrompt(body) {
+  const re = new RegExp(`<zeebe:linkedResource\\b[^>]*\\blinkName\\s*=\\s*"${DEFAULT_PROMPT_LINK_NAME}"`);
+  return re.test(String(body || ''));
+}
+
+// True iff a serviceTask is an *agent* task — by EITHER the legacy
+// `io.nanobpm.agentTask.*` header OR the current linked-prompt marker. Either
+// alone is sufficient; deployments in the wild carry one or the other.
+function serviceTaskIsAgentTask(body) {
+  return serviceTaskHasAgentHeader(body) || serviceTaskHasLinkedPrompt(body);
+}
+
 // Scan one deployed BPMN document for its *agent* task-definition leaves: every
 // `<bpmn:serviceTask>` carrying BOTH a non-empty `<zeebe:taskDefinition type>`
-// AND an `io.nanobpm.agentTask.` task header. Returns `{ taskType, process }`
-// leaves in first-occurrence order. This is the header-aware extension of the
-// demand package's `scanTaskDefinitions` (which reads type/element/process only).
+// AND an agent-task marker (legacy `io.nanobpm.agentTask.` header OR a
+// `linkName="prompt"` linked resource). Returns `{ taskType, process }` leaves in
+// first-occurrence order. This is the agent-aware extension of the demand
+// package's `scanTaskDefinitions` (which reads type/element/process only).
 function scanAgentTaskLeaves(xml) {
   const source = String(xml || '');
   const procMatch = source.match(/<bpmn:process\b[^>]*\bid\s*=\s*"([^"]*)"/);
@@ -2527,7 +2555,7 @@ function scanAgentTaskLeaves(xml) {
     const typeMatch = tdMatch[0].match(/\btype\s*=\s*"([^"]*)"/);
     const taskType = typeMatch ? typeMatch[1] : '';
     if (!taskType) continue;
-    if (!serviceTaskHasAgentHeader(body)) continue;
+    if (!serviceTaskIsAgentTask(body)) continue;
     out.push({ taskType, process: proc });
   }
   return out;
@@ -8882,6 +8910,8 @@ export {
   diffJobTypes,
   parseJobTypeFlags,
   serviceTaskHasAgentHeader,
+  serviceTaskHasLinkedPrompt,
+  serviceTaskIsAgentTask,
   scanAgentTaskLeaves,
   readDeployedAgentJobTypes,
   resolveAutoJobTypes,

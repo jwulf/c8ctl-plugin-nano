@@ -9,6 +9,8 @@ import assert from 'node:assert/strict';
 
 import {
   serviceTaskHasAgentHeader,
+  serviceTaskHasLinkedPrompt,
+  serviceTaskIsAgentTask,
   scanAgentTaskLeaves,
   readDeployedAgentJobTypes,
   resolveAutoJobTypes,
@@ -16,7 +18,9 @@ import {
 } from './c8ctl-plugin.js';
 
 // A minimal deployed-model builder: one bpmn:process with the given service
-// tasks. Each task is `{ id, type, headers?: [key,...], noTaskDef?: bool }`.
+// tasks. Each task is `{ id, type, headers?: [key,...], linkedPrompt?: bool,
+// noTaskDef?: bool }`. `linkedPrompt` emits the current canonical agent-task
+// marker (`<zeebe:linkedResource … linkName="prompt">`) instead of a header.
 function model(processId, tasks) {
   const body = tasks
     .map((t) => {
@@ -24,7 +28,10 @@ function model(processId, tasks) {
       const headers = (t.headers && t.headers.length)
         ? `<zeebe:taskHeaders>${t.headers.map((k) => `<zeebe:header key="${k}" value="x" />`).join('')}</zeebe:taskHeaders>`
         : '';
-      return `<bpmn:serviceTask id="${t.id}"><bpmn:extensionElements>${td}${headers}</bpmn:extensionElements></bpmn:serviceTask>`;
+      const linked = t.linkedPrompt
+        ? `<zeebe:linkedResources><zeebe:linkedResource resourceId="${t.id}.md" bindingType="latest" resourceType="GenericScript" linkName="prompt" /></zeebe:linkedResources>`
+        : '';
+      return `<bpmn:serviceTask id="${t.id}"><bpmn:extensionElements>${td}${headers}${linked}</bpmn:extensionElements></bpmn:serviceTask>`;
     })
     .join('');
   return `<?xml version="1.0"?><bpmn:definitions xmlns:bpmn="http://x" xmlns:zeebe="http://y"><bpmn:process id="${processId}" isExecutable="true">${body}</bpmn:process></bpmn:definitions>`;
@@ -73,6 +80,48 @@ test('scanAgentTaskLeaves preserves the raw colon-named job type verbatim', () =
     { id: 'r', type: 'senior:pr-review', headers: [`${AGENT_TASK_NS}.task.prompt`] },
   ]);
   assert.deepEqual(scanAgentTaskLeaves(xml).map((l) => l.taskType), ['senior:pr-review']);
+});
+
+// jwulf/c8ctl-plugin-nano#95 — the current `@nanobpm/workflow` toolchain marks
+// agent tasks with a `<zeebe:linkedResource … linkName="prompt">` binding, NOT an
+// `io.nanobpm.agentTask` header, so header-only detection discovered 0 job types
+// on every current nano-workforce deployment.
+test('serviceTaskHasLinkedPrompt matches the linkName="prompt" binding', () => {
+  assert.equal(
+    serviceTaskHasLinkedPrompt('<zeebe:linkedResource resourceId="feature.md" resourceType="GenericScript" linkName="prompt" />'),
+    true,
+  );
+  // Attribute order-independent (linkName first).
+  assert.equal(serviceTaskHasLinkedPrompt('<zeebe:linkedResource linkName="prompt" resourceType="GenericScript" />'), true);
+  // A non-prompt linked resource is not an agent marker.
+  assert.equal(serviceTaskHasLinkedPrompt('<zeebe:linkedResource linkName="form" resourceType="Form" />'), false);
+  assert.equal(serviceTaskHasLinkedPrompt(''), false);
+});
+
+test('serviceTaskIsAgentTask accepts EITHER the legacy header or the linked prompt', () => {
+  assert.equal(serviceTaskIsAgentTask(`<zeebe:header key="${AGENT_TASK_NS}.task.prompt" value="x"/>`), true);
+  assert.equal(serviceTaskIsAgentTask('<zeebe:linkedResource linkName="prompt" resourceType="GenericScript" />'), true);
+  assert.equal(serviceTaskIsAgentTask('<zeebe:header key="recordType" value="plan"/>'), false);
+});
+
+test('scanAgentTaskLeaves discovers linked-prompt agent tasks with no agent header (#95)', () => {
+  // Mirrors a current nano-workforce deployment: the senior:* task carries a
+  // linked prompt and NO io.nanobpm.agentTask header; the record-keeper carries
+  // neither and must stay excluded.
+  const xml = model('feature', [
+    { id: 'implement-task', type: 'senior:feature', linkedPrompt: true },
+    { id: 'record', type: 'pr.record-feature' },
+  ]);
+  assert.deepEqual(scanAgentTaskLeaves(xml).map((l) => l.taskType), ['senior:feature']);
+});
+
+test('scanAgentTaskLeaves discovers a mix of legacy-header and linked-prompt agent tasks', () => {
+  const xml = model('mixed', [
+    { id: 'legacy', type: 'senior:plan', headers: [`${AGENT_TASK_NS}.task.prompt`] },
+    { id: 'current', type: 'senior:pr-review', linkedPrompt: true },
+    { id: 'rec', type: 'pr.record-plan', headers: ['recordType'] },
+  ]);
+  assert.deepEqual(scanAgentTaskLeaves(xml).map((l) => l.taskType), ['senior:plan', 'senior:pr-review']);
 });
 
 test('readDeployedAgentJobTypes reads all defs, distinct + first-occurrence order', async () => {

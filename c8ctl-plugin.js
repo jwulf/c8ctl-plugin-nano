@@ -2684,16 +2684,26 @@ function resolveWorkerEngineBase(camunda, env = process.env) {
 // getAuthHeaders() is guarded so an older or atypical client runtime degrades to
 // the legacy path rather than throw.
 //
+// The base URL is invariant for a worker's lifetime, so callers on the per-job
+// hot path pass the once-at-startup `resolveWorkerEngineBase` result via
+// `baseUrl` to skip the synchronous config.json read (existsSync + readFileSync)
+// that this resolver would otherwise repeat on every job; only the auth headers
+// (which the client may rotate) are resolved per call. When `baseUrl` is omitted
+// it falls back to computing the canonical base itself, so standalone callers and
+// tests keep the single-argument behaviour.
+//
 // TODO: once c8ctl bumps @camunda8/orchestration-cluster-api to v10 (10.0.0-alpha
 // exposes the typed camunda.getResourceContentBinary({resourceKey}) → Blob), drop
 // this raw /content/binary fetch and call that method directly. The pinned ^9.1.0
 // SDK only exposes the deprecated getResourceContent, which 406s for generic
 // (Markdown) prompt resources — see camunda/orchestration-cluster-api-js.
-async function resolveLinkedPromptSource(camunda, env = process.env) {
+async function resolveLinkedPromptSource(camunda, env = process.env, { baseUrl: preResolvedBase } = {}) {
   // The fetch base follows the single canonical worker-engine resolver (explicit
   // override → active profile restAddress → localhost) so it can never drift from
-  // the base the job was activated against — the resourceKey is broker-local.
-  const baseUrl = resolveWorkerEngineBase(camunda, env);
+  // the base the job was activated against — the resourceKey is broker-local. A
+  // caller-supplied pre-resolved base (already normalized by resolveWorkerEngineBase
+  // at worker startup) is reused verbatim to avoid a per-job config.json read.
+  const baseUrl = preResolvedBase ?? resolveWorkerEngineBase(camunda, env);
   let authHeaders;
   if (env.NANO_REST_TOKEN) {
     authHeaders = { Authorization: `Bearer ${env.NANO_REST_TOKEN}` };
@@ -5035,8 +5045,10 @@ async function workAgent(req, flags) {
         try {
           // Fetch the prompt from the broker the SDK client is connected to,
           // deriving base URL + auth from that client (not restConfig, whose base
-          // defaults to localhost) — the resourceKey is broker-local.
-          const promptSource = await resolveLinkedPromptSource(camunda);
+          // defaults to localhost) — the resourceKey is broker-local. The base is
+          // invariant, so reuse the once-at-startup workerEngine and let the
+          // resolver only compute per-job auth headers (no per-job config.json read).
+          const promptSource = await resolveLinkedPromptSource(camunda, process.env, { baseUrl: workerEngine });
           const linked = await resolveLinkedPrompt(job.customHeaders ?? {}, {
             baseUrl: promptSource.baseUrl || restConfig.baseUrl,
             authHeaders: promptSource.authHeaders,

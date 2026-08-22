@@ -482,6 +482,22 @@ test('resolveLinkedPromptSource: a client without getConfig/getAuthHeaders degra
   });
 });
 
+test('resolveLinkedPromptSource: a pre-resolved baseUrl is reused verbatim (no config read) while auth is still resolved per call', async () => {
+  await withCleanAutoHome(async () => {
+    // The per-job hot path passes the once-at-startup resolveWorkerEngineBase
+    // result so the resolver skips its own config.json read. The pre-resolved
+    // base must win over what the client's profile would otherwise yield, and
+    // auth headers must still come from the (possibly rotating) client.
+    const camunda = {
+      getConfig: () => ({ restAddress: 'http://should-not-use:8080/v2' }),
+      getAuthHeaders: async () => ({ Authorization: '******' }),
+    };
+    const src = await resolveLinkedPromptSource(camunda, {}, { baseUrl: 'http://pre-resolved:8080' });
+    assert.equal(src.baseUrl, 'http://pre-resolved:8080');
+    assert.deepEqual(src.authHeaders, { Authorization: '******' });
+  });
+});
+
 // ---------------------------------------------------------------------------
 // resolveAutoRestConfig — the `--auto` engine-read base must follow the ACTIVE
 // c8ctl profile (the same client that activates jobs), never a localhost

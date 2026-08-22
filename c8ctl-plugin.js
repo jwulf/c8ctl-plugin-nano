@@ -5828,6 +5828,10 @@ function summarizeSupervisorWorker(w, now = Date.now()) {
     startedAtMs,
     lastExit: w.lastExit ?? null,
     args: Array.isArray(w.args) ? w.args : [],
+    // The per-worker log path (logs/supervisor/worker-<id>.log). Carried through
+    // so `supervisor status` can surface it (see formatSupervisorLogsLines);
+    // null when the source record predates it (e.g. an older persisted state).
+    logFile: w.logFile ?? null,
     activity,
     engine,
     agentic,
@@ -6035,6 +6039,30 @@ function createSupervisorLiveView({
 }
 
 /** Render a supervisor status object as an aligned text table. */
+/**
+ * The `Logs:` block for `supervisor status`, derived purely from the status
+ * payload so it renders identically for a live daemon status and a synthesized
+ * one. Lists the daemon log and each worker's log file, plus a hint at the
+ * existing tailer. Returns an empty array (no section) when no log path is
+ * known — an older persisted state, or a dead daemon whose frame carried none.
+ */
+function formatSupervisorLogsLines(status) {
+  const daemonLog = status?.daemon?.logFile || null;
+  const workers = Array.isArray(status?.workers) ? status.workers : [];
+  const workerLogs = workers
+    .filter((w) => w && w.logFile)
+    .map((w) => ({ label: String(w.id), path: String(w.logFile) }));
+  const entries = [];
+  if (daemonLog) entries.push({ label: 'daemon', path: String(daemonLog) });
+  for (const w of workerLogs) entries.push(w);
+  if (entries.length === 0) return [];
+  const labelWidth = Math.max(...entries.map((e) => e.label.length));
+  const out = ['', 'Logs:'];
+  for (const e of entries) out.push(`  ${e.label.padEnd(labelWidth)}  ${e.path}`);
+  out.push('  View: c8ctl nano supervisor logs [<id>] [--follow]');
+  return out;
+}
+
 function formatSupervisorStatus(status) {
   const lines = [];
   const d = status.daemon || {};
@@ -6047,6 +6075,7 @@ function formatSupervisorStatus(status) {
   lines.push('');
   if (workers.length === 0) {
     lines.push('  No workers. Add one with: c8ctl nano supervisor add <profile>');
+    lines.push(...formatSupervisorLogsLines(status));
     return lines.join('\n');
   }
   const rows = workers.map((w) => ({
@@ -6071,6 +6100,7 @@ function formatSupervisorStatus(status) {
   const fmt = (r) => '  ' + cols.map((c) => r[c].padEnd(width[c])).join('  ');
   lines.push(fmt(head));
   for (const r of rows) lines.push(fmt(r));
+  lines.push(...formatSupervisorLogsLines(status));
   return lines.join('\n');
 }
 
@@ -8903,6 +8933,7 @@ export {
   formatDuration,
   summarizeSupervisorWorker,
   formatSupervisorStatus,
+  formatSupervisorLogsLines,
   reageSupervisorStatus,
   clampToWidth,
   createSupervisorLiveView,

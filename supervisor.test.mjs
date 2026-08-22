@@ -24,6 +24,7 @@ import {
   formatDuration,
   summarizeSupervisorWorker,
   formatSupervisorStatus,
+  formatSupervisorLogsLines,
   reageSupervisorStatus,
   clampToWidth,
   createSupervisorLiveView,
@@ -389,6 +390,66 @@ test('summarizeSupervisorWorker reports a live pid as running with uptime', () =
 test('summarizeSupervisorWorker reports a stopping worker distinctly', () => {
   const row = summarizeSupervisorWorker({ id: 'x', profile: 'p', pid: process.pid, stopping: true });
   assert.equal(row.state, 'stopping');
+});
+
+test('summarizeSupervisorWorker carries the per-worker logFile through', () => {
+  const row = summarizeSupervisorWorker({
+    id: 'reviewer', profile: 'reviewer', pid: process.pid,
+    logFile: '/state/logs/supervisor/worker-reviewer.log',
+  });
+  assert.equal(row.logFile, '/state/logs/supervisor/worker-reviewer.log');
+});
+
+test('summarizeSupervisorWorker logFile is null when the source record has none', () => {
+  const row = summarizeSupervisorWorker({ id: 'reviewer', profile: 'reviewer', pid: process.pid });
+  assert.equal(row.logFile, null);
+});
+
+// --- formatSupervisorLogsLines / log discoverability -----------------------
+
+test('formatSupervisorLogsLines lists the daemon log, each worker log, and a tail hint', () => {
+  const now = Date.now();
+  const lines = formatSupervisorLogsLines({
+    daemon: { pid: process.pid, logFile: '/state/logs/supervisor/daemon.log' },
+    workers: [
+      summarizeSupervisorWorker({ id: 'reviewer', profile: 'reviewer', pid: process.pid, logFile: '/state/logs/supervisor/worker-reviewer.log' }, now),
+      summarizeSupervisorWorker({ id: 'coder', profile: 'coder', pid: 2 ** 30, logFile: '/state/logs/supervisor/worker-coder.log' }, now),
+    ],
+  });
+  const text = lines.join('\n');
+  assert.match(text, /Logs:/);
+  assert.match(text, /daemon\s+\/state\/logs\/supervisor\/daemon\.log/);
+  assert.match(text, /reviewer\s+\/state\/logs\/supervisor\/worker-reviewer\.log/);
+  assert.match(text, /coder\s+\/state\/logs\/supervisor\/worker-coder\.log/);
+  assert.match(text, /c8ctl nano supervisor logs/);
+});
+
+test('formatSupervisorLogsLines omits the section when no log path is known', () => {
+  const lines = formatSupervisorLogsLines({ daemon: { pid: process.pid }, workers: [] });
+  assert.deepEqual(lines, []);
+});
+
+test('formatSupervisorStatus surfaces log locations in the populated table', () => {
+  const now = Date.now();
+  const text = formatSupervisorStatus({
+    daemon: { pid: process.pid, logFile: '/state/logs/supervisor/daemon.log' },
+    workers: [
+      summarizeSupervisorWorker({ id: 'reviewer', profile: 'reviewer', pid: process.pid, startedAt: new Date(now - 1000).toISOString(), logFile: '/state/logs/supervisor/worker-reviewer.log' }, now),
+    ],
+  });
+  assert.match(text, /Logs:/);
+  assert.match(text, /daemon\s+\/state\/logs\/supervisor\/daemon\.log/);
+  assert.match(text, /reviewer\s+\/state\/logs\/supervisor\/worker-reviewer\.log/);
+});
+
+test('formatSupervisorStatus surfaces the daemon log even with no workers', () => {
+  const text = formatSupervisorStatus({
+    daemon: { pid: process.pid, logFile: '/state/logs/supervisor/daemon.log' },
+    workers: [],
+  });
+  assert.match(text, /No workers/);
+  assert.match(text, /Logs:/);
+  assert.match(text, /daemon\s+\/state\/logs\/supervisor\/daemon\.log/);
 });
 
 // --- formatSupervisorStatus ------------------------------------------------

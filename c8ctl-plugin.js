@@ -2458,18 +2458,12 @@ function resolveBrokerRestConfig(env = process.env, opts = {}) {
 // exposes no usable restAddress. The token same-origin gate lives in
 // resolveBrokerRestConfig (re-run against the profile base), never duplicated.
 function resolveAutoRestConfig(camunda, env = process.env) {
-  const cfg = readConfig() || {};
-  const hasExplicitBase = Boolean(env.NANO_REST_URL || env.NANO_BASE_URL || cfg.nanoUrl);
-  if (!hasExplicitBase && camunda && typeof camunda.getConfig === 'function') {
-    let profileBase = '';
-    try {
-      profileBase = normalizeRestBase(camunda.getConfig()?.restAddress);
-    } catch {
-      // ignore — degrade to the resolveBrokerRestConfig (localhost) default below
-    }
-    if (profileBase) return resolveBrokerRestConfig(env, { baseUrl: profileBase });
-  }
-  return resolveBrokerRestConfig(env);
+  // Derive the base from the single canonical resolver (explicit override →
+  // profile restAddress → localhost), then run it through resolveBrokerRestConfig
+  // so the token same-origin gate stays single-sourced. resolveWorkerEngineBase
+  // always returns a base, so opts.baseUrl always pins it here.
+  const baseUrl = resolveWorkerEngineBase(camunda, env);
+  return resolveBrokerRestConfig(env, { baseUrl });
 }
 
 // ---------------------------------------------------------------------------
@@ -2647,13 +2641,48 @@ function normalizeRestBase(addr) {
   return String(addr || '').replace(/\/+$/, '').replace(/\/v2$/i, '');
 }
 
+// The ONE place that answers "what engine base does this worker use?" — the
+// single source of truth for the worker's engine-base precedence chain:
+//
+//   explicit override (NANO_REST_URL → NANO_BASE_URL → persisted cfg.nanoUrl)
+//     → active c8ctl profile restAddress (the client that activates jobs)
+//     → localhost default (DEFAULT_NANO_URL).
+//
+// Every worker engine reference derives from this (derivation over duplication):
+// the `--auto` job-type read (resolveAutoRestConfig, injecting it into the
+// resolveBrokerRestConfig token gate), the linked-prompt fetch
+// (resolveLinkedPromptSource), the `supervisor status` engine column
+// (workerEngine), and the agentic visibility channel base (resolveAgenticConfig).
+// Before this existed the chain was hand-copied at each site and the agentic copy
+// silently lost the profile fallback, so a profile-only remote worker degraded to
+// its own localhost and never enrolled (jwulf/c8ctl-plugin-nano#107, sibling of
+// #93/#99). Sharing this resolver fixes that by construction and removes the
+// drift surface. The token same-origin gate stays in resolveBrokerRestConfig,
+// never duplicated here.
+function resolveWorkerEngineBase(camunda, env = process.env) {
+  // readConfig() swallows parse/IO errors and returns {} — never throws.
+  const cfg = readConfig() || {};
+  const explicit = env.NANO_REST_URL || env.NANO_BASE_URL || cfg.nanoUrl;
+  if (explicit) return normalizeRestBase(explicit);
+  if (camunda && typeof camunda.getConfig === 'function') {
+    try {
+      const profileBase = normalizeRestBase(camunda.getConfig()?.restAddress);
+      if (profileBase) return profileBase;
+    } catch {
+      // degrade to the localhost default below rather than throw
+    }
+  }
+  return DEFAULT_NANO_URL;
+}
+
 // Derive the linked-resource fetch base URL + auth headers from the SAME SDK
 // client that activated the job. A linked-resource `resourceKey` is broker-local,
-// so prompt content must be fetched from the broker this worker is connected to
-// — never a localhost default (the cause of "prompt resource N fetch failed").
-// An explicit NANO_REST_URL / NANO_REST_TOKEN override still wins as an operator
-// escape hatch. Both getConfig()/getAuthHeaders() are guarded so an older or
-// atypical client runtime degrades to the override/legacy path rather than throw.
+// so prompt content must be fetched from the broker this worker is connected to.
+// The base comes from the shared resolveWorkerEngineBase (explicit override →
+// active profile restAddress → localhost) — the same base the job read uses, so
+// the two can never diverge (the cause of "prompt resource N fetch failed").
+// getAuthHeaders() is guarded so an older or atypical client runtime degrades to
+// the legacy path rather than throw.
 //
 // TODO: once c8ctl bumps @camunda8/orchestration-cluster-api to v10 (10.0.0-alpha
 // exposes the typed camunda.getResourceContentBinary({resourceKey}) → Blob), drop
@@ -2661,14 +2690,10 @@ function normalizeRestBase(addr) {
 // SDK only exposes the deprecated getResourceContent, which 406s for generic
 // (Markdown) prompt resources — see camunda/orchestration-cluster-api-js.
 async function resolveLinkedPromptSource(camunda, env = process.env) {
-  let baseUrl = env.NANO_REST_URL || '';
-  if (!baseUrl && camunda && typeof camunda.getConfig === 'function') {
-    try {
-      baseUrl = normalizeRestBase(camunda.getConfig().restAddress);
-    } catch {
-      // ignore — fall back to the legacy resolveBrokerRestConfig base below
-    }
-  }
+  // The fetch base follows the single canonical worker-engine resolver (explicit
+  // override → active profile restAddress → localhost) so it can never drift from
+  // the base the job was activated against — the resourceKey is broker-local.
+  const baseUrl = resolveWorkerEngineBase(camunda, env);
   let authHeaders;
   if (env.NANO_REST_TOKEN) {
     authHeaders = { Authorization: `Bearer ${env.NANO_REST_TOKEN}` };
@@ -4083,13 +4108,19 @@ function buildResultEnvelope(result, { sandbox, image, git, result: agentResult,
  *     secret is ignored (LOCAL mode).
  *   - OFF: NANO_AGENTIC=off (or 0/false/no), or persisted `agentic:false`.
  *
- * Env wins over persisted config; the base URL falls back to the configured nano
- * URL (the app's own port) and ultimately DEFAULT_NANO_URL, so it is never empty.
+ * Env wins over persisted config; when no explicit agentic target is set the base
+ * URL defers to the shared resolveWorkerEngineBase (explicit engine override →
+ * active c8ctl profile restAddress → localhost default), so a profile-only remote
+ * worker discovers the agentic channel of the engine its jobs actually run on
+ * rather than its own loopback (jwulf/c8ctl-plugin-nano#107). It is never empty.
  * Returns `null` only when disabled (the off-switch).
  *
+ * @param {object} [camunda] the SDK client that activates jobs — its
+ *   getConfig().restAddress supplies the profile engine base when no explicit
+ *   agentic/engine override is set. Threaded from the `work` call site.
  * @returns {{ url: string, token: string, credential: string, bufferCapacity: number, secure: boolean, explicitUrl: boolean } | null}
  */
-function resolveAgenticConfig() {
+function resolveAgenticConfig(camunda) {
   const cfg = readConfig();
   // Explicit off-switch (env wins). Lets an operator fully opt out of visibility.
   const offSetting = process.env.NANO_AGENTIC
@@ -4098,14 +4129,14 @@ function resolveAgenticConfig() {
 
   // An explicit agentic target (env NANO_AGENTIC_URL or persisted `agenticUrl`)
   // is used verbatim and short-circuits hub auto-discovery (#75). When neither is
-  // set the URL below is the ENGINE base (nanoUrl → NANO_BASE_URL → default), off
-  // which `resolveAgenticTarget()` discovers the embedded app's own /agentic port.
+  // set the base defers to the shared worker-engine resolver (explicit engine
+  // override → profile restAddress → localhost default) — NOT a re-inlined
+  // nanoUrl → NANO_BASE_URL → default chain — so agentic discovery targets the
+  // same engine the worker's jobs run on (jwulf/c8ctl-plugin-nano#107).
   const explicitUrl = !!(process.env.NANO_AGENTIC_URL || cfg.agenticUrl);
   const url = process.env.NANO_AGENTIC_URL
     || cfg.agenticUrl
-    || cfg.nanoUrl
-    || process.env.NANO_BASE_URL
-    || DEFAULT_NANO_URL;
+    || resolveWorkerEngineBase(camunda);
   // SECURE-mode shared secret. Named NANO_AGENTIC_SECRET to match the server's env
   // var EXACTLY (Tab A → Slot A): set the same name + value on the server and every
   // worker box. The worker presents it as its identity token; the hub verifies it
@@ -4349,11 +4380,11 @@ async function discoverAgenticHubs(engineBaseUrl, {
  *     no projects API / not a nano engine, or discovery error/timeout). The
  *     worker continues doing real work with no channel.
  *
- * @param {{ fetchImpl?: Function, wsProbe?: Function, timeoutMs?: number }} [opts]
+ * @param {{ camunda?: object, fetchImpl?: Function, wsProbe?: Function, timeoutMs?: number }} [opts]
  * @returns {Promise<{ status: string, config?: object, message?: string, candidates?: Array }>}
  */
-async function resolveAgenticTarget(opts = {}) {
-  const base = resolveAgenticConfig();
+async function resolveAgenticTarget({ camunda, ...opts } = {}) {
+  const base = resolveAgenticConfig(camunda);
   if (!base) return { status: 'off' };
   // Explicit target wins verbatim and skips discovery entirely.
   if (base.explicitUrl) return { status: 'connect', config: base };
@@ -4774,24 +4805,16 @@ async function workAgent(req, flags) {
     installParentDeathWatchdog({ parentPid: Number.isInteger(daemonPid) ? daemonPid : undefined });
   }
   const activeJobs = new Map(); // jobKey -> { type, since (ms epoch) }
-  // Which engine this worker polls jobs from + the live agentic-visibility
-  // channel status, both surfaced to `supervisor status` via the activity
-  // marker (#99). `agenticState` starts 'starting' and is updated once the
-  // channel target is resolved and again on each connect/disconnect below.
-  // The engine must name the ACTUAL polling authority: jobs are activated by
-  // `camunda.createJobWorker()` against the active c8ctl profile engine
-  // (`camunda.getConfig().restAddress`), whereas `restConfig` can honor the
-  // auxiliary NANO_REST_URL/NANO_BASE_URL/nanoUrl overrides (for `--auto`
-  // reads). Derive from the profile engine, using restConfig only as a
-  // fallback, so the column can't advertise an override host jobs aren't
-  // polled from.
-  const workerEngine = (() => {
-    try {
-      const profileBase = normalizeRestBase(camunda?.getConfig?.()?.restAddress);
-      if (profileBase) return profileBase;
-    } catch { /* degrade to the auxiliary REST config below */ }
-    return restConfig?.baseUrl || null;
-  })();
+  // Which engine this worker polls jobs from, surfaced to `supervisor status` via
+  // the activity marker (#99). Derived from the single canonical
+  // resolveWorkerEngineBase (explicit override → active c8ctl profile restAddress
+  // → localhost) — the SAME base the job read and agentic channel use, so the
+  // column can't drift from the engine the worker actually talks to.
+  const workerEngine = resolveWorkerEngineBase(camunda);
+  // The live agentic-visibility channel status, also surfaced to `supervisor
+  // status` via the activity marker (#99). `agenticState` starts 'starting' and
+  // is updated once the channel target is resolved and again on each
+  // connect/disconnect below.
   let agenticState = { status: 'starting' };
   const writeActivity = () => {
     if (!activityFile) return;
@@ -4843,7 +4866,7 @@ async function workAgent(req, flags) {
   // worker joins with the well-known LOCAL token and no credential; SECURE mode
   // (NANO_AGENTIC_SECRET) sends a real per-peer shared secret as the identity;
   // NANO_AGENTIC=off disables it (see resolveAgenticConfig).
-  const agenticTarget = await resolveAgenticTarget({ logger });
+  const agenticTarget = await resolveAgenticTarget({ camunda, logger });
   let agenticCfg = null;
   // buildAgenticUrl can throw on a malformed/unsupported explicit NANO_AGENTIC_URL.
   // This is only the display URL for the activity marker, so compute it
@@ -8852,6 +8875,7 @@ export {
   pickLinkedResource,
   resolveBrokerRestConfig,
   resolveAutoRestConfig,
+  resolveWorkerEngineBase,
   resourceContentUrl,
   fetchLinkedResourceContent,
   resolveLinkedPrompt,

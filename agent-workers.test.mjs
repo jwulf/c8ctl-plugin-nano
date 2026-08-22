@@ -16,6 +16,7 @@ import {
   pickLinkedResource,
   resolveBrokerRestConfig,
   resolveAutoRestConfig,
+  resolveWorkerEngineBase,
   resourceContentUrl,
   fetchLinkedResourceContent,
   resolveLinkedPrompt,
@@ -439,37 +440,46 @@ test('normalizeRestBase: strips trailing slashes and an optional /v2 so resource
 });
 
 test('resolveLinkedPromptSource: derives base + auth from the activating client', async () => {
-  const camunda = {
-    getConfig: () => ({ restAddress: 'http://merlin.local:8080/v2' }),
-    getAuthHeaders: async () => ({ Authorization: 'Bearer CLIENT_TOKEN' }),
-  };
-  const src = await resolveLinkedPromptSource(camunda, {});
-  assert.equal(src.baseUrl, 'http://merlin.local:8080');
-  assert.deepEqual(src.authHeaders, { Authorization: 'Bearer CLIENT_TOKEN' });
+  await withCleanAutoHome(async () => {
+      const camunda = {
+        getConfig: () => ({ restAddress: 'http://merlin.local:8080/v2' }),
+        getAuthHeaders: async () => ({ Authorization: 'Bearer CLIENT_TOKEN' }),
+      };
+      const src = await resolveLinkedPromptSource(camunda, {});
+      assert.equal(src.baseUrl, 'http://merlin.local:8080');
+      assert.deepEqual(src.authHeaders, { Authorization: 'Bearer CLIENT_TOKEN' });
+  });
 });
 
 test('resolveLinkedPromptSource: NANO_REST_URL / NANO_REST_TOKEN override the client (operator escape hatch)', async () => {
-  const camunda = {
-    getConfig: () => ({ restAddress: 'http://should-not-use:8080' }),
-    getAuthHeaders: async () => ({ Authorization: 'Bearer CLIENT' }),
-  };
-  const src = await resolveLinkedPromptSource(camunda, {
-    NANO_REST_URL: 'http://override:9000',
-    NANO_REST_TOKEN: 'OP',
+  await withCleanAutoHome(async () => {
+      const camunda = {
+        getConfig: () => ({ restAddress: 'http://should-not-use:8080' }),
+        getAuthHeaders: async () => ({ Authorization: 'Bearer CLIENT' }),
+      };
+      const src = await resolveLinkedPromptSource(camunda, {
+        NANO_REST_URL: 'http://override:9000',
+        NANO_REST_TOKEN: 'OP',
+      });
+      assert.equal(src.baseUrl, 'http://override:9000');
+      assert.deepEqual(src.authHeaders, { Authorization: 'Bearer OP' });
   });
-  assert.equal(src.baseUrl, 'http://override:9000');
-  assert.deepEqual(src.authHeaders, { Authorization: 'Bearer OP' });
 });
 
 test('resolveLinkedPromptSource: a client without getConfig/getAuthHeaders degrades gracefully (no throw)', async () => {
-  const src = await resolveLinkedPromptSource({}, {});
-  assert.equal(src.baseUrl, '');
-  assert.equal(src.authHeaders, undefined);
-  // A throwing client is swallowed, not propagated.
-  const throwing = { getConfig: () => { throw new Error('boom'); }, getAuthHeaders: async () => { throw new Error('boom'); } };
-  const src2 = await resolveLinkedPromptSource(throwing, {});
-  assert.equal(src2.baseUrl, '');
-  assert.equal(src2.authHeaders, undefined);
+  await withCleanAutoHome(async () => {
+    // With no explicit override and no usable profile, the shared resolver
+    // degrades to the localhost default (never throws); the caller then reuses it
+    // in place of the old empty-string sentinel.
+    const src = await resolveLinkedPromptSource({}, {});
+    assert.equal(src.baseUrl, 'http://localhost:8080');
+    assert.equal(src.authHeaders, undefined);
+    // A throwing client is swallowed, not propagated.
+    const throwing = { getConfig: () => { throw new Error('boom'); }, getAuthHeaders: async () => { throw new Error('boom'); } };
+    const src2 = await resolveLinkedPromptSource(throwing, {});
+    assert.equal(src2.baseUrl, 'http://localhost:8080');
+    assert.equal(src2.authHeaders, undefined);
+  });
 });
 
 // ---------------------------------------------------------------------------
@@ -490,13 +500,25 @@ function withCleanAutoHome(fn) {
   const prevEnv = Object.fromEntries(AUTO_ENV_KEYS.map((k) => [k, process.env[k]]));
   process.env.C8CTL_NANO_HOME = home;
   for (const k of AUTO_ENV_KEYS) delete process.env[k];
-  try {
-    return fn(home);
-  } finally {
+  const cleanup = () => {
     if (prevHome === undefined) delete process.env.C8CTL_NANO_HOME; else process.env.C8CTL_NANO_HOME = prevHome;
     for (const k of AUTO_ENV_KEYS) { if (prevEnv[k] === undefined) delete process.env[k]; else process.env[k] = prevEnv[k]; }
     rmSync(home, { recursive: true, force: true });
+  };
+  let result;
+  try {
+    result = fn(home);
+  } catch (err) {
+    cleanup();
+    throw err;
   }
+  // Defer cleanup until an async callback settles so its env/home isolation
+  // outlives its awaits; a sync callback cleans up immediately.
+  if (result && typeof result.then === 'function') {
+    return Promise.resolve(result).finally(cleanup);
+  }
+  cleanup();
+  return result;
 }
 
 // RED (route): with no explicit override, the `--auto` reader base is derived
@@ -555,6 +577,45 @@ test('resolveAutoRestConfig: degrades to the localhost default when the client e
     assert.equal(resolveAutoRestConfig(null, process.env).baseUrl, 'http://localhost:8080');
     const throwing = { getConfig: () => { throw new Error('boom'); } };
     assert.equal(resolveAutoRestConfig(throwing, process.env).baseUrl, 'http://localhost:8080');
+  });
+});
+
+// ---------------------------------------------------------------------------
+// resolveWorkerEngineBase — the ONE canonical worker engine-base resolver that
+// every site (job read, linked-prompt fetch, status column, agentic channel)
+// derives from (jwulf/c8ctl-plugin-nano#107). Precedence:
+//   explicit override (NANO_REST_URL → NANO_BASE_URL → cfg.nanoUrl)
+//     → active c8ctl profile restAddress → localhost default.
+// ---------------------------------------------------------------------------
+test('resolveWorkerEngineBase: profile-only (no NANO_*/nanoUrl) resolves to the profile restAddress', () => {
+  withCleanAutoHome(() => {
+    const camunda = { getConfig: () => ({ restAddress: 'http://merlin.local:8080/v2' }) };
+    assert.equal(resolveWorkerEngineBase(camunda, process.env), 'http://merlin.local:8080');
+  });
+});
+
+test('resolveWorkerEngineBase: explicit NANO_REST_URL / NANO_BASE_URL / cfg.nanoUrl win over the profile', () => {
+  withCleanAutoHome((home) => {
+    const camunda = { getConfig: () => ({ restAddress: 'http://merlin.local:8080/v2' }) };
+    assert.equal(
+      resolveWorkerEngineBase(camunda, { NANO_REST_URL: 'http://rest-override:9000' }),
+      'http://rest-override:9000',
+    );
+    assert.equal(
+      resolveWorkerEngineBase(camunda, { NANO_BASE_URL: 'http://base-override:9100' }),
+      'http://base-override:9100',
+    );
+    writeFileSync(join(home, 'config.json'), JSON.stringify({ nanoUrl: 'http://from-config:8080' }));
+    assert.equal(resolveWorkerEngineBase(camunda, {}), 'http://from-config:8080');
+  });
+});
+
+test('resolveWorkerEngineBase: no override + no usable profile → localhost default (never throws)', () => {
+  withCleanAutoHome(() => {
+    assert.equal(resolveWorkerEngineBase(undefined, {}), 'http://localhost:8080');
+    assert.equal(resolveWorkerEngineBase({}, {}), 'http://localhost:8080');
+    const throwing = { getConfig: () => { throw new Error('boom'); } };
+    assert.equal(resolveWorkerEngineBase(throwing, {}), 'http://localhost:8080');
   });
 });
 

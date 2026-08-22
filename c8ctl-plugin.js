@@ -6038,7 +6038,6 @@ function createSupervisorLiveView({
   };
 }
 
-/** Render a supervisor status object as an aligned text table. */
 /**
  * The `Logs:` block for `supervisor status`, derived purely from the status
  * payload so it renders identically for a live daemon status and a synthesized
@@ -6063,6 +6062,7 @@ function formatSupervisorLogsLines(status) {
   return out;
 }
 
+/** Render a supervisor status object as an aligned text table. */
 function formatSupervisorStatus(status) {
   const lines = [];
   const d = status.daemon || {};

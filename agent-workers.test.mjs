@@ -18,6 +18,7 @@ import {
   resolveAutoRestConfig,
   resolveWorkerEngineBase,
   resolveWorkerPollEngineBase,
+  resolveLinkedPromptBase,
   resourceContentUrl,
   fetchLinkedResourceContent,
   resolveLinkedPrompt,
@@ -660,6 +661,38 @@ test('resolveWorkerPollEngineBase: falls back to the canonical resolver when no 
     assert.equal(resolveWorkerPollEngineBase(undefined, {}), 'http://localhost:8080');
     const throwing = { getConfig: () => { throw new Error('boom'); } };
     assert.equal(resolveWorkerPollEngineBase(throwing, {}), 'http://localhost:8080');
+  });
+});
+
+// resolveLinkedPromptBase — the linked-prompt fetch base. The prompt resourceKey
+// is BROKER-LOCAL, so the base must track the polling engine (the broker the SDK
+// activated the job against), NOT the NANO_BASE_URL / cfg.nanoUrl auxiliary-read
+// overrides — those would point the fetch at an engine that never issued the
+// resourceKey and 404 it while activation still succeeds
+// (jwulf/c8ctl-plugin-nano#108 review advisory). NANO_REST_URL stays an explicit
+// escape hatch (e.g. a same-broker caching proxy).
+test('resolveLinkedPromptBase: prefers the polling engine over NANO_BASE_URL / cfg.nanoUrl overrides', () => {
+  withCleanAutoHome((home) => {
+    const camunda = { getConfig: () => ({ restAddress: 'http://merlin.local:8080/v2' }) };
+    // NANO_BASE_URL steers auxiliary reads, but the broker-local prompt base stays the polling engine.
+    assert.equal(resolveWorkerEngineBase(camunda, { NANO_BASE_URL: 'http://base-override:9100' }), 'http://base-override:9100');
+    assert.equal(resolveLinkedPromptBase(camunda, { NANO_BASE_URL: 'http://base-override:9100' }), 'http://merlin.local:8080');
+    // cfg.nanoUrl likewise must not divert the broker-local prompt fetch.
+    writeFileSync(join(home, 'config.json'), JSON.stringify({ nanoUrl: 'http://from-config:8080' }));
+    assert.equal(resolveLinkedPromptBase(camunda, {}), 'http://merlin.local:8080');
+  });
+});
+
+test('resolveLinkedPromptBase: NANO_REST_URL remains an explicit escape hatch; no profile → polling-base fallback chain', () => {
+  withCleanAutoHome(() => {
+    const camunda = { getConfig: () => ({ restAddress: 'http://merlin.local:8080/v2' }) };
+    // NANO_REST_URL wins even over the profile (same-broker proxy escape hatch).
+    assert.equal(resolveLinkedPromptBase(camunda, { NANO_REST_URL: 'http://proxy:9000' }), 'http://proxy:9000');
+    // No usable profile base → poll-engine fallback (canonical resolver): NANO_BASE_URL/localhost.
+    assert.equal(resolveLinkedPromptBase({ getConfig: () => ({}) }, { NANO_BASE_URL: 'http://base-override:9100' }), 'http://base-override:9100');
+    assert.equal(resolveLinkedPromptBase(undefined, {}), 'http://localhost:8080');
+    const throwing = { getConfig: () => { throw new Error('boom'); } };
+    assert.equal(resolveLinkedPromptBase(throwing, {}), 'http://localhost:8080');
   });
 });
 

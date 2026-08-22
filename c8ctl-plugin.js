@@ -2675,6 +2675,28 @@ function resolveWorkerEngineBase(camunda, env = process.env) {
   return DEFAULT_NANO_URL;
 }
 
+// The engine authority reported in the supervisor activity marker's ENGINE
+// column (#99): the base the worker actually POLLS JOBS from. The SDK job worker
+// (`camunda.createJobWorker`) activates jobs against the client's OWN profile
+// restAddress — which is NOT affected by the explicit NANO_REST_URL / NANO_BASE_URL
+// / cfg.nanoUrl overrides that resolveWorkerEngineBase prefers for auxiliary REST
+// reads (linked prompts, `--auto` reads, agentic channel). Reporting an override
+// there would make the ENGINE column claim an engine the worker is not polling,
+// violating supervisorEngineCell's "engine this worker polls jobs from" contract.
+// So prefer the profile restAddress (the polling engine) and fall back to the
+// canonical resolver only when the client exposes no usable base.
+function resolveWorkerPollEngineBase(camunda, env = process.env) {
+  if (camunda && typeof camunda.getConfig === 'function') {
+    try {
+      const profileBase = normalizeRestBase(camunda.getConfig()?.restAddress);
+      if (profileBase) return profileBase;
+    } catch {
+      // degrade to the canonical resolver below rather than throw
+    }
+  }
+  return resolveWorkerEngineBase(camunda, env);
+}
+
 // Derive the linked-resource fetch base URL + auth headers from the SAME SDK
 // client that activated the job. A linked-resource `resourceKey` is broker-local,
 // so prompt content must be fetched from the broker this worker is connected to.
@@ -4816,11 +4838,22 @@ async function workAgent(req, flags) {
   }
   const activeJobs = new Map(); // jobKey -> { type, since (ms epoch) }
   // Which engine this worker polls jobs from, surfaced to `supervisor status` via
-  // the activity marker (#99). Derived from the single canonical
-  // resolveWorkerEngineBase (explicit override → active c8ctl profile restAddress
-  // → localhost) — the SAME base the job read and agentic channel use, so the
-  // column can't drift from the engine the worker actually talks to.
-  const workerEngine = resolveWorkerEngineBase(camunda);
+  // the activity marker (#99). Derived from resolveWorkerPollEngineBase — the SDK
+  // client's OWN profile restAddress (the base createJobWorker actually activates
+  // against), NOT the NANO_* / cfg.nanoUrl override that resolveWorkerEngineBase
+  // prefers for auxiliary REST reads. That keeps the ENGINE column honest: it
+  // reports the engine the worker truly polls, never an override the job worker
+  // ignores. Falls back to the canonical resolver only when the client exposes no
+  // usable profile base.
+  const workerEngine = resolveWorkerPollEngineBase(camunda);
+  // Base URL for the per-job linked-prompt fetch (issue #63). This follows the
+  // canonical override-preferring resolveWorkerEngineBase (NANO_* / cfg.nanoUrl →
+  // profile restAddress → localhost) — the same precedence auxiliary REST reads
+  // use — computed ONCE at startup so the per-job hot path skips a config.json
+  // read. It is deliberately separate from `workerEngine` above: the marker
+  // reports the polling engine, while the prompt fetch honors an explicit engine
+  // override. They coincide whenever no override is set.
+  const linkedPromptBase = resolveWorkerEngineBase(camunda);
   // The live agentic-visibility channel status, also surfaced to `supervisor
   // status` via the activity marker (#99). `agenticState` starts 'starting' and
   // is updated once the channel target is resolved and again on each
@@ -5046,9 +5079,9 @@ async function workAgent(req, flags) {
           // Fetch the prompt from the broker the SDK client is connected to,
           // deriving base URL + auth from that client (not restConfig, whose base
           // defaults to localhost) — the resourceKey is broker-local. The base is
-          // invariant, so reuse the once-at-startup workerEngine and let the
+          // invariant, so reuse the once-at-startup linkedPromptBase and let the
           // resolver only compute per-job auth headers (no per-job config.json read).
-          const promptSource = await resolveLinkedPromptSource(camunda, process.env, { baseUrl: workerEngine });
+          const promptSource = await resolveLinkedPromptSource(camunda, process.env, { baseUrl: linkedPromptBase });
           const linked = await resolveLinkedPrompt(job.customHeaders ?? {}, {
             baseUrl: promptSource.baseUrl || restConfig.baseUrl,
             authHeaders: promptSource.authHeaders,
@@ -8888,6 +8921,7 @@ export {
   resolveBrokerRestConfig,
   resolveAutoRestConfig,
   resolveWorkerEngineBase,
+  resolveWorkerPollEngineBase,
   resourceContentUrl,
   fetchLinkedResourceContent,
   resolveLinkedPrompt,

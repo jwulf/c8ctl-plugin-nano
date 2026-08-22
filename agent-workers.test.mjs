@@ -17,6 +17,7 @@ import {
   resolveBrokerRestConfig,
   resolveAutoRestConfig,
   resolveWorkerEngineBase,
+  resolveWorkerPollEngineBase,
   resourceContentUrl,
   fetchLinkedResourceContent,
   resolveLinkedPrompt,
@@ -632,6 +633,33 @@ test('resolveWorkerEngineBase: no override + no usable profile → localhost def
     assert.equal(resolveWorkerEngineBase({}, {}), 'http://localhost:8080');
     const throwing = { getConfig: () => { throw new Error('boom'); } };
     assert.equal(resolveWorkerEngineBase(throwing, {}), 'http://localhost:8080');
+  });
+});
+
+// resolveWorkerPollEngineBase — the base reported in the supervisor activity
+// marker's ENGINE column: the engine the worker actually POLLS JOBS from (the SDK
+// client's own profile restAddress), NOT the NANO_* / cfg.nanoUrl override that
+// resolveWorkerEngineBase prefers for auxiliary REST reads. This keeps the ENGINE
+// column honest when an override redirects reads but job activation still targets
+// the profile engine (jwulf/c8ctl-plugin-nano#108 review advisory).
+test('resolveWorkerPollEngineBase: prefers the profile restAddress even when a NANO_* override is set', () => {
+  withCleanAutoHome((home) => {
+    const camunda = { getConfig: () => ({ restAddress: 'http://merlin.local:8080/v2' }) };
+    // Override wins for the canonical (reads) resolver, but the poll engine is the profile.
+    assert.equal(resolveWorkerEngineBase(camunda, { NANO_REST_URL: 'http://rest-override:9000' }), 'http://rest-override:9000');
+    assert.equal(resolveWorkerPollEngineBase(camunda, { NANO_REST_URL: 'http://rest-override:9000' }), 'http://merlin.local:8080');
+    writeFileSync(join(home, 'config.json'), JSON.stringify({ nanoUrl: 'http://from-config:8080' }));
+    assert.equal(resolveWorkerPollEngineBase(camunda, {}), 'http://merlin.local:8080');
+  });
+});
+
+test('resolveWorkerPollEngineBase: falls back to the canonical resolver when no usable profile base', () => {
+  withCleanAutoHome(() => {
+    // No profile base → canonical resolver: override wins, else localhost.
+    assert.equal(resolveWorkerPollEngineBase({ getConfig: () => ({}) }, { NANO_REST_URL: 'http://rest-override:9000' }), 'http://rest-override:9000');
+    assert.equal(resolveWorkerPollEngineBase(undefined, {}), 'http://localhost:8080');
+    const throwing = { getConfig: () => { throw new Error('boom'); } };
+    assert.equal(resolveWorkerPollEngineBase(throwing, {}), 'http://localhost:8080');
   });
 });
 

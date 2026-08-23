@@ -3066,9 +3066,9 @@ function credArgs() {
 // git via GIT_ASKPASS only (never argv/URL/helper), preserving the ephemeral-token
 // guarantee.
 // Memoized for the process lifetime: this is a synchronous spawnSync (up to a
-// 10s timeout) that can be reached per job, and jobs may run concurrently
-// (maxParallelJobs > 1), so consult the CLI at most once per worker run rather
-// than blocking every handler. A sentinel distinguishes "not yet computed" from
+// 10s timeout) that can be reached per job, so consult the CLI at most once per
+// worker run rather than blocking a handler on every job. A sentinel
+// distinguishes "not yet computed" from
 // a cached null (gh missing / not logged in).
 //
 // Memoization alone still lets the *first* job pay the synchronous spawn on the
@@ -4643,7 +4643,12 @@ async function workAgent(req, flags) {
     const n = Number.parseInt(String(v ?? ''), 10);
     return Number.isFinite(n) && n > 0 ? n : dflt;
   };
-  const maxParallelJobs = intFlag(flags?.['max-parallel'], 1);
+  // One job per worker, hard-wired (there is deliberately no --max-parallel
+  // flag): an agent harness holds a PTY + a git workspace for the whole life of
+  // a job, so a worker must never lease a second job concurrently. The @camunda8
+  // SDK derives maxJobsToActivate = maxParallelJobs - activeJobs, so 1 means
+  // "activate one job, then stop polling until it completes".
+  const maxParallelJobs = 1;
   // The broker job-activation lock is NOT hardcoded up front. A fixed timeout is
   // impossible to size for an agent: too short reclaims a still-working job (a
   // second agent starts + the stale complete/fail is rejected 409), too long
@@ -4837,12 +4842,13 @@ async function workAgent(req, flags) {
   }
   const extraNote = extraJobTypes.length > 0 ? ` (${extraJobTypes.length} via --job-type)` : '';
   logger.info(`  listening on ${jobTypes.length} job type(s)${extraNote}: ${jobTypes.join('  ')}`);
-  logger.info(`  max parallel: ${maxParallelJobs}; recovery window: ${recoveryWindowMs}ms; idle timeout: ${idleTimeoutMs}ms; hard cap: ${hardCapMs > 0 ? `${hardCapMs}ms` : 'off'}; poll timeout: ${pollTimeoutMs}ms`);
+  logger.info(`  one job per worker; recovery window: ${recoveryWindowMs}ms; idle timeout: ${idleTimeoutMs}ms; hard cap: ${hardCapMs > 0 ? `${hardCapMs}ms` : 'off'}; poll timeout: ${pollTimeoutMs}ms`);
   // Warm the gh-token cache now, off the job-handling path: githubCloneToken()
   // may consult `gh auth token` (a synchronous spawn, up to 10s) as its default
-  // credential fallback, and doing that inside a job handler would stall sibling
-  // handlers + lock heartbeats when maxParallelJobs > 1. Priming here pays that
-  // cost once at startup so every later lookup is a warm cache hit.
+  // credential fallback, and doing that inside a job handler would block the
+  // event loop — stalling the lock heartbeat and delaying the job itself.
+  // Priming here pays that cost once at startup so every later lookup is a warm
+  // cache hit.
   primeGhAuthToken();
   logger.info('Polling for work — press Ctrl-C to stop.');
 
@@ -5620,10 +5626,10 @@ const SUPERVISOR_MONITOR_INTERVAL_MS = 1_000;
 // extra daemon traffic.
 const SUPERVISOR_LIVE_TICK_MS = 5_000;
 
-// The `nano work` flags forwarded verbatim to each spawned child.
+// The `nano work` flags forwarded to each spawned child (reconstructed and
+// normalized by `reconstructWorkArgs`, not passed through byte-for-byte).
 // kind: 'value' → `--flag v`; 'boolean' → `--flag`; 'list' → repeated `--flag v`.
 const WORK_FORWARD_FLAGS = {
-  'max-parallel': 'value',
   'job-timeout': 'value',
   'recovery-window': 'value',
   'idle-timeout': 'value',
@@ -9106,7 +9112,7 @@ export const metadata = {
         { command: 'c8ctl nano supervisor start --worker reviewer --worker coder', description: 'Start a detached supervisor managing several workers from one terminal' },
         { command: 'c8ctl nano supervisor', description: 'Attach an interactive console to the supervisor (detach with Ctrl-D, leaving it running)' },
         { command: 'c8ctl nano supervisor status', description: 'List supervised workers (state, ENGINE + AGENTIC visibility diagnostics, serviced job / idle, pid, restarts, uptime) without the console' },
-        { command: 'c8ctl nano supervisor add decider --max-parallel 2', description: 'Add a supervised worker (forwarding work flags) to the running supervisor' },
+        { command: 'c8ctl nano supervisor add decider', description: 'Add a supervised worker (forwarding work flags) to the running supervisor' },
         { command: 'c8ctl nano supervisor add reviewer --instances 3', description: 'Add 3 distinct auto-named instances of a profile in one call' },
         { command: 'c8ctl nano supervisor restart reviewer', description: 'Restart a supervised worker by id or profile' },
         { command: 'c8ctl nano supervisor stop', description: 'Stop the supervisor daemon and all its workers' },
@@ -9168,7 +9174,6 @@ export const commands = {
       'keep-runs': { type: 'boolean', description: 'work: keep per-job workspaces under <state>/agent-runs instead of deleting them after each job (debug)' },
       stream: { type: 'boolean', description: 'work: tee each agent job\'s live stdout/stderr to this console, prefixed with the job type + key (spy/debug)' },
       list: { type: 'boolean', description: 'hire: list existing agent profiles instead of creating one' },
-      'max-parallel': { type: 'string', description: 'work: max concurrent jobs per worker (default 1)' },
       'job-timeout': { type: 'string', description: 'work: OPTIONAL absolute hard cap on total harness runtime per job in ms; the process is killed past this. Default 0 = unlimited (the broker lock is auto-managed — see --recovery-window / --idle-timeout).' },
       'recovery-window': { type: 'string', description: 'work: broker activation-lock window in ms, auto-refreshed while the agent runs; also the node-loss reclaim time (a dead/killed worker\'s job is re-activated within this). Default 300000.' },
       'idle-timeout': { type: 'string', description: 'work: max ms an agent may produce no stdout/stderr before it is killed as wedged (stops lock extension → job reclaimed). Default 300000.' },
@@ -9334,7 +9339,7 @@ function printUsage() {
   console.log('  c8ctl nano update [--check]');
   console.log('  c8ctl nano hire [--name <n>] [--rank <r>] [--command <c>] [--arg <switch> ...] [--model <m>] [--capabilities <a,b>] [--sandbox none|docker|podman] [--image <ref>] [--terminal pty|pipe] [--env NAME=VALUE ...] [--list]');
   console.log('  c8ctl nano assign <profileName> <cap[,cap...]> [--name <n>] [--capabilities <a,b>]');
-  console.log('  c8ctl nano work <profileName> [--auto [--auto-scope <p>]] [--arg <switch> ...] [--max-parallel <n>] [--recovery-window <ms>] [--idle-timeout <ms>] [--job-timeout <ms>] [--poll-timeout <ms>] [--job-type <token> ...] [--sandbox none|docker|podman] [--image <ref>] [--env NAME=VALUE ...] [--secret-resolver host] [--min-free-mb <n>] [--clone-timeout <ms>] [--keep-runs] [--stream]');
+  console.log('  c8ctl nano work <profileName> [--auto [--auto-scope <p>]] [--arg <switch> ...] [--recovery-window <ms>] [--idle-timeout <ms>] [--job-timeout <ms>] [--poll-timeout <ms>] [--job-type <token> ...] [--sandbox none|docker|podman] [--image <ref>] [--env NAME=VALUE ...] [--secret-resolver host] [--min-free-mb <n>] [--clone-timeout <ms>] [--keep-runs] [--stream]');
   console.log('  c8ctl nano supervisor [start|status|add|remove|restart|stop|logs|attach] ... (manage many workers from one terminal)');
   console.log('');
   console.log('Subcommands:');
@@ -9379,7 +9384,6 @@ function printUsage() {
   console.log('  --terminal <m>       hire: live-terminal mode pty|pipe (default pipe); pty streams a steerable terminal on the relay lane');
   console.log('  --env NAME=VALUE     hire/work: static env var for the harness (repeatable); persisted on hire, work extends/overrides');
   console.log('  --list               hire: list existing agent profiles instead of creating one');
-  console.log('  --max-parallel <n>   work: max concurrent jobs per worker (default 1)');
   console.log('  --job-type <token>   work: extra job type to service alongside the rank×capability matrix (repeatable)');
   console.log('  --auto               work: zero-config enrolment — serve ALL deployed agent job types read from the engine (no capability, no app enrol endpoint, no channel). NO capability gate: serves any deployed agent job on the engine.');
   console.log('  --auto-scope <p>     work: with --auto, narrow to agent job types whose bpmn:process id equals or is prefixed by <p> (one app/network); default all');

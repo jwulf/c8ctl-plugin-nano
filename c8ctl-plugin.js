@@ -5626,7 +5626,8 @@ const SUPERVISOR_MONITOR_INTERVAL_MS = 1_000;
 // extra daemon traffic.
 const SUPERVISOR_LIVE_TICK_MS = 5_000;
 
-// The `nano work` flags forwarded verbatim to each spawned child.
+// The `nano work` flags forwarded to each spawned child (reconstructed and
+// normalized by `reconstructWorkArgs`, not passed through byte-for-byte).
 // kind: 'value' → `--flag v`; 'boolean' → `--flag`; 'list' → repeated `--flag v`.
 const WORK_FORWARD_FLAGS = {
   'job-timeout': 'value',

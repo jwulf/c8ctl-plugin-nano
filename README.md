@@ -752,8 +752,9 @@ profile affects *every* instance of it.
 Each worker takes the **same flags as `nano work`**
 (`--recovery-window`, `--idle-timeout`, `--job-timeout`, `--poll-timeout`,
 `--sandbox`/`--image`, `--job-type`, `--env`, `--arg`, …); they are forwarded
-verbatim to the spawned child, so a supervised worker is byte-identical to a
-hand-run `nano work`. In the
+to the spawned child (reconstructed via `reconstructWorkArgs`, which normalizes
+ordering and coerces booleans), so a supervised worker is semantically
+equivalent to a hand-run `nano work`. In the
 interactive console, type the flags after the profile: `add reviewer --recovery-window 300000`.
 
 How it works and where things live:

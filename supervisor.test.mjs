@@ -44,8 +44,8 @@ import {
 
 test('reconstructWorkArgs emits value flags as --flag value', () => {
   assert.deepEqual(
-    reconstructWorkArgs({ 'max-parallel': '2', 'job-timeout': '600000' }),
-    ['--max-parallel', '2', '--job-timeout', '600000'],
+    reconstructWorkArgs({ 'recovery-window': '300000', 'job-timeout': '600000' }),
+    ['--job-timeout', '600000', '--recovery-window', '300000'],
   );
 });
 
@@ -210,8 +210,8 @@ test('autoWorkerName varies with the random suffix (distinct rand → distinct n
 
 test('extractNameFlag pulls --name <val> out of the token list', () => {
   assert.deepEqual(
-    extractNameFlag(['--name', 'alice', '--max-parallel', '2']),
-    { name: 'alice', rest: ['--max-parallel', '2'] },
+    extractNameFlag(['--name', 'alice', '--job-timeout', '600000']),
+    { name: 'alice', rest: ['--job-timeout', '600000'] },
   );
 });
 
@@ -264,8 +264,8 @@ test('parseInstancesCount rejects counts over the per-command cap', () => {
 
 test('extractInstancesFlag pulls --instances <val> out of the token list', () => {
   assert.deepEqual(
-    extractInstancesFlag(['--instances', '3', '--max-parallel', '2']),
-    { count: 3, rest: ['--max-parallel', '2'] },
+    extractInstancesFlag(['--instances', '3', '--job-timeout', '600000']),
+    { count: 3, rest: ['--job-timeout', '600000'] },
   );
 });
 
@@ -290,8 +290,8 @@ test('extractInstancesFlag surfaces a validation error while still stripping the
 
 test('redactWorkArgs masks --env values but preserves the name and other flags', () => {
   assert.deepEqual(
-    redactWorkArgs(['--max-parallel', '2', '--env', 'TOKEN=s3cr3t', '--stream']),
-    ['--max-parallel', '2', '--env', 'TOKEN=***', '--stream'],
+    redactWorkArgs(['--job-timeout', '600000', '--env', 'TOKEN=s3cr3t', '--stream']),
+    ['--job-timeout', '600000', '--env', 'TOKEN=***', '--stream'],
   );
 });
 
@@ -347,7 +347,7 @@ test('decodeFrames skips blank and malformed lines without throwing', () => {
 });
 
 test('encode → decode round-trips an object', () => {
-  const obj = { op: 'add', profile: 'reviewer', args: ['--max-parallel', '2'] };
+  const obj = { op: 'add', profile: 'reviewer', args: ['--job-timeout', '600000'] };
   const { frames } = decodeFrames(encodeFrame(obj));
   assert.deepEqual(frames[0], obj);
 });

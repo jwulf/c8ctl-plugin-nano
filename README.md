@@ -208,7 +208,7 @@ c8ctl nano work reviewer --job-type senior:pr-review --job-type senior:triage
 
 ```bash
 c8ctl nano work reviewer                     # poll for work until Ctrl-C
-c8ctl nano work reviewer --max-parallel 2 --recovery-window 300000
+c8ctl nano work reviewer --recovery-window 300000
 c8ctl nano work reviewer --name reviewer-eu  # name this worker (else auto ‹host›-‹profile›-‹random›)
 ```
 
@@ -728,7 +728,7 @@ c8ctl nano supervisor
 
 # Manage the fleet without the console (any terminal, any time):
 c8ctl nano supervisor status                       # id, state, pid, restarts, uptime
-c8ctl nano supervisor add reviewer --max-parallel 2 # add + spawn a worker (forwards work flags)
+c8ctl nano supervisor add reviewer                  # add + spawn a worker (forwards work flags)
 c8ctl nano supervisor add reviewer --name reviewer-2 # a SECOND reviewer, named so it stays distinct
 c8ctl nano supervisor add reviewer --instances 3    # add 3 distinct auto-named reviewers in one call
 c8ctl nano supervisor restart reviewer             # by worker id or profile name
@@ -749,12 +749,12 @@ cannot be combined with `--name`; omit `--name` to let them auto-name.
 `restart`/`remove` accept either a worker id **or** a profile name — targeting a
 profile affects *every* instance of it.
 
-Each worker takes the **same flags as `nano work`** (`--max-parallel`,
-`--recovery-window`, `--idle-timeout`, `--job-timeout`, `--poll-timeout`,
+Each worker takes the **same flags as `nano work`**
+(`--recovery-window`, `--idle-timeout`, `--job-timeout`, `--poll-timeout`,
 `--sandbox`/`--image`, `--job-type`, `--env`, `--arg`, …); they are forwarded
 verbatim to the spawned child, so a supervised worker is byte-identical to a
 hand-run `nano work`. In the
-interactive console, type the flags after the profile: `add reviewer --max-parallel 2`.
+interactive console, type the flags after the profile: `add reviewer --recovery-window 300000`.
 
 How it works and where things live:
 

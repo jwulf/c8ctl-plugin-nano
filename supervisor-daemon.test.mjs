@@ -142,7 +142,7 @@ test('supervisor daemon: start → add → status → remove → stop', async (t
   // Add a worker and confirm it comes up running. With no explicit name the
   // daemon auto-assigns ‹short-host›-‹profile›-‹random›; the profile is still
   // `faker` (that's the hire it runs).
-  const added = await mod.supervisorRequest({ op: 'add', profile: 'faker', args: ['--max-parallel', '1'] });
+  const added = await mod.supervisorRequest({ op: 'add', profile: 'faker', args: ['--job-timeout', '600000'] });
   assert.equal(added.ok, true);
   assert.match(added.worker.id, /^[a-z0-9._-]+-faker-[0-9a-f]+$/);
   assert.equal(added.worker.profile, 'faker');
@@ -379,9 +379,9 @@ test('supervisor add --instances N: spawns N distinct auto-named workers, forwar
 
   await mod.startSupervisorDaemon();
 
-  // Drive the real CLI handler path: `supervisor add faker --instances 3 --max-parallel 2`.
+  // Drive the real CLI handler path: `supervisor add faker --instances 3 --job-timeout 600000`.
   const req = { subcommand: 'supervisor', positional: ['add', 'faker'] };
-  await mod.supervisorAddCmd(req, { instances: '3', 'max-parallel': '2' });
+  await mod.supervisorAddCmd(req, { instances: '3', 'job-timeout': '600000' });
 
   // Three distinct workers, all running the `faker` profile, each auto-named.
   let workers = [];
@@ -399,15 +399,15 @@ test('supervisor add --instances N: spawns N distinct auto-named workers, forwar
     assert.match(w.id, /^[a-z0-9._-]+-faker-[0-9a-f]+$/, `auto-named id expected, got ${w.id}`);
   }
 
-  // Every child got the forwarded `--max-parallel 2` and its `--name <id>`, but
+  // Every child got the forwarded `--job-timeout 600000` and its `--name <id>`, but
   // never the `--instances` flag (that is consumed by the CLI, not `nano work`).
   for (const w of workers) {
     const childArgv = await readChildArgv(workArgvDir, w.pid);
     assert.ok(childArgv, `child argv for ${w.id} should be recorded`);
     assert.deepEqual(childArgv.slice(0, 3), ['nano', 'work', 'faker']);
     assert.ok(!childArgv.includes('--instances'), `child must not receive --instances: ${JSON.stringify(childArgv)}`);
-    const mp = childArgv.indexOf('--max-parallel');
-    assert.ok(mp !== -1 && childArgv[mp + 1] === '2', `child should carry --max-parallel 2: ${JSON.stringify(childArgv)}`);
+    const jt = childArgv.indexOf('--job-timeout');
+    assert.ok(jt !== -1 && childArgv[jt + 1] === '600000', `child should carry --job-timeout 600000: ${JSON.stringify(childArgv)}`);
     const nameIdx = childArgv.indexOf('--name');
     assert.ok(nameIdx !== -1 && childArgv[nameIdx + 1] === w.id, 'child --name should equal its supervisor id');
   }

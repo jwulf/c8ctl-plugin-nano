@@ -1927,7 +1927,10 @@ async function hireWorker(req, flags) {
       const proto = String(p.protocol || '').trim().toLowerCase() === 'acp' ? '; protocol: acp' : '';
       const perm = (() => {
         const v = String(p.permission || '').trim().toLowerCase();
-        return v && v !== 'yolo' ? `; permission: ${v}` : '';
+        // Only surface recognized non-default modes; normalizeStoredProfile
+        // coerces unknown/legacy values back to yolo at runtime, so showing them
+        // here would make --list disagree with actual behavior.
+        return v && v !== 'yolo' && PERMISSION_MODES.includes(v) ? `; permission: ${v}` : '';
       })();
       logger.info(`  ${name}  [${p.rank}]  ${buildAgentCommandLine(p.command, p.args)}  (model: ${p.model || '-'}; caps: ${normalizeCapabilities(p.capabilities).join(', ') || '-'}${term}${proto}${perm})`);
     }

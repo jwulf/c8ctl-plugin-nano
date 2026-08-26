@@ -12,7 +12,7 @@
 // agent-workers.test.mjs.
 import { test } from 'node:test';
 import assert from 'node:assert/strict';
-import { mkdtempSync, writeFileSync, readFileSync, rmSync, existsSync } from 'node:fs';
+import { mkdtempSync, writeFileSync, rmSync, existsSync } from 'node:fs';
 import { tmpdir } from 'node:os';
 import { join } from 'node:path';
 
@@ -40,6 +40,13 @@ const resultJson = process.env.FAKE_RESULT_JSON || '{"status":"converged","summa
 let promptId = null;
 let permAcks = 0;
 const chosen = [];
+
+// FAKE_FLOOD: stream N newline-free bytes on stdout and stay alive. Exercises the
+// executor's un-terminated-frame cap (it must kill us and fail, not buffer forever).
+if (process.env.FAKE_FLOOD) {
+  process.stdout.write('x'.repeat(Number(process.env.FAKE_FLOOD)));
+  setInterval(() => {}, 3_600_000);
+}
 
 function writeResult(extra) {
   try {
@@ -171,6 +178,27 @@ test('spawnCaptureAcp completes the ACP handshake and merges the result file', a
     assert.equal(result.exitCode, 0);
     // Result-file merge works exactly like the pipe path.
     assert.deepEqual(readAgentResultFile(resultFile), { status: 'converged', summary: 'acp ok' });
+  } finally {
+    rmSync(resDir, { recursive: true, force: true });
+  }
+});
+
+test('spawnCaptureAcp fails a run whose stdout frame never terminates (buffer cap)', async () => {
+  const resDir = mkdtempSync(join(tmpdir(), 'acp-res-'));
+  const resultFile = join(resDir, 'result.json');
+  try {
+    const result = await spawnCaptureAcp({
+      command: 'node',
+      args: [FAKE_AGENT],
+      cwd: workRoot,
+      // Emit >8 MiB with no newline so the cap trips before any frame parses.
+      env: { ...baseEnv(), AGENT_RESULT_FILE: resultFile, FAKE_FLOOD: String(9 * 1024 * 1024) },
+      stdinData: 'prompt',
+      timeoutMs: 20_000,
+      permission: 'yolo',
+    });
+    assert.equal(result.ok, false);
+    assert.ok(/framing violation/i.test(result.error || ''), `expected framing-violation error, got: ${result.error}`);
   } finally {
     rmSync(resDir, { recursive: true, force: true });
   }
@@ -358,7 +386,7 @@ test('runAgentJob (host) dispatches protocol:acp end-to-end without node-pty', a
     // The profile command IS the fake ACP agent; ensureAcpFlag appends --acp
     // (the fake ignores argv). No ptyFactory, no terminal:'pty' — proving the
     // ACP path needs no node-pty.
-    const profile = { name: 'p', rank: 'senior', command: `node ${FAKE_AGENT}`, model: '', capabilities: [], protocol: 'acp', permission: 'yolo' };
+    const profile = { name: 'p', rank: 'senior', command: `node "${FAKE_AGENT}"`, model: '', capabilities: [], protocol: 'acp', permission: 'yolo' };
     const job = { jobKey: 'jk', type: 'senior', variables: {}, customHeaders: {} };
     const result = await runAgentJob(profile, job, {
       sandbox: 'none',

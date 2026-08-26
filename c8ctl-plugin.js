@@ -3978,6 +3978,13 @@ function ensureAcpFlag(commandLine) {
 // (where Ctrl-C already interrupts) without needing a PTY.
 const ACP_INTERRUPT_BYTE = '\x03';
 
+// After the main session/prompt turn resolves we wait for the child's `close`
+// event (so $AGENT_RESULT_FILE is fully flushed before the caller reads it). A
+// well-behaved agent exits promptly once stdin closes; this bounds how long a
+// finished-but-lingering agent may hold the turn open before it is force-reaped,
+// so a completed turn is never held hostage to the full run timeout.
+const ACP_POST_TURN_GRACE_MS = 10_000;
+
 // Drive an ACP (Agent Client Protocol) agent over JSON-RPC 2.0 on stdio.
 //
 // This is the "minimal mode" executor (#110, step 1): it proves ACP end-to-end
@@ -3992,9 +3999,12 @@ const ACP_INTERRUPT_BYTE = '\x03';
 //
 // Sequence: initialize → session/new { cwd } → session/prompt { prompt } →
 // consume session/update notifications until the prompt request resolves
-// (end-of-turn) → end stdin for a clean shutdown → resolve. The result-file
-// merge is unchanged: the agent writes `$AGENT_RESULT_FILE` (already set in
-// `env`) and the caller reads it exactly as in pipe mode.
+// (end-of-turn) → end stdin for a clean shutdown → wait for the child's `close`
+// to settle the promise. Settling on the real exit (rather than the instant the
+// turn resolves) avoids racing the caller's result-file read and surfaces a late
+// non-zero/early exit as a failure. The result-file merge is unchanged: the
+// agent writes `$AGENT_RESULT_FILE` (already set in `env`) and the caller reads
+// it exactly as in pipe mode.
 //
 // Permission: inbound `session/request_permission` requests are answered by the
 // `permission` policy switch — see below. `yolo` auto-allow-always is the only
@@ -4005,7 +4015,7 @@ const ACP_INTERRUPT_BYTE = '\x03';
 // and every caller work unchanged. Because the raw stream is JSON-RPC (not human
 // output), `stdout` here is the accumulated human-readable transcript text (what
 // we relay), and `stderr` is the child's real stderr (agent diagnostics).
-function spawnCaptureAcp({ command, args = [], cwd, env, stdinData, timeoutMs, idleTimeoutMs, relayTap = null, stream = false, streamPrefix = '', onStreamOut, permission = 'yolo' }) {
+function spawnCaptureAcp({ command, args = [], cwd, env, stdinData, timeoutMs, idleTimeoutMs, relayTap = null, stream = false, streamPrefix = '', onStreamOut, permission = 'yolo', shell = false }) {
   return new Promise((resolve) => {
     const logger = getLogger();
     const humanChunks = [];
@@ -4023,6 +4033,8 @@ function spawnCaptureAcp({ command, args = [], cwd, env, stdinData, timeoutMs, i
     let nextId = 1;
     const pending = new Map();
     let childClosed = null; // { code, signal } once the child exits
+    let promptResolved = false; // the main session/prompt turn sent + resolved
+    let settleTimer = null; // post-turn grace before force-reaping a lingering agent
     // One-time warning latch for the reserved escalate/filter policies so the
     // deferral is observable (not silent) but never spams a warning per request.
     let interimWarned = false;
@@ -4069,6 +4081,7 @@ function spawnCaptureAcp({ command, args = [], cwd, env, stdinData, timeoutMs, i
       settled = true;
       if (timer) clearTimeout(timer);
       if (idleTimer) clearTimeout(idleTimer);
+      if (settleTimer) { clearTimeout(settleTimer); settleTimer = null; }
       if (detachSteer) { try { detachSteer(); } catch { /* best effort */ } detachSteer = null; }
       if (teeSink) tee('', true);
       // Reap the child if it is still alive (turn resolved but agent lingering).
@@ -4196,7 +4209,7 @@ function spawnCaptureAcp({ command, args = [], cwd, env, stdinData, timeoutMs, i
 
     // --- spawn ---------------------------------------------------------------
     try {
-      child = spawn(command, args, { cwd, stdio: ['pipe', 'pipe', 'pipe'], env, detached: process.platform !== 'win32' });
+      child = spawn(command, args, { cwd, stdio: ['pipe', 'pipe', 'pipe'], env, detached: process.platform !== 'win32', shell });
     } catch (err) {
       finish({ ok: false, exitCode: null, stdout: '', stderr: '', error: err.message, truncated: false, stderrTruncated: false });
       return;
@@ -4253,8 +4266,14 @@ function spawnCaptureAcp({ command, args = [], cwd, env, stdinData, timeoutMs, i
     });
     child.on('close', (code, signal) => {
       childClosed = { code, signal: signal ?? null };
-      // If the agent exits before we complete the turn, surface it as a failure.
-      finish({ ok: code === 0, exitCode: code, signal: signal ?? null, stdout: humanStdout(), stderr: joinCapped(stderrChunks), truncated: humanTruncated, stderrTruncated });
+      if (settleTimer) { clearTimeout(settleTimer); settleTimer = null; }
+      // Settle on the child's ACTUAL exit — this is what avoids racing the
+      // caller's $AGENT_RESULT_FILE read: the file's write/flush is guaranteed
+      // complete once the process is gone. Success requires BOTH the main
+      // session/prompt turn to have resolved AND a clean exit — an early exit
+      // (e.g. code 0 during the handshake, before the turn completes) or any
+      // non-zero exit is a failure, never a false success.
+      finish({ ok: promptResolved && code === 0, exitCode: code, signal: signal ?? null, stdout: humanStdout(), stderr: joinCapped(stderrChunks), truncated: humanTruncated, stderrTruncated });
     });
 
     // Steer + cancel via the relay tap — NO PTY. Wired once the session exists.
@@ -4292,19 +4311,35 @@ function spawnCaptureAcp({ command, args = [], cwd, env, stdinData, timeoutMs, i
         sessionId,
         prompt: [{ type: 'text', text: String(stdinData ?? '') }],
       });
-      // End-of-turn. The agent has already written $AGENT_RESULT_FILE; the
-      // caller reads it exactly as in pipe mode. Clean shutdown: close stdin so
-      // the agent can exit, then resolve success (child reaped in finish()).
+      // End-of-turn: the main session/prompt request resolved. Mark it so the
+      // `close` handler can tell a completed turn from an early/handshake exit.
+      promptResolved = true;
+      // The agent has written $AGENT_RESULT_FILE; close stdin so it can flush and
+      // exit, then let the child's `close` event settle the promise. Settling on
+      // the real exit (not here) avoids racing the caller's result-file read and
+      // surfaces a late non-zero exit as a failure instead of a false success. A
+      // well-behaved agent exits promptly once stdin closes; force-reap a
+      // lingering one after a short grace so a finished turn is never held hostage
+      // to the full timeout.
       try { child.stdin.end(); } catch { /* already gone */ }
-      finish({
-        ok: true,
-        exitCode: childClosed ? childClosed.code : 0,
-        signal: childClosed ? childClosed.signal : null,
-        stdout: humanStdout(),
-        stderr: joinCapped(stderrChunks),
-        truncated: humanTruncated,
-        stderrTruncated,
-      });
+      if (childClosed === null) {
+        settleTimer = setTimeout(() => {
+          settleTimer = null;
+          try { if (child && childClosed === null) killTree(child); } catch { /* best effort */ }
+          // The turn completed and the result file is already written; the linger
+          // is only a shutdown nicety, so report success despite the forced reap.
+          finish({
+            ok: true,
+            exitCode: childClosed ? childClosed.code : 0,
+            signal: childClosed ? childClosed.signal : null,
+            stdout: humanStdout(),
+            stderr: joinCapped(stderrChunks),
+            truncated: humanTruncated,
+            stderrTruncated,
+          });
+        }, ACP_POST_TURN_GRACE_MS);
+        if (typeof settleTimer.unref === 'function') settleTimer.unref();
+      }
     })().catch((err) => {
       finish({ ok: false, exitCode: null, stdout: humanStdout(), stderr: joinCapped(stderrChunks), error: `acp: ${err?.message || err}`, truncated: humanTruncated, stderrTruncated });
     });
@@ -4436,8 +4471,12 @@ function runAgentJob(profile, job, opts = {}) {
     // policy (yolo enforced; escalate/filter warned interim, pending #559).
     if (protocol === 'acp') {
       return spawnCaptureAcp({
-        command: 'sh',
-        args: ['-c', ensureAcpFlag(commandLine)],
+        // Route the assembled line through the platform shell (cmd.exe on
+        // Windows, /bin/sh elsewhere) exactly like the pipe path, rather than
+        // hard-coding `sh -c` which does not exist on Windows hosts. The
+        // Windows `--arg` restriction is already enforced by the guard above.
+        command: ensureAcpFlag(commandLine),
+        shell: true,
         cwd,
         env: harnessEnv,
         stdinData: payload,

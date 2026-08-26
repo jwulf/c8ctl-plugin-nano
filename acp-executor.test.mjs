@@ -155,62 +155,78 @@ test('ensureAcpFlag appends --acp only when ACP is not already selected', () => 
 });
 
 test('spawnCaptureAcp completes the ACP handshake and merges the result file', async () => {
-  const resultFile = join(mkdtempSync(join(tmpdir(), 'acp-res-')), 'result.json');
-  const result = await spawnCaptureAcp({
-    command: 'node',
-    args: [FAKE_AGENT],
-    cwd: workRoot,
-    env: { ...baseEnv(), AGENT_RESULT_FILE: resultFile, FAKE_EMIT_UPDATE: '1' },
-    stdinData: JSON.stringify({ prompt: 'do the thing' }),
-    timeoutMs: 20_000,
-    permission: 'yolo',
-  });
-  assert.equal(result.ok, true, result.error || result.stderr);
-  assert.equal(result.exitCode, 0);
-  // Result-file merge works exactly like the pipe path.
-  assert.deepEqual(readAgentResultFile(resultFile), { status: 'converged', summary: 'acp ok' });
+  const resDir = mkdtempSync(join(tmpdir(), 'acp-res-'));
+  const resultFile = join(resDir, 'result.json');
+  try {
+    const result = await spawnCaptureAcp({
+      command: 'node',
+      args: [FAKE_AGENT],
+      cwd: workRoot,
+      env: { ...baseEnv(), AGENT_RESULT_FILE: resultFile, FAKE_EMIT_UPDATE: '1' },
+      stdinData: JSON.stringify({ prompt: 'do the thing' }),
+      timeoutMs: 20_000,
+      permission: 'yolo',
+    });
+    assert.equal(result.ok, true, result.error || result.stderr);
+    assert.equal(result.exitCode, 0);
+    // Result-file merge works exactly like the pipe path.
+    assert.deepEqual(readAgentResultFile(resultFile), { status: 'converged', summary: 'acp ok' });
+  } finally {
+    rmSync(resDir, { recursive: true, force: true });
+  }
 });
 
 test('session/update notifications reach the relay tap as human text (raw JSON-RPC is never tee\'d)', async () => {
-  const resultFile = join(mkdtempSync(join(tmpdir(), 'acp-res-')), 'result.json');
+  const resDir = mkdtempSync(join(tmpdir(), 'acp-res-'));
+  const resultFile = join(resDir, 'result.json');
   const rec = makeRecordingTap();
-  const result = await spawnCaptureAcp({
-    command: 'node',
-    args: [FAKE_AGENT],
-    cwd: workRoot,
-    env: { ...baseEnv(), AGENT_RESULT_FILE: resultFile, FAKE_EMIT_UPDATE: '1' },
-    stdinData: 'prompt',
-    timeoutMs: 20_000,
-    relayTap: rec.tap,
-    permission: 'yolo',
-  });
-  assert.equal(result.ok, true, result.error || result.stderr);
-  const relayed = rec.chunks.join('');
-  assert.ok(relayed.includes('Hello ACP'), `expected relayed human text, got: ${JSON.stringify(rec.chunks)}`);
-  // The relay lane must carry TEXT, not raw JSON-RPC frames.
-  assert.ok(!relayed.includes('"jsonrpc"'), 'raw JSON-RPC must never be relayed');
-  assert.ok(!relayed.includes('session/update'), 'raw method names must never be relayed');
+  try {
+    const result = await spawnCaptureAcp({
+      command: 'node',
+      args: [FAKE_AGENT],
+      cwd: workRoot,
+      env: { ...baseEnv(), AGENT_RESULT_FILE: resultFile, FAKE_EMIT_UPDATE: '1' },
+      stdinData: 'prompt',
+      timeoutMs: 20_000,
+      relayTap: rec.tap,
+      permission: 'yolo',
+    });
+    assert.equal(result.ok, true, result.error || result.stderr);
+    const relayed = rec.chunks.join('');
+    assert.ok(relayed.includes('Hello ACP'), `expected relayed human text, got: ${JSON.stringify(rec.chunks)}`);
+    // The relay lane must carry TEXT, not raw JSON-RPC frames.
+    assert.ok(!relayed.includes('"jsonrpc"'), 'raw JSON-RPC must never be relayed');
+    assert.ok(!relayed.includes('session/update'), 'raw method names must never be relayed');
+  } finally {
+    rmSync(resDir, { recursive: true, force: true });
+  }
 });
 
 test('permission:yolo auto-allows session/request_permission and the turn proceeds', async () => {
-  const resultFile = join(mkdtempSync(join(tmpdir(), 'acp-res-')), 'result.json');
-  const result = await spawnCaptureAcp({
-    command: 'node',
-    args: [FAKE_AGENT],
-    cwd: workRoot,
-    env: { ...baseEnv(), AGENT_RESULT_FILE: resultFile, FAKE_PERM_COUNT: '1' },
-    stdinData: 'prompt',
-    timeoutMs: 20_000,
-    permission: 'yolo',
-  });
-  assert.equal(result.ok, true, result.error || result.stderr);
-  const merged = readAgentResultFile(resultFile);
-  // The agent recorded which option the client selected: allow-always.
-  assert.deepEqual(merged.chosen, ['allow_always']);
+  const resDir = mkdtempSync(join(tmpdir(), 'acp-res-'));
+  const resultFile = join(resDir, 'result.json');
+  try {
+    const result = await spawnCaptureAcp({
+      command: 'node',
+      args: [FAKE_AGENT],
+      cwd: workRoot,
+      env: { ...baseEnv(), AGENT_RESULT_FILE: resultFile, FAKE_PERM_COUNT: '1' },
+      stdinData: 'prompt',
+      timeoutMs: 20_000,
+      permission: 'yolo',
+    });
+    assert.equal(result.ok, true, result.error || result.stderr);
+    const merged = readAgentResultFile(resultFile);
+    // The agent recorded which option the client selected: allow-always.
+    assert.deepEqual(merged.chosen, ['allow_always']);
+  } finally {
+    rmSync(resDir, { recursive: true, force: true });
+  }
 });
 
 test('interrupt steer (Ctrl-C) drives session/cancel with no PTY', async () => {
-  const resultFile = join(mkdtempSync(join(tmpdir(), 'acp-res-')), 'result.json');
+  const resDir = mkdtempSync(join(tmpdir(), 'acp-res-'));
+  const resultFile = join(resDir, 'result.json');
   const rec = makeRecordingTap();
   // Once the first update arrives (session established + steer attached), send ETX.
   const origOnData = rec.tap.onData;
@@ -219,23 +235,28 @@ test('interrupt steer (Ctrl-C) drives session/cancel with no PTY', async () => {
     const w = rec.getSteer();
     if (w) { w('\x03'); rec.tap.onData = origOnData; }
   };
-  const result = await spawnCaptureAcp({
-    command: 'node',
-    args: [FAKE_AGENT],
-    cwd: workRoot,
-    env: { ...baseEnv(), AGENT_RESULT_FILE: resultFile, FAKE_EMIT_UPDATE: '1', FAKE_WAIT_CANCEL: '1' },
-    stdinData: 'prompt',
-    timeoutMs: 20_000,
-    relayTap: rec.tap,
-    permission: 'yolo',
-  });
-  assert.equal(result.ok, true, result.error || result.stderr);
-  const merged = readAgentResultFile(resultFile);
-  assert.equal(merged.cancelled, true, 'the agent should have taken the session/cancel path');
+  try {
+    const result = await spawnCaptureAcp({
+      command: 'node',
+      args: [FAKE_AGENT],
+      cwd: workRoot,
+      env: { ...baseEnv(), AGENT_RESULT_FILE: resultFile, FAKE_EMIT_UPDATE: '1', FAKE_WAIT_CANCEL: '1' },
+      stdinData: 'prompt',
+      timeoutMs: 20_000,
+      relayTap: rec.tap,
+      permission: 'yolo',
+    });
+    assert.equal(result.ok, true, result.error || result.stderr);
+    const merged = readAgentResultFile(resultFile);
+    assert.equal(merged.cancelled, true, 'the agent should have taken the session/cancel path');
+  } finally {
+    rmSync(resDir, { recursive: true, force: true });
+  }
 });
 
 test('mid-turn steer text drives a fresh session/prompt (no PTY)', async () => {
-  const resultFile = join(mkdtempSync(join(tmpdir(), 'acp-res-')), 'result.json');
+  const resDir = mkdtempSync(join(tmpdir(), 'acp-res-'));
+  const resultFile = join(resDir, 'result.json');
   const rec = makeRecordingTap();
   const origOnData = rec.tap.onData;
   rec.tap.onData = (d) => {
@@ -243,19 +264,23 @@ test('mid-turn steer text drives a fresh session/prompt (no PTY)', async () => {
     const w = rec.getSteer();
     if (w) { w('please refactor X\n'); rec.tap.onData = origOnData; }
   };
-  const result = await spawnCaptureAcp({
-    command: 'node',
-    args: [FAKE_AGENT],
-    cwd: workRoot,
-    env: { ...baseEnv(), AGENT_RESULT_FILE: resultFile, FAKE_EMIT_UPDATE: '1', FAKE_WAIT_CANCEL: '1', FAKE_ECHO_STEER: '1' },
-    stdinData: 'prompt',
-    timeoutMs: 20_000,
-    relayTap: rec.tap,
-    permission: 'yolo',
-  });
-  assert.equal(result.ok, true, result.error || result.stderr);
-  const relayed = rec.chunks.join('');
-  assert.ok(relayed.includes('STEERED:please refactor X'), `expected steer echo, got: ${JSON.stringify(rec.chunks)}`);
+  try {
+    const result = await spawnCaptureAcp({
+      command: 'node',
+      args: [FAKE_AGENT],
+      cwd: workRoot,
+      env: { ...baseEnv(), AGENT_RESULT_FILE: resultFile, FAKE_EMIT_UPDATE: '1', FAKE_WAIT_CANCEL: '1', FAKE_ECHO_STEER: '1' },
+      stdinData: 'prompt',
+      timeoutMs: 20_000,
+      relayTap: rec.tap,
+      permission: 'yolo',
+    });
+    assert.equal(result.ok, true, result.error || result.stderr);
+    const relayed = rec.chunks.join('');
+    assert.ok(relayed.includes('STEERED:please refactor X'), `expected steer echo, got: ${JSON.stringify(rec.chunks)}`);
+  } finally {
+    rmSync(resDir, { recursive: true, force: true });
+  }
 });
 
 test('escalate emits a one-time not-yet-enforced warning and still completes via the interim policy', async () => {
@@ -267,8 +292,9 @@ test('escalate emits a one-time not-yet-enforced warning and still completes via
       warn: (m) => warnings.push(String(m)),
     }),
   };
+  const resDir = mkdtempSync(join(tmpdir(), 'acp-res-'));
   try {
-    const resultFile = join(mkdtempSync(join(tmpdir(), 'acp-res-')), 'result.json');
+    const resultFile = join(resDir, 'result.json');
     const result = await spawnCaptureAcp({
       command: 'node',
       args: [FAKE_AGENT],
@@ -289,6 +315,7 @@ test('escalate emits a one-time not-yet-enforced warning and still completes via
     assert.ok(relevant[0].includes("'escalate'"));
     assert.ok(relevant[0].includes('nano-workforce#559'));
   } finally {
+    rmSync(resDir, { recursive: true, force: true });
     if (prevC8ctl === undefined) delete globalThis.c8ctl; else globalThis.c8ctl = prevC8ctl;
   }
 });
@@ -302,8 +329,9 @@ test('filter is likewise warned once and interim-handled', async () => {
       warn: (m) => warnings.push(String(m)),
     }),
   };
+  const resDir = mkdtempSync(join(tmpdir(), 'acp-res-'));
   try {
-    const resultFile = join(mkdtempSync(join(tmpdir(), 'acp-res-')), 'result.json');
+    const resultFile = join(resDir, 'result.json');
     const result = await spawnCaptureAcp({
       command: 'node',
       args: [FAKE_AGENT],
@@ -318,6 +346,7 @@ test('filter is likewise warned once and interim-handled', async () => {
     assert.equal(relevant.length, 1);
     assert.ok(relevant[0].includes("'filter'"));
   } finally {
+    rmSync(resDir, { recursive: true, force: true });
     if (prevC8ctl === undefined) delete globalThis.c8ctl; else globalThis.c8ctl = prevC8ctl;
   }
 });

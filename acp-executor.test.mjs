@@ -34,6 +34,7 @@ import { writeFileSync } from 'node:fs';
 const send = (o) => process.stdout.write(JSON.stringify(o) + '\\n');
 const permTotal = Number(process.env.FAKE_PERM_COUNT || 0);
 const emitUpdate = !!process.env.FAKE_EMIT_UPDATE;
+const richUpdates = !!process.env.FAKE_RICH_UPDATES;
 const waitCancel = !!process.env.FAKE_WAIT_CANCEL;
 const echoSteer = !!process.env.FAKE_ECHO_STEER;
 const resultJson = process.env.FAKE_RESULT_JSON || '{"status":"converged","summary":"acp ok"}';
@@ -147,6 +148,17 @@ function handle(m) {
     if (promptId === null) {
       promptId = m.id;
       if (emitUpdate) send({ jsonrpc: '2.0', method: 'session/update', params: { sessionId: 'sess-1', update: { sessionUpdate: 'agent_message_chunk', content: { type: 'text', text: 'Hello ACP' } } } });
+      // FAKE_RICH_UPDATES: emit one of every modelled update kind PLUS an
+      // unmodelled kind, so the typed nwfTranscriptEvent mapping and the
+      // text-fallback (for the unmapped kind) can both be asserted.
+      if (richUpdates) {
+        send({ jsonrpc: '2.0', method: 'session/update', params: { sessionId: 'sess-1', update: { sessionUpdate: 'agent_thought_chunk', content: { type: 'text', text: 'thinking hard' } } } });
+        send({ jsonrpc: '2.0', method: 'session/update', params: { sessionId: 'sess-1', update: { sessionUpdate: 'tool_call', toolCallId: 'tc-1', title: 'write file', status: 'pending', kind: 'edit' } } });
+        send({ jsonrpc: '2.0', method: 'session/update', params: { sessionId: 'sess-1', update: { sessionUpdate: 'tool_call_update', toolCallId: 'tc-1', title: 'write file', status: 'completed' } } });
+        send({ jsonrpc: '2.0', method: 'session/update', params: { sessionId: 'sess-1', update: { sessionUpdate: 'plan', entries: [{ content: 'step 1' }, { content: 'step 2' }] } } });
+        send({ jsonrpc: '2.0', method: 'session/update', params: { sessionId: 'sess-1', update: { sessionUpdate: 'available_commands_update', commands: ['/help'] } } });
+        send({ jsonrpc: '2.0', method: 'session/update', params: { sessionId: 'sess-1', update: { sessionUpdate: 'agent_message_chunk', content: { type: 'text', text: 'all done' } } } });
+      }
       if (process.env.FAKE_SPLIT_MULTIBYTE) { emitSplitMultibyte(); return; }
       if (waitCancel) return;        // hold the turn open until session/cancel
       nextPermOrFinish();
@@ -651,4 +663,214 @@ test('runAgentJob (host) dispatches protocol:acp end-to-end without node-pty', a
 
 test.after(() => {
   try { if (existsSync(workRoot)) rmSync(workRoot, { recursive: true, force: true }); } catch { /* best effort */ }
+});
+
+// ---------------------------------------------------------------------------
+// #110 step 2 — typed nwfTranscriptEvent producer.
+// ---------------------------------------------------------------------------
+
+// A relay tap exposing the TYPED publish seam (relayEnvelope) alongside the
+// step-1 text lane (onData), mirroring runAgentJob's relaySession wiring. It
+// captures published envelopes AND any text-fallback chunks separately so a test
+// can assert which lane each update took.
+function makeTypedTap() {
+  const envelopes = [];
+  const textChunks = [];
+  let steerWrite = null;
+  return {
+    envelopes,
+    textChunks,
+    getSteer: () => steerWrite,
+    tap: {
+      relayEnvelope: (env) => { envelopes.push(env); },
+      onData: (d) => { textChunks.push(typeof d === 'string' ? d : Buffer.from(d).toString('utf8')); },
+      attachSteer: (write) => { steerWrite = write; return () => { steerWrite = null; }; },
+    },
+  };
+}
+
+test('session/update maps to typed nwfTranscriptEvent envelopes on the relay (rich cockpit)', async () => {
+  const resDir = mkdtempSync(join(tmpdir(), 'acp-res-'));
+  const resultFile = join(resDir, 'result.json');
+  const rec = makeTypedTap();
+  try {
+    const result = await spawnCaptureAcp({
+      command: 'node',
+      args: [FAKE_AGENT],
+      cwd: workRoot,
+      env: { ...baseEnv(), AGENT_RESULT_FILE: resultFile, FAKE_EMIT_UPDATE: '1', FAKE_RICH_UPDATES: '1' },
+      stdinData: 'prompt',
+      timeoutMs: 20_000,
+      relayTap: rec.tap,
+      permission: 'yolo',
+    });
+    assert.equal(result.ok, true, result.error || result.stderr);
+
+    // Every modelled update is published as a typed envelope, not raw text.
+    const byKind = (k) => rec.envelopes.filter((e) => e.kind === k);
+    assert.ok(rec.envelopes.length >= 6, `expected typed envelopes, got: ${JSON.stringify(rec.envelopes)}`);
+    for (const e of rec.envelopes) {
+      assert.equal(e.type, 'nwfTranscriptEvent');
+      assert.equal(e.v, 1);
+      assert.equal(typeof e.ts, 'number');
+    }
+
+    // agent_message_chunk → message/agent with the text.
+    const messages = byKind('message');
+    assert.ok(messages.some((e) => e.role === 'agent' && e.text === 'Hello ACP'));
+    assert.ok(messages.some((e) => e.role === 'agent' && e.text === 'all done'));
+
+    // agent_thought_chunk → thought/agent.
+    const thoughts = byKind('thought');
+    assert.equal(thoughts.length, 1);
+    assert.equal(thoughts[0].role, 'agent');
+    assert.equal(thoughts[0].text, 'thinking hard');
+
+    // tool_call → tool_call with tool.{id,title,status,kind}.
+    const starts = byKind('tool_call');
+    assert.equal(starts.length, 1);
+    assert.deepEqual(starts[0].tool, { id: 'tc-1', title: 'write file', status: 'pending', kind: 'edit' });
+
+    // tool_call_update → tool_call_update carrying the terminal status.
+    const finishes = byKind('tool_call_update');
+    assert.equal(finishes.length, 1);
+    assert.equal(finishes[0].tool.id, 'tc-1');
+    assert.equal(finishes[0].tool.status, 'completed');
+
+    // plan → plan (carrying the actual entries payload for rich rendering).
+    const plans = byKind('plan');
+    assert.equal(plans.length, 1);
+    assert.deepEqual(plans[0].entries, [{ content: 'step 1' }, { content: 'step 2' }]);
+
+    // The unmodelled kind (available_commands_update) is NOT a typed envelope.
+    assert.ok(!rec.envelopes.some((e) => e.kind === 'available_commands_update'));
+    // Raw JSON-RPC / method names never appear in any envelope's text.
+    for (const e of rec.envelopes) {
+      if (typeof e.text === 'string') {
+        assert.ok(!e.text.includes('jsonrpc'), 'envelope text must not carry raw JSON-RPC');
+        assert.ok(!e.text.includes('session/update'));
+      }
+    }
+  } finally {
+    rmSync(resDir, { recursive: true, force: true });
+  }
+});
+
+test('an unmapped session/update falls back to the minimal text-chunk path (nothing dropped)', async () => {
+  const resDir = mkdtempSync(join(tmpdir(), 'acp-res-'));
+  const resultFile = join(resDir, 'result.json');
+  const rec = makeTypedTap();
+  try {
+    const result = await spawnCaptureAcp({
+      command: 'node',
+      args: [FAKE_AGENT],
+      cwd: workRoot,
+      env: { ...baseEnv(), AGENT_RESULT_FILE: resultFile, FAKE_EMIT_UPDATE: '1', FAKE_RICH_UPDATES: '1' },
+      stdinData: 'prompt',
+      timeoutMs: 20_000,
+      relayTap: rec.tap,
+      permission: 'yolo',
+    });
+    assert.equal(result.ok, true, result.error || result.stderr);
+    // The unmodelled kind did NOT produce a typed envelope, but it WAS emitted on
+    // the text-fallback lane — so the update is never silently dropped.
+    assert.ok(!rec.envelopes.some((e) => e.kind === 'available_commands_update'));
+    const fallbackText = rec.textChunks.join('');
+    assert.ok(fallbackText.includes('[available_commands_update]'), `expected fallback text for the unmapped kind, got: ${JSON.stringify(rec.textChunks)}`);
+    // Mapped kinds did NOT double-emit onto the text lane (they went typed).
+    assert.ok(!fallbackText.includes('Hello ACP'), 'mapped updates must not also hit the text fallback lane');
+  } finally {
+    rmSync(resDir, { recursive: true, force: true });
+  }
+});
+
+test('a throwing typed publish seam falls back to the text lane (nothing dropped)', async () => {
+  const resDir = mkdtempSync(join(tmpdir(), 'acp-res-'));
+  const resultFile = join(resDir, 'result.json');
+  // A tap whose typed seam always throws (a misbehaving downstream publisher).
+  const textChunks = [];
+  const tap = {
+    relayEnvelope: () => { throw new Error('boom'); },
+    onData: (d) => { textChunks.push(typeof d === 'string' ? d : Buffer.from(d).toString('utf8')); },
+  };
+  try {
+    const result = await spawnCaptureAcp({
+      command: 'node',
+      args: [FAKE_AGENT],
+      cwd: workRoot,
+      env: { ...baseEnv(), AGENT_RESULT_FILE: resultFile, FAKE_EMIT_UPDATE: '1', FAKE_RICH_UPDATES: '1' },
+      stdinData: 'prompt',
+      timeoutMs: 20_000,
+      relayTap: tap,
+      permission: 'yolo',
+    });
+    assert.equal(result.ok, true, result.error || result.stderr);
+    // The throwing typed publish must not crash the worker, and every mapped
+    // update must still reach the relay lane via the text fallback.
+    const relayed = textChunks.join('');
+    assert.ok(relayed.includes('Hello ACP'), `expected text fallback for a throwing typed seam, got: ${JSON.stringify(textChunks)}`);
+    assert.ok(relayed.includes('all done'));
+    assert.ok(relayed.includes('thinking hard'));
+  } finally {
+    rmSync(resDir, { recursive: true, force: true });
+  }
+});
+
+test('with no typed publish seam, every update falls back to human text (minimal-mode floor preserved)', async () => {
+  const resDir = mkdtempSync(join(tmpdir(), 'acp-res-'));
+  const resultFile = join(resDir, 'result.json');
+  // A PLAIN tap (onData only) — no relayEnvelope. Mirrors a legacy/minimal relay.
+  const chunks = [];
+  try {
+    const result = await spawnCaptureAcp({
+      command: 'node',
+      args: [FAKE_AGENT],
+      cwd: workRoot,
+      env: { ...baseEnv(), AGENT_RESULT_FILE: resultFile, FAKE_EMIT_UPDATE: '1', FAKE_RICH_UPDATES: '1' },
+      stdinData: 'prompt',
+      timeoutMs: 20_000,
+      relayTap: { onData: (d) => chunks.push(typeof d === 'string' ? d : Buffer.from(d).toString('utf8')) },
+      permission: 'yolo',
+    });
+    assert.equal(result.ok, true, result.error || result.stderr);
+    const relayed = chunks.join('');
+    // Every update — mapped and unmapped — lands as human text, exactly as step 1.
+    assert.ok(relayed.includes('Hello ACP'));
+    assert.ok(relayed.includes('all done'));
+    assert.ok(relayed.includes('thinking hard'));
+    assert.ok(relayed.includes('write file'));
+    assert.ok(relayed.includes('[available_commands_update]'));
+    // Still TEXT, never raw JSON-RPC.
+    assert.ok(!relayed.includes('"jsonrpc"'));
+    assert.ok(!relayed.includes('session/update'));
+  } finally {
+    rmSync(resDir, { recursive: true, force: true });
+  }
+});
+
+test('typed transcript publishing leaves the captured result stdout (human text) intact', async () => {
+  const resDir = mkdtempSync(join(tmpdir(), 'acp-res-'));
+  const resultFile = join(resDir, 'result.json');
+  const rec = makeTypedTap();
+  try {
+    const result = await spawnCaptureAcp({
+      command: 'node',
+      args: [FAKE_AGENT],
+      cwd: workRoot,
+      env: { ...baseEnv(), AGENT_RESULT_FILE: resultFile, FAKE_EMIT_UPDATE: '1', FAKE_RICH_UPDATES: '1' },
+      stdinData: 'prompt',
+      timeoutMs: 20_000,
+      relayTap: rec.tap,
+      permission: 'yolo',
+    });
+    assert.equal(result.ok, true, result.error || result.stderr);
+    // The result envelope's stdout still carries the human transcript (mirrored
+    // locally) even though the relay lane carried typed envelopes.
+    assert.ok(result.stdout.includes('Hello ACP'), `expected human text in result.stdout, got: ${JSON.stringify(result.stdout)}`);
+    assert.ok(result.stdout.includes('thinking hard'));
+    // Result-file merge is unchanged.
+    assert.deepEqual(readAgentResultFile(resultFile), { status: 'converged', summary: 'acp ok' });
+  } finally {
+    rmSync(resDir, { recursive: true, force: true });
+  }
 });

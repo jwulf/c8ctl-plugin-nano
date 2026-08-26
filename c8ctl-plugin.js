@@ -1571,7 +1571,8 @@ const PERMISSION_MODES = ['yolo', 'escalate', 'filter'];
 function resolveAgenticSetting(envValue, profileValue, allowed, dflt) {
   const env = String(envValue || '').trim().toLowerCase();
   if (allowed.includes(env)) return env;
-  if (profileValue && allowed.includes(profileValue)) return profileValue;
+  const profile = String(profileValue || '').trim().toLowerCase();
+  if (allowed.includes(profile)) return profile;
   return dflt;
 }
 

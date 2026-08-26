@@ -172,6 +172,14 @@ test('resolveAgenticSetting: env is trimmed and lowercased before matching', () 
   assert.equal(resolveAgenticSetting('Escalate', 'yolo', PERMISSION_MODES, 'yolo'), 'escalate');
 });
 
+test('resolveAgenticSetting: profile is trimmed and lowercased before matching', () => {
+  // A hand-edited / version-skewed stored profile must be tolerated the same as
+  // env — normalization applies at every layer, not just the env override.
+  assert.equal(resolveAgenticSetting('', '  ACP ', PROTOCOLS, 'pipe'), 'acp');
+  assert.equal(resolveAgenticSetting('', ' Escalate ', PERMISSION_MODES, 'yolo'), 'escalate');
+  assert.equal(resolveAgenticSetting('bogus', 'FILTER', PERMISSION_MODES, 'yolo'), 'filter');
+});
+
 test('resolveAgenticSetting: reserved permission values carry through verbatim', () => {
   for (const policy of ['escalate', 'filter']) {
     assert.equal(resolveAgenticSetting('', policy, PERMISSION_MODES, 'yolo'), policy);

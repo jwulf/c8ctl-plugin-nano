@@ -48,6 +48,22 @@ if (process.env.FAKE_FLOOD) {
   setInterval(() => {}, 3_600_000);
 }
 
+// FAKE_SPLIT_MULTIBYTE: emit one JSON-RPC frame carrying a multibyte-heavy text,
+// but flush it to stdout as two raw byte writes that DELIBERATELY split a
+// multibyte UTF-8 sequence across the chunk boundary. A naive per-chunk
+// .toString('utf8') corrupts the code point (U+FFFD); a streaming decoder holds
+// the partial sequence back and reassembles it intact.
+function emitSplitMultibyte() {
+  const frame = JSON.stringify({ jsonrpc: '2.0', method: 'session/update', params: { sessionId: 'sess-1', update: { sessionUpdate: 'agent_message_chunk', content: { type: 'text', text: 'café ☃ 🚀 done' } } } }) + '\\n';
+  const bytes = Buffer.from(frame, 'utf8');
+  // Split near the middle, then nudge forward until the boundary lands INSIDE a
+  // multibyte sequence (a continuation byte 0x80..0xBF starts the second chunk).
+  let cut = Math.floor(bytes.length / 2);
+  while (cut < bytes.length - 1 && (bytes[cut] & 0xc0) !== 0x80) cut++;
+  process.stdout.write(bytes.subarray(0, cut));
+  setTimeout(() => { process.stdout.write(bytes.subarray(cut)); finish('end_turn'); }, 15);
+}
+
 function writeResult(extra) {
   try {
     if (process.env.AGENT_RESULT_FILE) {
@@ -99,6 +115,7 @@ function handle(m) {
     if (promptId === null) {
       promptId = m.id;
       if (emitUpdate) send({ jsonrpc: '2.0', method: 'session/update', params: { sessionId: 'sess-1', update: { sessionUpdate: 'agent_message_chunk', content: { type: 'text', text: 'Hello ACP' } } } });
+      if (process.env.FAKE_SPLIT_MULTIBYTE) { emitSplitMultibyte(); return; }
       if (waitCancel) return;        // hold the turn open until session/cancel
       nextPermOrFinish();
     } else {
@@ -199,6 +216,32 @@ test('spawnCaptureAcp fails a run whose stdout frame never terminates (buffer ca
     });
     assert.equal(result.ok, false);
     assert.ok(/framing violation/i.test(result.error || ''), `expected framing-violation error, got: ${result.error}`);
+  } finally {
+    rmSync(resDir, { recursive: true, force: true });
+  }
+});
+
+test('spawnCaptureAcp reassembles a multibyte UTF-8 sequence split across stdout chunks', async () => {
+  const resDir = mkdtempSync(join(tmpdir(), 'acp-res-'));
+  const resultFile = join(resDir, 'result.json');
+  const rec = makeRecordingTap();
+  try {
+    const result = await spawnCaptureAcp({
+      command: 'node',
+      args: [FAKE_AGENT],
+      cwd: workRoot,
+      env: { ...baseEnv(), AGENT_RESULT_FILE: resultFile, FAKE_SPLIT_MULTIBYTE: '1' },
+      stdinData: 'prompt',
+      timeoutMs: 20_000,
+      relayTap: rec.tap,
+      permission: 'yolo',
+    });
+    assert.equal(result.ok, true, result.error || result.stderr);
+    const relayed = rec.chunks.join('');
+    // The frame parsed cleanly (a corrupted code point would have failed JSON.parse
+    // and dropped the whole update) and the text arrived byte-perfect.
+    assert.ok(relayed.includes('café ☃ 🚀 done'), `expected intact multibyte text, got: ${JSON.stringify(rec.chunks)}`);
+    assert.ok(!relayed.includes('\uFFFD'), 'no replacement char — the split sequence must be reassembled, not mangled');
   } finally {
     rmSync(resDir, { recursive: true, force: true });
   }

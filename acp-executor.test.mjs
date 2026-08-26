@@ -190,6 +190,13 @@ test('ensureAcpFlag appends --acp only when ACP is not already selected', () => 
   assert.equal(ensureAcpFlag("opencode 'acp'"), "opencode 'acp'");
   assert.equal(ensureAcpFlag("copilot '--acp'"), "copilot '--acp'");
   assert.equal(ensureAcpFlag("node '/x/agent.mjs' 'acp'"), "node '/x/agent.mjs' 'acp'");
+  // A legacy profile.command may double-quote the selector instead — also unquote.
+  assert.equal(ensureAcpFlag('copilot "--acp"'), 'copilot "--acp"');
+  assert.equal(ensureAcpFlag('opencode "acp"'), 'opencode "acp"');
+  // The `-acp` adapter suffix only counts on the COMMAND token; an argument that
+  // merely ends in `-acp` is not an ACP selector, so still append.
+  assert.equal(ensureAcpFlag('copilot --model foo-acp'), 'copilot --model foo-acp --acp');
+  assert.equal(ensureAcpFlag("copilot '--model' 'foo-acp'"), "copilot '--model' 'foo-acp' --acp");
   // A path that merely contains `/acp/` is NOT an ACP selector — append.
   assert.equal(ensureAcpFlag('/opt/acp/bin/agent'), '/opt/acp/bin/agent --acp');
   assert.equal(ensureAcpFlag("'/opt/acp/bin/agent'"), "'/opt/acp/bin/agent' --acp");

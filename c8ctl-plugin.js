@@ -3971,18 +3971,27 @@ function ensureAcpFlag(commandLine) {
   // Detection must survive buildAgentCommandLine()'s POSIX single-quoting: a
   // structured `--arg acp` (or `--arg --acp`) lands here as the quoted token
   // 'acp' / '--acp', so a naive `\bacp\b` on the raw line would miss it and
-  // wrongly append a second --acp. Tokenise the line, strip the single-quoting,
-  // and match each token as a WHOLE selector — `acp`/`-acp`/`--acp` (native
-  // subcommand or switch) or an adapter command whose basename ends in `-acp`
-  // (claude-agent-acp, pi-acp). Matching whole tokens/basenames (not a substring)
-  // also avoids the false positive of a path that merely contains `/acp/`.
-  const tokens = commandLine.match(/'(?:[^']|'\\'')*'|\S+/g) || [];
-  for (let tok of tokens) {
+  // wrongly append a second --acp. Tokenise the line, strip the shell quoting
+  // (both POSIX single-quotes from buildAgentCommandLine() AND double-quotes a
+  // legacy `profile.command` may bake in, e.g. `copilot "--acp"`), and match:
+  //   - a native ACP selector `acp`/`-acp`/`--acp` (subcommand or switch) as a
+  //     WHOLE token, in ANY position (it may be the command or an argument), or
+  //   - an adapter command whose basename ends in `-acp` (claude-agent-acp,
+  //     pi-acp) — but ONLY the command token (first token), since an *argument*
+  //     that merely ends in `-acp` (e.g. `--model foo-acp`) is not an ACP
+  //     selector. Matching whole tokens/basenames (not a substring) also avoids
+  //     the false positive of a path that merely contains `/acp/`.
+  const tokens = commandLine.match(/'(?:[^']|'\\'')*'|"(?:[^"\\]|\\.)*"|\S+/g) || [];
+  for (let i = 0; i < tokens.length; i++) {
+    let tok = tokens[i];
     if (tok.length >= 2 && tok.startsWith("'") && tok.endsWith("'")) {
       tok = tok.slice(1, -1).replace(/'\\''/g, "'");
+    } else if (tok.length >= 2 && tok.startsWith('"') && tok.endsWith('"')) {
+      tok = tok.slice(1, -1).replace(/\\(["\\$`])/g, '$1');
     }
     const base = tok.replace(/^.*[\\/]/, ''); // basename, for path-form commands
-    if (/^-{0,2}acp$/i.test(base) || /-acp$/i.test(base)) return commandLine;
+    if (/^-{0,2}acp$/i.test(base)) return commandLine;
+    if (i === 0 && /-acp$/i.test(base)) return commandLine;
   }
   return `${commandLine} --acp`;
 }

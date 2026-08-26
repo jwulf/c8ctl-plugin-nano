@@ -784,6 +784,38 @@ test('an unmapped session/update falls back to the minimal text-chunk path (noth
   }
 });
 
+test('a throwing typed publish seam falls back to the text lane (nothing dropped)', async () => {
+  const resDir = mkdtempSync(join(tmpdir(), 'acp-res-'));
+  const resultFile = join(resDir, 'result.json');
+  // A tap whose typed seam always throws (a misbehaving downstream publisher).
+  const textChunks = [];
+  const tap = {
+    relayEnvelope: () => { throw new Error('boom'); },
+    onData: (d) => { textChunks.push(typeof d === 'string' ? d : Buffer.from(d).toString('utf8')); },
+  };
+  try {
+    const result = await spawnCaptureAcp({
+      command: 'node',
+      args: [FAKE_AGENT],
+      cwd: workRoot,
+      env: { ...baseEnv(), AGENT_RESULT_FILE: resultFile, FAKE_EMIT_UPDATE: '1', FAKE_RICH_UPDATES: '1' },
+      stdinData: 'prompt',
+      timeoutMs: 20_000,
+      relayTap: tap,
+      permission: 'yolo',
+    });
+    assert.equal(result.ok, true, result.error || result.stderr);
+    // The throwing typed publish must not crash the worker, and every mapped
+    // update must still reach the relay lane via the text fallback.
+    const relayed = textChunks.join('');
+    assert.ok(relayed.includes('Hello ACP'), `expected text fallback for a throwing typed seam, got: ${JSON.stringify(textChunks)}`);
+    assert.ok(relayed.includes('all done'));
+    assert.ok(relayed.includes('thinking hard'));
+  } finally {
+    rmSync(resDir, { recursive: true, force: true });
+  }
+});
+
 test('with no typed publish seam, every update falls back to human text (minimal-mode floor preserved)', async () => {
   const resDir = mkdtempSync(join(tmpdir(), 'acp-res-'));
   const resultFile = join(resDir, 'result.json');

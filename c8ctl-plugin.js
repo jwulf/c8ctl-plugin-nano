@@ -4309,12 +4309,22 @@ function spawnCaptureAcp({ command, args = [], cwd, env, stdinData, timeoutMs, i
     const emitTranscript = (update) => {
       const env = mapTranscriptEnvelope(update);
       if (env && relayTap && typeof relayTap.relayEnvelope === 'function') {
-        try { relayTap.relayEnvelope(env); } catch { /* relay best-effort */ }
-        // Mirror the human text locally (spy tee + captured stdout) so the result
-        // envelope and --stream spy are unchanged — without re-emitting raw text
-        // onto the relay lane, which now carries the typed envelope.
-        captureHuman(describeUpdate(update));
-        return;
+        // Only skip the text fallback when the typed publish ACTUALLY succeeded.
+        // If the seam throws (a downstream tap implementation, not just the
+        // built-in best-effort stringify guard), the envelope never reached the
+        // relay lane — so we must fall through to the text path or that update
+        // would be silently dropped, breaking the "nothing is ever dropped"
+        // guarantee.
+        let published = false;
+        try { relayTap.relayEnvelope(env); published = true; } catch { /* relay best-effort */ }
+        if (published) {
+          // Mirror the human text locally (spy tee + captured stdout) so the
+          // result envelope and --stream spy are unchanged — without re-emitting
+          // raw text onto the relay lane, which now carries the typed envelope.
+          captureHuman(describeUpdate(update));
+          return;
+        }
+        // Typed publish threw → fall through to the text lane below.
       }
       // Fallback: minimal text-chunk path (relay text + spy tee + capture).
       emitHuman(describeUpdate(update));

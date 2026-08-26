@@ -2202,7 +2202,7 @@ const RESULT_SENTINEL = '::nano:result::';
 // audit envelope or process bookkeeping.
 const RESERVED_RESULT_KEYS = new Set([
   AGENT_RESULT_KEY, 'output', 'exitCode', 'agent', 'truncated',
-  'branch', 'commits', 'pushed', 'pullRequest',
+  'branch', 'commits', 'pushed', 'pullRequest', 'forcedReap',
 ]);
 
 // Parse `text` as a JSON object, returning it only when it is a plain object.

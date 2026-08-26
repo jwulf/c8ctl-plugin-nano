@@ -427,7 +427,7 @@ c8ctl nano hire --name coder --rank senior --command copilot --protocol acp
 
 # Override protocol/permission for a one-off worker without re-hiring
 NANO_AGENTIC_PROTOCOL=pipe c8ctl nano work coder
-NANO_AGENTIC_PERMISSION=yolo c8ctl nano work coder
+NANO_AGENTIC_PERMISSION=escalate c8ctl nano work coder
 ```
 
 - `--protocol pipe|acp` (default `pipe`) selects the harness protocol.
@@ -437,8 +437,10 @@ NANO_AGENTIC_PERMISSION=yolo c8ctl nano work coder
   policy. `NANO_AGENTIC_PERMISSION` overrides it at work time.
 
 **What ACP unlocks.** Because the harness speaks a structured protocol rather than
-a scraped terminal, the ACP path gives you **structured streaming turn/tool
-events**, **native permission handling**, and **PTY-free steering** — an operator's
+a scraped terminal, the ACP path gives you a **structured turn/tool event stream**
+(today serialized to text chunks on the relay lane — a *minimal* mode, not yet
+typed turn/tool envelopes), **native permission handling**, and **PTY-free
+steering** — an operator's
 steer text is delivered as a `session/prompt` and an interrupt as a
 `session/cancel`, with no keystroke injection. The ACP path therefore does **not**
 need the optional native `node-pty` dependency at all.

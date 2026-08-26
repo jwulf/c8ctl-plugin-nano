@@ -4073,23 +4073,29 @@ function spawnCaptureAcp({ command, args = [], cwd, env, stdinData, timeoutMs, i
     let interimWarned = false;
 
     // Live "spy" tee (--stream), line-buffered, mirroring the other paths.
+    // Separate line buffers per lane (stdout-human vs stderr) so a partial line
+    // on one lane never interleaves mid-line with the other — matching pipe/PTY.
     const STREAM_TEE_LINE_CAP = 64 * 1024;
-    let teePartial = '';
     const teeSink = stream ? (onStreamOut || ((line) => process.stdout.write(`${line}\n`))) : null;
-    const tee = (text, final) => {
-      if (!teeSink) return;
-      teePartial += text;
-      let nl;
-      while ((nl = teePartial.indexOf('\n')) !== -1) {
-        teeSink(`${streamPrefix}${teePartial.slice(0, nl)}`);
-        teePartial = teePartial.slice(nl + 1);
-      }
-      while (teePartial.length >= STREAM_TEE_LINE_CAP) {
-        teeSink(`${streamPrefix}${teePartial.slice(0, STREAM_TEE_LINE_CAP)}`);
-        teePartial = teePartial.slice(STREAM_TEE_LINE_CAP);
-      }
-      if (final && teePartial) { teeSink(`${streamPrefix}${teePartial}`); teePartial = ''; }
+    const makeTee = () => {
+      let partial = '';
+      return (text, final) => {
+        if (!teeSink) return;
+        partial += text;
+        let nl;
+        while ((nl = partial.indexOf('\n')) !== -1) {
+          teeSink(`${streamPrefix}${partial.slice(0, nl)}`);
+          partial = partial.slice(nl + 1);
+        }
+        while (partial.length >= STREAM_TEE_LINE_CAP) {
+          teeSink(`${streamPrefix}${partial.slice(0, STREAM_TEE_LINE_CAP)}`);
+          partial = partial.slice(STREAM_TEE_LINE_CAP);
+        }
+        if (final && partial) { teeSink(`${streamPrefix}${partial}`); partial = ''; }
+      };
     };
+    const tee = makeTee();
+    const teeErr = makeTee();
 
     const humanStdout = () => joinCapped(humanChunks);
 
@@ -4116,7 +4122,7 @@ function spawnCaptureAcp({ command, args = [], cwd, env, stdinData, timeoutMs, i
       if (idleTimer) clearTimeout(idleTimer);
       if (settleTimer) { clearTimeout(settleTimer); settleTimer = null; }
       if (detachSteer) { try { detachSteer(); } catch { /* best effort */ } detachSteer = null; }
-      if (teeSink) tee('', true);
+      if (teeSink) { tee('', true); teeErr('', true); }
       // Reap the child if it is still alive (turn resolved but agent lingering).
       try { if (child && childClosed === null) killTree(child); } catch { /* best effort */ }
       resolve(result);
@@ -4310,6 +4316,17 @@ function spawnCaptureAcp({ command, args = [], cwd, env, stdinData, timeoutMs, i
     child.stderr.on('data', (d) => {
       armIdle();
       const buf = Buffer.isBuffer(d) ? d : Buffer.from(d);
+      // Forward stderr to the SAME live lanes the pipe/PTY paths use — the
+      // --stream spy tee and the relay tap — so agent diagnostics are visible
+      // during execution rather than only after it finishes. This is safe
+      // precisely because stdout is the pure JSON-RPC channel here: stderr never
+      // carries protocol frames, so teeing/relaying it can't corrupt the
+      // relayed human stream.
+      const text = buf.toString('utf8');
+      if (teeSink) teeErr(text, false);
+      if (relayTap && typeof relayTap.onData === 'function') {
+        try { relayTap.onData(text); } catch { /* relay best-effort */ }
+      }
       const remaining = MAX_CAPTURE_BYTES - stderrBytes;
       if (remaining <= 0) { stderrTruncated = true; return; }
       if (buf.length > remaining) { stderrChunks.push(buf.subarray(0, remaining)); stderrBytes = MAX_CAPTURE_BYTES; stderrTruncated = true; }

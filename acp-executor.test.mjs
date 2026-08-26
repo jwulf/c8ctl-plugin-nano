@@ -63,6 +63,13 @@ if (process.env.FAKE_EARLY_EXIT) {
   process.exit(0);
 }
 
+// FAKE_STDERR: emit a diagnostic line on stderr during startup, then complete
+// the handshake normally. Exercises stderr being FORWARDED to the --stream tee
+// and the relay lane (live observability), not merely captured post-hoc.
+if (process.env.FAKE_STDERR) {
+  process.stderr.write('acp-diag: hello from stderr\\n');
+}
+
 // FAKE_SPLIT_MULTIBYTE: emit one JSON-RPC frame carrying a multibyte-heavy text,
 // but flush it to stdout as two raw byte writes that DELIBERATELY split a
 // multibyte UTF-8 sequence across the chunk boundary. A naive per-chunk
@@ -226,6 +233,35 @@ test('spawnCaptureAcp completes the ACP handshake and merges the result file', a
     assert.equal(result.exitCode, 0);
     // Result-file merge works exactly like the pipe path.
     assert.deepEqual(readAgentResultFile(resultFile), { status: 'converged', summary: 'acp ok' });
+  } finally {
+    rmSync(resDir, { recursive: true, force: true });
+  }
+});
+
+test('spawnCaptureAcp forwards stderr to the --stream tee and the relay lane', async () => {
+  const resDir = mkdtempSync(join(tmpdir(), 'acp-res-'));
+  const resultFile = join(resDir, 'result.json');
+  const teeLines = [];
+  const relayed = [];
+  try {
+    const result = await spawnCaptureAcp({
+      command: 'node',
+      args: [FAKE_AGENT],
+      cwd: workRoot,
+      env: { ...baseEnv(), AGENT_RESULT_FILE: resultFile, FAKE_STDERR: '1' },
+      stdinData: JSON.stringify({ prompt: 'do the thing' }),
+      timeoutMs: 20_000,
+      permission: 'yolo',
+      stream: true,
+      onStreamOut: (line) => teeLines.push(line),
+      relayTap: { onData: (d) => relayed.push(typeof d === 'string' ? d : Buffer.from(d).toString('utf8')) },
+    });
+    assert.equal(result.ok, true, result.error || result.stderr);
+    // stderr is still captured for the result...
+    assert.match(result.stderr, /acp-diag: hello from stderr/);
+    // ...AND streamed live on both lanes (like pipe/PTY mode), not just captured.
+    assert.ok(teeLines.some((l) => l.includes('acp-diag: hello from stderr')), 'stderr should reach the --stream tee');
+    assert.ok(relayed.some((r) => r.includes('acp-diag: hello from stderr')), 'stderr should reach the relay lane');
   } finally {
     rmSync(resDir, { recursive: true, force: true });
   }

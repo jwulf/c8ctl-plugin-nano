@@ -3959,6 +3959,358 @@ function spawnCapturePty({ command, args = [], cwd, env, stdinData, timeoutMs, i
   });
 }
 
+// ---- ACP capture (C3 #110 — the third harness path, "minimal mode") ---------
+// Some ACP agents are native (`copilot --acp`, `opencode acp`), some ride an
+// adapter (`claude-agent-acp`, `pi-acp`). In every case the profile's command +
+// `--arg`s already assemble the ACP invocation; we only append a default `--acp`
+// switch when the assembled line doesn't already select ACP, so a native/adapter
+// invocation is never doubled. This mirrors how the pipe path spawns the line
+// under a shell.
+function ensureAcpFlag(commandLine) {
+  if (/(^|[\s/-])acp\b/i.test(commandLine)) return commandLine;
+  return `${commandLine} --acp`;
+}
+
+// The steer control byte the cockpit sends to interrupt a live ACP turn: ETX
+// (Ctrl-C, 0x03), matching terminal semantics. Any other inbound steer text is
+// treated as a mid-turn steer prompt (a fresh `session/prompt` on the live
+// session). This keeps the ACP steer surface consistent with the PTY path
+// (where Ctrl-C already interrupts) without needing a PTY.
+const ACP_INTERRUPT_BYTE = '\x03';
+
+// Drive an ACP (Agent Client Protocol) agent over JSON-RPC 2.0 on stdio.
+//
+// This is the "minimal mode" executor (#110, step 1): it proves ACP end-to-end
+// with ZERO downstream changes by serialising each `session/update` to a short
+// human-readable TEXT chunk and feeding it to the SAME relay/tee lane the pipe
+// path uses (`relayTap.onData`) — it never tee's the raw JSON-RPC. Typed
+// transcript envelopes are a separate downstream task.
+//
+// Framing: ACP frames are newline-delimited JSON-RPC 2.0 messages on stdio (one
+// compact JSON object per line, `\n`-terminated). We implement a tiny inline
+// framer/parser rather than pull a dependency.
+//
+// Sequence: initialize → session/new { cwd } → session/prompt { prompt } →
+// consume session/update notifications until the prompt request resolves
+// (end-of-turn) → end stdin for a clean shutdown → resolve. The result-file
+// merge is unchanged: the agent writes `$AGENT_RESULT_FILE` (already set in
+// `env`) and the caller reads it exactly as in pipe mode.
+//
+// Permission: inbound `session/request_permission` requests are answered by the
+// `permission` policy switch — see below. `yolo` auto-allow-always is the only
+// policy enforced today; `escalate`/`filter` fall back to a warned safe interim
+// policy pending nano-workforce#559.
+//
+// Same result contract as spawnCaptureOneShot/spawnCapturePty so buildResultEnvelope
+// and every caller work unchanged. Because the raw stream is JSON-RPC (not human
+// output), `stdout` here is the accumulated human-readable transcript text (what
+// we relay), and `stderr` is the child's real stderr (agent diagnostics).
+function spawnCaptureAcp({ command, args = [], cwd, env, stdinData, timeoutMs, idleTimeoutMs, relayTap = null, stream = false, streamPrefix = '', onStreamOut, permission = 'yolo' }) {
+  return new Promise((resolve) => {
+    const logger = getLogger();
+    const humanChunks = [];
+    let humanBytes = 0;
+    let humanTruncated = false;
+    const stderrChunks = [];
+    let stderrBytes = 0;
+    let stderrTruncated = false;
+    let settled = false;
+    let timer = null;
+    let idleTimer = null;
+    let detachSteer = null;
+    let child;
+    let sessionId = null;
+    let nextId = 1;
+    const pending = new Map();
+    let childClosed = null; // { code, signal } once the child exits
+    // One-time warning latch for the reserved escalate/filter policies so the
+    // deferral is observable (not silent) but never spams a warning per request.
+    let interimWarned = false;
+
+    // Live "spy" tee (--stream), line-buffered, mirroring the other paths.
+    const STREAM_TEE_LINE_CAP = 64 * 1024;
+    let teePartial = '';
+    const teeSink = stream ? (onStreamOut || ((line) => process.stdout.write(`${line}\n`))) : null;
+    const tee = (text, final) => {
+      if (!teeSink) return;
+      teePartial += text;
+      let nl;
+      while ((nl = teePartial.indexOf('\n')) !== -1) {
+        teeSink(`${streamPrefix}${teePartial.slice(0, nl)}`);
+        teePartial = teePartial.slice(nl + 1);
+      }
+      while (teePartial.length >= STREAM_TEE_LINE_CAP) {
+        teeSink(`${streamPrefix}${teePartial.slice(0, STREAM_TEE_LINE_CAP)}`);
+        teePartial = teePartial.slice(STREAM_TEE_LINE_CAP);
+      }
+      if (final && teePartial) { teeSink(`${streamPrefix}${teePartial}`); teePartial = ''; }
+    };
+
+    const humanStdout = () => joinCapped(humanChunks);
+
+    // Emit a human-meaningful text chunk on the SAME lanes the pipe/pty paths
+    // use: the relay tap (framed + jobKey-tagged by the caller) and the local
+    // --stream spy tee. Byte-capped like the raw captures.
+    const emitHuman = (text) => {
+      if (!text) return;
+      const buf = Buffer.from(text, 'utf8');
+      if (teeSink) tee(text, false);
+      if (relayTap && typeof relayTap.onData === 'function') {
+        try { relayTap.onData(text); } catch { /* relay best-effort */ }
+      }
+      const remaining = MAX_CAPTURE_BYTES - humanBytes;
+      if (remaining <= 0) { humanTruncated = true; return; }
+      if (buf.length > remaining) { humanChunks.push(buf.subarray(0, remaining)); humanBytes = MAX_CAPTURE_BYTES; humanTruncated = true; }
+      else { humanChunks.push(buf); humanBytes += buf.length; }
+    };
+
+    const finish = (result) => {
+      if (settled) return;
+      settled = true;
+      if (timer) clearTimeout(timer);
+      if (idleTimer) clearTimeout(idleTimer);
+      if (detachSteer) { try { detachSteer(); } catch { /* best effort */ } detachSteer = null; }
+      if (teeSink) tee('', true);
+      // Reap the child if it is still alive (turn resolved but agent lingering).
+      try { if (child && childClosed === null) killTree(child); } catch { /* best effort */ }
+      resolve(result);
+    };
+
+    // --- JSON-RPC 2.0 plumbing (newline-delimited framing) -------------------
+    const send = (obj) => {
+      try { child.stdin.write(`${JSON.stringify(obj)}\n`); } catch { /* child gone; close handler settles */ }
+    };
+    const request = (method, params) => new Promise((res, rej) => {
+      const id = nextId++;
+      pending.set(id, { res, rej });
+      send({ jsonrpc: '2.0', id, method, params });
+    });
+    const notify = (method, params) => send({ jsonrpc: '2.0', method, params });
+    const respond = (id, result) => send({ jsonrpc: '2.0', id, result });
+    const respondError = (id, code, message) => send({ jsonrpc: '2.0', id, error: { code, message } });
+
+    // Pick the "allow-always" option (yolo / safe-interim structural path). ACP
+    // permission options carry a `kind` (allow_always|allow_once|reject_*). We
+    // prefer allow_always, then allow_once, then the first option; this is the
+    // conservative structural default the interim policy also uses.
+    const pickAllowOption = (options) => {
+      const list = Array.isArray(options) ? options : [];
+      return list.find((o) => o && o.kind === 'allow_always')
+        || list.find((o) => o && o.kind === 'allow_once')
+        || list[0]
+        || null;
+    };
+
+    const handlePermission = (id, params) => {
+      const options = params?.options;
+      const allow = pickAllowOption(options);
+      const grant = () => {
+        if (allow && allow.optionId != null) {
+          respond(id, { outcome: { outcome: 'selected', optionId: allow.optionId } });
+        } else {
+          // No option to select (malformed request) — cancel rather than hang.
+          respond(id, { outcome: { outcome: 'cancelled' } });
+        }
+      };
+      switch (permission) {
+        case 'yolo':
+          // The ONLY fully-enforced policy: auto-allow-always, no human, sub-ms
+          // local round-trip.
+          grant();
+          break;
+        // TODO(#559): implement escalate/filter — the real permission-event +
+        // escalation bridge (block-until-answered for escalate; auto-allow
+        // reads/edits + escalate destructive ops for filter) lands with the
+        // companion nano-workforce#559 task. Until then these reserved policies
+        // must NOT masquerade as enforced: warn once, then fall through to the
+        // safe interim structural policy (same allow-always grant as yolo).
+        case 'escalate':
+        case 'filter':
+        default:
+          if (!interimWarned) {
+            interimWarned = true;
+            logger.warn?.(`ACP permission policy '${permission}' is not yet enforced in this build; requests handled by interim policy pending nano-workforce#559`);
+          }
+          grant();
+          break;
+      }
+    };
+
+    // Serialise an ACP session/update into a short human-readable line. Minimal
+    // mode: this is TEXT for the existing cockpit lane, not a typed envelope.
+    const describeUpdate = (update) => {
+      if (!update || typeof update !== 'object') return '';
+      const kind = update.sessionUpdate || update.type || 'update';
+      const textOf = (content) => {
+        if (content == null) return '';
+        if (typeof content === 'string') return content;
+        if (Array.isArray(content)) return content.map(textOf).join('');
+        if (typeof content === 'object') return typeof content.text === 'string' ? content.text : '';
+        return '';
+      };
+      switch (kind) {
+        case 'agent_message_chunk':
+          return textOf(update.content);
+        case 'agent_thought_chunk':
+          return `\u{1F4AD} ${textOf(update.content)}`;
+        case 'user_message_chunk':
+          return textOf(update.content);
+        case 'tool_call': {
+          const title = update.title || update.toolCallId || 'tool';
+          return `\u2699 [tool: ${title}${update.status ? ` — ${update.status}` : ''}]\n`;
+        }
+        case 'tool_call_update': {
+          const title = update.title || update.toolCallId || 'tool';
+          return `\u2699 [tool: ${title}${update.status ? ` — ${update.status}` : ''}]\n`;
+        }
+        case 'plan':
+          return `\u{1F4CB} [plan updated]\n`;
+        default:
+          return `[${kind}]\n`;
+      }
+    };
+
+    const handleMessage = (msg) => {
+      if (!msg || typeof msg !== 'object') return;
+      // A response to one of OUR requests.
+      if (msg.id !== undefined && msg.method === undefined && (msg.result !== undefined || msg.error !== undefined)) {
+        const p = pending.get(msg.id);
+        if (p) {
+          pending.delete(msg.id);
+          if (msg.error) p.rej(new Error(msg.error.message || `rpc error ${msg.error.code}`));
+          else p.res(msg.result);
+        }
+        return;
+      }
+      // A request or notification FROM the agent.
+      if (typeof msg.method === 'string') {
+        if (msg.method === 'session/update') { emitHuman(describeUpdate(msg.params?.update)); return; }
+        if (msg.method === 'session/request_permission') {
+          if (msg.id !== undefined) handlePermission(msg.id, msg.params);
+          return;
+        }
+        // Unknown request → method-not-found; unknown notification → ignore.
+        if (msg.id !== undefined) respondError(msg.id, -32601, `method not found: ${msg.method}`);
+      }
+    };
+
+    // --- spawn ---------------------------------------------------------------
+    try {
+      child = spawn(command, args, { cwd, stdio: ['pipe', 'pipe', 'pipe'], env, detached: process.platform !== 'win32' });
+    } catch (err) {
+      finish({ ok: false, exitCode: null, stdout: '', stderr: '', error: err.message, truncated: false, stderrTruncated: false });
+      return;
+    }
+
+    timer = timeoutMs && timeoutMs > 0
+      ? setTimeout(() => {
+          try { killTree(child); } catch { /* best effort */ }
+          finish({ ok: false, exitCode: null, stdout: humanStdout(), stderr: joinCapped(stderrChunks), error: `timed out after ${timeoutMs}ms`, timedOut: true, truncated: humanTruncated, stderrTruncated });
+        }, timeoutMs)
+      : null;
+
+    const armIdle = () => {
+      if (settled) return;
+      if (!(idleTimeoutMs && idleTimeoutMs > 0)) return;
+      if (idleTimer) clearTimeout(idleTimer);
+      idleTimer = setTimeout(() => {
+        try { killTree(child); } catch { /* best effort */ }
+        finish({ ok: false, exitCode: null, stdout: humanStdout(), stderr: joinCapped(stderrChunks), error: `no output for ${idleTimeoutMs}ms (idle)`, timedOut: true, idle: true, truncated: humanTruncated, stderrTruncated });
+      }, idleTimeoutMs);
+    };
+    armIdle();
+
+    // Newline-delimited JSON-RPC parser over stdout. Progress on stdout re-arms
+    // the idle liveness timer (every frame counts as progress).
+    let rxBuf = '';
+    child.stdout.on('data', (d) => {
+      armIdle();
+      rxBuf += (Buffer.isBuffer(d) ? d : Buffer.from(d)).toString('utf8');
+      let nl;
+      while ((nl = rxBuf.indexOf('\n')) !== -1) {
+        const line = rxBuf.slice(0, nl).trim();
+        rxBuf = rxBuf.slice(nl + 1);
+        if (!line) continue;
+        let msg;
+        try { msg = JSON.parse(line); } catch { continue; }
+        try { handleMessage(msg); } catch { /* one bad frame must not wedge the loop */ }
+      }
+    });
+
+    child.stderr.on('data', (d) => {
+      armIdle();
+      const buf = Buffer.isBuffer(d) ? d : Buffer.from(d);
+      const remaining = MAX_CAPTURE_BYTES - stderrBytes;
+      if (remaining <= 0) { stderrTruncated = true; return; }
+      if (buf.length > remaining) { stderrChunks.push(buf.subarray(0, remaining)); stderrBytes = MAX_CAPTURE_BYTES; stderrTruncated = true; }
+      else { stderrChunks.push(buf); stderrBytes += buf.length; }
+    });
+
+    child.stdin.on('error', () => { /* peer may close first; close handler settles */ });
+
+    child.on('error', (err) => {
+      finish({ ok: false, exitCode: null, stdout: humanStdout(), stderr: joinCapped(stderrChunks), error: err.message, truncated: humanTruncated, stderrTruncated });
+    });
+    child.on('close', (code, signal) => {
+      childClosed = { code, signal: signal ?? null };
+      // If the agent exits before we complete the turn, surface it as a failure.
+      finish({ ok: code === 0, exitCode: code, signal: signal ?? null, stdout: humanStdout(), stderr: joinCapped(stderrChunks), truncated: humanTruncated, stderrTruncated });
+    });
+
+    // Steer + cancel via the relay tap — NO PTY. Wired once the session exists.
+    const attachSteerIfAny = () => {
+      if (!relayTap || typeof relayTap.attachSteer !== 'function') return;
+      detachSteer = relayTap.attachSteer((data) => {
+        const text = typeof data === 'string' ? data : Buffer.from(data).toString('utf8');
+        if (text.includes(ACP_INTERRUPT_BYTE)) {
+          // Ctrl-C / ETX → interrupt the live turn.
+          if (sessionId != null) notify('session/cancel', { sessionId });
+          return;
+        }
+        const steer = text.replace(/[\r\n]+$/, '');
+        if (!steer) return;
+        // Mid-turn steer → a fresh prompt on the live session (fire-and-forget;
+        // its own resolution is not part of the main turn sequence).
+        if (sessionId != null) {
+          request('session/prompt', { sessionId, prompt: [{ type: 'text', text: steer }] }).catch(() => {});
+        }
+      });
+    };
+
+    // --- drive the handshake + turn -----------------------------------------
+    (async () => {
+      await request('initialize', {
+        protocolVersion: 1,
+        clientCapabilities: { fs: { readTextFile: false, writeTextFile: false } },
+      });
+      const created = await request('session/new', { cwd: cwd || process.cwd(), mcpServers: [] });
+      sessionId = created?.sessionId ?? null;
+      attachSteerIfAny();
+      // Deliver the task envelope as the prompt (from stdinData, matching the
+      // pipe/pty paths which write the same payload to stdin).
+      await request('session/prompt', {
+        sessionId,
+        prompt: [{ type: 'text', text: String(stdinData ?? '') }],
+      });
+      // End-of-turn. The agent has already written $AGENT_RESULT_FILE; the
+      // caller reads it exactly as in pipe mode. Clean shutdown: close stdin so
+      // the agent can exit, then resolve success (child reaped in finish()).
+      try { child.stdin.end(); } catch { /* already gone */ }
+      finish({
+        ok: true,
+        exitCode: childClosed ? childClosed.code : 0,
+        signal: childClosed ? childClosed.signal : null,
+        stdout: humanStdout(),
+        stderr: joinCapped(stderrChunks),
+        truncated: humanTruncated,
+        stderrTruncated,
+      });
+    })().catch((err) => {
+      finish({ ok: false, exitCode: null, stdout: humanStdout(), stderr: joinCapped(stderrChunks), error: `acp: ${err?.message || err}`, truncated: humanTruncated, stderrTruncated });
+    });
+  });
+}
+
 function buildAgentPayload(profile, job, envelope) {
   const variables = job.variables && typeof job.variables === 'object' ? job.variables : {};
   return {
@@ -4039,11 +4391,8 @@ function startLockExtender(job, windowMs, intervalMs, tag, logger) {
  */
 function runAgentJob(profile, job, opts = {}) {
   const { timeoutMs, idleTimeoutMs, envelope, sandbox = 'none', image, runId, secretEnv = {}, passThroughSecretNames = [], cwd, extraEnv = {}, profileEnv = {}, resultFile, stream = false, streamPrefix = '', onStreamOut, onStreamErr, args: commandArgs, terminal = 'pipe', protocol = 'pipe', permission = 'yolo', relaySession = null, ptyFactory } = opts;
-  // #110: `protocol`/`permission` are accepted here so the seam exists for the
-  // downstream ACP executor. This task does NOT dispatch on them — the pipe/PTY
-  // paths below are unchanged, so `protocol === 'pipe'` behavior is identical.
-  // TODO(#110): the acp dispatch branch (spawnCaptureAcp) lands in a later task.
-  void protocol; void permission;
+  // #110: `protocol`/`permission` drive the ACP executor branch below. The
+  // pipe/PTY paths are unchanged, so `protocol === 'pipe'` behaviour is identical.
   const payload = JSON.stringify(buildAgentPayload(profile, job, envelope));
   const agentEnv = baseAgentEnv(profile, job);
   // The harness command line: the profile command plus its structured switches
@@ -4077,6 +4426,30 @@ function runAgentJob(profile, job, opts = {}) {
     }
     const resultEnv = resultFile ? { [AGENT_RESULT_FILE_ENV]: resultFile } : {};
     const harnessEnv = { ...process.env, ...staticEnv, ...secretEnv, ...agentEnv, ...extraEnv, ...resultEnv };
+
+    // A role opted into ACP (`protocol: acp`) drives its harness over the Agent
+    // Client Protocol (JSON-RPC 2.0 over stdio) instead of the stdin/scrape pipe
+    // or a PTY. Checked BEFORE the PTY branch: ACP owns the process when selected
+    // and needs no node-pty at all (steer/cancel ride JSON-RPC, not terminal
+    // writes). The ACP switch is appended to the assembled command line only when
+    // it isn't already present. `permission` selects the request_permission
+    // policy (yolo enforced; escalate/filter warned interim, pending #559).
+    if (protocol === 'acp') {
+      return spawnCaptureAcp({
+        command: 'sh',
+        args: ['-c', ensureAcpFlag(commandLine)],
+        cwd,
+        env: harnessEnv,
+        stdinData: payload,
+        timeoutMs,
+        idleTimeoutMs,
+        relayTap,
+        stream,
+        streamPrefix,
+        onStreamOut,
+        permission,
+      });
+    }
 
     // A role opted into a full PTY (`terminal: pty`) runs the harness on a real
     // terminal when one can be allocated — so its live output streams as a true
@@ -4123,6 +4496,10 @@ function runAgentJob(profile, job, opts = {}) {
 
   const engine = sandbox;
   const containerName = `nano-${runId}`;
+  // #110: ACP-in-container is deferred for this slice — a container sandbox runs
+  // the harness over the pipe path below regardless of `protocol`, so container
+  // pipe mode is never regressed. Host ACP (above) is the minimal-mode surface.
+  void protocol;
   // Container: bind-mount the result file's directory read-write at a fixed
   // in-container path and point AGENT_RESULT_FILE at the mounted file, so the
   // agent writes it inside the sandbox and the harness reads it back on the host.
@@ -9076,6 +9453,8 @@ export {
   containerEngineAvailable,
   runAgentJob,
   spawnCapturePty,
+  spawnCaptureAcp,
+  ensureAcpFlag,
   startLockExtender,
   provisionRepo,
   finalizeGit,

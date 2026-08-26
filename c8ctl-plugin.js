@@ -1562,6 +1562,19 @@ const PROTOCOLS = ['pipe', 'acp'];
 // effectively behave like `yolo` (auto-allow). Default is `yolo`.
 const PERMISSION_MODES = ['yolo', 'escalate', 'filter'];
 
+// #110: resolve a role's agentic setting (protocol/permission) with a uniform
+// env-override → profile → default precedence, tolerating invalid values at
+// every layer. A one-off worker env var wins if it names an allowed value; else
+// the persisted hire profile decides if it holds an allowed value; else the safe
+// default. Reserved-but-allowed values (e.g. escalate/filter) carry through
+// verbatim; unknown values are ignored and fall through to the next layer.
+function resolveAgenticSetting(envValue, profileValue, allowed, dflt) {
+  const env = String(envValue || '').trim().toLowerCase();
+  if (allowed.includes(env)) return env;
+  if (profileValue && allowed.includes(profileValue)) return profileValue;
+  return dflt;
+}
+
 /** Normalize a capability list: trim, drop empties, de-dupe, sort (canonical). */
 function normalizeCapabilities(input) {
   const raw = Array.isArray(input)
@@ -2099,7 +2112,7 @@ async function hireWorker(req, flags) {
   if (profile.args.length > 0) logger.info(`  args: ${profile.args.map(shQuote).join(' ')}`);
   logger.info(`  sandbox: ${profile.sandbox}${CONTAINER_SANDBOXES.has(profile.sandbox) ? ` (image ${profile.image})` : ''}`);
   logger.info(`  live terminal: ${profile.terminal}${profile.terminal === 'pty' ? ' (streamed + steerable on the relay lane)' : ''}`);
-  logger.info(`  protocol: ${profile.protocol}${profile.protocol === 'acp' ? ' (Agent Client Protocol — JSON-RPC over stdio; RESERVED — accepted/persisted but not yet active in this build, currently behaves like pipe)' : ''}`);
+  logger.info(`  protocol: ${profile.protocol}${profile.protocol === 'acp' ? ' (Agent Client Protocol — JSON-RPC over stdio; RESERVED — accepted/persisted but not yet active in this build; the harness still runs on the transport selected by --terminal (pipe or pty))' : ''}`);
   logger.info(`  permission: ${profile.permission}${(profile.permission === 'escalate' || profile.permission === 'filter') ? ' (RESERVED — not yet enforced, pending nano-workforce#559)' : ''}`);
   const envKeys = Object.keys(profile.env);
   if (envKeys.length > 0) logger.info(`  env: ${envKeys.join(', ')}`);
@@ -5136,13 +5149,9 @@ async function workAgent(req, flags) {
   // defaults (pipe/yolo). escalate/filter are carried through verbatim — the
   // acp-executor task enforces yolo and interim-handles the reserved policies.
   const envProtocol = (process.env.NANO_AGENTIC_PROTOCOL || '').trim().toLowerCase();
-  const roleProtocol = PROTOCOLS.includes(envProtocol)
-    ? envProtocol
-    : (profile.protocol && PROTOCOLS.includes(profile.protocol) ? profile.protocol : 'pipe');
+  const roleProtocol = resolveAgenticSetting(envProtocol, profile.protocol, PROTOCOLS, 'pipe');
   const envPermission = (process.env.NANO_AGENTIC_PERMISSION || '').trim().toLowerCase();
-  const rolePermission = PERMISSION_MODES.includes(envPermission)
-    ? envPermission
-    : (profile.permission && PERMISSION_MODES.includes(profile.permission) ? profile.permission : 'yolo');
+  const rolePermission = resolveAgenticSetting(envPermission, profile.permission, PERMISSION_MODES, 'yolo');
 
   // A per-job-type worker factory. Captures all the CLI-local + profile context
   // in closure scope so the profile watcher below can (re)spawn a poller for any
@@ -9020,6 +9029,7 @@ export {
 export { setConfig, unsetConfig, readConfig, writeConfig, getConfigFile, SETTING_ALIASES };
 export { buildNpmInvocation };
 export { resolveAgenticConfig, LOCAL_AGENTIC_TOKEN };
+export { resolveAgenticSetting, PROTOCOLS, PERMISSION_MODES };
 export { resolveAgenticTarget, discoverAgenticHubs, probeAgenticChannel, normalizeProjectApps, isLoopbackHost };
 export { compareSemver, githubRepoSlug, filterReleasesSince, renderReleaseBody };
 export {
@@ -9183,7 +9193,7 @@ export const metadata = {
         { command: 'c8ctl nano hire --list', description: 'List hired agent profiles' },
         { command: 'c8ctl nano hire --name coder --rank senior --command "agent-harness" --sandbox docker --image ghcr.io/acme/agent:1', description: 'Create a profile that runs each job in a throwaway Docker container' },
         { command: 'c8ctl nano hire --name coder --rank senior --command copilot --terminal pty', description: 'Opt this role into a full, steerable live terminal (PTY) streamed on the agentic relay lane (default: pipe)' },
-        { command: 'c8ctl nano hire --name coder --rank senior --command copilot --protocol acp --permission yolo', description: 'Accept/persist ACP (JSON-RPC/stdio) for this role — RESERVED, not yet active in this build (acp currently behaves like pipe); escalate/filter permission modes are likewise reserved/not yet active' },
+        { command: 'c8ctl nano hire --name coder --rank senior --command copilot --protocol acp --permission yolo', description: 'Accept/persist ACP (JSON-RPC/stdio) for this role — RESERVED, not yet active in this build (acp is inert; the harness still runs on the transport selected by --terminal, pipe or pty); escalate/filter permission modes are likewise reserved/not yet active' },
         { command: 'c8ctl nano assign reviewer code-review,testing', description: 'Grant more capabilities (comma-separated, like hire) to an existing hire — additive; running workers hot-reload it' },
         { command: 'c8ctl nano work reviewer', description: 'Spawn Nano job workers for the "reviewer" profile and poll for work' },
         { command: 'c8ctl nano work coder --auto', description: 'Zero-config: serve every deployed agent job type read straight from the engine — no capability, no wiring (great for a local single-tenant plane)' },
@@ -9246,7 +9256,7 @@ export const commands = {
       sandbox: { type: 'string', description: 'hire/work: execution sandbox none|docker|podman (default none). Containers isolate each job.' },
       image: { type: 'string', description: 'hire/work: container image the agent runs in (required for --sandbox docker|podman)' },
       terminal: { type: 'string', description: 'hire: live-terminal mode for this role — pty (full terminal, streamed + steerable on the relay lane) or pipe (default). NANO_AGENTIC_TERMINAL overrides at work time.' },
-      protocol: { type: 'string', description: 'hire: harness protocol pipe|acp (default pipe). acp is RESERVED — accepted and persisted for forward-compatibility but not yet implemented in this build (currently behaves like pipe; the ACP JSON-RPC-over-stdio executor lands downstream). NANO_AGENTIC_PROTOCOL overrides at work time.' },
+      protocol: { type: 'string', description: 'hire: harness protocol pipe|acp (default pipe). acp is RESERVED — accepted and persisted for forward-compatibility but not yet implemented in this build (inert: the harness still runs on the transport selected by --terminal, pipe or pty; the ACP JSON-RPC-over-stdio executor lands downstream). NANO_AGENTIC_PROTOCOL overrides at work time.' },
       permission: { type: 'string', description: 'hire: ACP permission policy (default yolo). yolo auto-allows all permission requests. escalate|filter are RESERVED/not-yet-active in this build (pending nano-workforce#559): they are persisted but not enforced and effectively behave like yolo (auto-allow). NANO_AGENTIC_PERMISSION overrides at work time.' },
       env: { type: 'string', multiple: true, description: 'hire/work: static env var for the harness as NAME=VALUE (repeatable); persisted on hire, work extends/overrides. E.g. permission toggles.' },
       'secret-resolver': { type: 'string', description: 'work: secret resolver for task secretRefs (host = process env; default host)' },
@@ -9465,7 +9475,7 @@ function printUsage() {
   console.log('  --sandbox <s>        hire/work: execution sandbox none|docker|podman (default none)');
   console.log('  --image <ref>        hire/work: container image the agent runs in (required for docker|podman)');
   console.log('  --terminal <m>       hire: live-terminal mode pty|pipe (default pipe); pty streams a steerable terminal on the relay lane');
-  console.log('  --protocol <p>       hire: harness protocol pipe|acp (default pipe); acp is RESERVED — accepted/persisted but not yet implemented in this build (currently behaves like pipe). NANO_AGENTIC_PROTOCOL overrides at work time');
+  console.log('  --protocol <p>       hire: harness protocol pipe|acp (default pipe); acp is RESERVED — accepted/persisted but not yet implemented in this build (inert: the harness still runs on the transport selected by --terminal, pipe or pty). NANO_AGENTIC_PROTOCOL overrides at work time');
   console.log('  --permission <p>     hire: ACP permission policy yolo|escalate|filter (default yolo); yolo auto-allows all requests. escalate|filter are RESERVED/not-yet-active (pending nano-workforce#559) — persisted but not enforced, effectively behave like yolo (auto-allow). NANO_AGENTIC_PERMISSION overrides at work time');
   console.log('  --env NAME=VALUE     hire/work: static env var for the harness (repeatable); persisted on hire, work extends/overrides');
   console.log('  --list               hire: list existing agent profiles instead of creating one');

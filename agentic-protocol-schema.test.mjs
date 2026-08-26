@@ -16,7 +16,7 @@ import { mkdtempSync, rmSync } from 'node:fs';
 import { tmpdir } from 'node:os';
 import { join } from 'node:path';
 
-import { normalizeStoredProfile, hireWorker, readConfig } from './c8ctl-plugin.js';
+import { normalizeStoredProfile, hireWorker, readConfig, resolveAgenticSetting, PROTOCOLS, PERMISSION_MODES } from './c8ctl-plugin.js';
 
 // --- logger capture -------------------------------------------------------
 const logs = { info: [], warn: [], error: [] };
@@ -134,3 +134,47 @@ for (const policy of ['escalate', 'filter']) {
     });
   });
 }
+
+// --- resolveAgenticSetting: env → profile → default precedence -------------
+// The work command resolves each role's protocol/permission with a uniform
+// env-override → profile → default precedence, tolerant of invalid values at
+// every layer (invalid values are ignored and fall through to the next layer).
+// These lock in that contract for both NANO_AGENTIC_PROTOCOL and
+// NANO_AGENTIC_PERMISSION so the ACP executor can rely on it.
+
+test('resolveAgenticSetting: env override wins when it names an allowed value', () => {
+  assert.equal(resolveAgenticSetting('acp', 'pipe', PROTOCOLS, 'pipe'), 'acp');
+  assert.equal(resolveAgenticSetting('filter', 'yolo', PERMISSION_MODES, 'yolo'), 'filter');
+});
+
+test('resolveAgenticSetting: profile decides when env is absent/blank', () => {
+  assert.equal(resolveAgenticSetting('', 'acp', PROTOCOLS, 'pipe'), 'acp');
+  assert.equal(resolveAgenticSetting(undefined, 'escalate', PERMISSION_MODES, 'yolo'), 'escalate');
+});
+
+test('resolveAgenticSetting: falls back to default when neither env nor profile is set', () => {
+  assert.equal(resolveAgenticSetting('', undefined, PROTOCOLS, 'pipe'), 'pipe');
+  assert.equal(resolveAgenticSetting(null, null, PERMISSION_MODES, 'yolo'), 'yolo');
+});
+
+test('resolveAgenticSetting: invalid env is ignored and falls through to profile', () => {
+  assert.equal(resolveAgenticSetting('bogus', 'acp', PROTOCOLS, 'pipe'), 'acp');
+  assert.equal(resolveAgenticSetting('nonsense', 'filter', PERMISSION_MODES, 'yolo'), 'filter');
+});
+
+test('resolveAgenticSetting: invalid env AND invalid profile fall through to default', () => {
+  assert.equal(resolveAgenticSetting('bogus', 'alsobogus', PROTOCOLS, 'pipe'), 'pipe');
+  assert.equal(resolveAgenticSetting('x', 'y', PERMISSION_MODES, 'yolo'), 'yolo');
+});
+
+test('resolveAgenticSetting: env is trimmed and lowercased before matching', () => {
+  assert.equal(resolveAgenticSetting('  ACP  ', 'pipe', PROTOCOLS, 'pipe'), 'acp');
+  assert.equal(resolveAgenticSetting('Escalate', 'yolo', PERMISSION_MODES, 'yolo'), 'escalate');
+});
+
+test('resolveAgenticSetting: reserved permission values carry through verbatim', () => {
+  for (const policy of ['escalate', 'filter']) {
+    assert.equal(resolveAgenticSetting('', policy, PERMISSION_MODES, 'yolo'), policy);
+    assert.equal(resolveAgenticSetting(policy, 'yolo', PERMISSION_MODES, 'yolo'), policy);
+  }
+});

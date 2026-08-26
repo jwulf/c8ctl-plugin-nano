@@ -63,6 +63,45 @@ SDK client (job workers) — do **not** add the SDK as a dependency or use raw
   skipped) and deleted per-job unless `--keep-runs`. Container-side cloning
   (strong isolation) is a later increment; container jobs don't clone yet.
 
+## ACP harness mode (opt-in)
+
+An agent can be driven over **ACP (Agent Client Protocol)** instead of the
+default stdin/scrape pipe: `hire --protocol pipe|acp` (default `pipe`) selects
+the harness; `NANO_AGENTIC_PROTOCOL` overrides at work time. `pipe` stays the
+default floor — ACP is purely additive. `spawnCaptureAcp` is the third executor
+alongside `spawnCaptureOneShot` (pipe) and `spawnCapturePty` (PTY); it returns
+the **same** result shape so `buildResultEnvelope` and callers are unchanged.
+
+- **Wire framing is newline-delimited JSON-RPC 2.0 over stdio — NOT LSP
+  `Content-Length` headers.** One compact JSON object per line, `\n`-terminated.
+  Assuming LSP-style framing is the natural wrong guess and will silently fail
+  to parse. Client sequence: `initialize` → `session/new {cwd,mcpServers:[]}` →
+  `session/prompt {sessionId, prompt:[{type:text,text}]}`; end-of-turn is the
+  `session/prompt` **result** resolving (`stopReason`). Agent→client traffic is
+  `session/update` notifications and `session/request_permission` requests.
+- **Steering is PTY-free:** a mid-turn steer is just a second `session/prompt`
+  on the live session; interrupt is a `session/cancel` notification. The ACP
+  path must **not** require `node-pty`. Wire this through `relayTap.attachSteer`.
+- **Producer has two modes on the relay lane.** Minimal mode serializes each
+  `session/update` to a human-readable text chunk via `relayTap.onData(text)`
+  (zero downstream changes). Rich mode publishes typed `nwfTranscriptEvent`
+  envelopes (`{type:'nwfTranscriptEvent',v:1,ts,kind,role?,text?,tool?,entries?}`)
+  via `relayTap.relayEnvelope` (= `relaySession.relay(JSON+\n)`); unmapped
+  updates fall back to the text chunk. Relay **transport** (ring/QoS/offsets/
+  jobKey routing) is unchanged — only the payload format differs. Never tee raw
+  JSON-RPC onto the relay.
+- **Permission policies — only `yolo` is enforced.** `hire --permission
+  yolo|escalate|filter` (default `yolo`); `NANO_AGENTIC_PERMISSION` overrides at
+  work time. `yolo` auto-allow-always is the *only* fully-implemented policy.
+  **`escalate` and `filter` are RESERVED / not yet active** — accepted and
+  persisted for forward-compat, but at runtime they fall back to a safe interim
+  policy pending companion `nano-workforce#559` (the permission-event +
+  escalation bridge). This is security-relevant: do **not** describe, document,
+  or assume escalate/filter gate destructive ops today. The fallback must stay
+  **non-silent** (a one-time `logger.warn` at hire and per session) so an
+  operator is never misled — keep the `// TODO(#559)` seam in the permission
+  switch, and keep the switch total.
+
 ## Worker supervisor (`supervisor`)
 
 - Runs/manages a fleet of `nano work` children from one terminal. `nano work`
@@ -177,3 +216,14 @@ uploads an asset named exactly `PLATFORMS[].asset`.
 - The plugin loads and `c8ctl nano` prints usage.
 - A multi-node `start` → `status` → `stop` cycle leaves no orphan processes and
   no stale state file.
+
+## Known test flakes (don't chase these)
+
+- **`supervisor-daemon.test.mjs` — "supervisor add --instances N …"** is
+  order-dependent: it **fails under the full `npm test` on clean `origin/main`**
+  (a spawned child's `--name` doesn't match the supervisor id) but **passes when
+  that file is run in isolation** (`node --test supervisor-daemon.test.mjs`).
+  This is a pre-existing flake, not caused by any current work. When validating
+  a change, treat the suite as green *modulo this one failure*; confirm your work
+  in isolation rather than assuming you broke it. (Only genuinely fix it as a
+  deliberate, separate task.)

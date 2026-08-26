@@ -4007,8 +4007,14 @@ const ACP_INTERRUPT_BYTE = '\x03';
 // event (so $AGENT_RESULT_FILE is fully flushed before the caller reads it). A
 // well-behaved agent exits promptly once stdin closes; this bounds how long a
 // finished-but-lingering agent may hold the turn open before it is force-reaped,
-// so a completed turn is never held hostage to the full run timeout.
-const ACP_POST_TURN_GRACE_MS = 10_000;
+// so a completed turn is never held hostage to the full run timeout. Resolved at
+// call time (see acpPostTurnGraceMs) so tests can shrink it and exercise the
+// force-reap path without a 10s wait.
+const ACP_POST_TURN_GRACE_DEFAULT_MS = 10_000;
+function acpPostTurnGraceMs() {
+  const v = Number(process.env.NANO_ACP_POST_TURN_GRACE_MS);
+  return Number.isFinite(v) && v >= 0 ? v : ACP_POST_TURN_GRACE_DEFAULT_MS;
+}
 
 // Hard cap on a single un-terminated JSON-RPC frame. ACP frames are one compact
 // JSON object per `\n`-terminated line; a conformant agent never emits a line
@@ -4354,6 +4360,7 @@ function spawnCaptureAcp({ command, args = [], cwd, env, stdinData, timeoutMs, i
       // to be a pure newline-delimited JSON-RPC stream — a framing violation we
       // must NOT let masquerade as success.
       let unterminatedTail = '';
+      let framingViolation = '';
       try {
         rxBuf += rxDecoder.end();
         let nl;
@@ -4361,9 +4368,21 @@ function spawnCaptureAcp({ command, args = [], cwd, env, stdinData, timeoutMs, i
           const line = rxBuf.slice(0, nl).trim();
           rxBuf = rxBuf.slice(nl + 1);
           if (!line) continue;
-          try { handleMessage(JSON.parse(line)); } catch { /* best effort on shutdown */ }
+          let msg;
+          try {
+            msg = JSON.parse(line);
+          } catch {
+            // A final newline-delimited frame that isn't JSON is a framing/
+            // protocol violation on what must be a pure JSON-RPC stream — the
+            // same rule the `data` handler enforces. Silently swallowing it here
+            // would let a malformed shutdown masquerade as a clean success, so
+            // record it and fail below instead of ignoring the parse error.
+            framingViolation = line;
+            break;
+          }
+          try { handleMessage(msg); } catch { /* one bad frame must not wedge shutdown */ }
         }
-        unterminatedTail = rxBuf.trim();
+        if (!framingViolation) unterminatedTail = rxBuf.trim();
       } catch { /* decoder flush best effort */ }
       rxBuf = '';
       // Settle on the child's ACTUAL exit — this is what avoids racing the
@@ -4373,13 +4392,16 @@ function spawnCaptureAcp({ command, args = [], cwd, env, stdinData, timeoutMs, i
       // un-terminated frame — an early exit (e.g. code 0 during the handshake,
       // before the turn completes), any non-zero exit, or a dangling tail is a
       // failure, never a false success.
-      const ok = promptResolved && code === 0 && !unterminatedTail;
+      const ok = promptResolved && code === 0 && !unterminatedTail && !framingViolation;
       // On failure, populate an explicit `error` so callers/logs explain WHY —
       // otherwise an early exit (code 0 before the turn resolved) surfaces as a
       // confusing bare "exit code 0" with no detail.
       let error;
       if (!ok) {
-        if (unterminatedTail && promptResolved && code === 0) {
+        if (framingViolation && promptResolved && code === 0) {
+          const preview = framingViolation.length > 200 ? `${framingViolation.slice(0, 200)}…` : framingViolation;
+          error = `ACP framing violation: non-JSON line on stdout at exit: ${preview}`;
+        } else if (unterminatedTail && promptResolved && code === 0) {
           const preview = unterminatedTail.length > 200 ? `${unterminatedTail.slice(0, 200)}…` : unterminatedTail;
           error = `ACP framing violation: un-terminated JSON-RPC frame on stdout at exit: ${preview}`;
         } else {
@@ -4442,18 +4464,24 @@ function spawnCaptureAcp({ command, args = [], cwd, env, stdinData, timeoutMs, i
         settleTimer = setTimeout(() => {
           settleTimer = null;
           try { if (child && childClosed === null) killTree(child); } catch { /* best effort */ }
-          // The turn completed and the result file is already written; the linger
-          // is only a shutdown nicety, so report success despite the forced reap.
+          // The turn completed and the result file is already written, so this
+          // is still a success — but the child did NOT exit on its own; we just
+          // force-reaped it. Report that honestly instead of a fabricated clean
+          // exit (code 0 / signal null): killTree sends SIGKILL, so surface the
+          // real signal (or the child's actual exit if it slipped in) plus a
+          // `forcedReap` flag so audits can spot agents that consistently hang
+          // on shutdown rather than seeing a misleading exitCode: 0.
           finish({
             ok: true,
-            exitCode: childClosed ? childClosed.code : 0,
-            signal: childClosed ? childClosed.signal : null,
+            exitCode: childClosed ? childClosed.code : null,
+            signal: childClosed ? childClosed.signal : 'SIGKILL',
+            forcedReap: childClosed === null,
             stdout: humanStdout(),
             stderr: joinCapped(stderrChunks),
             truncated: humanTruncated,
             stderrTruncated,
           });
-        }, ACP_POST_TURN_GRACE_MS);
+        }, acpPostTurnGraceMs());
         if (typeof settleTimer.unref === 'function') settleTimer.unref();
       }
     })().catch((err) => {
@@ -4730,6 +4758,10 @@ function buildResultEnvelope(result, { sandbox, image, git, result: agentResult,
     signal: result.signal ?? null,
     error: result.error ?? null,
   };
+  // Audit: a turn that completed but whose child had to be force-reaped on
+  // shutdown (didn't exit on its own within the post-turn grace) — surfaced so
+  // consistently-hanging agents are visible rather than hidden behind a success.
+  if (result.forcedReap) env.forcedReap = true;
   // Audit (issue #63): record which linked-resource key supplied the base prompt.
   // The engine only keeps `latest` per resourceId (no pinning), so recording the
   // resolved key is the only reproducibility handle for which prompt version ran.

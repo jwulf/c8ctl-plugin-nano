@@ -104,6 +104,11 @@ function finish(stopReason, extra) {
   // the executor must treat this dangling frame as a framing violation (ok:false)
   // rather than a false success.
   if (process.env.FAKE_TAIL) process.stdout.write('{"jsonrpc":"2.0","dangling":true}');
+  // FAKE_HANG_AFTER_TURN: resolve the turn + write the result file, then DON'T
+  // exit (ignore stdin EOF). The executor must force-reap us after the post-turn
+  // grace and report that honestly (ok:true, but signal SIGKILL + forcedReap),
+  // not a fabricated clean exit (code 0 / signal null).
+  if (process.env.FAKE_HANG_AFTER_TURN) { setInterval(() => {}, 3_600_000); return; }
   setTimeout(() => process.exit(0), 10);
 }
 function nextPermOrFinish() {
@@ -296,6 +301,38 @@ test('spawnCaptureAcp routes stderr to the onStreamErr sink (its own severity), 
     // ...and NOT be flattened onto the stdout sink when both are wired.
     assert.ok(!outLines.some((l) => l.includes('acp-diag: hello from stderr')), 'stderr must not reach onStreamOut when onStreamErr is provided');
   } finally {
+    rmSync(resDir, { recursive: true, force: true });
+  }
+});
+
+test('spawnCaptureAcp force-reaps a completed-but-hanging agent and reports the reap honestly', async () => {
+  const resDir = mkdtempSync(join(tmpdir(), 'acp-res-'));
+  const resultFile = join(resDir, 'result.json');
+  const prevGrace = process.env.NANO_ACP_POST_TURN_GRACE_MS;
+  // Shrink the post-turn grace so the reap happens promptly (not after 10s).
+  process.env.NANO_ACP_POST_TURN_GRACE_MS = '150';
+  try {
+    const result = await spawnCaptureAcp({
+      command: 'node',
+      args: [FAKE_AGENT],
+      cwd: workRoot,
+      // Turn resolves + result file written, but the agent never exits.
+      env: { ...baseEnv(), AGENT_RESULT_FILE: resultFile, FAKE_HANG_AFTER_TURN: '1' },
+      stdinData: JSON.stringify({ prompt: 'do the thing' }),
+      timeoutMs: 20_000,
+      permission: 'yolo',
+    });
+    // The turn completed and the result file is written → still a success...
+    assert.equal(result.ok, true, result.error || result.stderr);
+    assert.deepEqual(readAgentResultFile(resultFile), { status: 'converged', summary: 'acp ok' });
+    // ...but the child did NOT exit on its own, so the reap is reported honestly
+    // rather than as a fabricated clean exit (code 0 / signal null).
+    assert.equal(result.forcedReap, true, 'a force-reaped agent must set forcedReap');
+    assert.equal(result.exitCode, null, 'a force-reaped agent has no natural exit code');
+    assert.equal(result.signal, 'SIGKILL', 'a force-reaped agent is killed with SIGKILL');
+  } finally {
+    if (prevGrace === undefined) delete process.env.NANO_ACP_POST_TURN_GRACE_MS;
+    else process.env.NANO_ACP_POST_TURN_GRACE_MS = prevGrace;
     rmSync(resDir, { recursive: true, force: true });
   }
 });

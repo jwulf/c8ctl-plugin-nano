@@ -157,6 +157,9 @@ c8ctl nano hire --name reviewer --rank senior --command copilot \
 # Give the harness command-line switches (e.g. run copilot with --allow-all)
 c8ctl nano hire --name coder --rank senior --command copilot --arg --allow-all
 
+# Opt a role into the ACP harness mode (JSON-RPC/stdio) — see "ACP harness mode" below
+c8ctl nano hire --name coder --rank senior --command copilot --protocol acp
+
 # List profiles
 c8ctl nano hire --list
 ```
@@ -408,6 +411,86 @@ a **hub restart**, buffers its outbound frames in a **bounded** local ring and
 bound is operator-tunable for a long expected outage; raise it with
 `NANO_AGENTIC_BUFFER_CAPACITY` (frames). When the bound is hit the worker warns
 rather than silently shedding.
+
+### ACP harness mode (opt-in)
+
+Alongside the `pipe`/`pty` terminal choice above, a role can opt into driving its
+harness over the **[Agent Client Protocol (ACP)](https://agentclientprotocol.com)**
+— JSON-RPC 2.0 over stdio — instead of the default stdin/scrape **pipe**. ACP is
+**additive, not a switch**: `pipe` stays the default floor, so every CLI harness
+(and non-agent record-keepers) keeps working unchanged, and **YOLO stays the
+default** via auto-approve. You turn ACP on per role, exactly like `--terminal`:
+
+```bash
+# Drive a role's harness over ACP (JSON-RPC/stdio) instead of the pipe
+c8ctl nano hire --name coder --rank senior --command copilot --protocol acp
+
+# Override protocol/permission for a one-off worker without re-hiring
+NANO_AGENTIC_PROTOCOL=pipe c8ctl nano work coder
+NANO_AGENTIC_PERMISSION=escalate c8ctl nano work coder
+```
+
+- `--protocol pipe|acp` (default `pipe`) selects the harness protocol.
+  `NANO_AGENTIC_PROTOCOL` overrides it at work time (mirroring
+  `NANO_AGENTIC_TERMINAL`).
+- `--permission yolo|escalate|filter` (default `yolo`) selects the ACP permission
+  policy. `NANO_AGENTIC_PERMISSION` overrides it at work time.
+
+**What ACP unlocks.** Because the harness speaks a structured protocol rather than
+a scraped terminal, the ACP path gives you a **structured turn/tool event stream**
+(today serialized to text chunks on the relay lane — a *minimal* mode, not yet
+typed turn/tool envelopes), **native permission handling**, and **PTY-free
+steering** — an operator's
+steer text is delivered as a `session/prompt` and an interrupt as a
+`session/cancel`, with no keystroke injection. The ACP path therefore does **not**
+need the optional native `node-pty` dependency at all.
+
+**Permission policies — mind the status.** Only `yolo` is enforced today:
+
+- **`yolo`** *(default, the only enforced policy today)* — auto-allows every
+  permission request the agent raises: full speed, no human in the loop. This is
+  the same auto-approve posture the pipe/PTY paths already run with.
+- **`escalate`** and **`filter`** are **RESERVED / not-yet-active** in this build.
+  They are **accepted and persisted** for forward-compatibility, but they are
+  **not yet enforced**: at work time they fall back to a **safe interim policy**
+  (currently auto-allow, like `yolo`) and the CLI **emits a warning** so an
+  operator is never misled into thinking destructive operations are gated. Their
+  intended future behavior — **`escalate`** blocking a permission request until a
+  human answers it, and **`filter`** auto-allowing reads/edits while escalating
+  destructive operations — is **not available yet**; it lands once the companion
+  permission-event + escalation bridge (nanobpm/nano-workforce#559) ships.
+
+**Per-CLI hire examples.** Some CLIs speak ACP natively; others ride a thin
+adapter binary. In every case the profile's command (plus any `--arg`s) assembles
+the ACP invocation; a default `--acp` switch is appended only when the assembled
+command line doesn't already select ACP, so a native/adapter invocation is never
+doubled. All of these run with the enforced default `yolo` policy:
+
+```bash
+# Copilot CLI — native ACP (assembles `copilot --acp`)
+c8ctl nano hire --name coder --rank senior --command copilot --protocol acp --permission yolo
+
+# OpenCode — native ACP server (assembles `opencode acp`)
+c8ctl nano hire --name coder --rank senior --command opencode --arg acp --protocol acp --permission yolo
+
+# Claude Code — via the `claude-agent-acp` adapter
+c8ctl nano hire --name coder --rank senior --command claude-agent-acp --protocol acp --permission yolo
+
+# Pi — via the `pi-acp` adapter
+c8ctl nano hire --name coder --rank senior --command pi-acp --protocol acp --permission yolo
+```
+
+> `--permission yolo` is the default, so you can omit it. You **may** hire with
+> `--permission escalate` or `--permission filter` today — the value is persisted
+> — but it is **reserved / not-yet-active** (pending nanobpm/nano-workforce#559)
+> and currently behaves as the safe interim policy with a warning, so do **not**
+> rely on it to gate destructive operations yet.
+
+**Non-goals.** ACP does not replace anything: the **pipe/PTY** surface stays the
+default floor and every existing harness keeps working unchanged (ACP is enforced
+on the host executor; container sandboxes remain **pipe-only** for now). There is
+**no change to the Camunda-8 worker⇄engine job protocol** — ACP governs only how a
+worker drives its local agent harness, not how it talks to the engine.
 
 ### Live profile reload (no restart on `assign`)
 

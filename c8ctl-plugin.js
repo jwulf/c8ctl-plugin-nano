@@ -4026,11 +4026,15 @@ const ACP_MAX_LINE_BYTES = 8 * 1024 * 1024; // 8 MiB
 
 // Drive an ACP (Agent Client Protocol) agent over JSON-RPC 2.0 on stdio.
 //
-// This is the "minimal mode" executor (#110, step 1): it proves ACP end-to-end
-// with ZERO downstream changes by serialising each `session/update` to a short
-// human-readable TEXT chunk and feeding it to the SAME relay/tee lane the pipe
-// path uses (`relayTap.onData`) — it never tee's the raw JSON-RPC. Typed
-// transcript envelopes are a separate downstream task.
+// This executor drives ACP end-to-end. Each `session/update` is mapped to a
+// typed `nwfTranscriptEvent` envelope (#110, step 2) and published on the relay
+// session's typed publish seam (`relayTap.relayEnvelope`) — the rich cockpit
+// format its derive+render consumes. The raw relay TRANSPORT is untouched (still
+// `relaySession.relay(text)`); only the payload shape on the lane changes. When
+// an update has no typed mapping, or the relay exposes no typed seam (minimal
+// mode / a plain tap), it falls back to the step-1 human-TEXT chunk on the same
+// lane (`relayTap.onData`) so nothing is dropped. The raw JSON-RPC is never
+// tee'd either way.
 //
 // Framing: ACP frames are newline-delimited JSON-RPC 2.0 messages on stdio (one
 // compact JSON object per line, `\n`-terminated). We implement a tiny inline
@@ -4111,20 +4115,33 @@ function spawnCaptureAcp({ command, args = [], cwd, env, stdinData, timeoutMs, i
 
     const humanStdout = () => joinCapped(humanChunks);
 
-    // Emit a human-meaningful text chunk on the SAME lanes the pipe/pty paths
-    // use: the relay tap (framed + jobKey-tagged by the caller) and the local
-    // --stream spy tee. Byte-capped like the raw captures.
-    const emitHuman = (text) => {
+    // Local mirrors of a human text chunk: the --stream spy tee and the byte-
+    // capped stdout capture (what the result envelope carries). Deliberately does
+    // NOT touch the relay lane, so a typed-transcript update can mirror its human
+    // text locally (for the result + spy) WITHOUT also re-emitting raw text onto
+    // the relay lane — which, in step 2, carries the typed envelope instead.
+    const captureHuman = (text) => {
       if (!text) return;
       const buf = Buffer.from(text, 'utf8');
       if (teeSink) tee(text, false);
-      if (relayTap && typeof relayTap.onData === 'function') {
-        try { relayTap.onData(text); } catch { /* relay best-effort */ }
-      }
       const remaining = MAX_CAPTURE_BYTES - humanBytes;
       if (remaining <= 0) { humanTruncated = true; return; }
       if (buf.length > remaining) { humanChunks.push(buf.subarray(0, remaining)); humanBytes = MAX_CAPTURE_BYTES; humanTruncated = true; }
       else { humanChunks.push(buf); humanBytes += buf.length; }
+    };
+
+    // Emit a human-meaningful text chunk on the SAME lanes the pipe/pty paths
+    // use: the relay tap (framed + jobKey-tagged by the caller) and the local
+    // --stream spy tee. Byte-capped like the raw captures. This is the minimal-
+    // mode text path — used for stderr, and as the fallback for any session/update
+    // that has no typed nwfTranscriptEvent mapping (or when the relay exposes no
+    // typed publish seam).
+    const emitHuman = (text) => {
+      if (!text) return;
+      if (relayTap && typeof relayTap.onData === 'function') {
+        try { relayTap.onData(text); } catch { /* relay best-effort */ }
+      }
+      captureHuman(text);
     };
 
     const finish = (result) => {
@@ -4200,25 +4217,30 @@ function spawnCaptureAcp({ command, args = [], cwd, env, stdinData, timeoutMs, i
       }
     };
 
-    // Serialise an ACP session/update into a short human-readable line. Minimal
-    // mode: this is TEXT for the existing cockpit lane, not a typed envelope.
+    // Extract plain text from an ACP content value (string, {type,text}, or an
+    // array of content blocks). Shared by the typed-envelope mapper and the
+    // human-text describer so both agree on what the "text" of an update is.
+    const acpTextOf = (content) => {
+      if (content == null) return '';
+      if (typeof content === 'string') return content;
+      if (Array.isArray(content)) return content.map(acpTextOf).join('');
+      if (typeof content === 'object') return typeof content.text === 'string' ? content.text : '';
+      return '';
+    };
+
+    // Serialise an ACP session/update into a short human-readable line. This is
+    // the minimal-mode TEXT for the existing cockpit lane (the fallback), not a
+    // typed envelope.
     const describeUpdate = (update) => {
       if (!update || typeof update !== 'object') return '';
       const kind = update.sessionUpdate || update.type || 'update';
-      const textOf = (content) => {
-        if (content == null) return '';
-        if (typeof content === 'string') return content;
-        if (Array.isArray(content)) return content.map(textOf).join('');
-        if (typeof content === 'object') return typeof content.text === 'string' ? content.text : '';
-        return '';
-      };
       switch (kind) {
         case 'agent_message_chunk':
-          return textOf(update.content);
+          return acpTextOf(update.content);
         case 'agent_thought_chunk':
-          return `\u{1F4AD} ${textOf(update.content)}`;
+          return `\u{1F4AD} ${acpTextOf(update.content)}`;
         case 'user_message_chunk':
-          return textOf(update.content);
+          return acpTextOf(update.content);
         case 'tool_call': {
           const title = update.title || update.toolCallId || 'tool';
           return `\u2699 [tool: ${title}${update.status ? ` — ${update.status}` : ''}]\n`;
@@ -4232,6 +4254,62 @@ function spawnCaptureAcp({ command, args = [], cwd, env, stdinData, timeoutMs, i
         default:
           return `[${kind}]\n`;
       }
+    };
+
+    // #110 step 2: map an ACP session/update to a typed `nwfTranscriptEvent`
+    // envelope — the rich cockpit wire format (the existing downstream
+    // derive+render consumes it). Returns null for an update kind we don't model,
+    // so the caller falls back to the minimal human-text path (nothing dropped,
+    // no regression vs step 1). The `text` field carries the same plain text the
+    // fallback would relay, so a lightweight consumer can still render it.
+    const TRANSCRIPT_EVENT_TYPE = 'nwfTranscriptEvent';
+    const TRANSCRIPT_EVENT_VERSION = 1;
+    const mapTranscriptEnvelope = (update) => {
+      if (!update || typeof update !== 'object') return null;
+      const kind = update.sessionUpdate || update.type;
+      if (!kind) return null;
+      const base = { type: TRANSCRIPT_EVENT_TYPE, v: TRANSCRIPT_EVENT_VERSION, ts: Date.now() };
+      const toolOf = (u, defaultStatus) => ({
+        id: u.toolCallId || null,
+        title: u.title || null,
+        status: u.status || defaultStatus,
+        kind: u.kind || null,
+      });
+      switch (kind) {
+        case 'agent_message_chunk':
+          return { ...base, kind: 'message', role: 'agent', text: acpTextOf(update.content) };
+        case 'agent_thought_chunk':
+          return { ...base, kind: 'thought', role: 'agent', text: acpTextOf(update.content) };
+        case 'user_message_chunk':
+          return { ...base, kind: 'message', role: 'user', text: acpTextOf(update.content) };
+        case 'tool_call':
+          return { ...base, kind: 'tool_call', tool: toolOf(update, 'pending') };
+        case 'tool_call_update':
+          return { ...base, kind: 'tool_call_update', tool: toolOf(update, null) };
+        case 'plan':
+          return { ...base, kind: 'plan', entries: Array.isArray(update.entries) ? update.entries.length : undefined };
+        default:
+          // Unmodelled kind → no typed envelope; caller uses the text fallback.
+          return null;
+      }
+    };
+
+    // Publish a session/update: prefer the typed nwfTranscriptEvent envelope on
+    // the relay's typed publish seam; fall back to the minimal human-text path
+    // when the update has no typed mapping OR the relay exposes no typed seam, so
+    // nothing is ever dropped (no regression vs minimal mode).
+    const emitTranscript = (update) => {
+      const env = mapTranscriptEnvelope(update);
+      if (env && relayTap && typeof relayTap.relayEnvelope === 'function') {
+        try { relayTap.relayEnvelope(env); } catch { /* relay best-effort */ }
+        // Mirror the human text locally (spy tee + captured stdout) so the result
+        // envelope and --stream spy are unchanged — without re-emitting raw text
+        // onto the relay lane, which now carries the typed envelope.
+        captureHuman(describeUpdate(update));
+        return;
+      }
+      // Fallback: minimal text-chunk path (relay text + spy tee + capture).
+      emitHuman(describeUpdate(update));
     };
 
     const handleMessage = (msg) => {
@@ -4248,7 +4326,7 @@ function spawnCaptureAcp({ command, args = [], cwd, env, stdinData, timeoutMs, i
       }
       // A request or notification FROM the agent.
       if (typeof msg.method === 'string') {
-        if (msg.method === 'session/update') { emitHuman(describeUpdate(msg.params?.update)); return; }
+        if (msg.method === 'session/update') { emitTranscript(msg.params?.update); return; }
         if (msg.method === 'session/request_permission') {
           if (msg.id !== undefined) handlePermission(msg.id, msg.params);
           return;
@@ -4590,6 +4668,14 @@ function runAgentJob(profile, job, opts = {}) {
   const relayTap = relaySession
     ? {
         onData: (buf) => relaySession.relay(buf),
+        // #110 step 2: typed transcript publish seam. The ACP producer maps each
+        // session/update to an `nwfTranscriptEvent` envelope and publishes it
+        // here; we JSON-encode it (newline-delimited) onto the SAME relay lane —
+        // the raw relay TRANSPORT (ring/QoS/offsets/jobKey routing) is unchanged,
+        // still `relaySession.relay(text)`. Consumers (cockpit derive+render)
+        // parse the envelope; unmapped updates fall back to the `onData` text path
+        // so nothing is dropped (no regression vs the minimal-mode floor).
+        relayEnvelope: (env) => relaySession.relay(`${JSON.stringify(env)}\n`),
         attachSteer: (write) => relaySession.attachSteer(write),
       }
     : null;

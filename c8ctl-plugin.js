@@ -4269,11 +4269,15 @@ function spawnCaptureAcp({ command, args = [], cwd, env, stdinData, timeoutMs, i
       const kind = update.sessionUpdate || update.type;
       if (!kind) return null;
       const base = { type: TRANSCRIPT_EVENT_TYPE, v: TRANSCRIPT_EVENT_VERSION, ts: Date.now() };
+      // Optional fields stay `undefined` (JSON encoding omits them) rather than
+      // becoming explicit `null`s, and `??` preserves empty strings — so
+      // consumers see omitted/optional strings, not coerced nulls. `status`
+      // falls through to the kind's default only when genuinely absent.
       const toolOf = (u, defaultStatus) => ({
-        id: u.toolCallId || null,
-        title: u.title || null,
-        status: u.status || defaultStatus,
-        kind: u.kind || null,
+        id: u.toolCallId ?? undefined,
+        title: u.title ?? undefined,
+        status: u.status ?? defaultStatus ?? undefined,
+        kind: u.kind ?? undefined,
       });
       switch (kind) {
         case 'agent_message_chunk':
@@ -4283,11 +4287,15 @@ function spawnCaptureAcp({ command, args = [], cwd, env, stdinData, timeoutMs, i
         case 'user_message_chunk':
           return { ...base, kind: 'message', role: 'user', text: acpTextOf(update.content) };
         case 'tool_call':
-          return { ...base, kind: 'tool_call', tool: toolOf(update, 'pending') };
+          // `text` mirrors the fallback's plain text so the typed envelope stays
+          // self-contained for lightweight renderers (matches the stated contract).
+          return { ...base, kind: 'tool_call', text: describeUpdate(update), tool: toolOf(update, 'pending') };
         case 'tool_call_update':
-          return { ...base, kind: 'tool_call_update', tool: toolOf(update, null) };
+          return { ...base, kind: 'tool_call_update', text: describeUpdate(update), tool: toolOf(update, undefined) };
         case 'plan':
-          return { ...base, kind: 'plan', entries: Array.isArray(update.entries) ? update.entries.length : undefined };
+          // Carry the actual plan entries (rich cockpit renders them), not a
+          // count — an absent/malformed payload stays `undefined` (omitted).
+          return { ...base, kind: 'plan', entries: Array.isArray(update.entries) ? update.entries : undefined };
         default:
           // Unmodelled kind → no typed envelope; caller uses the text fallback.
           return null;
@@ -4675,7 +4683,11 @@ function runAgentJob(profile, job, opts = {}) {
         // still `relaySession.relay(text)`. Consumers (cockpit derive+render)
         // parse the envelope; unmapped updates fall back to the `onData` text path
         // so nothing is dropped (no regression vs the minimal-mode floor).
-        relayEnvelope: (env) => relaySession.relay(`${JSON.stringify(env)}\n`),
+        // Best-effort: a bad envelope (circular refs / BigInt making
+        // JSON.stringify throw) must never crash the worker, so swallow here.
+        relayEnvelope: (env) => {
+          try { relaySession.relay(`${JSON.stringify(env)}\n`); } catch { /* relay best-effort */ }
+        },
         attachSteer: (write) => relaySession.attachSteer(write),
       }
     : null;

@@ -737,10 +737,10 @@ test('session/update maps to typed nwfTranscriptEvent envelopes on the relay (ri
     assert.equal(finishes[0].tool.id, 'tc-1');
     assert.equal(finishes[0].tool.status, 'completed');
 
-    // plan → plan (with an entry count).
+    // plan → plan (carrying the actual entries payload for rich rendering).
     const plans = byKind('plan');
     assert.equal(plans.length, 1);
-    assert.equal(plans[0].entries, 2);
+    assert.deepEqual(plans[0].entries, [{ content: 'step 1' }, { content: 'step 2' }]);
 
     // The unmodelled kind (available_commands_update) is NOT a typed envelope.
     assert.ok(!rec.envelopes.some((e) => e.kind === 'available_commands_update'));

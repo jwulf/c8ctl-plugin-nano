@@ -36,20 +36,19 @@ process.on('exit', () => {
   else globalThis.c8ctl = prevC8ctl;
 });
 
-function withHome(fn) {
+async function withHome(fn) {
   const prevHome = process.env.C8CTL_NANO_HOME;
   const home = mkdtempSync(join(tmpdir(), 'c8ctl-proto-'));
   process.env.C8CTL_NANO_HOME = home;
   resetLogs();
   try {
-    return fn(home);
+    return await fn(home);
   } finally {
     if (prevHome === undefined) delete process.env.C8CTL_NANO_HOME;
     else process.env.C8CTL_NANO_HOME = prevHome;
     rmSync(home, { recursive: true, force: true });
   }
 }
-void withHome;
 
 // --- normalizeStoredProfile ----------------------------------------------
 const BASE = { rank: 'senior', command: 'copilot' };
@@ -93,11 +92,7 @@ test('normalizeStoredProfile does not add protocol/permission errors for a valid
 
 // --- hireWorker round-trip -------------------------------------------------
 test('hire round-trips protocol/permission through config.json', async () => {
-  const prevHome = process.env.C8CTL_NANO_HOME;
-  const home = mkdtempSync(join(tmpdir(), 'c8ctl-proto-'));
-  process.env.C8CTL_NANO_HOME = home;
-  resetLogs();
-  try {
+  await withHome(async () => {
     await hireWorker(
       { positional: [] },
       { name: 'coder', rank: 'senior', command: 'copilot', protocol: 'acp', permission: 'yolo' },
@@ -106,19 +101,11 @@ test('hire round-trips protocol/permission through config.json', async () => {
     assert.ok(hires.coder, 'profile was persisted');
     assert.equal(hires.coder.protocol, 'acp');
     assert.equal(hires.coder.permission, 'yolo');
-  } finally {
-    if (prevHome === undefined) delete process.env.C8CTL_NANO_HOME;
-    else process.env.C8CTL_NANO_HOME = prevHome;
-    rmSync(home, { recursive: true, force: true });
-  }
+  });
 });
 
 test('hire defaults protocol/permission to pipe/yolo when the flags are omitted', async () => {
-  const prevHome = process.env.C8CTL_NANO_HOME;
-  const home = mkdtempSync(join(tmpdir(), 'c8ctl-proto-'));
-  process.env.C8CTL_NANO_HOME = home;
-  resetLogs();
-  try {
+  await withHome(async () => {
     await hireWorker(
       { positional: [] },
       { name: 'coder', rank: 'senior', command: 'copilot' },
@@ -128,20 +115,12 @@ test('hire defaults protocol/permission to pipe/yolo when the flags are omitted'
     assert.equal(hires.coder.permission, 'yolo');
     // Default (pipe/yolo) hire must NOT emit the reserved-policy warning.
     assert.ok(!logs.warn.some((w) => /RESERVED|not yet enforced/i.test(w)));
-  } finally {
-    if (prevHome === undefined) delete process.env.C8CTL_NANO_HOME;
-    else process.env.C8CTL_NANO_HOME = prevHome;
-    rmSync(home, { recursive: true, force: true });
-  }
+  });
 });
 
 for (const policy of ['escalate', 'filter']) {
   test(`hire --permission ${policy} persists the value AND warns it is reserved/not-yet-enforced`, async () => {
-    const prevHome = process.env.C8CTL_NANO_HOME;
-    const home = mkdtempSync(join(tmpdir(), 'c8ctl-proto-'));
-    process.env.C8CTL_NANO_HOME = home;
-    resetLogs();
-    try {
+    await withHome(async () => {
       await hireWorker(
         { positional: [] },
         { name: 'coder', rank: 'senior', command: 'copilot', protocol: 'acp', permission: policy },
@@ -152,10 +131,6 @@ for (const policy of ['escalate', 'filter']) {
       // A warning naming nano-workforce#559 and the reserved status was emitted.
       const warned = logs.warn.some((w) => w.includes('559') && /reserved|not yet enforced|interim/i.test(w));
       assert.ok(warned, `expected a reserved/not-yet-enforced warning for --permission ${policy}, got: ${JSON.stringify(logs.warn)}`);
-    } finally {
-      if (prevHome === undefined) delete process.env.C8CTL_NANO_HOME;
-      else process.env.C8CTL_NANO_HOME = prevHome;
-      rmSync(home, { recursive: true, force: true });
-    }
+    });
   });
 }

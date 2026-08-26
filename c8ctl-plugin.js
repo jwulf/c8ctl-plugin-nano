@@ -4330,7 +4330,18 @@ function spawnCaptureAcp({ command, args = [], cwd, env, stdinData, timeoutMs, i
       // session/prompt turn to have resolved AND a clean exit — an early exit
       // (e.g. code 0 during the handshake, before the turn completes) or any
       // non-zero exit is a failure, never a false success.
-      finish({ ok: promptResolved && code === 0, exitCode: code, signal: signal ?? null, stdout: humanStdout(), stderr: joinCapped(stderrChunks), truncated: humanTruncated, stderrTruncated });
+      const ok = promptResolved && code === 0;
+      // On failure, populate an explicit `error` so callers/logs explain WHY —
+      // otherwise an early exit (code 0 before the turn resolved) surfaces as a
+      // confusing bare "exit code 0" with no detail.
+      let error;
+      if (!ok) {
+        const how = signal ? `signal ${signal}` : `code ${code}`;
+        error = promptResolved
+          ? `ACP agent exited with ${how} (session/prompt completed)`
+          : `ACP agent exited with ${how} before the session/prompt turn completed`;
+      }
+      finish({ ok, exitCode: code, signal: signal ?? null, stdout: humanStdout(), stderr: joinCapped(stderrChunks), ...(error ? { error } : {}), truncated: humanTruncated, stderrTruncated });
     });
 
     // Steer + cancel via the relay tap — NO PTY. Wired once the session exists.

@@ -56,6 +56,13 @@ if (process.env.FAKE_BAD_FRAME) {
   setInterval(() => {}, 3_600_000);
 }
 
+// FAKE_EARLY_EXIT: exit 0 during the handshake, before any session/prompt turn
+// resolves. The executor must report ok:false WITH an explicit error explaining
+// the early exit, not a confusing bare "exit code 0".
+if (process.env.FAKE_EARLY_EXIT) {
+  process.exit(0);
+}
+
 // FAKE_SPLIT_MULTIBYTE: emit one JSON-RPC frame carrying a multibyte-heavy text,
 // but flush it to stdout as two raw byte writes that DELIBERATELY split a
 // multibyte UTF-8 sequence across the chunk boundary. A naive per-chunk
@@ -240,6 +247,28 @@ test('spawnCaptureAcp fails a run whose stdout frame never terminates (buffer ca
     });
     assert.equal(result.ok, false);
     assert.ok(/framing violation/i.test(result.error || ''), `expected framing-violation error, got: ${result.error}`);
+  } finally {
+    rmSync(resDir, { recursive: true, force: true });
+  }
+});
+
+test('spawnCaptureAcp fails an early exit before the session/prompt turn resolves', async () => {
+  const resDir = mkdtempSync(join(tmpdir(), 'acp-res-'));
+  const resultFile = join(resDir, 'result.json');
+  try {
+    const result = await spawnCaptureAcp({
+      command: 'node',
+      args: [FAKE_AGENT],
+      cwd: workRoot,
+      env: { ...baseEnv(), AGENT_RESULT_FILE: resultFile, FAKE_EARLY_EXIT: '1' },
+      stdinData: 'prompt',
+      timeoutMs: 20_000,
+      permission: 'yolo',
+    });
+    assert.equal(result.ok, false);
+    assert.equal(result.exitCode, 0);
+    // An early exit must carry an explicit error, not a bare "exit code 0".
+    assert.ok(/before the session\/prompt turn completed/i.test(result.error || ''), `expected early-exit error, got: ${result.error}`);
   } finally {
     rmSync(resDir, { recursive: true, force: true });
   }

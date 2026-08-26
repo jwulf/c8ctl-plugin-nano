@@ -4048,7 +4048,7 @@ const ACP_MAX_LINE_BYTES = 8 * 1024 * 1024; // 8 MiB
 // and every caller work unchanged. Because the raw stream is JSON-RPC (not human
 // output), `stdout` here is the accumulated human-readable transcript text (what
 // we relay), and `stderr` is the child's real stderr (agent diagnostics).
-function spawnCaptureAcp({ command, args = [], cwd, env, stdinData, timeoutMs, idleTimeoutMs, relayTap = null, stream = false, streamPrefix = '', onStreamOut, permission = 'yolo', shell = false }) {
+function spawnCaptureAcp({ command, args = [], cwd, env, stdinData, timeoutMs, idleTimeoutMs, relayTap = null, stream = false, streamPrefix = '', onStreamOut, onStreamErr, permission = 'yolo', shell = false }) {
   return new Promise((resolve) => {
     const logger = getLogger();
     const humanChunks = [];
@@ -4075,27 +4075,33 @@ function spawnCaptureAcp({ command, args = [], cwd, env, stdinData, timeoutMs, i
     // Live "spy" tee (--stream), line-buffered, mirroring the other paths.
     // Separate line buffers per lane (stdout-human vs stderr) so a partial line
     // on one lane never interleaves mid-line with the other — matching pipe/PTY.
+    // stderr routes through its own sink (`onStreamErr`) so it keeps its warn/
+    // error severity instead of being flattened onto the stdout sink; it falls
+    // back to the stdout sink (then process.stdout) when no error sink is wired.
     const STREAM_TEE_LINE_CAP = 64 * 1024;
-    const teeSink = stream ? (onStreamOut || ((line) => process.stdout.write(`${line}\n`))) : null;
-    const makeTee = () => {
+    const defaultTeeOut = (line) => process.stdout.write(`${line}\n`);
+    const outSink = stream ? (onStreamOut || defaultTeeOut) : null;
+    const errSink = stream ? (onStreamErr || onStreamOut || defaultTeeOut) : null;
+    const teeSink = outSink; // truthy iff --stream is on (shared streaming guard)
+    const makeTee = (sink) => {
       let partial = '';
       return (text, final) => {
-        if (!teeSink) return;
+        if (!sink) return;
         partial += text;
         let nl;
         while ((nl = partial.indexOf('\n')) !== -1) {
-          teeSink(`${streamPrefix}${partial.slice(0, nl)}`);
+          sink(`${streamPrefix}${partial.slice(0, nl)}`);
           partial = partial.slice(nl + 1);
         }
         while (partial.length >= STREAM_TEE_LINE_CAP) {
-          teeSink(`${streamPrefix}${partial.slice(0, STREAM_TEE_LINE_CAP)}`);
+          sink(`${streamPrefix}${partial.slice(0, STREAM_TEE_LINE_CAP)}`);
           partial = partial.slice(STREAM_TEE_LINE_CAP);
         }
-        if (final && partial) { teeSink(`${streamPrefix}${partial}`); partial = ''; }
+        if (final && partial) { sink(`${streamPrefix}${partial}`); partial = ''; }
       };
     };
-    const tee = makeTee();
-    const teeErr = makeTee();
+    const tee = makeTee(outSink);
+    const teeErr = makeTee(errSink);
 
     const humanStdout = () => joinCapped(humanChunks);
 
@@ -4341,22 +4347,47 @@ function spawnCaptureAcp({ command, args = [], cwd, env, stdinData, timeoutMs, i
     child.on('close', (code, signal) => {
       childClosed = { code, signal: signal ?? null };
       if (settleTimer) { clearTimeout(settleTimer); settleTimer = null; }
+      // Flush the UTF-8 decoder's held-back bytes (an incomplete multibyte
+      // sequence at EOF) and drain any now-complete newline-delimited frames,
+      // so a final frame that arrives in the same read as EOF isn't dropped.
+      // Whatever remains after that is an un-terminated tail on what is supposed
+      // to be a pure newline-delimited JSON-RPC stream — a framing violation we
+      // must NOT let masquerade as success.
+      let unterminatedTail = '';
+      try {
+        rxBuf += rxDecoder.end();
+        let nl;
+        while ((nl = rxBuf.indexOf('\n')) !== -1) {
+          const line = rxBuf.slice(0, nl).trim();
+          rxBuf = rxBuf.slice(nl + 1);
+          if (!line) continue;
+          try { handleMessage(JSON.parse(line)); } catch { /* best effort on shutdown */ }
+        }
+        unterminatedTail = rxBuf.trim();
+      } catch { /* decoder flush best effort */ }
+      rxBuf = '';
       // Settle on the child's ACTUAL exit — this is what avoids racing the
       // caller's $AGENT_RESULT_FILE read: the file's write/flush is guaranteed
       // complete once the process is gone. Success requires BOTH the main
-      // session/prompt turn to have resolved AND a clean exit — an early exit
-      // (e.g. code 0 during the handshake, before the turn completes) or any
-      // non-zero exit is a failure, never a false success.
-      const ok = promptResolved && code === 0;
+      // session/prompt turn to have resolved AND a clean exit AND no leftover
+      // un-terminated frame — an early exit (e.g. code 0 during the handshake,
+      // before the turn completes), any non-zero exit, or a dangling tail is a
+      // failure, never a false success.
+      const ok = promptResolved && code === 0 && !unterminatedTail;
       // On failure, populate an explicit `error` so callers/logs explain WHY —
       // otherwise an early exit (code 0 before the turn resolved) surfaces as a
       // confusing bare "exit code 0" with no detail.
       let error;
       if (!ok) {
-        const how = signal ? `signal ${signal}` : `code ${code}`;
-        error = promptResolved
-          ? `ACP agent exited with ${how} (session/prompt completed)`
-          : `ACP agent exited with ${how} before the session/prompt turn completed`;
+        if (unterminatedTail && promptResolved && code === 0) {
+          const preview = unterminatedTail.length > 200 ? `${unterminatedTail.slice(0, 200)}…` : unterminatedTail;
+          error = `ACP framing violation: un-terminated JSON-RPC frame on stdout at exit: ${preview}`;
+        } else {
+          const how = signal ? `signal ${signal}` : `code ${code}`;
+          error = promptResolved
+            ? `ACP agent exited with ${how} (session/prompt completed)`
+            : `ACP agent exited with ${how} before the session/prompt turn completed`;
+        }
       }
       finish({ ok, exitCode: code, signal: signal ?? null, stdout: humanStdout(), stderr: joinCapped(stderrChunks), ...(error ? { error } : {}), truncated: humanTruncated, stderrTruncated });
     });
@@ -4571,6 +4602,7 @@ function runAgentJob(profile, job, opts = {}) {
         stream,
         streamPrefix,
         onStreamOut,
+        onStreamErr,
         permission,
       });
     }

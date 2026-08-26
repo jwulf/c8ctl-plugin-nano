@@ -99,6 +99,11 @@ function writeResult(extra) {
 function finish(stopReason, extra) {
   writeResult(extra);
   if (promptId != null) send({ jsonrpc: '2.0', id: promptId, result: { stopReason } });
+  // FAKE_TAIL: after the turn resolves, leave a non-newline-terminated tail on
+  // stdout, then exit 0. stdout is a pure newline-delimited JSON-RPC stream, so
+  // the executor must treat this dangling frame as a framing violation (ok:false)
+  // rather than a false success.
+  if (process.env.FAKE_TAIL) process.stdout.write('{"jsonrpc":"2.0","dangling":true}');
   setTimeout(() => process.exit(0), 10);
 }
 function nextPermOrFinish() {
@@ -262,6 +267,56 @@ test('spawnCaptureAcp forwards stderr to the --stream tee and the relay lane', a
     // ...AND streamed live on both lanes (like pipe/PTY mode), not just captured.
     assert.ok(teeLines.some((l) => l.includes('acp-diag: hello from stderr')), 'stderr should reach the --stream tee');
     assert.ok(relayed.some((r) => r.includes('acp-diag: hello from stderr')), 'stderr should reach the relay lane');
+  } finally {
+    rmSync(resDir, { recursive: true, force: true });
+  }
+});
+
+test('spawnCaptureAcp routes stderr to the onStreamErr sink (its own severity), not onStreamOut', async () => {
+  const resDir = mkdtempSync(join(tmpdir(), 'acp-res-'));
+  const resultFile = join(resDir, 'result.json');
+  const outLines = [];
+  const errLines = [];
+  try {
+    const result = await spawnCaptureAcp({
+      command: 'node',
+      args: [FAKE_AGENT],
+      cwd: workRoot,
+      env: { ...baseEnv(), AGENT_RESULT_FILE: resultFile, FAKE_STDERR: '1' },
+      stdinData: JSON.stringify({ prompt: 'do the thing' }),
+      timeoutMs: 20_000,
+      permission: 'yolo',
+      stream: true,
+      onStreamOut: (line) => outLines.push(line),
+      onStreamErr: (line) => errLines.push(line),
+    });
+    assert.equal(result.ok, true, result.error || result.stderr);
+    // stderr must land on the dedicated error sink (warn/error severity)...
+    assert.ok(errLines.some((l) => l.includes('acp-diag: hello from stderr')), 'stderr should reach onStreamErr');
+    // ...and NOT be flattened onto the stdout sink when both are wired.
+    assert.ok(!outLines.some((l) => l.includes('acp-diag: hello from stderr')), 'stderr must not reach onStreamOut when onStreamErr is provided');
+  } finally {
+    rmSync(resDir, { recursive: true, force: true });
+  }
+});
+
+test('spawnCaptureAcp fails a run that leaves an un-terminated stdout tail at exit', async () => {
+  const resDir = mkdtempSync(join(tmpdir(), 'acp-res-'));
+  const resultFile = join(resDir, 'result.json');
+  try {
+    const result = await spawnCaptureAcp({
+      command: 'node',
+      args: [FAKE_AGENT],
+      cwd: workRoot,
+      // Turn resolves, then a dangling non-newline-terminated frame is emitted.
+      env: { ...baseEnv(), AGENT_RESULT_FILE: resultFile, FAKE_TAIL: '1' },
+      stdinData: JSON.stringify({ prompt: 'do the thing' }),
+      timeoutMs: 20_000,
+      permission: 'yolo',
+    });
+    assert.equal(result.ok, false, 'a dangling stdout tail must not be reported as success');
+    assert.equal(result.exitCode, 0);
+    assert.ok(/framing violation/i.test(result.error || ''), `expected framing-violation error, got: ${result.error}`);
   } finally {
     rmSync(resDir, { recursive: true, force: true });
   }

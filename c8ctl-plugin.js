@@ -3968,7 +3968,22 @@ function spawnCapturePty({ command, args = [], cwd, env, stdinData, timeoutMs, i
 // invocation is never doubled. This mirrors how the pipe path spawns the line
 // under a shell.
 function ensureAcpFlag(commandLine) {
-  if (/(^|[\s/-])acp\b/i.test(commandLine)) return commandLine;
+  // Detection must survive buildAgentCommandLine()'s POSIX single-quoting: a
+  // structured `--arg acp` (or `--arg --acp`) lands here as the quoted token
+  // 'acp' / '--acp', so a naive `\bacp\b` on the raw line would miss it and
+  // wrongly append a second --acp. Tokenise the line, strip the single-quoting,
+  // and match each token as a WHOLE selector — `acp`/`-acp`/`--acp` (native
+  // subcommand or switch) or an adapter command whose basename ends in `-acp`
+  // (claude-agent-acp, pi-acp). Matching whole tokens/basenames (not a substring)
+  // also avoids the false positive of a path that merely contains `/acp/`.
+  const tokens = commandLine.match(/'(?:[^']|'\\'')*'|\S+/g) || [];
+  for (let tok of tokens) {
+    if (tok.length >= 2 && tok.startsWith("'") && tok.endsWith("'")) {
+      tok = tok.slice(1, -1).replace(/'\\''/g, "'");
+    }
+    const base = tok.replace(/^.*[\\/]/, ''); // basename, for path-form commands
+    if (/^-{0,2}acp$/i.test(base) || /-acp$/i.test(base)) return commandLine;
+  }
   return `${commandLine} --acp`;
 }
 
@@ -4258,7 +4273,20 @@ function spawnCaptureAcp({ command, args = [], cwd, env, stdinData, timeoutMs, i
         rxBuf = rxBuf.slice(nl + 1);
         if (!line) continue;
         let msg;
-        try { msg = JSON.parse(line); } catch { continue; }
+        try {
+          msg = JSON.parse(line);
+        } catch {
+          // stdout is a pure newline-delimited JSON-RPC stream; a line that
+          // isn't JSON is a framing/protocol violation, not noise. Silently
+          // skipping it would mask a misconfigured agent as an opaque idle
+          // timeout (and keep re-arming the idle timer on garbage). Fail fast
+          // with an explicit error, mirroring the un-terminated-frame cap below.
+          const preview = line.length > 200 ? `${line.slice(0, 200)}…` : line;
+          rxBuf = '';
+          try { killTree(child); } catch { /* best effort */ }
+          finish({ ok: false, exitCode: null, stdout: humanStdout(), stderr: joinCapped(stderrChunks), error: `ACP framing violation: non-JSON line on stdout: ${preview}`, truncated: humanTruncated, stderrTruncated });
+          return;
+        }
         try { handleMessage(msg); } catch { /* one bad frame must not wedge the loop */ }
       }
       // No newline in the (now line-free) tail past the cap → the peer is

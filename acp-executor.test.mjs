@@ -48,6 +48,14 @@ if (process.env.FAKE_FLOOD) {
   setInterval(() => {}, 3_600_000);
 }
 
+// FAKE_BAD_FRAME: write a single non-JSON line to stdout then stay alive. The
+// executor must treat this as a framing violation (kill + fail), not silently
+// skip it and stall into an idle timeout.
+if (process.env.FAKE_BAD_FRAME) {
+  process.stdout.write('this is not json\\n');
+  setInterval(() => {}, 3_600_000);
+}
+
 // FAKE_SPLIT_MULTIBYTE: emit one JSON-RPC frame carrying a multibyte-heavy text,
 // but flush it to stdout as two raw byte writes that DELIBERATELY split a
 // multibyte UTF-8 sequence across the chunk boundary. A naive per-chunk
@@ -176,6 +184,15 @@ test('ensureAcpFlag appends --acp only when ACP is not already selected', () => 
   assert.equal(ensureAcpFlag('opencode acp'), 'opencode acp');
   assert.equal(ensureAcpFlag('claude-agent-acp'), 'claude-agent-acp');
   assert.equal(ensureAcpFlag('pi-acp'), 'pi-acp');
+  // Real dispatch: structured --arg tokens are POSIX single-quoted by
+  // buildAgentCommandLine(), so the acp selector arrives quoted. Detection must
+  // still see it and NOT double the switch.
+  assert.equal(ensureAcpFlag("opencode 'acp'"), "opencode 'acp'");
+  assert.equal(ensureAcpFlag("copilot '--acp'"), "copilot '--acp'");
+  assert.equal(ensureAcpFlag("node '/x/agent.mjs' 'acp'"), "node '/x/agent.mjs' 'acp'");
+  // A path that merely contains `/acp/` is NOT an ACP selector — append.
+  assert.equal(ensureAcpFlag('/opt/acp/bin/agent'), '/opt/acp/bin/agent --acp');
+  assert.equal(ensureAcpFlag("'/opt/acp/bin/agent'"), "'/opt/acp/bin/agent' --acp");
 });
 
 test('spawnCaptureAcp completes the ACP handshake and merges the result file', async () => {
@@ -216,6 +233,27 @@ test('spawnCaptureAcp fails a run whose stdout frame never terminates (buffer ca
     });
     assert.equal(result.ok, false);
     assert.ok(/framing violation/i.test(result.error || ''), `expected framing-violation error, got: ${result.error}`);
+  } finally {
+    rmSync(resDir, { recursive: true, force: true });
+  }
+});
+
+test('spawnCaptureAcp fails fast on a non-JSON stdout line (framing violation)', async () => {
+  const resDir = mkdtempSync(join(tmpdir(), 'acp-res-'));
+  const resultFile = join(resDir, 'result.json');
+  try {
+    const result = await spawnCaptureAcp({
+      command: 'node',
+      args: [FAKE_AGENT],
+      cwd: workRoot,
+      env: { ...baseEnv(), AGENT_RESULT_FILE: resultFile, FAKE_BAD_FRAME: '1' },
+      stdinData: 'prompt',
+      timeoutMs: 20_000,
+      permission: 'yolo',
+    });
+    assert.equal(result.ok, false);
+    assert.ok(/framing violation/i.test(result.error || ''), `expected framing-violation error, got: ${result.error}`);
+    assert.ok(/non-JSON/i.test(result.error || ''), `expected non-JSON detail, got: ${result.error}`);
   } finally {
     rmSync(resDir, { recursive: true, force: true });
   }

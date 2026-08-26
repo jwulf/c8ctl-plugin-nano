@@ -1012,6 +1012,7 @@ test('sanitizeResultVars strips harness-reserved keys and the io.nanobpm namespa
     agent: 'impostor',
     truncated: true,
     branch: 'evil',
+    forcedReap: true,
     [AGENT_RESULT_KEY]: { forged: true },
     'io.nanobpm.somethingElse': 1,
   });

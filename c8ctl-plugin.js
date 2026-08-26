@@ -57,6 +57,7 @@ import { join, isAbsolute, resolve as resolvePath, dirname, basename, sep } from
 import { createRequire } from 'node:module';
 import { fileURLToPath } from 'node:url';
 import { createInterface } from 'node:readline/promises';
+import { StringDecoder } from 'node:string_decoder';
 import { createInterface as createReadline, cursorTo as rlCursorTo, moveCursor as rlMoveCursor, clearScreenDown as rlClearScreenDown } from 'node:readline';
 import { platformForHost } from './platforms.mjs';
 import { createWorkChannel, redactAgenticUrl, buildAgenticUrl } from './work-channel.mjs';
@@ -2113,7 +2114,7 @@ async function hireWorker(req, flags) {
   if (profile.args.length > 0) logger.info(`  args: ${profile.args.map(shQuote).join(' ')}`);
   logger.info(`  sandbox: ${profile.sandbox}${CONTAINER_SANDBOXES.has(profile.sandbox) ? ` (image ${profile.image})` : ''}`);
   logger.info(`  live terminal: ${profile.terminal}${profile.terminal === 'pty' ? ' (streamed + steerable on the relay lane)' : ''}`);
-  logger.info(`  protocol: ${profile.protocol}${profile.protocol === 'acp' ? ' (Agent Client Protocol — JSON-RPC over stdio; RESERVED — accepted/persisted but not yet active in this build; the harness still runs on the transport selected by --terminal (pipe or pty))' : ''}`);
+  logger.info(`  protocol: ${profile.protocol}${profile.protocol === 'acp' ? ' (Agent Client Protocol — JSON-RPC over stdio; ACTIVE on the host executor (sandbox=none): the harness is driven over ACP. Container sandboxes (docker/podman) do NOT yet run ACP and are pipe-only today (--terminal pty is host-only))' : ''}`);
   logger.info(`  permission: ${profile.permission}${(profile.permission === 'escalate' || profile.permission === 'filter') ? ' (RESERVED — not yet enforced, pending nano-workforce#559)' : ''}`);
   const envKeys = Object.keys(profile.env);
   if (envKeys.length > 0) logger.info(`  env: ${envKeys.join(', ')}`);
@@ -2201,7 +2202,7 @@ const RESULT_SENTINEL = '::nano:result::';
 // audit envelope or process bookkeeping.
 const RESERVED_RESULT_KEYS = new Set([
   AGENT_RESULT_KEY, 'output', 'exitCode', 'agent', 'truncated',
-  'branch', 'commits', 'pushed', 'pullRequest',
+  'branch', 'commits', 'pushed', 'pullRequest', 'forcedReap',
 ]);
 
 // Parse `text` as a JSON object, returning it only when it is a plain object.
@@ -3959,6 +3960,536 @@ function spawnCapturePty({ command, args = [], cwd, env, stdinData, timeoutMs, i
   });
 }
 
+// ---- ACP capture (C3 #110 — the third harness path, "minimal mode") ---------
+// Some ACP agents are native (`copilot --acp`, `opencode acp`), some ride an
+// adapter (`claude-agent-acp`, `pi-acp`). In every case the profile's command +
+// `--arg`s already assemble the ACP invocation; we only append a default `--acp`
+// switch when the assembled line doesn't already select ACP, so a native/adapter
+// invocation is never doubled. This mirrors how the pipe path spawns the line
+// under a shell.
+function ensureAcpFlag(commandLine) {
+  // Detection must survive buildAgentCommandLine()'s POSIX single-quoting: a
+  // structured `--arg acp` (or `--arg --acp`) lands here as the quoted token
+  // 'acp' / '--acp', so a naive `\bacp\b` on the raw line would miss it and
+  // wrongly append a second --acp. Tokenise the line, strip the shell quoting
+  // (both POSIX single-quotes from buildAgentCommandLine() AND double-quotes a
+  // legacy `profile.command` may bake in, e.g. `copilot "--acp"`), and match:
+  //   - a native ACP selector `acp`/`-acp`/`--acp` (subcommand or switch) as a
+  //     WHOLE token, in ANY position (it may be the command or an argument), or
+  //   - an adapter command whose basename ends in `-acp` (claude-agent-acp,
+  //     pi-acp) — but ONLY the command token (first token), since an *argument*
+  //     that merely ends in `-acp` (e.g. `--model foo-acp`) is not an ACP
+  //     selector. Matching whole tokens/basenames (not a substring) also avoids
+  //     the false positive of a path that merely contains `/acp/`.
+  const tokens = commandLine.match(/'(?:[^']|'\\'')*'|"(?:[^"\\]|\\.)*"|\S+/g) || [];
+  for (let i = 0; i < tokens.length; i++) {
+    let tok = tokens[i];
+    if (tok.length >= 2 && tok.startsWith("'") && tok.endsWith("'")) {
+      tok = tok.slice(1, -1).replace(/'\\''/g, "'");
+    } else if (tok.length >= 2 && tok.startsWith('"') && tok.endsWith('"')) {
+      tok = tok.slice(1, -1).replace(/\\(["\\$`])/g, '$1');
+    }
+    const base = tok.replace(/^.*[\\/]/, ''); // basename, for path-form commands
+    if (/^-{0,2}acp$/i.test(base)) return commandLine;
+    if (i === 0 && /-acp$/i.test(base)) return commandLine;
+  }
+  return `${commandLine} --acp`;
+}
+
+// The steer control byte the cockpit sends to interrupt a live ACP turn: ETX
+// (Ctrl-C, 0x03), matching terminal semantics. Any other inbound steer text is
+// treated as a mid-turn steer prompt (a fresh `session/prompt` on the live
+// session). This keeps the ACP steer surface consistent with the PTY path
+// (where Ctrl-C already interrupts) without needing a PTY.
+const ACP_INTERRUPT_BYTE = '\x03';
+
+// After the main session/prompt turn resolves we wait for the child's `close`
+// event (so $AGENT_RESULT_FILE is fully flushed before the caller reads it). A
+// well-behaved agent exits promptly once stdin closes; this bounds how long a
+// finished-but-lingering agent may hold the turn open before it is force-reaped,
+// so a completed turn is never held hostage to the full run timeout. Resolved at
+// call time (see acpPostTurnGraceMs) so tests can shrink it and exercise the
+// force-reap path without a 10s wait.
+const ACP_POST_TURN_GRACE_DEFAULT_MS = 10_000;
+function acpPostTurnGraceMs() {
+  const v = Number(process.env.NANO_ACP_POST_TURN_GRACE_MS);
+  return Number.isFinite(v) && v >= 0 ? v : ACP_POST_TURN_GRACE_DEFAULT_MS;
+}
+
+// Hard cap on a single un-terminated JSON-RPC frame. ACP frames are one compact
+// JSON object per `\n`-terminated line; a conformant agent never emits a line
+// this large. Without a cap a peer that streams bytes without a newline would
+// grow `rxBuf` without bound (and keep re-arming the idle timer), risking memory
+// exhaustion — so once the pending (newline-free) tail exceeds this we treat it
+// as a framing violation and fail the run rather than buffer forever.
+const ACP_MAX_LINE_BYTES = 8 * 1024 * 1024; // 8 MiB
+
+// Drive an ACP (Agent Client Protocol) agent over JSON-RPC 2.0 on stdio.
+//
+// This is the "minimal mode" executor (#110, step 1): it proves ACP end-to-end
+// with ZERO downstream changes by serialising each `session/update` to a short
+// human-readable TEXT chunk and feeding it to the SAME relay/tee lane the pipe
+// path uses (`relayTap.onData`) — it never tee's the raw JSON-RPC. Typed
+// transcript envelopes are a separate downstream task.
+//
+// Framing: ACP frames are newline-delimited JSON-RPC 2.0 messages on stdio (one
+// compact JSON object per line, `\n`-terminated). We implement a tiny inline
+// framer/parser rather than pull a dependency.
+//
+// Sequence: initialize → session/new { cwd } → session/prompt { prompt } →
+// consume session/update notifications until the prompt request resolves
+// (end-of-turn) → end stdin for a clean shutdown → wait for the child's `close`
+// to settle the promise. Settling on the real exit (rather than the instant the
+// turn resolves) avoids racing the caller's result-file read and surfaces a late
+// non-zero/early exit as a failure. The result-file merge is unchanged: the
+// agent writes `$AGENT_RESULT_FILE` (already set in `env`) and the caller reads
+// it exactly as in pipe mode.
+//
+// Permission: inbound `session/request_permission` requests are answered by the
+// `permission` policy switch — see below. `yolo` auto-allow-always is the only
+// policy enforced today; `escalate`/`filter` fall back to a warned safe interim
+// policy pending nano-workforce#559.
+//
+// Same result contract as spawnCaptureOneShot/spawnCapturePty so buildResultEnvelope
+// and every caller work unchanged. Because the raw stream is JSON-RPC (not human
+// output), `stdout` here is the accumulated human-readable transcript text (what
+// we relay), and `stderr` is the child's real stderr (agent diagnostics).
+function spawnCaptureAcp({ command, args = [], cwd, env, stdinData, timeoutMs, idleTimeoutMs, relayTap = null, stream = false, streamPrefix = '', onStreamOut, onStreamErr, permission = 'yolo', shell = false }) {
+  return new Promise((resolve) => {
+    const logger = getLogger();
+    const humanChunks = [];
+    let humanBytes = 0;
+    let humanTruncated = false;
+    const stderrChunks = [];
+    let stderrBytes = 0;
+    let stderrTruncated = false;
+    let settled = false;
+    let timer = null;
+    let idleTimer = null;
+    let detachSteer = null;
+    let child;
+    let sessionId = null;
+    let nextId = 1;
+    const pending = new Map();
+    let childClosed = null; // { code, signal } once the child exits
+    let promptResolved = false; // the main session/prompt turn sent + resolved
+    let settleTimer = null; // post-turn grace before force-reaping a lingering agent
+    // One-time warning latch for the reserved escalate/filter policies so the
+    // deferral is observable (not silent) but never spams a warning per request.
+    let interimWarned = false;
+
+    // Live "spy" tee (--stream), line-buffered, mirroring the other paths.
+    // Separate line buffers per lane (stdout-human vs stderr) so a partial line
+    // on one lane never interleaves mid-line with the other — matching pipe/PTY.
+    // stderr routes through its own sink (`onStreamErr`) so it keeps its warn/
+    // error severity instead of being flattened onto the stdout sink; it falls
+    // back to the stdout sink (then process.stdout) when no error sink is wired.
+    const STREAM_TEE_LINE_CAP = 64 * 1024;
+    const defaultTeeOut = (line) => process.stdout.write(`${line}\n`);
+    const outSink = stream ? (onStreamOut || defaultTeeOut) : null;
+    const errSink = stream ? (onStreamErr || onStreamOut || defaultTeeOut) : null;
+    const teeSink = outSink; // truthy iff --stream is on (shared streaming guard)
+    const makeTee = (sink) => {
+      let partial = '';
+      return (text, final) => {
+        if (!sink) return;
+        partial += text;
+        let nl;
+        while ((nl = partial.indexOf('\n')) !== -1) {
+          sink(`${streamPrefix}${partial.slice(0, nl)}`);
+          partial = partial.slice(nl + 1);
+        }
+        while (partial.length >= STREAM_TEE_LINE_CAP) {
+          sink(`${streamPrefix}${partial.slice(0, STREAM_TEE_LINE_CAP)}`);
+          partial = partial.slice(STREAM_TEE_LINE_CAP);
+        }
+        if (final && partial) { sink(`${streamPrefix}${partial}`); partial = ''; }
+      };
+    };
+    const tee = makeTee(outSink);
+    const teeErr = makeTee(errSink);
+
+    const humanStdout = () => joinCapped(humanChunks);
+
+    // Emit a human-meaningful text chunk on the SAME lanes the pipe/pty paths
+    // use: the relay tap (framed + jobKey-tagged by the caller) and the local
+    // --stream spy tee. Byte-capped like the raw captures.
+    const emitHuman = (text) => {
+      if (!text) return;
+      const buf = Buffer.from(text, 'utf8');
+      if (teeSink) tee(text, false);
+      if (relayTap && typeof relayTap.onData === 'function') {
+        try { relayTap.onData(text); } catch { /* relay best-effort */ }
+      }
+      const remaining = MAX_CAPTURE_BYTES - humanBytes;
+      if (remaining <= 0) { humanTruncated = true; return; }
+      if (buf.length > remaining) { humanChunks.push(buf.subarray(0, remaining)); humanBytes = MAX_CAPTURE_BYTES; humanTruncated = true; }
+      else { humanChunks.push(buf); humanBytes += buf.length; }
+    };
+
+    const finish = (result) => {
+      if (settled) return;
+      settled = true;
+      if (timer) clearTimeout(timer);
+      if (idleTimer) clearTimeout(idleTimer);
+      if (settleTimer) { clearTimeout(settleTimer); settleTimer = null; }
+      if (detachSteer) { try { detachSteer(); } catch { /* best effort */ } detachSteer = null; }
+      if (teeSink) { tee('', true); teeErr('', true); }
+      // Reap the child if it is still alive (turn resolved but agent lingering).
+      try { if (child && childClosed === null) killTree(child); } catch { /* best effort */ }
+      resolve(result);
+    };
+
+    // --- JSON-RPC 2.0 plumbing (newline-delimited framing) -------------------
+    const send = (obj) => {
+      try { child.stdin.write(`${JSON.stringify(obj)}\n`); } catch { /* child gone; close handler settles */ }
+    };
+    const request = (method, params) => new Promise((res, rej) => {
+      const id = nextId++;
+      pending.set(id, { res, rej });
+      send({ jsonrpc: '2.0', id, method, params });
+    });
+    const notify = (method, params) => send({ jsonrpc: '2.0', method, params });
+    const respond = (id, result) => send({ jsonrpc: '2.0', id, result });
+    const respondError = (id, code, message) => send({ jsonrpc: '2.0', id, error: { code, message } });
+
+    // Pick the "allow-always" option (yolo / safe-interim structural path). ACP
+    // permission options carry a `kind` (allow_always|allow_once|reject_*). We
+    // prefer allow_always, then allow_once, then the first option; this is the
+    // conservative structural default the interim policy also uses.
+    const pickAllowOption = (options) => {
+      const list = Array.isArray(options) ? options : [];
+      return list.find((o) => o && o.kind === 'allow_always')
+        || list.find((o) => o && o.kind === 'allow_once')
+        || list[0]
+        || null;
+    };
+
+    const handlePermission = (id, params) => {
+      const options = params?.options;
+      const allow = pickAllowOption(options);
+      const grant = () => {
+        if (allow && allow.optionId != null) {
+          respond(id, { outcome: { outcome: 'selected', optionId: allow.optionId } });
+        } else {
+          // No option to select (malformed request) — cancel rather than hang.
+          respond(id, { outcome: { outcome: 'cancelled' } });
+        }
+      };
+      switch (permission) {
+        case 'yolo':
+          // The ONLY fully-enforced policy: auto-allow-always, no human, sub-ms
+          // local round-trip.
+          grant();
+          break;
+        // TODO(#559): implement escalate/filter — the real permission-event +
+        // escalation bridge (block-until-answered for escalate; auto-allow
+        // reads/edits + escalate destructive ops for filter) lands with the
+        // companion nano-workforce#559 task. Until then these reserved policies
+        // must NOT masquerade as enforced: warn once, then fall through to the
+        // safe interim structural policy (same allow-always grant as yolo).
+        case 'escalate':
+        case 'filter':
+        default:
+          if (!interimWarned) {
+            interimWarned = true;
+            logger.warn?.(`ACP permission policy '${permission}' is not yet enforced in this build; requests handled by interim policy pending nano-workforce#559`);
+          }
+          grant();
+          break;
+      }
+    };
+
+    // Serialise an ACP session/update into a short human-readable line. Minimal
+    // mode: this is TEXT for the existing cockpit lane, not a typed envelope.
+    const describeUpdate = (update) => {
+      if (!update || typeof update !== 'object') return '';
+      const kind = update.sessionUpdate || update.type || 'update';
+      const textOf = (content) => {
+        if (content == null) return '';
+        if (typeof content === 'string') return content;
+        if (Array.isArray(content)) return content.map(textOf).join('');
+        if (typeof content === 'object') return typeof content.text === 'string' ? content.text : '';
+        return '';
+      };
+      switch (kind) {
+        case 'agent_message_chunk':
+          return textOf(update.content);
+        case 'agent_thought_chunk':
+          return `\u{1F4AD} ${textOf(update.content)}`;
+        case 'user_message_chunk':
+          return textOf(update.content);
+        case 'tool_call': {
+          const title = update.title || update.toolCallId || 'tool';
+          return `\u2699 [tool: ${title}${update.status ? ` — ${update.status}` : ''}]\n`;
+        }
+        case 'tool_call_update': {
+          const title = update.title || update.toolCallId || 'tool';
+          return `\u2699 [tool: ${title}${update.status ? ` — ${update.status}` : ''}]\n`;
+        }
+        case 'plan':
+          return `\u{1F4CB} [plan updated]\n`;
+        default:
+          return `[${kind}]\n`;
+      }
+    };
+
+    const handleMessage = (msg) => {
+      if (!msg || typeof msg !== 'object') return;
+      // A response to one of OUR requests.
+      if (msg.id !== undefined && msg.method === undefined && (msg.result !== undefined || msg.error !== undefined)) {
+        const p = pending.get(msg.id);
+        if (p) {
+          pending.delete(msg.id);
+          if (msg.error) p.rej(new Error(msg.error.message || `rpc error ${msg.error.code}`));
+          else p.res(msg.result);
+        }
+        return;
+      }
+      // A request or notification FROM the agent.
+      if (typeof msg.method === 'string') {
+        if (msg.method === 'session/update') { emitHuman(describeUpdate(msg.params?.update)); return; }
+        if (msg.method === 'session/request_permission') {
+          if (msg.id !== undefined) handlePermission(msg.id, msg.params);
+          return;
+        }
+        // Unknown request → method-not-found; unknown notification → ignore.
+        if (msg.id !== undefined) respondError(msg.id, -32601, `method not found: ${msg.method}`);
+      }
+    };
+
+    // --- spawn ---------------------------------------------------------------
+    try {
+      child = spawn(command, args, { cwd, stdio: ['pipe', 'pipe', 'pipe'], env, detached: process.platform !== 'win32', shell });
+    } catch (err) {
+      finish({ ok: false, exitCode: null, stdout: '', stderr: '', error: err.message, truncated: false, stderrTruncated: false });
+      return;
+    }
+
+    timer = timeoutMs && timeoutMs > 0
+      ? setTimeout(() => {
+          try { killTree(child); } catch { /* best effort */ }
+          finish({ ok: false, exitCode: null, stdout: humanStdout(), stderr: joinCapped(stderrChunks), error: `timed out after ${timeoutMs}ms`, timedOut: true, truncated: humanTruncated, stderrTruncated });
+        }, timeoutMs)
+      : null;
+
+    const armIdle = () => {
+      if (settled) return;
+      if (!(idleTimeoutMs && idleTimeoutMs > 0)) return;
+      if (idleTimer) clearTimeout(idleTimer);
+      idleTimer = setTimeout(() => {
+        try { killTree(child); } catch { /* best effort */ }
+        finish({ ok: false, exitCode: null, stdout: humanStdout(), stderr: joinCapped(stderrChunks), error: `no output for ${idleTimeoutMs}ms (idle)`, timedOut: true, idle: true, truncated: humanTruncated, stderrTruncated });
+      }, idleTimeoutMs);
+    };
+    armIdle();
+
+    // Newline-delimited JSON-RPC parser over stdout. Progress on stdout re-arms
+    // the idle liveness timer (every frame counts as progress). A StringDecoder
+    // buffers any multibyte UTF-8 sequence split across chunk boundaries so the
+    // assembled JSON text is never corrupted (a partial code point is held back
+    // until the continuation byte arrives, rather than emitting U+FFFD).
+    let rxBuf = '';
+    const rxDecoder = new StringDecoder('utf8');
+    child.stdout.on('data', (d) => {
+      armIdle();
+      rxBuf += rxDecoder.write(Buffer.isBuffer(d) ? d : Buffer.from(d));
+      let nl;
+      while ((nl = rxBuf.indexOf('\n')) !== -1) {
+        const line = rxBuf.slice(0, nl).trim();
+        rxBuf = rxBuf.slice(nl + 1);
+        if (!line) continue;
+        let msg;
+        try {
+          msg = JSON.parse(line);
+        } catch {
+          // stdout is a pure newline-delimited JSON-RPC stream; a line that
+          // isn't JSON is a framing/protocol violation, not noise. Silently
+          // skipping it would mask a misconfigured agent as an opaque idle
+          // timeout (and keep re-arming the idle timer on garbage). Fail fast
+          // with an explicit error, mirroring the un-terminated-frame cap below.
+          const preview = line.length > 200 ? `${line.slice(0, 200)}…` : line;
+          rxBuf = '';
+          try { killTree(child); } catch { /* best effort */ }
+          finish({ ok: false, exitCode: null, stdout: humanStdout(), stderr: joinCapped(stderrChunks), error: `ACP framing violation: non-JSON line on stdout: ${preview}`, truncated: humanTruncated, stderrTruncated });
+          return;
+        }
+        try { handleMessage(msg); } catch { /* one bad frame must not wedge the loop */ }
+      }
+      // No newline in the (now line-free) tail past the cap → the peer is
+      // streaming an unbounded frame. Fail rather than buffer to exhaustion.
+      if (Buffer.byteLength(rxBuf, 'utf8') > ACP_MAX_LINE_BYTES) {
+        rxBuf = '';
+        try { killTree(child); } catch { /* best effort */ }
+        finish({ ok: false, exitCode: null, stdout: humanStdout(), stderr: joinCapped(stderrChunks), error: `ACP framing violation: un-terminated JSON-RPC frame exceeded ${ACP_MAX_LINE_BYTES} bytes`, truncated: humanTruncated, stderrTruncated });
+      }
+    });
+
+    child.stderr.on('data', (d) => {
+      armIdle();
+      const buf = Buffer.isBuffer(d) ? d : Buffer.from(d);
+      // Forward stderr to the SAME live lanes the pipe/PTY paths use — the
+      // --stream spy tee and the relay tap — so agent diagnostics are visible
+      // during execution rather than only after it finishes. This is safe
+      // precisely because stdout is the pure JSON-RPC channel here: stderr never
+      // carries protocol frames, so teeing/relaying it can't corrupt the
+      // relayed human stream.
+      const text = buf.toString('utf8');
+      if (teeSink) teeErr(text, false);
+      if (relayTap && typeof relayTap.onData === 'function') {
+        try { relayTap.onData(text); } catch { /* relay best-effort */ }
+      }
+      const remaining = MAX_CAPTURE_BYTES - stderrBytes;
+      if (remaining <= 0) { stderrTruncated = true; return; }
+      if (buf.length > remaining) { stderrChunks.push(buf.subarray(0, remaining)); stderrBytes = MAX_CAPTURE_BYTES; stderrTruncated = true; }
+      else { stderrChunks.push(buf); stderrBytes += buf.length; }
+    });
+
+    child.stdin.on('error', () => { /* peer may close first; close handler settles */ });
+
+    child.on('error', (err) => {
+      finish({ ok: false, exitCode: null, stdout: humanStdout(), stderr: joinCapped(stderrChunks), error: err.message, truncated: humanTruncated, stderrTruncated });
+    });
+    child.on('close', (code, signal) => {
+      childClosed = { code, signal: signal ?? null };
+      if (settleTimer) { clearTimeout(settleTimer); settleTimer = null; }
+      // Flush the UTF-8 decoder's held-back bytes (an incomplete multibyte
+      // sequence at EOF) and drain any now-complete newline-delimited frames,
+      // so a final frame that arrives in the same read as EOF isn't dropped.
+      // Whatever remains after that is an un-terminated tail on what is supposed
+      // to be a pure newline-delimited JSON-RPC stream — a framing violation we
+      // must NOT let masquerade as success.
+      let unterminatedTail = '';
+      let framingViolation = '';
+      try {
+        rxBuf += rxDecoder.end();
+        let nl;
+        while ((nl = rxBuf.indexOf('\n')) !== -1) {
+          const line = rxBuf.slice(0, nl).trim();
+          rxBuf = rxBuf.slice(nl + 1);
+          if (!line) continue;
+          let msg;
+          try {
+            msg = JSON.parse(line);
+          } catch {
+            // A final newline-delimited frame that isn't JSON is a framing/
+            // protocol violation on what must be a pure JSON-RPC stream — the
+            // same rule the `data` handler enforces. Silently swallowing it here
+            // would let a malformed shutdown masquerade as a clean success, so
+            // record it and fail below instead of ignoring the parse error.
+            framingViolation = line;
+            break;
+          }
+          try { handleMessage(msg); } catch { /* one bad frame must not wedge shutdown */ }
+        }
+        if (!framingViolation) unterminatedTail = rxBuf.trim();
+      } catch { /* decoder flush best effort */ }
+      rxBuf = '';
+      // Settle on the child's ACTUAL exit — this is what avoids racing the
+      // caller's $AGENT_RESULT_FILE read: the file's write/flush is guaranteed
+      // complete once the process is gone. Success requires BOTH the main
+      // session/prompt turn to have resolved AND a clean exit AND no leftover
+      // un-terminated frame — an early exit (e.g. code 0 during the handshake,
+      // before the turn completes), any non-zero exit, or a dangling tail is a
+      // failure, never a false success.
+      const ok = promptResolved && code === 0 && !unterminatedTail && !framingViolation;
+      // On failure, populate an explicit `error` so callers/logs explain WHY —
+      // otherwise an early exit (code 0 before the turn resolved) surfaces as a
+      // confusing bare "exit code 0" with no detail.
+      let error;
+      if (!ok) {
+        if (framingViolation && promptResolved && code === 0) {
+          const preview = framingViolation.length > 200 ? `${framingViolation.slice(0, 200)}…` : framingViolation;
+          error = `ACP framing violation: non-JSON line on stdout at exit: ${preview}`;
+        } else if (unterminatedTail && promptResolved && code === 0) {
+          const preview = unterminatedTail.length > 200 ? `${unterminatedTail.slice(0, 200)}…` : unterminatedTail;
+          error = `ACP framing violation: un-terminated JSON-RPC frame on stdout at exit: ${preview}`;
+        } else {
+          const how = signal ? `signal ${signal}` : `code ${code}`;
+          error = promptResolved
+            ? `ACP agent exited with ${how} (session/prompt completed)`
+            : `ACP agent exited with ${how} before the session/prompt turn completed`;
+        }
+      }
+      finish({ ok, exitCode: code, signal: signal ?? null, stdout: humanStdout(), stderr: joinCapped(stderrChunks), ...(error ? { error } : {}), truncated: humanTruncated, stderrTruncated });
+    });
+
+    // Steer + cancel via the relay tap — NO PTY. Wired once the session exists.
+    const attachSteerIfAny = () => {
+      if (!relayTap || typeof relayTap.attachSteer !== 'function') return;
+      detachSteer = relayTap.attachSteer((data) => {
+        const text = typeof data === 'string' ? data : Buffer.from(data).toString('utf8');
+        if (text.includes(ACP_INTERRUPT_BYTE)) {
+          // Ctrl-C / ETX → interrupt the live turn.
+          if (sessionId != null) notify('session/cancel', { sessionId });
+          return;
+        }
+        const steer = text.replace(/[\r\n]+$/, '');
+        if (!steer) return;
+        // Mid-turn steer → a fresh prompt on the live session (fire-and-forget;
+        // its own resolution is not part of the main turn sequence).
+        if (sessionId != null) {
+          request('session/prompt', { sessionId, prompt: [{ type: 'text', text: steer }] }).catch(() => {});
+        }
+      });
+    };
+
+    // --- drive the handshake + turn -----------------------------------------
+    (async () => {
+      await request('initialize', {
+        protocolVersion: 1,
+        clientCapabilities: { fs: { readTextFile: false, writeTextFile: false } },
+      });
+      const created = await request('session/new', { cwd: cwd || process.cwd(), mcpServers: [] });
+      sessionId = created?.sessionId ?? null;
+      attachSteerIfAny();
+      // Deliver the task envelope as the prompt (from stdinData, matching the
+      // pipe/pty paths which write the same payload to stdin).
+      await request('session/prompt', {
+        sessionId,
+        prompt: [{ type: 'text', text: String(stdinData ?? '') }],
+      });
+      // End-of-turn: the main session/prompt request resolved. Mark it so the
+      // `close` handler can tell a completed turn from an early/handshake exit.
+      promptResolved = true;
+      // The agent has written $AGENT_RESULT_FILE; close stdin so it can flush and
+      // exit, then let the child's `close` event settle the promise. Settling on
+      // the real exit (not here) avoids racing the caller's result-file read and
+      // surfaces a late non-zero exit as a failure instead of a false success. A
+      // well-behaved agent exits promptly once stdin closes; force-reap a
+      // lingering one after a short grace so a finished turn is never held hostage
+      // to the full timeout.
+      try { child.stdin.end(); } catch { /* already gone */ }
+      if (childClosed === null) {
+        settleTimer = setTimeout(() => {
+          settleTimer = null;
+          try { if (child && childClosed === null) killTree(child); } catch { /* best effort */ }
+          // The turn completed and the result file is already written, so this
+          // is still a success — but the child did NOT exit on its own; we just
+          // force-reaped it. Report that honestly instead of a fabricated clean
+          // exit (code 0 / signal null): killTree sends SIGKILL, so surface the
+          // real signal (or the child's actual exit if it slipped in) plus a
+          // `forcedReap` flag so audits can spot agents that consistently hang
+          // on shutdown rather than seeing a misleading exitCode: 0.
+          finish({
+            ok: true,
+            exitCode: childClosed ? childClosed.code : null,
+            signal: childClosed ? childClosed.signal : 'SIGKILL',
+            forcedReap: childClosed === null,
+            stdout: humanStdout(),
+            stderr: joinCapped(stderrChunks),
+            truncated: humanTruncated,
+            stderrTruncated,
+          });
+        }, acpPostTurnGraceMs());
+        if (typeof settleTimer.unref === 'function') settleTimer.unref();
+      }
+    })().catch((err) => {
+      finish({ ok: false, exitCode: null, stdout: humanStdout(), stderr: joinCapped(stderrChunks), error: `acp: ${err?.message || err}`, truncated: humanTruncated, stderrTruncated });
+    });
+  });
+}
+
 function buildAgentPayload(profile, job, envelope) {
   const variables = job.variables && typeof job.variables === 'object' ? job.variables : {};
   return {
@@ -4039,11 +4570,8 @@ function startLockExtender(job, windowMs, intervalMs, tag, logger) {
  */
 function runAgentJob(profile, job, opts = {}) {
   const { timeoutMs, idleTimeoutMs, envelope, sandbox = 'none', image, runId, secretEnv = {}, passThroughSecretNames = [], cwd, extraEnv = {}, profileEnv = {}, resultFile, stream = false, streamPrefix = '', onStreamOut, onStreamErr, args: commandArgs, terminal = 'pipe', protocol = 'pipe', permission = 'yolo', relaySession = null, ptyFactory } = opts;
-  // #110: `protocol`/`permission` are accepted here so the seam exists for the
-  // downstream ACP executor. This task does NOT dispatch on them — the pipe/PTY
-  // paths below are unchanged, so `protocol === 'pipe'` behavior is identical.
-  // TODO(#110): the acp dispatch branch (spawnCaptureAcp) lands in a later task.
-  void protocol; void permission;
+  // #110: `protocol`/`permission` drive the ACP executor branch below. The
+  // pipe/PTY paths are unchanged, so `protocol === 'pipe'` behaviour is identical.
   const payload = JSON.stringify(buildAgentPayload(profile, job, envelope));
   const agentEnv = baseAgentEnv(profile, job);
   // The harness command line: the profile command plus its structured switches
@@ -4077,6 +4605,35 @@ function runAgentJob(profile, job, opts = {}) {
     }
     const resultEnv = resultFile ? { [AGENT_RESULT_FILE_ENV]: resultFile } : {};
     const harnessEnv = { ...process.env, ...staticEnv, ...secretEnv, ...agentEnv, ...extraEnv, ...resultEnv };
+
+    // A role opted into ACP (`protocol: acp`) drives its harness over the Agent
+    // Client Protocol (JSON-RPC 2.0 over stdio) instead of the stdin/scrape pipe
+    // or a PTY. Checked BEFORE the PTY branch: ACP owns the process when selected
+    // and needs no node-pty at all (steer/cancel ride JSON-RPC, not terminal
+    // writes). The ACP switch is appended to the assembled command line only when
+    // it isn't already present. `permission` selects the request_permission
+    // policy (yolo enforced; escalate/filter warned interim, pending #559).
+    if (protocol === 'acp') {
+      return spawnCaptureAcp({
+        // Route the assembled line through the platform shell (cmd.exe on
+        // Windows, /bin/sh elsewhere) exactly like the pipe path, rather than
+        // hard-coding `sh -c` which does not exist on Windows hosts. The
+        // Windows `--arg` restriction is already enforced by the guard above.
+        command: ensureAcpFlag(commandLine),
+        shell: true,
+        cwd,
+        env: harnessEnv,
+        stdinData: payload,
+        timeoutMs,
+        idleTimeoutMs,
+        relayTap,
+        stream,
+        streamPrefix,
+        onStreamOut,
+        onStreamErr,
+        permission,
+      });
+    }
 
     // A role opted into a full PTY (`terminal: pty`) runs the harness on a real
     // terminal when one can be allocated — so its live output streams as a true
@@ -4123,6 +4680,10 @@ function runAgentJob(profile, job, opts = {}) {
 
   const engine = sandbox;
   const containerName = `nano-${runId}`;
+  // #110: ACP-in-container is deferred for this slice — a container sandbox runs
+  // the harness over the pipe path below regardless of `protocol`, so container
+  // pipe mode is never regressed. Host ACP (above) is the minimal-mode surface.
+  void protocol;
   // Container: bind-mount the result file's directory read-write at a fixed
   // in-container path and point AGENT_RESULT_FILE at the mounted file, so the
   // agent writes it inside the sandbox and the harness reads it back on the host.
@@ -4197,6 +4758,10 @@ function buildResultEnvelope(result, { sandbox, image, git, result: agentResult,
     signal: result.signal ?? null,
     error: result.error ?? null,
   };
+  // Audit: a turn that completed but whose child had to be force-reaped on
+  // shutdown (didn't exit on its own within the post-turn grace) — surfaced so
+  // consistently-hanging agents are visible rather than hidden behind a success.
+  if (result.forcedReap) env.forcedReap = true;
   // Audit (issue #63): record which linked-resource key supplied the base prompt.
   // The engine only keeps `latest` per resourceId (no pinning), so recording the
   // resolved key is the only reproducibility handle for which prompt version ran.
@@ -9076,6 +9641,8 @@ export {
   containerEngineAvailable,
   runAgentJob,
   spawnCapturePty,
+  spawnCaptureAcp,
+  ensureAcpFlag,
   startLockExtender,
   provisionRepo,
   finalizeGit,
@@ -9194,7 +9761,7 @@ export const metadata = {
         { command: 'c8ctl nano hire --list', description: 'List hired agent profiles' },
         { command: 'c8ctl nano hire --name coder --rank senior --command "agent-harness" --sandbox docker --image ghcr.io/acme/agent:1', description: 'Create a profile that runs each job in a throwaway Docker container' },
         { command: 'c8ctl nano hire --name coder --rank senior --command copilot --terminal pty', description: 'Opt this role into a full, steerable live terminal (PTY) streamed on the agentic relay lane (default: pipe)' },
-        { command: 'c8ctl nano hire --name coder --rank senior --command copilot --protocol acp --permission yolo', description: 'Accept/persist ACP (JSON-RPC/stdio) for this role — RESERVED, not yet active in this build (acp is inert; the harness still runs on the transport selected by --terminal, pipe or pty); escalate/filter permission modes are likewise reserved/not yet active' },
+        { command: 'c8ctl nano hire --name coder --rank senior --command copilot --protocol acp --permission yolo', description: 'Drive this role over ACP (JSON-RPC/stdio) — ACTIVE on the host executor (sandbox=none); container sandboxes do not yet run ACP (pipe-only today; --terminal pty is host-only). permission yolo is enforced; escalate/filter are reserved (persisted, warned, behave like yolo)' },
         { command: 'c8ctl nano assign reviewer code-review,testing', description: 'Grant more capabilities (comma-separated, like hire) to an existing hire — additive; running workers hot-reload it' },
         { command: 'c8ctl nano work reviewer', description: 'Spawn Nano job workers for the "reviewer" profile and poll for work' },
         { command: 'c8ctl nano work coder --auto', description: 'Zero-config: serve every deployed agent job type read straight from the engine — no capability, no wiring (great for a local single-tenant plane)' },
@@ -9257,7 +9824,7 @@ export const commands = {
       sandbox: { type: 'string', description: 'hire/work: execution sandbox none|docker|podman (default none). Containers isolate each job.' },
       image: { type: 'string', description: 'hire/work: container image the agent runs in (required for --sandbox docker|podman)' },
       terminal: { type: 'string', description: 'hire: live-terminal mode for this role — pty (full terminal, streamed + steerable on the relay lane) or pipe (default). NANO_AGENTIC_TERMINAL overrides at work time.' },
-      protocol: { type: 'string', description: 'hire: harness protocol pipe|acp (default pipe). acp is RESERVED — accepted and persisted for forward-compatibility but not yet implemented in this build (inert: the harness still runs on the transport selected by --terminal, pipe or pty; the ACP JSON-RPC-over-stdio executor lands downstream). NANO_AGENTIC_PROTOCOL overrides at work time.' },
+      protocol: { type: 'string', description: 'hire: harness protocol pipe|acp (default pipe). acp drives the harness over ACP (JSON-RPC 2.0 over stdio) on the host executor (sandbox=none); container sandboxes (docker/podman) do NOT yet run ACP and are pipe-only today (--terminal pty is host-only; container ACP lands downstream). NANO_AGENTIC_PROTOCOL overrides at work time.' },
       permission: { type: 'string', description: 'hire: ACP permission policy (default yolo). yolo auto-allows all permission requests. escalate|filter are RESERVED/not-yet-active in this build (pending nano-workforce#559): they are persisted but not enforced and effectively behave like yolo (auto-allow). NANO_AGENTIC_PERMISSION overrides at work time.' },
       env: { type: 'string', multiple: true, description: 'hire/work: static env var for the harness as NAME=VALUE (repeatable); persisted on hire, work extends/overrides. E.g. permission toggles.' },
       'secret-resolver': { type: 'string', description: 'work: secret resolver for task secretRefs (host = process env; default host)' },
@@ -9476,7 +10043,7 @@ function printUsage() {
   console.log('  --sandbox <s>        hire/work: execution sandbox none|docker|podman (default none)');
   console.log('  --image <ref>        hire/work: container image the agent runs in (required for docker|podman)');
   console.log('  --terminal <m>       hire: live-terminal mode pty|pipe (default pipe); pty streams a steerable terminal on the relay lane');
-  console.log('  --protocol <p>       hire: harness protocol pipe|acp (default pipe); acp is RESERVED — accepted/persisted but not yet implemented in this build (inert: the harness still runs on the transport selected by --terminal, pipe or pty). NANO_AGENTIC_PROTOCOL overrides at work time');
+  console.log('  --protocol <p>       hire: harness protocol pipe|acp (default pipe); acp drives the harness over ACP (JSON-RPC/stdio) on the host executor (sandbox=none) — container sandboxes do not yet run ACP (pipe-only today; --terminal pty is host-only). NANO_AGENTIC_PROTOCOL overrides at work time');
   console.log('  --permission <p>     hire: ACP permission policy yolo|escalate|filter (default yolo); yolo auto-allows all requests. escalate|filter are RESERVED/not-yet-active (pending nano-workforce#559) — persisted but not enforced, effectively behave like yolo (auto-allow). NANO_AGENTIC_PERMISSION overrides at work time');
   console.log('  --env NAME=VALUE     hire/work: static env var for the harness (repeatable); persisted on hire, work extends/overrides');
   console.log('  --list               hire: list existing agent profiles instead of creating one');

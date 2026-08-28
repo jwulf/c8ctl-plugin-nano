@@ -258,6 +258,16 @@ test('ensureAcpFlag appends --acp only when ACP is not already selected', () => 
   assert.equal(ensureAcpFlag('ACP=true copilot'), 'ACP=true copilot --acp');
   assert.equal(ensureAcpFlag('copilot acp=true'), 'copilot acp=true --acp');
   assert.equal(ensureAcpFlag("copilot 'acp=true'"), "copilot 'acp=true' --acp");
+  // A `*-acp` ADAPTER command preceded by a leading env-assignment prefix is
+  // still the command token (not an argument), so ACP is already selected — do
+  // NOT append. Env assignments only prefix the command; the adapter check must
+  // land on the first non-assignment token, not blindly on token 0.
+  assert.equal(ensureAcpFlag('ACP=true claude-code-acp'), 'ACP=true claude-code-acp');
+  assert.equal(ensureAcpFlag('FOO=1 BAR=2 claude-agent-acp'), 'FOO=1 BAR=2 claude-agent-acp');
+  assert.equal(ensureAcpFlag('DEBUG=1 pi-acp'), 'DEBUG=1 pi-acp');
+  // But an env-prefixed NON-adapter command still needs the flag appended, and a
+  // later `-acp`-suffixed argument does not count as the command token.
+  assert.equal(ensureAcpFlag('ACP=true copilot --model foo-acp'), 'ACP=true copilot --model foo-acp --acp');
 });
 
 test('spawnCaptureAcp completes the ACP handshake and merges the result file', async () => {

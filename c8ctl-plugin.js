@@ -3981,18 +3981,33 @@ function ensureAcpFlag(commandLine) {
   //   - a native ACP selector `acp`/`-acp`/`--acp` (subcommand or switch) as a
   //     WHOLE token, in ANY position (it may be the command or an argument), or
   //   - an adapter command whose basename ends in `-acp` (claude-agent-acp,
-  //     pi-acp) — but ONLY the command token (first token), since an *argument*
+  //     pi-acp) — but ONLY the command token (the first token past any leading
+  //     env-assignment prefix, see commandIndex below), since an *argument*
   //     that merely ends in `-acp` (e.g. `--model foo-acp`) is not an ACP
   //     selector. Matching whole tokens/basenames (not a substring) also avoids
   //     the false positive of a path that merely contains `/acp/`.
   const tokens = commandLine.match(/'(?:[^']|'\\'')*'|"(?:[^"\\]|\\.)*"|\S+/g) || [];
-  for (let i = 0; i < tokens.length; i++) {
-    let tok = tokens[i];
+  const unquote = (tok) => {
     if (tok.length >= 2 && tok.startsWith("'") && tok.endsWith("'")) {
-      tok = tok.slice(1, -1).replace(/'\\''/g, "'");
+      return tok.slice(1, -1).replace(/'\\''/g, "'");
     } else if (tok.length >= 2 && tok.startsWith('"') && tok.endsWith('"')) {
-      tok = tok.slice(1, -1).replace(/\\(["\\$`])/g, '$1');
+      return tok.slice(1, -1).replace(/\\(["\\$`])/g, '$1');
     }
+    return tok;
+  };
+  // The `*-acp` adapter suffix identifies the COMMAND token, but the command is
+  // not always token 0: a shell command line may be prefixed with a contiguous
+  // run of env assignments (`NAME=value`, e.g. the `ACP=true` in
+  // `ACP=true claude-code-acp`). Skip that leading assignment prefix so the
+  // adapter check lands on the real command token. Only a *leading* run counts —
+  // once a real command token appears, later `FOO=bar` tokens are arguments.
+  let commandIndex = 0;
+  while (commandIndex < tokens.length &&
+         /^[A-Za-z_][A-Za-z0-9_]*=/.test(unquote(tokens[commandIndex]))) {
+    commandIndex++;
+  }
+  for (let i = 0; i < tokens.length; i++) {
+    let tok = unquote(tokens[i]);
     // Normalise a GNU-style `--opt=value` selector to its option-NAME part, so
     // `--acp=true` / `--experimental-acp=true` are detected as ACP selectors and
     // never doubled. Only the option NAME selects ACP — a `--model=foo-acp`
@@ -4012,7 +4027,7 @@ function ensureAcpFlag(commandLine) {
     // merely ends in `-acp` (e.g. `--model foo-acp`) does NOT start with `-`, so
     // it is not a switch and still (correctly) triggers the append below.
     if (/^--?[a-z0-9][a-z0-9-]*-acp$/i.test(name)) return commandLine;
-    if (i === 0 && /-acp$/i.test(base)) return commandLine;
+    if (i === commandIndex && /-acp$/i.test(base)) return commandLine;
   }
   return `${commandLine} --acp`;
 }

@@ -8111,11 +8111,16 @@ const WORKFORCE_ROLE_RE = /^[a-z0-9][a-z0-9._+-]*$/i;
  * lowercased list of role names. Returns `{ roles, errors }`. Pure.
  */
 function parseRolesList(raw) {
-  const list = Array.isArray(raw) ? raw : String(raw ?? '').split(',');
+  const fromArray = Array.isArray(raw);
+  const list = fromArray ? raw : String(raw ?? '').split(',');
   const seen = new Set();
   const roles = [];
   const errors = [];
   for (const item of list) {
+    if (fromArray && typeof item !== 'string') {
+      errors.push(`invalid role ${JSON.stringify(item)} (expected a role-name string)`);
+      continue;
+    }
     const r = String(item).trim().toLowerCase();
     if (!r) continue;
     if (!WORKFORCE_ROLE_RE.test(r)) { errors.push(`invalid role "${item}" (use letters, digits, and . _ + -)`); continue; }

@@ -77,6 +77,13 @@ test('parseRolesList dedupes, lowercases, and rejects invalid tokens', () => {
   assert.equal(bad.errors.length, 1);
 });
 
+test('parseRolesList rejects non-string array items instead of coercing them', () => {
+  const res = parseRolesList(['pr-review', true, { x: 1 }, 42, null]);
+  assert.deepEqual(res.roles, ['pr-review']);
+  assert.equal(res.errors.length, 4);
+  for (const e of res.errors) assert.match(e, /expected a role-name string/);
+});
+
 // --- entry → work args -----------------------------------------------------
 
 test('manifestEntryToWorkArgs: auto → --auto [--auto-scope]', () => {

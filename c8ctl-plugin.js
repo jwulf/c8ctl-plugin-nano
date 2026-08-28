@@ -10833,7 +10833,7 @@ export const metadata = {
         { command: 'c8ctl nano supervisor restart reviewer', description: 'Restart a supervised worker by id or profile' },
         { command: 'c8ctl nano supervisor stop', description: 'Stop the supervisor daemon and all its workers' },
         { command: 'c8ctl nano workforce add copilot --instances 5 --auto', description: 'Compose a reusable fleet: 5 copilot workers serving every deployed agent job type (--auto)' },
-        { command: 'c8ctl nano workforce add qwen --instances 2 --roles pr-review,feature', description: 'Add an entry mapped to explicit job types (senior:pr-review, senior:feature) at start — does not mutate the hired profile' },
+        { command: 'c8ctl nano workforce add qwen --instances 2 --roles pr-review,feature', description: "Add an entry mapped to explicit job types (<rank>:pr-review, <rank>:feature, where <rank> is the qwen hire's rank at start) — does not mutate the hired profile" },
         { command: 'c8ctl nano workforce start', description: "Ensure the daemon is up, then reconcile running workers to the 'default' manifest (idempotent — a second run changes nothing)" },
         { command: 'c8ctl nano workforce start --profile review-only', description: 'Bring up a named manifest (<stateHome>/workforce/review-only.json)' },
         { command: 'c8ctl nano workforce status --json', description: 'Manifest entries joined against live supervisor status (desired vs actual), machine-readable for the install script / CI' },

@@ -8795,6 +8795,17 @@ async function workforceStartCmd(req, flags, manifestName) {
     }
   }
 
+  // If every manifest entry was skipped (missing/invalid profiles), `desired` is
+  // empty and there is nothing to reconcile. Starting the supervisor daemon here
+  // would spin up (and leave behind) an empty daemon purely as a side effect of
+  // an all-error run. Report the failure, render current status without starting
+  // anything, and exit non-zero.
+  if (desired.length === 0) {
+    logger.error(`Workforce "${manifestName}": every entry was skipped (${skippedProfiles.join(', ')}) — nothing to start. Not starting a supervisor daemon.`);
+    await workforceStatusCmd(req, { ...flags, json: false }, manifestName);
+    process.exit(1);
+  }
+
   const state = await startSupervisorDaemon();
   logger.info(`Supervisor daemon running (pid ${state.pid}).`);
   const { reachable, workers: live } = await fetchSupervisorWorkers();

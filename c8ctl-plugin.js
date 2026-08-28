@@ -8295,6 +8295,13 @@ function normalizeManifestEntry(entry) {
   if (!entry || typeof entry !== 'object' || Array.isArray(entry)) return { error: 'entry is not an object' };
   const profile = String(entry.profile || '').trim();
   if (!profile) return { error: 'entry is missing a profile' };
+  // A manifest is hand-editable, so enforce the same safe charset as a hired
+  // profile name here: the profile rides into the deterministic
+  // `wf-<manifest>-<profile>-<index>` worker id, and a torn value like "bad
+  // name" would otherwise pass and fail later in a less obvious place.
+  if (!isValidProfileName(profile)) {
+    return { error: `entry "${profile}": invalid profile name (use letters, digits, dot, dash or underscore)` };
+  }
   const { count, error } = parseInstancesCount(entry.instances, 'workforce add');
   if (error) return { error: `entry "${profile}": ${error}` };
   let roles;

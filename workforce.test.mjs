@@ -275,6 +275,15 @@ test('normalizeManifestEntry: missing profile rejected', () => {
   assert.ok(normalizeManifestEntry({ instances: 1 }).error);
 });
 
+test('normalizeManifestEntry: invalid profile charset rejected', () => {
+  const bad = normalizeManifestEntry({ profile: 'bad name', instances: 1 });
+  assert.ok(bad.error, 'a profile with a space must be rejected');
+  assert.match(bad.error, /invalid profile name/);
+  assert.ok(normalizeManifestEntry({ profile: 'has/slash', instances: 1 }).error);
+  // A valid safe-charset profile still passes.
+  assert.equal(normalizeManifestEntry({ profile: 'copilot.v2_1-a', instances: 1 }).error, undefined);
+});
+
 test('normalizeManifestEntry: bad roles shape rejected', () => {
   assert.ok(normalizeManifestEntry({ profile: 'x', roles: 5 }).error);
   assert.ok(normalizeManifestEntry({ profile: 'x', roles: [] }).error);

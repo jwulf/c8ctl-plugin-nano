@@ -8,7 +8,7 @@
 // stops the now-empty daemon.
 import { test } from 'node:test';
 import assert from 'node:assert/strict';
-import { mkdtempSync, writeFileSync } from 'node:fs';
+import { mkdtempSync, writeFileSync, rmSync } from 'node:fs';
 import { tmpdir } from 'node:os';
 import { join } from 'node:path';
 
@@ -77,6 +77,7 @@ test('workforce start/stop reconciles a real supervisor', async (t) => {
     restoreEnv('C8CTL_NANO_ENTRY', prevEntry);
     restoreEnv('C8CTL_NANO_HOME', prevHome);
     if (prevC8ctl === undefined) delete globalThis.c8ctl; else globalThis.c8ctl = prevC8ctl;
+    try { rmSync(HOME, { recursive: true, force: true }); } catch { /* ignore */ }
   });
 
   // Compose a 2-instance auto manifest.

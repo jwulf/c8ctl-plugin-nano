@@ -8158,6 +8158,30 @@ function workforceWorkerName(manifest, profile, index) {
 }
 
 /**
+ * Is worker `id` owned by `manifest`? A worker name is
+ * `wf-<manifest>-<profile>-<index>`, and BOTH the manifest name and the profile
+ * may contain `-` (see `isValidManifestName`), so a bare `wf-<manifest>-` prefix
+ * test is ambiguous: manifest `a` would otherwise claim `wf-a-b-...` workers that
+ * actually belong to manifest `a-b`, letting `workforce start/stop/status`
+ * stop or report another manifest's workers. We disambiguate by LONGEST-prefix
+ * ownership against the manifest names that exist on this machine
+ * (`manifestNames`): `id` belongs to `manifest` only when no OTHER existing
+ * manifest name is a longer `wf-<name>-` prefix of `id`. When `manifestNames` is
+ * absent/empty this degrades to the plain prefix test (unchanged behaviour), so
+ * a worker whose more-specific owner no longer exists on disk stays claimable as
+ * an orphan under its prefix. Pure.
+ */
+function isWorkforceOwnedWorker(id, manifest, manifestNames) {
+  if (typeof id !== 'string' || !id.startsWith(workforceOwnerPrefix(manifest))) return false;
+  const names = Array.isArray(manifestNames) ? manifestNames : [];
+  for (const other of names) {
+    if (other === manifest) continue;
+    if (other.length > manifest.length && id.startsWith(workforceOwnerPrefix(other))) return false;
+  }
+  return true;
+}
+
+/**
  * Parse the `<profile>` embedded in a deterministic
  * `wf-<manifest>-<profile>-<index>` worker id, given the owning manifest.
  * Returns the profile string, or `null` when `id` does not carry this manifest's
@@ -8222,7 +8246,7 @@ function expandWorkforceDesired(manifest) {
  * (reported under `protected`) so a config problem never tears down part of the
  * live fleet. Pure.
  */
-function reconcileWorkforce({ desired, live, manifest, skippedProfiles }) {
+function reconcileWorkforce({ desired, live, manifest, skippedProfiles, manifestNames }) {
   const prefix = workforceOwnerPrefix(manifest);
   const liveList = Array.isArray(live) ? live : [];
   const liveById = new Map();
@@ -8253,7 +8277,7 @@ function reconcileWorkforce({ desired, live, manifest, skippedProfiles }) {
   const protectedWorkers = [];
   for (const w of liveList) {
     if (!w || typeof w.id !== 'string') continue;
-    if (!w.id.startsWith(prefix) || desiredNames.has(w.id)) continue;
+    if (!isWorkforceOwnedWorker(w.id, manifest, manifestNames) || desiredNames.has(w.id)) continue;
     if (isProtected(w.id)) { protectedWorkers.push(w.id); continue; }
     toStop.push(w.id);
   }
@@ -8455,8 +8479,7 @@ function formatWorkforceManifest(manifest) {
  * owned by this manifest (the `wf-<name>-` prefix) that no entry desires. Pure
  * over its inputs. `live` is an array of summarized supervisor workers.
  */
-function buildWorkforceStatus(manifest, name, live, supervisorRunning) {
-  const prefix = workforceOwnerPrefix(name);
+function buildWorkforceStatus(manifest, name, live, supervisorRunning, manifestNames) {
   const liveList = Array.isArray(live) ? live : [];
   const liveById = new Map();
   for (const w of liveList) { if (w && typeof w.id === 'string') liveById.set(w.id, w); }
@@ -8492,7 +8515,7 @@ function buildWorkforceStatus(manifest, name, live, supervisorRunning) {
     };
   });
   const extra = liveList
-    .filter((w) => w && typeof w.id === 'string' && w.id.startsWith(prefix) && !desiredNames.has(w.id))
+    .filter((w) => w && typeof w.id === 'string' && isWorkforceOwnedWorker(w.id, name, manifestNames) && !desiredNames.has(w.id))
     .map((w) => ({ name: w.id, profile: w.profile ?? null, state: w.state != null ? String(w.state) : 'running', pid: w.pid ?? null }));
   return {
     name,
@@ -8711,7 +8734,7 @@ async function workforceStartCmd(req, flags, manifestName) {
     logger.error('Supervisor daemon is running but its status socket is unreachable — cannot enumerate live workers to reconcile against. Refusing to reconcile blindly; try again once the socket responds.');
     process.exit(1);
   }
-  const { toStart, toRestart, toStop, unchanged, collisions, protected: protectedWorkers } = reconcileWorkforce({ desired, live, manifest: manifestName, skippedProfiles });
+  const { toStart, toRestart, toStop, unchanged, collisions, protected: protectedWorkers } = reconcileWorkforce({ desired, live, manifest: manifestName, skippedProfiles, manifestNames: listWorkforceManifestNames() });
 
   for (const c of collisions) {
     logger.warn(`Skipping "${c.name}": a worker with that name already runs profile "${c.haveProfile}" (manifest wants "${c.wantProfile}") — not clobbering a hand-added worker.`);
@@ -8754,7 +8777,7 @@ async function workforceStatusCmd(req, flags, manifestName) {
     logger.error('Supervisor is running but its status socket is unreachable — cannot report worker status. Try again once the socket responds.');
     process.exit(1);
   }
-  const report = buildWorkforceStatus(manifest, manifestName, live, running);
+  const report = buildWorkforceStatus(manifest, manifestName, live, running, listWorkforceManifestNames());
   if (json) { logger.output(JSON.stringify(report, null, 2)); return; }
   logger.output(formatWorkforceStatus(report));
 }
@@ -8763,14 +8786,17 @@ async function workforceStopCmd(req, flags, manifestName) {
   const logger = getLogger();
   const running = await liveSupervisor();
   if (!running) { logger.warn('Supervisor is not running — nothing to stop.'); return; }
-  const prefix = workforceOwnerPrefix(manifestName);
+  const manifestNames = listWorkforceManifestNames();
   const { reachable, workers: live } = await fetchSupervisorWorkers();
   if (!reachable) {
     logger.error('Supervisor is running but its status socket is unreachable — cannot enumerate workers. Leaving the daemon and its workers untouched.');
     process.exit(1);
   }
   const owned = live
-    .filter((w) => w && typeof w.id === 'string' && w.id.startsWith(prefix))
+    // Ownership is decided by longest-prefix match against the manifests that
+    // exist on this machine, so manifest `a` never claims manifest `a-b`'s
+    // `wf-a-b-...` workers even though its `wf-a-` prefix technically matches.
+    .filter((w) => w && typeof w.id === 'string' && isWorkforceOwnedWorker(w.id, manifestName, manifestNames))
     // A worker id that carries our prefix but whose LIVE profile disagrees with
     // the profile embedded in its deterministic name is a hand-added worker that
     // merely collides on the name (the same case `workforce start` skips): it is
@@ -10655,6 +10681,7 @@ export {
   workforceOwnerPrefix,
   workforceWorkerName,
   workforceProfileFromWorkerName,
+  isWorkforceOwnedWorker,
   expandWorkforceDesired,
   reconcileWorkforce,
   normalizeManifestEntry,
@@ -10801,7 +10828,7 @@ export const commands = {
       auto: { type: 'boolean', description: 'work: zero-config enrolment — serve ALL deployed agent job types read straight from the engine (no capability, no app enrol endpoint, no channel). Mutually exclusive with capability-resolved serving; has NO capability gate (serves any deployed agent job on the engine).' },
       'auto-scope': { type: 'string', description: 'work: with --auto, narrow the served agent job types to those whose bpmn:process id equals or is prefixed by this value (one app/network). Default: all agent job types on the engine.' },
       worker: { type: 'string', multiple: true, description: 'supervisor start: profile to launch as a supervised worker (repeatable)' },
-      instances: { type: 'string', description: `supervisor add: spawn N distinct auto-named instances of the profile in one call (default 1, max ${MAX_ADD_INSTANCES}; cannot combine with --name)` },
+      instances: { type: 'string', description: `supervisor add / workforce add: spawn/compose N distinct instances of the profile in one call (default 1, max ${MAX_ADD_INSTANCES}; for supervisor add cannot combine with --name)` },
       attach: { type: 'boolean', description: 'supervisor start: attach the interactive console after starting the daemon' },
       profile: { type: 'string', description: `workforce: manifest name to operate on (default ${DEFAULT_WORKFORCE_MANIFEST}); each subcommand reads/writes <stateHome>/workforce/<name>.json` },
       roles: { type: 'string', description: 'workforce add: comma-separated role list for the entry (→ --job-type <rank>:<role> at start); mutually exclusive with --auto' },

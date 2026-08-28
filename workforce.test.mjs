@@ -18,6 +18,7 @@ import {
   workforceOwnerPrefix,
   workforceWorkerName,
   workforceProfileFromWorkerName,
+  isWorkforceOwnedWorker,
   expandWorkforceDesired,
   reconcileWorkforce,
   normalizeManifestEntry,
@@ -343,6 +344,53 @@ test('workforceProfileFromWorkerName parses the embedded profile (incl. dashes)'
   // Foreign prefix / no index counter → null (not one of ours to parse).
   assert.equal(workforceProfileFromWorkerName('default', 'other-worker-1'), null);
   assert.equal(workforceProfileFromWorkerName('default', 'wf-default-noindex'), null);
+});
+
+test('isWorkforceOwnedWorker: plain prefix match when no other manifests exist', () => {
+  assert.equal(isWorkforceOwnedWorker('wf-a-copilot-1', 'a', ['a']), true);
+  assert.equal(isWorkforceOwnedWorker('wf-a-copilot-1', 'a', []), true);
+  assert.equal(isWorkforceOwnedWorker('wf-a-copilot-1', 'a', undefined), true);
+  // A foreign id (no prefix) is never owned.
+  assert.equal(isWorkforceOwnedWorker('sup-a-copilot-1', 'a', ['a']), false);
+  assert.equal(isWorkforceOwnedWorker(42, 'a', ['a']), false);
+});
+
+test('isWorkforceOwnedWorker: longest-prefix disambiguates when a-b also exists', () => {
+  // wf-a-b-p-1 belongs to manifest "a-b", NOT manifest "a", even though the
+  // "wf-a-" prefix technically matches — "a-b" is a longer existing prefix.
+  assert.equal(isWorkforceOwnedWorker('wf-a-b-p-1', 'a', ['a', 'a-b']), false);
+  assert.equal(isWorkforceOwnedWorker('wf-a-b-p-1', 'a-b', ['a', 'a-b']), true);
+  // Manifest "a" still owns its own non-colliding workers.
+  assert.equal(isWorkforceOwnedWorker('wf-a-p-1', 'a', ['a', 'a-b']), true);
+  // If the more-specific manifest is gone from disk, its lingering workers fall
+  // back to the prefix owner as orphans (degrades to plain prefix behaviour).
+  assert.equal(isWorkforceOwnedWorker('wf-a-b-p-1', 'a', ['a']), true);
+});
+
+test('reconcileWorkforce: does not stop another manifest\'s prefix-colliding workers', () => {
+  // Manifest "a" desires one worker; a live "wf-a-b-..." worker belongs to
+  // manifest "a-b" and must NOT be swept into toStop when both manifests exist.
+  const desired = [{ name: 'wf-a-copilot-1', profile: 'copilot', args: [] }];
+  const live = [
+    { id: 'wf-a-copilot-1', profile: 'copilot', state: 'running' },
+    { id: 'wf-a-b-copilot-1', profile: 'copilot', state: 'running' },
+  ];
+  const r = reconcileWorkforce({ desired, live, manifest: 'a', manifestNames: ['a', 'a-b'] });
+  assert.deepEqual(r.toStop, []);
+  assert.equal(r.unchanged.length, 1);
+  // Without the manifest-name set, the old prefix behaviour would claim it.
+  const r2 = reconcileWorkforce({ desired, live, manifest: 'a' });
+  assert.deepEqual(r2.toStop, ['wf-a-b-copilot-1']);
+});
+
+test('buildWorkforceStatus: excludes another manifest\'s prefix-colliding workers from extra', () => {
+  const manifest = { version: 1, name: 'a', workers: [{ profile: 'copilot', instances: 1, roles: 'auto' }] };
+  const live = [
+    { id: 'wf-a-copilot-1', profile: 'copilot', state: 'running' },
+    { id: 'wf-a-b-copilot-1', profile: 'copilot', state: 'running' },
+  ];
+  const report = buildWorkforceStatus(manifest, 'a', live, true, ['a', 'a-b']);
+  assert.deepEqual(report.extra, []);
 });
 
 // --- upsert / remove -------------------------------------------------------

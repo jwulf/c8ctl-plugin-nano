@@ -10,8 +10,7 @@ import { test } from 'node:test';
 import assert from 'node:assert/strict';
 import { mkdtempSync, writeFileSync } from 'node:fs';
 import { tmpdir } from 'node:os';
-import { join, dirname } from 'node:path';
-import { fileURLToPath } from 'node:url';
+import { join } from 'node:path';
 
 const pluginUrl = new URL('./c8ctl-plugin.js', import.meta.url).href;
 function sleep(ms) { return new Promise((r) => setTimeout(r, ms)); }

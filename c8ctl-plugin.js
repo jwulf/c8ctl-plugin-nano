@@ -1629,6 +1629,10 @@ function normalizeArgList(input) {
   const out = [];
   for (const item of list) {
     if (item == null) continue;
+    // A value-less string flag (e.g. a bare `--arg` with no following value) is
+    // coerced to boolean `true` by the flag layer. That is never a real arg, so
+    // drop it rather than persist the misleading literal token "true".
+    if (typeof item === 'boolean') continue;
     const s = String(item);
     if (s.length === 0) continue;
     out.push(s);

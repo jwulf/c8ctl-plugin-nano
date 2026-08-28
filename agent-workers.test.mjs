@@ -1883,7 +1883,7 @@ test('normalizeStoredProfile carries a normalized env map', () => {
 test('normalizeArgList coerces to a clean string[], dropping empties/nullish', () => {
   assert.deepEqual(normalizeArgList('--allow-all'), ['--allow-all'], 'a bare string is one arg');
   assert.deepEqual(normalizeArgList(['--a', '', null, undefined, '--b']), ['--a', '--b']);
-  assert.deepEqual(normalizeArgList([1, true]), ['1', 'true'], 'non-strings are coerced');
+  assert.deepEqual(normalizeArgList([1, true]), ['1'], 'numbers coerce; a value-less flag (boolean true) is dropped, not persisted as "true"');
   assert.deepEqual(normalizeArgList(undefined), []);
   assert.deepEqual(normalizeArgList('--foo=a b'), ['--foo=a b'], 'interior whitespace is preserved');
 });

@@ -37,7 +37,7 @@ function writeShim(shimPath) {
 }
 
 // Poll supervisor status until `n` workers are running (or timeout).
-async function waitForWorkers(mod, n, tries = 40) {
+async function waitForWorkers(mod, n, tries = 200) {
   for (let i = 0; i < tries; i++) {
     try {
       const res = await mod.supervisorRequest({ op: 'status' });
@@ -111,6 +111,8 @@ test('workforce start/stop reconciles a real supervisor', async (t) => {
 
   // Stop → the manifest's workers are removed and the empty daemon is stopped.
   await mod.commands.nano.handler(['workforce', 'stop'], {});
-  for (let i = 0; i < 40 && mod.runningSupervisor(); i++) await sleep(50);
+  // supervisorStopCmd can wait up to STOP_GRACE_MS + 2s for the daemon to exit,
+  // so poll well past that (≈14s) to stay robust under CI load.
+  for (let i = 0; i < 280 && mod.runningSupervisor(); i++) await sleep(50);
   assert.equal(mod.runningSupervisor(), null, 'daemon should be stopped once no workers remain');
 });

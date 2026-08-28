@@ -473,8 +473,13 @@ c8ctl nano hire --name coder --rank senior --command copilot --protocol acp --pe
 # OpenCode — native ACP server (assembles `opencode acp`)
 c8ctl nano hire --name coder --rank senior --command opencode --arg acp --protocol acp --permission yolo
 
-# Claude Code — via the `claude-agent-acp` adapter
-c8ctl nano hire --name coder --rank senior --command claude-agent-acp --protocol acp --permission yolo
+# Qwen — native ACP behind a HIDDEN flag (`qwen --experimental-acp`; present in
+# the shipped cli.js but not in `qwen --help`). Detection recognises the
+# switch, so no second `--acp` is appended.
+c8ctl nano hire --name coder --rank senior --command qwen --arg --experimental-acp --protocol acp --permission yolo
+
+# Claude Code — via the `claude-code-acp` adapter (npm @zed-industries/claude-code-acp)
+c8ctl nano hire --name coder --rank senior --command claude-code-acp --protocol acp --permission yolo
 
 # Pi — via the `pi-acp` adapter
 c8ctl nano hire --name coder --rank senior --command pi-acp --protocol acp --permission yolo
@@ -491,6 +496,23 @@ default floor and every existing harness keeps working unchanged (ACP is enforce
 on the host executor; container sandboxes remain **pipe-only** for now). There is
 **no change to the Camunda-8 worker⇄engine job protocol** — ACP governs only how a
 worker drives its local agent harness, not how it talks to the engine.
+
+**Selecting the model under ACP.** `--model` only exports `AGENT_MODEL` into the
+harness environment; it is **not** injected into the harness argv. And structured
+`--arg` values are POSIX single-quoted by the plugin, so a literal `$AGENT_MODEL`
+in an `--arg` does **not** expand (only the `--command` string is
+shell-interpolated, since the harness is spawned with `shell: true`). The
+deterministic, supported way to pin a model for an ACP hire is therefore to
+**bake it into `--command`**, where the shell does interpolate:
+
+```bash
+# The --command string IS shell-interpolated, so $AGENT_MODEL (or a literal name) works here:
+c8ctl nano hire --name coder --rank senior --command 'copilot --acp --model gpt-5.4' --protocol acp
+```
+
+(Equivalently, set a harness-specific env var with `--env` when the harness reads
+the model from its environment.) This is the seam the nano-workforce install
+script uses to route a detected model to each harness deterministically.
 
 ### Live profile reload (no restart on `assign`)
 
@@ -856,6 +878,121 @@ How it works and where things live:
   exit from the old process is never mis-counted against the new one).
 - Stopping is SIGTERM → grace → SIGKILL, per worker and for the daemon; `stop`
   always clears `supervisor.json` so a stale marker never wedges a future start.
+
+## Composing a workforce: `workforce`
+
+`supervisor` is imperative — you compose a fleet with a `start --worker …` plus a
+pile of `add … --instances N` calls that live only in your shell history. A
+**workforce manifest** makes that fleet a **reusable, inspectable artifact**: a
+named set of supervised workers you compose once and bring up convergently with
+one command.
+
+```bash
+# Compose a fleet (each add creates/updates one entry; no supervisor needed yet)
+c8ctl nano workforce add copilot --instances 5 --auto
+c8ctl nano workforce add claude  --instances 1 --auto
+c8ctl nano workforce add qwen    --instances 2 --roles pr-review,feature
+
+c8ctl nano workforce list                 # print the manifest (+ --json)
+c8ctl nano workforce start                # ensure the daemon is up, then reconcile
+c8ctl nano workforce status               # desired vs actual, per worker (+ --json)
+c8ctl nano workforce stop                 # remove this manifest's workers (+ stop an empty daemon)
+c8ctl nano workforce remove qwen          # drop an entry ("all" clears the manifest)
+```
+
+Every subcommand takes `--profile <name>` (default `default`) to select which
+manifest it operates on, so you can keep several — `--profile review-only`,
+`--profile full-fleet` — side by side.
+
+### The manifest
+
+A manifest is a **separate JSON document per name**, stored at
+`<stateHome>/workforce/<name>.json` (`<stateHome>` is `C8CTL_NANO_HOME` or the
+per-OS app dir). It is deliberately **not** a key in `config.json`: manifests are
+user-curated documents meant to be read, edited by hand, diffed and copied
+between machines; `config.json` is plugin state.
+
+```jsonc
+{
+  "version": 1,
+  "name": "default",
+  "workers": [
+    { "profile": "copilot", "instances": 5, "roles": "auto" },
+    { "profile": "claude",  "instances": 1, "roles": "auto" },
+    { "profile": "qwen",    "instances": 2, "roles": ["pr-review", "feature"] }
+  ]
+}
+```
+
+| Field | Meaning |
+| --- | --- |
+| `profile` | A hired profile name (must exist in `hires`; validated at `add` and again at `start`). |
+| `instances` | How many workers to run for this entry (`1`..`MAX_ADD_INSTANCES`). |
+| `roles` | `"auto"` → run the worker with `--auto`; **or** an array of capability names. |
+| `autoScope` | Optional, only with `roles: "auto"` → forwards `--auto-scope <value>`. |
+| `args` | Optional array of extra `work` flags forwarded verbatim (escape hatch: `--sandbox`, `--stream`, …). |
+
+### `roles` → job types
+
+`roles` is resolved **at start time from the manifest**, independent of what the
+profile was hired with (the install script hires with `--capabilities ""`):
+
+- `"auto"` → `c8ctl nano work <profile> --auto [--auto-scope X]`. No capability
+  gate; serves every deployed agent job type. This is what the install script
+  sets, and the default when you pass neither `--auto` nor `--roles` to `add`.
+- `["pr-review","feature"]` → repeatable `--job-type <rank>:<role>`, e.g. for a
+  `senior` hire: `--job-type senior:pr-review --job-type senior:feature`.
+
+`--job-type` is chosen deliberately over `nano assign`: it uses an existing
+work-time flag (no new override surface on `work`) and **does not mutate the
+profile** — the same profile can appear in two manifests with different role
+sets. `--auto` and `--roles` are mutually exclusive; `--auto-scope` requires
+`--auto`.
+
+### Reconcile semantics — `start` is convergent, not additive
+
+`start` ensures the supervisor daemon is running (starting it if needed), then
+**reconciles** the running workers to the manifest:
+
+- Start workers that are missing.
+- Stop workers that belong to this manifest but are no longer desired (entry
+  removed, or `instances` reduced).
+- Leave already-running, still-desired workers **untouched** — no restart churn,
+  no job interruption. A second `start` with an unchanged manifest starts
+  nothing, stops nothing and restarts nothing.
+- Workers **not** owned by this manifest (added by hand with `supervisor add`, or
+  owned by another manifest) are never touched.
+
+The enabling detail is **deterministic worker names**: workforce-owned workers
+are named `wf-<manifest>-<profile>-<index>` (`wf-default-copilot-1` …
+`wf-default-copilot-5`). Since `--instances` can't combine with `--name`, `start`
+issues N single adds with an explicit `--name` each. The `wf-<manifest>-` prefix
+is also how `status`/`stop` identify ownership; a name collision with a
+hand-added worker running a different profile is skipped with a warning rather
+than clobbered.
+
+### Portability
+
+A manifest is portable: copy `default.json` to another machine, `hire` the same
+profile names there, and `workforce start`. Because `roles` resolves from the
+manifest (not the hire), the fleet comes up identically even if the profiles were
+hired with `--capabilities ""`.
+
+### Validation & errors
+
+- `add`: the profile must exist in `hires` (otherwise an error pointing at
+  `c8ctl nano hire`); `instances` in `1..MAX_ADD_INSTANCES`; `--roles`/`--auto`
+  mutually exclusive; `--auto-scope` requires `--auto`.
+- `start`: an entry whose profile was since deleted → a clear error, the entry is
+  skipped, the rest continue, and the command exits non-zero (a partial start
+  never leaves a half-reconciled fleet silently).
+- A malformed/torn manifest, or an unknown `version`, is refused with an explicit
+  error naming the file path — never silently treated as empty.
+- `start` with an empty/absent manifest → a friendly pointer at `workforce add`,
+  exit 0.
+
+`--json` on `list`/`status` emits machine-readable output (through the same
+output-mode-aware logger) so the install script and CI can consume it.
 
 ## Cleaning up disk
 

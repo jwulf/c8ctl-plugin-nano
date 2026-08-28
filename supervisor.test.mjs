@@ -260,6 +260,17 @@ test('parseInstancesCount rejects counts over the per-command cap', () => {
   assert.ok(parseInstancesCount('65').error);
 });
 
+test('parseInstancesCount over-cap error names the command label', () => {
+  // Default label preserves the supervisor-add rerun hint: `supervisor add`
+  // accumulates workers, so re-running really does let you add more.
+  assert.match(parseInstancesCount('65').error, /run "supervisor add" again/);
+  // Workforce entries are updated in place, so the cap is a hard per-entry
+  // maximum — the rerun hint would be misleading and is intentionally omitted.
+  const wf = parseInstancesCount('65', 'workforce add').error;
+  assert.doesNotMatch(wf, /again/);
+  assert.match(wf, /per-entry maximum/);
+});
+
 // --- extractInstancesFlag --------------------------------------------------
 
 test('extractInstancesFlag pulls --instances <val> out of the token list', () => {

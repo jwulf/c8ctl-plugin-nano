@@ -220,6 +220,22 @@ test('ensureAcpFlag appends --acp only when ACP is not already selected', () => 
   assert.equal(ensureAcpFlag('opencode acp'), 'opencode acp');
   assert.equal(ensureAcpFlag('claude-agent-acp'), 'claude-agent-acp');
   assert.equal(ensureAcpFlag('pi-acp'), 'pi-acp');
+  // Qwen's ACP mode is a HIDDEN switch (`qwen --experimental-acp`, not in
+  // `qwen --help` but present in the shipped cli.js). A switch whose flag name
+  // ends in `-acp` selects ACP in ANY position, so it is never doubled — both
+  // raw and after buildAgentCommandLine()'s POSIX single-quoting of `--arg`.
+  assert.equal(ensureAcpFlag('qwen --experimental-acp'), 'qwen --experimental-acp');
+  assert.equal(ensureAcpFlag("qwen '--experimental-acp'"), "qwen '--experimental-acp'");
+  assert.equal(ensureAcpFlag('qwen "--experimental-acp"'), 'qwen "--experimental-acp"');
+  // A GNU-style `--opt=value` selector names ACP in its option NAME — detected
+  // by the option name (value stripped), so it is never doubled.
+  assert.equal(ensureAcpFlag('copilot --acp=true'), 'copilot --acp=true');
+  assert.equal(ensureAcpFlag('qwen --experimental-acp=true'), 'qwen --experimental-acp=true');
+  assert.equal(ensureAcpFlag("qwen '--experimental-acp=1'"), "qwen '--experimental-acp=1'");
+  // But a `--opt=value` whose VALUE (not name) ends in `-acp` is not a selector.
+  assert.equal(ensureAcpFlag('copilot --model=foo-acp'), 'copilot --model=foo-acp --acp');
+  // The adapter's real npm bin is `claude-code-acp` — also a `-acp` command token.
+  assert.equal(ensureAcpFlag('claude-code-acp'), 'claude-code-acp');
   // Real dispatch: structured --arg tokens are POSIX single-quoted by
   // buildAgentCommandLine(), so the acp selector arrives quoted. Detection must
   // still see it and NOT double the switch.
@@ -236,6 +252,32 @@ test('ensureAcpFlag appends --acp only when ACP is not already selected', () => 
   // A path that merely contains `/acp/` is NOT an ACP selector — append.
   assert.equal(ensureAcpFlag('/opt/acp/bin/agent'), '/opt/acp/bin/agent --acp');
   assert.equal(ensureAcpFlag("'/opt/acp/bin/agent'"), "'/opt/acp/bin/agent' --acp");
+  // A NON-switch token containing `=` must NOT be truncated to `acp` and
+  // mis-detected as an ACP selector: a leading env assignment (`ACP=true`) or a
+  // bare value (`acp=true`) is not a selector, so still append.
+  assert.equal(ensureAcpFlag('ACP=true copilot'), 'ACP=true copilot --acp');
+  assert.equal(ensureAcpFlag('copilot acp=true'), 'copilot acp=true --acp');
+  assert.equal(ensureAcpFlag("copilot 'acp=true'"), "copilot 'acp=true' --acp");
+  // A `*-acp` ADAPTER command preceded by a leading env-assignment prefix is
+  // still the command token (not an argument), so ACP is already selected — do
+  // NOT append. Env assignments only prefix the command; the adapter check must
+  // land on the first non-assignment token, not blindly on token 0.
+  assert.equal(ensureAcpFlag('ACP=true claude-code-acp'), 'ACP=true claude-code-acp');
+  assert.equal(ensureAcpFlag('FOO=1 BAR=2 claude-agent-acp'), 'FOO=1 BAR=2 claude-agent-acp');
+  assert.equal(ensureAcpFlag('DEBUG=1 pi-acp'), 'DEBUG=1 pi-acp');
+  // But an env-prefixed NON-adapter command still needs the flag appended, and a
+  // later `-acp`-suffixed argument does not count as the command token.
+  assert.equal(ensureAcpFlag('ACP=true copilot --model foo-acp'), 'ACP=true copilot --model foo-acp --acp');
+  // Regression: an env-assignment prefix whose VALUE is quoted and contains
+  // spaces is a SINGLE shell word, so the `*-acp` command that follows must
+  // still be detected (not doubled). A `\S+` tokenizer would split `FOO='a b'`
+  // into `FOO='a` + `b'`, mis-aligning commandIndex and wrongly appending --acp.
+  assert.equal(ensureAcpFlag("FOO='a b' claude-code-acp"), "FOO='a b' claude-code-acp");
+  assert.equal(ensureAcpFlag('FOO="a b" claude-agent-acp'), 'FOO="a b" claude-agent-acp');
+  assert.equal(ensureAcpFlag("A='x y' B='p q' pi-acp"), "A='x y' B='p q' pi-acp");
+  // The same quoted-space env prefix in front of a NON-adapter command still
+  // appends the flag (the command isn't an ACP selector).
+  assert.equal(ensureAcpFlag("FOO='a b' copilot"), "FOO='a b' copilot --acp");
 });
 
 test('spawnCaptureAcp completes the ACP handshake and merges the result file', async () => {

@@ -40,6 +40,7 @@ import {
   derivePollTimeoutMs,
   normalizeEnvMap,
   normalizeArgList,
+  hasValuelessArg,
   shQuote,
   buildAgentCommandLine,
   reapAgentContainers,
@@ -1883,9 +1884,17 @@ test('normalizeStoredProfile carries a normalized env map', () => {
 test('normalizeArgList coerces to a clean string[], dropping empties/nullish', () => {
   assert.deepEqual(normalizeArgList('--allow-all'), ['--allow-all'], 'a bare string is one arg');
   assert.deepEqual(normalizeArgList(['--a', '', null, undefined, '--b']), ['--a', '--b']);
-  assert.deepEqual(normalizeArgList([1, true]), ['1', 'true'], 'non-strings are coerced');
+  assert.deepEqual(normalizeArgList([1, true]), ['1'], 'numbers coerce; a value-less flag (boolean true) is dropped, not persisted as "true"');
   assert.deepEqual(normalizeArgList(undefined), []);
   assert.deepEqual(normalizeArgList('--foo=a b'), ['--foo=a b'], 'interior whitespace is preserved');
+});
+
+test('hasValuelessArg flags a bare --arg (boolean true) so hire/work/add reject it', () => {
+  assert.equal(hasValuelessArg(true), true, 'a lone bare --arg is value-less');
+  assert.equal(hasValuelessArg(['--allow-all', true]), true, 'any bare --arg among values is value-less');
+  assert.equal(hasValuelessArg('--allow-all'), false, 'a single valued --arg is fine');
+  assert.equal(hasValuelessArg(['--a', '--b']), false, 'all valued --args are fine');
+  assert.equal(hasValuelessArg(undefined), false, 'no --arg flag at all is not value-less');
 });
 
 test('shQuote wraps a value as one shell-safe literal, escaping single quotes', () => {

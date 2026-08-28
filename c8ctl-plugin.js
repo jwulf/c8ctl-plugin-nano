@@ -1640,6 +1640,17 @@ function normalizeArgList(input) {
   return out;
 }
 
+// True when a repeatable `--arg` flag contains a value-less occurrence: a bare
+// `--arg` with no following value arrives as boolean `true` from the flag layer.
+// Such an invocation is malformed — normalizeArgList would silently drop it,
+// making it look like the intended arg was accepted — so callers reject it up
+// front rather than let it be a silent no-op.
+function hasValuelessArg(argFlag) {
+  if (argFlag === undefined) return false;
+  const items = Array.isArray(argFlag) ? argFlag : [argFlag];
+  return items.some((a) => a === true);
+}
+
 // POSIX single-quote a string so it survives `sh -c`/shell:true as one literal
 // argv token, no matter what it contains (spaces, $, quotes, globs). Empty
 // string → ''. This is what keeps structured `--arg` values injection-safe even
@@ -1972,6 +1983,12 @@ async function hireWorker(req, flags) {
   let permission = flags?.permission !== undefined ? String(flags.permission).trim().toLowerCase() : undefined;
   // Structured command-line switches appended to the command when spawned, e.g.
   // `--arg --allow-all` for `copilot`. Repeatable; each --arg is one argv token.
+  // A value-less `--arg` (bare flag, boolean `true`) is a malformed invocation —
+  // reject it up front rather than silently drop it (mirrors workforce add).
+  if (hasValuelessArg(flags?.arg)) {
+    logger.error('--arg requires a value (e.g. --arg "--allow-all").');
+    process.exit(1);
+  }
   const commandArgs = normalizeArgList(flags?.arg);
   const envFromFlags = flags?.env !== undefined;
   const { env: profileEnv, errors: envErrors } = parseEnvPairs(flags?.env);
@@ -5419,7 +5436,12 @@ async function workAgent(req, flags) {
 
   // Structured command-line switches: the profile's persisted `--arg`s, extended
   // by any work-time `--arg` (appended). Lets an operator add switches (e.g.
-  // `--allow-all`) at dispatch time without re-hiring.
+  // `--allow-all`) at dispatch time without re-hiring. A value-less `--arg`
+  // (bare flag, boolean `true`) is malformed — reject it rather than drop it.
+  if (hasValuelessArg(flags?.arg)) {
+    logger.error('--arg requires a value (e.g. --arg "--allow-all").');
+    process.exit(1);
+  }
   const effectiveArgs = [...profile.args, ...normalizeArgList(flags?.arg)];
 
   const intFlag = (v, dflt) => {
@@ -8748,9 +8770,7 @@ async function workforceAddCmd(req, flags, manifestName) {
   // boolean `true` from the flag layer; normalizeArgList would silently drop it,
   // making a malformed invocation look like it accepted the intended arg. Reject
   // it up front (mirrors the `--roles`/`--auto-scope` value-less validation).
-  const argFlag = flags?.arg;
-  const argItems = Array.isArray(argFlag) ? argFlag : [argFlag];
-  if (argItems.some((a) => a === true)) {
+  if (hasValuelessArg(flags?.arg)) {
     logger.error('--arg requires a value (e.g. --arg "--allow-all-tools").');
     process.exit(1);
   }
@@ -10723,6 +10743,7 @@ export {
   parseEnvPairs,
   normalizeEnvMap,
   normalizeArgList,
+  hasValuelessArg,
   shQuote,
   buildAgentCommandLine,
   reapAgentContainers,

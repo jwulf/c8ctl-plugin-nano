@@ -84,8 +84,13 @@ test('workforce start/stop reconciles a real supervisor', async (t) => {
   const mod = await import(pluginUrl);
 
   t.after(async () => {
+    // Capture the daemon pid up front: the supervisor clears supervisor.json
+    // early during shutdown, so a slow/failed stop can leave the process alive
+    // while runningSupervisor() already reads null. Fall back to this snapshot
+    // so the SIGKILL still fires and no daemon leaks into later tests.
+    const before = mod.runningSupervisor();
     try { await mod.supervisorRequest({ op: 'stop' }); } catch { /* ignore */ }
-    const st = mod.runningSupervisor();
+    const st = mod.runningSupervisor() || before;
     if (st) { try { process.kill(st.pid, 'SIGKILL'); } catch { /* ignore */ } }
     mod.clearSupervisorState();
     restoreEnv('C8CTL_NANO_ENTRY', prevEntry);

@@ -8426,7 +8426,10 @@ function writeWorkforceManifest(manifest) {
   mkdirSync(getWorkforceDir(), { recursive: true });
   const target = getWorkforceManifestFile(manifest.name);
   const tmp = `${target}.${process.pid}.${Date.now()}.tmp`;
-  writeFileSync(tmp, JSON.stringify(manifest, null, 2));
+  // Owner-only (0600): manifests record forwarded `work` flags via `args`
+  // (e.g. `--env NAME=VALUE`), so keep them out of world-readable view on
+  // multi-user machines, consistent with supervisor.json.
+  writeFileSync(tmp, JSON.stringify(manifest, null, 2), { mode: 0o600 });
   try { renameSync(tmp, target); }
   catch (err) { try { rmSync(tmp, { force: true }); } catch { /* best effort */ } throw err; }
 }

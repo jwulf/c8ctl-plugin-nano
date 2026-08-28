@@ -8853,7 +8853,12 @@ async function workforceStopCmd(req, flags, manifestName) {
   const running = await liveSupervisor();
   if (!running) { logger.warn('Supervisor is not running — nothing to stop.'); return; }
   const manifestNames = listWorkforceManifestNames();
-  const { reachable, workers: live } = await fetchSupervisorWorkers();
+  const { running: stillRunning, reachable, workers: live } = await fetchSupervisorWorkers();
+  // The daemon can exit between the liveSupervisor() check above and this call;
+  // fetchSupervisorWorkers() then reports running:false (not merely
+  // unreachable). Treat that as "nothing to stop" rather than erroring out with
+  // a misleading "socket unreachable" message.
+  if (!stillRunning) { logger.warn('Supervisor is not running — nothing to stop.'); return; }
   if (!reachable) {
     logger.error('Supervisor is running but its status socket is unreachable — cannot enumerate workers. Leaving the daemon and its workers untouched.');
     process.exit(1);

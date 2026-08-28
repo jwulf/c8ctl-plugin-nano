@@ -52,6 +52,20 @@ async function waitForWorkers(mod, n, tries = 200) {
 
 const silentLogger = { info: () => {}, warn: () => {}, error: () => {}, debug: () => {}, output: () => {} };
 
+// Poll the control socket until it stops answering — the true "daemon is gone"
+// signal. The daemon clears its state file *early* during shutdown, so
+// runningSupervisor() can read null while the socket/process is still alive;
+// relying on the state file would let the test pass (and cleanup skip its kill)
+// with a live daemon. supervisorRequest throws once the socket is gone.
+async function waitForSupervisorGone(mod, tries = 280) {
+  for (let i = 0; i < tries; i++) {
+    try { await mod.supervisorRequest({ op: 'status' }); }
+    catch { return true; }
+    await sleep(50);
+  }
+  return false;
+}
+
 test('workforce start/stop reconciles a real supervisor', async (t) => {
   const HOME = mkdtempSync(join(tmpdir(), 'c8ctl-wf-it-'));
   const prevHome = process.env.C8CTL_NANO_HOME;
@@ -112,7 +126,9 @@ test('workforce start/stop reconciles a real supervisor', async (t) => {
   // Stop → the manifest's workers are removed and the empty daemon is stopped.
   await mod.commands.nano.handler(['workforce', 'stop'], {});
   // supervisorStopCmd can wait up to STOP_GRACE_MS + 2s for the daemon to exit,
-  // so poll well past that (≈14s) to stay robust under CI load.
-  for (let i = 0; i < 280 && mod.runningSupervisor(); i++) await sleep(50);
-  assert.equal(mod.runningSupervisor(), null, 'daemon should be stopped once no workers remain');
+  // so poll the control socket (not the early-cleared state file) well past that
+  // (≈14s) to stay robust under CI load.
+  const gone = await waitForSupervisorGone(mod);
+  assert.ok(gone, 'daemon should stop answering its control socket once no workers remain');
+  assert.equal(mod.runningSupervisor(), null, 'daemon state file should be cleared once stopped');
 });

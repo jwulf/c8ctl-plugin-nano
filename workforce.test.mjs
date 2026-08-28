@@ -353,6 +353,30 @@ test('normalizeManifestEntry: explicit null roles rejected as malformed', () => 
   assert.match(error, /roles must be "auto" or an array/);
 });
 
+test('normalizeManifestEntry: valid string args are kept', () => {
+  const { entry, error } = normalizeManifestEntry({ profile: 'copilot', instances: 1, args: ['--sandbox', 'docker'] });
+  assert.equal(error, undefined);
+  assert.deepEqual(entry.args, ['--sandbox', 'docker']);
+});
+
+test('normalizeManifestEntry: absent args yields no args key', () => {
+  const { entry, error } = normalizeManifestEntry({ profile: 'copilot', instances: 1 });
+  assert.equal(error, undefined);
+  assert.equal('args' in entry, false);
+});
+
+test('normalizeManifestEntry: malformed args rejected instead of silently dropped', () => {
+  // Non-array args field.
+  assert.match(normalizeManifestEntry({ profile: 'copilot', instances: 1, args: '--sandbox' }).error, /args must be an array/);
+  // Boolean element (e.g. a value-less flag torn into the manifest) must be
+  // refused, not silently dropped by normalizeArgList.
+  assert.match(normalizeManifestEntry({ profile: 'copilot', instances: 1, args: [true] }).error, /invalid arg/);
+  // Non-string element.
+  assert.match(normalizeManifestEntry({ profile: 'copilot', instances: 1, args: ['--flag', 5] }).error, /invalid arg/);
+  // Empty-string element is likewise silently dropped by normalizeArgList — refuse it.
+  assert.match(normalizeManifestEntry({ profile: 'copilot', instances: 1, args: [''] }).error, /empty string/);
+});
+
 // --- manifest-level validation ---------------------------------------------
 
 test('validateWorkforceManifest refuses an unknown version', () => {

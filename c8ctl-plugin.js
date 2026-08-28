@@ -8405,7 +8405,30 @@ function normalizeManifestEntry(entry) {
   } else {
     return { error: `entry "${profile}": roles must be "auto" or an array of role names` };
   }
-  const args = normalizeArgList(entry.args);
+  // `args` is documented as an array of extra verbatim `work` flags. Like
+  // roles/workers above, distinguish an ABSENT `args` (legitimately "no extra
+  // flags") from one that is PRESENT but malformed. Left to normalizeArgList, a
+  // torn/hand-edited value such as { "args": [true] } (or an empty string) would
+  // be silently dropped/coerced, so the flag looks accepted when it was actually
+  // discarded — contradicting the "malformed manifests are refused" contract and
+  // making debugging hard. Reject non-string / empty values here, naming the
+  // entry, rather than normalize them away.
+  const argsAbsent = !('args' in entry) || entry.args === undefined;
+  let args = [];
+  if (!argsAbsent) {
+    if (!Array.isArray(entry.args)) {
+      return { error: `entry "${profile}": args must be an array of flag strings` };
+    }
+    for (const a of entry.args) {
+      if (typeof a !== 'string') {
+        return { error: `entry "${profile}": invalid arg ${JSON.stringify(a)} (expected a flag string)` };
+      }
+      if (a.length === 0) {
+        return { error: `entry "${profile}": args contains an empty string (expected a flag string)` };
+      }
+    }
+    args = normalizeArgList(entry.args);
+  }
   const out = { profile, instances: count, roles };
   if (autoScope) out.autoScope = autoScope;
   if (args.length) out.args = args;

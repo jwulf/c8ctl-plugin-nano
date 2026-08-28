@@ -8158,6 +8158,23 @@ function workforceWorkerName(manifest, profile, index) {
 }
 
 /**
+ * Parse the `<profile>` embedded in a deterministic
+ * `wf-<manifest>-<profile>-<index>` worker id, given the owning manifest.
+ * Returns the profile string, or `null` when `id` does not carry this manifest's
+ * `wf-<manifest>-` prefix or does not end in a `-<index>` counter (a hand-added
+ * id that merely shares the prefix). A profile name may itself contain dashes,
+ * so we peel the trailing `-<digits>` index and treat the remainder as the
+ * profile. Pure — mirrors `workforceWorkerName`'s construction.
+ */
+function workforceProfileFromWorkerName(manifest, id) {
+  const prefix = workforceOwnerPrefix(manifest);
+  if (typeof id !== 'string' || !id.startsWith(prefix)) return null;
+  const rest = id.slice(prefix.length);
+  const m = rest.match(/^(.+)-(\d+)$/);
+  return m ? m[1] : null;
+}
+
+/**
  * Expand a manifest into the flat list of desired workers it describes:
  * `[{ name, profile, index, entry }]`, one per instance. Pure.
  */
@@ -8300,9 +8317,19 @@ function validateWorkforceManifest(parsed, file, expectedName) {
   }
   const workersRaw = Array.isArray(parsed.workers) ? parsed.workers : [];
   const workers = [];
+  const seenProfiles = new Set();
   for (const raw of workersRaw) {
     const norm = normalizeManifestEntry(raw);
     if (norm.error) throw new Error(`workforce manifest ${file}: ${norm.error}.`);
+    // Reject duplicate profiles: two entries for the same profile expand to the
+    // same deterministic `wf-<manifest>-<profile>-<index>` worker names, so
+    // `workforce start` would try `supervisor add` for the same worker id twice
+    // and fail non-deterministically. Surface the corruption here (naming the
+    // path) — use "instances" to run multiple copies of one profile.
+    if (seenProfiles.has(norm.entry.profile)) {
+      throw new Error(`workforce manifest ${file} has a duplicate profile ${JSON.stringify(norm.entry.profile)} — each profile may appear at most once (use "instances" to run more than one).`);
+    }
+    seenProfiles.add(norm.entry.profile);
     workers.push(norm.entry);
   }
   const onDiskName = typeof parsed.name === 'string' && parsed.name.trim() ? parsed.name.trim() : '';
@@ -8744,6 +8771,20 @@ async function workforceStopCmd(req, flags, manifestName) {
   }
   const owned = live
     .filter((w) => w && typeof w.id === 'string' && w.id.startsWith(prefix))
+    // A worker id that carries our prefix but whose LIVE profile disagrees with
+    // the profile embedded in its deterministic name is a hand-added worker that
+    // merely collides on the name (the same case `workforce start` skips): it is
+    // NOT ours, so never remove it. Skip only on a positive disagreement — an
+    // id we can't parse a profile from, or a live worker with no reported
+    // profile, stays owned (unchanged from prior behaviour).
+    .filter((w) => {
+      const embedded = workforceProfileFromWorkerName(manifestName, w.id);
+      if (embedded != null && w.profile != null && w.profile !== embedded) {
+        logger.info(`Skipping "${w.id}" — it runs profile "${w.profile}", not the "${embedded}" this manifest owns (name collision); not removing.`);
+        return false;
+      }
+      return true;
+    })
     .map((w) => w.id);
   let hadError = false;
   if (owned.length === 0) {
@@ -10613,6 +10654,7 @@ export {
   manifestEntryToWorkArgs,
   workforceOwnerPrefix,
   workforceWorkerName,
+  workforceProfileFromWorkerName,
   expandWorkforceDesired,
   reconcileWorkforce,
   normalizeManifestEntry,

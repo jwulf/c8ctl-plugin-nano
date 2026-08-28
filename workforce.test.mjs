@@ -17,6 +17,7 @@ import {
   manifestEntryToWorkArgs,
   workforceOwnerPrefix,
   workforceWorkerName,
+  workforceProfileFromWorkerName,
   expandWorkforceDesired,
   reconcileWorkforce,
   normalizeManifestEntry,
@@ -315,6 +316,33 @@ test('validateWorkforceManifest refuses an explicit null workers field', () => {
 test('validateWorkforceManifest allows an absent workers field (empty manifest)', () => {
   const m = validateWorkforceManifest({ version: 1, name: 'default' }, '/tmp/ok.json');
   assert.deepEqual(m.workers, []);
+});
+
+test('validateWorkforceManifest rejects duplicate profiles (naming the path)', () => {
+  assert.throws(
+    () => validateWorkforceManifest(
+      { version: 1, name: 'default', workers: [{ profile: 'copilot', instances: 1 }, { profile: 'copilot', instances: 2 }] },
+      '/tmp/dup.json',
+    ),
+    /\/tmp\/dup\.json.*duplicate profile.*copilot/,
+  );
+});
+
+test('validateWorkforceManifest allows one profile with multiple instances', () => {
+  const m = validateWorkforceManifest(
+    { version: 1, name: 'default', workers: [{ profile: 'copilot', instances: 3 }] },
+    '/tmp/ok.json',
+  );
+  assert.equal(m.workers.length, 1);
+  assert.equal(m.workers[0].instances, 3);
+});
+
+test('workforceProfileFromWorkerName parses the embedded profile (incl. dashes)', () => {
+  assert.equal(workforceProfileFromWorkerName('default', 'wf-default-copilot-1'), 'copilot');
+  assert.equal(workforceProfileFromWorkerName('default', 'wf-default-my-agent-12'), 'my-agent');
+  // Foreign prefix / no index counter → null (not one of ours to parse).
+  assert.equal(workforceProfileFromWorkerName('default', 'other-worker-1'), null);
+  assert.equal(workforceProfileFromWorkerName('default', 'wf-default-noindex'), null);
 });
 
 // --- upsert / remove -------------------------------------------------------

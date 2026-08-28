@@ -305,6 +305,18 @@ test('validateWorkforceManifest refuses a non-array workers field (naming the pa
   );
 });
 
+test('validateWorkforceManifest refuses an explicit null workers field', () => {
+  assert.throws(
+    () => validateWorkforceManifest({ version: 1, name: 'default', workers: null }, '/tmp/torn.json'),
+    /\/tmp\/torn\.json.*malformed "workers".*got null/,
+  );
+});
+
+test('validateWorkforceManifest allows an absent workers field (empty manifest)', () => {
+  const m = validateWorkforceManifest({ version: 1, name: 'default' }, '/tmp/ok.json');
+  assert.deepEqual(m.workers, []);
+});
+
 // --- upsert / remove -------------------------------------------------------
 
 test('upsertManifestEntry appends then updates in place by profile', () => {

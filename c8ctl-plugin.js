@@ -8291,8 +8291,12 @@ function validateWorkforceManifest(parsed, file, expectedName) {
   if (parsed.version !== WORKFORCE_MANIFEST_VERSION) {
     throw new Error(`workforce manifest ${file} has unsupported version ${JSON.stringify(parsed.version)} (this build understands version ${WORKFORCE_MANIFEST_VERSION}).`);
   }
-  if (parsed.workers != null && !Array.isArray(parsed.workers)) {
-    throw new Error(`workforce manifest ${file} has a malformed "workers" field (expected an array, got ${typeof parsed.workers}).`);
+  // Distinguish an ABSENT `workers` field (a legitimately empty manifest) from
+  // one that is PRESENT but not an array — including an explicit `null`, which
+  // is a malformed value, not "empty". `!= null` used to let `null` slip
+  // through as empty; keying on presence surfaces the corruption instead.
+  if ('workers' in parsed && parsed.workers !== undefined && !Array.isArray(parsed.workers)) {
+    throw new Error(`workforce manifest ${file} has a malformed "workers" field (expected an array, got ${parsed.workers === null ? 'null' : typeof parsed.workers}).`);
   }
   const workersRaw = Array.isArray(parsed.workers) ? parsed.workers : [];
   const workers = [];
@@ -8671,7 +8675,15 @@ async function workforceStartCmd(req, flags, manifestName) {
 
   const state = await startSupervisorDaemon();
   logger.info(`Supervisor daemon running (pid ${state.pid}).`);
-  const { workers: live } = await fetchSupervisorWorkers();
+  const { reachable, workers: live } = await fetchSupervisorWorkers();
+  // A running daemon with an unreachable status socket reports `live: []`, which
+  // would make reconcile think the fleet is empty — duplicating workers it can't
+  // see or "stopping" surplus it can't enumerate. Refuse to reconcile blindly
+  // and exit non-zero (mirrors `workforce stop`).
+  if (!reachable) {
+    logger.error('Supervisor daemon is running but its status socket is unreachable — cannot enumerate live workers to reconcile against. Refusing to reconcile blindly; try again once the socket responds.');
+    process.exit(1);
+  }
   const { toStart, toRestart, toStop, unchanged, collisions, protected: protectedWorkers } = reconcileWorkforce({ desired, live, manifest: manifestName, skippedProfiles });
 
   for (const c of collisions) {
@@ -8706,7 +8718,15 @@ async function workforceStatusCmd(req, flags, manifestName) {
   const logger = getLogger();
   const json = coerceBool(flags?.json, false);
   const manifest = readWorkforceManifestStrict(manifestName);
-  const { running, workers: live } = await fetchSupervisorWorkers();
+  const { running, reachable, workers: live } = await fetchSupervisorWorkers();
+  // When the daemon is up but its status socket can't be reached, `live` is
+  // empty and the report would falsely show every worker as absent — misleading
+  // a human and any automation consuming `--json`. Fail non-zero instead of
+  // rendering a phantom "everything down" status (mirrors `workforce stop`).
+  if (running && !reachable) {
+    logger.error('Supervisor is running but its status socket is unreachable — cannot report worker status. Try again once the socket responds.');
+    process.exit(1);
+  }
   const report = buildWorkforceStatus(manifest, manifestName, live, running);
   if (json) { logger.output(JSON.stringify(report, null, 2)); return; }
   logger.output(formatWorkforceStatus(report));

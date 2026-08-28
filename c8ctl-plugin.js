@@ -8123,14 +8123,21 @@ function parseRolesList(raw) {
   const roles = [];
   const errors = [];
   for (const rawItem of rawItems) {
-    if (fromArray && typeof rawItem !== 'string') {
-      errors.push(`invalid role ${JSON.stringify(rawItem)} (expected a role-name string)`);
+    if (typeof rawItem !== 'string') {
+      // Array elements must all be strings. For a lone scalar, a nullish value
+      // means "no roles supplied" (empty result, no error), but any other
+      // non-string (e.g. boolean `true` from a value-less `--roles` flag, or a
+      // torn JSON value) is a malformed value, not a role — reject it rather
+      // than coerce it into a phantom role like "true".
+      if (fromArray || rawItem != null) {
+        errors.push(`invalid role ${JSON.stringify(rawItem)} (expected a role-name string)`);
+      }
       continue;
     }
     // A single value may itself be comma-separated (`--roles a,b`); repeated
     // flags arrive as an array whose elements may also be comma-separated
     // (`--roles a,b --roles c`), so split every element on commas.
-    for (const item of String(rawItem ?? '').split(',')) {
+    for (const item of rawItem.split(',')) {
       const r = item.trim().toLowerCase();
       if (!r) continue;
       if (!WORKFORCE_ROLE_RE.test(r)) { errors.push(`invalid role "${item.trim()}" (use letters, digits, and . _ + -)`); continue; }
@@ -8716,6 +8723,16 @@ async function workforceAddCmd(req, flags, manifestName) {
     // job type), the onboarding/install-script happy path.
     entry = { profile, instances: count, roles: 'auto' };
     if (autoScope) entry.autoScope = autoScope;
+  }
+  // A value-less `--arg` (a bare flag with no following value) arrives as
+  // boolean `true` from the flag layer; normalizeArgList would silently drop it,
+  // making a malformed invocation look like it accepted the intended arg. Reject
+  // it up front (mirrors the `--roles`/`--auto-scope` value-less validation).
+  const argFlag = flags?.arg;
+  const argItems = Array.isArray(argFlag) ? argFlag : [argFlag];
+  if (argItems.some((a) => a === true)) {
+    logger.error('--arg requires a value (e.g. --arg "--allow-all-tools").');
+    process.exit(1);
   }
   const extraArgs = normalizeArgList(flags?.arg);
   if (extraArgs.length) entry.args = extraArgs;

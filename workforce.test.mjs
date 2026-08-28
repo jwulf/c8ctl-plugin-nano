@@ -91,6 +91,16 @@ test('parseRolesList rejects non-string array items instead of coercing them', (
   for (const e of res.errors) assert.match(e, /expected a role-name string/);
 });
 
+test('parseRolesList rejects a non-string scalar (value-less flag) but treats nullish as empty', () => {
+  const boolRes = parseRolesList(true);
+  assert.deepEqual(boolRes.roles, []);
+  assert.equal(boolRes.errors.length, 1);
+  assert.match(boolRes.errors[0], /expected a role-name string/);
+  // A nullish scalar means "no roles supplied": empty, no error.
+  assert.deepEqual(parseRolesList(undefined), { roles: [], errors: [] });
+  assert.deepEqual(parseRolesList(null), { roles: [], errors: [] });
+});
+
 // --- entry → work args -----------------------------------------------------
 
 test('manifestEntryToWorkArgs: auto → --auto [--auto-scope]', () => {

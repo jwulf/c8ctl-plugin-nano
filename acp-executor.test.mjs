@@ -268,6 +268,16 @@ test('ensureAcpFlag appends --acp only when ACP is not already selected', () => 
   // But an env-prefixed NON-adapter command still needs the flag appended, and a
   // later `-acp`-suffixed argument does not count as the command token.
   assert.equal(ensureAcpFlag('ACP=true copilot --model foo-acp'), 'ACP=true copilot --model foo-acp --acp');
+  // Regression: an env-assignment prefix whose VALUE is quoted and contains
+  // spaces is a SINGLE shell word, so the `*-acp` command that follows must
+  // still be detected (not doubled). A `\S+` tokenizer would split `FOO='a b'`
+  // into `FOO='a` + `b'`, mis-aligning commandIndex and wrongly appending --acp.
+  assert.equal(ensureAcpFlag("FOO='a b' claude-code-acp"), "FOO='a b' claude-code-acp");
+  assert.equal(ensureAcpFlag('FOO="a b" claude-agent-acp'), 'FOO="a b" claude-agent-acp');
+  assert.equal(ensureAcpFlag("A='x y' B='p q' pi-acp"), "A='x y' B='p q' pi-acp");
+  // The same quoted-space env prefix in front of a NON-adapter command still
+  // appends the flag (the command isn't an ACP selector).
+  assert.equal(ensureAcpFlag("FOO='a b' copilot"), "FOO='a b' copilot --acp");
 });
 
 test('spawnCaptureAcp completes the ACP handshake and merges the result file', async () => {

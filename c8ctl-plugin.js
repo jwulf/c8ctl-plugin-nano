@@ -4003,14 +4003,25 @@ function ensureAcpFlag(commandLine) {
   //     that merely ends in `-acp` (e.g. `--model foo-acp`) is not an ACP
   //     selector. Matching whole tokens/basenames (not a substring) also avoids
   //     the false positive of a path that merely contains `/acp/`.
-  const tokens = commandLine.match(/'(?:[^']|'\\'')*'|"(?:[^"\\]|\\.)*"|\S+/g) || [];
+  // A shell WORD is a contiguous run of quoted and/or unquoted segments with no
+  // whitespace between them, so a `\S+` token boundary is wrong: an env prefix
+  // whose value is quoted and contains spaces (e.g. `FOO='a b' claude-code-acp`)
+  // is a SINGLE word `FOO=a b`, but `\S+` would split it into `FOO='a` and `b'`,
+  // corrupting commandIndex so the real `*-acp` command token is never checked
+  // (and `--acp` wrongly appended). Glue adjacent segments into one word.
+  const tokens = commandLine.match(/(?:'(?:[^']|'\\'')*'|"(?:[^"\\]|\\.)*"|[^\s'"]+)+/g) || [];
+  // Strip shell quoting across ALL of a word's segments (a word may mix quoted
+  // and unquoted runs, e.g. `FOO='a b'`), yielding the logical value.
   const unquote = (tok) => {
-    if (tok.length >= 2 && tok.startsWith("'") && tok.endsWith("'")) {
-      return tok.slice(1, -1).replace(/'\\''/g, "'");
-    } else if (tok.length >= 2 && tok.startsWith('"') && tok.endsWith('"')) {
-      return tok.slice(1, -1).replace(/\\(["\\$`])/g, '$1');
+    let out = '';
+    const seg = /'((?:[^']|'\\'')*)'|"((?:[^"\\]|\\.)*)"|([^\s'"]+)/g;
+    let m;
+    while ((m = seg.exec(tok)) !== null) {
+      if (m[1] !== undefined) out += m[1].replace(/'\\''/g, "'");
+      else if (m[2] !== undefined) out += m[2].replace(/\\(["\\$`])/g, '$1');
+      else out += m[3];
     }
-    return tok;
+    return out;
   };
   // The `*-acp` adapter suffix identifies the COMMAND token, but the command is
   // not always token 0: a shell command line may be prefixed with a contiguous

@@ -3993,7 +3993,12 @@ function ensureAcpFlag(commandLine) {
     } else if (tok.length >= 2 && tok.startsWith('"') && tok.endsWith('"')) {
       tok = tok.slice(1, -1).replace(/\\(["\\$`])/g, '$1');
     }
-    const base = tok.replace(/^.*[\\/]/, ''); // basename, for path-form commands
+    // Normalise a GNU-style `--opt=value` selector to its option-NAME part, so
+    // `--acp=true` / `--experimental-acp=true` are detected as ACP selectors and
+    // never doubled. Only the option NAME selects ACP — a `--model=foo-acp`
+    // VALUE must not trigger (its name `--model` doesn't end in `-acp`).
+    const name = tok.replace(/=.*$/s, '');
+    const base = name.replace(/^.*[\\/]/, ''); // basename, for path-form commands
     if (/^-{0,2}acp$/i.test(base)) return commandLine;
     // A switch that NAMES acp, e.g. qwen's hidden `--experimental-acp` (present
     // in the shipped cli.js but not in `qwen --help`) — a long/short option
@@ -4001,7 +4006,7 @@ function ensureAcpFlag(commandLine) {
     // argument to the harness command (not the command token). A bare value that
     // merely ends in `-acp` (e.g. `--model foo-acp`) does NOT start with `-`, so
     // it is not a switch and still (correctly) triggers the append below.
-    if (/^--?[a-z0-9][a-z0-9-]*-acp$/i.test(tok)) return commandLine;
+    if (/^--?[a-z0-9][a-z0-9-]*-acp$/i.test(name)) return commandLine;
     if (i === 0 && /-acp$/i.test(base)) return commandLine;
   }
   return `${commandLine} --acp`;

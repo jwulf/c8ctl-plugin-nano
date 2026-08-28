@@ -227,6 +227,13 @@ test('ensureAcpFlag appends --acp only when ACP is not already selected', () => 
   assert.equal(ensureAcpFlag('qwen --experimental-acp'), 'qwen --experimental-acp');
   assert.equal(ensureAcpFlag("qwen '--experimental-acp'"), "qwen '--experimental-acp'");
   assert.equal(ensureAcpFlag('qwen "--experimental-acp"'), 'qwen "--experimental-acp"');
+  // A GNU-style `--opt=value` selector names ACP in its option NAME — detected
+  // by the option name (value stripped), so it is never doubled.
+  assert.equal(ensureAcpFlag('copilot --acp=true'), 'copilot --acp=true');
+  assert.equal(ensureAcpFlag('qwen --experimental-acp=true'), 'qwen --experimental-acp=true');
+  assert.equal(ensureAcpFlag("qwen '--experimental-acp=1'"), "qwen '--experimental-acp=1'");
+  // But a `--opt=value` whose VALUE (not name) ends in `-acp` is not a selector.
+  assert.equal(ensureAcpFlag('copilot --model=foo-acp'), 'copilot --model=foo-acp --acp');
   // The adapter's real npm bin is `claude-code-acp` — also a `-acp` command token.
   assert.equal(ensureAcpFlag('claude-code-acp'), 'claude-code-acp');
   // Real dispatch: structured --arg tokens are POSIX single-quoted by

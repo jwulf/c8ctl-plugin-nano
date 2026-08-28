@@ -8594,7 +8594,7 @@ function formatWorkforceStatus(report) {
 
 /** Resolve the manifest name from `--profile` (default `default`). Pure. */
 function workforceManifestName(flags) {
-  const raw = flags?.profile != null ? String(flags.profile).trim() : '';
+  const raw = typeof flags?.profile === 'string' ? flags.profile.trim() : '';
   return raw || DEFAULT_WORKFORCE_MANIFEST;
 }
 
@@ -8631,7 +8631,18 @@ async function workforceAddCmd(req, flags, manifestName) {
   if (error) { logger.error(error); process.exit(1); }
   const auto = coerceBool(flags?.auto, false);
   const rolesFlag = flags?.roles;
+  // A bare `--roles` (no value) is parsed as boolean `true` by the flag layer;
+  // reject it rather than let `String(true)` create a phantom role named "true"
+  // (mirrors how `--instances` rejects a non-numeric value).
+  if (rolesFlag === true) {
+    logger.error('--roles requires a comma-separated list of role names (e.g. --roles pr-review,fix).');
+    process.exit(1);
+  }
   const hasRoles = rolesFlag != null && String(rolesFlag).trim() !== '';
+  if (flags?.['auto-scope'] === true) {
+    logger.error('--auto-scope requires a value.');
+    process.exit(1);
+  }
   const autoScope = flags?.['auto-scope'] != null ? String(flags['auto-scope']).trim() : '';
   if (auto && hasRoles) {
     logger.error('--auto and --roles are mutually exclusive: an entry is either "auto" (serve all deployed job types) or an explicit role list.');
@@ -8860,6 +8871,12 @@ async function workforceStopCmd(req, flags, manifestName) {
 async function workforceCommand(req, flags) {
   const logger = getLogger();
   const action = (req.positional[0] || '').toLowerCase();
+  // A bare `--profile` (no value) is parsed as boolean `true`; reject it so we
+  // fail fast instead of silently operating on the default manifest.
+  if (flags?.profile === true) {
+    logger.error('--profile requires a manifest name.');
+    process.exit(1);
+  }
   const manifestName = workforceManifestName(flags);
   if (!isValidManifestName(manifestName)) {
     logger.error(`Invalid --profile "${manifestName}". Use letters, digits, dot, dash or underscore.`);

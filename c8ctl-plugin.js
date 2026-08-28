@@ -8087,8 +8087,9 @@ function getWorkforceManifestFile(name) {
 }
 
 /**
- * A manifest name is valid iff it is a non-empty run of `[A-Za-z0-9._-]` (same
- * charset as a profile name). It rides in both a filename and the deterministic
+ * A manifest name is valid iff it is a non-empty string of `[A-Za-z0-9._-]`
+ * whose first character is alphanumeric (`[A-Za-z0-9]`; same charset and rule
+ * as a profile name). It rides in both a filename and the deterministic
  * `wf-<name>-` worker-name prefix, so this charset keeps it safe on disk and as
  * a broker/supervisor worker id. Pure.
  */
@@ -8710,7 +8711,7 @@ async function workforceAddCmd(req, flags, manifestName) {
   const existed = (manifest.workers || []).some((w) => w && w.profile === profile);
   manifest = upsertManifestEntry(manifest, entry);
   writeWorkforceManifest(manifest);
-  logger.info(`${existed ? 'Updated' : 'Added'} "${profile}" in workforce "${manifestName}": instances ${count}, roles ${describeEntryRoles(entry)}${extraArgs.length ? `, args ${extraArgs.join(' ')}` : ''}.`);
+  logger.info(`${existed ? 'Updated' : 'Added'} "${profile}" in workforce "${manifestName}": instances ${count}, roles ${describeEntryRoles(entry)}${extraArgs.length ? `, args ${redactWorkArgs(extraArgs).join(' ')}` : ''}.`);
   logger.info(`Bring it up with: c8ctl nano workforce start${manifestName === DEFAULT_WORKFORCE_MANIFEST ? '' : ` --profile ${manifestName}`}`);
 }
 

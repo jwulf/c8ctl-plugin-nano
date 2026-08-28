@@ -937,7 +937,7 @@ between machines; `config.json` is plugin state.
 `roles` is resolved **at start time from the manifest**, independent of what the
 profile was hired with (the install script hires with `--capabilities ""`):
 
-- `"auto"` → `c8 nano work <profile> --auto [--auto-scope X]`. No capability
+- `"auto"` → `c8ctl nano work <profile> --auto [--auto-scope X]`. No capability
   gate; serves every deployed agent job type. This is what the install script
   sets, and the default when you pass neither `--auto` nor `--roles` to `add`.
 - `["pr-review","feature"]` → repeatable `--job-type <rank>:<role>`, e.g. for a
@@ -981,7 +981,7 @@ hired with `--capabilities ""`.
 ### Validation & errors
 
 - `add`: the profile must exist in `hires` (otherwise an error pointing at
-  `c8 nano hire`); `instances` in `1..MAX_ADD_INSTANCES`; `--roles`/`--auto`
+  `c8ctl nano hire`); `instances` in `1..MAX_ADD_INSTANCES`; `--roles`/`--auto`
   mutually exclusive; `--auto-scope` requires `--auto`.
 - `start`: an entry whose profile was since deleted → a clear error, the entry is
   skipped, the rest continue, and the command exits non-zero (a partial start

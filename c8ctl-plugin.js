@@ -8647,7 +8647,14 @@ async function workforceAddCmd(req, flags, manifestName) {
     logger.error('--roles requires a comma-separated list of role names (e.g. --roles pr-review,fix).');
     process.exit(1);
   }
-  const hasRoles = rolesFlag != null && String(rolesFlag).trim() !== '';
+  // An explicitly provided but empty `--roles` (e.g. `--roles ""`, or an empty
+  // array from the flag layer) is a user error, not an implicit "auto": reject
+  // it rather than silently defaulting the entry to `roles: "auto"`.
+  if (rolesFlag != null && String(rolesFlag).trim() === '') {
+    logger.error('--roles requires a comma-separated list of role names (e.g. --roles pr-review,fix).');
+    process.exit(1);
+  }
+  const hasRoles = rolesFlag != null;
   if (flags?.['auto-scope'] === true) {
     logger.error('--auto-scope requires a value.');
     process.exit(1);

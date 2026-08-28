@@ -8118,21 +8118,26 @@ const WORKFORCE_ROLE_RE = /^[a-z0-9][a-z0-9._+-]*$/i;
  */
 function parseRolesList(raw) {
   const fromArray = Array.isArray(raw);
-  const list = fromArray ? raw : String(raw ?? '').split(',');
+  const rawItems = fromArray ? raw : [raw];
   const seen = new Set();
   const roles = [];
   const errors = [];
-  for (const item of list) {
-    if (fromArray && typeof item !== 'string') {
-      errors.push(`invalid role ${JSON.stringify(item)} (expected a role-name string)`);
+  for (const rawItem of rawItems) {
+    if (fromArray && typeof rawItem !== 'string') {
+      errors.push(`invalid role ${JSON.stringify(rawItem)} (expected a role-name string)`);
       continue;
     }
-    const r = String(item).trim().toLowerCase();
-    if (!r) continue;
-    if (!WORKFORCE_ROLE_RE.test(r)) { errors.push(`invalid role "${item}" (use letters, digits, and . _ + -)`); continue; }
-    if (seen.has(r)) continue;
-    seen.add(r);
-    roles.push(r);
+    // A single value may itself be comma-separated (`--roles a,b`); repeated
+    // flags arrive as an array whose elements may also be comma-separated
+    // (`--roles a,b --roles c`), so split every element on commas.
+    for (const item of String(rawItem ?? '').split(',')) {
+      const r = item.trim().toLowerCase();
+      if (!r) continue;
+      if (!WORKFORCE_ROLE_RE.test(r)) { errors.push(`invalid role "${item.trim()}" (use letters, digits, and . _ + -)`); continue; }
+      if (seen.has(r)) continue;
+      seen.add(r);
+      roles.push(r);
+    }
   }
   return { roles, errors };
 }
@@ -8632,7 +8637,10 @@ function formatWorkforceStatus(report) {
 
 /** Resolve the manifest name from `--profile` (default `default`). Pure. */
 function workforceManifestName(flags) {
-  const raw = typeof flags?.profile === 'string' ? flags.profile.trim() : '';
+  // A repeated `--profile` flag arrives as a string[]; honor the last value.
+  let profile = flags?.profile;
+  if (Array.isArray(profile)) profile = profile.length ? profile[profile.length - 1] : '';
+  const raw = typeof profile === 'string' ? profile.trim() : '';
   return raw || DEFAULT_WORKFORCE_MANIFEST;
 }
 

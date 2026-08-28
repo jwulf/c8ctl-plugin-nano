@@ -46,6 +46,8 @@ test('workforceManifestName resolves --profile, defaulting to "default"', () => 
   assert.equal(workforceManifestName({}), 'default');
   assert.equal(workforceManifestName({ profile: '' }), 'default');
   assert.equal(workforceManifestName({ profile: '  full-fleet ' }), 'full-fleet');
+  assert.equal(workforceManifestName({ profile: ['a', 'full-fleet'] }), 'full-fleet');
+  assert.equal(workforceManifestName({ profile: [] }), 'default');
 });
 
 test('isValidManifestName accepts profile-charset names, rejects junk', () => {
@@ -75,6 +77,11 @@ test('parseRolesList dedupes, lowercases, and rejects invalid tokens', () => {
   const bad = parseRolesList('ok, bad:token');
   assert.deepEqual(bad.roles, ['ok']);
   assert.equal(bad.errors.length, 1);
+});
+
+test('parseRolesList splits comma-separated items inside a repeated-flag array', () => {
+  assert.deepEqual(parseRolesList(['pr-review,feature', 'bugfix']).roles, ['pr-review', 'feature', 'bugfix']);
+  assert.deepEqual(parseRolesList(['a, b', 'B ,c']).roles, ['a', 'b', 'c']);
 });
 
 test('parseRolesList rejects non-string array items instead of coercing them', () => {

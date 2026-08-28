@@ -8291,6 +8291,9 @@ function validateWorkforceManifest(parsed, file, expectedName) {
   if (parsed.version !== WORKFORCE_MANIFEST_VERSION) {
     throw new Error(`workforce manifest ${file} has unsupported version ${JSON.stringify(parsed.version)} (this build understands version ${WORKFORCE_MANIFEST_VERSION}).`);
   }
+  if (parsed.workers != null && !Array.isArray(parsed.workers)) {
+    throw new Error(`workforce manifest ${file} has a malformed "workers" field (expected an array, got ${typeof parsed.workers}).`);
+  }
   const workersRaw = Array.isArray(parsed.workers) ? parsed.workers : [];
   const workers = [];
   for (const raw of workersRaw) {
@@ -8347,7 +8350,7 @@ function listWorkforceManifestNames() {
   return entries
     .filter((f) => f.endsWith('.json'))
     .map((f) => f.slice(0, -'.json'.length))
-    .filter((n) => n)
+    .filter((n) => n && isValidManifestName(n))
     .sort();
 }
 
@@ -8435,7 +8438,9 @@ function buildWorkforceStatus(manifest, name, live, supervisorRunning) {
       const wname = workforceWorkerName(name, e.profile, i);
       desiredNames.add(wname);
       const w = liveById.get(wname) || null;
-      const state = w ? String(w.state) : 'absent';
+      // Mirror reconcile: a live worker with no `state` (older supervisor
+      // status payloads) is assumed running, not "undefined".
+      const state = w ? (w.state != null ? String(w.state) : 'running') : 'absent';
       if (state === 'running') running++;
       workers.push({
         name: wname,
@@ -8457,7 +8462,7 @@ function buildWorkforceStatus(manifest, name, live, supervisorRunning) {
   });
   const extra = liveList
     .filter((w) => w && typeof w.id === 'string' && w.id.startsWith(prefix) && !desiredNames.has(w.id))
-    .map((w) => ({ name: w.id, profile: w.profile ?? null, state: String(w.state), pid: w.pid ?? null }));
+    .map((w) => ({ name: w.id, profile: w.profile ?? null, state: w.state != null ? String(w.state) : 'running', pid: w.pid ?? null }));
   return {
     name,
     exists: Boolean(manifest),

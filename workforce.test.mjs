@@ -298,6 +298,13 @@ test('validateWorkforceManifest names the file path in entry errors', () => {
   );
 });
 
+test('validateWorkforceManifest refuses a non-array workers field (naming the path)', () => {
+  assert.throws(
+    () => validateWorkforceManifest({ version: 1, name: 'default', workers: {} }, '/tmp/torn.json'),
+    /\/tmp\/torn\.json.*malformed "workers"/,
+  );
+});
+
 // --- upsert / remove -------------------------------------------------------
 
 test('upsertManifestEntry appends then updates in place by profile', () => {
@@ -356,6 +363,22 @@ test('buildWorkforceStatus handles an absent manifest', () => {
   assert.match(formatWorkforceStatus(report), /no manifest/);
 });
 
+test('buildWorkforceStatus treats a live worker with no state field as running', () => {
+  const manifest = {
+    version: 1,
+    name: 'default',
+    workers: [{ profile: 'copilot', instances: 1, roles: 'auto' }],
+  };
+  const live = [
+    { id: 'wf-default-copilot-1', profile: 'copilot', pid: 100 }, // no `state` (older payload)
+    { id: 'wf-default-copilot-9', profile: 'copilot', pid: 109 }, // extra, no `state`
+  ];
+  const report = buildWorkforceStatus(manifest, 'default', live, true);
+  assert.equal(report.entries[0].running, 1);
+  assert.equal(report.entries[0].workers[0].state, 'running');
+  assert.equal(report.extra[0].state, 'running');
+});
+
 test('formatWorkforceManifest renders entries and empty state', () => {
   assert.match(formatWorkforceManifest(emptyWorkforceManifest('default')), /empty/);
   const m = upsertManifestEntry(emptyWorkforceManifest('default'), { profile: 'copilot', instances: 2, roles: ['pr-review'] });
@@ -397,6 +420,16 @@ test('listWorkforceManifestNames lists .json manifests', () => {
     writeWorkforceManifest(emptyWorkforceManifest('default'));
     writeWorkforceManifest(emptyWorkforceManifest('review-only'));
     assert.deepEqual(listWorkforceManifestNames(), ['default', 'review-only']);
+  });
+});
+
+test('listWorkforceManifestNames drops names that --profile could never select', () => {
+  withHome(() => {
+    writeWorkforceManifest(emptyWorkforceManifest('default'));
+    // A hand-dropped file whose stem is not a valid manifest name (has a space).
+    mkdirSync(dirname(getWorkforceManifestFile('default')), { recursive: true });
+    writeFileSync(join(dirname(getWorkforceManifestFile('default')), 'bad name.json'), '{}');
+    assert.deepEqual(listWorkforceManifestNames(), ['default']);
   });
 });
 

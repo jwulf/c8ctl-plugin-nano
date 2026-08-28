@@ -6536,11 +6536,13 @@ function extractNameFlag(parts) {
 const MAX_ADD_INSTANCES = 64;
 
 /**
- * Parse the `--instances N` count for `supervisor add`. Accepts undefined/blank
- * (defaults to 1), and a whole number in `[1, MAX_ADD_INSTANCES]`. Rejects
- * non-integers, zero/negatives, and anything over the cap with a clear message.
- * When a flag is repeated the last occurrence wins (arrays are tolerated).
- * Returns `{ count }` on success or `{ error }` on rejection. Pure.
+ * Parse the `--instances N` count for `supervisor add` / `workforce add`
+ * (the caller passes its own `cmdLabel`, which appears in the over-cap error).
+ * Accepts undefined/blank (defaults to 1), and a whole number in
+ * `[1, MAX_ADD_INSTANCES]`. Rejects non-integers, zero/negatives, and anything
+ * over the cap with a clear message. When a flag is repeated the last
+ * occurrence wins (arrays are tolerated). Returns `{ count }` on success or
+ * `{ error }` on rejection. Pure.
  */
 function parseInstancesCount(raw, cmdLabel = 'supervisor add') {
   const v = Array.isArray(raw) ? raw[raw.length - 1] : raw;

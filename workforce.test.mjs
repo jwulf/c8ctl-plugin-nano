@@ -222,6 +222,34 @@ test('reconcile: name collision with a different profile is skipped, not clobber
   assert.equal(r.collisions[0].name, 'wf-default-copilot-1');
 });
 
+test('reconcile: a skipped profile\'s live workers are protected, not stopped', () => {
+  // "claude" could not be resolved this run (missing hire), so it produces no
+  // desired workers. Its already-running workers must NOT be torn down.
+  const d = desired(['wf-default-copilot-1'], 'copilot');
+  const live = [
+    { id: 'wf-default-copilot-1', profile: 'copilot' },
+    { id: 'wf-default-claude-1', profile: 'claude' },
+    { id: 'wf-default-claude-2', profile: 'claude' },
+  ];
+  const r = reconcileWorkforce({ desired: d, live, manifest: 'default', skippedProfiles: ['claude'] });
+  assert.deepEqual(r.toStop, []); // config error tears down nothing
+  assert.deepEqual(r.protected.sort(), ['wf-default-claude-1', 'wf-default-claude-2']);
+  assert.equal(r.unchanged.length, 1);
+});
+
+test('reconcile: without skippedProfiles a removed entry\'s workers are still stopped', () => {
+  // Guard: protection is scoped to skipped profiles only — a genuine removal
+  // (entry gone, profile resolvable) still stops the surplus.
+  const d = desired(['wf-default-copilot-1'], 'copilot');
+  const live = [
+    { id: 'wf-default-copilot-1', profile: 'copilot' },
+    { id: 'wf-default-claude-1', profile: 'claude' },
+  ];
+  const r = reconcileWorkforce({ desired: d, live, manifest: 'default', skippedProfiles: [] });
+  assert.deepEqual(r.toStop, ['wf-default-claude-1']);
+  assert.deepEqual(r.protected, []);
+});
+
 // --- entry schema validation -----------------------------------------------
 
 test('normalizeManifestEntry: valid auto entry', () => {

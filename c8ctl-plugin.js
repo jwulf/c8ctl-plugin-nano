@@ -8195,15 +8195,26 @@ function expandWorkforceDesired(manifest) {
  *                   neither started (don't clobber) nor stopped (not ours).
  * Workers NOT owned by this manifest (added by hand with `supervisor add`, or
  * owned by another manifest) are never in `toStop`. `desired` is
- * `[{ name, profile, ... }]`; `live` is `[{ id, profile }]`. Pure.
+ * `[{ name, profile, ... }]`; `live` is `[{ id, profile }]`.
+ *
+ * `skippedProfiles` names manifest entries whose profile could not be resolved
+ * this run (a local config error, e.g. a deleted hire). Such an entry produces
+ * NO desired workers, so its already-running `wf-<manifest>-<profile>-*` workers
+ * would otherwise be swept into `toStop` — turning a validation error into a
+ * destructive teardown. We PROTECT those workers instead: they are left running
+ * (reported under `protected`) so a config problem never tears down part of the
+ * live fleet. Pure.
  */
-function reconcileWorkforce({ desired, live, manifest }) {
+function reconcileWorkforce({ desired, live, manifest, skippedProfiles }) {
   const prefix = workforceOwnerPrefix(manifest);
   const liveList = Array.isArray(live) ? live : [];
   const liveById = new Map();
   for (const w of liveList) { if (w && typeof w.id === 'string') liveById.set(w.id, w); }
   const desiredList = Array.isArray(desired) ? desired : [];
   const desiredNames = new Set(desiredList.map((d) => d.name));
+  const protectedPrefixes = (Array.isArray(skippedProfiles) ? skippedProfiles : [])
+    .map((p) => `${prefix}${p}-`);
+  const isProtected = (id) => protectedPrefixes.some((pp) => id.startsWith(pp));
   const toStart = [];
   const toRestart = [];
   const unchanged = [];
@@ -8221,10 +8232,15 @@ function reconcileWorkforce({ desired, live, manifest }) {
     if (existing.state != null && existing.state !== 'running') { toRestart.push(d); continue; }
     unchanged.push(d);
   }
-  const toStop = liveList
-    .filter((w) => w && typeof w.id === 'string' && w.id.startsWith(prefix) && !desiredNames.has(w.id))
-    .map((w) => w.id);
-  return { toStart, toRestart, toStop, unchanged, collisions };
+  const toStop = [];
+  const protectedWorkers = [];
+  for (const w of liveList) {
+    if (!w || typeof w.id !== 'string') continue;
+    if (!w.id.startsWith(prefix) || desiredNames.has(w.id)) continue;
+    if (isProtected(w.id)) { protectedWorkers.push(w.id); continue; }
+    toStop.push(w.id);
+  }
+  return { toStart, toRestart, toStop, unchanged, collisions, protected: protectedWorkers };
 }
 
 /**
@@ -8625,17 +8641,20 @@ async function workforceStartCmd(req, flags, manifestName) {
   // silently.
   const hires = readHiresStrict();
   const desired = [];
+  const skippedProfiles = [];
   let hadError = false;
   for (const entry of manifest.workers) {
     const stored = hires[entry.profile];
     if (!stored) {
       logger.error(`Skipping "${entry.profile}": no such hired profile (create it with c8ctl nano hire --name ${entry.profile} ...).`);
+      skippedProfiles.push(entry.profile);
       hadError = true;
       continue;
     }
     const norm = normalizeStoredProfile(entry.profile, stored);
     if (norm.error) {
       logger.error(`Skipping "${entry.profile}": ${norm.error}.`);
+      skippedProfiles.push(entry.profile);
       hadError = true;
       continue;
     }
@@ -8648,11 +8667,14 @@ async function workforceStartCmd(req, flags, manifestName) {
   const state = await startSupervisorDaemon();
   logger.info(`Supervisor daemon running (pid ${state.pid}).`);
   const { workers: live } = await fetchSupervisorWorkers();
-  const { toStart, toRestart, toStop, unchanged, collisions } = reconcileWorkforce({ desired, live, manifest: manifestName });
+  const { toStart, toRestart, toStop, unchanged, collisions, protected: protectedWorkers } = reconcileWorkforce({ desired, live, manifest: manifestName, skippedProfiles });
 
   for (const c of collisions) {
     logger.warn(`Skipping "${c.name}": a worker with that name already runs profile "${c.haveProfile}" (manifest wants "${c.wantProfile}") — not clobbering a hand-added worker.`);
     hadError = true;
+  }
+  for (const id of protectedWorkers) {
+    logger.warn(`  = kept "${id}" running (its profile could not be resolved this run — not tearing it down over a config error).`);
   }
   for (const id of toStop) {
     const res = await supervisorRequest({ op: 'remove', target: id });
@@ -8669,7 +8691,7 @@ async function workforceStartCmd(req, flags, manifestName) {
     if (res && res.ok) logger.info(`  ↻ restarted "${d.name}" (was not running)`);
     else { logger.error(`  ! could not restart "${d.name}": ${(res && res.error) || 'unknown error'}`); hadError = true; }
   }
-  logger.info(`Workforce "${manifestName}" reconciled: ${toStart.length} started, ${toRestart.length} restarted, ${toStop.length} stopped, ${unchanged.length} unchanged.`);
+  logger.info(`Workforce "${manifestName}" reconciled: ${toStart.length} started, ${toRestart.length} restarted, ${toStop.length} stopped, ${unchanged.length} unchanged${protectedWorkers.length ? `, ${protectedWorkers.length} kept (profile unresolved)` : ''}.`);
 
   await workforceStatusCmd(req, flags, manifestName);
   if (hadError) process.exit(1);

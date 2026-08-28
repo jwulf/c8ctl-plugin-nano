@@ -260,6 +260,13 @@ test('parseInstancesCount rejects counts over the per-command cap', () => {
   assert.ok(parseInstancesCount('65').error);
 });
 
+test('parseInstancesCount over-cap error names the command label', () => {
+  // Default label preserves the supervisor-add hint for existing callers.
+  assert.match(parseInstancesCount('65').error, /run "supervisor add" again/);
+  // Workforce callers pass their own label so the rerun hint is not misleading.
+  assert.match(parseInstancesCount('65', 'workforce add').error, /run "workforce add" again/);
+});
+
 // --- extractInstancesFlag --------------------------------------------------
 
 test('extractInstancesFlag pulls --instances <val> out of the token list', () => {

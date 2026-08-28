@@ -6542,7 +6542,7 @@ const MAX_ADD_INSTANCES = 64;
  * When a flag is repeated the last occurrence wins (arrays are tolerated).
  * Returns `{ count }` on success or `{ error }` on rejection. Pure.
  */
-function parseInstancesCount(raw) {
+function parseInstancesCount(raw, cmdLabel = 'supervisor add') {
   const v = Array.isArray(raw) ? raw[raw.length - 1] : raw;
   if (v === undefined || v === null || (typeof v === 'string' && v.trim() === '')) {
     return { count: 1 };
@@ -6551,7 +6551,7 @@ function parseInstancesCount(raw) {
   if (!/^\d+$/.test(s)) return { error: `Invalid --instances "${v}": use a whole number between 1 and ${MAX_ADD_INSTANCES}.` };
   const n = Number.parseInt(s, 10);
   if (n < 1) return { error: `Invalid --instances "${v}": use a whole number between 1 and ${MAX_ADD_INSTANCES}.` };
-  if (n > MAX_ADD_INSTANCES) return { error: `--instances ${n} exceeds the ${MAX_ADD_INSTANCES}-per-command cap; run "supervisor add" again to add more.` };
+  if (n > MAX_ADD_INSTANCES) return { error: `--instances ${n} exceeds the ${MAX_ADD_INSTANCES}-per-command cap; run "${cmdLabel}" again to add more.` };
   return { count: n };
 }
 
@@ -8295,7 +8295,7 @@ function normalizeManifestEntry(entry) {
   if (!entry || typeof entry !== 'object' || Array.isArray(entry)) return { error: 'entry is not an object' };
   const profile = String(entry.profile || '').trim();
   if (!profile) return { error: 'entry is missing a profile' };
-  const { count, error } = parseInstancesCount(entry.instances);
+  const { count, error } = parseInstancesCount(entry.instances, 'workforce add');
   if (error) return { error: `entry "${profile}": ${error}` };
   let roles;
   let autoScope;
@@ -8617,7 +8617,7 @@ async function workforceAddCmd(req, flags, manifestName) {
     logger.error(`No hired profile "${profile}". Create one first with: c8ctl nano hire --name ${profile} --rank <r> --command <cmd>`);
     process.exit(1);
   }
-  const { count, error } = parseInstancesCount(flags?.instances);
+  const { count, error } = parseInstancesCount(flags?.instances, 'workforce add');
   if (error) { logger.error(error); process.exit(1); }
   const auto = coerceBool(flags?.auto, false);
   const rolesFlag = flags?.roles;

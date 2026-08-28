@@ -8521,17 +8521,28 @@ function buildWorkforceStatus(manifest, name, live, supervisorRunning, manifestN
       const wname = workforceWorkerName(name, e.profile, i);
       desiredNames.add(wname);
       const w = liveById.get(wname) || null;
+      // Mirror reconcile's collision rule: a live worker occupying the desired
+      // NAME but running a DIFFERENT profile does NOT satisfy this instance
+      // (workforce start skips such a name collision rather than clobbering it).
+      // Treat it as a collision — the desired instance is effectively absent —
+      // and surface the intruding profile so status doesn't mask the clash by
+      // reporting the instance as "running".
+      const collision = w && w.profile != null && e.profile != null && String(w.profile) !== String(e.profile)
+        ? String(w.profile)
+        : null;
+      const eff = collision ? null : w;
       // Mirror reconcile: a live worker with no `state` (older supervisor
       // status payloads) is assumed running, not "undefined".
-      const state = w ? (w.state != null ? String(w.state) : 'running') : 'absent';
+      const state = eff ? (eff.state != null ? String(eff.state) : 'running') : 'absent';
       if (state === 'running') running++;
       workers.push({
         name: wname,
-        present: Boolean(w),
+        present: Boolean(eff),
         state,
-        pid: w && w.pid != null ? w.pid : null,
-        uptimeMs: w && Number.isFinite(w.uptimeMs) ? w.uptimeMs : null,
-        restarts: w ? Number(w.restarts) || 0 : 0,
+        pid: eff && eff.pid != null ? eff.pid : null,
+        uptimeMs: eff && Number.isFinite(eff.uptimeMs) ? eff.uptimeMs : null,
+        restarts: eff ? Number(eff.restarts) || 0 : 0,
+        collision,
       });
     }
     return {
@@ -8576,7 +8587,7 @@ function formatWorkforceStatus(report) {
         worker: w.name,
         profile: String(e.profile),
         desired: `${e.running}/${e.desired}`,
-        state: w.state,
+        state: w.collision ? `collision(${w.collision})` : w.state,
         pid: w.pid ? String(w.pid) : '-',
         restarts: String(w.restarts),
         uptime: w.state === 'running' && w.uptimeMs != null ? formatDuration(w.uptimeMs) : '-',

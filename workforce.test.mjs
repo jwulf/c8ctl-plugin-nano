@@ -503,6 +503,30 @@ test('buildWorkforceStatus treats a live worker with no state field as running',
   assert.equal(report.extra[0].state, 'running');
 });
 
+test('buildWorkforceStatus: a name collision with a different profile is not counted as running', () => {
+  const manifest = {
+    version: 1,
+    name: 'default',
+    workers: [{ profile: 'copilot', instances: 1, roles: 'auto' }],
+  };
+  // The desired name is taken by a worker running a DIFFERENT profile — exactly
+  // the case `workforce start`/reconcile skips as a collision. It must not
+  // satisfy the desired instance nor be counted running.
+  const live = [
+    { id: 'wf-default-copilot-1', profile: 'claude', state: 'running', pid: 100 },
+  ];
+  const report = buildWorkforceStatus(manifest, 'default', live, true);
+  assert.equal(report.entries[0].running, 0);
+  const w = report.entries[0].workers[0];
+  assert.equal(w.present, false);
+  assert.equal(w.state, 'absent');
+  assert.equal(w.collision, 'claude');
+  assert.equal(w.pid, null);
+  // The desired name is claimed, so the intruder is not "extra" either.
+  assert.equal(report.extra.length, 0);
+  assert.match(formatWorkforceStatus(report), /collision\(claude\)/);
+});
+
 test('formatWorkforceManifest renders entries and empty state', () => {
   assert.match(formatWorkforceManifest(emptyWorkforceManifest('default')), /empty/);
   const m = upsertManifestEntry(emptyWorkforceManifest('default'), { profile: 'copilot', instances: 2, roles: ['pr-review'] });

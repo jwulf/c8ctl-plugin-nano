@@ -33,6 +33,7 @@ import {
   formatWorkforceStatus,
   formatWorkforceManifest,
   workforceManifestName,
+  lastProfileValue,
 } from './c8ctl-plugin.js';
 
 // --- defaults --------------------------------------------------------------
@@ -48,6 +49,18 @@ test('workforceManifestName resolves --profile, defaulting to "default"', () => 
   assert.equal(workforceManifestName({ profile: '  full-fleet ' }), 'full-fleet');
   assert.equal(workforceManifestName({ profile: ['a', 'full-fleet'] }), 'full-fleet');
   assert.equal(workforceManifestName({ profile: [] }), 'default');
+});
+
+test('lastProfileValue honors the last --profile value, matching manifest selection', () => {
+  assert.equal(lastProfileValue({}), '');
+  assert.equal(lastProfileValue({ profile: '' }), '');
+  assert.equal(lastProfileValue({ profile: '  full-fleet ' }), 'full-fleet');
+  assert.equal(lastProfileValue({ profile: ['a', 'full-fleet'] }), 'full-fleet');
+  assert.equal(lastProfileValue({ profile: [] }), '');
+  // A trailing empty repeat must be treated as "not explicit" so listing stays
+  // consistent with the (default) manifest workforceManifestName resolves.
+  assert.equal(lastProfileValue({ profile: ['review-only', ''] }), '');
+  assert.equal(workforceManifestName({ profile: ['review-only', ''] }), 'default');
 });
 
 test('isValidManifestName accepts profile-charset names, rejects junk', () => {

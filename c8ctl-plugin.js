@@ -8685,12 +8685,15 @@ function formatWorkforceStatus(report) {
 }
 
 /** Resolve the manifest name from `--profile` (default `default`). Pure. */
-function workforceManifestName(flags) {
+function lastProfileValue(flags) {
   // A repeated `--profile` flag arrives as a string[]; honor the last value.
   let profile = flags?.profile;
   if (Array.isArray(profile)) profile = profile.length ? profile[profile.length - 1] : '';
-  const raw = typeof profile === 'string' ? profile.trim() : '';
-  return raw || DEFAULT_WORKFORCE_MANIFEST;
+  return typeof profile === 'string' ? profile.trim() : '';
+}
+
+function workforceManifestName(flags) {
+  return lastProfileValue(flags) || DEFAULT_WORKFORCE_MANIFEST;
 }
 
 /** Fetch the live supervisor worker set, or `[]` when no daemon is running. */
@@ -8804,7 +8807,7 @@ async function workforceRemoveCmd(req, flags, manifestName) {
 async function workforceListCmd(req, flags, manifestName) {
   const logger = getLogger();
   const json = coerceBool(flags?.json, false);
-  const explicitProfile = flags?.profile != null && String(flags.profile).trim() !== '';
+  const explicitProfile = lastProfileValue(flags) !== '';
   const manifest = readWorkforceManifestStrict(manifestName);
   const others = explicitProfile ? null : listWorkforceManifestNames();
   if (json) {
@@ -10861,6 +10864,7 @@ export {
   buildWorkforceStatus,
   formatWorkforceStatus,
   workforceManifestName,
+  lastProfileValue,
 };
 
 export const metadata = {

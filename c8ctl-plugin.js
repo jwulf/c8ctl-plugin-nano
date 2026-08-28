@@ -9019,8 +9019,13 @@ async function workforceStopCmd(req, flags, manifestName) {
   // status socket actually answered. A `{ workers: [] }` from an *unreachable*
   // socket is ambiguous, and treating it as "empty" would wrongly kill the
   // daemon (and any foreign workers it still supervises).
-  const { reachable: stillReachable, workers: remaining } = await fetchSupervisorWorkers();
-  if (!stillReachable) {
+  const { running: daemonStillRunning, reachable: stillReachable, workers: remaining } = await fetchSupervisorWorkers();
+  if (!daemonStillRunning) {
+    // The daemon exited/crashed between the removals and this re-check (its pid
+    // is no longer live), so there is nothing left to stop and reporting an
+    // unreachable *socket* would misdescribe a dead daemon as merely unanswered.
+    logger.warn('Supervisor daemon is no longer running.');
+  } else if (!stillReachable) {
     logger.warn('Supervisor status socket became unreachable; leaving the daemon running.');
   } else if (remaining.length === 0) {
     logger.info('No supervised workers remain — stopping the supervisor daemon.');
@@ -11003,7 +11008,7 @@ export const commands = {
       name: { type: 'string', description: 'work/supervisor add: worker name (auto ‹host›-‹profile›-‹random› if omitted); hire/assign: agent profile name' },
       rank: { type: 'string', description: 'hire: agent rank (principal|senior|junior|decider)' },
       command: { type: 'string', description: 'hire: CLI command that runs the agent harness (e.g. copilot, claude, pi)' },
-      arg: { type: 'string', multiple: true, description: 'hire/work: command-line switch/arg appended to the harness command (repeatable), e.g. --arg --allow-all. Persisted on hire; work appends more.' },
+      arg: { type: 'string', multiple: true, description: 'hire/work/workforce add: command-line switch/arg appended to the harness command (repeatable), e.g. --arg --allow-all. Persisted on hire; work appends more; workforce add sets the entry args.' },
       model: { type: 'string', description: 'hire: model name passed to the harness (AGENT_MODEL)' },
       capabilities: { type: 'string', description: 'hire/assign: comma-separated capability list' },
       sandbox: { type: 'string', description: 'hire/work: execution sandbox none|docker|podman (default none). Containers isolate each job.' },

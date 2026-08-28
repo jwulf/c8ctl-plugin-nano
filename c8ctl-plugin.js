@@ -8299,7 +8299,13 @@ function normalizeManifestEntry(entry) {
   if (error) return { error: `entry "${profile}": ${error}` };
   let roles;
   let autoScope;
-  if (entry.roles === 'auto' || entry.roles == null) {
+  // Distinguish an ABSENT `roles` field (a legitimate "default to auto") from a
+  // field that is PRESENT but malformed — including an explicit `null`, which is
+  // a torn value, not "auto". Keying on presence (mirrors the strict `workers:
+  // null` rejection above) surfaces the corruption instead of silently
+  // broadening the worker to `--auto` serving.
+  const rolesAbsent = !('roles' in entry) || entry.roles === undefined;
+  if (entry.roles === 'auto' || rolesAbsent) {
     roles = 'auto';
     const scope = typeof entry.autoScope === 'string' ? entry.autoScope.trim() : '';
     if (scope) autoScope = scope;

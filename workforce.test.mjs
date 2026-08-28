@@ -280,6 +280,18 @@ test('normalizeManifestEntry: bad roles shape rejected', () => {
   assert.ok(normalizeManifestEntry({ profile: 'x', roles: [] }).error);
 });
 
+test('normalizeManifestEntry: absent roles field defaults to auto', () => {
+  const { entry, error } = normalizeManifestEntry({ profile: 'copilot', instances: 1 });
+  assert.equal(error, undefined);
+  assert.equal(entry.roles, 'auto');
+});
+
+test('normalizeManifestEntry: explicit null roles rejected as malformed', () => {
+  const { entry, error } = normalizeManifestEntry({ profile: 'copilot', instances: 1, roles: null });
+  assert.equal(entry, undefined);
+  assert.match(error, /roles must be "auto" or an array/);
+});
+
 // --- manifest-level validation ---------------------------------------------
 
 test('validateWorkforceManifest refuses an unknown version', () => {

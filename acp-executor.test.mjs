@@ -220,6 +220,15 @@ test('ensureAcpFlag appends --acp only when ACP is not already selected', () => 
   assert.equal(ensureAcpFlag('opencode acp'), 'opencode acp');
   assert.equal(ensureAcpFlag('claude-agent-acp'), 'claude-agent-acp');
   assert.equal(ensureAcpFlag('pi-acp'), 'pi-acp');
+  // Qwen's ACP mode is a HIDDEN switch (`qwen --experimental-acp`, not in
+  // `qwen --help` but present in the shipped cli.js). A switch whose flag name
+  // ends in `-acp` selects ACP in ANY position, so it is never doubled — both
+  // raw and after buildAgentCommandLine()'s POSIX single-quoting of `--arg`.
+  assert.equal(ensureAcpFlag('qwen --experimental-acp'), 'qwen --experimental-acp');
+  assert.equal(ensureAcpFlag("qwen '--experimental-acp'"), "qwen '--experimental-acp'");
+  assert.equal(ensureAcpFlag('qwen "--experimental-acp"'), 'qwen "--experimental-acp"');
+  // The adapter's real npm bin is `claude-code-acp` — also a `-acp` command token.
+  assert.equal(ensureAcpFlag('claude-code-acp'), 'claude-code-acp');
   // Real dispatch: structured --arg tokens are POSIX single-quoted by
   // buildAgentCommandLine(), so the acp selector arrives quoted. Detection must
   // still see it and NOT double the switch.

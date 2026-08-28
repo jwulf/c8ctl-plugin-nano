@@ -482,7 +482,7 @@ function launcherEnvMarkers(resolved) {
 // Argument parsing
 // ---------------------------------------------------------------------------
 
-const VALID_SUBCOMMANDS = ['start', 'stop', 'status', 'logs', 'log', 'restart', 'pause', 'resume', 'clean', 'set', 'unset', 'config', 'update', 'hire', 'assign', 'work', 'supervisor'];
+const VALID_SUBCOMMANDS = ['start', 'stop', 'status', 'logs', 'log', 'restart', 'pause', 'resume', 'clean', 'set', 'unset', 'config', 'update', 'hire', 'assign', 'work', 'supervisor', 'workforce'];
 
 /**
  * Parse positional args + flags into a normalized request.
@@ -3961,12 +3961,12 @@ function spawnCapturePty({ command, args = [], cwd, env, stdinData, timeoutMs, i
 }
 
 // ---- ACP capture (C3 #110 — the third harness path, "minimal mode") ---------
-// Some ACP agents are native (`copilot --acp`, `opencode acp`), some ride an
-// adapter (`claude-agent-acp`, `pi-acp`). In every case the profile's command +
-// `--arg`s already assemble the ACP invocation; we only append a default `--acp`
-// switch when the assembled line doesn't already select ACP, so a native/adapter
-// invocation is never doubled. This mirrors how the pipe path spawns the line
-// under a shell.
+// Some ACP agents are native (`copilot --acp`, `qwen --experimental-acp`,
+// `opencode acp`), some ride an adapter (`claude-code-acp`, `pi-acp`). In every
+// case the profile's command + `--arg`s already assemble the ACP invocation; we
+// only append a default `--acp` switch when the assembled line doesn't already
+// select ACP, so a native/adapter invocation is never doubled. This mirrors how
+// the pipe path spawns the line under a shell.
 function ensureAcpFlag(commandLine) {
   // Detection must survive buildAgentCommandLine()'s POSIX single-quoting: a
   // structured `--arg acp` (or `--arg --acp`) lands here as the quoted token
@@ -3991,6 +3991,13 @@ function ensureAcpFlag(commandLine) {
     }
     const base = tok.replace(/^.*[\\/]/, ''); // basename, for path-form commands
     if (/^-{0,2}acp$/i.test(base)) return commandLine;
+    // A switch that NAMES acp, e.g. qwen's hidden `--experimental-acp` (present
+    // in the shipped cli.js but not in `qwen --help`) — a long/short option
+    // whose flag name ends in `-acp`. Matched in ANY position, since it is an
+    // argument to the harness command (not the command token). A bare value that
+    // merely ends in `-acp` (e.g. `--model foo-acp`) does NOT start with `-`, so
+    // it is not a switch and still (correctly) triggers the append below.
+    if (/^--?[a-z0-9][a-z0-9-]*-acp$/i.test(tok)) return commandLine;
     if (i === 0 && /-acp$/i.test(base)) return commandLine;
   }
   return `${commandLine} --acp`;
@@ -8040,6 +8047,685 @@ async function supervisorCommand(req, flags) {
 }
 
 // ---------------------------------------------------------------------------
+// workforce — declarative workforce manifests (issue #117). A manifest is a
+// named, user-curated document (`<stateHome>/workforce/<name>.json`) describing
+// a fleet of supervised workers you compose once (`workforce add`) and bring up
+// convergently with one command (`workforce start`). It is deliberately a
+// SEPARATE file per manifest — a portable artifact meant to be read, edited,
+// diffed and copied between machines — not a key in `config.json` (plugin
+// state). `workforce start` reconciles the running supervisor to the manifest
+// using deterministic `wf-<manifest>-<profile>-<index>` worker names, so a
+// second start with an unchanged manifest starts/stops/restarts nothing.
+// ---------------------------------------------------------------------------
+
+const WORKFORCE_MANIFEST_VERSION = 1;
+const DEFAULT_WORKFORCE_MANIFEST = 'default';
+
+/** The directory holding per-name workforce manifests. */
+function getWorkforceDir() {
+  return join(getStateHome(), 'workforce');
+}
+
+/** The manifest file for a given manifest name (`<stateHome>/workforce/<name>.json`). */
+function getWorkforceManifestFile(name) {
+  return join(getWorkforceDir(), `${name}.json`);
+}
+
+/**
+ * A manifest name is valid iff it is a non-empty run of `[A-Za-z0-9._-]` (same
+ * charset as a profile name). It rides in both a filename and the deterministic
+ * `wf-<name>-` worker-name prefix, so this charset keeps it safe on disk and as
+ * a broker/supervisor worker id. Pure.
+ */
+function isValidManifestName(name) {
+  return typeof name === 'string' && /^[a-z0-9][a-z0-9._-]*$/i.test(name);
+}
+
+/** An empty v1 manifest with the given name. Pure. */
+function emptyWorkforceManifest(name) {
+  return { version: WORKFORCE_MANIFEST_VERSION, name: String(name), workers: [] };
+}
+
+// A workforce role name (a capability token): starts with a letter/digit, then
+// letters/digits/`. _ + -`. No `:` (that delimits rank↔role in the mapped job
+// type). Roles are lowercased to match `normalizeCapabilities`.
+const WORKFORCE_ROLE_RE = /^[a-z0-9][a-z0-9._+-]*$/i;
+
+/**
+ * Parse a `--roles a,b,c` value (string | string[]) into a deduped, validated,
+ * lowercased list of role names. Returns `{ roles, errors }`. Pure.
+ */
+function parseRolesList(raw) {
+  const list = Array.isArray(raw) ? raw : String(raw ?? '').split(',');
+  const seen = new Set();
+  const roles = [];
+  const errors = [];
+  for (const item of list) {
+    const r = String(item).trim().toLowerCase();
+    if (!r) continue;
+    if (!WORKFORCE_ROLE_RE.test(r)) { errors.push(`invalid role "${item}" (use letters, digits, and . _ + -)`); continue; }
+    if (seen.has(r)) continue;
+    seen.add(r);
+    roles.push(r);
+  }
+  return { roles, errors };
+}
+
+/**
+ * Map an explicit role list to repeatable `--job-type <rank>:<role>` tokens,
+ * resolved AT START TIME from the manifest and the hired profile's rank —
+ * independent of what the profile was hired with (the install script hires with
+ * `--capabilities ""`). `["pr-review"]` × rank `senior` → `["senior:pr-review"]`.
+ * Pure and unit-tested.
+ */
+function rolesToJobTypes(roles, rank) {
+  if (!Array.isArray(roles)) return [];
+  const r = String(rank || '').trim();
+  return roles.map((role) => `${r}:${String(role).trim()}`);
+}
+
+/**
+ * Translate one manifest entry (+ the resolved hired-profile rank) into the
+ * `nano work` argv tail a supervised worker runs with:
+ *   - `roles: "auto"` → `--auto [--auto-scope <s>]` (no capability gate; serves
+ *     every deployed agent job type — what the install script sets).
+ *   - `roles: [...]`  → repeatable `--job-type <rank>:<role>` per role.
+ * Then any verbatim `entry.args` escape-hatch flags are appended. Neither form
+ * mutates the hired profile. Pure and unit-tested.
+ */
+function manifestEntryToWorkArgs(entry, rank) {
+  const out = [];
+  const roles = entry?.roles;
+  if (roles === 'auto' || roles == null) {
+    out.push('--auto');
+    const scope = typeof entry?.autoScope === 'string' ? entry.autoScope.trim() : '';
+    if (scope) out.push('--auto-scope', scope);
+  } else if (Array.isArray(roles)) {
+    for (const jt of rolesToJobTypes(roles, rank)) out.push('--job-type', jt);
+  }
+  for (const a of normalizeArgList(entry?.args)) out.push(a);
+  return out;
+}
+
+/** The ownership prefix for a manifest's workforce-owned workers. Pure. */
+function workforceOwnerPrefix(manifest) {
+  return `wf-${manifest}-`;
+}
+
+/** The deterministic worker name for the Nth instance of a profile. Pure. */
+function workforceWorkerName(manifest, profile, index) {
+  return `${workforceOwnerPrefix(manifest)}${profile}-${index}`;
+}
+
+/**
+ * Expand a manifest into the flat list of desired workers it describes:
+ * `[{ name, profile, index, entry }]`, one per instance. Pure.
+ */
+function expandWorkforceDesired(manifest) {
+  const name = manifest?.name;
+  const entries = Array.isArray(manifest?.workers) ? manifest.workers : [];
+  const out = [];
+  for (const entry of entries) {
+    const profile = entry?.profile;
+    const instances = Number(entry?.instances) || 0;
+    for (let i = 1; i <= instances; i++) {
+      out.push({ name: workforceWorkerName(name, profile, i), profile, index: i, entry });
+    }
+  }
+  return out;
+}
+
+/**
+ * The convergent reconcile diff for `workforce start`, factored as a PURE
+ * function over (desired workers, live supervisor workers, manifest name) so it
+ * is unit-testable directly (mirroring how `diffJobTypes` is factored):
+ *   - `toStart`   — desired workers not currently running (by exact name).
+ *   - `toStop`    — live workers OWNED by this manifest (the `wf-<manifest>-`
+ *                   name prefix) that are no longer desired (entry removed or
+ *                   `instances` reduced).
+ *   - `unchanged` — desired workers already running under the same profile.
+ *   - `collisions`— a desired name is already taken by a worker running a
+ *                   DIFFERENT profile (a hand-added worker that clashes): it is
+ *                   neither started (don't clobber) nor stopped (not ours).
+ * Workers NOT owned by this manifest (added by hand with `supervisor add`, or
+ * owned by another manifest) are never in `toStop`. `desired` is
+ * `[{ name, profile, ... }]`; `live` is `[{ id, profile }]`. Pure.
+ */
+function reconcileWorkforce({ desired, live, manifest }) {
+  const prefix = workforceOwnerPrefix(manifest);
+  const liveList = Array.isArray(live) ? live : [];
+  const liveById = new Map();
+  for (const w of liveList) { if (w && typeof w.id === 'string') liveById.set(w.id, w); }
+  const desiredList = Array.isArray(desired) ? desired : [];
+  const desiredNames = new Set(desiredList.map((d) => d.name));
+  const toStart = [];
+  const unchanged = [];
+  const collisions = [];
+  for (const d of desiredList) {
+    const existing = liveById.get(d.name);
+    if (!existing) { toStart.push(d); continue; }
+    if (existing.profile != null && d.profile != null && existing.profile !== d.profile) {
+      collisions.push({ name: d.name, wantProfile: d.profile, haveProfile: existing.profile });
+      continue;
+    }
+    unchanged.push(d);
+  }
+  const toStop = liveList
+    .filter((w) => w && typeof w.id === 'string' && w.id.startsWith(prefix) && !desiredNames.has(w.id))
+    .map((w) => w.id);
+  return { toStart, toStop, unchanged, collisions };
+}
+
+/**
+ * Validate + normalize one stored manifest entry, returning `{ entry }` or
+ * `{ error }`. Enforces: a profile string, `instances` in `[1, MAX_ADD_INSTANCES]`,
+ * and `roles` being either `"auto"` (with an optional `autoScope`) or a
+ * non-empty array of valid role names. Pure — no config/hire I/O (the profile's
+ * EXISTENCE is checked at add/start against `hires`, not here). Pure.
+ */
+function normalizeManifestEntry(entry) {
+  if (!entry || typeof entry !== 'object' || Array.isArray(entry)) return { error: 'entry is not an object' };
+  const profile = String(entry.profile || '').trim();
+  if (!profile) return { error: 'entry is missing a profile' };
+  const { count, error } = parseInstancesCount(entry.instances);
+  if (error) return { error: `entry "${profile}": ${error}` };
+  let roles;
+  let autoScope;
+  if (entry.roles === 'auto' || entry.roles == null) {
+    roles = 'auto';
+    const scope = typeof entry.autoScope === 'string' ? entry.autoScope.trim() : '';
+    if (scope) autoScope = scope;
+  } else if (Array.isArray(entry.roles)) {
+    const { roles: rs, errors } = parseRolesList(entry.roles);
+    if (errors.length) return { error: `entry "${profile}": ${errors.join('; ')}` };
+    if (rs.length === 0) return { error: `entry "${profile}": roles array is empty` };
+    roles = rs;
+  } else {
+    return { error: `entry "${profile}": roles must be "auto" or an array of role names` };
+  }
+  const args = normalizeArgList(entry.args);
+  const out = { profile, instances: count, roles };
+  if (autoScope) out.autoScope = autoScope;
+  if (args.length) out.args = args;
+  return { entry: out };
+}
+
+/**
+ * Validate a parsed manifest object against the v1 schema, THROWING a clear
+ * error naming the file path on any problem (mirroring `readConfigStrict()`'s
+ * "absent vs unreadable" distinction — a torn/unknown manifest is never silently
+ * treated as empty). Refuses an unknown `version` rather than best-effort
+ * parsing. Returns the normalized manifest.
+ */
+function validateWorkforceManifest(parsed, file, expectedName) {
+  if (!parsed || typeof parsed !== 'object' || Array.isArray(parsed)) {
+    throw new Error(`workforce manifest ${file} is malformed (expected a JSON object).`);
+  }
+  if (parsed.version !== WORKFORCE_MANIFEST_VERSION) {
+    throw new Error(`workforce manifest ${file} has unsupported version ${JSON.stringify(parsed.version)} (this build understands version ${WORKFORCE_MANIFEST_VERSION}).`);
+  }
+  const workersRaw = Array.isArray(parsed.workers) ? parsed.workers : [];
+  const workers = [];
+  for (const raw of workersRaw) {
+    const norm = normalizeManifestEntry(raw);
+    if (norm.error) throw new Error(`workforce manifest ${file}: ${norm.error}.`);
+    workers.push(norm.entry);
+  }
+  const name = typeof parsed.name === 'string' && parsed.name.trim() ? parsed.name.trim() : String(expectedName || '');
+  return { version: WORKFORCE_MANIFEST_VERSION, name, workers };
+}
+
+/**
+ * Read + validate a manifest by name. Returns the normalized manifest, or
+ * `null` when the file is absent. THROWS (naming the path) on an unreadable
+ * file, torn/non-JSON content, or a schema/version violation — so callers never
+ * mistake "unreadable" for "empty".
+ */
+function readWorkforceManifestStrict(name) {
+  const file = getWorkforceManifestFile(name);
+  if (!existsSync(file)) return null;
+  let raw;
+  try { raw = readFileSync(file, 'utf-8'); }
+  catch (err) { throw new Error(`could not read workforce manifest ${file}: ${err.message}`); }
+  let parsed;
+  try { parsed = JSON.parse(raw); }
+  catch (err) { throw new Error(`workforce manifest ${file} is not valid JSON: ${err.message}`); }
+  return validateWorkforceManifest(parsed, file, name);
+}
+
+/** Atomically persist a manifest to `<stateHome>/workforce/<name>.json`. */
+function writeWorkforceManifest(manifest) {
+  mkdirSync(getWorkforceDir(), { recursive: true });
+  const target = getWorkforceManifestFile(manifest.name);
+  const tmp = `${target}.${process.pid}.${Date.now()}.tmp`;
+  writeFileSync(tmp, JSON.stringify(manifest, null, 2));
+  try { renameSync(tmp, target); }
+  catch (err) { try { rmSync(tmp, { force: true }); } catch { /* best effort */ } throw err; }
+}
+
+/** All manifest names that exist on disk (sorted). Best-effort IO. */
+function listWorkforceManifestNames() {
+  let entries;
+  try { entries = readdirSync(getWorkforceDir()); }
+  catch { return []; }
+  return entries
+    .filter((f) => f.endsWith('.json'))
+    .map((f) => f.slice(0, -'.json'.length))
+    .filter((n) => n)
+    .sort();
+}
+
+/**
+ * Append or update-in-place a manifest entry, matched by `profile` (idempotent,
+ * matching `hire`'s update-in-place semantics). Returns a new manifest. Pure.
+ */
+function upsertManifestEntry(manifest, entry) {
+  const workers = Array.isArray(manifest.workers) ? manifest.workers.slice() : [];
+  const idx = workers.findIndex((w) => w && w.profile === entry.profile);
+  if (idx >= 0) workers[idx] = entry; else workers.push(entry);
+  return { ...manifest, workers };
+}
+
+/**
+ * Drop a manifest entry by profile, or clear ALL entries when `profile` is
+ * `"all"`. Returns `{ manifest, removed }` where `removed` lists the dropped
+ * profiles. Pure.
+ */
+function removeManifestEntry(manifest, profile) {
+  const workers = Array.isArray(manifest.workers) ? manifest.workers : [];
+  if (profile === 'all') {
+    return { manifest: { ...manifest, workers: [] }, removed: workers.map((w) => w && w.profile).filter(Boolean) };
+  }
+  const kept = [];
+  let removed = null;
+  for (const w of workers) {
+    if (w && w.profile === profile) removed = w.profile;
+    else kept.push(w);
+  }
+  return { manifest: { ...manifest, workers: kept }, removed: removed ? [removed] : [] };
+}
+
+/** Human-readable one-line summary of an entry's roles. Pure. */
+function describeEntryRoles(entry) {
+  if (Array.isArray(entry?.roles)) return entry.roles.join(', ');
+  const scope = typeof entry?.autoScope === 'string' && entry.autoScope ? ` (scope ${entry.autoScope})` : '';
+  return `auto${scope}`;
+}
+
+/** Render a manifest as an aligned text table for `workforce list`. Pure. */
+function formatWorkforceManifest(manifest) {
+  const lines = [];
+  lines.push(`Workforce "${manifest.name}" (v${manifest.version ?? WORKFORCE_MANIFEST_VERSION}):`);
+  const entries = Array.isArray(manifest.workers) ? manifest.workers : [];
+  if (entries.length === 0) {
+    lines.push('  (empty — add workers with: c8ctl nano workforce add <profile> --instances N [--auto|--roles a,b])');
+    return lines.join('\n');
+  }
+  const rows = entries.map((e) => ({
+    profile: String(e.profile),
+    instances: String(e.instances ?? 1),
+    roles: describeEntryRoles(e),
+    args: Array.isArray(e.args) && e.args.length ? e.args.join(' ') : '-',
+  }));
+  const head = { profile: 'PROFILE', instances: 'INSTANCES', roles: 'ROLES', args: 'ARGS' };
+  const cols = ['profile', 'instances', 'roles', 'args'];
+  const width = {};
+  for (const c of cols) width[c] = Math.max(head[c].length, ...rows.map((r) => r[c].length));
+  const fmt = (r) => '  ' + cols.map((c) => r[c].padEnd(width[c])).join('  ');
+  lines.push(fmt(head));
+  for (const r of rows) lines.push(fmt(r));
+  return lines.join('\n');
+}
+
+/**
+ * Build the `workforce status` report — the manifest's entries joined against
+ * the live supervisor worker set — as a plain data object (also the `--json`
+ * shape). For each entry it reports desired vs actual instance counts and the
+ * per-instance worker (present/state/pid/uptime/restarts); plus `extra` workers
+ * owned by this manifest (the `wf-<name>-` prefix) that no entry desires. Pure
+ * over its inputs. `live` is an array of summarized supervisor workers.
+ */
+function buildWorkforceStatus(manifest, name, live, supervisorRunning) {
+  const prefix = workforceOwnerPrefix(name);
+  const liveList = Array.isArray(live) ? live : [];
+  const liveById = new Map();
+  for (const w of liveList) { if (w && typeof w.id === 'string') liveById.set(w.id, w); }
+  const entriesRaw = Array.isArray(manifest?.workers) ? manifest.workers : [];
+  const desiredNames = new Set();
+  const entries = entriesRaw.map((e) => {
+    const workers = [];
+    let running = 0;
+    for (let i = 1; i <= (Number(e.instances) || 0); i++) {
+      const wname = workforceWorkerName(name, e.profile, i);
+      desiredNames.add(wname);
+      const w = liveById.get(wname) || null;
+      const state = w ? String(w.state) : 'absent';
+      if (state === 'running') running++;
+      workers.push({
+        name: wname,
+        present: Boolean(w),
+        state,
+        pid: w && w.pid != null ? w.pid : null,
+        uptimeMs: w && Number.isFinite(w.uptimeMs) ? w.uptimeMs : null,
+        restarts: w ? Number(w.restarts) || 0 : 0,
+      });
+    }
+    return {
+      profile: e.profile,
+      roles: e.roles,
+      autoScope: e.autoScope ?? null,
+      desired: Number(e.instances) || 0,
+      running,
+      workers,
+    };
+  });
+  const extra = liveList
+    .filter((w) => w && typeof w.id === 'string' && w.id.startsWith(prefix) && !desiredNames.has(w.id))
+    .map((w) => ({ name: w.id, profile: w.profile ?? null, state: String(w.state), pid: w.pid ?? null }));
+  return {
+    name,
+    exists: Boolean(manifest),
+    supervisorRunning: Boolean(supervisorRunning),
+    entries,
+    extra,
+  };
+}
+
+/** Render a `buildWorkforceStatus` report as an aligned text table. Pure. */
+function formatWorkforceStatus(report) {
+  const lines = [];
+  lines.push(`Workforce "${report.name}":`);
+  if (!report.exists) {
+    lines.push('  (no manifest — create one with: c8ctl nano workforce add <profile> ...)');
+    return lines.join('\n');
+  }
+  lines.push(`  supervisor: ${report.supervisorRunning ? 'running' : 'not running'}`);
+  const entries = Array.isArray(report.entries) ? report.entries : [];
+  if (entries.length === 0) {
+    lines.push('  (empty manifest)');
+    return lines.join('\n');
+  }
+  const rows = [];
+  for (const e of entries) {
+    for (const w of e.workers) {
+      rows.push({
+        worker: w.name,
+        profile: String(e.profile),
+        desired: `${e.running}/${e.desired}`,
+        state: w.state,
+        pid: w.pid ? String(w.pid) : '-',
+        restarts: String(w.restarts),
+        uptime: w.state === 'running' && w.uptimeMs != null ? formatDuration(w.uptimeMs) : '-',
+      });
+    }
+  }
+  if (rows.length > 0) {
+    const head = { worker: 'WORKER', profile: 'PROFILE', desired: 'RUN/WANT', state: 'STATE', pid: 'PID', restarts: 'RESTARTS', uptime: 'UPTIME' };
+    const cols = ['worker', 'profile', 'desired', 'state', 'pid', 'restarts', 'uptime'];
+    const width = {};
+    for (const c of cols) width[c] = Math.max(head[c].length, ...rows.map((r) => r[c].length));
+    const fmt = (r) => '  ' + cols.map((c) => r[c].padEnd(width[c])).join('  ');
+    lines.push('');
+    lines.push(fmt(head));
+    for (const r of rows) lines.push(fmt(r));
+  }
+  const missing = entries.filter((e) => e.running < e.desired);
+  if (missing.length > 0) {
+    lines.push('');
+    lines.push(`  Missing: ${missing.map((e) => `${e.profile} (${e.running}/${e.desired})`).join(', ')} — run: c8ctl nano workforce start${report.name === DEFAULT_WORKFORCE_MANIFEST ? '' : ` --profile ${report.name}`}`);
+  }
+  if (Array.isArray(report.extra) && report.extra.length > 0) {
+    lines.push('');
+    lines.push(`  Extra (owned by this workforce, not desired): ${report.extra.map((w) => w.name).join(', ')} — will be stopped on next start.`);
+  }
+  return lines.join('\n');
+}
+
+/** Resolve the manifest name from `--profile` (default `default`). Pure. */
+function workforceManifestName(flags) {
+  const raw = flags?.profile != null ? String(flags.profile).trim() : '';
+  return raw || DEFAULT_WORKFORCE_MANIFEST;
+}
+
+/** Fetch the live supervisor worker set, or `[]` when no daemon is running. */
+async function fetchSupervisorWorkers() {
+  const running = await liveSupervisor();
+  if (!running) return { running: false, workers: [] };
+  try {
+    const res = await supervisorRequest({ op: 'status' });
+    if (res && res.ok) return { running: true, workers: Array.isArray(res.workers) ? res.workers : [] };
+  } catch { /* socket unreachable */ }
+  return { running: true, workers: [] };
+}
+
+async function workforceAddCmd(req, flags, manifestName) {
+  const logger = getLogger();
+  const profile = req.positional[1];
+  if (!profile) {
+    logger.error('Usage: c8ctl nano workforce add <profile> [--instances <n>] [--auto [--auto-scope <s>] | --roles a,b,c] [--arg <flag> ...] [--profile <manifest>]');
+    process.exit(1);
+  }
+  if (!isValidProfileName(profile)) {
+    logger.error(`Invalid profile name "${profile}". Use letters, digits, dot, dash or underscore.`);
+    process.exit(1);
+  }
+  // The profile must be a hired profile — validated here at `add` and again at
+  // `start`. readHiresStrict throws on a torn config (surfaced by the handler).
+  const hires = readHiresStrict();
+  if (!hires[profile]) {
+    logger.error(`No hired profile "${profile}". Create one first with: c8ctl nano hire --name ${profile} --rank <r> --command <cmd>`);
+    process.exit(1);
+  }
+  const { count, error } = parseInstancesCount(flags?.instances);
+  if (error) { logger.error(error); process.exit(1); }
+  const auto = coerceBool(flags?.auto, false);
+  const rolesFlag = flags?.roles;
+  const hasRoles = rolesFlag != null && String(rolesFlag).trim() !== '';
+  const autoScope = flags?.['auto-scope'] != null ? String(flags['auto-scope']).trim() : '';
+  if (auto && hasRoles) {
+    logger.error('--auto and --roles are mutually exclusive: an entry is either "auto" (serve all deployed job types) or an explicit role list.');
+    process.exit(1);
+  }
+  if (autoScope && !auto) {
+    logger.error('--auto-scope requires --auto.');
+    process.exit(1);
+  }
+  let entry;
+  if (hasRoles) {
+    const { roles, errors } = parseRolesList(rolesFlag);
+    if (errors.length) { logger.error(errors.join('; ')); process.exit(1); }
+    if (roles.length === 0) { logger.error('--roles must name at least one role.'); process.exit(1); }
+    entry = { profile, instances: count, roles };
+  } else {
+    // Neither --auto nor --roles → default to "auto" (serve every deployed agent
+    // job type), the onboarding/install-script happy path.
+    entry = { profile, instances: count, roles: 'auto' };
+    if (autoScope) entry.autoScope = autoScope;
+  }
+  const extraArgs = normalizeArgList(flags?.arg);
+  if (extraArgs.length) entry.args = extraArgs;
+
+  let manifest = readWorkforceManifestStrict(manifestName) || emptyWorkforceManifest(manifestName);
+  const existed = (manifest.workers || []).some((w) => w && w.profile === profile);
+  manifest = upsertManifestEntry(manifest, entry);
+  writeWorkforceManifest(manifest);
+  logger.info(`${existed ? 'Updated' : 'Added'} "${profile}" in workforce "${manifestName}": instances ${count}, roles ${describeEntryRoles(entry)}${extraArgs.length ? `, args ${extraArgs.join(' ')}` : ''}.`);
+  logger.info(`Bring it up with: c8ctl nano workforce start${manifestName === DEFAULT_WORKFORCE_MANIFEST ? '' : ` --profile ${manifestName}`}`);
+}
+
+async function workforceRemoveCmd(req, flags, manifestName) {
+  const logger = getLogger();
+  const profile = req.positional[1];
+  if (!profile) {
+    logger.error('Usage: c8ctl nano workforce remove <profile|all> [--profile <manifest>]');
+    process.exit(1);
+  }
+  const manifest = readWorkforceManifestStrict(manifestName);
+  if (!manifest) { logger.warn(`Workforce "${manifestName}" does not exist — nothing to remove.`); return; }
+  const { manifest: next, removed } = removeManifestEntry(manifest, profile);
+  if (removed.length === 0) { logger.warn(`No entry for "${profile}" in workforce "${manifestName}".`); return; }
+  writeWorkforceManifest(next);
+  if (profile === 'all') logger.info(`Cleared workforce "${manifestName}" (${removed.length} entr${removed.length === 1 ? 'y' : 'ies'} removed).`);
+  else logger.info(`Removed "${profile}" from workforce "${manifestName}".`);
+}
+
+async function workforceListCmd(req, flags, manifestName) {
+  const logger = getLogger();
+  const json = coerceBool(flags?.json, false);
+  const explicitProfile = flags?.profile != null && String(flags.profile).trim() !== '';
+  const manifest = readWorkforceManifestStrict(manifestName);
+  const others = explicitProfile ? null : listWorkforceManifestNames();
+  if (json) {
+    const payload = { manifest: manifest || null };
+    if (others) payload.manifests = others;
+    logger.output(JSON.stringify(payload, null, 2));
+    return;
+  }
+  if (!manifest) {
+    logger.info(`Workforce "${manifestName}" does not exist. Create it with: c8ctl nano workforce add <profile> --instances N [--auto|--roles a,b]`);
+  } else {
+    logger.output(formatWorkforceManifest(manifest));
+  }
+  if (others && others.length > 0) {
+    logger.info('');
+    logger.info(`Manifests on this machine: ${others.join(', ')}`);
+  }
+}
+
+async function workforceStartCmd(req, flags, manifestName) {
+  const logger = getLogger();
+  const manifest = readWorkforceManifestStrict(manifestName);
+  if (!manifest || !Array.isArray(manifest.workers) || manifest.workers.length === 0) {
+    logger.info(`Workforce "${manifestName}" is empty — nothing to start. Add workers with: c8ctl nano workforce add <profile> --instances N [--auto|--roles a,b]`);
+    return; // friendly, exit 0
+  }
+  // Resolve each entry's profile → rank and its work args. A profile deleted
+  // since it was added yields a clear error, is skipped, and forces a non-zero
+  // exit at the end — a partial start never leaves a half-reconciled fleet
+  // silently.
+  const hires = readHiresStrict();
+  const desired = [];
+  let hadError = false;
+  for (const entry of manifest.workers) {
+    const stored = hires[entry.profile];
+    if (!stored) {
+      logger.error(`Skipping "${entry.profile}": no such hired profile (create it with c8ctl nano hire --name ${entry.profile} ...).`);
+      hadError = true;
+      continue;
+    }
+    const norm = normalizeStoredProfile(entry.profile, stored);
+    if (norm.error) {
+      logger.error(`Skipping "${entry.profile}": ${norm.error}.`);
+      hadError = true;
+      continue;
+    }
+    const args = manifestEntryToWorkArgs(entry, norm.profile.rank);
+    for (let i = 1; i <= entry.instances; i++) {
+      desired.push({ name: workforceWorkerName(manifestName, entry.profile, i), profile: entry.profile, args });
+    }
+  }
+
+  const state = await startSupervisorDaemon();
+  logger.info(`Supervisor daemon running (pid ${state.pid}).`);
+  const { workers: live } = await fetchSupervisorWorkers();
+  const { toStart, toStop, unchanged, collisions } = reconcileWorkforce({ desired, live, manifest: manifestName });
+
+  for (const c of collisions) {
+    logger.warn(`Skipping "${c.name}": a worker with that name already runs profile "${c.haveProfile}" (manifest wants "${c.wantProfile}") — not clobbering a hand-added worker.`);
+    hadError = true;
+  }
+  for (const id of toStop) {
+    const res = await supervisorRequest({ op: 'remove', target: id });
+    if (res && res.ok) logger.info(`  - stopped "${id}" (no longer desired)`);
+    else { logger.error(`  ! could not stop "${id}": ${(res && res.error) || 'unknown error'}`); hadError = true; }
+  }
+  for (const d of toStart) {
+    const res = await supervisorRequest({ op: 'add', profile: d.profile, name: d.name, args: d.args });
+    if (res && res.ok) logger.info(`  + started "${d.name}" (profile ${d.profile})`);
+    else { logger.error(`  ! could not start "${d.name}": ${(res && res.error) || 'unknown error'}`); hadError = true; }
+  }
+  logger.info(`Workforce "${manifestName}" reconciled: ${toStart.length} started, ${toStop.length} stopped, ${unchanged.length} unchanged.`);
+
+  await workforceStatusCmd(req, flags, manifestName);
+  if (hadError) process.exit(1);
+}
+
+async function workforceStatusCmd(req, flags, manifestName) {
+  const logger = getLogger();
+  const json = coerceBool(flags?.json, false);
+  const manifest = readWorkforceManifestStrict(manifestName);
+  const { running, workers: live } = await fetchSupervisorWorkers();
+  const report = buildWorkforceStatus(manifest, manifestName, live, running);
+  if (json) { logger.output(JSON.stringify(report, null, 2)); return; }
+  logger.output(formatWorkforceStatus(report));
+}
+
+async function workforceStopCmd(req, flags, manifestName) {
+  const logger = getLogger();
+  const running = await liveSupervisor();
+  if (!running) { logger.warn('Supervisor is not running — nothing to stop.'); return; }
+  const prefix = workforceOwnerPrefix(manifestName);
+  const { workers: live } = await fetchSupervisorWorkers();
+  const owned = live
+    .filter((w) => w && typeof w.id === 'string' && w.id.startsWith(prefix))
+    .map((w) => w.id);
+  if (owned.length === 0) {
+    logger.info(`No workers from workforce "${manifestName}" are running.`);
+  } else {
+    for (const id of owned) {
+      const res = await supervisorRequest({ op: 'remove', target: id });
+      if (res && res.ok) logger.info(`Removed worker "${id}".`);
+      else logger.error(`Could not remove "${id}": ${(res && res.error) || 'unknown error'}`);
+    }
+  }
+  // If no supervised workers remain, stop the daemon too.
+  const { workers: remaining } = await fetchSupervisorWorkers();
+  if (remaining.length === 0) {
+    logger.info('No supervised workers remain — stopping the supervisor daemon.');
+    await supervisorStopCmd();
+  } else {
+    logger.info(`${remaining.length} other supervised worker(s) remain; leaving the daemon running.`);
+  }
+}
+
+async function workforceCommand(req, flags) {
+  const logger = getLogger();
+  const action = (req.positional[0] || '').toLowerCase();
+  const manifestName = workforceManifestName(flags);
+  if (!isValidManifestName(manifestName)) {
+    logger.error(`Invalid --profile "${manifestName}". Use letters, digits, dot, dash or underscore.`);
+    process.exit(1);
+  }
+  switch (action) {
+    case 'add':
+      await workforceAddCmd(req, flags, manifestName);
+      return;
+    case 'remove':
+    case 'rm':
+      await workforceRemoveCmd(req, flags, manifestName);
+      return;
+    case 'list':
+    case 'ls':
+      await workforceListCmd(req, flags, manifestName);
+      return;
+    case 'start':
+    case 'up':
+      await workforceStartCmd(req, flags, manifestName);
+      return;
+    case 'status':
+      await workforceStatusCmd(req, flags, manifestName);
+      return;
+    case 'stop':
+    case 'down':
+      await workforceStopCmd(req, flags, manifestName);
+      return;
+    default:
+      logger.error(`Unknown workforce action "${action}". Use: add|remove|list|start|status|stop`);
+      process.exit(1);
+  }
+}
+
+// ---------------------------------------------------------------------------
 // update — pull a new nanobpmn release onto a machine with an existing install.
 // The plugin (and the bundled server binary, shipped via the matching platform
 // package) is distributed on npm as c8ctl-plugin-nano, so a release is pulled by
@@ -9831,6 +10517,34 @@ export {
   getSupervisorStateFile,
 };
 
+export {
+  WORKFORCE_MANIFEST_VERSION,
+  DEFAULT_WORKFORCE_MANIFEST,
+  isValidManifestName,
+  emptyWorkforceManifest,
+  parseRolesList,
+  rolesToJobTypes,
+  manifestEntryToWorkArgs,
+  workforceOwnerPrefix,
+  workforceWorkerName,
+  expandWorkforceDesired,
+  reconcileWorkforce,
+  normalizeManifestEntry,
+  validateWorkforceManifest,
+  readWorkforceManifestStrict,
+  writeWorkforceManifest,
+  listWorkforceManifestNames,
+  getWorkforceDir,
+  getWorkforceManifestFile,
+  upsertManifestEntry,
+  removeManifestEntry,
+  describeEntryRoles,
+  formatWorkforceManifest,
+  buildWorkforceStatus,
+  formatWorkforceStatus,
+  workforceManifestName,
+};
+
 export const metadata = {
   name: 'c8ctl-plugin-nano',
   description: 'Start, inspect, and stop a local Nano BPM (nanobpmn) cluster',
@@ -9883,6 +10597,13 @@ export const metadata = {
         { command: 'c8ctl nano supervisor add reviewer --instances 3', description: 'Add 3 distinct auto-named instances of a profile in one call' },
         { command: 'c8ctl nano supervisor restart reviewer', description: 'Restart a supervised worker by id or profile' },
         { command: 'c8ctl nano supervisor stop', description: 'Stop the supervisor daemon and all its workers' },
+        { command: 'c8ctl nano workforce add copilot --instances 5 --auto', description: 'Compose a reusable fleet: 5 copilot workers serving every deployed agent job type (--auto)' },
+        { command: 'c8ctl nano workforce add qwen --instances 2 --roles pr-review,feature', description: 'Add an entry mapped to explicit job types (senior:pr-review, senior:feature) at start — does not mutate the hired profile' },
+        { command: 'c8ctl nano workforce start', description: "Ensure the daemon is up, then reconcile running workers to the 'default' manifest (idempotent — a second run changes nothing)" },
+        { command: 'c8ctl nano workforce start --profile review-only', description: 'Bring up a named manifest (<stateHome>/workforce/review-only.json)' },
+        { command: 'c8ctl nano workforce status --json', description: 'Manifest entries joined against live supervisor status (desired vs actual), machine-readable for the install script / CI' },
+        { command: 'c8ctl nano workforce list', description: 'Print the default manifest and list the manifests that exist on this machine' },
+        { command: 'c8ctl nano workforce stop', description: "Remove this manifest's workers; stop the daemon too if no supervised workers remain" },
       ],
     },
     processos: {
@@ -9954,6 +10675,9 @@ export const commands = {
       worker: { type: 'string', multiple: true, description: 'supervisor start: profile to launch as a supervised worker (repeatable)' },
       instances: { type: 'string', description: `supervisor add: spawn N distinct auto-named instances of the profile in one call (default 1, max ${MAX_ADD_INSTANCES}; cannot combine with --name)` },
       attach: { type: 'boolean', description: 'supervisor start: attach the interactive console after starting the daemon' },
+      profile: { type: 'string', description: `workforce: manifest name to operate on (default ${DEFAULT_WORKFORCE_MANIFEST}); each subcommand reads/writes <stateHome>/workforce/<name>.json` },
+      roles: { type: 'string', description: 'workforce add: comma-separated role list for the entry (→ --job-type <rank>:<role> at start); mutually exclusive with --auto' },
+      json: { type: 'boolean', description: 'workforce list/status: emit machine-readable JSON (for the install script / CI)' },
     },
     handler: async (args, flags) => {
       const logger = getLogger();
@@ -10016,6 +10740,9 @@ export const commands = {
             break;
           case 'supervisor':
             await supervisorCommand(req, flags);
+            break;
+          case 'workforce':
+            await workforceCommand(req, flags);
             break;
         }
       } catch (error) {
@@ -10110,6 +10837,7 @@ function printUsage() {
   console.log('  c8ctl nano assign <profileName> <cap[,cap...]> [--name <n>] [--capabilities <a,b>]');
   console.log('  c8ctl nano work <profileName> [--auto [--auto-scope <p>]] [--arg <switch> ...] [--recovery-window <ms>] [--idle-timeout <ms>] [--job-timeout <ms>] [--poll-timeout <ms>] [--job-type <token> ...] [--sandbox none|docker|podman] [--image <ref>] [--env NAME=VALUE ...] [--secret-resolver host] [--min-free-mb <n>] [--clone-timeout <ms>] [--keep-runs] [--stream]');
   console.log('  c8ctl nano supervisor [start|status|add|remove|restart|stop|logs|attach] ... (manage many workers from one terminal)');
+  console.log('  c8ctl nano workforce [add|remove|list|start|status|stop] ... [--profile <manifest>] (declarative, reusable fleet manifests)');
   console.log('');
   console.log('Subcommands:');
   console.log('  start    Spawn an N-node local cluster wired to talk to each other on localhost');
@@ -10128,6 +10856,7 @@ function printUsage() {
   console.log('  assign   Grant new capabilities (roles) to an existing hire (additive; comma-separated; workers hot-reload)');
   console.log('  work     Run a hired profile as Nano job workers, polling for work until Ctrl-C');
   console.log('  supervisor  Run/manage a fleet of workers from one terminal (detachable console + non-interactive control)');
+  console.log('  workforce   Compose a reusable, declarative fleet manifest and reconcile it up/down (add|remove|list|start|status|stop)');
   console.log('');
   console.log('Options:');
   console.log('  <nodes>              Number of nodes to start (default 1)');

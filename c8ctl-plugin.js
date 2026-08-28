@@ -6553,7 +6553,16 @@ function parseInstancesCount(raw, cmdLabel = 'supervisor add') {
   if (!/^\d+$/.test(s)) return { error: `Invalid --instances "${v}": use a whole number between 1 and ${MAX_ADD_INSTANCES}.` };
   const n = Number.parseInt(s, 10);
   if (n < 1) return { error: `Invalid --instances "${v}": use a whole number between 1 and ${MAX_ADD_INSTANCES}.` };
-  if (n > MAX_ADD_INSTANCES) return { error: `--instances ${n} exceeds the ${MAX_ADD_INSTANCES}-per-command cap; run "${cmdLabel}" again to add more.` };
+  if (n > MAX_ADD_INSTANCES) {
+    // `supervisor add` accumulates workers, so exceeding the cap can be worked
+    // around by re-running the command. Workforce entries are updated in place,
+    // so the cap is a hard per-entry maximum — the rerun hint would mislead.
+    return {
+      error: cmdLabel === 'supervisor add'
+        ? `--instances ${n} exceeds the ${MAX_ADD_INSTANCES}-per-command cap; run "${cmdLabel}" again to add more.`
+        : `--instances ${n} exceeds the ${MAX_ADD_INSTANCES}-per-entry maximum.`,
+    };
+  }
   return { count: n };
 }
 
@@ -8787,7 +8796,10 @@ async function workforceStartCmd(req, flags, manifestName) {
   }
   logger.info(`Workforce "${manifestName}" reconciled: ${toStart.length} started, ${toRestart.length} restarted, ${toStop.length} stopped, ${unchanged.length} unchanged${protectedWorkers.length ? `, ${protectedWorkers.length} kept (profile unresolved)` : ''}.`);
 
-  await workforceStatusCmd(req, flags, manifestName);
+  // `--json` is documented for `workforce list/status` only; forcing it off here
+  // keeps `workforce start --json` from appending a stray JSON blob to start's
+  // human-readable log (which would be neither pure text nor machine-readable).
+  await workforceStatusCmd(req, { ...flags, json: false }, manifestName);
   if (hadError) process.exit(1);
 }
 

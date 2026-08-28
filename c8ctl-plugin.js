@@ -8247,15 +8247,16 @@ function expandWorkforceDesired(manifest) {
  * live fleet. Pure.
  */
 function reconcileWorkforce({ desired, live, manifest, skippedProfiles, manifestNames }) {
-  const prefix = workforceOwnerPrefix(manifest);
   const liveList = Array.isArray(live) ? live : [];
   const liveById = new Map();
   for (const w of liveList) { if (w && typeof w.id === 'string') liveById.set(w.id, w); }
   const desiredList = Array.isArray(desired) ? desired : [];
   const desiredNames = new Set(desiredList.map((d) => d.name));
-  const protectedPrefixes = (Array.isArray(skippedProfiles) ? skippedProfiles : [])
-    .map((p) => `${prefix}${p}-`);
-  const isProtected = (id) => protectedPrefixes.some((pp) => id.startsWith(pp));
+  const protectedProfiles = new Set(Array.isArray(skippedProfiles) ? skippedProfiles : []);
+  // Compare the worker id's EMBEDDED profile exactly against skippedProfiles.
+  // A prefix `startsWith` check would over-match when profile names contain '-'
+  // (e.g. skipping "a" must not protect "a-b"'s `wf-<manifest>-a-b-*` workers).
+  const isProtected = (id) => protectedProfiles.has(workforceProfileFromWorkerName(manifest, id));
   const toStart = [];
   const toRestart = [];
   const unchanged = [];

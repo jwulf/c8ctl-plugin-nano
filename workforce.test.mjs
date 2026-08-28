@@ -239,6 +239,21 @@ test('reconcile: a skipped profile\'s live workers are protected, not stopped', 
   assert.equal(r.unchanged.length, 1);
 });
 
+test('reconcile: a skipped profile with a dash prefix does not protect a longer profile\'s workers', () => {
+  // "a" is skipped; "a-b" is a genuine removal. A prefix `startsWith` check on
+  // `wf-default-a-` would wrongly protect `wf-default-a-b-*`; embedded-profile
+  // parsing compares exactly, so only "a"'s workers are protected.
+  const d = desired(['wf-default-copilot-1'], 'copilot');
+  const live = [
+    { id: 'wf-default-copilot-1', profile: 'copilot' },
+    { id: 'wf-default-a-1', profile: 'a' },
+    { id: 'wf-default-a-b-1', profile: 'a-b' },
+  ];
+  const r = reconcileWorkforce({ desired: d, live, manifest: 'default', skippedProfiles: ['a'] });
+  assert.deepEqual(r.protected, ['wf-default-a-1']); // only exact-profile "a"
+  assert.deepEqual(r.toStop, ['wf-default-a-b-1']);  // "a-b" is not protected
+});
+
 test('reconcile: without skippedProfiles a removed entry\'s workers are still stopped', () => {
   // Guard: protection is scoped to skipped profiles only — a genuine removal
   // (entry gone, profile resolvable) still stops the surplus.

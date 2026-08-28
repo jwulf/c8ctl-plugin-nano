@@ -252,6 +252,12 @@ test('ensureAcpFlag appends --acp only when ACP is not already selected', () => 
   // A path that merely contains `/acp/` is NOT an ACP selector — append.
   assert.equal(ensureAcpFlag('/opt/acp/bin/agent'), '/opt/acp/bin/agent --acp');
   assert.equal(ensureAcpFlag("'/opt/acp/bin/agent'"), "'/opt/acp/bin/agent' --acp");
+  // A NON-switch token containing `=` must NOT be truncated to `acp` and
+  // mis-detected as an ACP selector: a leading env assignment (`ACP=true`) or a
+  // bare value (`acp=true`) is not a selector, so still append.
+  assert.equal(ensureAcpFlag('ACP=true copilot'), 'ACP=true copilot --acp');
+  assert.equal(ensureAcpFlag('copilot acp=true'), 'copilot acp=true --acp');
+  assert.equal(ensureAcpFlag("copilot 'acp=true'"), "copilot 'acp=true' --acp");
 });
 
 test('spawnCaptureAcp completes the ACP handshake and merges the result file', async () => {

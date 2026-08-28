@@ -3997,7 +3997,12 @@ function ensureAcpFlag(commandLine) {
     // `--acp=true` / `--experimental-acp=true` are detected as ACP selectors and
     // never doubled. Only the option NAME selects ACP — a `--model=foo-acp`
     // VALUE must not trigger (its name `--model` doesn't end in `-acp`).
-    const name = tok.replace(/=.*$/s, '');
+    // Strip `=value` ONLY for switch tokens (those starting with `-`): a
+    // non-switch token that happens to contain `=` — a leading env assignment
+    // like `ACP=true copilot` or a bare value `acp=true` — must NOT be truncated
+    // to `acp` and mis-detected as an ACP selector (a false positive that would
+    // wrongly skip appending `--acp`).
+    const name = tok.startsWith('-') ? tok.replace(/=.*$/s, '') : tok;
     const base = name.replace(/^.*[\\/]/, ''); // basename, for path-form commands
     if (/^-{0,2}acp$/i.test(base)) return commandLine;
     // A switch that NAMES acp, e.g. qwen's hidden `--experimental-acp` (present

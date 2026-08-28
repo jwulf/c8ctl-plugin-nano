@@ -8271,7 +8271,16 @@ function validateWorkforceManifest(parsed, file, expectedName) {
     if (norm.error) throw new Error(`workforce manifest ${file}: ${norm.error}.`);
     workers.push(norm.entry);
   }
-  const name = typeof parsed.name === 'string' && parsed.name.trim() ? parsed.name.trim() : String(expectedName || '');
+  const onDiskName = typeof parsed.name === 'string' && parsed.name.trim() ? parsed.name.trim() : '';
+  // When loaded by name, the file's identity (its path) is authoritative: a
+  // hand-edited `name` that disagrees would make writeWorkforceManifest() target
+  // a *different* file, silently corrupting an unrelated manifest. Refuse it
+  // rather than trust the field (mirrors the strict "surface corruption" ethos).
+  const expected = String(expectedName || '').trim();
+  if (expected && onDiskName && onDiskName !== expected) {
+    throw new Error(`workforce manifest ${file} declares name ${JSON.stringify(onDiskName)} but was loaded as ${JSON.stringify(expected)} — the manifest name must match its filename.`);
+  }
+  const name = onDiskName || expected;
   return { version: WORKFORCE_MANIFEST_VERSION, name, workers };
 }
 
@@ -8490,12 +8499,12 @@ function workforceManifestName(flags) {
 /** Fetch the live supervisor worker set, or `[]` when no daemon is running. */
 async function fetchSupervisorWorkers() {
   const running = await liveSupervisor();
-  if (!running) return { running: false, workers: [] };
+  if (!running) return { running: false, reachable: false, workers: [] };
   try {
     const res = await supervisorRequest({ op: 'status' });
-    if (res && res.ok) return { running: true, workers: Array.isArray(res.workers) ? res.workers : [] };
+    if (res && res.ok) return { running: true, reachable: true, workers: Array.isArray(res.workers) ? res.workers : [] };
   } catch { /* socket unreachable */ }
-  return { running: true, workers: [] };
+  return { running: true, reachable: false, workers: [] };
 }
 
 async function workforceAddCmd(req, flags, manifestName) {
@@ -8665,7 +8674,11 @@ async function workforceStopCmd(req, flags, manifestName) {
   const running = await liveSupervisor();
   if (!running) { logger.warn('Supervisor is not running — nothing to stop.'); return; }
   const prefix = workforceOwnerPrefix(manifestName);
-  const { workers: live } = await fetchSupervisorWorkers();
+  const { reachable, workers: live } = await fetchSupervisorWorkers();
+  if (!reachable) {
+    logger.error('Supervisor is running but its status socket is unreachable — cannot enumerate workers. Leaving the daemon and its workers untouched.');
+    process.exit(1);
+  }
   const owned = live
     .filter((w) => w && typeof w.id === 'string' && w.id.startsWith(prefix))
     .map((w) => w.id);
@@ -8678,9 +8691,14 @@ async function workforceStopCmd(req, flags, manifestName) {
       else logger.error(`Could not remove "${id}": ${(res && res.error) || 'unknown error'}`);
     }
   }
-  // If no supervised workers remain, stop the daemon too.
-  const { workers: remaining } = await fetchSupervisorWorkers();
-  if (remaining.length === 0) {
+  // If no supervised workers remain, stop the daemon too — but only when the
+  // status socket actually answered. A `{ workers: [] }` from an *unreachable*
+  // socket is ambiguous, and treating it as "empty" would wrongly kill the
+  // daemon (and any foreign workers it still supervises).
+  const { reachable: stillReachable, workers: remaining } = await fetchSupervisorWorkers();
+  if (!stillReachable) {
+    logger.warn('Supervisor status socket became unreachable; leaving the daemon running.');
+  } else if (remaining.length === 0) {
     logger.info('No supervised workers remain — stopping the supervisor daemon.');
     await supervisorStopCmd();
   } else {

@@ -8183,6 +8183,12 @@ function expandWorkforceDesired(manifest) {
  *   - `toStop`    — live workers OWNED by this manifest (the `wf-<manifest>-`
  *                   name prefix) that are no longer desired (entry removed or
  *                   `instances` reduced).
+ *   - `toRestart` — desired workers present in supervisor status under the same
+ *                   profile but NOT actually running (e.g. `state: "down"` while
+ *                   crashed / mid-backoff). Restarting them lets `workforce
+ *                   start` converge back to the desired *running* fleet instead
+ *                   of counting a down worker as "unchanged". A live worker with
+ *                   no `state` field (older status payloads) is assumed running.
  *   - `unchanged` — desired workers already running under the same profile.
  *   - `collisions`— a desired name is already taken by a worker running a
  *                   DIFFERENT profile (a hand-added worker that clashes): it is
@@ -8199,6 +8205,7 @@ function reconcileWorkforce({ desired, live, manifest }) {
   const desiredList = Array.isArray(desired) ? desired : [];
   const desiredNames = new Set(desiredList.map((d) => d.name));
   const toStart = [];
+  const toRestart = [];
   const unchanged = [];
   const collisions = [];
   for (const d of desiredList) {
@@ -8208,12 +8215,16 @@ function reconcileWorkforce({ desired, live, manifest }) {
       collisions.push({ name: d.name, wantProfile: d.profile, haveProfile: existing.profile });
       continue;
     }
+    // A worker known to the supervisor but NOT running (state present and not
+    // "running", e.g. "down" while crashed/mid-backoff) is restarted so `start`
+    // converges to the desired *running* fleet. Missing state ⇒ assume running.
+    if (existing.state != null && existing.state !== 'running') { toRestart.push(d); continue; }
     unchanged.push(d);
   }
   const toStop = liveList
     .filter((w) => w && typeof w.id === 'string' && w.id.startsWith(prefix) && !desiredNames.has(w.id))
     .map((w) => w.id);
-  return { toStart, toStop, unchanged, collisions };
+  return { toStart, toRestart, toStop, unchanged, collisions };
 }
 
 /**
@@ -8637,7 +8648,7 @@ async function workforceStartCmd(req, flags, manifestName) {
   const state = await startSupervisorDaemon();
   logger.info(`Supervisor daemon running (pid ${state.pid}).`);
   const { workers: live } = await fetchSupervisorWorkers();
-  const { toStart, toStop, unchanged, collisions } = reconcileWorkforce({ desired, live, manifest: manifestName });
+  const { toStart, toRestart, toStop, unchanged, collisions } = reconcileWorkforce({ desired, live, manifest: manifestName });
 
   for (const c of collisions) {
     logger.warn(`Skipping "${c.name}": a worker with that name already runs profile "${c.haveProfile}" (manifest wants "${c.wantProfile}") — not clobbering a hand-added worker.`);
@@ -8653,7 +8664,12 @@ async function workforceStartCmd(req, flags, manifestName) {
     if (res && res.ok) logger.info(`  + started "${d.name}" (profile ${d.profile})`);
     else { logger.error(`  ! could not start "${d.name}": ${(res && res.error) || 'unknown error'}`); hadError = true; }
   }
-  logger.info(`Workforce "${manifestName}" reconciled: ${toStart.length} started, ${toStop.length} stopped, ${unchanged.length} unchanged.`);
+  for (const d of toRestart) {
+    const res = await supervisorRequest({ op: 'restart', target: d.name });
+    if (res && res.ok) logger.info(`  ↻ restarted "${d.name}" (was not running)`);
+    else { logger.error(`  ! could not restart "${d.name}": ${(res && res.error) || 'unknown error'}`); hadError = true; }
+  }
+  logger.info(`Workforce "${manifestName}" reconciled: ${toStart.length} started, ${toRestart.length} restarted, ${toStop.length} stopped, ${unchanged.length} unchanged.`);
 
   await workforceStatusCmd(req, flags, manifestName);
   if (hadError) process.exit(1);
@@ -8682,13 +8698,14 @@ async function workforceStopCmd(req, flags, manifestName) {
   const owned = live
     .filter((w) => w && typeof w.id === 'string' && w.id.startsWith(prefix))
     .map((w) => w.id);
+  let hadError = false;
   if (owned.length === 0) {
     logger.info(`No workers from workforce "${manifestName}" are running.`);
   } else {
     for (const id of owned) {
       const res = await supervisorRequest({ op: 'remove', target: id });
       if (res && res.ok) logger.info(`Removed worker "${id}".`);
-      else logger.error(`Could not remove "${id}": ${(res && res.error) || 'unknown error'}`);
+      else { logger.error(`Could not remove "${id}": ${(res && res.error) || 'unknown error'}`); hadError = true; }
     }
   }
   // If no supervised workers remain, stop the daemon too — but only when the
@@ -8704,6 +8721,10 @@ async function workforceStopCmd(req, flags, manifestName) {
   } else {
     logger.info(`${remaining.length} other supervised worker(s) remain; leaving the daemon running.`);
   }
+  // A worker that could not be removed means the workforce is NOT fully stopped:
+  // exit non-zero so automation doesn't mistake a partial stop for success
+  // (consistent with `supervisor remove`, which also exits non-zero on failure).
+  if (hadError) process.exit(1);
 }
 
 async function workforceCommand(req, flags) {

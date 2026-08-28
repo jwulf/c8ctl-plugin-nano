@@ -144,7 +144,29 @@ test('reconcile: no-op re-run — all desired already running', () => {
   const r = reconcileWorkforce({ desired: d, live, manifest: 'default' });
   assert.deepEqual(r.toStart, []);
   assert.deepEqual(r.toStop, []);
+  assert.deepEqual(r.toRestart, []);
   assert.equal(r.unchanged.length, 2);
+});
+
+test('reconcile: a down worker is restarted, not counted as unchanged', () => {
+  const d = desired(['wf-default-copilot-1', 'wf-default-copilot-2'], 'copilot');
+  const live = [
+    { id: 'wf-default-copilot-1', profile: 'copilot', state: 'running' },
+    { id: 'wf-default-copilot-2', profile: 'copilot', state: 'down' },
+  ];
+  const r = reconcileWorkforce({ desired: d, live, manifest: 'default' });
+  assert.deepEqual(r.toStart, []);
+  assert.deepEqual(r.toStop, []);
+  assert.deepEqual(r.toRestart.map((x) => x.name), ['wf-default-copilot-2']);
+  assert.deepEqual(r.unchanged.map((x) => x.name), ['wf-default-copilot-1']);
+});
+
+test('reconcile: a worker with no state field is assumed running (unchanged)', () => {
+  const d = desired(['wf-default-copilot-1'], 'copilot');
+  const live = [{ id: 'wf-default-copilot-1', profile: 'copilot' }];
+  const r = reconcileWorkforce({ desired: d, live, manifest: 'default' });
+  assert.deepEqual(r.toRestart, []);
+  assert.equal(r.unchanged.length, 1);
 });
 
 test('reconcile: scale up starts only the missing instances', () => {

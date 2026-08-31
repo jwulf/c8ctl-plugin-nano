@@ -1,9 +1,11 @@
 // Unit tests for `nano work --auto`: zero-config engine-read enrolment
-// (jwulf/c8ctl-plugin-nano#66). Agent-task discovery derives agentic-ness SOLELY
-// from `@nanobpm/agentic`'s `demand.scanTaskDefinitions` canonical `agentic` flag
-// (issue #102) — a service task is an agent task iff it declares a
-// `<zeebe:linkedResource … linkName="prompt">` base-prompt side-car. Plain
-// connectors and record-keepers (e.g. `pr.record-plan`) carry no prompt link and
+// (jwulf/c8ctl-plugin-nano#66). Agent-task discovery derives agentic-ness
+// primarily from `@nanobpm/agentic`'s `demand.scanTaskDefinitions` canonical
+// `agentic` flag (issue #102) — a service task is an agent task iff it declares a
+// `<zeebe:linkedResource … linkName="prompt">` base-prompt side-car — with a
+// legacy fallback for tasks carrying an `io.nanobpm.agentTask` header
+// (`serviceTaskHasAgentHeader` / `legacyAgentHeaderElementIds`, issue #120). Plain
+// connectors and record-keepers (e.g. `pr.record-plan`) carry neither signal and
 // are excluded. The engine read is driven through an in-memory C8RestReader seam
 // so no live engine is needed.
 import { test } from 'node:test';

@@ -2602,12 +2602,15 @@ function resolveAutoRestConfig(camunda, env = process.env) {
 //
 // True when `body` (a service task's inner XML) declares any
 // `io.nanobpm.agentTask*` `<zeebe:header>` key — the sole such header on a
-// pre-#203 agent service task.
+// pre-#203 agent service task. The regex is compiled once (it is called once
+// per matched `<serviceTask>` during `--auto` scans, so recompiling per call
+// would allocate needlessly across many deployed definitions).
+const AGENT_TASK_HEADER_RE = new RegExp(
+  `<(?:\\w+:)?header\\b[^>]*\\bkey\\s*=\\s*(["'])${AGENT_TASK_NS.replace(/[.]/g, '\\.')}(?:\\.[^"']*)?\\1`,
+  'i'
+);
 function serviceTaskHasAgentHeader(body) {
-  return new RegExp(
-    `<(?:\\w+:)?header\\b[^>]*\\bkey\\s*=\\s*(["'])${AGENT_TASK_NS.replace(/[.]/g, '\\.')}(?:\\.[^"']*)?\\1`,
-    'i'
-  ).test(String(body || ''));
+  return AGENT_TASK_HEADER_RE.test(String(body || ''));
 }
 
 // The set of service-task element ids in `xml` bearing the legacy agent-task
@@ -2618,6 +2621,12 @@ function serviceTaskHasAgentHeader(body) {
 function legacyAgentHeaderElementIds(xml) {
   const ids = new Set();
   const src = String(xml || '');
+  // Cheap guard: a legacy agent-task header always contains the literal
+  // `io.nanobpm.agentTask` namespace, so a document lacking that substring
+  // cannot match — skip the full `<serviceTask>` walk entirely. This avoids
+  // parsing every deployed definition in `--auto` enrolment loops when none
+  // carry the legacy marker.
+  if (!src.includes(AGENT_TASK_NS)) return ids;
   const taskRe =
     /<(?:\w+:)?serviceTask\b[^>]*?\bid\s*=\s*(["'])(.*?)\1[^>]*?>([\s\S]*?)<\/(?:\w+:)?serviceTask>/g;
   let m;

@@ -8894,9 +8894,9 @@ async function workforceRemoveCmd(req, flags, manifestName) {
 async function workforceListCmd(req, flags, manifestName) {
   const logger = getLogger();
   const json = coerceBool(flags?.json, false);
-  const explicitProfile = lastManifestValue(flags) !== '';
+  const explicitManifest = lastManifestValue(flags) !== '';
   const manifest = readWorkforceManifestStrict(manifestName);
-  const others = explicitProfile ? null : listWorkforceManifestNames();
+  const others = explicitManifest ? null : listWorkforceManifestNames();
   if (json) {
     const payload = { manifest: manifest || null };
     if (others) payload.manifests = others;

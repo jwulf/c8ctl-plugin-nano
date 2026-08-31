@@ -900,9 +900,10 @@ c8ctl nano workforce stop                 # remove this manifest's workers (+ st
 c8ctl nano workforce remove qwen          # drop an entry ("all" clears the manifest)
 ```
 
-Every subcommand takes `--profile <name>` (default `default`) to select which
-manifest it operates on, so you can keep several — `--profile review-only`,
-`--profile full-fleet` — side by side.
+Every subcommand takes `--manifest <name>` (default `default`) to select which
+manifest it operates on, so you can keep several — `--manifest review-only`,
+`--manifest full-fleet` — side by side. (This flag was renamed from `--profile`,
+which now collides with c8ctl's global connection-profile flag.)
 
 ### The manifest
 
@@ -991,8 +992,9 @@ hired with `--capabilities ""`.
 - `start` with an empty/absent manifest → a friendly pointer at `workforce add`,
   exit 0.
 
-`--json` on `list`/`status` emits machine-readable output (through the same
-output-mode-aware logger) so the install script and CI can consume it.
+`--json` on `list`/`status` emits machine-readable output (via c8ctl's global
+`--json` flag, whose parsed value is passed through to the handler) so the
+install script and CI can consume it.
 
 ## Cleaning up disk
 

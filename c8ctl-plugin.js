@@ -188,6 +188,28 @@ function getLogger() {
   };
 }
 
+/**
+ * True when c8ctl's effective output mode is JSON.
+ *
+ * The plugin used to declare its own `--json` flag, but it collided with
+ * c8ctl's new global `--json` and was dropped (see #122). As a result the
+ * global `--json` (and persisted `output json` / `C8CTL_OUTPUT_MODE`) is no
+ * longer delivered to the plugin as `flags.json`. Read the host's effective
+ * output mode directly — the same signal c8ctl's own bundled plugins use — so
+ * `workforce list/status` still emit machine-readable JSON on stdout.
+ */
+function hostOutputIsJson() {
+  const c = globalThis.c8ctl;
+  if (!c) return false;
+  try {
+    if (c.outputMode === 'json') return true;
+    const l = typeof c.getLogger === 'function' ? c.getLogger() : null;
+    return !!l && l.mode === 'json';
+  } catch {
+    return false;
+  }
+}
+
 /** Expand a leading `~` to the user's home directory. */
 function expandHome(p) {
   if (!p) return p;
@@ -8893,7 +8915,7 @@ async function workforceRemoveCmd(req, flags, manifestName) {
 
 async function workforceListCmd(req, flags, manifestName) {
   const logger = getLogger();
-  const json = coerceBool(flags?.json, false);
+  const json = flags?.json === false ? false : (coerceBool(flags?.json, false) || hostOutputIsJson());
   const explicitManifest = lastManifestValue(flags) !== '';
   const manifest = readWorkforceManifestStrict(manifestName);
   const others = explicitManifest ? null : listWorkforceManifestNames();
@@ -9007,7 +9029,7 @@ async function workforceStartCmd(req, flags, manifestName) {
 
 async function workforceStatusCmd(req, flags, manifestName) {
   const logger = getLogger();
-  const json = coerceBool(flags?.json, false);
+  const json = flags?.json === false ? false : (coerceBool(flags?.json, false) || hostOutputIsJson());
   const manifest = readWorkforceManifestStrict(manifestName);
   const { running, reachable, workers: live } = await fetchSupervisorWorkers();
   // When the daemon is up but its status socket can't be reached, `live` is
@@ -10958,6 +10980,7 @@ export {
   formatWorkforceStatus,
   workforceManifestName,
   lastManifestValue,
+  hostOutputIsJson,
 };
 
 export const metadata = {

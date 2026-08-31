@@ -2641,8 +2641,8 @@ function legacyAgentHeaderElementIds(xml) {
 // canonical `agentic` flag is set (i.e. the service task declares a
 // `linkName="prompt"` linked resource) OR — for backward compatibility with
 // pre-#203 deployments — which carry the legacy `io.nanobpm.agentTask` header.
-// Returns `{ taskType, process }` leaves in first-occurrence order, de-duped by
-// element id so a task matched by both signals is emitted once. The published
+// Returns `{ taskType, process }` leaves in first-occurrence order; a task
+// matched by both signals is the same leaf, so it is emitted once. The published
 // `scanTaskDefinitions` is INJECTED so this stays a pure, synchronous function;
 // `readDeployedAgentJobTypes` supplies the real one from the lazily-imported
 // demand surface (`agentic.mjs`).

@@ -24,6 +24,16 @@ import {
   normalizeTaskEnvelope,
 } from './c8ctl-plugin.js';
 
+// The canonical transcript seams — consumed through the single agentic import
+// surface, the SAME `parseTranscriptEvent` / `deriveView` the cockpit uses and
+// the SAME `acpUpdateToTranscriptChunk` producer bridge the executor uses. Tests
+// assert on the derivation, never on a hand-rolled envelope shape.
+import { transcript, sessionAcp } from './agentic.mjs';
+// The shared ACP→transcript conformance corpus published by nanobpm/nano-ide#534:
+// the pinned {update → chunk → typed event} vectors that hold this repo's producer
+// in lock-step with the hub's parser.
+import { ACP_TRANSCRIPT_VECTORS } from '@nanobpm/agentic/protocol/conformance';
+
 // ---------------------------------------------------------------------------
 // Fake ACP agent: newline-delimited JSON-RPC 2.0 over stdio. Behaviour is driven
 // entirely by env vars so each test shapes the flow it needs. It NEVER writes
@@ -149,7 +159,7 @@ function handle(m) {
       promptId = m.id;
       if (emitUpdate) send({ jsonrpc: '2.0', method: 'session/update', params: { sessionId: 'sess-1', update: { sessionUpdate: 'agent_message_chunk', content: { type: 'text', text: 'Hello ACP' } } } });
       // FAKE_RICH_UPDATES: emit one of every modelled update kind PLUS an
-      // unmodelled kind, so the typed nwfTranscriptEvent mapping and the
+      // unmodelled kind, so the canonical transcript-chunk bridge and the
       // text-fallback (for the unmapped kind) can both be asserted.
       if (richUpdates) {
         send({ jsonrpc: '2.0', method: 'session/update', params: { sessionId: 'sess-1', update: { sessionUpdate: 'agent_thought_chunk', content: { type: 'text', text: 'thinking hard' } } } });
@@ -708,30 +718,74 @@ test.after(() => {
 });
 
 // ---------------------------------------------------------------------------
-// #110 step 2 — typed nwfTranscriptEvent producer.
+// #110 / nanobpm/nano-ide#534 — canonical transcript-chunk producer.
 // ---------------------------------------------------------------------------
 
-// A relay tap exposing the TYPED publish seam (relayEnvelope) alongside the
-// step-1 text lane (onData), mirroring runAgentJob's relaySession wiring. It
-// captures published envelopes AND any text-fallback chunks separately so a test
-// can assert which lane each update took.
+// A relay tap exposing the canonical transcript-chunk seam (relayTranscriptChunk)
+// alongside the human-text lane (onData), mirroring runAgentJob's relaySession
+// wiring. It captures the relayed chunk STRINGS and any text-fallback chunks
+// separately, and derives a view through the shared parser so a test can assert
+// the structured cockpit result (messages / tool cards) each update folds into.
 function makeTypedTap() {
-  const envelopes = [];
+  const chunks = [];
   const textChunks = [];
   let steerWrite = null;
+  const stored = () => chunks.map((chunk, offset) => ({ offset, chunk }));
   return {
-    envelopes,
+    chunks,
     textChunks,
+    // Fold the relayed chunks through the canonical parser + deriveView — exactly
+    // what the cockpit does to render a rich transcript from the relay lane.
+    derive: () => transcript.deriveViewFromChunks(stored()),
+    events: () => stored().map((entry) => transcript.parseTranscriptEvent(entry)),
     getSteer: () => steerWrite,
     tap: {
-      relayEnvelope: (env) => { envelopes.push(env); },
+      relayTranscriptChunk: (chunk) => { chunks.push(chunk); },
       onData: (d) => { textChunks.push(typeof d === 'string' ? d : Buffer.from(d).toString('utf8')); },
       attachSteer: (write) => { steerWrite = write; return () => { steerWrite = null; }; },
     },
   };
 }
 
-test('session/update maps to typed nwfTranscriptEvent envelopes on the relay (rich cockpit)', async () => {
+test('red/green: the former {type,v} envelope derives raw-only; the canonical bridge derives structured', () => {
+  // RED — the reported defect. The OLD hand-rolled grammar put the marker in
+  // `type` and the version in `v`, so the cockpit's parser (`parseTranscriptEvent`)
+  // finds no `nwfTranscriptEvent` KEY and retains every envelope as a raw
+  // stream-chunk: 0 structured messages, byte-replay only ("No structured events
+  // derived — raw replay only").
+  const legacyEnvelope = JSON.stringify({ type: 'nwfTranscriptEvent', v: 1, ts: 0, kind: 'message', role: 'agent', text: 'Hello ACP' });
+  const legacyView = transcript.deriveViewFromChunks([{ offset: 0, chunk: legacyEnvelope }]);
+  assert.equal(legacyView.messages.length, 0, 'the {type,v} envelope must derive NO structured message (the reported defect)');
+  assert.equal(legacyView.rawChunkCount, 1, 'the {type,v} envelope falls back to a raw stream-chunk');
+
+  // GREEN — the canonical bridge emits the exact bytes the parser accepts, so the
+  // SAME ACP update now derives a structured assistant message, not raw replay.
+  const chunk = sessionAcp.acpUpdateToTranscriptChunk({ sessionUpdate: 'agent_message_chunk', content: { type: 'text', text: 'Hello ACP' } });
+  const view = transcript.deriveViewFromChunks([{ offset: 0, chunk }]);
+  assert.equal(view.rawChunkCount, 0, 'the canonical chunk must NOT fall back to a raw stream-chunk');
+  assert.equal(view.messages.length, 1);
+  assert.equal(view.messages[0].role, 'assistant');
+  assert.equal(view.messages[0].text, 'Hello ACP');
+});
+
+test('ACP transcript conformance vectors: our producer emits the pinned chunk that derives structured (#534)', () => {
+  assert.ok(ACP_TRANSCRIPT_VECTORS.length > 0, 'the #534 conformance corpus must ship ACP transcript vectors');
+  for (const vec of ACP_TRANSCRIPT_VECTORS) {
+    // Our production seam IS `acpUpdateToTranscriptChunk` (via agentic.mjs): for a
+    // canonical update it must emit the EXACT pinned chunk; for an `ignored` one, null.
+    const chunk = sessionAcp.acpUpdateToTranscriptChunk(vec.update);
+    if (vec.chunk == null) {
+      assert.equal(chunk, null, `${vec.name}: an ignored update must produce no canonical chunk`);
+      continue;
+    }
+    assert.equal(chunk, vec.chunk, `${vec.name}: producer must emit the pinned canonical chunk`);
+    // And the pinned chunk parses back to a typed event — never a raw stream-chunk.
+    const event = transcript.parseTranscriptEvent({ offset: vec.offset ?? 0, chunk });
+    assert.notEqual(event.kind, 'stream-chunk', `${vec.name}: a canonical chunk must NOT derive raw`);
+  }
+});
+
+test('session/update relays canonical transcript chunks that derive to structured messages/tool cards (rich cockpit)', async () => {
   const resDir = mkdtempSync(join(tmpdir(), 'acp-res-'));
   const resultFile = join(resDir, 'result.json');
   const rec = makeTypedTap();
@@ -748,51 +802,38 @@ test('session/update maps to typed nwfTranscriptEvent envelopes on the relay (ri
     });
     assert.equal(result.ok, true, result.error || result.stderr);
 
-    // Every modelled update is published as a typed envelope, not raw text.
-    const byKind = (k) => rec.envelopes.filter((e) => e.kind === k);
-    assert.ok(rec.envelopes.length >= 6, `expected typed envelopes, got: ${JSON.stringify(rec.envelopes)}`);
-    for (const e of rec.envelopes) {
-      assert.equal(e.type, 'nwfTranscriptEvent');
-      assert.equal(e.v, 1);
-      assert.equal(typeof e.ts, 'number');
+    // Every canonical update is relayed as a transcript CHUNK carrying the
+    // `nwfTranscriptEvent` marker KEY (not a hand-rolled {type,v} envelope).
+    assert.ok(rec.chunks.length >= 4, `expected canonical chunks, got: ${JSON.stringify(rec.chunks)}`);
+    for (const chunk of rec.chunks) {
+      const parsed = JSON.parse(chunk);
+      assert.equal(parsed.nwfTranscriptEvent, 1, `chunk must carry the canonical marker key: ${chunk}`);
+      assert.ok(!chunk.includes('jsonrpc'), 'chunk must not carry raw JSON-RPC');
+      assert.ok(!chunk.includes('session/update'));
     }
 
-    // agent_message_chunk → message/agent with the text.
-    const messages = byKind('message');
-    assert.ok(messages.some((e) => e.role === 'agent' && e.text === 'Hello ACP'));
-    assert.ok(messages.some((e) => e.role === 'agent' && e.text === 'all done'));
+    // Folded through the canonical parser + deriveView (what the cockpit does), the
+    // relayed chunks derive STRUCTURED messages + tool cards — NOT raw stream-chunk.
+    const view = rec.derive();
+    assert.equal(view.rawChunkCount, 0, 'no relayed chunk derives as a raw stream-chunk');
 
-    // agent_thought_chunk → thought/agent.
-    const thoughts = byKind('thought');
-    assert.equal(thoughts.length, 1);
-    assert.equal(thoughts[0].role, 'agent');
-    assert.equal(thoughts[0].text, 'thinking hard');
+    // agent_message_chunk → assistant messages.
+    assert.ok(view.messages.some((m) => m.role === 'assistant' && m.text === 'Hello ACP'));
+    assert.ok(view.messages.some((m) => m.role === 'assistant' && m.text === 'all done'));
+    // agent_thought_chunk folds to an assistant (reasoning) message.
+    assert.ok(view.messages.some((m) => m.role === 'assistant' && m.text === 'thinking hard'));
 
-    // tool_call → tool_call with tool.{id,title,status,kind}.
-    const starts = byKind('tool_call');
-    assert.equal(starts.length, 1);
-    assert.deepEqual(starts[0].tool, { id: 'tc-1', title: 'write file', status: 'pending', kind: 'edit' });
+    // tool_call + terminal tool_call_update → ONE tool card, its call paired to a result.
+    assert.equal(view.tools.length, 1, `expected one tool card, got: ${JSON.stringify(view.tools)}`);
+    const [card] = view.tools;
+    assert.equal(card.name, 'write file');
+    assert.equal(card.callId, 'tc-1');
+    assert.ok(card.result, 'the terminal tool_call_update pairs a result onto the tool card');
+    assert.equal(card.result.ok, true);
 
-    // tool_call_update → tool_call_update carrying the terminal status.
-    const finishes = byKind('tool_call_update');
-    assert.equal(finishes.length, 1);
-    assert.equal(finishes[0].tool.id, 'tc-1');
-    assert.equal(finishes[0].tool.status, 'completed');
-
-    // plan → plan (carrying the actual entries payload for rich rendering).
-    const plans = byKind('plan');
-    assert.equal(plans.length, 1);
-    assert.deepEqual(plans[0].entries, [{ content: 'step 1' }, { content: 'step 2' }]);
-
-    // The unmodelled kind (available_commands_update) is NOT a typed envelope.
-    assert.ok(!rec.envelopes.some((e) => e.kind === 'available_commands_update'));
-    // Raw JSON-RPC / method names never appear in any envelope's text.
-    for (const e of rec.envelopes) {
-      if (typeof e.text === 'string') {
-        assert.ok(!e.text.includes('jsonrpc'), 'envelope text must not carry raw JSON-RPC');
-        assert.ok(!e.text.includes('session/update'));
-      }
-    }
+    // The unmodelled kinds (plan, available_commands_update) are `ignored` by the
+    // bridge → no chunk; they take the text-fallback lane instead (nothing dropped).
+    assert.ok(rec.textChunks.join('').includes('[available_commands_update]'));
   } finally {
     rmSync(resDir, { recursive: true, force: true });
   }
@@ -814,25 +855,27 @@ test('an unmapped session/update falls back to the minimal text-chunk path (noth
       permission: 'yolo',
     });
     assert.equal(result.ok, true, result.error || result.stderr);
-    // The unmodelled kind did NOT produce a typed envelope, but it WAS emitted on
-    // the text-fallback lane — so the update is never silently dropped.
-    assert.ok(!rec.envelopes.some((e) => e.kind === 'available_commands_update'));
+    // Every relayed chunk is canonical (parses to a typed event, never raw).
+    assert.ok(!rec.events().some((e) => e.kind === 'stream-chunk'), 'relayed chunks are all canonical, never raw');
+    // The `ignored` kinds produced NO chunk but WERE emitted on the text-fallback
+    // lane — so the update is never silently dropped.
     const fallbackText = rec.textChunks.join('');
     assert.ok(fallbackText.includes('[available_commands_update]'), `expected fallback text for the unmapped kind, got: ${JSON.stringify(rec.textChunks)}`);
-    // Mapped kinds did NOT double-emit onto the text lane (they went typed).
+    assert.ok(fallbackText.includes('[plan updated]'), 'the plan update takes the text fallback (canonical bridge ignores it)');
+    // Mapped kinds did NOT double-emit onto the text lane (they went as chunks).
     assert.ok(!fallbackText.includes('Hello ACP'), 'mapped updates must not also hit the text fallback lane');
   } finally {
     rmSync(resDir, { recursive: true, force: true });
   }
 });
 
-test('a throwing typed publish seam falls back to the text lane (nothing dropped)', async () => {
+test('a throwing transcript-chunk seam falls back to the text lane (nothing dropped)', async () => {
   const resDir = mkdtempSync(join(tmpdir(), 'acp-res-'));
   const resultFile = join(resDir, 'result.json');
-  // A tap whose typed seam always throws (a misbehaving downstream publisher).
+  // A tap whose transcript seam always throws (a misbehaving downstream publisher).
   const textChunks = [];
   const tap = {
-    relayEnvelope: () => { throw new Error('boom'); },
+    relayTranscriptChunk: () => { throw new Error('boom'); },
     onData: (d) => { textChunks.push(typeof d === 'string' ? d : Buffer.from(d).toString('utf8')); },
   };
   try {
@@ -847,10 +890,10 @@ test('a throwing typed publish seam falls back to the text lane (nothing dropped
       permission: 'yolo',
     });
     assert.equal(result.ok, true, result.error || result.stderr);
-    // The throwing typed publish must not crash the worker, and every mapped
+    // The throwing transcript publish must not crash the worker, and every mapped
     // update must still reach the relay lane via the text fallback.
     const relayed = textChunks.join('');
-    assert.ok(relayed.includes('Hello ACP'), `expected text fallback for a throwing typed seam, got: ${JSON.stringify(textChunks)}`);
+    assert.ok(relayed.includes('Hello ACP'), `expected text fallback for a throwing transcript seam, got: ${JSON.stringify(textChunks)}`);
     assert.ok(relayed.includes('all done'));
     assert.ok(relayed.includes('thinking hard'));
   } finally {
@@ -858,10 +901,10 @@ test('a throwing typed publish seam falls back to the text lane (nothing dropped
   }
 });
 
-test('with no typed publish seam, every update falls back to human text (minimal-mode floor preserved)', async () => {
+test('with no transcript-chunk seam, every update falls back to human text (minimal-mode floor preserved)', async () => {
   const resDir = mkdtempSync(join(tmpdir(), 'acp-res-'));
   const resultFile = join(resDir, 'result.json');
-  // A PLAIN tap (onData only) — no relayEnvelope. Mirrors a legacy/minimal relay.
+  // A PLAIN tap (onData only) — no relayTranscriptChunk. Mirrors a legacy/minimal relay.
   const chunks = [];
   try {
     const result = await spawnCaptureAcp({
@@ -890,7 +933,7 @@ test('with no typed publish seam, every update falls back to human text (minimal
   }
 });
 
-test('typed transcript publishing leaves the captured result stdout (human text) intact', async () => {
+test('canonical transcript publishing leaves the captured result stdout (human text) intact', async () => {
   const resDir = mkdtempSync(join(tmpdir(), 'acp-res-'));
   const resultFile = join(resDir, 'result.json');
   const rec = makeTypedTap();
@@ -907,7 +950,7 @@ test('typed transcript publishing leaves the captured result stdout (human text)
     });
     assert.equal(result.ok, true, result.error || result.stderr);
     // The result envelope's stdout still carries the human transcript (mirrored
-    // locally) even though the relay lane carried typed envelopes.
+    // locally) even though the relay lane carried canonical transcript chunks.
     assert.ok(result.stdout.includes('Hello ACP'), `expected human text in result.stdout, got: ${JSON.stringify(result.stdout)}`);
     assert.ok(result.stdout.includes('thinking hard'));
     // Result-file merge is unchanged.

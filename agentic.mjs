@@ -74,6 +74,15 @@ export * as presence from '@nanobpm/agentic/presence';
 export * as relay from '@nanobpm/agentic/relay';
 export * as transcript from '@nanobpm/agentic/transcript';
 
+// ACP → transcript bridge (nanobpm/nano-ide#534). The canonical, pure wire seam
+// that turns one raw ACP `session/update` into the exact `{ nwfTranscriptEvent:
+// 1, kind, … }` transcript-chunk bytes the cockpit decodes — `classifyUpdate`
+// composed with `encodeTranscriptEvent` behind the single `acpUpdateToTranscriptChunk`
+// helper. The ACP executor (`spawnCaptureAcp`) consumes it through THIS surface
+// instead of hand-rolling an envelope grammar, so there is one producer of the
+// wire and the shared conformance corpus pins it to the hub.
+export * as sessionAcp from '@nanobpm/agentic/session/acp';
+
 // ---------------------------------------------------------------------------
 // Demand read — @nanobpm/agentic/demand.
 //

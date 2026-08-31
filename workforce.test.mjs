@@ -33,7 +33,7 @@ import {
   formatWorkforceStatus,
   formatWorkforceManifest,
   workforceManifestName,
-  lastProfileValue,
+  lastManifestValue,
 } from './c8ctl-plugin.js';
 
 // --- defaults --------------------------------------------------------------
@@ -43,24 +43,27 @@ test('DEFAULT_WORKFORCE_MANIFEST is "default" and version is 1', () => {
   assert.equal(WORKFORCE_MANIFEST_VERSION, 1);
 });
 
-test('workforceManifestName resolves --profile, defaulting to "default"', () => {
+test('workforceManifestName resolves --manifest, defaulting to "default"', () => {
   assert.equal(workforceManifestName({}), 'default');
-  assert.equal(workforceManifestName({ profile: '' }), 'default');
-  assert.equal(workforceManifestName({ profile: '  full-fleet ' }), 'full-fleet');
-  assert.equal(workforceManifestName({ profile: ['a', 'full-fleet'] }), 'full-fleet');
-  assert.equal(workforceManifestName({ profile: [] }), 'default');
+  assert.equal(workforceManifestName({ manifest: '' }), 'default');
+  assert.equal(workforceManifestName({ manifest: '  full-fleet ' }), 'full-fleet');
+  assert.equal(workforceManifestName({ manifest: ['a', 'full-fleet'] }), 'full-fleet');
+  assert.equal(workforceManifestName({ manifest: [] }), 'default');
+  // The retired --profile name must NOT select a manifest anymore (it now
+  // collides with c8ctl's global connection-profile flag).
+  assert.equal(workforceManifestName({ profile: 'review-only' }), 'default');
 });
 
-test('lastProfileValue honors the last --profile value, matching manifest selection', () => {
-  assert.equal(lastProfileValue({}), '');
-  assert.equal(lastProfileValue({ profile: '' }), '');
-  assert.equal(lastProfileValue({ profile: '  full-fleet ' }), 'full-fleet');
-  assert.equal(lastProfileValue({ profile: ['a', 'full-fleet'] }), 'full-fleet');
-  assert.equal(lastProfileValue({ profile: [] }), '');
+test('lastManifestValue honors the last --manifest value, matching manifest selection', () => {
+  assert.equal(lastManifestValue({}), '');
+  assert.equal(lastManifestValue({ manifest: '' }), '');
+  assert.equal(lastManifestValue({ manifest: '  full-fleet ' }), 'full-fleet');
+  assert.equal(lastManifestValue({ manifest: ['a', 'full-fleet'] }), 'full-fleet');
+  assert.equal(lastManifestValue({ manifest: [] }), '');
   // A trailing empty repeat must be treated as "not explicit" so listing stays
   // consistent with the (default) manifest workforceManifestName resolves.
-  assert.equal(lastProfileValue({ profile: ['review-only', ''] }), '');
-  assert.equal(workforceManifestName({ profile: ['review-only', ''] }), 'default');
+  assert.equal(lastManifestValue({ manifest: ['review-only', ''] }), '');
+  assert.equal(workforceManifestName({ manifest: ['review-only', ''] }), 'default');
 });
 
 test('isValidManifestName accepts profile-charset names, rejects junk', () => {
@@ -632,7 +635,7 @@ test('listWorkforceManifestNames lists .json manifests', () => {
   });
 });
 
-test('listWorkforceManifestNames drops names that --profile could never select', () => {
+test('listWorkforceManifestNames drops names that --manifest could never select', () => {
   withHome(() => {
     writeWorkforceManifest(emptyWorkforceManifest('default'));
     // A hand-dropped file whose stem is not a valid manifest name (has a space).

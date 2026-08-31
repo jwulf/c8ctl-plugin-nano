@@ -8762,7 +8762,7 @@ function formatWorkforceStatus(report) {
   const missing = entries.filter((e) => e.running < e.desired);
   if (missing.length > 0) {
     lines.push('');
-    lines.push(`  Missing: ${missing.map((e) => `${e.profile} (${e.running}/${e.desired})`).join(', ')} — run: c8ctl nano workforce start${report.name === DEFAULT_WORKFORCE_MANIFEST ? '' : ` --profile ${report.name}`}`);
+    lines.push(`  Missing: ${missing.map((e) => `${e.profile} (${e.running}/${e.desired})`).join(', ')} — run: c8ctl nano workforce start${report.name === DEFAULT_WORKFORCE_MANIFEST ? '' : ` --manifest ${report.name}`}`);
   }
   if (Array.isArray(report.extra) && report.extra.length > 0) {
     lines.push('');
@@ -8771,16 +8771,16 @@ function formatWorkforceStatus(report) {
   return lines.join('\n');
 }
 
-/** Resolve the manifest name from `--profile` (default `default`). Pure. */
-function lastProfileValue(flags) {
-  // A repeated `--profile` flag arrives as a string[]; honor the last value.
-  let profile = flags?.profile;
-  if (Array.isArray(profile)) profile = profile.length ? profile[profile.length - 1] : '';
-  return typeof profile === 'string' ? profile.trim() : '';
+/** Resolve the manifest name from `--manifest` (default `default`). Pure. */
+function lastManifestValue(flags) {
+  // A repeated `--manifest` flag arrives as a string[]; honor the last value.
+  let manifest = flags?.manifest;
+  if (Array.isArray(manifest)) manifest = manifest.length ? manifest[manifest.length - 1] : '';
+  return typeof manifest === 'string' ? manifest.trim() : '';
 }
 
 function workforceManifestName(flags) {
-  return lastProfileValue(flags) || DEFAULT_WORKFORCE_MANIFEST;
+  return lastManifestValue(flags) || DEFAULT_WORKFORCE_MANIFEST;
 }
 
 /** Fetch the live supervisor worker set, or `[]` when no daemon is running. */
@@ -8798,7 +8798,7 @@ async function workforceAddCmd(req, flags, manifestName) {
   const logger = getLogger();
   const profile = req.positional[1];
   if (!profile) {
-    logger.error('Usage: c8ctl nano workforce add <profile> [--instances <n>] [--auto [--auto-scope <s>] | --roles a,b,c] [--arg <flag> ...] [--profile <manifest>]');
+    logger.error('Usage: c8ctl nano workforce add <profile> [--instances <n>] [--auto [--auto-scope <s>] | --roles a,b,c] [--arg <flag> ...] [--manifest <manifest>]');
     process.exit(1);
   }
   if (!isValidProfileName(profile)) {
@@ -8872,14 +8872,14 @@ async function workforceAddCmd(req, flags, manifestName) {
   manifest = upsertManifestEntry(manifest, entry);
   writeWorkforceManifest(manifest);
   logger.info(`${existed ? 'Updated' : 'Added'} "${profile}" in workforce "${manifestName}": instances ${count}, roles ${describeEntryRoles(entry)}${extraArgs.length ? `, args ${redactWorkArgs(extraArgs).join(' ')}` : ''}.`);
-  logger.info(`Bring it up with: c8ctl nano workforce start${manifestName === DEFAULT_WORKFORCE_MANIFEST ? '' : ` --profile ${manifestName}`}`);
+  logger.info(`Bring it up with: c8ctl nano workforce start${manifestName === DEFAULT_WORKFORCE_MANIFEST ? '' : ` --manifest ${manifestName}`}`);
 }
 
 async function workforceRemoveCmd(req, flags, manifestName) {
   const logger = getLogger();
   const profile = req.positional[1];
   if (!profile) {
-    logger.error('Usage: c8ctl nano workforce remove <profile|all> [--profile <manifest>]');
+    logger.error('Usage: c8ctl nano workforce remove <profile|all> [--manifest <manifest>]');
     process.exit(1);
   }
   const manifest = readWorkforceManifestStrict(manifestName);
@@ -8894,7 +8894,7 @@ async function workforceRemoveCmd(req, flags, manifestName) {
 async function workforceListCmd(req, flags, manifestName) {
   const logger = getLogger();
   const json = coerceBool(flags?.json, false);
-  const explicitProfile = lastProfileValue(flags) !== '';
+  const explicitProfile = lastManifestValue(flags) !== '';
   const manifest = readWorkforceManifestStrict(manifestName);
   const others = explicitProfile ? null : listWorkforceManifestNames();
   if (json) {
@@ -9095,15 +9095,15 @@ async function workforceStopCmd(req, flags, manifestName) {
 async function workforceCommand(req, flags) {
   const logger = getLogger();
   const action = (req.positional[0] || '').toLowerCase();
-  // A bare `--profile` (no value) is parsed as boolean `true`; reject it so we
+  // A bare `--manifest` (no value) is parsed as boolean `true`; reject it so we
   // fail fast instead of silently operating on the default manifest.
-  if (flags?.profile === true) {
-    logger.error('--profile requires a manifest name.');
+  if (flags?.manifest === true) {
+    logger.error('--manifest requires a manifest name.');
     process.exit(1);
   }
   const manifestName = workforceManifestName(flags);
   if (!isValidManifestName(manifestName)) {
-    logger.error(`Invalid --profile "${manifestName}". Use letters, digits, dot, dash or underscore.`);
+    logger.error(`Invalid --manifest "${manifestName}". Use letters, digits, dot, dash or underscore.`);
     process.exit(1);
   }
   switch (action) {
@@ -10957,7 +10957,7 @@ export {
   buildWorkforceStatus,
   formatWorkforceStatus,
   workforceManifestName,
-  lastProfileValue,
+  lastManifestValue,
 };
 
 export const metadata = {
@@ -11015,7 +11015,7 @@ export const metadata = {
         { command: 'c8ctl nano workforce add copilot --instances 5 --auto', description: 'Compose a reusable fleet: 5 copilot workers serving every deployed agent job type (--auto)' },
         { command: 'c8ctl nano workforce add qwen --instances 2 --roles pr-review,feature', description: "Add an entry mapped to explicit job types (<rank>:pr-review, <rank>:feature, where <rank> is the qwen hire's rank at start) — does not mutate the hired profile" },
         { command: 'c8ctl nano workforce start', description: "Ensure the daemon is up, then reconcile running workers to the 'default' manifest (idempotent — a second run changes nothing)" },
-        { command: 'c8ctl nano workforce start --profile review-only', description: 'Bring up a named manifest (<stateHome>/workforce/review-only.json)' },
+        { command: 'c8ctl nano workforce start --manifest review-only', description: 'Bring up a named manifest (<stateHome>/workforce/review-only.json)' },
         { command: 'c8ctl nano workforce status --json', description: 'Manifest entries joined against live supervisor status (desired vs actual), machine-readable for the install script / CI' },
         { command: 'c8ctl nano workforce list', description: 'Print the default manifest and list the manifests that exist on this machine' },
         { command: 'c8ctl nano workforce stop', description: "Remove this manifest's workers; stop the daemon too if no supervised workers remain" },
@@ -11090,9 +11090,8 @@ export const commands = {
       worker: { type: 'string', multiple: true, description: 'supervisor start: profile to launch as a supervised worker (repeatable)' },
       instances: { type: 'string', description: `supervisor add / workforce add: spawn/compose N distinct instances of the profile in one call (default 1, max ${MAX_ADD_INSTANCES}; for supervisor add cannot combine with --name)` },
       attach: { type: 'boolean', description: 'supervisor start: attach the interactive console after starting the daemon' },
-      profile: { type: 'string', description: `workforce: manifest name to operate on (default ${DEFAULT_WORKFORCE_MANIFEST}); each subcommand reads/writes <stateHome>/workforce/<name>.json` },
+      manifest: { type: 'string', description: `workforce: manifest name to operate on (default ${DEFAULT_WORKFORCE_MANIFEST}); each subcommand reads/writes <stateHome>/workforce/<name>.json. Renamed from --profile (which now collides with c8ctl's global connection-profile flag).` },
       roles: { type: 'string', description: 'workforce add: comma-separated role list for the entry (→ --job-type <rank>:<role> at start); mutually exclusive with --auto' },
-      json: { type: 'boolean', description: 'workforce list/status: emit machine-readable JSON (for the install script / CI)' },
     },
     handler: async (args, flags) => {
       const logger = getLogger();
@@ -11252,7 +11251,7 @@ function printUsage() {
   console.log('  c8ctl nano assign <profileName> <cap[,cap...]> [--name <n>] [--capabilities <a,b>]');
   console.log('  c8ctl nano work <profileName> [--auto [--auto-scope <p>]] [--arg <switch> ...] [--recovery-window <ms>] [--idle-timeout <ms>] [--job-timeout <ms>] [--poll-timeout <ms>] [--job-type <token> ...] [--sandbox none|docker|podman] [--image <ref>] [--env NAME=VALUE ...] [--secret-resolver host] [--min-free-mb <n>] [--clone-timeout <ms>] [--keep-runs] [--stream]');
   console.log('  c8ctl nano supervisor [start|status|add|remove|restart|stop|logs|attach] ... (manage many workers from one terminal)');
-  console.log('  c8ctl nano workforce [add|remove|list|start|status|stop] ... [--profile <manifest>] (declarative, reusable fleet manifests)');
+  console.log('  c8ctl nano workforce [add|remove|list|start|status|stop] ... [--manifest <manifest>] (declarative, reusable fleet manifests)');
   console.log('');
   console.log('Subcommands:');
   console.log('  start    Spawn an N-node local cluster wired to talk to each other on localhost');

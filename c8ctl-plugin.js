@@ -2588,13 +2588,55 @@ function resolveAutoRestConfig(camunda, env = process.env) {
 // dot-grammar.
 // ---------------------------------------------------------------------------
 
+// Legacy (pre-nano-workforce#203) agent-task marker: a service task carried the
+// agent's prompt in an `io.nanobpm.agentTask.*` `<zeebe:header>` rather than a
+// `linkName="prompt"` linked resource. The current package detector
+// (`scanTaskDefinitions`, whose `agentic` flag keys SOLELY off the linked-prompt
+// side-car) therefore reports `agentic:false` for such tasks. We keep a narrow,
+// self-contained fallback so `--auto` still discovers agent job types against an
+// engine still holding a pre-#203 deployment (issue #120 acceptance criterion:
+// "Legacy header-based BPMN still discovers correctly"). This is a supplement to
+// — never a replacement for — the package flag: the authoritative task-type /
+// process derivation still comes from `scanTaskDefinitions`; this only answers
+// "is this leaf an agent task?" for the legacy shape.
+//
+// True when `body` (a service task's inner XML) declares any
+// `io.nanobpm.agentTask*` `<zeebe:header>` key — the sole such header on a
+// pre-#203 agent service task.
+function serviceTaskHasAgentHeader(body) {
+  return new RegExp(
+    `<(?:\\w+:)?header\\b[^>]*\\bkey\\s*=\\s*(["'])${AGENT_TASK_NS.replace(/[.]/g, '\\.')}(?:\\.[^"']*)?\\1`,
+    'i'
+  ).test(String(body || ''));
+}
+
+// The set of service-task element ids in `xml` bearing the legacy agent-task
+// header. Correlates back to `scanTaskDefinitions` leaves by `elementId`, so a
+// leaf is treated as legacy-agentic only when it ALSO has a `taskDefinition type`
+// (the package only yields leaves that do) — matching the issue rule "prompt link
+// OR legacy header, AND a non-empty task type".
+function legacyAgentHeaderElementIds(xml) {
+  const ids = new Set();
+  const src = String(xml || '');
+  const taskRe =
+    /<(?:\w+:)?serviceTask\b[^>]*?\bid\s*=\s*(["'])(.*?)\1[^>]*?>([\s\S]*?)<\/(?:\w+:)?serviceTask>/g;
+  let m;
+  while ((m = taskRe.exec(src)) !== null) {
+    if (serviceTaskHasAgentHeader(m[3])) ids.add(m[2]);
+  }
+  return ids;
+}
+
 // Scan one deployed BPMN document for its *agent* task-definition leaves: the
 // subset of `@nanobpm/agentic` `demand.scanTaskDefinitions(xml)` leaves whose
 // canonical `agentic` flag is set (i.e. the service task declares a
-// `linkName="prompt"` linked resource). Returns `{ taskType, process }` leaves in
-// first-occurrence order. The published `scanTaskDefinitions` is INJECTED so this
-// stays a pure, synchronous function; `readDeployedAgentJobTypes` supplies the
-// real one from the lazily-imported demand surface (`agentic.mjs`).
+// `linkName="prompt"` linked resource) OR — for backward compatibility with
+// pre-#203 deployments — which carry the legacy `io.nanobpm.agentTask` header.
+// Returns `{ taskType, process }` leaves in first-occurrence order, de-duped by
+// element id so a task matched by both signals is emitted once. The published
+// `scanTaskDefinitions` is INJECTED so this stays a pure, synchronous function;
+// `readDeployedAgentJobTypes` supplies the real one from the lazily-imported
+// demand surface (`agentic.mjs`).
 function scanAgentTaskLeaves(xml, scanTaskDefinitions) {
   if (typeof scanTaskDefinitions !== 'function') {
     throw new TypeError(
@@ -2602,8 +2644,10 @@ function scanAgentTaskLeaves(xml, scanTaskDefinitions) {
         `(got ${typeof scanTaskDefinitions}); pass demand.scanTaskDefinitions from ./agentic.mjs`
     );
   }
-  return scanTaskDefinitions(String(xml || ''))
-    .filter((leaf) => leaf.agentic)
+  const src = String(xml || '');
+  const legacyIds = legacyAgentHeaderElementIds(src);
+  return scanTaskDefinitions(src)
+    .filter((leaf) => leaf.agentic || legacyIds.has(leaf.elementId))
     .map((leaf) => ({ taskType: leaf.taskType, process: leaf.process }));
 }
 
@@ -10820,6 +10864,7 @@ export {
   diffJobTypes,
   parseJobTypeFlags,
   scanAgentTaskLeaves,
+  serviceTaskHasAgentHeader,
   readDeployedAgentJobTypes,
   resolveAutoJobTypes,
   workAgent,

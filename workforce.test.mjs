@@ -34,6 +34,7 @@ import {
   formatWorkforceManifest,
   workforceManifestName,
   lastManifestValue,
+  hostOutputIsJson,
 } from './c8ctl-plugin.js';
 
 // --- defaults --------------------------------------------------------------
@@ -664,4 +665,53 @@ test('readWorkforceManifestStrict refuses an unknown version on disk', () => {
     writeFileSync(getWorkforceManifestFile('default'), JSON.stringify({ version: 99, name: 'default', workers: [] }));
     assert.throws(() => readWorkforceManifestStrict('default'), /unsupported version 99/);
   });
+});
+
+// --- hostOutputIsJson: honour c8ctl's global output mode -------------------
+// The plugin dropped its own `--json` flag (it collided with c8ctl's global
+// `--json`; see #122), so `workforce list/status` must read the host's
+// effective output mode instead. Regression guard for the install-script gate.
+
+test('hostOutputIsJson is false when no c8ctl host is present', () => {
+  const prev = globalThis.c8ctl;
+  try {
+    delete globalThis.c8ctl;
+    assert.equal(hostOutputIsJson(), false);
+  } finally {
+    if (prev === undefined) delete globalThis.c8ctl; else globalThis.c8ctl = prev;
+  }
+});
+
+test('hostOutputIsJson reflects c8ctl.outputMode', () => {
+  const prev = globalThis.c8ctl;
+  try {
+    globalThis.c8ctl = { outputMode: 'json' };
+    assert.equal(hostOutputIsJson(), true);
+    globalThis.c8ctl = { outputMode: 'text' };
+    assert.equal(hostOutputIsJson(), false);
+  } finally {
+    if (prev === undefined) delete globalThis.c8ctl; else globalThis.c8ctl = prev;
+  }
+});
+
+test('hostOutputIsJson falls back to getLogger().mode', () => {
+  const prev = globalThis.c8ctl;
+  try {
+    globalThis.c8ctl = { getLogger: () => ({ mode: 'json' }) };
+    assert.equal(hostOutputIsJson(), true);
+    globalThis.c8ctl = { getLogger: () => ({ mode: 'text' }) };
+    assert.equal(hostOutputIsJson(), false);
+  } finally {
+    if (prev === undefined) delete globalThis.c8ctl; else globalThis.c8ctl = prev;
+  }
+});
+
+test('hostOutputIsJson never throws on a malformed host', () => {
+  const prev = globalThis.c8ctl;
+  try {
+    globalThis.c8ctl = { getLogger() { throw new Error('boom'); } };
+    assert.equal(hostOutputIsJson(), false);
+  } finally {
+    if (prev === undefined) delete globalThis.c8ctl; else globalThis.c8ctl = prev;
+  }
 });

@@ -63,6 +63,11 @@ import { platformForHost } from './platforms.mjs';
 import { createWorkChannel, redactAgenticUrl, buildAgenticUrl } from './work-channel.mjs';
 import { createRelaySession, roleTerminalMode } from './work-relay.mjs';
 import { createBufferMonitor, resolveBufferCapacity } from './work-buffer.mjs';
+// Canonical ACP → transcript wire bridge (nanobpm/nano-ide#534), consumed through
+// the single agentic import surface. `acpUpdateToTranscriptChunk(update)` maps one
+// raw ACP `session/update` to the exact transcript-chunk bytes the cockpit decodes,
+// replacing the plugin's former hand-rolled `nwfTranscriptEvent` envelope grammar.
+import { sessionAcp as agenticSessionAcp } from './agentic.mjs';
 
 const requireFromHere = createRequire(import.meta.url);
 const pluginDir = dirname(fileURLToPath(import.meta.url));
@@ -4165,15 +4170,17 @@ const ACP_MAX_LINE_BYTES = 8 * 1024 * 1024; // 8 MiB
 
 // Drive an ACP (Agent Client Protocol) agent over JSON-RPC 2.0 on stdio.
 //
-// This executor drives ACP end-to-end. Each `session/update` is mapped to a
-// typed `nwfTranscriptEvent` envelope (#110, step 2) and published on the relay
-// session's typed publish seam (`relayTap.relayEnvelope`) — the rich cockpit
-// format its derive+render consumes. The raw relay TRANSPORT is untouched (still
-// `relaySession.relay(text)`); only the payload shape on the lane changes. When
-// an update has no typed mapping, or the relay exposes no typed seam (minimal
-// mode / a plain tap), it falls back to the step-1 human-TEXT chunk on the same
-// lane (`relayTap.onData`) so nothing is dropped. The raw JSON-RPC is never
-// tee'd either way.
+// This executor drives ACP end-to-end. Each `session/update` is mapped to the
+// CANONICAL transcript-chunk wire form via the shared `@nanobpm/agentic` bridge
+// (`acpUpdateToTranscriptChunk` — nanobpm/nano-ide#534) and published on the relay
+// session's transcript-chunk seam (`relayTap.relayTranscriptChunk`) — the exact
+// `{ nwfTranscriptEvent: 1, kind, … }` bytes the cockpit's `parseTranscriptEvent` +
+// `deriveView` decode into messages / tool cards. The raw relay TRANSPORT is
+// untouched (still `relaySession.relay(text)`); only the payload shape on the lane
+// changes. When an update has no canonical mapping (an `ignored` classification), or
+// the relay exposes no transcript seam (minimal mode / a plain tap), it falls back
+// to the human-TEXT chunk on the same lane (`relayTap.onData`) so nothing is
+// dropped. The raw JSON-RPC is never tee'd either way.
 //
 // Framing: ACP frames are newline-delimited JSON-RPC 2.0 messages on stdio (one
 // compact JSON object per line, `\n`-terminated). We implement a tiny inline
@@ -4256,9 +4263,9 @@ function spawnCaptureAcp({ command, args = [], cwd, env, stdinData, timeoutMs, i
 
     // Local mirrors of a human text chunk: the --stream spy tee and the byte-
     // capped stdout capture (what the result envelope carries). Deliberately does
-    // NOT touch the relay lane, so a typed-transcript update can mirror its human
-    // text locally (for the result + spy) WITHOUT also re-emitting raw text onto
-    // the relay lane — which, in step 2, carries the typed envelope instead.
+    // NOT touch the relay lane, so a canonical-transcript update can mirror its
+    // human text locally (for the result + spy) WITHOUT also re-emitting raw text
+    // onto the relay lane — which carries the canonical transcript chunk instead.
     const captureHuman = (text) => {
       if (!text) return;
       const buf = Buffer.from(text, 'utf8');
@@ -4273,8 +4280,8 @@ function spawnCaptureAcp({ command, args = [], cwd, env, stdinData, timeoutMs, i
     // use: the relay tap (framed + jobKey-tagged by the caller) and the local
     // --stream spy tee. Byte-capped like the raw captures. This is the minimal-
     // mode text path — used for stderr, and as the fallback for any session/update
-    // that has no typed nwfTranscriptEvent mapping (or when the relay exposes no
-    // typed publish seam).
+    // that has no canonical transcript mapping (or when the relay exposes no
+    // transcript-chunk seam).
     const emitHuman = (text) => {
       if (!text) return;
       if (relayTap && typeof relayTap.onData === 'function') {
@@ -4395,75 +4402,45 @@ function spawnCaptureAcp({ command, args = [], cwd, env, stdinData, timeoutMs, i
       }
     };
 
-    // #110 step 2: map an ACP session/update to a typed `nwfTranscriptEvent`
-    // envelope — the rich cockpit wire format (the existing downstream
-    // derive+render consumes it). Returns null for an update kind we don't model,
-    // so the caller falls back to the minimal human-text path (nothing dropped,
-    // no regression vs step 1). The `text` field carries the same plain text the
-    // fallback would relay, so a lightweight consumer can still render it.
-    const TRANSCRIPT_EVENT_TYPE = 'nwfTranscriptEvent';
-    const TRANSCRIPT_EVENT_VERSION = 1;
-    const mapTranscriptEnvelope = (update) => {
-      if (!update || typeof update !== 'object') return null;
-      const kind = update.sessionUpdate || update.type;
-      if (!kind) return null;
-      const base = { type: TRANSCRIPT_EVENT_TYPE, v: TRANSCRIPT_EVENT_VERSION, ts: Date.now() };
-      // Optional fields stay `undefined` (JSON encoding omits them) rather than
-      // becoming explicit `null`s, and `??` preserves empty strings — so
-      // consumers see omitted/optional strings, not coerced nulls. `status`
-      // falls through to the kind's default only when genuinely absent.
-      const toolOf = (u, defaultStatus) => ({
-        id: u.toolCallId ?? undefined,
-        title: u.title ?? undefined,
-        status: u.status ?? defaultStatus ?? undefined,
-        kind: u.kind ?? undefined,
-      });
-      switch (kind) {
-        case 'agent_message_chunk':
-          return { ...base, kind: 'message', role: 'agent', text: acpTextOf(update.content) };
-        case 'agent_thought_chunk':
-          return { ...base, kind: 'thought', role: 'agent', text: acpTextOf(update.content) };
-        case 'user_message_chunk':
-          return { ...base, kind: 'message', role: 'user', text: acpTextOf(update.content) };
-        case 'tool_call':
-          // `text` mirrors the fallback's plain text so the typed envelope stays
-          // self-contained for lightweight renderers (matches the stated contract).
-          return { ...base, kind: 'tool_call', text: describeUpdate(update), tool: toolOf(update, 'pending') };
-        case 'tool_call_update':
-          return { ...base, kind: 'tool_call_update', text: describeUpdate(update), tool: toolOf(update, undefined) };
-        case 'plan':
-          // Carry the actual plan entries (rich cockpit renders them), not a
-          // count — an absent/malformed payload stays `undefined` (omitted).
-          return { ...base, kind: 'plan', entries: Array.isArray(update.entries) ? update.entries : undefined };
-        default:
-          // Unmodelled kind → no typed envelope; caller uses the text fallback.
-          return null;
-      }
+    // #110 / nanobpm/nano-ide#534: map an ACP session/update to the CANONICAL
+    // transcript-chunk wire form via the shared `@nanobpm/agentic` bridge —
+    // `classifyUpdate` composed with `encodeTranscriptEvent` behind the single
+    // `acpUpdateToTranscriptChunk` helper. It returns the exact
+    // `{ nwfTranscriptEvent: 1, kind, … }` bytes the cockpit's `parseTranscriptEvent`
+    // decodes and `deriveView` folds into messages / tool cards, or `null` for an
+    // update with no canonical meaning (an `ignored` classification: a plan, an
+    // intermediate tool_call_update, a non-text chunk, or a malformed update). No
+    // envelope grammar or vocab is hand-rolled here anymore — the marker, version,
+    // kinds and fields all come from the package, so a producer and a consumer can
+    // never diverge on the wire again. `null` (and any bridge throw) falls through
+    // to the minimal human-text path below, so nothing is ever dropped.
+    const encodeTranscriptChunk = (update) => {
+      try { return agenticSessionAcp.acpUpdateToTranscriptChunk(update); }
+      catch { return null; }
     };
 
-    // Publish a session/update: prefer the typed nwfTranscriptEvent envelope on
-    // the relay's typed publish seam; fall back to the minimal human-text path
-    // when the update has no typed mapping OR the relay exposes no typed seam, so
-    // nothing is ever dropped (no regression vs minimal mode).
+    // Publish a session/update: prefer the canonical transcript chunk on the
+    // relay's transcript-chunk seam; fall back to the minimal human-text path when
+    // the update has no canonical mapping OR the relay exposes no transcript seam,
+    // so nothing is ever dropped (no regression vs minimal mode).
     const emitTranscript = (update) => {
-      const env = mapTranscriptEnvelope(update);
-      if (env && relayTap && typeof relayTap.relayEnvelope === 'function') {
-        // Only skip the text fallback when the typed publish ACTUALLY succeeded.
+      const chunk = encodeTranscriptChunk(update);
+      if (chunk && relayTap && typeof relayTap.relayTranscriptChunk === 'function') {
+        // Only skip the text fallback when the chunk publish ACTUALLY succeeded.
         // If the seam throws (a downstream tap implementation, not just the
-        // built-in best-effort stringify guard), the envelope never reached the
-        // relay lane — so we must fall through to the text path or that update
-        // would be silently dropped, breaking the "nothing is ever dropped"
-        // guarantee.
+        // built-in best-effort guard), the chunk never reached the relay lane — so
+        // we must fall through to the text path or that update would be silently
+        // dropped, breaking the "nothing is ever dropped" guarantee.
         let published = false;
-        try { relayTap.relayEnvelope(env); published = true; } catch { /* relay best-effort */ }
+        try { relayTap.relayTranscriptChunk(chunk); published = true; } catch { /* relay best-effort */ }
         if (published) {
           // Mirror the human text locally (spy tee + captured stdout) so the
           // result envelope and --stream spy are unchanged — without re-emitting
-          // raw text onto the relay lane, which now carries the typed envelope.
+          // raw text onto the relay lane, which now carries the canonical chunk.
           captureHuman(describeUpdate(update));
           return;
         }
-        // Typed publish threw → fall through to the text lane below.
+        // Chunk publish threw → fall through to the text lane below.
       }
       // Fallback: minimal text-chunk path (relay text + spy tee + capture).
       emitHuman(describeUpdate(update));
@@ -4825,17 +4802,18 @@ function runAgentJob(profile, job, opts = {}) {
   const relayTap = relaySession
     ? {
         onData: (buf) => relaySession.relay(buf),
-        // #110 step 2: typed transcript publish seam. The ACP producer maps each
-        // session/update to an `nwfTranscriptEvent` envelope and publishes it
-        // here; we JSON-encode it (newline-delimited) onto the SAME relay lane —
-        // the raw relay TRANSPORT (ring/QoS/offsets/jobKey routing) is unchanged,
-        // still `relaySession.relay(text)`. Consumers (cockpit derive+render)
-        // parse the envelope; unmapped updates fall back to the `onData` text path
-        // so nothing is dropped (no regression vs the minimal-mode floor).
-        // Best-effort: a bad envelope (circular refs / BigInt making
-        // JSON.stringify throw) must never crash the worker, so swallow here.
-        relayEnvelope: (env) => {
-          try { relaySession.relay(`${JSON.stringify(env)}\n`); } catch { /* relay best-effort */ }
+        // #110 / nanobpm/nano-ide#534: canonical transcript-chunk publish seam. The
+        // ACP producer maps each session/update to the exact `{ nwfTranscriptEvent:
+        // 1, kind, … }` chunk bytes via `acpUpdateToTranscriptChunk` and hands them
+        // here PRE-ENCODED; we relay them verbatim (newline-framed) onto the SAME
+        // relay lane — the raw relay TRANSPORT (ring/QoS/offsets/jobKey routing) is
+        // unchanged, still `relaySession.relay(text)`. Consumers (cockpit
+        // parseTranscriptEvent + deriveView) decode the chunk; unmapped updates fall
+        // back to the `onData` text path so nothing is dropped (no regression vs the
+        // minimal-mode floor). Best-effort: a relay-transport failure must never
+        // crash the worker, so swallow here.
+        relayTranscriptChunk: (chunk) => {
+          try { relaySession.relay(`${chunk}\n`); } catch { /* relay best-effort */ }
         },
         attachSteer: (write) => relaySession.attachSteer(write),
       }

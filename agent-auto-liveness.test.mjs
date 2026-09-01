@@ -60,15 +60,26 @@ test('nano work --auto: a failed INITIAL engine read keeps the worker alive (no 
     hires: { faker: { name: 'faker', rank: 'senior', command: 'true', model: '', capabilities: [] } },
   }));
 
-  // Stand up a local TCP server on an EPHEMERAL port that immediately drops every
-  // connection. Pointing the worker's engine read at this port forces a
-  // deterministic connection failure (socket hang up / reset) regardless of the
-  // host's environment — unlike a fixed well-known port (e.g. 9/discard), which
-  // can actually be listening and make the test flaky or skip the failure path.
-  const deadServer = createServer((sock) => { sock.destroy(); });
-  await new Promise((resolve) => deadServer.listen(0, '127.0.0.1', resolve));
-  t.after(() => { try { deadServer.close(); } catch { /* ignore */ } });
-  const deadPort = deadServer.address().port;
+  // Point the worker's engine read at a CLOSED ephemeral port: bind one to learn
+  // a free port number, then close it so the port has no listener. Connecting
+  // there fails with a kernel-level ECONNREFUSED in microseconds, deterministically
+  // and independent of any userland event loop — which also faithfully models the
+  // common real scenario the worker must survive: "no engine listening yet".
+  //
+  // The earlier design (a listening server whose connection handler calls
+  // `sock.destroy()`) was subtly load-dependent and flaky in CI: the destroy
+  // callback runs in THIS (parent) process's event loop, so while the parent is
+  // busy running the rest of the suite in parallel the kernel still completes the
+  // TCP handshake and the child's fetch connects and then blocks waiting for a
+  // response that never comes — stalling the engine read until its 15s timeout
+  // (which equals this test's own observation window) and starving the assertion
+  // of any output. A refused connection removes the parent from the failure path
+  // entirely. A fixed well-known port is avoided because it can actually be
+  // listening and skip the failure path.
+  const portFinder = createServer();
+  await new Promise((resolve) => portFinder.listen(0, '127.0.0.1', resolve));
+  const deadPort = portFinder.address().port;
+  await new Promise((resolve) => portFinder.close(resolve));
 
   const harness = join(HOME, 'harness.mjs');
   writeFileSync(harness, harnessSource(deadPort));

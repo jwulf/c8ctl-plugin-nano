@@ -2486,7 +2486,10 @@ function normalizeTaskEnvelope(customHeaders, variables, opts = {}) {
 //   - `scheme://host/…` (https/http/ssh/git), host required;
 //   - `file://…` with a path;
 //   - scp-like `user@host:path` (e.g. `git@github.com:o/r.git`);
-//   - a local filesystem path (`/…`, `./…`, `../…`).
+//   - a POSIX local filesystem path (`/…`, `./…`, `../…`);
+//   - a Windows local path — drive-absolute (`C:\repo`, `C:/repo`), UNC
+//     (`\\server\share\repo`), or backslash-relative (`.\repo`, `..\repo`) —
+//     since the plugin also runs on win32 hosts.
 // Anything else (a bare word, `github.com/o/r` with no scheme) is treated as
 // malformed.
 function isPlausibleRepoUrl(url) {
@@ -2494,6 +2497,9 @@ function isPlausibleRepoUrl(url) {
   if (!s) return false;
   // scp-like syntax has no scheme: user@host:path (the colon is not a port).
   if (/^[^\s/@]+@[^\s/:]+:.+/.test(s)) return true;
+  // Windows local paths — checked BEFORE new URL() because a drive letter like
+  // `C:` parses as a (hostname-less) URL scheme and would otherwise be rejected.
+  if (/^[A-Za-z]:[\\/]/.test(s) || /^\\\\[^\\]/.test(s) || s.startsWith('.\\') || s.startsWith('..\\')) return true;
   try {
     const u = new URL(s);
     if (u.protocol === 'file:') return !!u.pathname && u.pathname !== '/';

@@ -730,6 +730,11 @@ test('isPlausibleRepoUrl: accepts real clone targets, rejects unusable strings',
     '/srv/repos/r.git',
     './r',
     '../sibling/r',
+    'C:\\repo',
+    'C:/repo',
+    '\\\\server\\share\\repo',
+    '.\\r',
+    '..\\sibling\\r',
   ]) {
     assert.equal(isPlausibleRepoUrl(ok), true, `should accept ${ok}`);
   }

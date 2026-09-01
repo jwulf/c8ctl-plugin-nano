@@ -3,7 +3,7 @@
 // normalization, and (Docker-gated) container execution + disk hygiene.
 import { test } from 'node:test';
 import assert from 'node:assert/strict';
-import { spawnSync } from 'node:child_process';
+import { spawn, spawnSync } from 'node:child_process';
 
 import { mkdtempSync, mkdirSync, writeFileSync, rmSync, existsSync, utimesSync } from 'node:fs';
 import { tmpdir } from 'node:os';
@@ -52,6 +52,10 @@ import {
   resolveAssignInputs,
   containerEngineAvailable,
   runAgentJob,
+  sampleSubtreeCpu,
+  createIdleLivenessMonitor,
+  resolveLivenessOverrides,
+  parsePsTime,
   startLockExtender,
   provisionRepo,
   finalizeGit,
@@ -2242,6 +2246,221 @@ test('runAgentJob (host) idle-timeout does NOT kill a harness that keeps produci
   assert.equal(result.ok, true, result.error || result.stderr);
   assert.notEqual(result.idle, true);
   assert.equal(result.stdout, 'xxxxx');
+});
+
+// ---- #130: progress-aware idle liveness -----------------------------------
+// The idle-liveness kill no longer treats terminal silence as "wedged": before
+// killing it probes the spawned process subtree, and if a descendant is doing
+// work (aggregate CPU advancing) the agent is treated as live and the kill is
+// deferred. Only a genuinely quiescent tree ages out. This lets an agent keep
+// the cheapest pattern — a fully silent `-q` build — without being mistaken for
+// a hang.
+
+test('sampleSubtreeCpu reports descendants + advancing CPU for a working subtree', { skip: process.platform === 'win32' }, async () => {
+  // A shell that backgrounds a CPU spinner (a descendant burning CPU) then waits.
+  const child = spawn('sh', ['-c', 'sh -c "while :; do :; done" & W=$!; sleep 3; kill $W 2>/dev/null'], { detached: true, stdio: 'ignore' });
+  try {
+    await new Promise((r) => setTimeout(r, 200));
+    const a = sampleSubtreeCpu(child.pid);
+    assert.ok(a, 'a live subtree is sampleable');
+    assert.ok(a.descendants >= 1, `the backgrounded spinner is a descendant (got ${a?.descendants})`);
+    await new Promise((r) => setTimeout(r, 300));
+    const b = sampleSubtreeCpu(child.pid);
+    assert.ok(b.cpu > a.cpu, `aggregate subtree CPU advances while the spinner runs (${a.cpu} → ${b.cpu})`);
+  } finally {
+    try { process.kill(-child.pid, 'SIGKILL'); } catch { /* best effort */ }
+  }
+});
+
+test('sampleSubtreeCpu: no descendants for a childless process; null for a bogus pid', { skip: process.platform === 'win32' }, async () => {
+  const child = spawn('sleep', ['3'], { stdio: 'ignore' });
+  try {
+    await new Promise((r) => setTimeout(r, 100));
+    const s = sampleSubtreeCpu(child.pid);
+    assert.ok(s, 'a live leaf process is sampleable');
+    assert.equal(s.descendants, 0, 'a `sleep` with no children has zero descendants');
+  } finally {
+    try { child.kill('SIGKILL'); } catch { /* best effort */ }
+  }
+  assert.equal(sampleSubtreeCpu(2 ** 31), null, 'a non-existent pid yields null');
+  assert.equal(sampleSubtreeCpu(-1), null, 'an invalid pid yields null');
+  assert.equal(sampleSubtreeCpu('x'), null, 'a non-numeric pid yields null');
+});
+
+test('parsePsTime parses ps CPU time fields into seconds', () => {
+  assert.equal(parsePsTime('0:00'), 0);
+  assert.equal(parsePsTime('0:05'), 5);
+  assert.equal(parsePsTime('1:02'), 62);
+  assert.equal(parsePsTime('1:00:00'), 3600);
+  assert.equal(parsePsTime('2-03:00:00'), 2 * 86_400 + 3 * 3600);
+  assert.equal(parsePsTime('bogus'), 0);
+});
+
+// The monitor is the heart of the heuristic; drive it deterministically with an
+// injected CPU sampler and fake wall-clock so the branch behaviour is exact.
+test('createIdleLivenessMonitor defers while subtree CPU advances, kills when it stalls', async () => {
+  let cpu = 0;
+  let killed = 0;
+  // Advance CPU steadily so every probe sees forward progress.
+  const ticker = setInterval(() => { cpu += 3; }, 10);
+  const mon = createIdleLivenessMonitor({
+    getPid: () => 1234,
+    idleTimeoutMs: 30,
+    recoveryWindowMs: 30,
+    isSettled: () => false,
+    sampleCpu: () => ({ descendants: 1, cpu }),
+    onIdleKill: () => { killed += 1; },
+  });
+  mon.arm();
+  await new Promise((r) => setTimeout(r, 160)); // several probe windows of progress
+  assert.equal(killed, 0, 'a subtree that keeps advancing CPU is never killed');
+  clearInterval(ticker); // CPU now stalls (stays flat)
+  await new Promise((r) => setTimeout(r, 120)); // a couple of flat-CPU windows
+  mon.stop();
+  assert.equal(killed, 1, 'a stalled (flat-CPU) subtree ages out and is killed exactly once');
+});
+
+test('createIdleLivenessMonitor kills immediately when there is no live descendant', async () => {
+  let killed = 0;
+  const mon = createIdleLivenessMonitor({
+    getPid: () => 1234,
+    idleTimeoutMs: 15,
+    recoveryWindowMs: 100,
+    isSettled: () => false,
+    sampleCpu: () => ({ descendants: 0, cpu: 0 }),
+    onIdleKill: () => { killed += 1; },
+  });
+  mon.arm();
+  await new Promise((r) => setTimeout(r, 40));
+  mon.stop();
+  assert.equal(killed, 1, 'a childless silent agent still ages out on silence (legacy behaviour)');
+});
+
+test('createIdleLivenessMonitor kills on silence when the subtree is unsampleable (fallback)', async () => {
+  let killed = 0;
+  const mon = createIdleLivenessMonitor({
+    getPid: () => 1234,
+    idleTimeoutMs: 15,
+    recoveryWindowMs: 100,
+    isSettled: () => false,
+    sampleCpu: () => null, // sampling unsupported/failed → degrade to silence-kill
+    onIdleKill: () => { killed += 1; },
+  });
+  mon.arm();
+  await new Promise((r) => setTimeout(r, 40));
+  mon.stop();
+  assert.equal(killed, 1, 'no usable sample → the legacy silence-only liveness applies');
+});
+
+test('createIdleLivenessMonitor arm() resets the silence window on output', async () => {
+  let killed = 0;
+  const mon = createIdleLivenessMonitor({
+    getPid: () => 1234,
+    idleTimeoutMs: 30,
+    recoveryWindowMs: 30,
+    isSettled: () => false,
+    sampleCpu: () => ({ descendants: 0, cpu: 0 }),
+    onIdleKill: () => { killed += 1; },
+  });
+  mon.arm();
+  // Re-arm before the window elapses (simulating a steady drip of output).
+  for (let i = 0; i < 4; i += 1) { await new Promise((r) => setTimeout(r, 15)); mon.arm(); }
+  assert.equal(killed, 0, 'continuous output keeps re-arming so the idle-kill never fires');
+  mon.stop();
+});
+
+test('createIdleLivenessMonitor is inert when idleTimeoutMs is not positive', async () => {
+  let killed = 0;
+  const mon = createIdleLivenessMonitor({
+    getPid: () => 1234,
+    idleTimeoutMs: 0,
+    recoveryWindowMs: 0,
+    isSettled: () => false,
+    sampleCpu: () => ({ descendants: 0, cpu: 0 }),
+    onIdleKill: () => { killed += 1; },
+  });
+  assert.equal(mon.enabled, false);
+  mon.arm();
+  await new Promise((r) => setTimeout(r, 30));
+  mon.stop();
+  assert.equal(killed, 0, 'idle-timeout disabled (0) → no idle-kill, unbounded silence allowed');
+});
+
+test('runAgentJob (host) idle-timeout does NOT kill a silent harness with a CPU-active descendant', { skip: process.platform === 'win32' }, async () => {
+  // The harness produces ZERO output but keeps a busy descendant alive for ~1.2s,
+  // then exits 0. Under the old silence-only heuristic the 300ms idle window
+  // would kill it mid-work; the progress-aware check must defer and let it finish.
+  const profile = { name: 'p', rank: 'senior', command: 'sh -c "while :; do :; done" >/dev/null 2>&1 & W=$!; sleep 1.2; kill $W 2>/dev/null; true', args: [], model: '', capabilities: [] };
+  const job = { jobKey: 'jk', type: 'senior', variables: {}, customHeaders: {} };
+  const result = await runAgentJob(profile, job, {
+    sandbox: 'none',
+    envelope: normalizeTaskEnvelope({}, {}),
+    idleTimeoutMs: 300,
+    recoveryWindowMs: 300,
+  });
+  assert.notEqual(result.idle, true, 'a silent-but-working subtree is not idle-killed');
+  assert.equal(result.ok, true, result.error || result.stderr);
+});
+
+test('runAgentJob (host) idle-timeout DOES kill a silent, CPU-idle tree', { skip: process.platform === 'win32' }, async () => {
+  // A silent tree that burns no CPU (just sleeps) past the window is a genuine
+  // hang and must still be reclaimed.
+  const profile = { name: 'p', rank: 'senior', command: 'sleep 10', args: [], model: '', capabilities: [] };
+  const job = { jobKey: 'jk', type: 'senior', variables: {}, customHeaders: {} };
+  const t0 = Date.now();
+  const result = await runAgentJob(profile, job, {
+    sandbox: 'none',
+    envelope: normalizeTaskEnvelope({}, {}),
+    idleTimeoutMs: 150,
+    recoveryWindowMs: 150,
+  });
+  assert.equal(result.ok, false);
+  assert.equal(result.idle, true, 'a silent CPU-idle tree is aged out');
+  assert.ok(Date.now() - t0 < 5_000, 'killed well before the 10s sleep completes');
+});
+
+// #130 (#3): the task envelope may carry per-task idle/recovery/hard-cap
+// overrides, wired through to the values passed to runAgentJob.
+test('normalizeTaskEnvelope carries per-task idle/recovery/timeout overrides', () => {
+  const env = normalizeTaskEnvelope(
+    { 'io.nanobpm.agentTask': { task: { idleTimeoutMs: '600000', recoveryWindowMs: 120000, timeoutMs: '1800000' } } },
+    {},
+  );
+  assert.equal(env.task.idleTimeoutMs, 600000);
+  assert.equal(env.task.recoveryWindowMs, 120000);
+  assert.equal(env.task.timeoutMs, 1800000);
+  // Absent → undefined (worker-flag behaviour preserved downstream).
+  const bare = normalizeTaskEnvelope({}, {});
+  assert.equal(bare.task.idleTimeoutMs, undefined);
+  assert.equal(bare.task.recoveryWindowMs, undefined);
+});
+
+test('resolveLivenessOverrides: envelope overrides worker defaults; absent → unchanged; over-max → clamped', () => {
+  const workerDefaults = { idleTimeoutMs: 300_000, recoveryWindowMs: 300_000, hardCapMs: 0 };
+  // Absent envelope fields → worker defaults, unchanged.
+  assert.deepEqual(
+    resolveLivenessOverrides({}, workerDefaults),
+    { idleTimeoutMs: 300_000, recoveryWindowMs: 300_000, hardCapMs: 0 },
+  );
+  assert.deepEqual(resolveLivenessOverrides(undefined, workerDefaults), workerDefaults);
+  // Envelope override wins.
+  assert.deepEqual(
+    resolveLivenessOverrides({ idleTimeoutMs: 600_000, recoveryWindowMs: 120_000, timeoutMs: 900_000 }, workerDefaults),
+    { idleTimeoutMs: 600_000, recoveryWindowMs: 120_000, hardCapMs: 900_000 },
+  );
+  // Over-max → clamped to the sane ceilings, not passed through unbounded.
+  const clamped = resolveLivenessOverrides(
+    { idleTimeoutMs: 9_999_999_999, recoveryWindowMs: 9_999_999_999, timeoutMs: 9_999_999_999_999 },
+    workerDefaults,
+  );
+  assert.equal(clamped.idleTimeoutMs, 60 * 60_000);
+  assert.equal(clamped.recoveryWindowMs, 60 * 60_000);
+  assert.equal(clamped.hardCapMs, 24 * 60 * 60_000);
+  // Non-positive / invalid envelope values are ignored (fall through to default).
+  assert.deepEqual(
+    resolveLivenessOverrides({ idleTimeoutMs: 0, recoveryWindowMs: -5, timeoutMs: 'x' }, workerDefaults),
+    workerDefaults,
+  );
 });
 
 // derivePollTimeoutMs resolves the broker long-poll window passed to the SDK as

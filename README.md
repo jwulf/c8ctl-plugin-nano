@@ -571,9 +571,17 @@ the job with a decremented retry count. Profiles are stored in the plugin's
 >   the node is lost, the harness is idle-killed, or it hits the hard cap — the
 >   lock lapses within one `--recovery-window` and the broker reclaims the job.
 >   This is deliberately optimised for quick reclaim, not for holding a stale lock.
-> - **`--idle-timeout`** (default `300000`ms) is the liveness gate: if the agent
->   produces no stdout/stderr for this long it is killed as wedged, extension
->   stops, and the job is reclaimed — so a hung agent can't hold a job forever.
+> - **`--idle-timeout`** (default `300000`ms) is the liveness gate — but it is
+>   **progress-aware**, not a blunt silence timer. When the window elapses the
+>   worker probes the harness's process subtree: if a descendant is still doing
+>   work (aggregate CPU time across the tree is advancing — e.g. a long, quiet
+>   `./mvnw -q` build that emits nothing for minutes) the agent is treated as
+>   **live** and the kill is deferred. Only a genuinely quiescent tree — no live
+>   descendant, or descendants burning no CPU across the window — is killed as
+>   wedged, so a hung agent still can't hold a job forever while a silent-but-busy
+>   one keeps the cheapest, zero-token build pattern. A task can widen this per
+>   task class via the envelope's `task.idleTimeoutMs` / `task.recoveryWindowMs`
+>   (see the task envelope below) instead of a global flag change.
 > - **`--job-timeout`** is now an *optional* absolute hard cap on total harness
 >   runtime (default `0` = unlimited), for when you want a ceiling regardless of
 >   output. `--lock-grace` is **deprecated and ignored** — the lock is auto-managed.
@@ -616,7 +624,16 @@ stdin payload as `task`:
 Element templates emit flat dotpath header keys (strings); the plugin expands
 them into a nested object and coerces `"true"/"false"` → bool and numeric
 strings → int. The normalized shape is
-`{ schemaVersion, repository{provider,url,ref,sha,depth,singleBranch,filter,baseRef,baseSha,cloneTimeoutMs,submodules,authRef}, branch{base,create,push}, setup{commands,env,secretRefs}, task{prompt,promptFile,maxIterations,timeoutMs,allowPr,prBase} }`.
+`{ schemaVersion, repository{provider,url,ref,sha,depth,singleBranch,filter,baseRef,baseSha,cloneTimeoutMs,submodules,authRef}, branch{base,create,push}, setup{commands,env,secretRefs}, task{prompt,promptFile,maxIterations,timeoutMs,idleTimeoutMs,recoveryWindowMs,allowPr,prBase} }`.
+
+**Per-task liveness overrides.** `task.idleTimeoutMs` and `task.recoveryWindowMs`
+let a specific task class (e.g. an implementation job on a large monorepo) widen
+the idle-liveness / broker-lock recovery window without touching the worker's
+global `--idle-timeout` / `--recovery-window` flags, and `task.timeoutMs` raises
+the absolute hard cap (`--job-timeout`). Precedence is **envelope override →
+worker flag → built-in default**, each clamped to a sane maximum so a task can't
+request an unbounded window; absent fields leave the worker-flag behaviour
+unchanged.
 
 **Prompt = base + optional verbatim append.** The agent's prompt resolves to
 `task.prompt` (typically a model header filled at deploy time), falling back to a

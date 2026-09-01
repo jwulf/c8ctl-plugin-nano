@@ -2208,6 +2208,219 @@ function killTree(child) {
   try { child.kill('SIGKILL'); } catch { /* already gone */ }
 }
 
+// ---- Progress-aware idle liveness (#130) ---------------------------------
+// The idle-liveness kill used to treat terminal silence as "wedged": a harness
+// that emitted no stdout/stderr for `idleTimeoutMs` was killed, which stops the
+// broker lock extension and lets the job be reclaimed. But an agent running a
+// long, QUIET subprocess (e.g. a cold `./mvnw -q … | tail` reactor build) can
+// produce zero output for 10+ minutes while actively progressing — a silence
+// that is NOT a hang. The fix: before the idle-kill fires, probe the spawned
+// process subtree; if a descendant is doing work (aggregate CPU time across the
+// tree is advancing) treat the agent as live and defer the kill instead of
+// reclaiming a job that is genuinely making forward progress. Only a quiescent
+// tree — no live descendant, or descendants burning no CPU across the window —
+// ages out and is killed, so a truly wedged agent is still reclaimed.
+
+/**
+ * Parse a `ps`-style CPU time field (`[[dd-]hh:]mm:ss[.frac]`) into whole
+ * seconds. Best-effort: an unrecognised token yields 0 so a single odd line
+ * never poisons the aggregate.
+ */
+function parsePsTime(token) {
+  if (typeof token !== 'string') return 0;
+  let s = token.trim();
+  let days = 0;
+  const dash = s.indexOf('-');
+  if (dash !== -1) { days = Number(s.slice(0, dash)) || 0; s = s.slice(dash + 1); }
+  const parts = s.split(':').map((p) => Number.parseFloat(p));
+  if (parts.some((n) => !Number.isFinite(n))) return days * 86_400;
+  let secs = 0;
+  for (const p of parts) secs = secs * 60 + p;
+  return days * 86_400 + secs;
+}
+
+/**
+ * Sample the process subtree rooted at `rootPid` from Linux `/proc`.
+ * Returns `{ descendants, cpu }` — the count of live descendant processes
+ * (excluding the root) and the aggregate CPU time (utime+stime, in clock ticks)
+ * summed across the WHOLE subtree including the root — or `null` when the tree
+ * cannot be read (e.g. `/proc` unavailable). The descendant count is the
+ * presence gate (a childless silent agent still ages out on silence); the CPU
+ * aggregate is the progress signal (a present-but-hung `java` burning no CPU
+ * still ages out).
+ */
+function sampleSubtreeCpuProc(rootPid) {
+  let entries;
+  try { entries = readdirSync('/proc'); } catch { return null; }
+  const children = new Map(); // ppid -> [pid]
+  const cpu = new Map();      // pid  -> aggregate ticks (utime+stime)
+  for (const name of entries) {
+    if (name.charCodeAt(0) < 48 || name.charCodeAt(0) > 57) continue; // fast /^\d/ gate
+    if (!/^\d+$/.test(name)) continue;
+    const pid = Number(name);
+    let stat;
+    try { stat = readFileSync(`/proc/${name}/stat`, 'utf8'); } catch { continue; }
+    // `comm` (field #2) is parenthesised and may itself contain spaces or
+    // parentheses, so split on the LAST ')' — everything after it is the
+    // space-separated tail starting at field #3 (state).
+    const rparen = stat.lastIndexOf(')');
+    if (rparen < 0) continue;
+    const tail = stat.slice(rparen + 2).split(' ');
+    // tail[0]=state(#3), tail[1]=ppid(#4) … utime(#14)=tail[11], stime(#15)=tail[12].
+    const ppid = Number(tail[1]);
+    if (!Number.isFinite(ppid)) continue;
+    const utime = Number(tail[11]);
+    const stime = Number(tail[12]);
+    if (!children.has(ppid)) children.set(ppid, []);
+    children.get(ppid).push(pid);
+    cpu.set(pid, (Number.isFinite(utime) ? utime : 0) + (Number.isFinite(stime) ? stime : 0));
+  }
+  if (!cpu.has(rootPid) && !children.has(rootPid)) return null; // root already gone
+  let descendants = 0;
+  let totalCpu = cpu.get(rootPid) || 0;
+  const seen = new Set([rootPid]);
+  const stack = [...(children.get(rootPid) || [])];
+  while (stack.length) {
+    const pid = stack.pop();
+    if (seen.has(pid)) continue;
+    seen.add(pid);
+    descendants += 1;
+    totalCpu += cpu.get(pid) || 0;
+    const kids = children.get(pid);
+    if (kids) for (const k of kids) if (!seen.has(k)) stack.push(k);
+  }
+  return { descendants, cpu: totalCpu };
+}
+
+/**
+ * Non-Linux fallback: sample the subtree via a one-shot `ps`. Heavier than the
+ * `/proc` read (it spawns a process) but only runs during an idle window, which
+ * is rare by construction. Returns the same `{ descendants, cpu }` shape (cpu in
+ * whole seconds here) or `null` when `ps` is unavailable/unparsable.
+ */
+function sampleSubtreeCpuPs(rootPid) {
+  let out;
+  try {
+    const r = spawnSync('ps', ['-A', '-o', 'pid=,ppid=,time='], { encoding: 'utf8', timeout: 5_000 });
+    if (r.status !== 0 || !r.stdout) return null;
+    out = r.stdout;
+  } catch { return null; }
+  const children = new Map();
+  const cpu = new Map();
+  for (const line of out.split('\n')) {
+    const m = line.trim().match(/^(\d+)\s+(\d+)\s+(\S+)$/);
+    if (!m) continue;
+    const pid = Number(m[1]);
+    const ppid = Number(m[2]);
+    if (!children.has(ppid)) children.set(ppid, []);
+    children.get(ppid).push(pid);
+    cpu.set(pid, parsePsTime(m[3]));
+  }
+  if (!cpu.has(rootPid) && !children.has(rootPid)) return null;
+  let descendants = 0;
+  let totalCpu = cpu.get(rootPid) || 0;
+  const seen = new Set([rootPid]);
+  const stack = [...(children.get(rootPid) || [])];
+  while (stack.length) {
+    const pid = stack.pop();
+    if (seen.has(pid)) continue;
+    seen.add(pid);
+    descendants += 1;
+    totalCpu += cpu.get(pid) || 0;
+    const kids = children.get(pid);
+    if (kids) for (const k of kids) if (!seen.has(k)) stack.push(k);
+  }
+  return { descendants, cpu: totalCpu };
+}
+
+/**
+ * Sample the aggregate CPU + descendant count of the process subtree rooted at
+ * `rootPid`. Linux reads `/proc`; other POSIX platforms fall back to `ps`.
+ * Returns `null` when sampling is unsupported/failed, so callers degrade to the
+ * legacy silence-only liveness rather than mis-killing.
+ */
+function sampleSubtreeCpu(rootPid) {
+  if (typeof rootPid !== 'number' || !(rootPid > 0)) return null;
+  if (process.platform === 'win32') return null;
+  if (process.platform === 'linux') return sampleSubtreeCpuProc(rootPid);
+  return sampleSubtreeCpuPs(rootPid);
+}
+
+/**
+ * Build a progress-aware idle-liveness monitor shared by the pipe/PTY/ACP
+ * capture paths. `arm()` is called on every output chunk (and once at start) to
+ * (re)start the silence window; `stop()` is called when the run settles.
+ *
+ * When the silence window elapses the monitor probes the subtree via `sampleCpu`
+ * instead of killing outright:
+ *  - no usable sample OR no live descendant → the tree is childless/quiescent →
+ *    `onIdleKill()` (preserves the legacy "silence == wedged" behaviour, so a
+ *    genuinely wedged agent with no children still ages out).
+ *  - a live descendant whose aggregate CPU advanced since the last probe → the
+ *    tree is doing work → defer another probe window (`recoveryWindowMs`, or the
+ *    idle window when unset) instead of killing.
+ *  - a live descendant whose CPU did NOT advance across a probe window → hung →
+ *    `onIdleKill()`.
+ * The first elapse with live descendants takes a baseline (a single sample can't
+ * show movement) and re-probes after the recovery window. The absolute
+ * `--job-timeout` hard cap remains the ultimate backstop, untouched by this.
+ */
+function createIdleLivenessMonitor({ getPid, idleTimeoutMs, recoveryWindowMs, onIdleKill, isSettled, sampleCpu = sampleSubtreeCpu }) {
+  const enabled = idleTimeoutMs && idleTimeoutMs > 0;
+  const probeWindow = recoveryWindowMs && recoveryWindowMs > 0 ? recoveryWindowMs : idleTimeoutMs;
+  let timer = null;
+  let prev = null; // last subtree CPU probe taken during the current silent stretch
+  const settled = () => (typeof isSettled === 'function' ? isSettled() : false);
+  const clear = () => { if (timer) { clearTimeout(timer); timer = null; } };
+  const onElapse = () => {
+    timer = null;
+    if (settled()) return;
+    const pid = typeof getPid === 'function' ? getPid() : undefined;
+    const sample = pid != null ? sampleCpu(pid) : null;
+    // Childless / unsampleable / dead tree → silence really is a hang: kill.
+    if (!sample || sample.descendants <= 0) { onIdleKill(); return; }
+    if (prev != null) {
+      // Aggregate CPU advanced across the window → the tree is doing work; defer.
+      if (sample.cpu > prev.cpu) { prev = sample; timer = setTimeout(onElapse, probeWindow); return; }
+      // Live descendants but no CPU movement across a full window → hung: kill.
+      onIdleKill();
+      return;
+    }
+    // First elapse with live descendants: baseline, then re-probe (can't judge
+    // progress from one sample).
+    prev = sample;
+    timer = setTimeout(onElapse, probeWindow);
+  };
+  return {
+    enabled: !!enabled,
+    arm() {
+      if (!enabled || settled()) return;
+      prev = null; // output resumed → a fresh silent stretch starts
+      clear();
+      timer = setTimeout(onElapse, idleTimeoutMs);
+    },
+    stop() { clear(); },
+  };
+}
+
+/**
+ * Resolve the effective per-job liveness values (#130) from the task envelope
+ * with precedence: envelope override → worker-flag default → built-in default.
+ * Each override is clamped to a sane max so a task envelope can't request an
+ * unbounded window. Absent/invalid envelope fields fall through to the
+ * worker-flag value unchanged. `hardCapMs` (0 = no absolute cap) is preserved as
+ * the ultimate backstop; an envelope `timeoutMs` can raise it (clamped).
+ */
+function resolveLivenessOverrides(envelopeTask, { idleTimeoutMs, recoveryWindowMs, hardCapMs } = {}) {
+  const task = isPlainObject(envelopeTask) ? envelopeTask : {};
+  const clampPos = (v, max) => (Number.isFinite(v) && v > 0 ? Math.min(v, max) : undefined);
+  return {
+    idleTimeoutMs: clampPos(task.idleTimeoutMs, MAX_TASK_IDLE_TIMEOUT_MS) ?? idleTimeoutMs,
+    recoveryWindowMs: clampPos(task.recoveryWindowMs, MAX_TASK_RECOVERY_WINDOW_MS) ?? recoveryWindowMs,
+    hardCapMs: clampPos(task.timeoutMs, MAX_TASK_HARD_CAP_MS) ?? hardCapMs,
+  };
+}
+
 // ===========================================================================
 // Agent task envelope + sandboxed execution (issue #8, increment 1)
 // ===========================================================================
@@ -2228,6 +2441,14 @@ const AGENT_RESULT_KEY = 'io.nanobpm.agentResult';
 const LINKED_RESOURCES_HEADER = 'linkedResources';
 const DEFAULT_PROMPT_LINK_NAME = 'prompt';
 const TASK_ENVELOPE_SCHEMA_VERSION = 1;
+// Upper bounds for per-task liveness overrides (#130). A task envelope may widen
+// the idle/recovery window (and the absolute hard cap) for a long-idle task
+// class, but never unboundedly — a runaway or malicious envelope can't pin a
+// worker forever. Generous but finite: 1h of silence-with-progress, 1h recovery
+// cadence, 24h absolute runtime cap.
+const MAX_TASK_IDLE_TIMEOUT_MS = 60 * 60_000;
+const MAX_TASK_RECOVERY_WINDOW_MS = 60 * 60_000;
+const MAX_TASK_HARD_CAP_MS = 24 * 60 * 60_000;
 // The result-envelope version is intentionally independent of the task-envelope
 // version so the two contracts can evolve separately without silently coupling.
 const RESULT_ENVELOPE_SCHEMA_VERSION = 1;
@@ -2472,6 +2693,16 @@ function normalizeTaskEnvelope(customHeaders, variables, opts = {}) {
     promptFile: str(task.promptFile),
     maxIterations: coerceInt(task.maxIterations, undefined),
     timeoutMs: coerceInt(task.timeoutMs, undefined),
+    // #130: per-task liveness overrides. `idleTimeoutMs` is the max silence
+    // (with no subtree CPU progress) before the harness is treated as wedged;
+    // `recoveryWindowMs` is the cadence at which a silent-but-working tree is
+    // re-probed and also the broker lock recovery window. Both let the
+    // orchestrator widen the window for a specific long-idle task class (e.g. a
+    // JVM-heavy monorepo build) without a global `--idle-timeout` widen. Absent
+    // → the worker-flag defaults apply, unchanged. Clamped to a sane max at the
+    // point of use so a task can't request an unbounded window.
+    idleTimeoutMs: coerceInt(task.idleTimeoutMs, undefined),
+    recoveryWindowMs: coerceInt(task.recoveryWindowMs, undefined),
     allowPr: coerceBool(task.allowPr, false),
     prBase: str(task.prBase),
   };
@@ -3789,7 +4020,7 @@ const MAX_CAPTURE_BYTES = 1_048_576; // 1 MiB per stream
 // Spawn a child, pipe `stdinData`, capture byte-capped stdout/stderr, enforce a
 // timeout (invoking `onTimeout(child)` to tear the child down), and resolve to a
 // uniform result. Used by both the host and container executors.
-function spawnCaptureOneShot({ command, args = [], shell = false, detached = false, cwd, env, stdinData, timeoutMs, idleTimeoutMs, onTimeout, stream = false, streamPrefix = '', onStreamOut, onStreamErr, relayTap = null }) {
+function spawnCaptureOneShot({ command, args = [], shell = false, detached = false, cwd, env, stdinData, timeoutMs, idleTimeoutMs, recoveryWindowMs, onTimeout, stream = false, streamPrefix = '', onStreamOut, onStreamErr, relayTap = null }) {
   return new Promise((resolve) => {
     let child;
     const stdoutChunks = [];
@@ -3800,7 +4031,7 @@ function spawnCaptureOneShot({ command, args = [], shell = false, detached = fal
     let stderrTruncated = false;
     let settled = false;
     let timer = null;
-    let idleTimer = null;
+    let idleMon = null;
 
     // Live "spy" tee (--stream): mirror the child's output line-by-line to a
     // caller-supplied emitter (the worker routes these through c8ctl's
@@ -3837,7 +4068,7 @@ function spawnCaptureOneShot({ command, args = [], shell = false, detached = fal
       if (settled) return;
       settled = true;
       if (timer) clearTimeout(timer);
-      if (idleTimer) clearTimeout(idleTimer);
+      if (idleMon) idleMon.stop();
       if (teeOut) teeOut('', true);
       if (teeErr) teeErr('', true);
       resolve(result);
@@ -3857,21 +4088,27 @@ function spawnCaptureOneShot({ command, args = [], shell = false, detached = fal
         }, timeoutMs)
       : null;
 
-    // Idle-liveness kill: if the child emits no stdout/stderr for `idleTimeoutMs`,
-    // treat it as wedged and kill the tree. This is the liveness signal the
-    // worker's lock-extender relies on — a silent hang stops producing output, we
-    // kill it here, `runAgentJob` resolves, and the worker fails the job
-    // (retryable) so the broker reclaims it. Distinct from the absolute `timeoutMs`
-    // hard cap: this fires on *silence*, not total runtime. Re-armed on every chunk.
-    const armIdle = () => {
-      if (settled) return;
-      if (!(idleTimeoutMs && idleTimeoutMs > 0)) return;
-      if (idleTimer) clearTimeout(idleTimer);
-      idleTimer = setTimeout(() => {
+    // Idle-liveness kill: if the child emits no stdout/stderr for `idleTimeoutMs`
+    // AND its process subtree is quiescent (no live descendant, or descendants
+    // burning no CPU across the window), treat it as wedged and kill the tree.
+    // This is the liveness signal the worker's lock-extender relies on — a silent
+    // hang stops producing output, we kill it here, `runAgentJob` resolves, and
+    // the worker fails the job (retryable) so the broker reclaims it. Distinct
+    // from the absolute `timeoutMs` hard cap: this fires on *silence without
+    // progress*, not total runtime. A long, QUIET subprocess that keeps a
+    // descendant doing work (advancing subtree CPU) is deferred, not killed
+    // (#130). Re-armed on every chunk.
+    idleMon = createIdleLivenessMonitor({
+      getPid: () => child?.pid,
+      idleTimeoutMs,
+      recoveryWindowMs,
+      isSettled: () => settled,
+      onIdleKill: () => {
         try { if (onTimeout) onTimeout(child); } catch { /* best effort */ }
         finish({ ok: false, exitCode: null, stdout: joinCapped(stdoutChunks), stderr: joinCapped(stderrChunks), error: `no output for ${idleTimeoutMs}ms (idle)`, timedOut: true, idle: true, truncated: stdoutTruncated, stderrTruncated });
-      }, idleTimeoutMs);
-    };
+      },
+    });
+    const armIdle = () => idleMon.arm();
     armIdle();
 
     child.stdout.on('data', (d) => {
@@ -3953,7 +4190,7 @@ function ptyAvailable(ptyFactory) {
 // spawnCaptureOneShot. A PTY merges stdout+stderr into one stream, so stderr is
 // always '' here; that is expected for a live terminal. `ptyFactory` is
 // injectable for tests (defaults to node-pty).
-function spawnCapturePty({ command, args = [], cwd, env, stdinData, timeoutMs, idleTimeoutMs, cols = 120, rows = 30, ptyFactory, relayTap = null, stream = false, streamPrefix = '', onStreamOut }) {
+function spawnCapturePty({ command, args = [], cwd, env, stdinData, timeoutMs, idleTimeoutMs, recoveryWindowMs, cols = 120, rows = 30, ptyFactory, relayTap = null, stream = false, streamPrefix = '', onStreamOut }) {
   return new Promise((resolve) => {
     const factory = ptyFactory || loadPtyModule();
     if (!factory || typeof factory.spawn !== 'function') {
@@ -3966,7 +4203,7 @@ function spawnCapturePty({ command, args = [], cwd, env, stdinData, timeoutMs, i
     let truncated = false;
     let settled = false;
     let timer = null;
-    let idleTimer = null;
+    let idleMon = null;
     let detachSteer = null;
     let term;
 
@@ -3997,7 +4234,7 @@ function spawnCapturePty({ command, args = [], cwd, env, stdinData, timeoutMs, i
       if (settled) return;
       settled = true;
       if (timer) clearTimeout(timer);
-      if (idleTimer) clearTimeout(idleTimer);
+      if (idleMon) idleMon.stop();
       if (detachSteer) { try { detachSteer(); } catch { /* best effort */ } detachSteer = null; }
       if (teeSink) tee('', true);
       resolve(result);
@@ -4017,15 +4254,17 @@ function spawnCapturePty({ command, args = [], cwd, env, stdinData, timeoutMs, i
         }, timeoutMs)
       : null;
 
-    const armIdle = () => {
-      if (settled) return;
-      if (!(idleTimeoutMs && idleTimeoutMs > 0)) return;
-      if (idleTimer) clearTimeout(idleTimer);
-      idleTimer = setTimeout(() => {
+    const armIdle = () => idleMon.arm();
+    idleMon = createIdleLivenessMonitor({
+      getPid: () => term?.pid,
+      idleTimeoutMs,
+      recoveryWindowMs,
+      isSettled: () => settled,
+      onIdleKill: () => {
         killTerm();
         finish({ ok: false, exitCode: null, stdout: joinCapped(chunks), stderr: '', error: `no output for ${idleTimeoutMs}ms (idle)`, timedOut: true, idle: true, truncated, stderrTruncated: false });
-      }, idleTimeoutMs);
-    };
+      },
+    });
     armIdle();
 
     term.onData((d) => {
@@ -4204,7 +4443,7 @@ const ACP_MAX_LINE_BYTES = 8 * 1024 * 1024; // 8 MiB
 // and every caller work unchanged. Because the raw stream is JSON-RPC (not human
 // output), `stdout` here is the accumulated human-readable transcript text (what
 // we relay), and `stderr` is the child's real stderr (agent diagnostics).
-function spawnCaptureAcp({ command, args = [], cwd, env, stdinData, timeoutMs, idleTimeoutMs, relayTap = null, stream = false, streamPrefix = '', onStreamOut, onStreamErr, permission = 'yolo', shell = false }) {
+function spawnCaptureAcp({ command, args = [], cwd, env, stdinData, timeoutMs, idleTimeoutMs, recoveryWindowMs, relayTap = null, stream = false, streamPrefix = '', onStreamOut, onStreamErr, permission = 'yolo', shell = false }) {
   return new Promise((resolve) => {
     const logger = getLogger();
     const humanChunks = [];
@@ -4215,7 +4454,7 @@ function spawnCaptureAcp({ command, args = [], cwd, env, stdinData, timeoutMs, i
     let stderrTruncated = false;
     let settled = false;
     let timer = null;
-    let idleTimer = null;
+    let idleMon = null;
     let detachSteer = null;
     let child;
     let sessionId = null;
@@ -4294,7 +4533,7 @@ function spawnCaptureAcp({ command, args = [], cwd, env, stdinData, timeoutMs, i
       if (settled) return;
       settled = true;
       if (timer) clearTimeout(timer);
-      if (idleTimer) clearTimeout(idleTimer);
+      if (idleMon) idleMon.stop();
       if (settleTimer) { clearTimeout(settleTimer); settleTimer = null; }
       if (detachSteer) { try { detachSteer(); } catch { /* best effort */ } detachSteer = null; }
       if (teeSink) { tee('', true); teeErr('', true); }
@@ -4485,15 +4724,17 @@ function spawnCaptureAcp({ command, args = [], cwd, env, stdinData, timeoutMs, i
         }, timeoutMs)
       : null;
 
-    const armIdle = () => {
-      if (settled) return;
-      if (!(idleTimeoutMs && idleTimeoutMs > 0)) return;
-      if (idleTimer) clearTimeout(idleTimer);
-      idleTimer = setTimeout(() => {
+    const armIdle = () => idleMon.arm();
+    idleMon = createIdleLivenessMonitor({
+      getPid: () => child?.pid,
+      idleTimeoutMs,
+      recoveryWindowMs,
+      isSettled: () => settled,
+      onIdleKill: () => {
         try { killTree(child); } catch { /* best effort */ }
         finish({ ok: false, exitCode: null, stdout: humanStdout(), stderr: joinCapped(stderrChunks), error: `no output for ${idleTimeoutMs}ms (idle)`, timedOut: true, idle: true, truncated: humanTruncated, stderrTruncated });
-      }, idleTimeoutMs);
-    };
+      },
+    });
     armIdle();
 
     // Newline-delimited JSON-RPC parser over stdout. Progress on stdout re-arms
@@ -4781,7 +5022,7 @@ function startLockExtender(job, windowMs, intervalMs, tag, logger) {
  * Both paths resolve to the same result contract.
  */
 function runAgentJob(profile, job, opts = {}) {
-  const { timeoutMs, idleTimeoutMs, envelope, sandbox = 'none', image, runId, secretEnv = {}, passThroughSecretNames = [], cwd, extraEnv = {}, profileEnv = {}, resultFile, stream = false, streamPrefix = '', onStreamOut, onStreamErr, args: commandArgs, terminal = 'pipe', protocol = 'pipe', permission = 'yolo', relaySession = null, ptyFactory } = opts;
+  const { timeoutMs, idleTimeoutMs, recoveryWindowMs, envelope, sandbox = 'none', image, runId, secretEnv = {}, passThroughSecretNames = [], cwd, extraEnv = {}, profileEnv = {}, resultFile, stream = false, streamPrefix = '', onStreamOut, onStreamErr, args: commandArgs, terminal = 'pipe', protocol = 'pipe', permission = 'yolo', relaySession = null, ptyFactory } = opts;
   // #110: `protocol`/`permission` drive the ACP executor branch below. The
   // pipe/PTY paths are unchanged, so `protocol === 'pipe'` behaviour is identical.
   const payload = JSON.stringify(buildAgentPayload(profile, job, envelope));
@@ -4851,6 +5092,7 @@ function runAgentJob(profile, job, opts = {}) {
         stdinData: payload,
         timeoutMs,
         idleTimeoutMs,
+        recoveryWindowMs,
         relayTap,
         stream,
         streamPrefix,
@@ -4873,6 +5115,7 @@ function runAgentJob(profile, job, opts = {}) {
         stdinData: payload,
         timeoutMs,
         idleTimeoutMs,
+        recoveryWindowMs,
         ptyFactory,
         relayTap,
         stream,
@@ -4894,6 +5137,7 @@ function runAgentJob(profile, job, opts = {}) {
       stdinData: payload,
       timeoutMs,
       idleTimeoutMs,
+      recoveryWindowMs,
       onTimeout: (child) => killTree(child),
       stream,
       streamPrefix,
@@ -4955,6 +5199,7 @@ function runAgentJob(profile, job, opts = {}) {
     stdinData: payload,
     timeoutMs,
     idleTimeoutMs,
+    recoveryWindowMs,
     stream,
     streamPrefix,
     onStreamOut,
@@ -6025,6 +6270,32 @@ async function workAgent(req, flags) {
           return job.fail({ errorMessage: msg, retries });
         }
 
+        // #130: per-task liveness overrides. Precedence: envelope override →
+        // worker-flag default → built-in default, each clamped to a sane max so
+        // a task can't request an unbounded window. Absent envelope fields leave
+        // the worker-flag behaviour unchanged. These drive BOTH the harness idle
+        // liveness (idle/recovery) AND the broker lock recovery window, so a
+        // JVM-heavy task can widen its own window without a global flag change.
+        const {
+          idleTimeoutMs: effectiveIdleTimeoutMs,
+          recoveryWindowMs: effectiveRecoveryWindowMs,
+          hardCapMs: effectiveHardCapMs,
+        } = resolveLivenessOverrides(envelope.task, { idleTimeoutMs, recoveryWindowMs, hardCapMs });
+        // Recompute the lock-extend cadence from the effective recovery window
+        // (same ~1/3-of-window rule as at startup) so a widened window still
+        // renews comfortably before it lapses.
+        const effectiveLockExtendIntervalMs = Math.min(
+          Math.max(5_000, Math.floor(effectiveRecoveryWindowMs / 3)),
+          Math.max(1, Math.floor(effectiveRecoveryWindowMs * 0.75)),
+        );
+        if (
+          effectiveIdleTimeoutMs !== idleTimeoutMs ||
+          effectiveRecoveryWindowMs !== recoveryWindowMs ||
+          effectiveHardCapMs !== hardCapMs
+        ) {
+          logger.info(`[${jobType}] job ${job.jobKey} liveness (envelope override) → idle timeout: ${effectiveIdleTimeoutMs}ms; recovery window: ${effectiveRecoveryWindowMs}ms; hard cap: ${effectiveHardCapMs > 0 ? `${effectiveHardCapMs}ms` : 'off'}`);
+        }
+
         const runId = randomUUID();
         if (isContainer) liveRunIds.add(runId);
 
@@ -6039,7 +6310,7 @@ async function workAgent(req, flags) {
         // here — ahead of provisionRepo — guarantees the first renewal is queued
         // before the clone, so the lock can't lapse mid-provision and trigger the
         // duplicate-activation / stale-409 race. The `finally` below stops it.
-        stopLockExtender = startLockExtender(job, recoveryWindowMs, lockExtendIntervalMs, `[${jobType}] job ${job.jobKey}`, logger);
+        stopLockExtender = startLockExtender(job, effectiveRecoveryWindowMs, effectiveLockExtendIntervalMs, `[${jobType}] job ${job.jobKey}`, logger);
         let cwd;
         let extraEnv;
         let repoToken = null;
@@ -6115,8 +6386,9 @@ async function workAgent(req, flags) {
           } catch { resultDir = null; resultFile = null; }
 
           result = await runAgentJob(profile, job, {
-            timeoutMs: hardCapMs,
-            idleTimeoutMs,
+            timeoutMs: effectiveHardCapMs,
+            idleTimeoutMs: effectiveIdleTimeoutMs,
+            recoveryWindowMs: effectiveRecoveryWindowMs,
             envelope,
             sandbox,
             image,
@@ -10847,6 +11119,10 @@ export {
   runAgentJob,
   spawnCapturePty,
   spawnCaptureAcp,
+  sampleSubtreeCpu,
+  createIdleLivenessMonitor,
+  resolveLivenessOverrides,
+  parsePsTime,
   ensureAcpFlag,
   startLockExtender,
   provisionRepo,

@@ -2233,10 +2233,10 @@ function parsePsTime(token) {
   const dash = s.indexOf('-');
   if (dash !== -1) { days = Number(s.slice(0, dash)) || 0; s = s.slice(dash + 1); }
   const parts = s.split(':').map((p) => Number.parseFloat(p));
-  if (parts.some((n) => !Number.isFinite(n))) return days * 86_400;
+  if (parts.length === 0 || parts.some((n) => !Number.isFinite(n))) return 0;
   let secs = 0;
   for (const p of parts) secs = secs * 60 + p;
-  return days * 86_400 + secs;
+  return Math.floor(days * 86_400 + secs);
 }
 
 /**

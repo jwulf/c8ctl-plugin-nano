@@ -2294,6 +2294,12 @@ test('parsePsTime parses ps CPU time fields into seconds', () => {
   assert.equal(parsePsTime('1:00:00'), 3600);
   assert.equal(parsePsTime('2-03:00:00'), 2 * 86_400 + 3 * 3600);
   assert.equal(parsePsTime('bogus'), 0);
+  // Unparsable time portion after a valid day count must yield 0 (contract:
+  // an unrecognised token never poisons the aggregate), not days * 86400.
+  assert.equal(parsePsTime('2-bogus'), 0);
+  // Fractional ps time is floored to whole seconds per the documented contract.
+  assert.equal(parsePsTime('0:01.99'), 1);
+  assert.equal(parsePsTime('1:02.5'), 62);
 });
 
 // The monitor is the heart of the heuristic; drive it deterministically with an

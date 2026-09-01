@@ -2299,7 +2299,10 @@ function sampleSubtreeCpuProc(rootPid) {
  * Non-Linux fallback: sample the subtree via a one-shot `ps`. Heavier than the
  * `/proc` read (it spawns a process) but only runs during an idle window, which
  * is rare by construction. Returns the same `{ descendants, cpu }` shape (cpu in
- * whole seconds here) or `null` when `ps` is unavailable/unparsable.
+ * whole seconds here) plus `resolutionMs: 1000` to flag the coarse whole-second
+ * CPU granularity — the monitor uses that so a probe window shorter than a
+ * whole-second tick can't read flat CPU and false-kill a still-progressing but
+ * low-churn subtree. Returns `null` when `ps` is unavailable/unparsable.
  */
 function sampleSubtreeCpuPs(rootPid) {
   let out;
@@ -2333,7 +2336,7 @@ function sampleSubtreeCpuPs(rootPid) {
     const kids = children.get(pid);
     if (kids) for (const k of kids) if (!seen.has(k)) stack.push(k);
   }
-  return { descendants, cpu: totalCpu };
+  return { descendants, cpu: totalCpu, resolutionMs: 1000 };
 }
 
 /**
@@ -2366,7 +2369,14 @@ function sampleSubtreeCpu(rootPid) {
  *    (its ticks no longer count) → that is progress, not a stall → re-baseline
  *    and defer instead of killing.
  *  - a live descendant whose CPU was exactly unchanged across a probe window →
- *    a true stall (hung) → `onIdleKill()`.
+ *    a candidate stall, but only a *confirmed* stall once the cumulative flat
+ *    time reaches the sampler's CPU-time resolution (`sample.resolutionMs`, e.g.
+ *    the whole-second `ps` fallback reports 1000ms). A probe window shorter than
+ *    that resolution can read flat CPU while a low-churn subtree is still
+ *    progressing but hasn't crossed the next whole-second tick, so a single flat
+ *    read under a coarse sampler must NOT kill; the fine-grained `/proc` path
+ *    carries no resolution and so ages out on the first flat window as before →
+ *    `onIdleKill()`.
  * The first elapse with live descendants takes a baseline (a single sample can't
  * show movement) and re-probes after the recovery window. The absolute
  * `--job-timeout` hard cap remains the ultimate backstop, untouched by this.
@@ -2376,41 +2386,53 @@ function createIdleLivenessMonitor({ getPid, idleTimeoutMs, recoveryWindowMs, on
   const probeWindow = recoveryWindowMs && recoveryWindowMs > 0 ? recoveryWindowMs : idleTimeoutMs;
   let timer = null;
   let prev = null; // last subtree CPU probe taken during the current silent stretch
+  let flatMs = 0;  // cumulative time observed with flat CPU since the last movement/baseline
+  let lastWindow = idleTimeoutMs; // duration of the currently pending probe window
   const settled = () => (typeof isSettled === 'function' ? isSettled() : false);
   const clear = () => { if (timer) { clearTimeout(timer); timer = null; } };
-  const onElapse = () => {
+  const schedule = (ms) => { lastWindow = ms; timer = setTimeout(onElapse, ms); };
+  function onElapse() {
     timer = null;
     if (settled()) return;
+    const elapsed = lastWindow;
     const pid = typeof getPid === 'function' ? getPid() : undefined;
     const sample = pid != null ? sampleCpu(pid) : null;
     // Childless / unsampleable / dead tree → silence really is a hang: kill.
     if (!sample || sample.descendants <= 0) { onIdleKill(); return; }
     if (prev != null) {
       // Aggregate CPU advanced across the window → the tree is doing work; defer.
-      if (sample.cpu > prev.cpu) { prev = sample; timer = setTimeout(onElapse, probeWindow); return; }
+      if (sample.cpu > prev.cpu) { prev = sample; flatMs = 0; schedule(probeWindow); return; }
       // Aggregate CPU REGRESSED → `sampleSubtreeCpu*` only sums CPU for live
       // PIDs, so the total can legitimately drop when a busy descendant exits
       // (its ticks stop counting) even though the subtree just made progress.
       // A regression is activity, not a stall: re-baseline and defer rather
       // than mis-killing a silent-but-busy job.
-      if (sample.cpu < prev.cpu) { prev = sample; timer = setTimeout(onElapse, probeWindow); return; }
-      // Live descendants but CPU exactly unchanged across a full window → a true
-      // stall (hung): kill.
-      onIdleKill();
+      if (sample.cpu < prev.cpu) { prev = sample; flatMs = 0; schedule(probeWindow); return; }
+      // Live descendants but CPU exactly unchanged across a full window → a
+      // candidate stall. Only confirm it once we have observed flat CPU for at
+      // least the sampler's CPU-time resolution: a probe window shorter than the
+      // granularity (the whole-second `ps` fallback) can read flat while a
+      // low-churn subtree is still progressing but hasn't crossed the next tick.
+      flatMs += elapsed;
+      const resolutionMs = Number.isFinite(sample.resolutionMs) ? sample.resolutionMs : 0;
+      if (flatMs >= resolutionMs) { onIdleKill(); return; }
+      schedule(probeWindow);
       return;
     }
     // First elapse with live descendants: baseline, then re-probe (can't judge
     // progress from one sample).
     prev = sample;
-    timer = setTimeout(onElapse, probeWindow);
-  };
+    flatMs = 0;
+    schedule(probeWindow);
+  }
   return {
     enabled: !!enabled,
     arm() {
       if (!enabled || settled()) return;
       prev = null; // output resumed → a fresh silent stretch starts
+      flatMs = 0;
       clear();
-      timer = setTimeout(onElapse, idleTimeoutMs);
+      schedule(idleTimeoutMs);
     },
     stop() { clear(); },
   };

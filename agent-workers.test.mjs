@@ -2326,6 +2326,51 @@ test('createIdleLivenessMonitor defers while subtree CPU advances, kills when it
   assert.equal(killed, 1, 'a stalled (flat-CPU) subtree ages out and is killed exactly once');
 });
 
+test('createIdleLivenessMonitor with a coarse (ps) sampler needs cumulative flat time >= resolution before killing', async () => {
+  // A whole-second-granularity sampler (`resolutionMs: 1000`) whose CPU reads
+  // flat across sub-second probe windows must NOT be treated as a stall until
+  // the cumulative flat time reaches the resolution: a low-churn subtree that
+  // is still progressing may not cross the next whole-second tick within one
+  // short window. With a 30ms window, ~1000ms of flat CPU is required before
+  // the idle-kill fires.
+  let killed = 0;
+  const mon = createIdleLivenessMonitor({
+    getPid: () => 1234,
+    idleTimeoutMs: 30,
+    recoveryWindowMs: 30,
+    isSettled: () => false,
+    sampleCpu: () => ({ descendants: 1, cpu: 7, resolutionMs: 1000 }), // flat but coarse
+    onIdleKill: () => { killed += 1; },
+  });
+  mon.arm();
+  await new Promise((r) => setTimeout(r, 300)); // ~10 flat windows, well under 1000ms
+  assert.equal(killed, 0, 'a coarse sampler reading flat under its resolution window is not a stall');
+  await new Promise((r) => setTimeout(r, 900)); // cumulative flat time now exceeds 1000ms
+  mon.stop();
+  assert.equal(killed, 1, 'once cumulative flat time reaches the sampler resolution the subtree ages out');
+});
+
+test('createIdleLivenessMonitor with a coarse (ps) sampler still defers while CPU advances', async () => {
+  // Progress under a coarse sampler (whole-second ticks) must reset the flat
+  // accumulator so a subtree that keeps crossing ticks is never killed.
+  let cpu = 0;
+  let killed = 0;
+  const ticker = setInterval(() => { cpu += 1; }, 20); // crosses a "tick" every window
+  const mon = createIdleLivenessMonitor({
+    getPid: () => 1234,
+    idleTimeoutMs: 30,
+    recoveryWindowMs: 30,
+    isSettled: () => false,
+    sampleCpu: () => ({ descendants: 1, cpu, resolutionMs: 1000 }),
+    onIdleKill: () => { killed += 1; },
+  });
+  mon.arm();
+  await new Promise((r) => setTimeout(r, 1500)); // well past the resolution, but CPU keeps moving
+  clearInterval(ticker);
+  mon.stop();
+  assert.equal(killed, 0, 'advancing CPU keeps resetting the flat accumulator so no kill fires');
+});
+
 test('createIdleLivenessMonitor treats a CPU regression as progress (busy descendant exited), not a stall', async () => {
   let killed = 0;
   // Probe #1 baselines at cpu=100. Probe #2 regresses to 40 (a busy descendant

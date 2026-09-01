@@ -2264,8 +2264,17 @@ test('sampleSubtreeCpu reports descendants + advancing CPU for a working subtree
     const a = sampleSubtreeCpu(child.pid);
     assert.ok(a, 'a live subtree is sampleable');
     assert.ok(a.descendants >= 1, `the backgrounded spinner is a descendant (got ${a?.descendants})`);
-    await new Promise((r) => setTimeout(r, 300));
-    const b = sampleSubtreeCpu(child.pid);
+    // On the whole-second `ps` fallback (non-Linux), aggregate CPU only advances
+    // in 1s steps, so a 300ms gap commonly reads flat even while the spinner is
+    // running. Use a gap wider than that resolution off Linux and poll a couple
+    // of windows (bounded well under the spinner's 3s lifetime) until CPU moves,
+    // rather than asserting on a single short-gap sample.
+    const gapMs = process.platform === 'linux' ? 300 : 1100;
+    let b = sampleSubtreeCpu(child.pid);
+    for (let waited = 0; waited < 2200 && !(b.cpu > a.cpu); waited += gapMs) {
+      await new Promise((r) => setTimeout(r, gapMs));
+      b = sampleSubtreeCpu(child.pid);
+    }
     assert.ok(b.cpu > a.cpu, `aggregate subtree CPU advances while the spinner runs (${a.cpu} → ${b.cpu})`);
   } finally {
     try { process.kill(-child.pid, 'SIGKILL'); } catch { /* best effort */ }

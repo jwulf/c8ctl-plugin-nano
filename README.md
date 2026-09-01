@@ -579,7 +579,13 @@ the job with a decremented retry count. Profiles are stored in the plugin's
 >   **live** and the kill is deferred. Only a genuinely quiescent tree — no live
 >   descendant, or descendants burning no CPU across the window — is killed as
 >   wedged, so a hung agent still can't hold a job forever while a silent-but-busy
->   one keeps the cheapest, zero-token build pattern. A task can widen this per
+>   one keeps the cheapest, zero-token build pattern. Reclaim timing: because a
+>   single CPU sample can't reveal progress, the first elapse with live
+>   descendants only *baselines* and re-probes — the kill-vs-defer decision then
+>   lands on the following `--recovery-window`, so a quiescent-but-live subtree
+>   ages out roughly `--idle-timeout` **plus one recovery window** after the last
+>   output, not the instant the idle window first elapses. (A tree with no live
+>   descendants is killed immediately when the idle window elapses.) A task can widen this per
 >   task class via the envelope's `task.idleTimeoutMs` / `task.recoveryWindowMs`
 >   (see the task envelope below) instead of a global flag change.
 > - **`--job-timeout`** is now an *optional* absolute hard cap on total harness

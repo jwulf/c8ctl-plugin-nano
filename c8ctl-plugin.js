@@ -2265,7 +2265,10 @@ function sampleSubtreeCpuProc(rootPid) {
     // space-separated tail starting at field #3 (state).
     const rparen = stat.lastIndexOf(')');
     if (rparen < 0) continue;
-    const tail = stat.slice(rparen + 2).split(' ');
+    // Split the post-`comm` tail on RUNS of whitespace (not a single space): a
+    // stray double space would otherwise yield empty tokens and shift the
+    // ppid/utime/stime field indexes, mis-sampling the subtree.
+    const tail = stat.slice(rparen + 1).trim().split(/\s+/);
     // tail[0]=state(#3), tail[1]=ppid(#4) … utime(#14)=tail[11], stime(#15)=tail[12].
     const ppid = Number(tail[1]);
     if (!Number.isFinite(ppid)) continue;
@@ -2359,8 +2362,11 @@ function sampleSubtreeCpu(rootPid) {
  *  - a live descendant whose aggregate CPU advanced since the last probe → the
  *    tree is doing work → defer another probe window (`recoveryWindowMs`, or the
  *    idle window when unset) instead of killing.
- *  - a live descendant whose CPU did NOT advance across a probe window → hung →
- *    `onIdleKill()`.
+ *  - a live descendant whose aggregate CPU regressed → a busy descendant exited
+ *    (its ticks no longer count) → that is progress, not a stall → re-baseline
+ *    and defer instead of killing.
+ *  - a live descendant whose CPU was exactly unchanged across a probe window →
+ *    a true stall (hung) → `onIdleKill()`.
  * The first elapse with live descendants takes a baseline (a single sample can't
  * show movement) and re-probes after the recovery window. The absolute
  * `--job-timeout` hard cap remains the ultimate backstop, untouched by this.
@@ -2382,7 +2388,14 @@ function createIdleLivenessMonitor({ getPid, idleTimeoutMs, recoveryWindowMs, on
     if (prev != null) {
       // Aggregate CPU advanced across the window → the tree is doing work; defer.
       if (sample.cpu > prev.cpu) { prev = sample; timer = setTimeout(onElapse, probeWindow); return; }
-      // Live descendants but no CPU movement across a full window → hung: kill.
+      // Aggregate CPU REGRESSED → `sampleSubtreeCpu*` only sums CPU for live
+      // PIDs, so the total can legitimately drop when a busy descendant exits
+      // (its ticks stop counting) even though the subtree just made progress.
+      // A regression is activity, not a stall: re-baseline and defer rather
+      // than mis-killing a silent-but-busy job.
+      if (sample.cpu < prev.cpu) { prev = sample; timer = setTimeout(onElapse, probeWindow); return; }
+      // Live descendants but CPU exactly unchanged across a full window → a true
+      // stall (hung): kill.
       onIdleKill();
       return;
     }

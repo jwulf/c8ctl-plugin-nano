@@ -2320,6 +2320,30 @@ test('createIdleLivenessMonitor defers while subtree CPU advances, kills when it
   assert.equal(killed, 1, 'a stalled (flat-CPU) subtree ages out and is killed exactly once');
 });
 
+test('createIdleLivenessMonitor treats a CPU regression as progress (busy descendant exited), not a stall', async () => {
+  let killed = 0;
+  // Probe #1 baselines at cpu=100. Probe #2 regresses to 40 (a busy descendant
+  // exited so its ticks no longer count) — this is activity, not a hang, so the
+  // monitor must re-baseline and defer rather than kill. Probes then hold flat
+  // at 40, which IS a true stall and must kill exactly once.
+  const samples = [100, 40, 40, 40, 40];
+  let i = 0;
+  const mon = createIdleLivenessMonitor({
+    getPid: () => 1234,
+    idleTimeoutMs: 20,
+    recoveryWindowMs: 20,
+    isSettled: () => false,
+    sampleCpu: () => ({ descendants: 1, cpu: samples[Math.min(i++, samples.length - 1)] }),
+    onIdleKill: () => { killed += 1; },
+  });
+  mon.arm();
+  await new Promise((r) => setTimeout(r, 60)); // baseline + the regression probe
+  assert.equal(killed, 0, 'a CPU regression (descendant exit) is not treated as a stall');
+  await new Promise((r) => setTimeout(r, 80)); // now CPU holds flat → true stall
+  mon.stop();
+  assert.equal(killed, 1, 'once CPU truly stalls (flat across a window) the subtree ages out');
+});
+
 test('createIdleLivenessMonitor kills immediately when there is no live descendant', async () => {
   let killed = 0;
   const mon = createIdleLivenessMonitor({

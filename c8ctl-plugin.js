@@ -5195,6 +5195,23 @@ function wsHostPart(host) {
 }
 
 /**
+ * URL-encode the zone id of an IPv6 scoped address so it is safe to embed in a
+ * URL host (#133). A resolver may return a link-local address carrying an
+ * interface zone id (e.g. `fe80::1%en0`); the raw `%` is not URL-safe and yields
+ * an invalid `ws://[fe80::1%en0]:…` that fails to parse even when the address is
+ * reachable. Percent-encode the delimiter (`%` → `%25`) so the bracketed host is
+ * valid. Idempotent — an already-encoded zone id (`%25`) is left untouched — and
+ * a no-op for any host without a zone id.
+ *
+ * @param {string} host a raw address, possibly `<ipv6>%<zone>`
+ * @returns {string}
+ */
+function encodeIpZoneId(host) {
+  const h = String(host || '');
+  return h.replace(/%(25)?/g, '%25');
+}
+
+/**
  * Normalise the engine's `GET /console/api/projects` payload into the running
  * embedded apps that advertise an agentic UI port. Accepts the shapes the
  * console may serve — a keyed map (`{ "Nano_Workforce": { appUi } }`), a bare
@@ -5339,7 +5356,7 @@ async function resolveProbeCandidates(host, { lookupImpl = dnsLookup } = {}) {
   try {
     const all = await lookupImpl(h, { all: true });
     const hosts = orderProbeAddresses(Array.isArray(all) ? all : [])
-      .map((a) => wsHostPart(String(a.address)));
+      .map((a) => wsHostPart(encodeIpZoneId(String(a.address))));
     return hosts.length ? hosts : [h];
   } catch {
     return [h];
@@ -5603,8 +5620,11 @@ function defaultAgenticRediscoveryDelays({
  * cold-start miss leaves a worker in `advisory`, re-run `resolveTarget` on a
  * jittered backoff schedule and, on the FIRST attempt that yields a
  * `status:'connect'` target, invoke `onConnect(target)` and stop — so the worker
- * upgrades to `connected` without a restart. Fail-open: an attempt that throws is
- * swallowed and the loop continues; the loop also stops early whenever
+ * upgrades to `connected` without a restart. Fail-open: an attempt whose
+ * `resolveTarget` throws is swallowed and the loop continues; likewise, if
+ * `onConnect` itself throws (a transient channel-open failure), the loop keeps
+ * re-discovering rather than stopping, so retries proceed until a connect
+ * callback actually succeeds. The loop also stops early whenever
  * `shouldContinue()` returns false (e.g. a channel already came up, or the worker
  * is shutting down). Returns the connecting target, or `null` if the schedule was
  * exhausted / cancelled without a hit. Timers and the resolver are injectable so
@@ -5641,7 +5661,14 @@ async function rediscoverAgenticUntilConnected({
       continue;
     }
     if (target && target.status === 'connect') {
-      try { await onConnect?.(target); } catch { /* best effort — never throw out of the loop */ }
+      try {
+        await onConnect?.(target);
+      } catch (err) {
+        // A transient channel-open failure must not prematurely stop self-heal:
+        // keep re-discovering until an onConnect callback actually succeeds.
+        logger?.debug?.(`agentic re-discovery onConnect failed, will retry: ${err?.message || err}`);
+        continue;
+      }
       return target;
     }
   }

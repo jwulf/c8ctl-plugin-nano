@@ -408,6 +408,20 @@ test('resolveProbeCandidates falls back to [host] when the resolver throws', asy
   assert.deepEqual(await resolveProbeCandidates('merlin.local', { lookupImpl }), ['merlin.local']);
 });
 
+test('resolveProbeCandidates URL-encodes an IPv6 zone id so the host stays valid', async () => {
+  // A resolver can return a scoped link-local address carrying an interface zone
+  // id (`fe80::1%en0`); the raw `%` must be percent-encoded so the bracketed host
+  // parses as a valid ws:// URL (#133).
+  const lookupImpl = async () => ([
+    { address: 'fe80::1%en0', family: 6 },
+    { address: '192.168.0.21', family: 4 },
+  ]);
+  const hosts = await resolveProbeCandidates('merlin.local', { lookupImpl });
+  assert.deepEqual(hosts, ['192.168.0.21', '[fe80::1%25en0]']);
+  // The zone-id delimiter is percent-encoded, not left as a raw `%` (RFC 6874).
+  assert.ok(!/[^%]%[^2]/.test(hosts[1]) && hosts[1].includes('%25'), 'zone id is percent-encoded');
+});
+
 test('raceProbeCandidates returns the fast routable host even when link-local never opens', async () => {
   // fe80:: never opens (the slow macOS path); the routable IPv4 opens fast.
   const wsProbe = async (_port, { host } = {}) => {
@@ -536,6 +550,27 @@ test('rediscoverAgenticUntilConnected swallows a throwing attempt and keeps tryi
   });
   assert.equal(calls, 2);
   assert.equal(result.status, 'connect');
+});
+
+test('rediscoverAgenticUntilConnected keeps retrying when onConnect throws, then stops on success', async () => {
+  // A transient channel-open failure in onConnect must NOT prematurely stop the
+  // self-heal loop: it should keep re-discovering until a connect callback
+  // actually succeeds (#133).
+  let attempts = 0;
+  let onConnectCalls = 0;
+  const result = await rediscoverAgenticUntilConnected({
+    resolveTarget: async () => { attempts += 1; return { status: 'connect', config: { url: `http://h:${attempts}` } }; },
+    onConnect: async () => {
+      onConnectCalls += 1;
+      if (onConnectCalls === 1) throw new Error('channel-open transient');
+    },
+    delaysMs: [1, 1, 1],
+    sleep: async () => {},
+    logger: { debug: () => {} },
+  });
+  assert.equal(onConnectCalls, 2, 'retried after the failing onConnect');
+  assert.equal(attempts, 2, 're-resolved on the retry');
+  assert.equal(result.config.url, 'http://h:2', 'returned the target whose onConnect succeeded');
 });
 
 test('rediscoverAgenticUntilConnected stops early when shouldContinue() turns false', async () => {

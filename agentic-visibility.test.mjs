@@ -37,7 +37,7 @@ import {
   redactAgenticUrl,
   createWorkChannel,
 } from './work-channel.mjs';
-import { createRelaySession, relayStreamName } from './work-relay.mjs';
+import { createRelaySession, relayStreamName, RELAY_OPEN_CHUNK } from './work-relay.mjs';
 import { createBufferMonitor } from './work-buffer.mjs';
 import { spawnCapturePty, metadata, commands } from './c8ctl-plugin.js';
 
@@ -289,7 +289,7 @@ test('a worker that starts before the app buffers presence + relay and drains in
   const relayChunks = t.framesOf('relay').map((f) => f.payload.chunk);
   assert.deepEqual(
     relayChunks,
-    ['line-1\n', 'line-2\n', 'line-3\n', 'line-4\n'],
+    [RELAY_OPEN_CHUNK, 'line-1\n', 'line-2\n', 'line-3\n', 'line-4\n'],
     'relay frames drain in production order — no loss, no reorder',
   );
   assert.equal(monitor.health().flushes >= 1, true, 'the pre-app flush is recorded');

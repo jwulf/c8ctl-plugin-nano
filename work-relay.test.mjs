@@ -12,6 +12,7 @@ import {
   roleTerminalMode,
   parseInboundRelayChunk,
   createRelaySession,
+  RELAY_OPEN_CHUNK,
 } from './work-relay.mjs';
 import { runAgentJob, spawnCapturePty } from './c8ctl-plugin.js';
 
@@ -119,9 +120,23 @@ test('relay() streams framed output tagged with the jobKey stream', () => {
   session.relay(null); // null is skipped
 
   assert.deepEqual(ch.produced, [
+    { stream: 'job:4856', chunk: RELAY_OPEN_CHUNK },
     { stream: 'job:4856', chunk: 'line one\n' },
     { stream: 'job:4856', chunk: 'bytes-two' },
   ]);
+});
+
+test('createRelaySession opens the stream with a lifecycle marker so the app correlates immediately', () => {
+  const ch = fakeChannel();
+  const session = createRelaySession({ channel: ch, jobKey: '4856' });
+  // The very first produced frame is the open marker on this job's stream —
+  // emitted at creation, before any agent output. This is what links
+  // worker→jobKey in the app even for a silent agent.
+  assert.deepEqual(ch.produced, [{ stream: 'job:4856', chunk: RELAY_OPEN_CHUNK }]);
+  const marker = JSON.parse(RELAY_OPEN_CHUNK);
+  assert.equal(marker.kind, 'lifecycle');
+  assert.equal(marker.phase, 'open');
+  session.close();
 });
 
 test('createRelaySession requires a channel with relayLane() and a jobKey', () => {
@@ -188,9 +203,13 @@ test('spawnCapturePty streams terminal output on the relay lane and accepts stee
   assert.equal(term.writes[0], '{"payload":true}');
   assert.equal(term.writes[1], '\x04');
 
-  // terminal output is framed + jobKey-tagged on the relay lane
+  // terminal output is framed + jobKey-tagged on the relay lane (after the
+  // session-open marker emitted at createRelaySession time)
   term.feed('hello from the agent');
-  assert.deepEqual(ch.produced, [{ stream: 'job:123', chunk: 'hello from the agent' }]);
+  assert.deepEqual(ch.produced, [
+    { stream: 'job:123', chunk: RELAY_OPEN_CHUNK },
+    { stream: 'job:123', chunk: 'hello from the agent' },
+  ]);
 
   // steer-in: a cockpit relay frame on this job's stream reaches the PTY
   ch.emit({ family: 'relay', payload: { stream: 'job:123', chunk: '\x03' } });
@@ -241,9 +260,12 @@ test('runAgentJob(terminal: pty) runs the harness on a PTY and relays tagged out
   ch.emit({ family: 'relay', payload: { stream: 'job:777', chunk: 'steer' } });
   assert.equal(term.writes.at(-1), 'steer');
 
-  // output relayed, tagged with the jobKey stream
+  // output relayed, tagged with the jobKey stream (after the session-open marker)
   term.feed('working...');
-  assert.deepEqual(ch.produced, [{ stream: 'job:777', chunk: 'working...' }]);
+  assert.deepEqual(ch.produced, [
+    { stream: 'job:777', chunk: RELAY_OPEN_CHUNK },
+    { stream: 'job:777', chunk: 'working...' },
+  ]);
 
   term.exit(0);
   const result = await p;

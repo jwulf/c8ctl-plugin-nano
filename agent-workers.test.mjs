@@ -780,6 +780,24 @@ test('classifyRepoEnvelope: a present-but-blank url with other fields → malfor
   assert.deepEqual(c, { present: true, url: null, malformed: true });
 });
 
+test('classifyRepoEnvelope: ONLY a blank/whitespace url, no other fields → malformed (intent)', () => {
+  // Spelling out `repository.url` at all is intent to clone, so even a lone
+  // blank url must fail-closed rather than silently degrade to a repo-less run.
+  for (const blank of ['', '   ']) {
+    const c = classifyRepoEnvelope(
+      { [`${AGENT_TASK_NS}.repository.url`]: blank },
+      {},
+    );
+    assert.deepEqual(c, { present: true, url: null, malformed: true });
+  }
+  // Whole-envelope JSON form of the same lone-blank-url case.
+  const cJson = classifyRepoEnvelope(
+    { [AGENT_TASK_NS]: JSON.stringify({ repository: { url: '' } }) },
+    {},
+  );
+  assert.deepEqual(cJson, { present: true, url: null, malformed: true });
+});
+
 test('classifyRepoEnvelope: a non-empty but unusable url → malformed (with url echoed)', () => {
   const c = classifyRepoEnvelope(
     { [`${AGENT_TASK_NS}.repository.url`]: 'github.com/o/r' },

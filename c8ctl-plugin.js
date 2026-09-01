@@ -2517,19 +2517,27 @@ function isPlausibleRepoUrl(url) {
 // fail-closed on it.
 //
 // Returns { present, url, malformed }:
-//   - present   — a `repository` block with at least one non-empty field was
-//                 supplied (a task with NO repository block is legitimately
-//                 repo-less and is `present: false`).
+//   - present   — repository intent was supplied: a `repository` block that
+//                 either carries at least one non-empty field OR explicitly
+//                 includes a `url` key at all (even blank/whitespace — spelling
+//                 out `repository.url` IS intent to clone, so it must fail-closed
+//                 rather than silently degrade). A task with NO repository block,
+//                 or one with only blank non-url fields, is legitimately
+//                 repo-less and is `present: false`.
 //   - url       — the trimmed url string when present & non-empty, else null.
 //   - malformed — repository intent is expected but unusable: the block is
-//                 present with fields but the `url` is absent, or the `url` is a
-//                 non-empty string that isn't a plausible clone target.
+//                 present with fields but the `url` is absent/blank, or the `url`
+//                 is a non-empty string that isn't a plausible clone target.
 function classifyRepoEnvelope(customHeaders, variables) {
   const raw = deepMerge(collectEnvelopeFrom(customHeaders), collectEnvelopeFrom(variables));
   const repo = raw.repository;
   if (!isPlainObject(repo)) return { present: false, url: null, malformed: false };
+  // A `url` key present at all — even blank/whitespace/null — is repository
+  // intent, so an envelope carrying only a blank `repository.url` must
+  // fail-closed instead of silently running repo-less in the temp cwd.
+  const hasUrlKey = Object.prototype.hasOwnProperty.call(repo, 'url');
   const hasAnyField = Object.keys(repo).some((k) => repo[k] != null && String(repo[k]).trim() !== '');
-  if (!hasAnyField) return { present: false, url: null, malformed: false };
+  if (!hasUrlKey && !hasAnyField) return { present: false, url: null, malformed: false };
   const url = repo.url == null ? '' : String(repo.url).trim();
   if (!url) return { present: true, url: null, malformed: true };
   if (!isPlausibleRepoUrl(url)) return { present: true, url, malformed: true };

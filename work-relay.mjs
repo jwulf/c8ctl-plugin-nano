@@ -23,6 +23,8 @@
 // a duck-typed terminal handle, so it is unit-testable with a fake terminal and
 // a fake channel.
 
+import { transcript as agenticTranscript } from './agentic.mjs';
+
 /** Prefix for a per-job relay stream name. One stream carries a job's terminal. */
 export const RELAY_STREAM_PREFIX = 'job:';
 
@@ -39,6 +41,26 @@ export const RELAY_STREAM_PREFIX = 'job:';
 export function relayStreamName(jobKey) {
   return `${RELAY_STREAM_PREFIX}${String(jobKey)}`;
 }
+
+/**
+ * The initial produce frame emitted on a relay stream the instant a session is
+ * created: a canonical `@nanobpm/agentic` lifecycle "open" transcript event.
+ *
+ * It carries no agent output — its sole job is to OPEN the `job:<jobKey>` stream
+ * immediately so the app's correlation registry links this worker→jobKey on
+ * session creation, INDEPENDENT of whether the agent later emits any transcript
+ * bytes. Without it, a quiet ACP agent (one that emits no mappable
+ * `session/update`) never produces a `job:` frame, so the app never correlates
+ * the job — it renders "—" in the cockpit with no drill-in, even though the job
+ * ran and completed (regression since #128 coupled correlation to transcript
+ * bytes). Newline-framed to match the transcript-chunk framing the ACP relay
+ * path uses, and derived through `encodeTranscriptEvent` (never hand-rolled) so
+ * the wire marker stays single-sourced in `@nanobpm/agentic`.
+ */
+export const RELAY_OPEN_CHUNK = `${agenticTranscript.encodeTranscriptEvent({
+  kind: 'lifecycle',
+  phase: 'open',
+})}\n`;
 
 /**
  * Resolve a role's terminal mode — whether the agent harness for this role gets
@@ -188,6 +210,12 @@ export function createRelaySession({ channel, jobKey, logger } = {}) {
   const close = () => {
     for (const detach of [...activeDetaches]) detach();
   };
+
+  // Open the stream the instant the session exists, so the app correlates
+  // worker→jobKey immediately — independent of any later agent transcript bytes
+  // (a quiet ACP agent emits none). Routed through the internal relay(), which
+  // already swallows sink errors, so opening the stream never fails the job.
+  relay(RELAY_OPEN_CHUNK);
 
   return { stream, relay, attachSteer, close };
 }

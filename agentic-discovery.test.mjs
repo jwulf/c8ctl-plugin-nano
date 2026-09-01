@@ -18,6 +18,12 @@ import {
   probeAgenticChannel,
   normalizeProjectApps,
   isLoopbackHost,
+  orderProbeAddresses,
+  resolveProbeCandidates,
+  raceProbeCandidates,
+  isLinkLocalAddress,
+  rediscoverAgenticUntilConnected,
+  defaultAgenticRediscoveryDelays,
   LOCAL_AGENTIC_TOKEN,
 } from './c8ctl-plugin.js';
 
@@ -153,11 +159,14 @@ test('discoverAgenticHubs discovers a remote (LAN) engine against the engine hos
   let probedHost;
   const hubs = await discoverAgenticHubs('http://merlin.local:8080', {
     fetchImpl: async (url) => { fetchedUrl = url; return { ok: true, json: async () => NANO_WORKFORCE }; },
+    // Deterministic resolver (fix B, #133): the engine host resolves to a single
+    // routable address, so the probe/hub carry that address, never the worker's.
+    lookupImpl: async () => ([{ address: '192.168.0.21', family: 4 }]),
     wsProbe: async (_port, { host } = {}) => { probedHost = host; return true; },
   });
-  assert.deepEqual(hubs, [{ project: 'Nano_Workforce', port: 3000, label: 'Nano Workforce', host: 'merlin.local' }]);
+  assert.deepEqual(hubs, [{ project: 'Nano_Workforce', port: 3000, label: 'Nano Workforce', host: '192.168.0.21' }]);
   assert.equal(fetchedUrl, 'http://merlin.local:8080/console/api/projects', 'reads the remote engine projects API');
-  assert.equal(probedHost, 'merlin.local', 'probes the engine host, not the worker loopback');
+  assert.equal(probedHost, '192.168.0.21', 'probes the engine host address, not the worker loopback');
 });
 
 test('discoverAgenticHubs normalizes a loopback engine host to 127.0.0.1 in the probe + hub', async () => {
@@ -180,37 +189,50 @@ test('discoverAgenticHubs allows every loopback host form (127.x, ::1)', async (
   }
 });
 
-// Single shared time budget (#76): the fetch and the probes must not each get a
-// fresh full timeout. The injected probe records the budget it was handed; after
-// a fetch that consumes most of the window, the probe budget must be the small
-// remainder — never the full timeoutMs.
-test('discoverAgenticHubs shares one deadline across fetch + probes (no 2x budget)', async () => {
+// Decoupled budgets (#133, fix C): the projects fetch and each WS probe get
+// INDEPENDENT deadlines. A slow fetch that consumed most of one shared window
+// used to starve the probe to ~0ms remaining and strand a reachable worker in
+// `advisory`; now the probe keeps its own full budget regardless of how long the
+// fetch took. The injected probe records the budget it was handed.
+test('discoverAgenticHubs gives the probe an independent budget (slow fetch cannot starve it)', async () => {
   let handedTimeout;
   const hubs = await discoverAgenticHubs('http://localhost:8080', {
     timeoutMs: 200,
     fetchImpl: async () => {
-      await new Promise((r) => setTimeout(r, 120)); // consume >half the budget
+      await new Promise((r) => setTimeout(r, 120)); // consume >half the fetch window
       return { ok: true, json: async () => NANO_WORKFORCE };
     },
     wsProbe: async (_port, { timeoutMs } = {}) => { handedTimeout = timeoutMs; return true; },
   });
   assert.deepEqual(hubs.map((h) => h.port), [3000]);
-  assert.ok(handedTimeout < 200, `probe budget ${handedTimeout} should be the remainder, not the full 200`);
-  assert.ok(handedTimeout > 0, 'probe budget should still be positive when time remains');
+  assert.equal(handedTimeout, 200, 'probe keeps its own full budget, not the fetch remainder');
 });
 
-test('discoverAgenticHubs skips probing when the fetch exhausts the whole budget', async () => {
+test('discoverAgenticHubs honours a separate probeTimeoutMs distinct from the fetch budget', async () => {
+  let handedTimeout;
+  await discoverAgenticHubs('http://localhost:8080', {
+    fetchTimeoutMs: 50,
+    probeTimeoutMs: 150,
+    fetchImpl: fetchReturning(NANO_WORKFORCE),
+    wsProbe: async (_port, { timeoutMs } = {}) => { handedTimeout = timeoutMs; return true; },
+  });
+  assert.equal(handedTimeout, 150, 'probe uses probeTimeoutMs, independent of the fetch budget');
+});
+
+test('discoverAgenticHubs still fails open to [] when the fetch outlasts its own budget', async () => {
   let probed = false;
+  // A signal-respecting fake fetch: rejects the moment its own fetch budget
+  // aborts (fetchTimeoutMs), proving the fetch is independently bounded.
   const hubs = await discoverAgenticHubs('http://localhost:8080', {
-    timeoutMs: 40,
-    fetchImpl: async () => {
-      await new Promise((r) => setTimeout(r, 60)); // outlasts the budget
-      return { ok: true, json: async () => NANO_WORKFORCE };
-    },
+    fetchTimeoutMs: 30,
+    fetchImpl: (_url, { signal } = {}) => new Promise((resolve, reject) => {
+      const t = setTimeout(() => resolve({ ok: true, json: async () => NANO_WORKFORCE }), 200);
+      signal?.addEventListener('abort', () => { clearTimeout(t); reject(new Error('aborted')); });
+    }),
     wsProbe: async () => { probed = true; return true; },
   });
   assert.deepEqual(hubs, []);
-  assert.equal(probed, false, 'no budget left → do not probe');
+  assert.equal(probed, false, 'a fetch that blows its own budget never reaches the probe');
 });
 
 // ---------------------------------------------------------------------------
@@ -290,10 +312,14 @@ test('single-match discovery connects to the direct loopback port with the local
 
 test('single-match discovery against a remote LAN engine connects to the engine host (#96)', async () => {
   const res = await withEnv({}, { nanoUrl: 'http://merlin.local:8080' }, () =>
-    resolveAgenticTarget({ fetchImpl: fetchReturning(NANO_WORKFORCE), wsProbe: probeUpgrades(3000) }));
+    resolveAgenticTarget({
+      fetchImpl: fetchReturning(NANO_WORKFORCE),
+      lookupImpl: async () => ([{ address: '192.168.0.21', family: 4 }]),
+      wsProbe: probeUpgrades(3000),
+    }));
   assert.equal(res.status, 'connect');
-  assert.equal(res.config.url, 'http://merlin.local:3000');
-  assert.deepEqual(res.config.discovered, { project: 'Nano_Workforce', port: 3000, host: 'merlin.local' });
+  assert.equal(res.config.url, 'http://192.168.0.21:3000');
+  assert.deepEqual(res.config.discovered, { project: 'Nano_Workforce', port: 3000, host: '192.168.0.21' });
 });
 
 test('single-match discovery brackets an IPv6 engine host in the resolved URL (#96)', async () => {
@@ -329,4 +355,243 @@ test('discovery timeout / error degrades to the zero-match advisory', async () =
   const res = await withEnv({}, null, () =>
     resolveAgenticTarget({ fetchImpl: async () => { throw new Error('AbortError'); }, wsProbe: probeUpgrades(3000) }));
   assert.equal(res.status, 'advisory');
+});
+
+// ---------------------------------------------------------------------------
+// (B) Address preference + Happy-Eyeballs — routable wins over link-local (#133)
+// ---------------------------------------------------------------------------
+
+test('isLinkLocalAddress flags fe80::/10 and 169.254/16, not routable addresses', () => {
+  for (const a of ['fe80::1', 'FE80::f412:e2aa:759f:761b', 'fe80::1%en0', '[fe80::1]', 'fe90::1', 'fea0::1', 'febf::1', 'FEBF::abcd', '169.254.10.20']) {
+    assert.equal(isLinkLocalAddress(a), true, `${a} should be link-local`);
+  }
+  for (const a of ['192.168.0.21', '10.0.0.1', '2001:db8::1', '::1', '127.0.0.1', 'fe7f::1', 'fec0::1', '', undefined]) {
+    assert.equal(isLinkLocalAddress(a), false, `${a} should not be link-local`);
+  }
+});
+
+test('orderProbeAddresses ranks link-local last, stable within a rank', () => {
+  const ordered = orderProbeAddresses([
+    { address: 'fe80::f412:e2aa:759f:761b', family: 6 },
+    { address: '192.168.0.21', family: 4 },
+    { address: '169.254.1.2', family: 4 },
+    { address: '10.0.0.5', family: 4 },
+  ]);
+  assert.deepEqual(ordered.map((a) => a.address), [
+    '192.168.0.21', // routable, first seen
+    '10.0.0.5',     // routable, later
+    'fe80::f412:e2aa:759f:761b', // link-local, pushed back (stable order)
+    '169.254.1.2',
+  ]);
+});
+
+test('resolveProbeCandidates returns an IP literal / loopback verbatim (no lookup)', async () => {
+  let looked = false;
+  const lookupImpl = async () => { looked = true; return []; };
+  assert.deepEqual(await resolveProbeCandidates('127.0.0.1', { lookupImpl }), ['127.0.0.1']);
+  assert.deepEqual(await resolveProbeCandidates('192.168.0.21', { lookupImpl }), ['192.168.0.21']);
+  assert.deepEqual(await resolveProbeCandidates('[2001:db8::1]', { lookupImpl }), ['[2001:db8::1]']);
+  assert.equal(looked, false, 'an IP literal / loopback needs no DNS resolution');
+});
+
+test('resolveProbeCandidates resolves a hostname routable-first, bracketing IPv6', async () => {
+  const lookupImpl = async () => ([
+    { address: 'fe80::f412:e2aa:759f:761b', family: 6 }, // link-local first, as Node returns
+    { address: '192.168.0.21', family: 4 },
+  ]);
+  const hosts = await resolveProbeCandidates('merlin.local', { lookupImpl });
+  assert.deepEqual(hosts, ['192.168.0.21', '[fe80::f412:e2aa:759f:761b]']);
+});
+
+test('resolveProbeCandidates falls back to [host] when the resolver throws', async () => {
+  const lookupImpl = async () => { throw new Error('ENOTFOUND'); };
+  assert.deepEqual(await resolveProbeCandidates('merlin.local', { lookupImpl }), ['merlin.local']);
+});
+
+test('resolveProbeCandidates URL-encodes an IPv6 zone id so the host stays valid', async () => {
+  // A resolver can return a scoped link-local address carrying an interface zone
+  // id (`fe80::1%en0`); the raw `%` must be percent-encoded so the bracketed host
+  // parses as a valid ws:// URL (#133).
+  const lookupImpl = async () => ([
+    { address: 'fe80::1%en0', family: 6 },
+    { address: '192.168.0.21', family: 4 },
+  ]);
+  const hosts = await resolveProbeCandidates('merlin.local', { lookupImpl });
+  assert.deepEqual(hosts, ['192.168.0.21', '[fe80::1%25en0]']);
+  // The zone-id delimiter is percent-encoded, not left as a raw `%` (RFC 6874).
+  assert.ok(!/[^%]%[^2]/.test(hosts[1]) && hosts[1].includes('%25'), 'zone id is percent-encoded');
+});
+
+test('raceProbeCandidates returns the fast routable host even when link-local never opens', async () => {
+  // fe80:: never opens (the slow macOS path); the routable IPv4 opens fast.
+  const wsProbe = async (_port, { host } = {}) => {
+    if (host === '192.168.0.21') return true;
+    return new Promise(() => {}); // never resolves — simulates the stalled link-local connect
+  };
+  const winner = await raceProbeCandidates(3000, {
+    hosts: ['192.168.0.21', '[fe80::1]'],
+    wsProbe,
+    staggerMs: 5,
+  });
+  assert.equal(winner, '192.168.0.21');
+});
+
+test('raceProbeCandidates resolves null when every candidate fails', async () => {
+  const winner = await raceProbeCandidates(3000, {
+    hosts: ['10.0.0.1', '10.0.0.2'],
+    wsProbe: async () => false,
+    staggerMs: 1,
+  });
+  assert.equal(winner, null);
+});
+
+// End-to-end discovery: the injected resolver returns link-local-FIRST, and the
+// injected probe only upgrades on the routable IPv4 — discovery must still find
+// the reachable hub and carry the routable host (proves B fixes the first
+// attempt, not just retries).
+test('discoverAgenticHubs prefers a routable address when the resolver returns link-local first', async () => {
+  const lookupImpl = async () => ([
+    { address: 'fe80::f412:e2aa:759f:761b', family: 6 },
+    { address: '192.168.0.21', family: 4 },
+  ]);
+  const wsProbe = async (_port, { host } = {}) => {
+    if (host === '192.168.0.21') return true;
+    return new Promise(() => {}); // link-local stalls forever
+  };
+  const hubs = await discoverAgenticHubs('http://merlin.local:8080', {
+    fetchImpl: fetchReturning(NANO_WORKFORCE),
+    wsProbe,
+    lookupImpl,
+    probeTimeoutMs: 500,
+  });
+  assert.deepEqual(hubs, [{ project: 'Nano_Workforce', port: 3000, label: 'Nano Workforce', host: '192.168.0.21' }]);
+});
+
+// ---------------------------------------------------------------------------
+// (C) Cache the last known-good hub so a blip doesn't drop to advisory (#133)
+// ---------------------------------------------------------------------------
+
+test('resolveAgenticTarget reuses a cached hub when a later discovery comes up empty', async () => {
+  await withEnv({}, { nanoUrl: 'http://merlin.local:8080' }, async () => {
+    const cache = new Map();
+    // First: discovery succeeds → connect, and the hub is cached.
+    const first = await resolveAgenticTarget({
+      cache,
+      fetchImpl: fetchReturning(NANO_WORKFORCE),
+      lookupImpl: async () => ([{ address: '192.168.0.21', family: 4 }]),
+      wsProbe: probeUpgrades(3000),
+    });
+    assert.equal(first.status, 'connect');
+    assert.equal(first.config.url, 'http://192.168.0.21:3000');
+    // Then: a transient blip yields zero hubs — but the cache self-heals it to
+    // connect rather than dropping the known-good worker to advisory.
+    const second = await resolveAgenticTarget({
+      cache,
+      fetchImpl: fetchReturning(null, { ok: false }),
+      wsProbe: probeUpgrades(3000),
+    });
+    assert.equal(second.status, 'connect');
+    assert.equal(second.config.url, 'http://192.168.0.21:3000');
+    assert.equal(second.config.fromCache, true);
+  });
+});
+
+test('resolveAgenticTarget without a cache still drops to advisory on a miss', async () => {
+  const res = await withEnv({}, null, () =>
+    resolveAgenticTarget({ fetchImpl: fetchReturning(null, { ok: false }), wsProbe: probeUpgrades(3000) }));
+  assert.equal(res.status, 'advisory');
+});
+
+// ---------------------------------------------------------------------------
+// (A) Background re-discovery self-heals advisory → connected (#133)
+// ---------------------------------------------------------------------------
+
+test('defaultAgenticRediscoveryDelays grows 2s→…→30s cap and spans several minutes', () => {
+  const delays = defaultAgenticRediscoveryDelays({ rng: () => 0.5 }); // no jitter
+  assert.equal(delays[0], 2_000);
+  assert.equal(delays[1], 4_000);
+  assert.equal(delays[2], 8_000);
+  assert.ok(delays[delays.length - 1] <= 30_000, 'capped at 30s');
+  assert.ok(delays.reduce((a, b) => a + b, 0) >= 4 * 60_000, 'spans several minutes of retries');
+});
+
+test('rediscoverAgenticUntilConnected flips advisory → connected on a later attempt', async () => {
+  // First two attempts miss (advisory); the third discovers a hub.
+  const outcomes = [
+    { status: 'advisory' },
+    { status: 'advisory' },
+    { status: 'connect', config: { url: 'http://192.168.0.21:3000' } },
+  ];
+  let calls = 0;
+  let connectedTarget = null;
+  const result = await rediscoverAgenticUntilConnected({
+    resolveTarget: async () => outcomes[calls++],
+    onConnect: async (target) => { connectedTarget = target; },
+    delaysMs: [1, 1, 1, 1],
+    sleep: async () => {}, // no real waiting
+  });
+  assert.equal(calls, 3, 'stopped as soon as a connect target appeared');
+  assert.equal(result.status, 'connect');
+  assert.equal(connectedTarget.config.url, 'http://192.168.0.21:3000');
+});
+
+test('rediscoverAgenticUntilConnected swallows a throwing attempt and keeps trying', async () => {
+  let calls = 0;
+  const result = await rediscoverAgenticUntilConnected({
+    resolveTarget: async () => {
+      calls += 1;
+      if (calls === 1) throw new Error('transient');
+      return { status: 'connect', config: { url: 'http://h:1' } };
+    },
+    onConnect: async () => {},
+    delaysMs: [1, 1, 1],
+    sleep: async () => {},
+    logger: { debug: () => {} },
+  });
+  assert.equal(calls, 2);
+  assert.equal(result.status, 'connect');
+});
+
+test('rediscoverAgenticUntilConnected keeps retrying when onConnect throws, then stops on success', async () => {
+  // A transient channel-open failure in onConnect must NOT prematurely stop the
+  // self-heal loop: it should keep re-discovering until a connect callback
+  // actually succeeds (#133).
+  let attempts = 0;
+  let onConnectCalls = 0;
+  const result = await rediscoverAgenticUntilConnected({
+    resolveTarget: async () => { attempts += 1; return { status: 'connect', config: { url: `http://h:${attempts}` } }; },
+    onConnect: async () => {
+      onConnectCalls += 1;
+      if (onConnectCalls === 1) throw new Error('channel-open transient');
+    },
+    delaysMs: [1, 1, 1],
+    sleep: async () => {},
+    logger: { debug: () => {} },
+  });
+  assert.equal(onConnectCalls, 2, 'retried after the failing onConnect');
+  assert.equal(attempts, 2, 're-resolved on the retry');
+  assert.equal(result.config.url, 'http://h:2', 'returned the target whose onConnect succeeded');
+});
+
+test('rediscoverAgenticUntilConnected stops early when shouldContinue() turns false', async () => {
+  let calls = 0;
+  const result = await rediscoverAgenticUntilConnected({
+    resolveTarget: async () => { calls += 1; return { status: 'advisory' }; },
+    onConnect: async () => {},
+    delaysMs: [1, 1, 1, 1],
+    sleep: async () => {},
+    shouldContinue: () => false, // e.g. a channel already came up
+  });
+  assert.equal(calls, 0, 'never resolves when cancelled up front');
+  assert.equal(result, null);
+});
+
+test('rediscoverAgenticUntilConnected returns null when the schedule is exhausted with no hit', async () => {
+  const result = await rediscoverAgenticUntilConnected({
+    resolveTarget: async () => ({ status: 'advisory' }),
+    onConnect: async () => { throw new Error('should not be called'); },
+    delaysMs: [1, 1],
+    sleep: async () => {},
+  });
+  assert.equal(result, null);
 });

@@ -362,10 +362,10 @@ test('discovery timeout / error degrades to the zero-match advisory', async () =
 // ---------------------------------------------------------------------------
 
 test('isLinkLocalAddress flags fe80::/10 and 169.254/16, not routable addresses', () => {
-  for (const a of ['fe80::1', 'FE80::f412:e2aa:759f:761b', 'fe80::1%en0', '[fe80::1]', '169.254.10.20']) {
+  for (const a of ['fe80::1', 'FE80::f412:e2aa:759f:761b', 'fe80::1%en0', '[fe80::1]', 'fe90::1', 'fea0::1', 'febf::1', 'FEBF::abcd', '169.254.10.20']) {
     assert.equal(isLinkLocalAddress(a), true, `${a} should be link-local`);
   }
-  for (const a of ['192.168.0.21', '10.0.0.1', '2001:db8::1', '::1', '127.0.0.1', '', undefined]) {
+  for (const a of ['192.168.0.21', '10.0.0.1', '2001:db8::1', '::1', '127.0.0.1', 'fe7f::1', 'fec0::1', '', undefined]) {
     assert.equal(isLinkLocalAddress(a), false, `${a} should not be link-local`);
   }
 });

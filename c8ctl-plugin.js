@@ -5305,7 +5305,10 @@ function isLinkLocalAddress(address) {
     .trim().toLowerCase()
     .replace(/^\[|\]$/g, '')
     .replace(/%.*$/, '');
-  return a.startsWith('fe80:') || /^169\.254\./.test(a);
+  // IPv6 link-local is the full fe80::/10 block, whose first hextet spans
+  // fe80–febf (the low byte's top two bits are `10`), not just the fe80:
+  // prefix — match the whole range so e.g. fe90::/fea0::/febf:: are covered too.
+  return /^fe[89ab][0-9a-f]:/.test(a) || /^169\.254\./.test(a);
 }
 
 /**
@@ -6272,6 +6275,13 @@ async function workAgent(req, flags) {
         writeActivity();
         logger.info('  agentic channel: background re-discovery succeeded — upgrading advisory → connecting.');
         await openAgenticChannel(agenticCfg);
+        // openAgenticChannel swallows its own open failures (it nulls
+        // workChannel and returns rather than throwing), so a failed open must
+        // be re-thrown here — otherwise the self-heal loop treats this attempt
+        // as success and stops retrying with workChannel still null (#133).
+        if (workChannel === null) {
+          throw new Error('agentic channel failed to open after background re-discovery');
+        }
       },
       // Stop as soon as a channel exists (loop won this or a prior attempt did).
       shouldContinue: () => workChannel === null,

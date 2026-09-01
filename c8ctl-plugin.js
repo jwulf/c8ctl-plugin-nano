@@ -51,6 +51,7 @@ import {
   unwatchFile,
 } from 'node:fs';
 import { createConnection, createServer } from 'node:net';
+import { lookup as dnsLookup } from 'node:dns/promises';
 import { randomUUID, createHash, randomBytes } from 'node:crypto';
 import { homedir, platform as osPlatform, devNull, tmpdir, hostname } from 'node:os';
 import { join, isAbsolute, resolve as resolvePath, dirname, basename, sep } from 'node:path';
@@ -5273,6 +5274,133 @@ function probeAgenticChannel(port, {
 }
 
 /**
+ * Is `address` a link-local address? Node's default `dns.lookup` can return an
+ * IPv6 link-local `fe80::…` (interface-scoped) address FIRST for a `.local`/mDNS
+ * host, and on some hosts (notably macOS) opening a TCP/WS connection to such a
+ * peer stalls for hundreds of ms — long enough to blow the discovery budget and
+ * strand the worker in `advisory` (#133). Covers IPv6 `fe80::/10` and IPv4
+ * link-local `169.254.0.0/16`; tolerates URL brackets and a zone-id suffix.
+ * @param {string} address
+ * @returns {boolean}
+ */
+function isLinkLocalAddress(address) {
+  const a = String(address || '')
+    .trim().toLowerCase()
+    .replace(/^\[|\]$/g, '')
+    .replace(/%.*$/, '');
+  return a.startsWith('fe80:') || /^169\.254\./.test(a);
+}
+
+/**
+ * Is `host` an IP literal (v4 or bracketed/bare v6) that needs no DNS
+ * resolution? Used to skip the resolver for an address that is already concrete.
+ * @param {string} host
+ * @returns {boolean}
+ */
+function isIpLiteral(host) {
+  const h = String(host || '').trim().replace(/^\[|\]$/g, '');
+  if (!h) return false;
+  if (/^\d{1,3}(\.\d{1,3}){3}$/.test(h)) return true; // IPv4 dotted-quad
+  return h.includes(':'); // any colon → IPv6 literal
+}
+
+/**
+ * Order resolved connect candidates routable-first (#133, fix B). Ranks a
+ * link-local `fe80::`/`169.254.` candidate LAST (stable within a rank) so a fast
+ * routable IPv4/global address wins the Happy-Eyeballs race instead of a slow
+ * interface-scoped one dominating the connect budget.
+ * @param {Array<{address:string, family?:number}>} addresses
+ * @returns {Array<{address:string, family?:number}>} a new, rank-sorted array
+ */
+function orderProbeAddresses(addresses) {
+  const list = Array.isArray(addresses) ? addresses.filter((a) => a && a.address) : [];
+  return list
+    .map((a, i) => ({ a, i, rank: isLinkLocalAddress(a.address) ? 1 : 0 }))
+    .sort((x, y) => (x.rank - y.rank) || (x.i - y.i))
+    .map((x) => x.a);
+}
+
+/**
+ * Resolve a probe host to an ordered list of candidate host strings to try,
+ * routable-first (#133, fix B). A loopback host, an IP literal, or an
+ * unavailable resolver yields the single host verbatim (unchanged legacy
+ * behaviour); a real hostname is resolved via `lookupImpl(host, { all:true })`
+ * and its addresses are ranked so a link-local `fe80::` never dominates the
+ * connect budget. Fail-open: any resolver error or empty result falls back to
+ * `[host]`, so a host that can't be pre-resolved still gets its one legacy probe.
+ * @param {string} host
+ * @param {{ lookupImpl?: Function }} [opts]
+ * @returns {Promise<string[]>}
+ */
+async function resolveProbeCandidates(host, { lookupImpl = dnsLookup } = {}) {
+  const h = String(host || '').trim();
+  if (!h) return [];
+  if (isLoopbackHost(h) || isIpLiteral(h) || typeof lookupImpl !== 'function') return [h];
+  try {
+    const all = await lookupImpl(h, { all: true });
+    const hosts = orderProbeAddresses(Array.isArray(all) ? all : [])
+      .map((a) => wsHostPart(String(a.address)));
+    return hosts.length ? hosts : [h];
+  } catch {
+    return [h];
+  }
+}
+
+/**
+ * Race a WS `/agentic` probe across ordered candidate hosts (Happy-Eyeballs,
+ * #133 fix B) and resolve with the FIRST host whose socket opens — or `null` if
+ * every candidate fails/times out. Candidates are tried in order (routable
+ * first) with a small stagger so the preferred address gets a head start but a
+ * slow-to-open one can't stall the whole probe: a fast later candidate still
+ * wins. Each per-host probe is bounded by `timeoutMs`. A single candidate skips
+ * the racing machinery entirely (unchanged legacy path).
+ * @param {number} port
+ * @param {{ hosts?: string[], token?: string, timeoutMs?: number, wsProbe?: Function, staggerMs?: number }} [opts]
+ * @returns {Promise<string|null>} the winning host, or null
+ */
+async function raceProbeCandidates(port, {
+  hosts = [],
+  token = LOCAL_AGENTIC_TOKEN,
+  timeoutMs = AGENTIC_DISCOVERY_TIMEOUT_MS,
+  wsProbe = probeAgenticChannel,
+  staggerMs = 250,
+} = {}) {
+  const list = Array.isArray(hosts) ? hosts.filter(Boolean) : [];
+  if (list.length === 0) return null;
+  if (list.length === 1) {
+    try {
+      return (await wsProbe(port, { host: list[0], token, timeoutMs })) ? list[0] : null;
+    } catch {
+      return null;
+    }
+  }
+  return new Promise((resolve) => {
+    let pending = list.length;
+    let settled = false;
+    const timers = [];
+    const done = (host) => {
+      if (settled) return;
+      settled = true;
+      timers.forEach(clearTimeout);
+      resolve(host);
+    };
+    const start = (host) => {
+      Promise.resolve()
+        .then(() => wsProbe(port, { host, token, timeoutMs }))
+        .catch(() => false)
+        .then((ok) => {
+          if (ok) done(host);
+          else if (--pending === 0) done(null);
+        });
+    };
+    list.forEach((host, idx) => {
+      if (idx === 0) start(host);
+      else timers.push(setTimeout(() => start(host), staggerMs * idx));
+    });
+  });
+}
+
+/**
  * Auto-discover the embedded nwf agentic hub(s) reachable from an engine base
  * URL (#75, #96). Reads `GET <engine>/console/api/projects`, keeps the apps that
  * advertise an agentic UI port, and WS-probes each app's `/agentic` **on the
@@ -5281,20 +5409,25 @@ function probeAgenticChannel(port, {
  * loopback engine probes `127.0.0.1`, a remote engine (e.g. `merlin.local`)
  * probes that same host — the port is taken from the projects API but the host is
  * always the engine's, so a rogue projects API can never steer a probe at the
- * worker's own loopback (#76). Enforces a single shared time budget across the
- * fetch + probes, and is fail-open: any error — not a nano engine (Camunda),
- * network failure, malformed body, or an overall timeout — degrades to `[]` so
- * the worker's real job is never blocked.
+ * worker's own loopback (#76). Gives the projects fetch and each WS probe
+ * INDEPENDENT deadlines (#133) so a slow fetch can't starve the probe, prefers a
+ * routable address over a link-local `fe80::` one (Happy-Eyeballs), and is
+ * fail-open: any error — not a nano engine (Camunda), network failure, malformed
+ * body, or a timeout — degrades to `[]` so the worker's real job is never
+ * blocked.
  *
  * @param {string} engineBaseUrl the engine base URL (e.g. `http://merlin.local:8080`)
- * @param {{ token?: string, fetchImpl?: Function, wsProbe?: Function, timeoutMs?: number }} [opts]
+ * @param {{ token?: string, fetchImpl?: Function, wsProbe?: Function, lookupImpl?: Function, timeoutMs?: number, fetchTimeoutMs?: number, probeTimeoutMs?: number }} [opts]
  * @returns {Promise<Array<{ project: string, port: number, label?: string, host: string }>>}
  */
 async function discoverAgenticHubs(engineBaseUrl, {
   token = LOCAL_AGENTIC_TOKEN,
   fetchImpl = globalThis.fetch,
   wsProbe = probeAgenticChannel,
+  lookupImpl = dnsLookup,
   timeoutMs = AGENTIC_DISCOVERY_TIMEOUT_MS,
+  fetchTimeoutMs = timeoutMs,
+  probeTimeoutMs = timeoutMs,
 } = {}) {
   if (typeof fetchImpl !== 'function' || typeof engineBaseUrl !== 'string' || !engineBaseUrl.trim()) {
     return [];
@@ -5315,14 +5448,15 @@ async function discoverAgenticHubs(engineBaseUrl, {
     return [];
   }
   const probeHost = isLoopbackHost(host) ? '127.0.0.1' : host;
-  // Single discovery budget: the projects fetch and the WS probes share ONE
-  // deadline, so total discovery can't approach 2× timeoutMs (the fetch could
-  // consume ~timeoutMs and then each probe was previously given a fresh full
-  // budget). Probes get only the time left after the fetch (#76).
-  const deadline = Date.now() + timeoutMs;
+  // (C) Decoupled budgets (#133): the projects fetch and each WS probe get their
+  // OWN independent deadline. Previously they shared one 2s budget, so a fetch
+  // that consumed most of the window starved the probe to ~0ms remaining and
+  // stranded an otherwise-reachable worker in `advisory`. They no longer subtract
+  // from each other — the fetch is bounded by `fetchTimeoutMs`, each probe by
+  // `probeTimeoutMs`.
   let projects;
   const controller = new AbortController();
-  const timer = setTimeout(() => controller.abort(), timeoutMs);
+  const timer = setTimeout(() => controller.abort(), fetchTimeoutMs);
   try {
     const res = await fetchImpl(`${base}/console/api/projects`, { signal: controller.signal });
     if (!res || !res.ok) return [];
@@ -5334,15 +5468,23 @@ async function discoverAgenticHubs(engineBaseUrl, {
   }
   const apps = normalizeProjectApps(projects);
   if (apps.length === 0) return [];
-  const remainingMs = deadline - Date.now();
-  if (remainingMs <= 0) return [];
-  // Probe candidate ports concurrently within the remaining shared budget. Each
-  // surviving hub carries the engine host so the caller builds the right URL.
+  // (B) Prefer a routable address over a link-local one and race families
+  // (Happy-Eyeballs, #133): resolve the engine host to ordered candidate
+  // addresses (routable first) so a fast IPv4/global address wins over a slow
+  // `fe80::` link-local one that Node's default dns.lookup may return first. Each
+  // surviving hub carries the WINNING host so the caller (and the real channel
+  // connect) reuse that fast, routable address rather than re-resolving to the
+  // slow link-local path.
+  const candidates = await resolveProbeCandidates(probeHost, { lookupImpl });
   const settled = await Promise.all(apps.map(async (app) => {
     try {
-      return (await wsProbe(app.port, { host: probeHost, token, timeoutMs: remainingMs }))
-        ? { ...app, host: probeHost }
-        : null;
+      const winner = await raceProbeCandidates(app.port, {
+        hosts: candidates,
+        token,
+        timeoutMs: probeTimeoutMs,
+        wsProbe,
+      });
+      return winner ? { ...app, host: winner } : null;
     } catch {
       return null;
     }
@@ -5367,10 +5509,16 @@ async function discoverAgenticHubs(engineBaseUrl, {
  *     no projects API / not a nano engine, or discovery error/timeout). The
  *     worker continues doing real work with no channel.
  *
- * @param {{ camunda?: object, fetchImpl?: Function, wsProbe?: Function, timeoutMs?: number }} [opts]
+ * (C) When a `cache` Map is supplied, a successfully-resolved hub URL is
+ * remembered against the engine base URL, and a later discovery that comes up
+ * empty for that same engine reuses the cached known-good hub instead of dropping
+ * to `advisory` — so a brief blip doesn't strip visibility from an
+ * already-connected worker (#133).
+ *
+ * @param {{ camunda?: object, fetchImpl?: Function, wsProbe?: Function, lookupImpl?: Function, cache?: Map, timeoutMs?: number }} [opts]
  * @returns {Promise<{ status: string, config?: object, message?: string, candidates?: Array }>}
  */
-async function resolveAgenticTarget({ camunda, ...opts } = {}) {
+async function resolveAgenticTarget({ camunda, cache, ...opts } = {}) {
   const base = resolveAgenticConfig(camunda);
   if (!base) return { status: 'off' };
   // Explicit target wins verbatim and skips discovery entirely.
@@ -5389,14 +5537,14 @@ async function resolveAgenticTarget({ camunda, ...opts } = {}) {
 
   if (hubs.length === 1) {
     const { project, port, host } = hubs[0];
-    return {
-      status: 'connect',
-      config: {
-        ...base,
-        url: `http://${wsHostPart(host)}:${port}`,
-        discovered: { project, port, host },
-      },
+    const config = {
+      ...base,
+      url: `http://${wsHostPart(host)}:${port}`,
+      discovered: { project, port, host },
     };
+    // Cache the known-good hub so a later blip self-heals from cache (#133-C).
+    if (cache && typeof cache.set === 'function') cache.set(base.url, config);
+    return { status: 'connect', config };
   }
   if (hubs.length > 1) {
     const list = hubs.map((h) => `${h.project} → :${h.port}`).join(', ');
@@ -5407,12 +5555,97 @@ async function resolveAgenticTarget({ camunda, ...opts } = {}) {
         + `Disambiguate by setting NANO_AGENTIC_URL=http://${suggestHost}:<port> (or persisted agenticUrl) to the one you want.`,
     };
   }
+  // Zero matches: reuse a cached known-good hub for this engine if we have one, so
+  // a transient discovery miss doesn't drop an already-known-good worker to
+  // advisory (#133-C).
+  if (cache && typeof cache.get === 'function') {
+    const cached = cache.get(base.url);
+    if (cached) return { status: 'connect', config: { ...cached, fromCache: true } };
+  }
   return {
     status: 'advisory',
     message: `agentic visibility was not discoverable at ${base.url} — the embedded app port could `
       + 'not be found (not a nano engine, or its console projects API is absent). Set '
       + `NANO_AGENTIC_URL=http://${suggestHost}:<appUi.port> to enable the visibility channel. Continuing without it.`,
   };
+}
+
+/**
+ * A jittered backoff schedule (ms) for background agentic re-discovery (#133-A):
+ * ~2s → 4s → 8s → 16s → 30s (capped), each waited value randomised ±20%, spanning
+ * roughly `ceilingMs` (default ~5 minutes) of total elapsed retry time before the
+ * loop gives up. A worker that lost the cold-start discovery race walks this
+ * schedule to upgrade `advisory → connected` without a restart.
+ * @param {{ base?: number, cap?: number, ceilingMs?: number, rng?: () => number }} [opts]
+ * @returns {number[]} the ordered per-attempt wait durations
+ */
+function defaultAgenticRediscoveryDelays({
+  base = 2_000,
+  cap = 30_000,
+  ceilingMs = 5 * 60 * 1_000,
+  rng = Math.random,
+} = {}) {
+  const delays = [];
+  let d = base;
+  let total = 0;
+  while (total < ceilingMs) {
+    const jitter = Math.round((rng() - 0.5) * 0.4 * d); // ±20%
+    const wait = Math.max(500, d + jitter);
+    delays.push(wait);
+    total += wait;
+    d = Math.min(cap, d * 2);
+  }
+  return delays;
+}
+
+/**
+ * Background self-heal loop for agentic discovery (#133-A). After an initial
+ * cold-start miss leaves a worker in `advisory`, re-run `resolveTarget` on a
+ * jittered backoff schedule and, on the FIRST attempt that yields a
+ * `status:'connect'` target, invoke `onConnect(target)` and stop — so the worker
+ * upgrades to `connected` without a restart. Fail-open: an attempt that throws is
+ * swallowed and the loop continues; the loop also stops early whenever
+ * `shouldContinue()` returns false (e.g. a channel already came up, or the worker
+ * is shutting down). Returns the connecting target, or `null` if the schedule was
+ * exhausted / cancelled without a hit. Timers and the resolver are injectable so
+ * this is unit-testable without real waits or sockets.
+ *
+ * @param {{
+ *   resolveTarget: () => Promise<{status:string, config?:object}>,
+ *   onConnect?: (target: {status:string, config?:object}) => (void|Promise<void>),
+ *   delaysMs?: number[],
+ *   sleep?: (ms:number) => Promise<void>,
+ *   shouldContinue?: () => boolean,
+ *   logger?: object,
+ * }} opts
+ * @returns {Promise<object|null>}
+ */
+async function rediscoverAgenticUntilConnected({
+  resolveTarget,
+  onConnect,
+  delaysMs = defaultAgenticRediscoveryDelays(),
+  sleep = (ms) => new Promise((r) => setTimeout(r, ms)),
+  shouldContinue = () => true,
+  logger = null,
+} = {}) {
+  if (typeof resolveTarget !== 'function') return null;
+  for (const delay of delaysMs) {
+    if (!shouldContinue()) return null;
+    try { await sleep(delay); } catch { return null; }
+    if (!shouldContinue()) return null;
+    let target;
+    try {
+      target = await resolveTarget();
+    } catch (err) {
+      logger?.debug?.(`agentic re-discovery attempt failed: ${err?.message || err}`);
+      continue;
+    }
+    if (target && target.status === 'connect') {
+      try { await onConnect?.(target); } catch { /* best effort — never throw out of the loop */ }
+      return target;
+    }
+  }
+  return null;
 }
 
 /**
@@ -5917,7 +6150,17 @@ async function workAgent(req, flags) {
   // `supervisor status` reflects connecting/advisory/off immediately, before
   // the socket opens (or without a channel at all).
   writeActivity();
-  if (agenticCfg) {
+  // Track the live connection state on the activity marker so the supervisor
+  // shows connected↔disconnected transitions (#99). A close carries a normalized
+  // diagnostic under the contract `agentic.message` field (not `reason`) so a hub
+  // drop explains WHY; a fresh (re)connect clears any stale message.
+  const markAgentic = (status, message = null) => { agenticState = { ...agenticState, status, message }; writeActivity(); };
+  // Open (or re-open) the visibility channel for a resolved connect config. This
+  // is the SINGLE place the connected+authenticated client is instantiated — the
+  // initial connect path and the background self-heal loop (#133) both call it,
+  // (re)assigning the shared `workChannel`/`bufferMonitor` closures the job
+  // recorders and shutdown path already track.
+  const openAgenticChannel = async (cfg) => {
     try {
       workChannel = await createWorkChannel({
         instance: workerName,
@@ -5928,30 +6171,25 @@ async function workAgent(req, flags) {
           host: hostname(),
         },
         listJobKeys: () => [...activeJobs.keys()],
-        url: agenticCfg.url,
-        token: agenticCfg.token,
-        credential: agenticCfg.credential,
-        bufferCapacity: agenticCfg.bufferCapacity,
+        url: cfg.url,
+        token: cfg.token,
+        credential: cfg.credential,
+        bufferCapacity: cfg.bufferCapacity,
         logger,
       });
-      const shown = redactAgenticUrl(buildAgenticUrl(agenticCfg.url, {}));
-      const mode = agenticCfg.secure ? 'secure' : 'local';
-      if (agenticCfg.discovered) {
-        const d = agenticCfg.discovered;
+      const shown = redactAgenticUrl(buildAgenticUrl(cfg.url, {}));
+      const mode = cfg.secure ? 'secure' : 'local';
+      if (cfg.discovered) {
+        const d = cfg.discovered;
         logger.info(`  agentic channel: auto-discovered ${d.project} on the app's /agentic port ${wsHostPart(d.host)}:${d.port} (bypassing the WS-incapable console proxy).`);
       }
       logger.info(`  agentic channel (${mode}): announcing presence as ${workerName} on ${shown}`);
-      // Track the live connection state on the activity marker so the
-      // supervisor shows connected↔disconnected transitions (#99). onConnect
-      // fires only for listeners present at first open, so also reconcile the
-      // already-open case synchronously via connected(). If the socket opened
-      // and then dropped inside the createWorkChannel() await window (before
-      // these listeners existed), connected() is false but everConnected() is
-      // true — record that as `disconnected` rather than leaving it stuck at
-      // `connecting`. A close carries a normalized diagnostic under the contract
-      // `agentic.message` field (not `reason`) so a hub drop explains WHY; a
-      // fresh (re)connect clears any stale message.
-      const markAgentic = (status, message = null) => { agenticState = { ...agenticState, status, message }; writeActivity(); };
+      // onConnect fires only for listeners present at first open, so also
+      // reconcile the already-open case synchronously via connected(). If the
+      // socket opened and then dropped inside the createWorkChannel() await window
+      // (before these listeners existed), connected() is false but everConnected()
+      // is true — record that as `disconnected` rather than leaving it stuck at
+      // `connecting`.
       workChannel.onConnect(() => markAgentic('connected'));
       workChannel.onReconnect(() => markAgentic('connected'));
       workChannel.onDisconnect((info) => markAgentic('disconnected', normalizeAgenticMessage(info)));
@@ -5967,6 +6205,7 @@ async function workAgent(req, flags) {
       agenticState = { ...agenticState, status: 'disconnected', message: normalizeAgenticMessage(err) };
       writeActivity();
       logger.warn(`  agentic channel unavailable (${err?.message || err}); continuing without visibility.`);
+      return;
     }
     // C4 (#43): observe the client's built-in outbound buffer across the
     // channel lifecycle — surface a high-water mark and warn when the bound
@@ -5977,7 +6216,7 @@ async function workAgent(req, flags) {
     if (workChannel) {
       try {
         bufferMonitor = createBufferMonitor(workChannel, {
-          capacity: agenticCfg.bufferCapacity,
+          capacity: cfg.bufferCapacity,
           logger,
         });
       } catch (err) {
@@ -5985,6 +6224,32 @@ async function workAgent(req, flags) {
         logger.warn(`  agentic buffer monitor unavailable (${err?.message || err}); channel presence still active.`);
       }
     }
+  };
+
+  if (agenticCfg) {
+    await openAgenticChannel(agenticCfg);
+  } else if (agenticTarget.status === 'advisory') {
+    // (A) Self-heal a cold-start discovery miss (#133): discovery is one-shot at
+    // enrolment, so a worker that merely lost the cold-start race (e.g. a slow
+    // link-local candidate blew the budget) would otherwise run `advisory` for
+    // its whole lifetime — the only recovery being a restart. Keep re-discovering
+    // in the background on a jittered backoff and, on a later success, upgrade
+    // advisory→connected WITHOUT a restart, flipping the AGENTIC status surface.
+    // A shared cache lets a brief blip reuse the last known-good hub (#133-C).
+    const hubCache = new Map();
+    rediscoverAgenticUntilConnected({
+      resolveTarget: () => resolveAgenticTarget({ camunda, logger, cache: hubCache }),
+      onConnect: async (target) => {
+        agenticCfg = target.config;
+        agenticState = agenticStateForTarget(target, safeAgenticDisplayUrl);
+        writeActivity();
+        logger.info('  agentic channel: background re-discovery succeeded — upgrading advisory → connecting.');
+        await openAgenticChannel(agenticCfg);
+      },
+      // Stop as soon as a channel exists (loop won this or a prior attempt did).
+      shouldContinue: () => workChannel === null,
+      logger,
+    }).catch(() => { /* best-effort self-heal — never surfaces an error */ });
   }
 
   // C3 (#42): the role's live-terminal mode — a full PTY (streamed on the relay
@@ -10914,6 +11179,14 @@ export { buildNpmInvocation };
 export { resolveAgenticConfig, LOCAL_AGENTIC_TOKEN };
 export { resolveAgenticSetting, PROTOCOLS, PERMISSION_MODES };
 export { resolveAgenticTarget, discoverAgenticHubs, probeAgenticChannel, normalizeProjectApps, isLoopbackHost };
+export {
+  orderProbeAddresses,
+  resolveProbeCandidates,
+  raceProbeCandidates,
+  isLinkLocalAddress,
+  rediscoverAgenticUntilConnected,
+  defaultAgenticRediscoveryDelays,
+};
 export { compareSemver, githubRepoSlug, filterReleasesSince, renderReleaseBody };
 export {
   webConsoleUrl,

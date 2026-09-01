@@ -2479,6 +2479,57 @@ function normalizeTaskEnvelope(customHeaders, variables, opts = {}) {
   return env;
 }
 
+// Does a string look like a usable git clone URL? Used to fail-closed on a
+// half-specified repository envelope (issue #129) rather than silently degrading
+// to a launch/temp cwd. Deliberately permissive — it only rejects values git
+// clone could never resolve to a remote:
+//   - `scheme://host/…` (https/http/ssh/git), host required;
+//   - `file://…` with a path;
+//   - scp-like `user@host:path` (e.g. `git@github.com:o/r.git`);
+//   - a local filesystem path (`/…`, `./…`, `../…`).
+// Anything else (a bare word, `github.com/o/r` with no scheme) is treated as
+// malformed.
+function isPlausibleRepoUrl(url) {
+  const s = String(url == null ? '' : url).trim();
+  if (!s) return false;
+  // scp-like syntax has no scheme: user@host:path (the colon is not a port).
+  if (/^[^\s/@]+@[^\s/:]+:.+/.test(s)) return true;
+  try {
+    const u = new URL(s);
+    if (u.protocol === 'file:') return !!u.pathname && u.pathname !== '/';
+    return !!u.hostname;
+  } catch { /* not a URL — fall through to the local-path check */ }
+  return s.startsWith('/') || s.startsWith('./') || s.startsWith('../');
+}
+
+// Classify the RAW `repository` block of a task envelope BEFORE normalization
+// drops it (issue #129). `normalizeTaskEnvelope` only emits `env.repository`
+// when a truthy `url` is present, so a half-specified repo block (other
+// `repository.*` fields, but `url` absent — or a `url` that isn't a usable clone
+// target) is invisible downstream and silently degrades to a repo-less run in
+// the launch/temp cwd. This surfaces that intent so the job handler can
+// fail-closed on it.
+//
+// Returns { present, url, malformed }:
+//   - present   — a `repository` block with at least one non-empty field was
+//                 supplied (a task with NO repository block is legitimately
+//                 repo-less and is `present: false`).
+//   - url       — the trimmed url string when present & non-empty, else null.
+//   - malformed — repository intent is expected but unusable: the block is
+//                 present with fields but the `url` is absent, or the `url` is a
+//                 non-empty string that isn't a plausible clone target.
+function classifyRepoEnvelope(customHeaders, variables) {
+  const raw = deepMerge(collectEnvelopeFrom(customHeaders), collectEnvelopeFrom(variables));
+  const repo = raw.repository;
+  if (!isPlainObject(repo)) return { present: false, url: null, malformed: false };
+  const hasAnyField = Object.keys(repo).some((k) => repo[k] != null && String(repo[k]).trim() !== '');
+  if (!hasAnyField) return { present: false, url: null, malformed: false };
+  const url = repo.url == null ? '' : String(repo.url).trim();
+  if (!url) return { present: true, url: null, malformed: true };
+  if (!isPlausibleRepoUrl(url)) return { present: true, url, malformed: true };
+  return { present: true, url, malformed: false };
+}
+
 // ---- Linked resources → live agent prompt (issue #63) ----------------------
 // A job's `linkedResources` activation header carries KEYS (not content); the
 // worker resolves each to the LATEST deployed bytes over the broker REST API, so
@@ -6028,6 +6079,28 @@ async function workAgent(req, flags) {
         const runId = randomUUID();
         if (isContainer) liveRunIds.add(runId);
 
+        // Fail-closed on a half-specified repository envelope (issue #129,
+        // hardening 2): a `repository` block that declares intent (any field set)
+        // but whose `url` is absent or not a usable clone target almost always
+        // means an orchestrator bug. Refuse the job LOUDLY (retryable) instead of
+        // silently degrading to a launch/temp cwd and running an agent with no
+        // repo where one was expected. A task with NO `repository` block at all
+        // is legitimately repo-less and takes the temp-cwd default below.
+        // Container runs don't provision a host repo (cloning is a later
+        // increment), so this gate is host-only, mirroring `hasRepo`.
+        if (!isContainer) {
+          const repoIntent = classifyRepoEnvelope(job.customHeaders ?? {}, job.variables ?? {});
+          if (repoIntent.malformed) {
+            const retries = Math.max(0, (Number(job.retries) || 1) - 1);
+            const why = repoIntent.url
+              ? `repository.url ${JSON.stringify(repoIntent.url)} is not a usable clone target`
+              : 'repository.url is missing';
+            const msg = `incomplete repository envelope — ${why}; refusing to run in the launch/temp cwd (likely an orchestrator bug emitting a half-specified repository block)`;
+            logger.warn(`[${jobType}] job ${job.jobKey} not provisioned — ${msg}; retries left ${retries}`);
+            return job.fail({ errorMessage: msg.slice(0, 2000), retries, retryBackOff: 15_000 });
+          }
+        }
+
         // Host git provisioning (increment 2a): sandbox=none + a repository →
         // clone into a throwaway workspace, run the harness there, then push +
         // reconcile the agent PR. Container-side cloning is a later increment.
@@ -6080,6 +6153,32 @@ async function workAgent(req, flags) {
             if (isContainer) liveRunIds.delete(runId);
             const retries = Math.max(0, (Number(job.retries) || 1) - 1);
             const msg = err instanceof ProvisionError ? err.message : `provisioning error: ${err.message}`;
+            logger.warn(`[${jobType}] job ${job.jobKey} not provisioned — ${msg}; retries left ${retries}`);
+            return job.fail({ errorMessage: msg.slice(0, 2000), retries, retryBackOff: 15_000 });
+          }
+        } else if (!isContainer) {
+          // Repo-less host job (issue #129, hardening 1): nothing is provisioned,
+          // so default the agent's cwd to a fresh, empty `run-*` dir under the
+          // runs root instead of leaving it undefined (which inherits the
+          // worker's launch dir and lets stray scratch files / a `git init`
+          // pollute it — or worse, an agent `cd` into a shared checkout). Track
+          // it in `liveRunDirs` and let the SAME `finally` below reap it, reusing
+          // the existing run-dir lifecycle — the only difference from the
+          // provisioned path is an EMPTY workspace.
+          //
+          // Hygiene, not a sandbox: the agent runs as the user with full
+          // filesystem access, so an empty cwd does not CONFINE it (it can still
+          // `cd` to a known absolute path). True confinement is the container
+          // increment; a provisioned repository envelope stays the preferred path.
+          try {
+            mkdirSync(agentRunsRoot(), { recursive: true });
+            runDir = mkdtempSync(join(agentRunsRoot(), 'run-'));
+            liveRunDirs.add(runDir);
+            cwd = runDir;
+          } catch (err) {
+            if (runDir) { try { rmSync(runDir, { recursive: true, force: true }); } catch { /* best effort */ } liveRunDirs.delete(runDir); runDir = null; }
+            const retries = Math.max(0, (Number(job.retries) || 1) - 1);
+            const msg = `could not create a temp workspace under the runs root: ${err.message}`;
             logger.warn(`[${jobType}] job ${job.jobKey} not provisioned — ${msg}; retries left ${retries}`);
             return job.fail({ errorMessage: msg.slice(0, 2000), retries, retryBackOff: 15_000 });
           }
@@ -10811,6 +10910,8 @@ export {
 export {
   normalizeTaskEnvelope,
   collectEnvelopeFrom,
+  classifyRepoEnvelope,
+  isPlausibleRepoUrl,
   parseLinkedResources,
   pickLinkedResource,
   resolveBrokerRestConfig,

@@ -5,13 +5,15 @@ import { test } from 'node:test';
 import assert from 'node:assert/strict';
 import { spawnSync } from 'node:child_process';
 
-import { mkdtempSync, mkdirSync, writeFileSync, rmSync, existsSync, utimesSync } from 'node:fs';
+import { mkdtempSync, mkdirSync, writeFileSync, rmSync, existsSync, utimesSync, readdirSync } from 'node:fs';
 import { tmpdir } from 'node:os';
 import { join } from 'node:path';
 
 import {
   normalizeTaskEnvelope,
   collectEnvelopeFrom,
+  classifyRepoEnvelope,
+  isPlausibleRepoUrl,
   parseLinkedResources,
   pickLinkedResource,
   resolveBrokerRestConfig,
@@ -61,6 +63,7 @@ import {
   resolveCommitterIdentity,
   isPlaceholderEmail,
   reapAgentRunDirs,
+  agentRunsRoot,
   authUrl,
   githubCloneToken,
   primeGhAuthToken,
@@ -711,6 +714,84 @@ test('normalizeTaskEnvelope: no repository when url absent', () => {
   assert.equal(env.branch.push, true); // default
   assert.deepEqual(env.setup.commands, []);
   assert.equal(env.task.allowPr, false);
+});
+
+// ---- issue #129: repository-envelope classification (fail-closed on a
+// half-specified repo block; safe temp-cwd default for the truly repo-less) ----
+
+test('isPlausibleRepoUrl: accepts real clone targets, rejects unusable strings', () => {
+  for (const ok of [
+    'https://github.com/o/r.git',
+    'http://gitea.local/o/r',
+    'ssh://git@host/o/r.git',
+    'git://host/o/r.git',
+    'git@github.com:o/r.git',
+    'file:///srv/repos/r.git',
+    '/srv/repos/r.git',
+    './r',
+    '../sibling/r',
+  ]) {
+    assert.equal(isPlausibleRepoUrl(ok), true, `should accept ${ok}`);
+  }
+  for (const bad of ['', '   ', 'not-a-url', 'github.com/o/r', 'file://', 'r.git']) {
+    assert.equal(isPlausibleRepoUrl(bad), false, `should reject ${JSON.stringify(bad)}`);
+  }
+});
+
+test('classifyRepoEnvelope: no repository block → repo-less (present:false, not malformed)', () => {
+  const c = classifyRepoEnvelope({}, {});
+  assert.deepEqual(c, { present: false, url: null, malformed: false });
+});
+
+test('classifyRepoEnvelope: a valid url → present, carried, not malformed', () => {
+  const c = classifyRepoEnvelope(
+    { [`${AGENT_TASK_NS}.repository.url`]: 'https://github.com/o/r.git' },
+    {},
+  );
+  assert.equal(c.present, true);
+  assert.equal(c.url, 'https://github.com/o/r.git');
+  assert.equal(c.malformed, false);
+});
+
+test('classifyRepoEnvelope: repository fields present but url absent → malformed', () => {
+  const c = classifyRepoEnvelope(
+    {
+      [`${AGENT_TASK_NS}.repository.provider`]: 'github',
+      [`${AGENT_TASK_NS}.repository.ref`]: 'main',
+    },
+    {},
+  );
+  assert.deepEqual(c, { present: true, url: null, malformed: true });
+});
+
+test('classifyRepoEnvelope: a present-but-blank url with other fields → malformed', () => {
+  const c = classifyRepoEnvelope(
+    {
+      [`${AGENT_TASK_NS}.repository.url`]: '   ',
+      [`${AGENT_TASK_NS}.repository.ref`]: 'main',
+    },
+    {},
+  );
+  assert.deepEqual(c, { present: true, url: null, malformed: true });
+});
+
+test('classifyRepoEnvelope: a non-empty but unusable url → malformed (with url echoed)', () => {
+  const c = classifyRepoEnvelope(
+    { [`${AGENT_TASK_NS}.repository.url`]: 'github.com/o/r' },
+    {},
+  );
+  assert.equal(c.present, true);
+  assert.equal(c.url, 'github.com/o/r');
+  assert.equal(c.malformed, true);
+});
+
+test('classifyRepoEnvelope: variables override headers (whole-envelope JSON supported)', () => {
+  const c = classifyRepoEnvelope(
+    { [AGENT_TASK_NS]: JSON.stringify({ repository: { url: '' } }) },
+    { [`${AGENT_TASK_NS}.repository.url`]: 'https://github.com/o/r.git' },
+  );
+  assert.equal(c.malformed, false);
+  assert.equal(c.url, 'https://github.com/o/r.git');
 });
 
 test('normalizeTaskEnvelope: provider is lowercased so downstream comparisons work', () => {
@@ -2073,6 +2154,67 @@ test('reapAgentRunDirs reaps run-* and res-* dirs, never unrelated operator file
     assert.equal(existsSync(resDir), false, 'leftover result dir is reaped');
     assert.equal(existsSync(foreignDir), true, 'unrelated dir is never reaped');
     assert.equal(existsSync(foreignFile), true, 'unrelated file is never reaped');
+  } finally {
+    if (prev === undefined) delete process.env.C8CTL_NANO_HOME; else process.env.C8CTL_NANO_HOME = prev;
+    rmSync(home, { recursive: true, force: true });
+  }
+});
+
+// issue #129 (hardening 1): a repo-less host job defaults its cwd to a fresh,
+// empty `run-*` dir under the runs root (never the worker's launch dir), tracked
+// live so the run-dir reaper skips it in-flight and reaps it once the job's
+// `finally` un-tracks it — the same lifecycle a provisioned clone uses. This
+// exercises those building blocks against the real `agentRunsRoot()` reaper.
+test('repo-less temp cwd: a fresh run-* dir under the runs root, distinct from cwd, reaped after the job', () => {
+  const home = mkdtempSync(join(tmpdir(), 'nano-home-'));
+  const prev = process.env.C8CTL_NANO_HOME;
+  process.env.C8CTL_NANO_HOME = home;
+  try {
+    const liveRunDirs = new Set();
+
+    // What the handler's repo-less branch does: mkdtemp a run-* under the runs
+    // root and track it live as the agent cwd.
+    mkdirSync(agentRunsRoot(), { recursive: true });
+    const cwd = mkdtempSync(join(agentRunsRoot(), 'run-'));
+    liveRunDirs.add(cwd);
+
+    assert.equal(existsSync(cwd), true, 'the temp cwd exists');
+    assert.notEqual(cwd, process.cwd(), 'the temp cwd is NOT the worker launch dir');
+    assert.equal(cwd.startsWith(agentRunsRoot()), true, 'the temp cwd lives under the runs root');
+    assert.deepEqual(readdirSync(cwd), [], 'the temp cwd is empty (no provisioned repo)');
+
+    // While the job is in-flight (tracked live) an aged reaper sweep must skip it.
+    const old = Date.now() / 1000 - 7200; // 2h ago
+    utimesSync(cwd, old, old);
+    const during = reapAgentRunDirs({ maxAgeMs: 60 * 60_000, liveRunDirs });
+    assert.equal(during.reaped, 0, 'in-flight temp cwd is never reaped');
+    assert.equal(existsSync(cwd), true);
+
+    // The job's `finally` reaps the dir directly and un-tracks it (keepRuns=false).
+    rmSync(cwd, { recursive: true, force: true });
+    liveRunDirs.delete(cwd);
+    assert.equal(existsSync(cwd), false, 'temp cwd is reaped after the job');
+  } finally {
+    if (prev === undefined) delete process.env.C8CTL_NANO_HOME; else process.env.C8CTL_NANO_HOME = prev;
+    rmSync(home, { recursive: true, force: true });
+  }
+});
+
+// issue #129 (hardening 1): even after a crash that leaves the temp cwd behind
+// (never un-tracked), the age-gated reaper eventually reclaims it as a `run-*`
+// dir, so a repo-less default can't leak workspace dirs.
+test('repo-less temp cwd: a leftover run-* dir is reclaimed by the age-gated reaper', () => {
+  const home = mkdtempSync(join(tmpdir(), 'nano-home-'));
+  const prev = process.env.C8CTL_NANO_HOME;
+  process.env.C8CTL_NANO_HOME = home;
+  try {
+    mkdirSync(agentRunsRoot(), { recursive: true });
+    const leftover = mkdtempSync(join(agentRunsRoot(), 'run-'));
+    const old = Date.now() / 1000 - 7200; // 2h ago
+    utimesSync(leftover, old, old);
+    const r = reapAgentRunDirs({ maxAgeMs: 60 * 60_000 });
+    assert.equal(r.reaped, 1, 'the aged, un-tracked temp cwd is reclaimed');
+    assert.equal(existsSync(leftover), false);
   } finally {
     if (prev === undefined) delete process.env.C8CTL_NANO_HOME; else process.env.C8CTL_NANO_HOME = prev;
     rmSync(home, { recursive: true, force: true });

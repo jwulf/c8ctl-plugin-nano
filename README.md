@@ -728,6 +728,25 @@ deleted after each job (keep them with `--keep-runs`).
 c8ctl nano work coder            # sandbox=none: repository-bearing jobs are provisioned on the host
 ```
 
+**Repo-less jobs run in a throwaway temp cwd (host).** When `--sandbox none` and
+the envelope carries **no** `repository` block at all, there is nothing to clone,
+but the job still gets a fresh, **empty** `run-*` workspace under
+`<state>/agent-runs/` as its `cwd` (tracked and auto-reaped by the same run-dir
+lifecycle as a provisioned clone). This makes *"each job runs in a throwaway
+per-job workspace"* true **by default**, not only for repo-bearing tasks: the
+worker's launch dir is never polluted with scratch files or a stray `git init`,
+and an agent that must clone the repo itself gets a clean base. **This is hygiene,
+not a sandbox** — the harness runs as your user with full filesystem access, so an
+empty `cwd` does **not** *confine* it (an agent can still `cd` to a known absolute
+path); true confinement remains the container increment, and a provisioned
+`repository` envelope stays the preferred path (it also avoids a full-monorepo
+self-clone, defeating the `singleBranch`+`filter` shaping above). A job whose
+envelope carries a `repository` block that declares intent (any `repository.*`
+field set) but whose **`url` is absent or not a usable clone target** is treated
+as an orchestrator bug and **fails closed** (retryable) rather than silently
+degrading to the temp cwd — surfacing the half-specified envelope loudly instead
+of running an agent with no repo where one was expected.
+
 **Sandbox.** By default the command runs on the host (`--sandbox none`). Pass
 `--sandbox docker` (or `podman`) with an `--image` to run **each job in a
 throwaway container** instead:

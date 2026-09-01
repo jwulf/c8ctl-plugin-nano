@@ -585,9 +585,10 @@ the job with a decremented retry count. Profiles are stored in the plugin's
 >   lands on the following `--recovery-window`, so a quiescent-but-live subtree
 >   ages out roughly `--idle-timeout` **plus one recovery window** after the last
 >   output, not the instant the idle window first elapses. (A tree with no live
->   descendants is killed immediately when the idle window elapses.) A task can widen this per
->   task class via the envelope's `task.idleTimeoutMs` / `task.recoveryWindowMs`
->   (see the task envelope below) instead of a global flag change.
+>   descendants is killed immediately when the idle window elapses.) A task can
+>   widen this per-task class via the envelope's `task.idleTimeoutMs` /
+>   `task.recoveryWindowMs` (see the task envelope below) instead of a global
+>   flag change.
 > - **`--job-timeout`** is now an *optional* absolute hard cap on total harness
 >   runtime (default `0` = unlimited), for when you want a ceiling regardless of
 >   output. `--lock-grace` is **deprecated and ignored** — the lock is auto-managed.

@@ -4140,7 +4140,7 @@ function spawnCaptureOneShot({ command, args = [], shell = false, detached = fal
       isSettled: () => settled,
       onIdleKill: () => {
         try { if (onTimeout) onTimeout(child); } catch { /* best effort */ }
-        finish({ ok: false, exitCode: null, stdout: joinCapped(stdoutChunks), stderr: joinCapped(stderrChunks), error: `no output and no subtree progress for ${idleTimeoutMs}ms (idle)`, timedOut: true, idle: true, truncated: stdoutTruncated, stderrTruncated });
+        finish({ ok: false, exitCode: null, stdout: joinCapped(stdoutChunks), stderr: joinCapped(stderrChunks), error: `no output and no subtree progress for >= ${idleTimeoutMs}ms (idle)`, timedOut: true, idle: true, truncated: stdoutTruncated, stderrTruncated });
       },
     });
     const armIdle = () => idleMon.arm();
@@ -4297,7 +4297,7 @@ function spawnCapturePty({ command, args = [], cwd, env, stdinData, timeoutMs, i
       isSettled: () => settled,
       onIdleKill: () => {
         killTerm();
-        finish({ ok: false, exitCode: null, stdout: joinCapped(chunks), stderr: '', error: `no output and no subtree progress for ${idleTimeoutMs}ms (idle)`, timedOut: true, idle: true, truncated, stderrTruncated: false });
+        finish({ ok: false, exitCode: null, stdout: joinCapped(chunks), stderr: '', error: `no output and no subtree progress for >= ${idleTimeoutMs}ms (idle)`, timedOut: true, idle: true, truncated, stderrTruncated: false });
       },
     });
     armIdle();
@@ -4767,7 +4767,7 @@ function spawnCaptureAcp({ command, args = [], cwd, env, stdinData, timeoutMs, i
       isSettled: () => settled,
       onIdleKill: () => {
         try { killTree(child); } catch { /* best effort */ }
-        finish({ ok: false, exitCode: null, stdout: humanStdout(), stderr: joinCapped(stderrChunks), error: `no output and no subtree progress for ${idleTimeoutMs}ms (idle)`, timedOut: true, idle: true, truncated: humanTruncated, stderrTruncated });
+        finish({ ok: false, exitCode: null, stdout: humanStdout(), stderr: joinCapped(stderrChunks), error: `no output and no subtree progress for >= ${idleTimeoutMs}ms (idle)`, timedOut: true, idle: true, truncated: humanTruncated, stderrTruncated });
       },
     });
     armIdle();

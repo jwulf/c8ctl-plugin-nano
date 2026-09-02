@@ -41,23 +41,24 @@ const activateType = (
   type: string,
   cfg: ActivationConfig,
 ): Effect.Effect<ActivatedJob, SupervisorError> =>
-  engine
-    .activate({
-      type,
-      maxJobsToActivate: 1,
-      requestTimeoutMs: cfg.requestTimeoutMs,
-      lockMs: cfg.initialLockMs,
-    })
-    .pipe(
-      Effect.flatMap((jobs) =>
-        jobs.length > 0
-          ? Effect.succeed(jobs[0]!)
-          : (cfg.emptyPollBackoffMs > 0
-              ? Effect.sleep(Duration.millis(cfg.emptyPollBackoffMs))
-              : Effect.void
-            ).pipe(Effect.flatMap(() => activateType(engine, type, cfg))),
-      ),
-    );
+  // Explicit constant-space loop (not self-recursion): re-poll on an empty
+  // return until a job is leased, without building an ever-deeper Effect chain.
+  Effect.gen(function* () {
+    while (true) {
+      const jobs = yield* engine.activate({
+        type,
+        maxJobsToActivate: 1,
+        requestTimeoutMs: cfg.requestTimeoutMs,
+        lockMs: cfg.initialLockMs,
+      });
+      if (jobs.length > 0) {
+        return jobs[0]!;
+      }
+      if (cfg.emptyPollBackoffMs > 0) {
+        yield* Effect.sleep(Duration.millis(cfg.emptyPollBackoffMs));
+      }
+    }
+  });
 
 /**
  * Hold one long-poll per serviceable-with-capacity `type` and race them. Resolves

@@ -28,6 +28,13 @@ if (!version) {
   console.error("vendor-effect: could not read `effect` version from package.json (dev)dependencies");
   process.exit(1);
 }
+// `version` flows into shell commands via execSync below, so reject anything that
+// isn't a plain semver token (digits, dots, and `-`/`+` pre-release/build parts).
+// This fails fast on shell metacharacters, closing the command-injection vector.
+if (!/^\d+\.\d+\.\d+(?:[-+][0-9A-Za-z.-]+)*$/.test(version)) {
+  console.error(`vendor-effect: refusing to use unexpected effect version string ${JSON.stringify(version)} (must be a plain semver)`);
+  process.exit(1);
+}
 const ref = `effect@${version}`;
 
 const run = (cmd) => {

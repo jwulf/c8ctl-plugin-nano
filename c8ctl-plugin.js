@@ -2598,21 +2598,40 @@ const NUDGE_CONTEXT_CAP_CHARS = 24_000;
 
 // The bespoke prompt for the re-emit turn: derive the status from the work the
 // agent already did, write ONLY the result, change nothing else.
-function buildResultNudgePrompt(priorStdout) {
+function buildResultNudgePrompt(priorStdout, { hasResultFile = true } = {}) {
   const ctx = typeof priorStdout === 'string' ? priorStdout.slice(-NUDGE_CONTEXT_CAP_CHARS) : '';
-  return [
+  const intro = [
     'You already completed the task in your previous turn, but you did NOT emit a',
     'machine-readable result, so the orchestrator cannot read your status and the',
     'run cannot advance.',
     '',
     'Do NOT redo the work, re-run tools, edit files, push, or open/modify a PR. Just',
-    'emit the result for the work you already did: write a single flat JSON object of',
-    'your result variables (at minimum {"status":"..."}) to the file named by the',
-    'AGENT_RESULT_FILE environment variable, e.g.:',
+    'emit the result for the work you already did: a single flat JSON object of your',
+    'result variables (at minimum {"status":"..."}).',
     '',
-    '    printf \'%s\' \'{"status":"...","summary":"..."}\' > "$AGENT_RESULT_FILE"',
-    '',
-    'If you truly cannot write that file, print exactly one line: ::nano:result:: {json}',
+  ];
+  // When the harness could not create the result file, AGENT_RESULT_FILE is NOT
+  // exported (runAgentJob only sets it for a truthy resultFile), so the usual
+  // "write to $AGENT_RESULT_FILE" instruction is impossible. Lead with the stdout
+  // sentinel in that case so weaker agents don't waste the turn chasing an unset
+  // env var; otherwise keep the file the primary path with the sentinel fallback.
+  const how = hasResultFile
+    ? [
+        'Write it to the file named by the AGENT_RESULT_FILE environment variable, e.g.:',
+        '',
+        '    printf \'%s\' \'{"status":"...","summary":"..."}\' > "$AGENT_RESULT_FILE"',
+        '',
+        'If you truly cannot write that file, print exactly one line: ::nano:result:: {json}',
+      ]
+    : [
+        'The AGENT_RESULT_FILE environment variable is unset/empty in this run, so you',
+        'CANNOT write a result file. Instead, print exactly one line to stdout:',
+        '',
+        '    ::nano:result:: {"status":"...","summary":"..."}',
+      ];
+  return [
+    ...intro,
+    ...how,
     '',
     'Your previous output (reference — derive the status/summary from it):',
     '-----',
@@ -2659,7 +2678,7 @@ async function resolveAgentResultWithNudge({ result, resultFile, rerun, logger, 
   }
   let nudge = null;
   let nudgeError = null;
-  try { nudge = await rerun(buildResultNudgePrompt(stdout0)); } catch (err) { nudge = null; nudgeError = err; }
+  try { nudge = await rerun(buildResultNudgePrompt(stdout0, { hasResultFile: resultFile != null })); } catch (err) { nudge = null; nudgeError = err; }
   const nudgeOut = nudge && typeof nudge.stdout === 'string' ? nudge.stdout : '';
   // Re-apply the per-stream capture cap after concatenation: `result.stdout` is
   // forwarded verbatim into the job vars (`output`) and the audit envelope, so

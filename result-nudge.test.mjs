@@ -36,6 +36,16 @@ test('buildResultNudgePrompt caps the echoed transcript', () => {
   assert.ok(p.length < 40_000, `nudge prompt should be capped, got ${p.length}`);
 });
 
+test('buildResultNudgePrompt leads with the stdout sentinel when no result file is available', () => {
+  const withFile = buildResultNudgePrompt('prior', { hasResultFile: true });
+  assert.match(withFile, /> "\$AGENT_RESULT_FILE"/, 'file path is the primary instruction when a file exists');
+
+  const noFile = buildResultNudgePrompt('prior', { hasResultFile: false });
+  assert.match(noFile, /::nano:result::/, 'still offers the stdout sentinel');
+  assert.match(noFile, /unset\/empty/, 'explains AGENT_RESULT_FILE is unavailable');
+  assert.doesNotMatch(noFile, /> "\$AGENT_RESULT_FILE"/, 'does not tell the agent to write an unusable file');
+});
+
 test('nudges once and recovers a dropped result (agent writes the file on the re-emit turn)', async () => {
   const { dir, file } = tmpResultFile();
   try {

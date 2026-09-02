@@ -6259,6 +6259,20 @@ async function rediscoverAgenticUntilConnected({
 // client lib alone. Overridable via NANO_AGENTIC_STALE_MS / NANO_AGENTIC_WATCHDOG_MS.
 const DEFAULT_AGENTIC_STALE_MS = 60_000;
 const DEFAULT_AGENTIC_WATCHDOG_INTERVAL_MS = 15_000;
+// #147 presence-keyed staleness. #144's stale trigger keys on a SUSTAINED socket
+// drop (`disconnectedSince` ages past the threshold). On a lossy WiFi/NAT link
+// that drops `1006` repeatedly, the client lib reconnects and re-announces, but
+// each brief reconnect clears the drop clock — so the sustained-drop trigger
+// never fires even though presence never actually re-lands on the hub (the
+// worker stays absent from the Workers view). The presence-keyed trigger closes
+// that gap: a connection only counts as "presence confirmed" once it HOLDS for
+// the grace window, so a reconnect that immediately re-drops cannot mask an
+// unrecovered presence. When presence has not been confirmed within the stale
+// threshold — regardless of transient reconnect flapping — the watchdog forces a
+// full re-discovery + reopen. Overridable via NANO_AGENTIC_PRESENCE_STALE_MS /
+// NANO_AGENTIC_PRESENCE_GRACE_MS.
+const DEFAULT_AGENTIC_PRESENCE_STALE_MS = DEFAULT_AGENTIC_STALE_MS;
+const DEFAULT_AGENTIC_PRESENCE_GRACE_MS = 5_000;
 
 /**
  * Decide whether a worker's agentic channel is *stale* — i.e. it once connected,
@@ -6294,6 +6308,78 @@ function agenticChannelIsStale({
 }
 
 /**
+ * Decide whether a worker's agentic channel is *presence-stale* (#147) — i.e. it
+ * once connected but its presence has NOT been re-confirmed on the hub within
+ * `staleAfterMs`, even though the socket may be intermittently reconnecting. This
+ * is the churn counterpart to {@link agenticChannelIsStale}: on a lossy link the
+ * client lib reconnects and re-announces after every `1006`, which keeps clearing
+ * the sustained-drop clock, so the socket-keyed trigger never fires — yet
+ * presence never actually lands. `presenceHealthySince` is the epoch-ms of the
+ * last time the channel was observed *stably* connected long enough for presence
+ * to be considered landed. The first open seeds it immediately (that open drains
+ * the buffered REGISTER, so presence lands with it); thereafter it advances only
+ * once a connection has *held* past a grace window (via `onPresenceHealthy`), so a
+ * reconnect that immediately re-drops does not count. Pure so the trigger is
+ * unit-testable
+ * without timers or sockets. A channel that never opened is not presence-stale
+ * (the initial connect owns it); a null `presenceHealthySince` (never confirmed,
+ * or reset by a heal) also reads as not-stale so a fresh open is given its grace.
+ *
+ * @param {{
+ *   everConnected: () => boolean,
+ *   presenceHealthySince?: () => (number|null),
+ *   now?: () => number,
+ *   staleAfterMs?: number,
+ * }} opts
+ * @returns {boolean}
+ */
+function agenticPresenceIsStale({
+  everConnected,
+  presenceHealthySince,
+  now = () => Date.now(),
+  staleAfterMs = DEFAULT_AGENTIC_PRESENCE_STALE_MS,
+}) {
+  if (typeof everConnected !== 'function') return false;
+  if (!everConnected()) return false; // never opened → the initial connect owns it
+  const since = typeof presenceHealthySince === 'function' ? presenceHealthySince() : null;
+  if (since == null) return false; // never confirmed / freshly reset → give the open its grace
+  return now() - since >= staleAfterMs;
+}
+
+/**
+ * Equal-jitter backoff (#147). Given a base backoff `baseMs`, keep half of it and
+ * randomise the other half: `baseMs/2 + rand()*baseMs/2`. A fleet of workers that
+ * all dropped on the same lossy link would otherwise reconnect in lockstep (the
+ * client lib's exponential backoff is deterministic), re-congesting the link and
+ * re-triggering the `1006` drops that stranded them. Spreading the reconnect
+ * attempts bounds that thundering-herd churn while preserving the exponential
+ * growth of the underlying policy. Pure (`rand` injectable) so it is testable.
+ *
+ * @param {number} baseMs the deterministic backoff the client lib computed
+ * @param {{ rand?: () => number }} [opts]
+ * @returns {number} the jittered delay in ms (0 when baseMs is non-positive)
+ */
+function jitteredDelay(baseMs, { rand = Math.random } = {}) {
+  const b = Number.isFinite(baseMs) && baseMs > 0 ? baseMs : 0;
+  if (b === 0) return 0;
+  const half = b / 2;
+  return Math.round(half + rand() * half);
+}
+
+/**
+ * Build a reconnect `schedule` function that applies {@link jitteredDelay} to the
+ * backoff the client lib passes, so the worker's reconnect attempts on a lossy
+ * link are de-synchronised (#147). Drops straight into `createWorkChannel`'s
+ * injectable `schedule` seam; the timer is injectable for tests.
+ *
+ * @param {{ rand?: () => number, timer?: (fn: () => void, ms: number) => any }} [opts]
+ * @returns {(fn: () => void, ms: number) => void}
+ */
+function makeJitteredReconnectSchedule({ rand = Math.random, timer = setTimeout } = {}) {
+  return (fn, ms) => { timer(fn, jitteredDelay(ms, { rand })); };
+}
+
+/**
  * Start the worker-side agentic-channel liveness watchdog (#144). On a fixed
  * interval it asks {@link agenticChannelIsStale} whether the channel dropped and
  * never recovered within the threshold; when it has, it fires `onStale()` (which
@@ -6310,9 +6396,23 @@ function agenticChannelIsStale({
  * prevent a stale-channel resurrection mid-teardown), and `tick()` runs a single
  * check (tests drive it directly).
  *
+ * #147 adds a second, presence-keyed trigger alongside the #144 sustained-drop
+ * one: each tick, a channel observed *stably* connected (connected for at least
+ * `presenceGraceMs` since `connectedSince()`) advances the presence-health clock
+ * via `onPresenceHealthy()`; when presence has not been confirmed within
+ * `presenceStaleAfterMs` — even while the socket flaps `1006` reconnects — the
+ * watchdog heals just as it does for a sustained drop. The presence accessors are
+ * optional: omitting them leaves the #147 trigger inert, so the #144 behaviour is
+ * unchanged.
+ *
  * @param {{
  *   getChannel: () => (import('./work-channel.mjs').WorkChannel | null),
  *   disconnectedSince: () => (number|null),
+ *   connectedSince?: () => (number|null),
+ *   presenceHealthySince?: () => (number|null),
+ *   onPresenceHealthy?: () => void,
+ *   presenceGraceMs?: number,
+ *   presenceStaleAfterMs?: number,
  *   onStale: () => (void|Promise<void>),
  *   staleAfterMs?: number,
  *   intervalMs?: number,
@@ -6327,6 +6427,11 @@ function startAgenticChannelWatchdog({
   getChannel,
   disconnectedSince,
   onStale,
+  connectedSince = null,
+  presenceHealthySince = null,
+  onPresenceHealthy = null,
+  presenceGraceMs = DEFAULT_AGENTIC_PRESENCE_GRACE_MS,
+  presenceStaleAfterMs = DEFAULT_AGENTIC_PRESENCE_STALE_MS,
   staleAfterMs = DEFAULT_AGENTIC_STALE_MS,
   intervalMs = DEFAULT_AGENTIC_WATCHDOG_INTERVAL_MS,
   now = () => Date.now(),
@@ -6347,17 +6452,39 @@ function startAgenticChannelWatchdog({
   const tick = async () => {
     if (stopped || healing) return; // shutting down, or a heal is in flight — don't stack a second re-discovery
     const ch = typeof getChannel === 'function' ? getChannel() : null;
+    // #147: advance the presence-health clock when the channel is observed
+    // STABLY connected (held for the grace window). A churny link that reconnects
+    // but immediately re-drops never accrues the grace, so its health clock ages
+    // out and the presence-keyed trigger below fires — unlike the sustained-drop
+    // trigger, which the churn keeps resetting. Inert unless the accessors are wired.
+    if (ch && typeof onPresenceHealthy === 'function' && typeof connectedSince === 'function') {
+      try {
+        const cs = connectedSince();
+        if (ch.connected() && cs != null && now() - cs >= presenceGraceMs) onPresenceHealthy();
+      } catch { /* best effort — never let a health probe break the tick */ }
+    }
+    // The channel is stale when EITHER trigger fires: #144's sustained socket
+    // drop, or #147's presence-not-confirmed-despite-reconnect-churn.
+    const stale = !!ch && (
+      agenticChannelIsStale({
+        connected: () => ch.connected(),
+        everConnected: () => ch.everConnected(),
+        disconnectedSince,
+        now,
+        staleAfterMs,
+      })
+      || agenticPresenceIsStale({
+        everConnected: () => ch.everConnected(),
+        presenceHealthySince,
+        now,
+        staleAfterMs: presenceStaleAfterMs,
+      })
+    );
     // No channel object → the initial open or the cold-start self-heal loop owns
     // recovery; the watchdog only guards a channel that HAS connected and stalled.
     // A missing or non-stale (healthy / recovered / still-connecting) channel also
     // ends any current stale episode, so re-arm the latch for the next one.
-    if (!ch || !agenticChannelIsStale({
-      connected: () => ch.connected(),
-      everConnected: () => ch.everConnected(),
-      disconnectedSince,
-      now,
-      staleAfterMs,
-    })) {
+    if (!stale) {
       firedForEpisode = false;
       return;
     }
@@ -6366,9 +6493,16 @@ function startAgenticChannelWatchdog({
     firedForEpisode = true;
     try {
       if (stopped) return; // shutdown raced us between the checks — do not heal
-      const since = disconnectedSince();
-      const downFor = since != null ? Math.round((now() - since) / 1000) : '?';
-      logger?.warn?.(`  agentic channel: no reconnect ${downFor}s after drop — forcing re-discovery (the client lib did not self-heal; likely a half-open drop).`);
+      const since = typeof disconnectedSince === 'function' ? disconnectedSince() : null;
+      // During reconnect churn `disconnectedSince` can be null (no sustained drop)
+      // or reset by the latest blip, so it under-reports the real staleness. Fall
+      // back to the presence-health clock — the signal we actually acted on — so
+      // the logged age reflects how long presence has genuinely been unconfirmed.
+      const staleSince = since != null
+        ? since
+        : (typeof presenceHealthySince === 'function' ? presenceHealthySince() : null);
+      const downFor = staleSince != null ? Math.round((now() - staleSince) / 1000) : '?';
+      logger?.warn?.(`  agentic channel: presence not confirmed within threshold (down ${downFor}s / reconnect churn) — forcing re-discovery (the client lib did not self-heal; likely a lossy-link 1006 churn or half-open drop).`);
       await onStale?.();
     } catch (err) {
       firedForEpisode = false; // heal failed → re-arm so a later tick retries this episode
@@ -6888,6 +7022,16 @@ async function workAgent(req, flags) {
   // shutdown); `agenticSelfHealing` guards against two concurrent re-discovery
   // loops (the cold-start one and a watchdog-triggered one).
   let agenticDisconnectedSince = null;
+  // #147 presence-keyed watchdog state. `agenticConnectedSince` is the epoch-ms
+  // the channel last (re)connected (null while down); the watchdog uses it to
+  // require a stable connection to have held for a grace window before counting
+  // presence as confirmed. `agenticPresenceHealthyAt` is the epoch-ms presence
+  // was last confirmed healthy — advanced on the first connect (buffered REGISTER
+  // drains) and by the watchdog whenever a stable connection is observed, and
+  // reset by a heal. When it ages past the presence-stale threshold — even while
+  // the socket flaps `1006` reconnects — the watchdog forces a re-discovery.
+  let agenticConnectedSince = null;
+  let agenticPresenceHealthyAt = null;
   /** @type {{ stop: () => void } | null} */
   let agenticWatchdog = null;
   let agenticSelfHealing = false;
@@ -6985,6 +7129,11 @@ async function workAgent(req, flags) {
         token: cfg.token,
         credential: cfg.credential,
         bufferCapacity: cfg.bufferCapacity,
+        // #147: de-synchronise reconnect attempts with equal-jitter backoff so a
+        // fleet dropped on the same lossy link does not reconnect in lockstep and
+        // re-congest it. Wraps the client lib's own exponential policy (which has
+        // no jitter of its own); the base delays/factor stay the lib's defaults.
+        schedule: makeJitteredReconnectSchedule(),
         logger,
       });
       const shown = redactAgenticUrl(buildAgenticUrl(cfg.url, {}));
@@ -7004,16 +7153,38 @@ async function workAgent(req, flags) {
       // a disconnect starts it (first drop wins, so the watchdog measures from the
       // ORIGINAL drop, not the latest of a reconnect storm). The watchdog reads
       // this to decide when the client lib has failed to self-heal.
-      workChannel.onConnect(() => { markAgentic('connected'); agenticDisconnectedSince = null; });
-      workChannel.onReconnect(() => { markAgentic('connected'); agenticDisconnectedSince = null; });
+      workChannel.onConnect(() => {
+        markAgentic('connected');
+        agenticDisconnectedSince = null;
+        agenticConnectedSince = Date.now();
+        // First open drains the buffered REGISTER → presence lands; seed the
+        // presence-health clock so the #147 trigger measures from here (#147).
+        agenticPresenceHealthyAt = Date.now();
+      });
+      workChannel.onReconnect(() => {
+        markAgentic('connected');
+        agenticDisconnectedSince = null;
+        agenticConnectedSince = Date.now();
+        // Deliberately do NOT advance agenticPresenceHealthyAt here: a reconnect
+        // only CLAIMS presence (re-announces). On a lossy link the socket may
+        // re-drop `1006` before presence actually lands, so the watchdog confirms
+        // it only once a connection HOLDS for the grace window — a reconnect that
+        // immediately re-drops must not mask an unrecovered presence (#147).
+      });
       workChannel.onDisconnect((info) => {
         markAgentic('disconnected', normalizeAgenticMessage(info));
         if (agenticDisconnectedSince == null) agenticDisconnectedSince = Date.now();
+        agenticConnectedSince = null;
       });
-      if (workChannel.connected()) { markAgentic('connected'); agenticDisconnectedSince = null; }
-      else if (workChannel.everConnected()) {
+      if (workChannel.connected()) {
+        markAgentic('connected');
+        agenticDisconnectedSince = null;
+        agenticConnectedSince = Date.now();
+        if (agenticPresenceHealthyAt == null) agenticPresenceHealthyAt = Date.now();
+      } else if (workChannel.everConnected()) {
         markAgentic('disconnected');
         if (agenticDisconnectedSince == null) agenticDisconnectedSince = Date.now();
+        agenticConnectedSince = null;
       }
     } catch (err) {
       // Never let a channel failure stop the worker from doing its actual job.
@@ -7093,6 +7264,8 @@ async function workAgent(req, flags) {
     if (!stale) return;
     workChannel = null; // re-arms armAgenticSelfHeal()'s shouldContinue gate
     agenticDisconnectedSince = null; // reset the clock; the fresh open restarts it
+    agenticConnectedSince = null; // #147: the fresh open re-seeds it
+    agenticPresenceHealthyAt = null; // #147: the fresh open re-confirms presence
     try { bufferMonitor?.stop(); } catch { /* best effort */ }
     bufferMonitor = null;
     markAgentic('disconnected', 'stale channel — re-discovering hub');
@@ -7106,9 +7279,18 @@ async function workAgent(req, flags) {
     if (agenticWatchdog) return;
     const staleAfterMs = Math.max(5_000, intFlag(process.env.NANO_AGENTIC_STALE_MS, DEFAULT_AGENTIC_STALE_MS));
     const intervalMs = Math.max(1_000, intFlag(process.env.NANO_AGENTIC_WATCHDOG_MS, DEFAULT_AGENTIC_WATCHDOG_INTERVAL_MS));
+    const presenceStaleAfterMs = Math.max(5_000, intFlag(process.env.NANO_AGENTIC_PRESENCE_STALE_MS, DEFAULT_AGENTIC_PRESENCE_STALE_MS));
+    const presenceGraceMs = Math.max(1_000, intFlag(process.env.NANO_AGENTIC_PRESENCE_GRACE_MS, DEFAULT_AGENTIC_PRESENCE_GRACE_MS));
     agenticWatchdog = startAgenticChannelWatchdog({
       getChannel: () => workChannel,
       disconnectedSince: () => agenticDisconnectedSince,
+      // #147: presence-keyed trigger — heal reconnect-churn that never re-lands
+      // presence, not just a sustained socket drop.
+      connectedSince: () => agenticConnectedSince,
+      presenceHealthySince: () => agenticPresenceHealthyAt,
+      onPresenceHealthy: () => { agenticPresenceHealthyAt = Date.now(); },
+      presenceStaleAfterMs,
+      presenceGraceMs,
       onStale: healStaleAgenticChannel,
       staleAfterMs,
       intervalMs,
@@ -12154,6 +12336,9 @@ export {
   rediscoverAgenticUntilConnected,
   defaultAgenticRediscoveryDelays,
   agenticChannelIsStale,
+  agenticPresenceIsStale,
+  jitteredDelay,
+  makeJitteredReconnectSchedule,
   startAgenticChannelWatchdog,
 };
 export { compareSemver, githubRepoSlug, filterReleasesSince, renderReleaseBody };

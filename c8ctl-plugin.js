@@ -2691,6 +2691,13 @@ async function resolveAgentResultWithNudge({ result, resultFile, rerun, logger, 
   // and surface truncation so `result.truncated` stays honest.
   const capped = capStdoutTail(nudgeOut ? `${stdout0}\n${nudgeOut}` : stdout0);
   const stdout = capped.text;
+  // The returned `stdout` still starts with `stdout0`, so if the FIRST turn was
+  // already truncated the returned output is truncated regardless of whether the
+  // post-concatenation cap trimmed anything: an empty/short nudge leaves
+  // `capped.truncated` false even though `stdout0` was clipped. OR in the incoming
+  // flag so `truncated` stays consistent with the returned stdout (and with the
+  // no-nudge early return above).
+  const truncated = result?.truncated === true || capped.truncated;
   const recovered = hasUsableResult(readAgentResultFile(resultFile) ?? parseResultFromStdout(stdout));
   if (nudgeError && logger?.warn) {
     logger.warn(`${logPrefix} re-emit nudge rerun threw — ${nudgeError?.message ?? nudgeError}`);
@@ -2700,7 +2707,7 @@ async function resolveAgentResultWithNudge({ result, resultFile, rerun, logger, 
       ? `${logPrefix} no result on the first turn — recovered it via one re-emit nudge`
       : `${logPrefix} no result on the first turn — re-emit nudge did not recover one`);
   }
-  return { stdout, nudged: true, truncated: capped.truncated };
+  return { stdout, nudged: true, truncated };
 }
 
 function coerceBool(v, dflt = false) {
@@ -7041,6 +7048,12 @@ async function workAgent(req, flags) {
                 nudgePayload: nudgeText,
                 stream: false,
                 idleTimeoutMs: Math.min(effectiveIdleTimeoutMs || NUDGE_IDLE_TIMEOUT_MS, NUDGE_IDLE_TIMEOUT_MS),
+                // Cap the recovery/probe window to the same 120s idle bound: it is
+                // used by createIdleLivenessMonitor as the probe window when >0, so
+                // inheriting the (possibly minutes-long) `effectiveRecoveryWindowMs`
+                // from runOpts would let a silent nudge run outlive the intended
+                // 120s idle bound and delay convergence on a wedged second turn.
+                recoveryWindowMs: Math.min(effectiveRecoveryWindowMs || NUDGE_IDLE_TIMEOUT_MS, NUDGE_IDLE_TIMEOUT_MS),
                 timeoutMs: Math.min(effectiveHardCapMs || NUDGE_HARD_CAP_MS, NUDGE_HARD_CAP_MS) || NUDGE_HARD_CAP_MS,
               }),
             });

@@ -4825,9 +4825,9 @@ function spawnCaptureAcp({ command, args = [], cwd, env, stdinData, timeoutMs, i
         // floor — capped so a chatty agent can't blow up a single transcript card.
         const FLOOR_DIAG_CAP = 2_000;
         const tail = diag.length > FLOOR_DIAG_CAP ? `…${diag.slice(diag.length - FLOOR_DIAG_CAP)}` : diag;
-        return `Agent produced no ACP transcript messages. Diagnostics:\n${tail}`;
+        return `Agent published no structured/canonical transcript content. Diagnostics:\n${tail}`;
       }
-      return 'Agent completed the turn but emitted no ACP session/update messages, so no transcript content was produced.';
+      return 'Agent completed the turn but published no structured/canonical transcript content, so no transcript messages were produced.';
     };
 
     // #137: synthesise ONE structured transcript-chunk FLOOR when a completed turn
@@ -4846,7 +4846,14 @@ function spawnCaptureAcp({ command, args = [], cwd, env, stdinData, timeoutMs, i
       const text = buildFloorText();
       if (!text) return;
       const chunk = encodeTranscriptChunk({ sessionUpdate: 'agent_message_chunk', content: { type: 'text', text } });
-      if (!chunk) return;
+      if (!chunk) {
+        // Canonical bridge couldn't produce a chunk (bridge throw or unmapped
+        // classification) → emit the floor on the text lane rather than dropping
+        // it, exactly like `emitTranscript`, so the cockpit transcript is never
+        // left empty in the very failure mode this floor exists to mitigate.
+        emitHuman(text);
+        return;
+      }
       // Only skip the text lane when the chunk publish ACTUALLY succeeded. If the
       // seam throws (a downstream tap implementation bug, not just the built-in
       // best-effort guard), the floor never reached the relay lane — so fall back

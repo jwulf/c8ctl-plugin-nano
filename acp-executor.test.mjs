@@ -1057,7 +1057,7 @@ test('#137 floor: emits a fixed explanatory note when there is neither a summary
     assert.equal(rec.chunks.length, 1);
     const view = rec.derive();
     assert.equal(view.messages.length, 1);
-    assert.ok(/emitted no ACP session\/update/i.test(view.messages[0].text), `floor should carry the explanatory note, got: ${view.messages[0].text}`);
+    assert.ok(/no structured\/canonical transcript content/i.test(view.messages[0].text), `floor should carry the explanatory note, got: ${view.messages[0].text}`);
   } finally {
     rmSync(resDir, { recursive: true, force: true });
   }

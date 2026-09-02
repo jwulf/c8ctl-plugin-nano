@@ -6089,6 +6089,114 @@ async function rediscoverAgenticUntilConnected({
   return null;
 }
 
+// Worker-side liveness watchdog defaults (jwulf/c8ctl-plugin-nano#144). A
+// previously-connected agentic channel that has been `disconnected` for longer
+// than the stale threshold — because the client lib's own reconnect never
+// brought it back (e.g. a half-open drop after a server restart/crash/partition,
+// or a reconnect that keeps failing) — is force-healed: the wedged channel is
+// torn down and full discovery + reopen is re-armed, instead of trusting the
+// client lib alone. Overridable via NANO_AGENTIC_STALE_MS / NANO_AGENTIC_WATCHDOG_MS.
+const DEFAULT_AGENTIC_STALE_MS = 60_000;
+const DEFAULT_AGENTIC_WATCHDOG_INTERVAL_MS = 15_000;
+
+/**
+ * Decide whether a worker's agentic channel is *stale* — i.e. it once connected,
+ * is no longer connected, and has stayed down past `staleAfterMs`. Pure so the
+ * watchdog's trigger condition is unit-testable without timers or sockets. A
+ * channel that never opened (`everConnected() === false`) is NOT stale — it is
+ * still doing its first connect, which the initial open / cold-start self-heal
+ * owns. `disconnectedSince` is null whenever the channel is up (or never went
+ * down), which also reads as not-stale.
+ *
+ * @param {{
+ *   connected: () => boolean,
+ *   everConnected: () => boolean,
+ *   disconnectedSince: () => (number|null),
+ *   now?: () => number,
+ *   staleAfterMs?: number,
+ * }} opts
+ * @returns {boolean}
+ */
+function agenticChannelIsStale({
+  connected,
+  everConnected,
+  disconnectedSince,
+  now = () => Date.now(),
+  staleAfterMs = DEFAULT_AGENTIC_STALE_MS,
+}) {
+  if (typeof connected !== 'function' || typeof everConnected !== 'function') return false;
+  if (!everConnected()) return false; // never opened → the initial connect owns it
+  if (connected()) return false; // healthy
+  const since = typeof disconnectedSince === 'function' ? disconnectedSince() : null;
+  if (since == null) return false; // no recorded drop → nothing to heal
+  return now() - since >= staleAfterMs;
+}
+
+/**
+ * Start the worker-side agentic-channel liveness watchdog (#144). On a jittered
+ * interval it asks {@link agenticChannelIsStale} whether the channel dropped and
+ * never recovered within the threshold; when it has, it fires `onStale()` (which
+ * tears the wedged channel down and re-runs discovery + reopen). Re-entrancy is
+ * guarded so a slow heal never overlaps a later tick. Timers, clock, and the
+ * channel accessors are injectable so this is unit-testable without real waits.
+ * Returns a `{ stop, tick }` handle — `stop()` clears the timer (shutdown), and
+ * `tick()` runs a single check (tests drive it directly).
+ *
+ * @param {{
+ *   getChannel: () => (import('./work-channel.mjs').WorkChannel | null),
+ *   disconnectedSince: () => (number|null),
+ *   onStale: () => (void|Promise<void>),
+ *   staleAfterMs?: number,
+ *   intervalMs?: number,
+ *   now?: () => number,
+ *   setIntervalFn?: typeof setInterval,
+ *   clearIntervalFn?: typeof clearInterval,
+ *   logger?: object|null,
+ * }} opts
+ * @returns {{ stop: () => void, tick: () => Promise<void> }}
+ */
+function startAgenticChannelWatchdog({
+  getChannel,
+  disconnectedSince,
+  onStale,
+  staleAfterMs = DEFAULT_AGENTIC_STALE_MS,
+  intervalMs = DEFAULT_AGENTIC_WATCHDOG_INTERVAL_MS,
+  now = () => Date.now(),
+  setIntervalFn = setInterval,
+  clearIntervalFn = clearInterval,
+  logger = null,
+} = {}) {
+  let healing = false;
+  const tick = async () => {
+    if (healing) return; // a heal is in flight — don't stack a second re-discovery
+    const ch = typeof getChannel === 'function' ? getChannel() : null;
+    // No channel object → the initial open or the cold-start self-heal loop owns
+    // recovery; the watchdog only guards a channel that HAS connected and stalled.
+    if (!ch) return;
+    if (!agenticChannelIsStale({
+      connected: () => ch.connected(),
+      everConnected: () => ch.everConnected(),
+      disconnectedSince,
+      now,
+      staleAfterMs,
+    })) return;
+    healing = true;
+    try {
+      const since = disconnectedSince();
+      const downFor = since != null ? Math.round((now() - since) / 1000) : '?';
+      logger?.warn?.(`  agentic channel: no reconnect ${downFor}s after drop — forcing re-discovery (the client lib did not self-heal; likely a half-open drop).`);
+      await onStale?.();
+    } catch (err) {
+      logger?.debug?.(`agentic watchdog heal failed: ${err?.message || err}`);
+    } finally {
+      healing = false;
+    }
+  };
+  const timer = setIntervalFn(() => { tick().catch(() => {}); }, intervalMs);
+  if (timer && typeof timer.unref === 'function') timer.unref();
+  return { stop: () => { try { clearIntervalFn(timer); } catch { /* best effort */ } }, tick };
+}
+
 /**
  * Collapse an agentic disconnect/failure detail into the single short string the
  * marker's `agentic.message` field carries (#99 contract). Accepts the close
@@ -6587,6 +6695,17 @@ async function workAgent(req, flags) {
   let workChannel = null;
   /** @type {import('./work-buffer.mjs').BufferMonitor | null} */
   let bufferMonitor = null;
+  // #144 liveness watchdog state. `agenticDisconnectedSince` is the epoch-ms the
+  // channel last dropped (null whenever it is up or has never opened); the
+  // watchdog uses it to force a full re-discovery + reopen when the client lib's
+  // own reconnect fails to bring a previously-connected channel back within the
+  // stale threshold. `agenticWatchdog` is the running timer handle (stopped on
+  // shutdown); `agenticSelfHealing` guards against two concurrent re-discovery
+  // loops (the cold-start one and a watchdog-triggered one).
+  let agenticDisconnectedSince = null;
+  /** @type {{ stop: () => void } | null} */
+  let agenticWatchdog = null;
+  let agenticSelfHealing = false;
   // Maintain `activeJobs` unconditionally: it feeds both the supervisor activity
   // file (gated inside writeActivity) AND the agentic presence frame's live
   // jobKey set, so a standalone worker (no NANO_SUPERVISOR_ACTIVITY_FILE) still
@@ -6696,11 +6815,21 @@ async function workAgent(req, flags) {
       // (before these listeners existed), connected() is false but everConnected()
       // is true — record that as `disconnected` rather than leaving it stuck at
       // `connecting`.
-      workChannel.onConnect(() => markAgentic('connected'));
-      workChannel.onReconnect(() => markAgentic('connected'));
-      workChannel.onDisconnect((info) => markAgentic('disconnected', normalizeAgenticMessage(info)));
-      if (workChannel.connected()) markAgentic('connected');
-      else if (workChannel.everConnected()) markAgentic('disconnected');
+      // #144: track the drop clock alongside presence — a (re)connect clears it,
+      // a disconnect starts it (first drop wins, so the watchdog measures from the
+      // ORIGINAL drop, not the latest of a reconnect storm). The watchdog reads
+      // this to decide when the client lib has failed to self-heal.
+      workChannel.onConnect(() => { markAgentic('connected'); agenticDisconnectedSince = null; });
+      workChannel.onReconnect(() => { markAgentic('connected'); agenticDisconnectedSince = null; });
+      workChannel.onDisconnect((info) => {
+        markAgentic('disconnected', normalizeAgenticMessage(info));
+        if (agenticDisconnectedSince == null) agenticDisconnectedSince = Date.now();
+      });
+      if (workChannel.connected()) { markAgentic('connected'); agenticDisconnectedSince = null; }
+      else if (workChannel.everConnected()) {
+        markAgentic('disconnected');
+        if (agenticDisconnectedSince == null) agenticDisconnectedSince = Date.now();
+      }
     } catch (err) {
       // Never let a channel failure stop the worker from doing its actual job.
       workChannel = null;
@@ -6732,16 +6861,16 @@ async function workAgent(req, flags) {
     }
   };
 
-  if (agenticCfg) {
-    await openAgenticChannel(agenticCfg);
-  } else if (agenticTarget.status === 'advisory') {
-    // (A) Self-heal a cold-start discovery miss (#133): discovery is one-shot at
-    // enrolment, so a worker that merely lost the cold-start race (e.g. a slow
-    // link-local candidate blew the budget) would otherwise run `advisory` for
-    // its whole lifetime — the only recovery being a restart. Keep re-discovering
-    // in the background on a jittered backoff and, on a later success, upgrade
-    // advisory→connected WITHOUT a restart, flipping the AGENTIC status surface.
-    // A shared cache lets a brief blip reuse the last known-good hub (#133-C).
+  // (A) Background self-heal loop, shared by the cold-start advisory path (#133)
+  // AND the #144 liveness watchdog. Re-run discovery on a jittered backoff and,
+  // on the first `connect` target, (re)open the channel WITHOUT a restart. The
+  // `agenticSelfHealing` guard makes it idempotent: the watchdog can call it
+  // after tearing a stale channel down without racing a still-running cold-start
+  // loop. A shared cache lets a brief blip reuse the last known-good hub (#133-C).
+  const armAgenticSelfHeal = () => {
+    if (agenticSelfHealing) return; // a re-discovery loop is already running
+    if (workChannel !== null) return; // a channel already exists — nothing to heal
+    agenticSelfHealing = true;
     const hubCache = new Map();
     rediscoverAgenticUntilConnected({
       resolveTarget: () => resolveAgenticTarget({ camunda, logger, cache: hubCache }),
@@ -6749,7 +6878,7 @@ async function workAgent(req, flags) {
         agenticCfg = target.config;
         agenticState = agenticStateForTarget(target, safeAgenticDisplayUrl);
         writeActivity();
-        logger.info('  agentic channel: background re-discovery succeeded — upgrading advisory → connecting.');
+        logger.info('  agentic channel: background re-discovery succeeded — (re)opening channel.');
         await openAgenticChannel(agenticCfg);
         // openAgenticChannel swallows its own open failures (it nulls
         // workChannel and returns rather than throwing), so a failed open must
@@ -6762,7 +6891,57 @@ async function workAgent(req, flags) {
       // Stop as soon as a channel exists (loop won this or a prior attempt did).
       shouldContinue: () => workChannel === null,
       logger,
-    }).catch(() => { /* best-effort self-heal — never surfaces an error */ });
+    })
+      .catch(() => { /* best-effort self-heal — never surfaces an error */ })
+      .finally(() => { agenticSelfHealing = false; });
+  };
+
+  // (B) #144 liveness watchdog: force-heal a wedged channel. When a channel that
+  // HAS connected drops and the client lib's own reconnect never brings it back
+  // within the stale threshold (a half-open drop after a server restart/crash/
+  // partition, or a reconnect that keeps failing), the client sits `disconnected`
+  // forever and the worker vanishes from the Workers view until a supervisor
+  // restart. This tears the wedged channel down (so `shouldContinue` re-arms) and
+  // re-runs full discovery + reopen instead of trusting the client lib alone.
+  const healStaleAgenticChannel = async () => {
+    const stale = workChannel;
+    if (!stale) return;
+    workChannel = null; // re-arms armAgenticSelfHeal()'s shouldContinue gate
+    agenticDisconnectedSince = null; // reset the clock; the fresh open restarts it
+    try { bufferMonitor?.stop(); } catch { /* best effort */ }
+    bufferMonitor = null;
+    markAgentic('disconnected', 'stale channel — re-discovering hub');
+    // Deregister + close the wedged client so it stops its own doomed reconnect
+    // attempts and we don't leak two clients once the fresh one connects.
+    try { await stale.stop('stale channel — re-discovering'); } catch { /* best effort */ }
+    armAgenticSelfHeal();
+  };
+
+  const startAgenticWatchdog = () => {
+    if (agenticWatchdog) return;
+    const staleAfterMs = Math.max(5_000, intFlag(process.env.NANO_AGENTIC_STALE_MS, DEFAULT_AGENTIC_STALE_MS));
+    const intervalMs = Math.max(1_000, intFlag(process.env.NANO_AGENTIC_WATCHDOG_MS, DEFAULT_AGENTIC_WATCHDOG_INTERVAL_MS));
+    agenticWatchdog = startAgenticChannelWatchdog({
+      getChannel: () => workChannel,
+      disconnectedSince: () => agenticDisconnectedSince,
+      onStale: healStaleAgenticChannel,
+      staleAfterMs,
+      intervalMs,
+      logger,
+    });
+  };
+
+  if (agenticCfg) {
+    await openAgenticChannel(agenticCfg);
+    // Guard the connected channel: if it later drops and the client lib can't
+    // recover it, the watchdog forces a full re-discovery + reopen (#144).
+    startAgenticWatchdog();
+  } else if (agenticTarget.status === 'advisory') {
+    // A cold-start discovery miss leaves the worker `advisory`; the self-heal
+    // loop upgrades it to `connected` without a restart (#133), and once a
+    // channel exists the watchdog keeps it alive across later drops (#144).
+    armAgenticSelfHeal();
+    startAgenticWatchdog();
   }
 
   // C3 (#42): the role's live-terminal mode — a full PTY (streamed on the relay
@@ -7382,6 +7561,9 @@ async function workAgent(req, flags) {
       logger.info(`Received ${signal} — stopping ${list.length} worker(s)...`);
       if (reaperTimer) clearInterval(reaperTimer);
       if (runDirTimer) clearInterval(runDirTimer);
+      // Stop the #144 liveness watchdog so it can't kick off a re-discovery
+      // mid-teardown (which would resurrect the channel we're about to close).
+      if (agenticWatchdog) { try { agenticWatchdog.stop(); } catch { /* best effort */ } agenticWatchdog = null; }
       const results = await Promise.all(list.map(drainWorker));
       const stopFailures = results.filter((ok) => !ok).length;
       if (stopFailures > 0) {
@@ -11751,6 +11933,8 @@ export {
   isLinkLocalAddress,
   rediscoverAgenticUntilConnected,
   defaultAgenticRediscoveryDelays,
+  agenticChannelIsStale,
+  startAgenticChannelWatchdog,
 };
 export { compareSemver, githubRepoSlug, filterReleasesSince, renderReleaseBody };
 export {

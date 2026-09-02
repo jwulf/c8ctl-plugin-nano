@@ -352,7 +352,7 @@ one of:
 | `starting` | transient: the worker just spawned and hasn't resolved its channel target yet (pre-`connecting`) |
 | `connected` | presence is live on the hub — you should see this worker in the Cockpit |
 | `connecting` | resolved a hub, socket not open yet (or the hub is unreachable) |
-| `disconnected` | an established channel dropped (hub restart/outage) — it auto-reconnects; also set if the channel failed to start (bad URL/refused socket), in which case it stays disconnected until the worker restarts |
+| `disconnected` | an established channel dropped (hub restart/outage) — it auto-reconnects, and a worker-side **liveness watchdog** force-re-discovers the hub if it stays down (see below); also set if the channel failed to start (bad URL/refused socket), in which case the watchdog keeps retrying discovery in the background |
 | `advisory` | nothing discoverable at the engine — **not** in the Cockpit; set `NANO_AGENTIC_URL` |
 | `off` | visibility disabled (`NANO_AGENTIC=off`) |
 | `?` | a live worker not yet reporting, or an older build predating these fields |
@@ -360,6 +360,22 @@ one of:
 If workers show `advisory` (or stay `connecting`) while jobs still run, that's the
 "connected to the engine but empty Cockpit" case: point them at the app with
 `export NANO_AGENTIC_URL=http://<engine-host>:<appUi.port>` (e.g. `:3000`).
+
+**Liveness watchdog (auto-recovery from a wedged channel).** If the nano server
+restarts, crashes, or a network partition drops the connection *without* a clean
+close (a **half-open** socket), a worker's channel client can sit `disconnected`
+forever — the worker vanishes from the Nano Workers view / Cockpit and, before
+this, only a supervisor restart brought it back. Each worker now runs a
+belt-and-suspenders watchdog: once a channel that had connected stays down past a
+threshold (the client library's own reconnect never recovered it), the worker
+tears the wedged channel down and re-runs full hub discovery + reopen — no restart
+needed. The thresholds are tunable via env (sensible defaults; you rarely need
+these):
+
+```bash
+export NANO_AGENTIC_STALE_MS=60000     # force re-discovery if a drop hasn't recovered within 60s (default)
+export NANO_AGENTIC_WATCHDOG_MS=15000  # how often the watchdog checks channel liveness (default)
+```
 
 **Secure mode (opt-in).** For a deployment where you want the visibility channel
 authenticated (rather than open on the LAN), start the server **and** every worker

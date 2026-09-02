@@ -61,8 +61,11 @@ test("connect is retried on transient failure, then the connection is used", asy
             return Effect.succeed({ disconnect: Effect.void });
           }),
       };
+      // Zero base delay keeps the retry path deterministic and wall-clock free:
+      // Schedule.exponential(0) yields 0ms delays (jitter*0 == 0), so the retry
+      // fires instantly under the live Clock without any real sleeping.
       const used = yield* withAgenticConnection(endpoint, noopLogger, () => Effect.succeed("ok"), {
-        reconnectBaseMs: 1,
+        reconnectBaseMs: 0,
         reconnectMaxMs: 10,
       });
       assert.equal(used, "ok");

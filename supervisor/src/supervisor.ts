@@ -124,11 +124,11 @@ export const makeSupervisor = (deps: SupervisorDeps): Effect.Effect<Supervisor> 
         return parking.takeFor(typeSet).pipe(
           Effect.flatMap((parked) => {
             if (parked) {
-              return deps.registry.claim(parked.type).pipe(
+              return deps.registry.claim(parked.job.type).pipe(
                 Effect.flatMap((worker) =>
                   worker
-                    ? Effect.forkChild(dispatch(dispatchDeps, parked, worker)).pipe(Effect.asVoid)
-                    : parking.park(parked, cfg.activation.initialLockMs),
+                    ? Effect.forkChild(dispatch(dispatchDeps, parked.job, worker)).pipe(Effect.asVoid)
+                    : parking.repark(parked),
                 ),
               );
             }

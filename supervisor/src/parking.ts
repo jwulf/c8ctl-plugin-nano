@@ -46,8 +46,19 @@ export function takeValidFor(
 export interface ParkingLot {
   /** Park a job with a lock deadline `lockMs` from now. */
   park(job: ActivatedJob, lockMs: number): Effect.Effect<void>;
-  /** Promote the oldest live parked job servicing one of `types`, pruning expired. */
-  takeFor(types: ReadonlySet<string>): Effect.Effect<ActivatedJob | null>;
+  /**
+   * Re-park a job that was promoted but could not be claimed, **preserving its
+   * original lock deadline** rather than resetting it to `now + lockMs`. Resetting
+   * would inflate the deadline past the engine's real lock, so an already-lapsed
+   * job keeps getting re-promoted (each promote-extend fails) until the fake
+   * deadline finally prunes it. An entry already past its deadline is dropped.
+   */
+  repark(parked: ParkedJob): Effect.Effect<void>;
+  /**
+   * Promote the oldest live parked job servicing one of `types`, pruning expired.
+   * Returns the whole `ParkedJob` so its `lockDeadlineMs` survives a re-park round-trip.
+   */
+  takeFor(types: ReadonlySet<string>): Effect.Effect<ParkedJob | null>;
   /** Current parked count after pruning lapsed entries (telemetry/tests). */
   readonly size: Effect.Effect<number>;
 }
@@ -62,12 +73,20 @@ export const makeParkingLot = (): Effect.Effect<ParkingLot> =>
             Ref.update(ref, (lot) => [...prune(lot, now), { job, lockDeadlineMs: now + lockMs }]),
           ),
         ),
+      repark: (parked) =>
+        Clock.currentTimeMillis.pipe(
+          Effect.flatMap((now) =>
+            Ref.update(ref, (lot) =>
+              parked.lockDeadlineMs > now ? [...prune(lot, now), parked] : prune(lot, now),
+            ),
+          ),
+        ),
       takeFor: (types) =>
         Clock.currentTimeMillis.pipe(
           Effect.flatMap((now) =>
             Ref.modify(ref, (lot) => {
               const { picked, rest } = takeValidFor(lot, types, now);
-              return [picked ? picked.job : null, rest];
+              return [picked, rest];
             }),
           ),
         ),

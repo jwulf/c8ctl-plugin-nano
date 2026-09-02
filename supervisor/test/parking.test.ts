@@ -38,7 +38,7 @@ test("ParkingLot: promote-on-slot-free returns a parked job while its lock is li
 
       yield* TestClock.adjust(Duration.millis(5_000)); // t=5s, still live
       const promoted = yield* lot.takeFor(new Set(["a"]));
-      assert.equal(promoted?.jobKey, "J1", "promoted the parked job instead of re-fetching");
+      assert.equal(promoted?.job.jobKey, "J1", "promoted the parked job instead of re-fetching");
       assert.equal(yield* lot.size, 0);
 
       // Park again, then let the lock lapse — it must NOT be promotable (it lapsed).
@@ -51,6 +51,42 @@ test("ParkingLot: promote-on-slot-free returns a parked job while its lock is li
   );
 });
 
+test("ParkingLot: repark preserves the original lock deadline instead of resetting it", async () => {
+  await Effect.runPromise(
+    Effect.gen(function* () {
+      const lot = yield* makeParkingLot();
+      yield* lot.park(job("J1", "a"), 15_000); // deadline t=15s (parked at t=0)
+
+      yield* TestClock.adjust(Duration.millis(10_000)); // t=10s, still live
+      const promoted = yield* lot.takeFor(new Set(["a"]));
+      assert.equal(promoted?.job.jobKey, "J1");
+
+      // Re-park (slot raced away). The deadline must stay t=15s, NOT reset to t=25s.
+      yield* lot.repark(promoted!);
+      yield* TestClock.adjust(Duration.millis(6_000)); // t=16s — past the original deadline
+      const lapsed = yield* lot.takeFor(new Set(["a"]));
+      assert.equal(lapsed, null, "reparked job lapses on its original deadline, not a reset one");
+      assert.equal(yield* lot.size, 0);
+    }).pipe(Effect.provide(TestClock.layer())),
+  );
+});
+
+test("ParkingLot: repark drops a job whose lock has already lapsed", async () => {
+  await Effect.runPromise(
+    Effect.gen(function* () {
+      const lot = yield* makeParkingLot();
+      yield* lot.park(job("J1", "a"), 15_000);
+      yield* TestClock.adjust(Duration.millis(10_000));
+      const promoted = yield* lot.takeFor(new Set(["a"]));
+      assert.equal(promoted?.job.jobKey, "J1");
+
+      yield* TestClock.adjust(Duration.millis(10_000)); // t=20s — deadline (15s) lapsed
+      yield* lot.repark(promoted!);
+      assert.equal(yield* lot.size, 0, "an already-lapsed job is not re-added");
+    }).pipe(Effect.provide(TestClock.layer())),
+  );
+});
+
 test("ParkingLot: takeFor ignores parked jobs whose type is not currently serviceable", async () => {
   await Effect.runPromise(
     Effect.gen(function* () {
@@ -59,7 +95,7 @@ test("ParkingLot: takeFor ignores parked jobs whose type is not currently servic
       const none = yield* lot.takeFor(new Set(["b"]));
       assert.equal(none, null);
       const some = yield* lot.takeFor(new Set(["a", "b"]));
-      assert.equal(some?.jobKey, "J1");
+      assert.equal(some?.job.jobKey, "J1");
     }).pipe(Effect.provide(TestClock.layer())),
   );
 });

@@ -16,7 +16,7 @@
  *  (b) **never touch a parked/lapsed job again** — losers are dropped upstream in
  *      activation and never reach here, so a late complete/fail can't 409.
  */
-import { Duration, Effect, Fiber, Schedule } from "effect";
+import { Duration, Effect, Fiber } from "effect";
 import type { ActivatedJob, EngineClient, JobRunner, Logger, SupervisorError } from "./ports.ts";
 import type { Registry } from "./registry.ts";
 
@@ -78,22 +78,29 @@ export const dispatch = (
 
     // (b) Heartbeat + run, releasing the slot on every exit path.
     yield* Effect.gen(function* () {
-      const heartbeat = yield* Effect.forkChild(
-        engine
-          .extendLock(job.jobKey, config.recoveryWindowMs)
-          .pipe(
-            // Log (and continue) when a heartbeat extend fails, rather than
-            // silently swallowing it — an invisible extend outage makes
-            // "job reclaimed while agent still running" much harder to diagnose.
-            Effect.catch((err: SupervisorError) =>
-              Effect.sync(() =>
-                logger.warn(
-                  `[${job.type}] job ${job.jobKey}: heartbeat extend failed — ${err.message}`,
-                ),
+      // We already extended the winner to the full recovery window above, so the
+      // first heartbeat extend is redundant if it fires immediately. Wait one
+      // interval before the first beat, then repeat on the cadence — this drops
+      // one engine call on every job start.
+      const beat = engine
+        .extendLock(job.jobKey, config.recoveryWindowMs)
+        .pipe(
+          // Log (and continue) when a heartbeat extend fails, rather than
+          // silently swallowing it — an invisible extend outage makes
+          // "job reclaimed while agent still running" much harder to diagnose.
+          Effect.catch((err: SupervisorError) =>
+            Effect.sync(() =>
+              logger.warn(
+                `[${job.type}] job ${job.jobKey}: heartbeat extend failed — ${err.message}`,
               ),
             ),
-            Effect.repeat(Schedule.spaced(Duration.millis(config.extendIntervalMs))),
           ),
+        );
+      const heartbeat = yield* Effect.forkChild(
+        Effect.sleep(Duration.millis(config.extendIntervalMs)).pipe(
+          Effect.flatMap(() => beat),
+          Effect.forever,
+        ),
       );
       yield* runner.run(job).pipe(
         Effect.catch((err: SupervisorError) =>

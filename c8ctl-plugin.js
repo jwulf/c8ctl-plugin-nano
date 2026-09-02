@@ -6136,7 +6136,11 @@ function agenticChannelIsStale({
  * Start the worker-side agentic-channel liveness watchdog (#144). On a fixed
  * interval it asks {@link agenticChannelIsStale} whether the channel dropped and
  * never recovered within the threshold; when it has, it fires `onStale()` (which
- * tears the wedged channel down and re-runs discovery + reopen). Re-entrancy is
+ * tears the wedged channel down and re-runs discovery + reopen). It fires
+ * `onStale` **exactly once per stale episode** — a per-episode latch is re-armed
+ * only when the channel is next observed healthy (or gone), or when a heal
+ * throws (a failed recovery retries on the next tick), so a persistent stale
+ * condition with a successful heal does not retrigger the heal on every tick. Re-entrancy is
  * guarded so a slow heal never overlaps a later tick. Timers, clock, and the
  * channel accessors are injectable so this is unit-testable without real waits.
  * Returns a `{ stop, tick }` handle — `stop()` clears the timer (shutdown), and
@@ -6167,26 +6171,38 @@ function startAgenticChannelWatchdog({
   logger = null,
 } = {}) {
   let healing = false;
+  // Per-episode latch: fire `onStale` exactly once when a connected channel goes
+  // stale, and don't fire again until it recovers (a fresh episode). Without this
+  // the helper would re-heal on every tick whenever `onStale` does not itself
+  // clear the staleness signal, causing repeated teardown/re-discovery attempts.
+  let firedForEpisode = false;
   const tick = async () => {
     if (healing) return; // a heal is in flight — don't stack a second re-discovery
     const ch = typeof getChannel === 'function' ? getChannel() : null;
     // No channel object → the initial open or the cold-start self-heal loop owns
     // recovery; the watchdog only guards a channel that HAS connected and stalled.
-    if (!ch) return;
-    if (!agenticChannelIsStale({
+    // A missing or non-stale (healthy / recovered / still-connecting) channel also
+    // ends any current stale episode, so re-arm the latch for the next one.
+    if (!ch || !agenticChannelIsStale({
       connected: () => ch.connected(),
       everConnected: () => ch.everConnected(),
       disconnectedSince,
       now,
       staleAfterMs,
-    })) return;
+    })) {
+      firedForEpisode = false;
+      return;
+    }
+    if (firedForEpisode) return; // already fired once for this stale episode
     healing = true;
+    firedForEpisode = true;
     try {
       const since = disconnectedSince();
       const downFor = since != null ? Math.round((now() - since) / 1000) : '?';
       logger?.warn?.(`  agentic channel: no reconnect ${downFor}s after drop — forcing re-discovery (the client lib did not self-heal; likely a half-open drop).`);
       await onStale?.();
     } catch (err) {
+      firedForEpisode = false; // heal failed → re-arm so a later tick retries this episode
       logger?.debug?.(`agentic watchdog heal failed: ${err?.message || err}`);
     } finally {
       healing = false;

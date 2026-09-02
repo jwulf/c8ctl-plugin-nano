@@ -221,10 +221,44 @@ test('startAgenticChannelWatchdog: guards re-entrancy — a slow heal is not sta
   release();
   await first;
 
-  // After the heal completes, the guard is released so a later stale episode
-  // can heal again.
+  // Same stale episode (never recovered) → the per-episode latch holds: a fresh
+  // tick must NOT re-heal.
   await wd.tick();
-  assert.equal(calls, 2, 'a fresh tick after the heal finished may heal again');
+  assert.equal(calls, 1, 'a persistent stale episode heals exactly once');
+
+  // The channel recovers, ending the episode and re-arming the latch…
+  ch.state.open = true;
+  ch.state.since = null;
+  await wd.tick();
+  assert.equal(calls, 1, 'a healthy channel does not heal');
+
+  // …then a fresh stale episode heals again.
+  ch.state.open = false;
+  ch.state.since = h.now();
+  h.advance(20_000);
+  await wd.tick();
+  assert.equal(calls, 2, 'a new stale episode after recovery heals again');
+  wd.stop();
+});
+
+test('startAgenticChannelWatchdog: a persistent stale episode fires onStale exactly once across many ticks', async () => {
+  const h = timerHarness();
+  // Stale from the start and it stays stale — onStale does NOT clear the signal.
+  const ch = fakeChannel({ open: false, ever: true, since: 0 });
+  let calls = 0;
+  const wd = startAgenticChannelWatchdog({
+    getChannel: () => ch,
+    disconnectedSince: () => ch.state.since,
+    onStale: () => { calls += 1; }, // deliberately does not reset ch.state
+    staleAfterMs: 10_000,
+    now: h.now,
+    setIntervalFn: h.setIntervalFn,
+    clearIntervalFn: h.clearIntervalFn,
+  });
+
+  h.advance(20_000); // well past stale
+  for (let i = 0; i < 5; i += 1) { h.advance(5_000); await wd.tick(); }
+  assert.equal(calls, 1, 'the latch holds onStale to one call per stale episode');
   wd.stop();
 });
 

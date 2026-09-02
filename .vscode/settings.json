@@ -1,0 +1,13 @@
+{
+  "//": "Keep the vendored Effect reference source (repos/**) out of editor auto-import, search, and file watching. It is read-only reference (see AGENTS.md) — app code imports the normal `effect` dependency, never repos/effect.",
+  "search.exclude": {
+    "**/node_modules": true,
+    "repos/**": true,
+    "supervisor.dist.js": true
+  },
+  "files.watcherExclude": {
+    "repos/**": true
+  },
+  "typescript.preferences.autoImportFileExcludePatterns": ["repos/**"],
+  "typescript.tsdk": "node_modules/typescript/lib"
+}

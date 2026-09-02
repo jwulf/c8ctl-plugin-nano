@@ -3215,6 +3215,22 @@ async function resolveAutoJobTypes({ restConfig, scope = '', readerFactory, time
   }
 }
 
+// Lazily load the bundled, Effect-backed single-owner supervisor runtime
+// (`supervisor.dist.js`, authored in TypeScript under `supervisor/src/` and
+// esbuild-bundled with Effect tree-shaken in — see AGENTS.md "Supervisor
+// runtime"). The import is deferred so the ~100 KB Effect surface only loads
+// when the new activation runtime is actually used, and the raw-JS plugin stays
+// importable with zero Effect cost on every other code path. The returned module
+// exposes `makeSupervisor`, the port interfaces, and the tree-shaken Effect
+// namespaces (`Effect`, `Duration`, `Fiber`, …) a JS caller needs to run it.
+let _supervisorRuntime;
+async function loadSupervisorRuntime() {
+  if (!_supervisorRuntime) {
+    _supervisorRuntime = await import('./supervisor.dist.js');
+  }
+  return _supervisorRuntime;
+}
+
 // Build the content endpoint. Per issue #63 / nano-bpm #759 the non-binary
 // `/content` variant is deprecated for non-RPA types (Markdown → 406), so the
 // worker always fetches `/content/binary`.
@@ -12429,6 +12445,7 @@ export {
   serviceTaskHasAgentHeader,
   readDeployedAgentJobTypes,
   resolveAutoJobTypes,
+  loadSupervisorRuntime,
   enableEngineHappyEyeballs,
   workAgent,
   derivePollTimeoutMs,

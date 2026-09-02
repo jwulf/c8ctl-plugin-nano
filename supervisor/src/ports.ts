@@ -1,0 +1,96 @@
+/**
+ * Injected ports for the single-owner supervisor runtime.
+ *
+ * Everything the supervisor touches at the edge of the process — the engine's
+ * `/v2/jobs/activation` + `UpdateJobTimeout` calls, the deployed-definition
+ * reconcile reader, the agent job runner, the agentic connection, and logging —
+ * is expressed as a narrow, injectable interface. This is what lets the whole
+ * runtime be driven deterministically under Effect's `TestClock` with in-memory
+ * fakes, and lets the raw-JS `c8ctl-plugin.js` monolith supply real adapters
+ * (its existing keep-alive reader, `createClient()` SDK, `runAgentJob`, etc.)
+ * without the supervisor ever importing Node/undici/the SDK directly.
+ *
+ * Durations crossing the port are plain **milliseconds** (numbers), not
+ * `Duration`, so a JS adapter never has to construct an Effect `Duration`.
+ */
+import type { Effect } from "effect";
+
+/** A single tagged failure surface for every port. Keeps the error channel closed. */
+export class SupervisorError extends Error {
+  readonly _tag = "SupervisorError";
+  readonly cause?: unknown;
+  constructor(message: string, cause?: unknown) {
+    super(message);
+    this.name = "SupervisorError";
+    this.cause = cause;
+  }
+}
+
+/** A job as activated from the engine. `variables`/`payload` are opaque passthrough. */
+export interface ActivatedJob {
+  readonly jobKey: string;
+  readonly type: string;
+  readonly processDefinitionKey?: string;
+  readonly variables?: unknown;
+}
+
+/** One per-type activation request. `maxJobsToActivate` is always 1 for agent jobs. */
+export interface ActivateRequest {
+  readonly type: string;
+  readonly maxJobsToActivate: number;
+  /** Long-poll request timeout (ms) — how long a single `activation` call blocks. */
+  readonly requestTimeoutMs: number;
+  /** Short initial lock (ms) applied to any returned job — the crash-safety net. */
+  readonly lockMs: number;
+}
+
+/**
+ * Direct engine calls. Deliberately NOT the `@camunda8` SDK job worker: the SDK
+ * models one poller per type with `maxJobsToActivate = maxParallel − active` and
+ * structurally cannot express "global capacity S shared across K types with
+ * per-type gating". We roll our own loop over this surface instead.
+ */
+export interface EngineClient {
+  /**
+   * `POST /v2/jobs/activation` for exactly ONE type. Resolves with between 0 and
+   * `maxJobsToActivate` jobs (0 == the long-poll expired with nothing to hand out).
+   */
+  activate(req: ActivateRequest): Effect.Effect<ReadonlyArray<ActivatedJob>, SupervisorError>;
+  /**
+   * `UpdateJobTimeout` — SET the job's lock to `ms` from now (the contract is a
+   * duration-from-now, so calls set rather than accumulate). Used to extend the
+   * winner to the recovery window, then to heartbeat it. A failure here on the
+   * winner's first extend means the lock likely raced a reclaim — do not start.
+   */
+  extendLock(jobKey: string, ms: number): Effect.Effect<void, SupervisorError>;
+}
+
+/**
+ * The deployed-definition reconcile seam (the existing `httpC8RestReader`). A
+ * real adapter reuses a keep-alive undici pool and resolves the engine host once
+ * (IPv4-first) so the 1 + N crawl is paid at most once per new key, not per pass.
+ */
+export interface ReconcileReader {
+  searchProcessDefinitionKeys(): Effect.Effect<ReadonlyArray<string>, SupervisorError>;
+  getProcessDefinitionXml(key: string): Effect.Effect<string, SupervisorError>;
+}
+
+/** Scan a BPMN XML string for its agent job-type leaves (from `agentic.mjs`). */
+export type ScanAgentLeaves = (xml: string) => ReadonlyArray<{ taskType: string; process: string }>;
+
+/**
+ * Runs one activated job to completion (the existing `runAgentJob` harness). The
+ * supervisor owns the lock lifecycle around this; the runner just executes.
+ */
+export interface JobRunner {
+  run(job: ActivatedJob): Effect.Effect<void, SupervisorError>;
+}
+
+/** Minimal logger, satisfied by the plugin's `getLogger()` or `console`. */
+export interface Logger {
+  info(msg: string): void;
+  warn(msg: string): void;
+  debug?(msg: string): void;
+}
+
+export const noopLogger: Logger = { info: () => {}, warn: () => {}, debug: () => {} };

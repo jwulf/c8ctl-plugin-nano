@@ -27,12 +27,18 @@
     "work-channel.mjs",
     "work-relay.mjs",
     "work-buffer.mjs",
+    "supervisor.dist.js",
     "nanobpmn-binary.json",
     "README.md"
   ],
   "scripts": {
     "lint": "node --check c8ctl-plugin.js",
-    "test": "node --check c8ctl-plugin.js && node --test"
+    "typecheck:supervisor": "tsc -p supervisor/tsconfig.json",
+    "build:supervisor": "node supervisor/build.mjs",
+    "vendor:effect": "node scripts/vendor-effect.mjs",
+    "test:supervisor": "node --experimental-strip-types --test supervisor/test/*.test.ts",
+    "test": "node --check c8ctl-plugin.js && npm run typecheck:supervisor && npm run build:supervisor && npm run test:supervisor && node --test",
+    "prepublishOnly": "npm run build:supervisor"
   },
   "license": "MIT",
   "engines": {
@@ -49,7 +55,11 @@
     "@commitlint/config-conventional": "^20.4.1",
     "@semantic-release/exec": "^7.1.0",
     "@semantic-release/github": "^12.0.6",
-    "semantic-release": "^25.0.3"
+    "@types/node": "^22.20.1",
+    "effect": "4.0.0-rc.112",
+    "esbuild": "^0.24.2",
+    "semantic-release": "^25.0.3",
+    "typescript": "^5.9.3"
   },
   "dependencies": {
     "@nanobpm/agentic": "^0.10.0",

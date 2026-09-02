@@ -959,3 +959,191 @@ test('canonical transcript publishing leaves the captured result stdout (human t
     rmSync(resDir, { recursive: true, force: true });
   }
 });
+
+// ---------------------------------------------------------------------------
+// #137: the transcript FLOOR. Some ACP agents (e.g. copilot 1.0.82 on omarchy/
+// macbook) complete a turn without ever emitting a mappable `session/update`, so
+// the canonical bridge never fires and the cockpit drill-in would show an empty
+// session (only the lifecycle open marker from #136). When a resolved turn
+// published zero canonical chunks, the executor synthesises ONE structured floor
+// chunk — via the SAME `acpUpdateToTranscriptChunk` bridge — carrying the run's
+// outcome (result summary, else stderr diagnostics, else a fixed note), so the
+// drill-in shows something useful. The fake agent with NO FAKE_EMIT_UPDATE is
+// exactly this "no mappable session/update" shape.
+// ---------------------------------------------------------------------------
+
+test('#137 floor: a completed turn that emits no session/update still derives a structured message from the result summary', async () => {
+  const resDir = mkdtempSync(join(tmpdir(), 'acp-res-'));
+  const resultFile = join(resDir, 'result.json');
+  const rec = makeTypedTap();
+  try {
+    const result = await spawnCaptureAcp({
+      command: 'node',
+      args: [FAKE_AGENT],
+      cwd: workRoot,
+      // No FAKE_EMIT_UPDATE / FAKE_RICH_UPDATES → the agent resolves the turn
+      // WITHOUT emitting any session/update (the copilot 1.0.82 shape).
+      env: { ...baseEnv(), AGENT_RESULT_FILE: resultFile, FAKE_RESULT_JSON: '{"status":"opened","summary":"built the slice","pr":"o/r#7"}' },
+      stdinData: 'prompt',
+      timeoutMs: 20_000,
+      relayTap: rec.tap,
+      permission: 'yolo',
+    });
+    assert.equal(result.ok, true, result.error || result.stderr);
+    // Exactly ONE floor chunk reached the transcript-chunk seam (not zero — the
+    // whole point — and not a flood; one structured card summarising the run).
+    assert.equal(rec.chunks.length, 1, `expected a single floor chunk, got: ${JSON.stringify(rec.chunks)}`);
+    // It carries the canonical marker KEY and is NOT raw JSON-RPC.
+    const parsed = JSON.parse(rec.chunks[0]);
+    assert.equal(parsed.nwfTranscriptEvent, 1, `floor chunk must carry the canonical marker key: ${rec.chunks[0]}`);
+    assert.ok(!rec.chunks[0].includes('jsonrpc'));
+    // Folded through the cockpit's parser + deriveView it is a STRUCTURED
+    // assistant message (never a raw stream-chunk), carrying the run's outcome.
+    const view = rec.derive();
+    assert.equal(view.rawChunkCount, 0, 'the floor must NOT derive as a raw stream-chunk');
+    assert.equal(view.messages.length, 1);
+    assert.equal(view.messages[0].role, 'assistant');
+    assert.ok(view.messages[0].text.includes('built the slice'), `floor should surface the result summary, got: ${view.messages[0].text}`);
+    assert.ok(view.messages[0].text.includes('opened'), 'floor should surface the result status');
+    assert.ok(view.messages[0].text.includes('o/r#7'), 'floor should surface the result PR');
+  } finally {
+    rmSync(resDir, { recursive: true, force: true });
+  }
+});
+
+test('#137 floor: falls back to stderr diagnostics when the result carries no summary', async () => {
+  const resDir = mkdtempSync(join(tmpdir(), 'acp-res-'));
+  const resultFile = join(resDir, 'result.json');
+  const rec = makeTypedTap();
+  try {
+    const result = await spawnCaptureAcp({
+      command: 'node',
+      args: [FAKE_AGENT],
+      cwd: workRoot,
+      // Empty result object (no summary/status/pr) + a stderr diagnostic line.
+      env: { ...baseEnv(), AGENT_RESULT_FILE: resultFile, FAKE_RESULT_JSON: '{}', FAKE_STDERR: '1' },
+      stdinData: 'prompt',
+      timeoutMs: 20_000,
+      relayTap: rec.tap,
+      permission: 'yolo',
+    });
+    assert.equal(result.ok, true, result.error || result.stderr);
+    assert.equal(rec.chunks.length, 1, `expected a single floor chunk, got: ${JSON.stringify(rec.chunks)}`);
+    const view = rec.derive();
+    assert.equal(view.messages.length, 1);
+    assert.equal(view.messages[0].role, 'assistant');
+    assert.ok(view.messages[0].text.includes('acp-diag: hello from stderr'), `floor should surface stderr diagnostics, got: ${view.messages[0].text}`);
+  } finally {
+    rmSync(resDir, { recursive: true, force: true });
+  }
+});
+
+test('#137 floor: emits a fixed explanatory note when there is neither a summary nor stderr', async () => {
+  const resDir = mkdtempSync(join(tmpdir(), 'acp-res-'));
+  const resultFile = join(resDir, 'result.json');
+  const rec = makeTypedTap();
+  try {
+    const result = await spawnCaptureAcp({
+      command: 'node',
+      args: [FAKE_AGENT],
+      cwd: workRoot,
+      env: { ...baseEnv(), AGENT_RESULT_FILE: resultFile, FAKE_RESULT_JSON: '{}' },
+      stdinData: 'prompt',
+      timeoutMs: 20_000,
+      relayTap: rec.tap,
+      permission: 'yolo',
+    });
+    assert.equal(result.ok, true, result.error || result.stderr);
+    assert.equal(rec.chunks.length, 1);
+    const view = rec.derive();
+    assert.equal(view.messages.length, 1);
+    assert.ok(/no structured\/canonical transcript content/i.test(view.messages[0].text), `floor should carry the explanatory note, got: ${view.messages[0].text}`);
+  } finally {
+    rmSync(resDir, { recursive: true, force: true });
+  }
+});
+
+test('#137 floor: does NOT fire when the agent already emitted a mappable session/update', async () => {
+  const resDir = mkdtempSync(join(tmpdir(), 'acp-res-'));
+  const resultFile = join(resDir, 'result.json');
+  const rec = makeTypedTap();
+  try {
+    const result = await spawnCaptureAcp({
+      command: 'node',
+      args: [FAKE_AGENT],
+      cwd: workRoot,
+      // A single real update → the canonical bridge fires; the floor must stay quiet.
+      env: { ...baseEnv(), AGENT_RESULT_FILE: resultFile, FAKE_EMIT_UPDATE: '1' },
+      stdinData: 'prompt',
+      timeoutMs: 20_000,
+      relayTap: rec.tap,
+      permission: 'yolo',
+    });
+    assert.equal(result.ok, true, result.error || result.stderr);
+    // Exactly the ONE real update's chunk — no extra synthesised floor.
+    assert.equal(rec.chunks.length, 1, `expected only the real update chunk, got: ${JSON.stringify(rec.chunks)}`);
+    const view = rec.derive();
+    assert.equal(view.messages.length, 1);
+    assert.equal(view.messages[0].text, 'Hello ACP', 'the real update, not a synthesised floor');
+  } finally {
+    rmSync(resDir, { recursive: true, force: true });
+  }
+});
+
+test('#137 floor: inert (no crash, nothing structured) when the relay exposes no transcript-chunk seam', async () => {
+  const resDir = mkdtempSync(join(tmpdir(), 'acp-res-'));
+  const resultFile = join(resDir, 'result.json');
+  // A PLAIN tap (onData only) — no relayTranscriptChunk. The floor requires the
+  // transcript-chunk seam, so it must stay inert here (minimal-mode preserved).
+  const chunks = [];
+  try {
+    const result = await spawnCaptureAcp({
+      command: 'node',
+      args: [FAKE_AGENT],
+      cwd: workRoot,
+      env: { ...baseEnv(), AGENT_RESULT_FILE: resultFile },
+      stdinData: 'prompt',
+      timeoutMs: 20_000,
+      relayTap: { onData: (d) => chunks.push(typeof d === 'string' ? d : Buffer.from(d).toString('utf8')) },
+      permission: 'yolo',
+    });
+    assert.equal(result.ok, true, result.error || result.stderr);
+    // No transcript-chunk seam → the floor cannot publish; nothing on the lane.
+    assert.equal(chunks.join(''), '', 'a seamless relay stays empty (no floor, no crash)');
+  } finally {
+    rmSync(resDir, { recursive: true, force: true });
+  }
+});
+
+test('#137 floor: a throwing transcript-chunk seam falls back to the text lane (floor not dropped)', async () => {
+  const resDir = mkdtempSync(join(tmpdir(), 'acp-res-'));
+  const resultFile = join(resDir, 'result.json');
+  // The relay exposes the transcript-chunk seam but it always throws (a
+  // misbehaving downstream publisher). The turn emits no session/update, so the
+  // floor fires — and must fall back to the text lane instead of being silently
+  // lost, mirroring emitTranscript.
+  const textChunks = [];
+  const tap = {
+    relayTranscriptChunk: () => { throw new Error('boom'); },
+    onData: (d) => { textChunks.push(typeof d === 'string' ? d : Buffer.from(d).toString('utf8')); },
+  };
+  try {
+    const result = await spawnCaptureAcp({
+      command: 'node',
+      args: [FAKE_AGENT],
+      cwd: workRoot,
+      env: { ...baseEnv(), AGENT_RESULT_FILE: resultFile, FAKE_RESULT_JSON: '{"status":"opened","summary":"built the slice","pr":"o/r#7"}' },
+      stdinData: 'prompt',
+      timeoutMs: 20_000,
+      relayTap: tap,
+      permission: 'yolo',
+    });
+    assert.equal(result.ok, true, result.error || result.stderr);
+    // The floor's content reached the relay lane via the text fallback rather
+    // than being silently lost when the chunk seam threw.
+    const relayed = textChunks.join('');
+    assert.ok(relayed.includes('built the slice'), `expected floor text fallback for a throwing seam, got: ${JSON.stringify(textChunks)}`);
+  } finally {
+    rmSync(resDir, { recursive: true, force: true });
+  }
+});

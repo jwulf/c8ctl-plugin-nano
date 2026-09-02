@@ -4568,6 +4568,15 @@ function spawnCaptureAcp({ command, args = [], cwd, env, stdinData, timeoutMs, i
     // One-time warning latch for the reserved escalate/filter policies so the
     // deferral is observable (not silent) but never spams a warning per request.
     let interimWarned = false;
+    // #137: count of canonical transcript chunks actually PUBLISHED to the relay's
+    // transcript-chunk seam, plus a one-time latch for the fallback floor. Some ACP
+    // agents (e.g. copilot 1.0.82 on some hosts) complete a turn without ever
+    // emitting a mappable `session/update`, so `emitTranscript` never fires and the
+    // cockpit drill-in would show an empty session. When the turn completes having
+    // published zero chunks, we synthesise ONE structured floor chunk so the
+    // drill-in shows the outcome instead of nothing (see `maybeEmitTranscriptFloor`).
+    let transcriptChunksPublished = 0;
+    let floorEmitted = false;
 
     // Live "spy" tee (--stream), line-buffered, mirroring the other paths.
     // Separate line buffers per lane (stdout-human vs stderr) so a partial line
@@ -4638,6 +4647,13 @@ function spawnCaptureAcp({ command, args = [], cwd, env, stdinData, timeoutMs, i
       if (idleMon) idleMon.stop();
       if (settleTimer) { clearTimeout(settleTimer); settleTimer = null; }
       if (detachSteer) { try { detachSteer(); } catch { /* best effort */ } detachSteer = null; }
+      // #137: a turn that completed but produced no mappable session/update gets a
+      // synthesised structured floor so the cockpit drill-in isn't empty. Only for
+      // a resolved turn (`promptResolved`) — a handshake/spawn failure has nothing
+      // to floor and its error is surfaced in the result envelope. Best-effort and
+      // guarded, so it can never turn a settle into a throw. Runs before the tee is
+      // flushed so a --stream watcher sees the floored line too.
+      if (promptResolved) { try { maybeEmitTranscriptFloor(); } catch { /* floor best-effort */ } }
       if (teeSink) { tee('', true); teeErr('', true); }
       // Reap the child if it is still alive (turn resolved but agent lingering).
       try { if (child && childClosed === null) killTree(child); } catch { /* best effort */ }
@@ -4775,6 +4791,7 @@ function spawnCaptureAcp({ command, args = [], cwd, env, stdinData, timeoutMs, i
         let published = false;
         try { relayTap.relayTranscriptChunk(chunk); published = true; } catch { /* relay best-effort */ }
         if (published) {
+          transcriptChunksPublished++;
           // Mirror the human text locally (spy tee + captured stdout) so the
           // result envelope and --stream spy are unchanged — without re-emitting
           // raw text onto the relay lane, which now carries the canonical chunk.
@@ -4785,6 +4802,76 @@ function spawnCaptureAcp({ command, args = [], cwd, env, stdinData, timeoutMs, i
       }
       // Fallback: minimal text-chunk path (relay text + spy tee + capture).
       emitHuman(describeUpdate(update));
+    };
+
+    // #137: build the human-readable text for a fallback transcript FLOOR — used
+    // only when a turn completed having produced no mappable session/update, so
+    // the cockpit drill-in shows the run's OUTCOME instead of an empty session.
+    // Prefer the agent's own structured result (from $AGENT_RESULT_FILE: summary,
+    // status, pr), then its stderr diagnostics, then a fixed explanatory note.
+    const buildFloorText = () => {
+      const resultPath = env && typeof env === 'object' ? env[AGENT_RESULT_FILE_ENV] : null;
+      const res = readAgentResultFile(resultPath);
+      if (res && typeof res === 'object') {
+        const parts = [];
+        if (typeof res.summary === 'string' && res.summary.trim()) parts.push(res.summary.trim());
+        if (typeof res.status === 'string' && res.status.trim()) parts.push(`(status: ${res.status.trim()})`);
+        if (typeof res.pr === 'string' && res.pr.trim()) parts.push(`PR: ${res.pr.trim()}`);
+        else if (res.pr && typeof res.pr === 'object' && typeof res.pr.url === 'string' && res.pr.url.trim()) parts.push(`PR: ${res.pr.url.trim()}`);
+        if (parts.length) return parts.join(' ');
+      }
+      const diag = joinCapped(stderrChunks).trim();
+      if (diag) {
+        // Surface the tail of the agent's stderr (its own diagnostics) as the
+        // floor — capped so a chatty agent can't blow up a single transcript card.
+        const FLOOR_DIAG_CAP = 2_000;
+        const tail = diag.length > FLOOR_DIAG_CAP ? `…${diag.slice(diag.length - FLOOR_DIAG_CAP)}` : diag;
+        return `Agent published no structured/canonical transcript content. Diagnostics:\n${tail}`;
+      }
+      return 'Agent completed the turn but published no structured/canonical transcript content, so no transcript messages were produced.';
+    };
+
+    // #137: synthesise ONE structured transcript-chunk FLOOR when a completed turn
+    // published zero canonical chunks. The floor rides the SAME canonical bridge
+    // (an `agent_message_chunk` run through `acpUpdateToTranscriptChunk`) so the
+    // cockpit renders a real assistant-message card — never a hand-rolled envelope
+    // — and honours the acceptance's "structured/raw transcript floor" so the
+    // drill-in shows something useful rather than an empty session. Idempotent
+    // (one-time latch), inert unless the relay exposes the transcript-chunk seam,
+    // and skipped entirely when any real chunk already reached the lane.
+    const maybeEmitTranscriptFloor = () => {
+      if (floorEmitted) return;
+      if (transcriptChunksPublished > 0) return;
+      if (!relayTap || typeof relayTap.relayTranscriptChunk !== 'function') return;
+      floorEmitted = true;
+      const text = buildFloorText();
+      if (!text) return;
+      const chunk = encodeTranscriptChunk({ sessionUpdate: 'agent_message_chunk', content: { type: 'text', text } });
+      if (!chunk) {
+        // Canonical bridge couldn't produce a chunk (bridge throw or unmapped
+        // classification) → emit the floor on the text lane rather than dropping
+        // it, exactly like `emitTranscript`, so the cockpit transcript is never
+        // left empty in the very failure mode this floor exists to mitigate.
+        emitHuman(text);
+        return;
+      }
+      // Only skip the text lane when the chunk publish ACTUALLY succeeded. If the
+      // seam throws (a downstream tap implementation bug, not just the built-in
+      // best-effort guard), the floor never reached the relay lane — so fall back
+      // to the text lane, exactly like `emitTranscript`, or the cockpit transcript
+      // could still be empty in that failure mode.
+      let published = false;
+      try { relayTap.relayTranscriptChunk(chunk); published = true; } catch { /* relay best-effort */ }
+      if (published) {
+        transcriptChunksPublished++;
+        // Mirror locally (spy tee + captured stdout) so a --stream watcher and the
+        // result envelope also reflect the floor, matching the mapped-update path.
+        captureHuman(text);
+        return;
+      }
+      // Chunk publish threw → emit the floor on the text lane (relay text + spy
+      // tee + capture) so nothing is dropped.
+      emitHuman(text);
     };
 
     const handleMessage = (msg) => {

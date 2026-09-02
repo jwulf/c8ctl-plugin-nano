@@ -64,8 +64,8 @@ function makeTransportDouble() {
     connFramesOf(conn, family) {
       return (conn?.sent || []).map((b) => decodeFrame(b)).filter((f) => f.family === family);
     },
-    /** Simulate the hub dropping the current connection (remote close). An
-     * optional close `code` models a specific abnormal closure, e.g. `1006`. */
+    /** Simulate the hub dropping the current connection (remote close).
+     * An optional close `code` models a specific abnormal closure, e.g. `1006`. */
     dropCurrent(code) {
       const c = conns[conns.length - 1];
       if (c && !c.closed) {

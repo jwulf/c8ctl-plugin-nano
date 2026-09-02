@@ -8,7 +8,13 @@ import { mkdtempSync, writeFileSync, rmSync } from 'node:fs';
 import { tmpdir } from 'node:os';
 import { join } from 'node:path';
 
-import { buildResultNudgePrompt, resolveAgentResultWithNudge } from './c8ctl-plugin.js';
+import { buildResultNudgePrompt, resolveAgentResultWithNudge, buildAgentStdin } from './c8ctl-plugin.js';
+
+const nudgeFixture = () => ({
+  profile: { name: 'copilot', rank: 'senior', model: 'Opus', capabilities: ['pr-review'] },
+  job: { jobKey: '1', type: 'senior:pr-review', variables: { prompt: 'original task' } },
+  envelope: { task: { prompt: 'original task', allowPr: false }, setup: {} },
+});
 
 function tmpResultFile() {
   const dir = mkdtempSync(join(tmpdir(), 'nudge-'));
@@ -105,4 +111,36 @@ test('a throwing / still-empty re-emit turn degrades safely (nudged, but no cras
   } finally {
     rmSync(dir, { recursive: true, force: true });
   }
+});
+
+test('non-nudge stdin is the plain JSON job envelope for every mode', () => {
+  const { profile, job, envelope } = nudgeFixture();
+  for (const acp of [false, true]) {
+    const stdin = buildAgentStdin(profile, job, envelope, { nudgePayload: null, acp });
+    const parsed = JSON.parse(stdin);
+    assert.equal(parsed.jobKey, '1');
+    assert.equal(parsed.prompt, 'original task');
+    assert.equal(parsed.task.task.prompt, 'original task');
+  }
+});
+
+test('a nudge keeps the JSON envelope for non-ACP and only overrides the prompt fields', () => {
+  const { profile, job, envelope } = nudgeFixture();
+  const nudge = buildResultNudgePrompt('prior output');
+  const stdin = buildAgentStdin(profile, job, envelope, { nudgePayload: nudge, acp: false });
+  // Non-ACP harnesses read JSON off stdin — the envelope shape must survive.
+  const parsed = JSON.parse(stdin);
+  assert.equal(parsed.jobKey, '1', 'still the structured job envelope, not a bare string');
+  assert.equal(parsed.prompt, nudge, 'top-level prompt reflects the nudge');
+  assert.equal(parsed.task.task.prompt, nudge, 'reserved task.task.prompt reflects the nudge');
+  // The shared envelope must not be mutated by the override.
+  assert.equal(envelope.task.prompt, 'original task', 'source envelope is left untouched');
+});
+
+test('a nudge is delivered as the raw prompt string in ACP mode', () => {
+  const { profile, job, envelope } = nudgeFixture();
+  const nudge = buildResultNudgePrompt('prior output');
+  const stdin = buildAgentStdin(profile, job, envelope, { nudgePayload: nudge, acp: true });
+  // ACP writes stdin verbatim as the session/prompt text — it must be the raw nudge.
+  assert.equal(stdin, nudge);
 });

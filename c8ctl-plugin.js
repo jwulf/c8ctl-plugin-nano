@@ -5136,6 +5136,31 @@ function buildAgentPayload(profile, job, envelope) {
   };
 }
 
+// Build the exact bytes handed to the harness on stdin for a run (#678).
+//
+// Normal run: the JSON job envelope from `buildAgentPayload`. Every non-ACP
+// harness (pipe/PTY/container) reads that JSON off stdin, so the shape is a
+// contract — a re-emit nudge must NOT replace it with a bare string or the
+// harness fails to parse its job. So when a `nudgePayload` (the bounded "re-emit
+// your result" prompt) is present:
+//   - ACP delivers stdin verbatim as the `session/prompt` text, so it takes the
+//     raw nudge string.
+//   - Non-ACP keeps the JSON envelope and overrides its prompt fields (top-level
+//     `prompt` and the reserved `task.task.prompt`, i.e. `envelope.task.prompt`)
+//     so a harness that dispatches on either sees the nudge. The shared envelope
+//     is copied, never mutated.
+function buildAgentStdin(profile, job, envelope, { nudgePayload = null, acp = false } = {}) {
+  if (nudgePayload == null) return JSON.stringify(buildAgentPayload(profile, job, envelope));
+  const nudgeText = String(nudgePayload);
+  if (acp) return nudgeText;
+  const base = buildAgentPayload(profile, job, envelope);
+  base.prompt = nudgeText;
+  if (isPlainObject(base.task) && isPlainObject(base.task.task)) {
+    base.task = { ...base.task, task: { ...base.task.task, prompt: nudgeText } };
+  }
+  return JSON.stringify(base);
+}
+
 function baseAgentEnv(profile, job) {
   return {
     AGENT_PROFILE: profile.name,
@@ -5196,10 +5221,14 @@ function runAgentJob(profile, job, opts = {}) {
   const { timeoutMs, idleTimeoutMs, recoveryWindowMs, envelope, sandbox = 'none', image, runId, secretEnv = {}, passThroughSecretNames = [], cwd, extraEnv = {}, profileEnv = {}, resultFile, stream = false, streamPrefix = '', onStreamOut, onStreamErr, args: commandArgs, terminal = 'pipe', protocol = 'pipe', permission = 'yolo', relaySession = null, ptyFactory, nudgePayload = null } = opts;
   // #110: `protocol`/`permission` drive the ACP executor branch below. The
   // pipe/PTY paths are unchanged, so `protocol === 'pipe'` behaviour is identical.
-  // A `nudgePayload` (#678) replaces the task-envelope stdin with a bespoke
-  // "re-emit your result" prompt for a bounded second turn in the SAME workspace;
-  // everything else (env, cwd, command, result file) is identical to the main run.
-  const payload = nudgePayload != null ? String(nudgePayload) : JSON.stringify(buildAgentPayload(profile, job, envelope));
+  // A `nudgePayload` (#678) carries the bespoke "re-emit your result" prompt for a
+  // bounded second turn in the SAME workspace; everything else (env, cwd, command,
+  // result file) is identical to the main run. ACP delivers stdin as the prompt
+  // text so it takes the raw nudge; every non-ACP harness reads the JSON envelope
+  // off stdin, so there we keep the envelope and override its prompt fields
+  // (buildAgentStdin). Container sandboxes ignore `protocol` (pipe-only today).
+  const acpStdin = protocol === 'acp' && !CONTAINER_SANDBOXES.has(sandbox);
+  const payload = buildAgentStdin(profile, job, envelope, { nudgePayload, acp: acpStdin });
   const agentEnv = baseAgentEnv(profile, job);
   // The harness command line: the profile command plus its structured switches
   // (persisted `--arg`s, possibly extended at work time via opts.args), each
@@ -11658,6 +11687,7 @@ export {
   makeSecretResolver,
   hostEnvSecretResolver,
   buildAgentPayload,
+  buildAgentStdin,
   buildResultEnvelope,
   parseAgentResultObject,
   readAgentResultFile,

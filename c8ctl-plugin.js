@@ -2592,12 +2592,14 @@ const CONTAINER_SANDBOXES = new Set(['docker', 'podman']);
 const NUDGE_IDLE_TIMEOUT_MS = 120_000;
 const NUDGE_HARD_CAP_MS = 300_000;
 // Cap the prior transcript we echo back so a huge run can't blow the nudge prompt.
-const NUDGE_CONTEXT_CAP_BYTES = 24_000;
+// This is a UTF-16 code-unit (character) cap, not a byte cap: `String.slice`
+// counts code units, so with multi-byte output the byte size may be larger.
+const NUDGE_CONTEXT_CAP_CHARS = 24_000;
 
 // The bespoke prompt for the re-emit turn: derive the status from the work the
 // agent already did, write ONLY the result, change nothing else.
 function buildResultNudgePrompt(priorStdout) {
-  const ctx = typeof priorStdout === 'string' ? priorStdout.slice(-NUDGE_CONTEXT_CAP_BYTES) : '';
+  const ctx = typeof priorStdout === 'string' ? priorStdout.slice(-NUDGE_CONTEXT_CAP_CHARS) : '';
   return [
     'You already completed the task in your previous turn, but you did NOT emit a',
     'machine-readable result, so the orchestrator cannot read your status and the',
@@ -2633,10 +2635,14 @@ async function resolveAgentResultWithNudge({ result, resultFile, rerun, logger, 
     return { stdout: stdout0, nudged: false };
   }
   let nudge = null;
-  try { nudge = await rerun(buildResultNudgePrompt(stdout0)); } catch { nudge = null; }
+  let nudgeError = null;
+  try { nudge = await rerun(buildResultNudgePrompt(stdout0)); } catch (err) { nudge = null; nudgeError = err; }
   const nudgeOut = nudge && typeof nudge.stdout === 'string' ? nudge.stdout : '';
   const stdout = nudgeOut ? `${stdout0}\n${nudgeOut}` : stdout0;
   const recovered = readAgentResultFile(resultFile) ?? parseResultFromStdout(stdout);
+  if (nudgeError && logger?.warn) {
+    logger.warn(`${logPrefix} re-emit nudge rerun threw — ${nudgeError?.message ?? nudgeError}`);
+  }
   if (logger?.info) {
     logger.info(recovered
       ? `${logPrefix} no result on the first turn — recovered it via one re-emit nudge`

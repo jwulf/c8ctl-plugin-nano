@@ -2626,6 +2626,19 @@ function buildResultNudgePrompt(priorStdout) {
 // `rerun` is injected so this is unit-testable without a real model. Returns the
 // (possibly appended) stdout and whether a nudge was attempted; the caller reads
 // the structured result from the result file / stdout afterwards as usual.
+// Cap a string to MAX_CAPTURE_BYTES of UTF-8 keeping the TAIL (so a trailing
+// `::nano:result::` sentinel / fenced JSON block survives the trim) and skipping
+// any partial leading continuation byte so we start on a char boundary. Mirrors
+// the per-stream capture cap for the nudge's post-concatenation stdout. Returns
+// `{ text, truncated }`.
+function capStdoutTail(s) {
+  const buf = Buffer.from(s, 'utf8');
+  if (buf.length <= MAX_CAPTURE_BYTES) return { text: s, truncated: false };
+  let start = buf.length - MAX_CAPTURE_BYTES;
+  while (start < buf.length && (buf[start] & 0xc0) === 0x80) start += 1;
+  return { text: buf.subarray(start).toString('utf8'), truncated: true };
+}
+
 async function resolveAgentResultWithNudge({ result, resultFile, rerun, logger, logPrefix = '' }) {
   const stdout0 = result && typeof result.stdout === 'string' ? result.stdout : '';
   // A parsed result only counts as usable if it still carries at least one
@@ -2642,13 +2655,19 @@ async function resolveAgentResultWithNudge({ result, resultFile, rerun, logger, 
   // prompt explicitly offers the `::nano:result::` stdout sentinel, so recovery
   // still works in stdout-sentinel-only mode.
   if (hasUsableResult(already) || !result?.ok || !stdout0.trim() || typeof rerun !== 'function') {
-    return { stdout: stdout0, nudged: false };
+    return { stdout: stdout0, nudged: false, truncated: false };
   }
   let nudge = null;
   let nudgeError = null;
   try { nudge = await rerun(buildResultNudgePrompt(stdout0)); } catch (err) { nudge = null; nudgeError = err; }
   const nudgeOut = nudge && typeof nudge.stdout === 'string' ? nudge.stdout : '';
-  const stdout = nudgeOut ? `${stdout0}\n${nudgeOut}` : stdout0;
+  // Re-apply the per-stream capture cap after concatenation: `result.stdout` is
+  // forwarded verbatim into the job vars (`output`) and the audit envelope, so
+  // the nudge must not let the combined output bypass MAX_CAPTURE_BYTES. Keep the
+  // tail so a `::nano:result::` sentinel emitted by the nudge survives the trim,
+  // and surface truncation so `result.truncated` stays honest.
+  const capped = capStdoutTail(nudgeOut ? `${stdout0}\n${nudgeOut}` : stdout0);
+  const stdout = capped.text;
   const recovered = hasUsableResult(readAgentResultFile(resultFile) ?? parseResultFromStdout(stdout));
   if (nudgeError && logger?.warn) {
     logger.warn(`${logPrefix} re-emit nudge rerun threw — ${nudgeError?.message ?? nudgeError}`);
@@ -2658,7 +2677,7 @@ async function resolveAgentResultWithNudge({ result, resultFile, rerun, logger, 
       ? `${logPrefix} no result on the first turn — recovered it via one re-emit nudge`
       : `${logPrefix} no result on the first turn — re-emit nudge did not recover one`);
   }
-  return { stdout, nudged: true };
+  return { stdout, nudged: true, truncated: capped.truncated };
 }
 
 function coerceBool(v, dflt = false) {
@@ -6989,7 +7008,7 @@ async function workAgent(req, flags) {
           // the result is recoverable only via the stdout `::nano:result::`
           // sentinel, which `resolveAgentResultWithNudge` handles directly.
           if (result.ok) {
-            const { stdout, nudged } = await resolveAgentResultWithNudge({
+            const { stdout, nudged, truncated } = await resolveAgentResultWithNudge({
               result,
               resultFile,
               logger,
@@ -7003,7 +7022,10 @@ async function workAgent(req, flags) {
               }),
             });
             result.stdout = stdout;
-            if (nudged) result.nudgedForResult = true;
+            if (nudged) {
+              result.nudgedForResult = true;
+              if (truncated) result.truncated = true;
+            }
           }
 
           // Finalize git only when the harness succeeded — never push a

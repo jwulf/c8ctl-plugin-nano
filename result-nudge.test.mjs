@@ -152,6 +152,28 @@ test('does NOT nudge when resultFile is null but stdout already carries a sentin
   assert.equal(reruns, 0);
 });
 
+test('the nudge re-caps combined stdout to MAX_CAPTURE_BYTES, keeping the tail sentinel and flagging truncation', async () => {
+  const MAX = 1_048_576; // MAX_CAPTURE_BYTES (1 MiB)
+  // First turn already filled the whole capture cap with prose (truncated true),
+  // then the nudge appends a recovery sentinel. The combined output must be
+  // trimmed back to the cap, keep the trailing sentinel, and report truncation.
+  const result = { ok: true, stdout: 'X'.repeat(MAX), truncated: true };
+  const sentinel = '::nano:result:: {"status":"addressed","summary":"recovered after a huge first turn"}';
+  const rerun = async () => ({ ok: true, stdout: sentinel });
+  const { stdout, nudged, truncated } = await resolveAgentResultWithNudge({ result, resultFile: null, rerun });
+  assert.equal(nudged, true);
+  assert.equal(truncated, true, 'reports truncation when the combined output exceeds the cap');
+  assert.ok(Buffer.byteLength(stdout, 'utf8') <= MAX, 'combined stdout is capped to MAX_CAPTURE_BYTES');
+  assert.ok(stdout.endsWith(sentinel), 'keeps the tail so the recovery sentinel survives');
+});
+
+test('the nudge does NOT flag truncation when the combined output fits under the cap', async () => {
+  const result = { ok: true, stdout: 'did work, dropped result' };
+  const rerun = async () => ({ ok: true, stdout: '::nano:result:: {"status":"addressed","summary":"ok"}' });
+  const { truncated } = await resolveAgentResultWithNudge({ result, resultFile: null, rerun });
+  assert.equal(truncated, false, 'small combined output is not marked truncated');
+});
+
 test('a throwing / still-empty re-emit turn degrades safely (nudged, but no crash)', async () => {
   const { dir, file } = tmpResultFile();
   try {

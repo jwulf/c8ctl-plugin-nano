@@ -53,6 +53,7 @@ import {
 import { createConnection, createServer } from 'node:net';
 import * as nodeNet from 'node:net';
 import { lookup as dnsLookup } from 'node:dns/promises';
+import * as nodeDns from 'node:dns';
 import { randomUUID, createHash, randomBytes } from 'node:crypto';
 import { homedir, platform as osPlatform, devNull, tmpdir, hostname } from 'node:os';
 import { join, isAbsolute, resolve as resolvePath, dirname, basename, sep } from 'node:path';
@@ -5463,7 +5464,11 @@ function runAgentJob(profile, job, opts = {}) {
       return Promise.resolve({ ok: false, exitCode: null, stdout: '', stderr: '', error: 'command-line args (--arg) are not supported for host execution on Windows; use a container sandbox or bake switches into the command', truncated: false, stderrTruncated: false });
     }
     const resultEnv = resultFile ? { [AGENT_RESULT_FILE_ENV]: resultFile } : {};
-    const harnessEnv = { ...process.env, ...staticEnv, ...secretEnv, ...agentEnv, ...extraEnv, ...resultEnv };
+    // Propagate IPv4-first DNS ordering into the forked agent via NODE_OPTIONS
+    // (jwulf/c8ctl-plugin-nano#151): the parent's process-wide setDefaultResultOrder
+    // can't reach the child, so its own Node runtime must read the flag at startup.
+    // Merges (never clobbers) any inherited/operator NODE_OPTIONS.
+    const harnessEnv = withIpv4FirstNodeOptions({ ...process.env, ...staticEnv, ...secretEnv, ...agentEnv, ...extraEnv, ...resultEnv });
 
     // A role opted into ACP (`protocol: acp`) drives its harness over the Agent
     // Client Protocol (JSON-RPC 2.0 over stdio) instead of the stdin/scrape pipe
@@ -5566,6 +5571,16 @@ function runAgentJob(profile, job, opts = {}) {
   for (const n of passThroughSecretNames) envArgs.push('-e', n);
   for (const k of Object.keys(staticEnv)) envArgs.push('-e', k);
 
+  // Propagate IPv4-first DNS ordering into the containerised agent's Node runtime
+  // via NODE_OPTIONS (jwulf/c8ctl-plugin-nano#151), merged (never clobbered) with
+  // any inherited/operator value. Forwarded by NAME like every other env so the
+  // value stays out of argv/`docker inspect`; `-e NODE_OPTIONS` is added only when
+  // it wasn't already forwarded via the static env above (avoid a duplicate flag).
+  const containerEnv = withIpv4FirstNodeOptions({ ...process.env, ...staticEnv, ...secretEnv, ...agentEnv, ...extraEnv, ...resultEnv });
+  if (!Object.prototype.hasOwnProperty.call(staticEnv, 'NODE_OPTIONS')) {
+    envArgs.push('-e', 'NODE_OPTIONS');
+  }
+
   const args = [
     'run', '--rm', '-i',
     '--name', containerName,
@@ -5588,7 +5603,7 @@ function runAgentJob(profile, job, opts = {}) {
     // Reserved harness env (AGENT_* + the result-file path) is layered AFTER
     // resolved secrets so a task-supplied secret NAME can never shadow it. In
     // container mode docker reads these values from our child env by NAME.
-    env: { ...process.env, ...staticEnv, ...secretEnv, ...agentEnv, ...extraEnv, ...resultEnv },
+    env: containerEnv,
     stdinData: payload,
     timeoutMs,
     idleTimeoutMs,
@@ -6655,6 +6670,86 @@ function enableEngineHappyEyeballs(opts = {}) {
   return false;
 }
 
+// The Node DNS result-order token that ranks any A (IPv4) record ahead of an
+// AAAA (IPv6) one, so a host advertised over mDNS (`*.local`) that answers with
+// an unreachable IPv6 link-local `fe80::…` FIRST is still connected over its
+// reachable IPv4 A record. Used both process-wide (setDefaultResultOrder) and as
+// the `--dns-result-order` value propagated into the forked agent's NODE_OPTIONS.
+const DNS_RESULT_ORDER_IPV4_FIRST = 'ipv4first';
+
+/**
+ * Prefer IPv4 whenever an A record exists, PROCESS-WIDE, by flipping Node's
+ * default DNS result order to `ipv4first` (jwulf/c8ctl-plugin-nano#151). This is
+ * the harness-wide *class* fix that complements the engine-client Happy-Eyeballs
+ * enabler (#139): Happy-Eyeballs races families but can't help when the *only*
+ * answer picked is a single dead address, and it doesn't govern ordering; forcing
+ * `ipv4first` makes every `dns.lookup` (and therefore every outbound the worker
+ * and any in-process client make — the SDK's `activateJobs`, the raw-`fetch`
+ * `--auto` engine reads, agentic discovery) rank the reachable A record ahead of
+ * a dead AAAA. Because `dns.lookup` re-resolves per connection (Node keeps no
+ * process-wide lookup cache), a *running* worker that started against a bad
+ * resolution also heals the moment DNS is corrected — no supervisor restart — as
+ * the next long-poll / reconcile re-resolves under the new ordering.
+ *
+ * Fail-open and idempotent: a runtime without `setDefaultResultOrder` (or any
+ * throw) is swallowed so an ordering hint — an optimisation — can never block a
+ * worker from starting.
+ *
+ * @param {{ dns?: object, order?: string }} [opts] injection seam for tests
+ * @returns {boolean} true if the default DNS result order was (re)asserted
+ */
+function preferIpv4Resolution(opts = {}) {
+  try {
+    // Destructure INSIDE the try so a non-object arg (e.g. `null`) fails open
+    // like any other throw rather than blowing up before the guard.
+    const { dns = nodeDns, order = DNS_RESULT_ORDER_IPV4_FIRST } = opts || {};
+    if (dns && typeof dns.setDefaultResultOrder === 'function') {
+      dns.setDefaultResultOrder(order);
+      return true;
+    }
+  } catch {
+    // Fail-open: DNS ordering is a connectivity optimisation, never a start gate.
+  }
+  return false;
+}
+
+/**
+ * Merge `--dns-result-order=ipv4first` into an existing `NODE_OPTIONS` string so
+ * a forked agent child (and any node-based tool it spawns) inherits the same
+ * IPv4-first ordering as its parent worker (jwulf/c8ctl-plugin-nano#151) — a
+ * `dns.setDefaultResultOrder` call in THIS process can't reach the child, but the
+ * child's own Node runtime reads the flag from `NODE_OPTIONS` at startup.
+ *
+ * Preserves any other options already in `NODE_OPTIONS` (we append, never
+ * clobber) and, crucially, RESPECTS an operator who has *explicitly* pinned a
+ * `--dns-result-order` (e.g. `verbatim`): we only add ours when none is present,
+ * so we harden the default without overriding a deliberate choice.
+ *
+ * @param {string} [existing] the incoming NODE_OPTIONS value (may be empty)
+ * @returns {string} the NODE_OPTIONS value with an ordering flag guaranteed
+ */
+function ipv4FirstNodeOptions(existing = '') {
+  const flag = `--dns-result-order=${DNS_RESULT_ORDER_IPV4_FIRST}`;
+  const cur = typeof existing === 'string' ? existing.trim() : '';
+  // An explicit operator ordering (any `--dns-result-order=…`) wins untouched.
+  if (/--dns-result-order[=\s]/.test(cur)) return cur;
+  return cur ? `${cur} ${flag}` : flag;
+}
+
+/**
+ * Return a shallow copy of an env map whose `NODE_OPTIONS` carries the
+ * IPv4-first ordering flag, so the forked harness inherits it (#151). Applied at
+ * every harness spawn site (host pipe/PTY/ACP and container) so the ordering
+ * follows the agent regardless of transport. Never mutates the input.
+ *
+ * @param {Record<string,string>} [env] the env map about to be handed to a child
+ * @returns {Record<string,string>} a new env map with NODE_OPTIONS hardened
+ */
+function withIpv4FirstNodeOptions(env) {
+  const base = env && typeof env === 'object' ? env : {};
+  return { ...base, NODE_OPTIONS: ipv4FirstNodeOptions(base.NODE_OPTIONS) };
+}
+
 /**
  * work — turn a hire profile into live Nano job workers (one per job-type in
  * the rank×capability matrix) and poll for work in the foreground until Ctrl-C.
@@ -6902,6 +6997,14 @@ async function workAgent(req, flags) {
   // scaling the fleet to zero (jwulf/c8ctl-plugin-nano#139). Process-wide, so it
   // covers both the SDK's activateJobs and the raw-fetch --auto engine reads.
   enableEngineHappyEyeballs();
+  // Prefer IPv4 whenever an A record exists (jwulf/c8ctl-plugin-nano#151): the
+  // process-wide, class-level complement to Happy-Eyeballs. `ipv4first` ranks the
+  // reachable A record ahead of a dead AAAA (mDNS `fe80::` link-local), so BOTH
+  // the SDK activateJobs and the raw-fetch --auto reads resolve to it — and,
+  // since Node re-resolves per connection, a running worker heals the moment a
+  // bad DNS answer is corrected, without a supervisor restart. Set before the
+  // client is created so every outbound inherits it.
+  preferIpv4Resolution();
   const camunda = globalThis.c8ctl.createClient();
 
   // Broker REST endpoint for live linked-resource prompts (issue #63) and the
@@ -12427,6 +12530,10 @@ export {
   readDeployedAgentJobTypes,
   resolveAutoJobTypes,
   enableEngineHappyEyeballs,
+  preferIpv4Resolution,
+  ipv4FirstNodeOptions,
+  withIpv4FirstNodeOptions,
+  DNS_RESULT_ORDER_IPV4_FIRST,
   workAgent,
   derivePollTimeoutMs,
   AGENT_TASK_NS,

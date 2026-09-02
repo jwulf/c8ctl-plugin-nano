@@ -38,7 +38,7 @@
     "vendor:effect": "node scripts/vendor-effect.mjs",
     "test:supervisor": "node --experimental-strip-types --test supervisor/test/*.test.ts",
     "test": "node --check c8ctl-plugin.js && npm run typecheck:supervisor && npm run build:supervisor && npm run test:supervisor && node --test",
-    "prepublishOnly": "npm run build:supervisor"
+    "prepublishOnly": "npm run typecheck:supervisor && npm run build:supervisor"
   },
   "license": "MIT",
   "engines": {

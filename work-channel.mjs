@@ -286,8 +286,13 @@ export async function createWorkChannel(opts) {
       // (the old behaviour) left a successfully-deregistered client half-open and
       // still reconnecting — which is exactly the wedged/duplicate-client case the
       // #144 stale-channel heal path relies on stop() to end.
+      // deregister() is fire-and-forget but may be thenable (register() is
+      // treated as one above), so guard BOTH a synchronous throw and an async
+      // rejection — an unhandled rejection during shutdown must never escape.
       try {
-        client.deregister(reason);
+        Promise.resolve(client.deregister(reason)).catch((err) => {
+          log.warn?.(`agentic deregister failed: ${err?.message || err}`);
+        });
       } catch (err) {
         log.warn?.(`agentic deregister failed: ${err?.message || err}`);
       }

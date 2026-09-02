@@ -30,7 +30,7 @@ step and the `effect` dependency are confined to this module.
 ```bash
 npm run typecheck:supervisor   # tsc --noEmit
 npm run build:supervisor       # esbuild → ../supervisor.dist.js
-npm run test:supervisor        # node --experimental-strip-types --test test/*.test.ts
+npm run test:supervisor        # node --experimental-strip-types --test supervisor/test/*.test.ts
 ```
 
 All three also run under `npm test`. Rebuild `supervisor.dist.js` whenever you

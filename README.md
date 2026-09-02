@@ -262,6 +262,19 @@ specialisation.
 > (capability-declared) enrolment path. Use `--auto-scope <process-id | prefix>`
 > to narrow the blast radius to one app/network.
 
+> **Dual-stack / IPv6-first engine hosts.** The engine client races IPv4 and IPv6
+> (Happy-Eyeballs, RFC 8305) at connect time, so a worker whose engine host
+> resolves to an **unreachable IPv6 address first** — common with macOS mDNS
+> (`merlin.local → fe80::… (dead) → 192.168.x.x`), a stray/misordered `AAAA`, or
+> an IPv6-advertised host — transparently falls back to IPv4 instead of failing
+> the activation / `--auto` engine read (`fetch failed` / `write EPIPE` /
+> `UND_ERR_CONNECT_TIMEOUT`). Without this, the `--auto` autoscaler would read
+> `0` job types and **silently scale the fleet to zero** (workers vanish from the
+> Nano console) even though `curl`/`fetch` reach the same host fine
+> (jwulf/c8ctl-plugin-nano#139). No configuration is needed; if you still want to
+> pin a family you can set `NODE_OPTIONS=--dns-result-order=ipv4first` or point
+> the engine URL at the IPv4 literal.
+
 
 The optional `--name` sets **this worker's name** — the `workerName` it
 registers under at the broker (`‹name›:‹jobType›`) and how it shows up in

@@ -68,9 +68,11 @@ function distinctJobTypes(
 }
 
 /**
- * Run one reconcile pass against `prev`. Fetches XML for **new keys only**, and
- * when the key set is unchanged returns `prev` untouched with `crawled:false`
- * (no `searchProcessDefinitionKeys` follow-up crawl at all).
+ * Run one reconcile pass against `prev`. Always calls
+ * `searchProcessDefinitionKeys()` (cheap) to fingerprint the key set, then
+ * fetches XML for **new keys only**. When the key set is unchanged it returns
+ * `prev` untouched with `crawled:false` — skipping the expensive
+ * `getProcessDefinitionXml` crawl entirely (zero XML fetches).
  */
 export const reconcile = (
   reader: ReconcileReader,

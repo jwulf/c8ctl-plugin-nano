@@ -10,8 +10,14 @@ command (includes `start|status|stop|logs|restart|hire|work`).
 
 ## Plugin contract
 
-- Entry point is **`c8ctl-plugin.js`** (plain ESM JavaScript — Node.js does not
-  strip TypeScript types inside `node_modules`, so do not introduce a TS build).
+- Entry point is **`c8ctl-plugin.js`** (plain ESM JavaScript). Node.js does not
+  strip TypeScript types inside `node_modules`, so the **agent-edited monolith
+  and the `*.mjs` sidecars stay raw JS** — do not convert them to TypeScript.
+  The **one sanctioned exception** is the quarantined `supervisor/` module (see
+  "Supervisor runtime (Effect)" below): it is authored in TypeScript and
+  esbuild-bundled to a single committed `supervisor.dist.js` that the monolith
+  loads via `await import()`. The build step and the `effect` dependency are
+  confined to that module; everything else remains build-free raw JS.
 - Required export: `commands` (an object keyed by command name).
 - Optional export: `metadata` (drives `c8ctl help` text and examples).
 - `package.json` `keywords` must include `c8ctl` and `c8ctl-plugin`.
@@ -89,7 +95,58 @@ SDK client (job workers) — do **not** add the SDK as a dependency or use raw
   daemon never runs a worker loop itself. Forwarded flags come from
   `WORK_FORWARD_FLAGS` via `reconstructWorkArgs` (only real `work` flags).
 
-## How a cluster is modelled
+## Supervisor runtime (Effect) — `supervisor/`
+
+The **single-owner activation runtime** (issue #154) is a quarantined TypeScript
+module under `supervisor/src/`, esbuild-bundled (Effect **tree-shaken in**, pinned
+to v4) to a single committed `supervisor.dist.js`. The raw-JS monolith consumes
+it lazily via `loadSupervisorRuntime()` (`await import('./supervisor.dist.js')`),
+so the ~100 KB Effect surface only loads when the runtime is actually used and
+every other code path stays Effect-free.
+
+- **Architecture.** One per-host supervisor owns polling, per-type capacity
+  accounting, and dispatch — replacing the old design where every named `work`
+  process was a full, independent supervisor (its own 1 + N reconcile crawl **and**
+  its own per-type SDK long-polls, all gated by a *process-wide* capacity-1
+  `singleFlight`). Pieces: **worker registry + capability map** (`registry.ts`,
+  per-type free-slot accounting), **capacity-gated activation** (`activation.ts`,
+  one `raceAll` long-poll per serviceable-with-capacity type, `maxJobsToActivate=1`,
+  losers interrupted → lapse), **dispatch + lock lifecycle** (`dispatch.ts`, short
+  lock → extend-winner-before-start → periodic extender; never touch a lapsed job),
+  **cached reconcile** (`reconcile.ts`, fetch only new keys, skip the crawl when the
+  key-set hash is unchanged), **parking lot** (`parking.ts`, promote-on-slot-free),
+  and **agentic connection** (`agentic.ts`, `acquireRelease` teardown on
+  interruption). `supervisor.ts` composes them behind `Schedule` cadences.
+- **Ports, not globals.** Everything at the process edge (engine
+  `activate`/`extendLock`, reconcile reader, job runner, agentic endpoint, logger)
+  is an injected interface in `ports.ts`, so the runtime is driven deterministically
+  under Effect's `TestClock` with in-memory fakes, and the monolith supplies real
+  adapters (its keep-alive reader, `createClient()` SDK, `runAgentJob`).
+- **Build / test.** `npm run build:supervisor` (esbuild → `supervisor.dist.js`),
+  `npm run typecheck:supervisor` (tsc, `--noEmit`), `npm run test:supervisor`
+  (`node --experimental-strip-types --test supervisor/test/*.test.ts`). All three
+  run in `npm test`, alongside the existing `node --check` + `node --test`. Tests
+  are **red-first, deterministic** — drive time via `TestClock`, never wall-clock
+  sleeps or `flaky`. Rebuild the committed `supervisor.dist.js` whenever you touch
+  `supervisor/src/**` (CI and `prepublishOnly` rebuild it too).
+
+### Writing Effect (v4) — read the vendored source first
+
+This repo is AI-agent-edited, and agents write far better idiomatic Effect from
+**source** than from docs. Effect source is vendored (as source, for reference)
+under `repos/effect`:
+
+- Treat `repos/effect` as **read-only reference**. Prefer its examples/tests over
+  generated guesses, and **read `repos/effect/LLMS.md` before writing any Effect
+  code**.
+- **Do not import from `repos/effect`.** App code imports the normal pinned
+  `effect` dependency; the vendored tree is reference only.
+- `repos/**` is excluded from editor auto-import/search/watch (`.vscode/settings.json`)
+  and is **git-ignored** — populate it with `npm run vendor:effect` (a thin wrapper
+  over `git subtree`, pinned to the same `effect` version). Quick-reference notes
+  for the modules we lean on live in `agent-patterns/effect-*.md`.
+
+
 
 - Each nanobpmn node is the single server binary, configured by env vars:
   `PORT`, `NANOBPMN_NODE_ID`, `NANOBPMN_NODES`, `NANOBPMN_PARTITIONS`,
@@ -174,6 +231,9 @@ uploads an asset named exactly `PLATFORMS[].asset`.
 ## Quality bar before considering work done
 
 - `node --check c8ctl-plugin.js` passes.
+- For any change under `supervisor/src/**`: `npm run typecheck:supervisor`,
+  `npm run build:supervisor`, and `npm run test:supervisor` all pass, and the
+  regenerated `supervisor.dist.js` is committed.
 - The plugin loads and `c8ctl nano` prints usage.
 - A multi-node `start` → `status` → `stop` cycle leaves no orphan processes and
   no stale state file.

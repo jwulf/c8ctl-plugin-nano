@@ -379,7 +379,7 @@ export NANO_AGENTIC_WATCHDOG_MS=15000  # how often the watchdog checks channel l
 
 **Lossy-link hardening (reconnect churn that never re-lands presence).** A
 distinct failure mode shows up on a **lossy/roaming WiFi (or NAT) link**: the drop
-*is* detected (a clean `1006` abnormal close), the client *does* reconnect and
+*is* detected (an abnormal closure, code `1006`), the client *does* reconnect and
 re-announce — yet presence never re-lands on the hub, so the worker stays absent
 even though its log shows it re-announcing. The sustained-drop watchdog above does
 not catch this, because each brief reconnect keeps resetting its drop clock. Two

@@ -6316,8 +6316,11 @@ function agenticChannelIsStale({
  * the sustained-drop clock, so the socket-keyed trigger never fires — yet
  * presence never actually lands. `presenceHealthySince` is the epoch-ms of the
  * last time the channel was observed *stably* connected long enough for presence
- * to be considered landed (advanced only past a grace window, so a reconnect that
- * immediately re-drops does not count). Pure so the trigger is unit-testable
+ * to be considered landed. The first open seeds it immediately (that open drains
+ * the buffered REGISTER, so presence lands with it); thereafter it advances only
+ * once a connection has *held* past a grace window (via `onPresenceHealthy`), so a
+ * reconnect that immediately re-drops does not count. Pure so the trigger is
+ * unit-testable
  * without timers or sockets. A channel that never opened is not presence-stale
  * (the initial connect owns it); a null `presenceHealthySince` (never confirmed,
  * or reset by a heal) also reads as not-stale so a fresh open is given its grace.
@@ -6491,7 +6494,14 @@ function startAgenticChannelWatchdog({
     try {
       if (stopped) return; // shutdown raced us between the checks — do not heal
       const since = typeof disconnectedSince === 'function' ? disconnectedSince() : null;
-      const downFor = since != null ? Math.round((now() - since) / 1000) : '?';
+      // During reconnect churn `disconnectedSince` can be null (no sustained drop)
+      // or reset by the latest blip, so it under-reports the real staleness. Fall
+      // back to the presence-health clock — the signal we actually acted on — so
+      // the logged age reflects how long presence has genuinely been unconfirmed.
+      const staleSince = since != null
+        ? since
+        : (typeof presenceHealthySince === 'function' ? presenceHealthySince() : null);
+      const downFor = staleSince != null ? Math.round((now() - staleSince) / 1000) : '?';
       logger?.warn?.(`  agentic channel: presence not confirmed within threshold (down ${downFor}s / reconnect churn) — forcing re-discovery (the client lib did not self-heal; likely a lossy-link 1006 churn or half-open drop).`);
       await onStale?.();
     } catch (err) {

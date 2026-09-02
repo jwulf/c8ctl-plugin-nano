@@ -21,6 +21,9 @@ import assert from 'node:assert/strict';
 
 import {
   agenticChannelIsStale,
+  agenticPresenceIsStale,
+  jitteredDelay,
+  makeJitteredReconnectSchedule,
   startAgenticChannelWatchdog,
 } from './c8ctl-plugin.js';
 
@@ -327,4 +330,178 @@ test('startAgenticChannelWatchdog: after stop() a tick is a no-op (no heal durin
   wd.stop();
   await wd.tick();
   assert.equal(calls, 0, 'stop() latches the watchdog so a stale tick never reaches onStale');
+});
+
+// ===========================================================================
+// #147 — presence-keyed staleness (reconnect-after-1006 that never re-lands).
+// The #144 trigger keys on a SUSTAINED socket drop; on a lossy link the client
+// reconnects after each `1006`, resetting that clock, so it never fires even
+// though presence never re-lands. These lock in the churn-aware trigger and the
+// jittered backoff that bounds the reconnect herd.
+// ===========================================================================
+
+test('agenticPresenceIsStale: a channel that never opened is NOT presence-stale', () => {
+  assert.equal(agenticPresenceIsStale({
+    everConnected: () => false,
+    presenceHealthySince: () => 1,
+    now: () => 10_000_000,
+    staleAfterMs: 60_000,
+  }), false);
+});
+
+test('agenticPresenceIsStale: a null presence-health clock (never confirmed / reset) is NOT stale', () => {
+  assert.equal(agenticPresenceIsStale({
+    everConnected: () => true,
+    presenceHealthySince: () => null,
+    now: () => 10_000_000,
+    staleAfterMs: 60_000,
+  }), false);
+});
+
+test('agenticPresenceIsStale: presence confirmed within the threshold is NOT stale', () => {
+  const at = 1_000_000;
+  assert.equal(agenticPresenceIsStale({
+    everConnected: () => true,
+    presenceHealthySince: () => at,
+    now: () => at + 59_999,
+    staleAfterMs: 60_000,
+  }), false);
+});
+
+test('agenticPresenceIsStale: presence unconfirmed past the threshold IS stale', () => {
+  const at = 1_000_000;
+  assert.equal(agenticPresenceIsStale({
+    everConnected: () => true,
+    presenceHealthySince: () => at,
+    now: () => at + 60_000,
+    staleAfterMs: 60_000,
+  }), true);
+});
+
+test('agenticPresenceIsStale: missing accessors degrade to not-stale (never throws)', () => {
+  assert.equal(agenticPresenceIsStale({}), false);
+});
+
+test('jitteredDelay: equal-jitter keeps half and randomises the other half', () => {
+  assert.equal(jitteredDelay(1000, { rand: () => 0 }), 500, 'rand=0 → the floor half');
+  assert.equal(jitteredDelay(1000, { rand: () => 1 }), 1000, 'rand=1 → the full base');
+  assert.equal(jitteredDelay(1000, { rand: () => 0.5 }), 750, 'rand=0.5 → three-quarters');
+  // Never negative, and a non-positive base collapses to 0 (no hot loop).
+  assert.equal(jitteredDelay(0, { rand: () => 0.5 }), 0);
+  assert.equal(jitteredDelay(-5, { rand: () => 0.5 }), 0);
+});
+
+test('makeJitteredReconnectSchedule: schedules the callback at the jittered delay', () => {
+  const scheduled = [];
+  const schedule = makeJitteredReconnectSchedule({
+    rand: () => 0,
+    timer: (fn, ms) => { scheduled.push(ms); fn(); },
+  });
+  let ran = 0;
+  schedule(() => { ran += 1; }, 1000);
+  assert.deepEqual(scheduled, [500], 'the client-lib base is jittered before scheduling');
+  assert.equal(ran, 1, 'the callback still runs');
+});
+
+// A churn-capable channel double: models a lossy link where the socket keeps
+// reconnecting and immediately re-dropping. `connectedSince` is refreshed on each
+// brief (re)connect, and `presenceHealthyAt` is advanced ONLY by the watchdog's
+// onPresenceHealthy (never by the flapping itself) — exactly the startWork wiring.
+function churnChannel() {
+  const state = { open: false, ever: true, connectedSince: null, presenceHealthyAt: null, disconnectedSince: null };
+  return {
+    state,
+    connected: () => state.open,
+    everConnected: () => state.ever,
+    // Simulate a brief reconnect that immediately re-drops (a `1006` blip): the
+    // socket is never observed connected between watchdog ticks.
+    blip(now) { state.connectedSince = now; state.disconnectedSince = now; state.open = false; },
+  };
+}
+
+test('#147 watchdog heals reconnect-churn that never re-lands presence (the sustained-drop trigger never fires here)', async () => {
+  const h = timerHarness();
+  const ch = churnChannel();
+  // Presence landed once on first connect, then the link goes lossy.
+  ch.state.presenceHealthyAt = h.now();
+  ch.state.connectedSince = h.now();
+  let stale = 0;
+  const wd = startAgenticChannelWatchdog({
+    getChannel: () => ch,
+    disconnectedSince: () => ch.state.disconnectedSince,
+    connectedSince: () => ch.state.connectedSince,
+    presenceHealthySince: () => ch.state.presenceHealthyAt,
+    onPresenceHealthy: () => { ch.state.presenceHealthyAt = h.now(); },
+    onStale: () => { stale += 1; },
+    presenceStaleAfterMs: 60_000,
+    presenceGraceMs: 5_000,
+    staleAfterMs: 60_000, // the #144 sustained-drop trigger — must NOT be what fires
+    now: h.now,
+    setIntervalFn: h.setIntervalFn,
+    clearIntervalFn: h.clearIntervalFn,
+  });
+
+  // For 70s the link churns: every 10s the socket briefly reconnects then
+  // re-drops. Each blip resets `disconnectedSince` to "just now", so the #144
+  // sustained-drop trigger (which needs a continuous 60s down) never fires.
+  for (let elapsed = 0; elapsed < 70_000; elapsed += 10_000) {
+    ch.blip(h.now()); // reconnected & re-dropped in the same instant → never stably connected
+    h.advance(10_000);
+    await wd.tick();
+  }
+  // The presence-health clock never advanced (never stably connected for the
+  // grace window), so once 60s elapsed since the last confirmed presence the
+  // presence-keyed trigger fired and forced a re-discovery — even though the
+  // socket kept reconnecting and the sustained-drop clock kept resetting.
+  assert.equal(stale, 1, 'presence-keyed trigger heals reconnect-churn exactly once per episode');
+  wd.stop();
+});
+
+test('#147 watchdog: a STABLE reconnect (held past the grace window) confirms presence and does NOT heal', async () => {
+  const h = timerHarness();
+  const ch = churnChannel();
+  ch.state.presenceHealthyAt = h.now();
+  ch.state.connectedSince = h.now();
+  ch.state.open = true; // stably connected from the start
+  let stale = 0;
+  const wd = startAgenticChannelWatchdog({
+    getChannel: () => ch,
+    disconnectedSince: () => ch.state.disconnectedSince,
+    connectedSince: () => ch.state.connectedSince,
+    presenceHealthySince: () => ch.state.presenceHealthyAt,
+    onPresenceHealthy: () => { ch.state.presenceHealthyAt = h.now(); },
+    onStale: () => { stale += 1; },
+    presenceStaleAfterMs: 60_000,
+    presenceGraceMs: 5_000,
+    staleAfterMs: 60_000,
+    now: h.now,
+    setIntervalFn: h.setIntervalFn,
+    clearIntervalFn: h.clearIntervalFn,
+  });
+  // The channel stays connected well past the grace window across many ticks; the
+  // watchdog keeps advancing the presence-health clock, so it never ages out.
+  for (let i = 0; i < 10; i += 1) { h.advance(10_000); await wd.tick(); }
+  assert.equal(stale, 0, 'a stably-connected channel confirms presence and never heals');
+  wd.stop();
+});
+
+test('#147 watchdog: presence-keyed trigger is inert when its accessors are omitted (#144 behaviour preserved)', async () => {
+  const h = timerHarness();
+  // Connected the whole time, but no presence accessors wired: the presence
+  // trigger must never fire, so only the #144 sustained-drop path can heal.
+  const ch = fakeChannel({ open: true, ever: true, since: null });
+  let stale = 0;
+  const wd = startAgenticChannelWatchdog({
+    getChannel: () => ch,
+    disconnectedSince: () => ch.state.since,
+    onStale: () => { stale += 1; },
+    staleAfterMs: 10_000,
+    now: h.now,
+    setIntervalFn: h.setIntervalFn,
+    clearIntervalFn: h.clearIntervalFn,
+  });
+  h.advance(1_000_000);
+  await wd.tick();
+  assert.equal(stale, 0, 'no presence accessors → the #147 trigger stays inert');
+  wd.stop();
 });

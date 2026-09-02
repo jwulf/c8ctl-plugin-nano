@@ -26,7 +26,7 @@ function makeTransportDouble() {
   const sent = [];
   const conns = [];
   const factory = (url, hooks) => {
-    const conn = { url, hooks, closed: false };
+    const conn = { url, hooks, closed: false, sent: [] };
     conns.push(conn);
     setTimeout(() => {
       if (!conn.closed) hooks.onOpen();
@@ -34,6 +34,7 @@ function makeTransportDouble() {
     return {
       send(bytes) {
         sent.push(bytes);
+        conn.sent.push(bytes); // also record which connection carried the frame
       },
       close() {
         if (!conn.closed) {
@@ -55,12 +56,21 @@ function makeTransportDouble() {
     framesOf(family) {
       return this.frames().filter((f) => f.family === family);
     },
-    /** Simulate the hub dropping the current connection (remote close). */
-    dropCurrent() {
+    /** The most recently created connection (the live socket). */
+    lastConn() {
+      return conns[conns.length - 1];
+    },
+    /** Frames of one family sent on a specific connection, in send order. */
+    connFramesOf(conn, family) {
+      return (conn?.sent || []).map((b) => decodeFrame(b)).filter((f) => f.family === family);
+    },
+    /** Simulate the hub dropping the current connection (remote close). An
+     * optional close `code` models a specific abnormal closure, e.g. `1006`. */
+    dropCurrent(code) {
       const c = conns[conns.length - 1];
       if (c && !c.closed) {
         c.closed = true;
-        c.hooks.onClose({ local: false });
+        c.hooks.onClose(code == null ? { local: false } : { local: false, code });
       }
     },
   };
@@ -377,6 +387,38 @@ test('presence is re-announced after a reconnect so the row survives a hub resta
   assert.equal(after > before, true, 're-registered on reconnect');
   const last = t.framesOf('register').pop().payload;
   assert.deepEqual(last.capability.jobs, ['777']);
+
+  await ch.stop();
+});
+
+test('#147: a 1006 abnormal close re-lands a REGISTER on the NEW post-reconnect socket', async () => {
+  const t = makeTransportDouble();
+  const ch = await createWorkChannel({
+    ...BASE,
+    instance: 'wifi-1006',
+    host: 'h',
+    listJobKeys: () => ['job-42'],
+    heartbeatIntervalMs: 0,
+    transport: t.factory,
+    reconnect: { initialDelayMs: 1, maxDelayMs: 1 },
+    schedule: (fn) => setTimeout(fn, 1),
+  });
+  await tick();
+  const firstConn = t.lastConn();
+  assert.equal(t.connFramesOf(firstConn, 'register').length >= 1, true, 'presence announced on the first socket');
+
+  // The lossy WiFi/NAT path tears the socket down with NO close frame → 1006.
+  t.dropCurrent(1006);
+  await tick(30);
+
+  // The client reconnects onto a brand-new transport, and the REGISTER MUST land
+  // on THAT socket (not be lost against the dead pre-drop one), so presence
+  // re-appears on the hub — the exact failure mode #147 hardens against.
+  const newConn = t.lastConn();
+  assert.notEqual(newConn, firstConn, 'a fresh socket was opened after the 1006 drop');
+  const reRegs = t.connFramesOf(newConn, 'register');
+  assert.equal(reRegs.length >= 1, true, 'a REGISTER re-landed on the post-reconnect socket');
+  assert.deepEqual(reRegs.pop().payload.capability.jobs, ['job-42'], 'the re-landed presence carries the live job set');
 
   await ch.stop();
 });

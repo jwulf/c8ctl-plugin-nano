@@ -377,6 +377,28 @@ export NANO_AGENTIC_STALE_MS=60000     # force re-discovery if a drop hasn't rec
 export NANO_AGENTIC_WATCHDOG_MS=15000  # how often the watchdog checks channel liveness (default)
 ```
 
+**Lossy-link hardening (reconnect churn that never re-lands presence).** A
+distinct failure mode shows up on a **lossy/roaming WiFi (or NAT) link**: the drop
+*is* detected (a clean `1006` abnormal close), the client *does* reconnect and
+re-announce — yet presence never re-lands on the hub, so the worker stays absent
+even though its log shows it re-announcing. The sustained-drop watchdog above does
+not catch this, because each brief reconnect keeps resetting its drop clock. Two
+extra safeguards close the gap:
+
+- **Presence-keyed watchdog trigger.** A reconnect only counts as recovered once
+  the socket *holds* for a short grace window (so a `1006` blip that immediately
+  re-drops does not mask an unrecovered presence). When presence has not been
+  confirmed within a threshold — regardless of the reconnect flapping — the
+  watchdog forces the same full re-discovery + reopen.
+- **Jittered reconnect backoff.** Reconnect attempts are spread with equal-jitter
+  backoff so a fleet dropped on the same link does not reconnect in lockstep and
+  re-congest it.
+
+```bash
+export NANO_AGENTIC_PRESENCE_STALE_MS=60000  # force re-discovery if presence isn't re-confirmed within 60s (default)
+export NANO_AGENTIC_PRESENCE_GRACE_MS=5000   # how long a reconnect must hold before presence counts as landed (default)
+```
+
 **Secure mode (opt-in).** For a deployment where you want the visibility channel
 authenticated (rather than open on the LAN), start the server **and** every worker
 box with the **same** `NANO_AGENTIC_SECRET` — same env-var name, same value on both

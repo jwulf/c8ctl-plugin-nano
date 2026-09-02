@@ -5109,7 +5109,7 @@ function createSingleFlight() {
       held = true;
       return true;
     },
-    /** Release the permit (idempotent). Call exactly once per successful acquire. */
+    /** Release the permit. Idempotent: redundant calls are safe no-ops, though the normal path releases once per acquire (in a `finally`). */
     release() {
       held = false;
     },

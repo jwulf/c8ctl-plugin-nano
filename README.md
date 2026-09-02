@@ -352,7 +352,7 @@ one of:
 | `starting` | transient: the worker just spawned and hasn't resolved its channel target yet (pre-`connecting`) |
 | `connected` | presence is live on the hub — you should see this worker in the Cockpit |
 | `connecting` | resolved a hub, socket not open yet (or the hub is unreachable) |
-| `disconnected` | an established channel dropped (hub restart/outage) — it auto-reconnects, and a worker-side **liveness watchdog** force-re-discovers the hub if it stays down (see below); also set if the channel failed to start (bad URL/refused socket), in which case the watchdog keeps retrying discovery in the background |
+| `disconnected` | an established channel dropped (hub restart/outage) — it auto-reconnects, and a worker-side **liveness watchdog** force-re-discovers the hub if it stays down (see below); also set if the channel failed to start (bad URL/refused socket), which is **not** auto-recovered by the watchdog (it only guards a channel that has connected) — fix the target and restart the worker |
 | `advisory` | nothing discoverable at the engine — **not** in the Cockpit; set `NANO_AGENTIC_URL` |
 | `off` | visibility disabled (`NANO_AGENTIC=off`) |
 | `?` | a live worker not yet reporting, or an older build predating these fields |

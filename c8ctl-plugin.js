@@ -6133,7 +6133,7 @@ function agenticChannelIsStale({
 }
 
 /**
- * Start the worker-side agentic-channel liveness watchdog (#144). On a jittered
+ * Start the worker-side agentic-channel liveness watchdog (#144). On a fixed
  * interval it asks {@link agenticChannelIsStale} whether the channel dropped and
  * never recovered within the threshold; when it has, it fires `onStale()` (which
  * tears the wedged channel down and re-runs discovery + reopen). Re-entrancy is

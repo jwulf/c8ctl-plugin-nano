@@ -136,6 +136,13 @@ test('nano work: a worker serving multiple job types runs at most one harness at
   // would interleave two STARTs before an END — the violation the guard prevents.
   // The target log is chosen at run time from NANO_TEST_CONC_LOG so the harness
   // can separate the two phases' evidence.
+  //
+  // It also emits a `::nano:result::` sentinel with a usable var so the run
+  // reports a HEALTHY result. Without one, `runAgentJob`'s weak-agent recovery
+  // (the #678 re-emit nudge) treats the run as a dropped result and reruns the
+  // harness a second time — a legitimate feature, but it would add a spurious
+  // (still serialized) START to the log and defeat this test's one-job→one-start
+  // accounting. A healthy result keeps each job to exactly one harness start.
   const rec = join(HOME, 'rec.sh');
   writeFileSync(rec, [
     '#!/bin/sh',
@@ -144,6 +151,7 @@ test('nano work: a worker serving multiple job types runs at most one harness at
     'sleep 1',
     'echo END >> "$f"',
     'echo harness-done',
+    'echo \'::nano:result:: {"status":"ok"}\'',
   ].join('\n'));
   chmodSync(rec, 0o755);
 

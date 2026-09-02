@@ -281,15 +281,25 @@ export async function createWorkChannel(opts) {
     everConnected: () => hasConnected,
     buffered: () => client.buffered,
     async stop(reason = 'worker stopped') {
+      // Deregister to drop presence cleanly, then ALWAYS close the socket so the
+      // client stops its own reconnect loop. Closing only on a deregister error
+      // (the old behaviour) left a successfully-deregistered client half-open and
+      // still reconnecting — which is exactly the wedged/duplicate-client case the
+      // #144 stale-channel heal path relies on stop() to end.
+      // deregister() is fire-and-forget but may be thenable (register() is
+      // treated as one above), so guard BOTH a synchronous throw and an async
+      // rejection — an unhandled rejection during shutdown must never escape.
       try {
-        client.deregister(reason);
-      } catch (err) {
-        try {
+        Promise.resolve(client.deregister(reason)).catch((err) => {
           log.warn?.(`agentic deregister failed: ${err?.message || err}`);
-          client.close();
-        } catch {
-          /* best effort — never let shutdown hang on the channel */
-        }
+        });
+      } catch (err) {
+        log.warn?.(`agentic deregister failed: ${err?.message || err}`);
+      }
+      try {
+        client.close();
+      } catch {
+        /* best effort — never let shutdown hang on the channel */
       }
     },
   };

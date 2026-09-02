@@ -51,6 +51,7 @@ import {
   unwatchFile,
 } from 'node:fs';
 import { createConnection, createServer } from 'node:net';
+import * as nodeNet from 'node:net';
 import { lookup as dnsLookup } from 'node:dns/promises';
 import { randomUUID, createHash, randomBytes } from 'node:crypto';
 import { homedir, platform as osPlatform, devNull, tmpdir, hostname } from 'node:os';
@@ -6046,6 +6047,58 @@ function buildActivityPayload({ pid, updatedAt, jobs, engine, agentic }) {
 }
 
 /**
+ * Enable Happy-Eyeballs (RFC 8305) dual-stack connect for the engine client so a
+ * worker whose engine host resolves IPv6-first with an *unreachable* v6 address
+ * (macOS mDNS `fe80::` link-local, a stray/misordered AAAA, an IPv6-advertised
+ * host) transparently races and falls back to IPv4 — matching `curl`/`fetch` —
+ * instead of connecting to the dead address and failing the activation / `--auto`
+ * engine read with `fetch failed` / `write EPIPE` / `UND_ERR_CONNECT_TIMEOUT`
+ * (jwulf/c8ctl-plugin-nano#139).
+ *
+ * We set Node's PROCESS-WIDE `net` default rather than an instance option so the
+ * fix covers the *class*, not one call site: BOTH transports the worker harness
+ * uses inherit it — the `@camunda8` SDK client's `activateJobs` (its undici
+ * dispatcher connects via `net`) AND the raw-`fetch` `--auto` reconcile / initial
+ * engine reads. Node ≥20 already defaults this on, but older runtimes — and any
+ * build where the client's dispatcher inherits a `false` default — leave it off;
+ * the reporter's repro shows the failing "SDK default path" is exactly
+ * `setDefaultAutoSelectFamily(false)`, and asserting `true` here is what fixes it.
+ * The attempt timeout bounds the per-address race so a dead `fe80::` yields to
+ * IPv4 quickly (RFC 8305 default of 250ms) instead of stalling the connect.
+ *
+ * Fail-open and idempotent: a runtime without the API (or any throw) is swallowed
+ * so Happy-Eyeballs — an optimisation — can never block a worker from starting.
+ *
+ * @param {{ net?: object, attemptTimeoutMs?: number }} [opts] injection seam for tests
+ * @returns {boolean} true if the net default was (re)asserted to Happy-Eyeballs
+ */
+function enableEngineHappyEyeballs(opts = {}) {
+  try {
+    // Destructure INSIDE the try so a non-object arg (e.g. `null`) fails open
+    // like any other throw rather than blowing up before the guard.
+    const { net = nodeNet, attemptTimeoutMs = 250 } = opts || {};
+    if (net && typeof net.setDefaultAutoSelectFamily === 'function') {
+      net.setDefaultAutoSelectFamily(true);
+      // The attempt timeout is an optional refinement: once the primary family
+      // default is asserted the contract is satisfied, so a throw here must not
+      // retract our `true`. Swallow it independently.
+      try {
+        if (typeof net.setDefaultAutoSelectFamilyAttemptTimeout === 'function'
+            && Number.isFinite(attemptTimeoutMs) && attemptTimeoutMs > 0) {
+          net.setDefaultAutoSelectFamilyAttemptTimeout(attemptTimeoutMs);
+        }
+      } catch {
+        // Fail-open on the optional timeout setter; the family default still holds.
+      }
+      return true;
+    }
+  } catch {
+    // Fail-open: Happy-Eyeballs is a connectivity optimisation, never a start gate.
+  }
+  return false;
+}
+
+/**
  * work — turn a hire profile into live Nano job workers (one per job-type in
  * the rank×capability matrix) and poll for work in the foreground until Ctrl-C.
  * Uses the c8ctl-provided SDK client (globalThis.c8ctl.createClient()).
@@ -6279,6 +6332,12 @@ async function workAgent(req, flags) {
     logger.error('--auto-scope requires --auto (it narrows the engine-read agent job types).');
     process.exit(1);
   }
+  // Enable Happy-Eyeballs (RFC 8305) at the socket layer BEFORE the SDK client
+  // or any engine read is created, so a worker whose engine host resolves
+  // IPv6-first with a dead v6 address falls back to IPv4 instead of silently
+  // scaling the fleet to zero (jwulf/c8ctl-plugin-nano#139). Process-wide, so it
+  // covers both the SDK's activateJobs and the raw-fetch --auto engine reads.
+  enableEngineHappyEyeballs();
   const camunda = globalThis.c8ctl.createClient();
 
   // Broker REST endpoint for live linked-resource prompts (issue #63) and the
@@ -11612,6 +11671,7 @@ export {
   serviceTaskHasAgentHeader,
   readDeployedAgentJobTypes,
   resolveAutoJobTypes,
+  enableEngineHappyEyeballs,
   workAgent,
   derivePollTimeoutMs,
   AGENT_TASK_NS,

@@ -3224,9 +3224,16 @@ async function resolveAutoJobTypes({ restConfig, scope = '', readerFactory, time
 // exposes `makeSupervisor`, the port interfaces, and the tree-shaken Effect
 // namespaces (`Effect`, `Duration`, `Fiber`, …) a JS caller needs to run it.
 let _supervisorRuntime;
-async function loadSupervisorRuntime() {
+function loadSupervisorRuntime() {
+  // Cache the in-flight Promise (not just the resolved module) so concurrent
+  // callers racing before the first import settles share a single import()
+  // instead of each kicking off a redundant one. Clear the cache on failure so
+  // a later call can retry rather than being wedged on a rejected Promise.
   if (!_supervisorRuntime) {
-    _supervisorRuntime = await import('./supervisor.dist.js');
+    _supervisorRuntime = import('./supervisor.dist.js').catch((err) => {
+      _supervisorRuntime = undefined;
+      throw err;
+    });
   }
   return _supervisorRuntime;
 }

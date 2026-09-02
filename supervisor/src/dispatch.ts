@@ -82,7 +82,16 @@ export const dispatch = (
         engine
           .extendLock(job.jobKey, config.recoveryWindowMs)
           .pipe(
-            Effect.ignore,
+            // Log (and continue) when a heartbeat extend fails, rather than
+            // silently swallowing it — an invisible extend outage makes
+            // "job reclaimed while agent still running" much harder to diagnose.
+            Effect.catch((err: SupervisorError) =>
+              Effect.sync(() =>
+                logger.warn(
+                  `[${job.type}] job ${job.jobKey}: heartbeat extend failed — ${err.message}`,
+                ),
+              ),
+            ),
             Effect.repeat(Schedule.spaced(Duration.millis(config.extendIntervalMs))),
           ),
       );

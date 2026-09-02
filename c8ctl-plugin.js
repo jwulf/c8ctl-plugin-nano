@@ -2637,7 +2637,11 @@ async function resolveAgentResultWithNudge({ result, resultFile, rerun, logger, 
   const already = readAgentResultFile(resultFile) ?? parseResultFromStdout(stdout0);
   // Only nudge a clean run that produced NO usable result but DID produce output
   // (silence means a crash/hang the idle path already handles, not a dropped result).
-  if (hasUsableResult(already) || !result?.ok || !resultFile || !stdout0.trim() || typeof rerun !== 'function') {
+  // A null `resultFile` (temp-dir creation failed) is NOT a reason to skip: the
+  // read-back already falls through to `parseResultFromStdout`, and the nudge
+  // prompt explicitly offers the `::nano:result::` stdout sentinel, so recovery
+  // still works in stdout-sentinel-only mode.
+  if (hasUsableResult(already) || !result?.ok || !stdout0.trim() || typeof rerun !== 'function') {
     return { stdout: stdout0, nudged: false };
   }
   let nudge = null;
@@ -6981,7 +6985,10 @@ async function workAgent(req, flags) {
           // ONE bounded re-emit nudge in the same workspace, feeding back its own
           // output, before we accept an empty result. Runs before finalizeGit so
           // the workspace/result file are still live; the nudge changes no code.
-          if (result.ok && resultFile) {
+          // Not gated on `resultFile`: when the temp dir/file could not be created
+          // the result is recoverable only via the stdout `::nano:result::`
+          // sentinel, which `resolveAgentResultWithNudge` handles directly.
+          if (result.ok) {
             const { stdout, nudged } = await resolveAgentResultWithNudge({
               result,
               resultFile,

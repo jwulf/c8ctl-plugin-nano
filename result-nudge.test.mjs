@@ -132,6 +132,26 @@ test('does NOT nudge a failed run', async () => {
   }
 });
 
+test('nudges and recovers via the stdout sentinel when resultFile is null (temp dir creation failed)', async () => {
+  // No result file could be created, so recovery is possible ONLY via the
+  // `::nano:result::` stdout sentinel. The nudge must still fire and recover.
+  let reruns = 0;
+  const result = { ok: true, stdout: 'did the work but dropped the result' };
+  const rerun = async () => { reruns++; return { ok: true, stdout: '::nano:result:: {"status":"addressed","summary":"recovered via stdout"}' }; };
+  const { stdout, nudged } = await resolveAgentResultWithNudge({ result, resultFile: null, rerun });
+  assert.equal(nudged, true, 'nudges even without a result file');
+  assert.equal(reruns, 1, 'nudges exactly once');
+  assert.match(stdout, /::nano:result:: \{"status":"addressed"/, 'appends the recovered sentinel to stdout');
+});
+
+test('does NOT nudge when resultFile is null but stdout already carries a sentinel result', async () => {
+  let reruns = 0;
+  const result = { ok: true, stdout: '::nano:result:: {"status":"converged","summary":"all done"}' };
+  const { nudged } = await resolveAgentResultWithNudge({ result, resultFile: null, rerun: async () => { reruns++; return { ok: true, stdout: '' }; } });
+  assert.equal(nudged, false, 'a usable stdout-only result needs no nudge');
+  assert.equal(reruns, 0);
+});
+
 test('a throwing / still-empty re-emit turn degrades safely (nudged, but no crash)', async () => {
   const { dir, file } = tmpResultFile();
   try {

@@ -2628,10 +2628,16 @@ function buildResultNudgePrompt(priorStdout) {
 // the structured result from the result file / stdout afterwards as usual.
 async function resolveAgentResultWithNudge({ result, resultFile, rerun, logger, logPrefix = '' }) {
   const stdout0 = result && typeof result.stdout === 'string' ? result.stdout : '';
+  // A parsed result only counts as usable if it still carries at least one
+  // *effective* var after sanitizeResultVars strips the reserved / io.nanobpm.* /
+  // proto keys. An empty `{}` or a reserved-keys-only object leaves downstream
+  // gateways with no status/decision vars — exactly the dropped-result case the
+  // nudge exists to recover — so gate on effective vars, not raw object presence.
+  const hasUsableResult = (parsed) => Object.keys(sanitizeResultVars(parsed)).length > 0;
   const already = readAgentResultFile(resultFile) ?? parseResultFromStdout(stdout0);
   // Only nudge a clean run that produced NO usable result but DID produce output
   // (silence means a crash/hang the idle path already handles, not a dropped result).
-  if (already || !result?.ok || !resultFile || !stdout0.trim() || typeof rerun !== 'function') {
+  if (hasUsableResult(already) || !result?.ok || !resultFile || !stdout0.trim() || typeof rerun !== 'function') {
     return { stdout: stdout0, nudged: false };
   }
   let nudge = null;
@@ -2639,7 +2645,7 @@ async function resolveAgentResultWithNudge({ result, resultFile, rerun, logger, 
   try { nudge = await rerun(buildResultNudgePrompt(stdout0)); } catch (err) { nudge = null; nudgeError = err; }
   const nudgeOut = nudge && typeof nudge.stdout === 'string' ? nudge.stdout : '';
   const stdout = nudgeOut ? `${stdout0}\n${nudgeOut}` : stdout0;
-  const recovered = readAgentResultFile(resultFile) ?? parseResultFromStdout(stdout);
+  const recovered = hasUsableResult(readAgentResultFile(resultFile) ?? parseResultFromStdout(stdout));
   if (nudgeError && logger?.warn) {
     logger.warn(`${logPrefix} re-emit nudge rerun threw — ${nudgeError?.message ?? nudgeError}`);
   }

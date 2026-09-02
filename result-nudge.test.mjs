@@ -74,6 +74,38 @@ test('does NOT nudge when the first turn already produced a result', async () =>
   }
 });
 
+test('nudges when the result file is an empty object (no effective vars)', async () => {
+  const { dir, file } = tmpResultFile();
+  try {
+    writeFileSync(file, JSON.stringify({}));
+    let reruns = 0;
+    const result = { ok: true, stdout: 'did the work but emitted an empty {}' };
+    const rerun = async () => { reruns++; writeFileSync(file, JSON.stringify({ status: 'addressed' })); return { ok: true, stdout: '::nano:result:: {"status":"addressed"}' }; };
+    const { nudged } = await resolveAgentResultWithNudge({ result, resultFile: file, rerun });
+    assert.equal(nudged, true, 'an empty {} is not a usable result — must nudge');
+    assert.equal(reruns, 1);
+  } finally {
+    rmSync(dir, { recursive: true, force: true });
+  }
+});
+
+test('nudges when the result carries only reserved keys (sanitized away to nothing)', async () => {
+  const { dir, file } = tmpResultFile();
+  try {
+    // Reserved / io.nanobpm.* keys are stripped by sanitizeResultVars, leaving no
+    // effective vars — downstream sees no status, so this must still nudge.
+    writeFileSync(file, JSON.stringify({ 'io.nanobpm.agentResult': { exitCode: 0 } }));
+    let reruns = 0;
+    const result = { ok: true, stdout: 'did the work but only reserved keys landed' };
+    const rerun = async () => { reruns++; writeFileSync(file, JSON.stringify({ status: 'converged' })); return { ok: true, stdout: '::nano:result:: {"status":"converged"}' }; };
+    const { nudged } = await resolveAgentResultWithNudge({ result, resultFile: file, rerun });
+    assert.equal(nudged, true, 'reserved-keys-only is not a usable result — must nudge');
+    assert.equal(reruns, 1);
+  } finally {
+    rmSync(dir, { recursive: true, force: true });
+  }
+});
+
 test('does NOT nudge a silent run (no stdout) — that is a crash/hang, not a dropped result', async () => {
   const { dir, file } = tmpResultFile();
   try {

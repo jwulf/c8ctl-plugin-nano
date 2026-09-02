@@ -2587,6 +2587,135 @@ const SANDBOXES = ['none', 'docker', 'podman'];
 // Only container-based sandboxes need an image / disk hygiene / a runtime bin.
 const CONTAINER_SANDBOXES = new Set(['docker', 'podman']);
 
+// Result-nudge (#678). A weak / non-Claude agent can finish a result-contract
+// job (exit 0, real work done) yet never emit the machine-readable result — the
+// downstream gateway then falls through to its default (e.g. a completed review
+// silently re-waits instead of converging). Rather than accept the empty result,
+// give the agent exactly ONE bounded "emit your result now" turn, feeding back
+// its own prior output, in the SAME workspace. This never redoes work; it only
+// recovers a dropped result. Bounded independently of the main run so a second
+// hang can't double a long idle window.
+const NUDGE_IDLE_TIMEOUT_MS = 120_000;
+const NUDGE_HARD_CAP_MS = 300_000;
+// Cap the prior transcript we echo back so a huge run can't blow the nudge prompt.
+// This is a UTF-16 code-unit (character) cap, not a byte cap: `String.slice`
+// counts code units, so with multi-byte output the byte size may be larger.
+const NUDGE_CONTEXT_CAP_CHARS = 24_000;
+
+// The bespoke prompt for the re-emit turn: derive the status from the work the
+// agent already did, write ONLY the result, change nothing else.
+function buildResultNudgePrompt(priorStdout, { hasResultFile = true } = {}) {
+  const ctx = typeof priorStdout === 'string' ? priorStdout.slice(-NUDGE_CONTEXT_CAP_CHARS) : '';
+  const intro = [
+    'You already completed the task in your previous turn, but you did NOT emit a',
+    'machine-readable result, so the orchestrator cannot read your status and the',
+    'run cannot advance.',
+    '',
+    'Do NOT redo the work, re-run tools, edit files, push, or open/modify a PR. Just',
+    'emit the result for the work you already did: a single flat JSON object of your',
+    'result variables (at minimum {"status":"..."}).',
+    '',
+  ];
+  // When the harness could not create the result file, AGENT_RESULT_FILE is NOT
+  // exported (runAgentJob only sets it for a truthy resultFile), so the usual
+  // "write to $AGENT_RESULT_FILE" instruction is impossible. Lead with the stdout
+  // sentinel in that case so weaker agents don't waste the turn chasing an unset
+  // env var; otherwise keep the file the primary path with the sentinel fallback.
+  const how = hasResultFile
+    ? [
+        'Write it to the file named by the AGENT_RESULT_FILE environment variable, e.g.:',
+        '',
+        '    printf \'%s\' \'{"status":"...","summary":"..."}\' > "$AGENT_RESULT_FILE"',
+        '',
+        'If you truly cannot write that file, print exactly one line: ::nano:result:: {json}',
+      ]
+    : [
+        'The AGENT_RESULT_FILE environment variable is unset/empty in this run, so you',
+        'CANNOT write a result file. Instead, print exactly one line to stdout:',
+        '',
+        '    ::nano:result:: {"status":"...","summary":"..."}',
+      ];
+  return [
+    ...intro,
+    ...how,
+    '',
+    'Your previous output (reference — derive the status/summary from it):',
+    '-----',
+    ctx,
+  ].join('\n');
+}
+
+// Given a finished agent run, decide whether it dropped its result and, if so,
+// perform ONE re-emit nudge via the injected `rerun(nudgeText)` (which re-invokes
+// the agent in the same workspace, writing to the same AGENT_RESULT_FILE).
+// `rerun` is injected so this is unit-testable without a real model. Returns the
+// (possibly appended) stdout and whether a nudge was attempted; the caller reads
+// the structured result from the result file / stdout afterwards as usual.
+// Cap a string to MAX_CAPTURE_BYTES of UTF-8 keeping the TAIL (so a trailing
+// `::nano:result::` sentinel / fenced JSON block survives the trim) and skipping
+// any partial leading continuation byte so we start on a char boundary. Mirrors
+// the per-stream capture cap for the nudge's post-concatenation stdout. Returns
+// `{ text, truncated }`.
+function capStdoutTail(s) {
+  const buf = Buffer.from(s, 'utf8');
+  if (buf.length <= MAX_CAPTURE_BYTES) return { text: s, truncated: false };
+  let start = buf.length - MAX_CAPTURE_BYTES;
+  while (start < buf.length && (buf[start] & 0xc0) === 0x80) start += 1;
+  return { text: buf.subarray(start).toString('utf8'), truncated: true };
+}
+
+async function resolveAgentResultWithNudge({ result, resultFile, rerun, logger, logPrefix = '' }) {
+  const stdout0 = result && typeof result.stdout === 'string' ? result.stdout : '';
+  // A parsed result only counts as usable if it still carries at least one
+  // *effective* var after sanitizeResultVars strips the reserved / io.nanobpm.* /
+  // proto keys. An empty `{}` or a reserved-keys-only object leaves downstream
+  // gateways with no status/decision vars — exactly the dropped-result case the
+  // nudge exists to recover — so gate on effective vars, not raw object presence.
+  const hasUsableResult = (parsed) => Object.keys(sanitizeResultVars(parsed)).length > 0;
+  const already = readAgentResultFile(resultFile) ?? parseResultFromStdout(stdout0);
+  // Only nudge a clean run that produced NO usable result but DID produce output
+  // (silence means a crash/hang the idle path already handles, not a dropped result).
+  // A null `resultFile` (temp-dir creation failed) is NOT a reason to skip: the
+  // read-back already falls through to `parseResultFromStdout`, and the nudge
+  // prompt explicitly offers the `::nano:result::` stdout sentinel, so recovery
+  // still works in stdout-sentinel-only mode.
+  if (hasUsableResult(already) || !result?.ok || !stdout0.trim() || typeof rerun !== 'function') {
+    // No nudge: `stdout0` is the incoming stdout verbatim, so keep the returned
+    // `truncated` flag consistent with it — echo the incoming `result.truncated`
+    // rather than hardcoding false, so callers that trust the return value don't
+    // see an already-truncated stdout reported as untruncated.
+    return { stdout: stdout0, nudged: false, truncated: result?.truncated === true };
+  }
+  let nudge = null;
+  let nudgeError = null;
+  try { nudge = await rerun(buildResultNudgePrompt(stdout0, { hasResultFile: resultFile != null })); } catch (err) { nudge = null; nudgeError = err; }
+  const nudgeOut = nudge && typeof nudge.stdout === 'string' ? nudge.stdout : '';
+  // Re-apply the per-stream capture cap after concatenation: `result.stdout` is
+  // forwarded verbatim into the job vars (`output`) and the audit envelope, so
+  // the nudge must not let the combined output bypass MAX_CAPTURE_BYTES. Keep the
+  // tail so a `::nano:result::` sentinel emitted by the nudge survives the trim,
+  // and surface truncation so `result.truncated` stays honest.
+  const capped = capStdoutTail(nudgeOut ? `${stdout0}\n${nudgeOut}` : stdout0);
+  const stdout = capped.text;
+  // The returned `stdout` still starts with `stdout0`, so if the FIRST turn was
+  // already truncated the returned output is truncated regardless of whether the
+  // post-concatenation cap trimmed anything: an empty/short nudge leaves
+  // `capped.truncated` false even though `stdout0` was clipped. OR in the incoming
+  // flag so `truncated` stays consistent with the returned stdout (and with the
+  // no-nudge early return above).
+  const truncated = result?.truncated === true || capped.truncated;
+  const recovered = hasUsableResult(readAgentResultFile(resultFile) ?? parseResultFromStdout(stdout));
+  if (nudgeError && logger?.warn) {
+    logger.warn(`${logPrefix} re-emit nudge rerun threw — ${nudgeError?.message ?? nudgeError}`);
+  }
+  if (logger?.info) {
+    logger.info(recovered
+      ? `${logPrefix} no result on the first turn — recovered it via one re-emit nudge`
+      : `${logPrefix} no result on the first turn — re-emit nudge did not recover one`);
+  }
+  return { stdout, nudged: true, truncated };
+}
+
 function coerceBool(v, dflt = false) {
   if (typeof v === 'boolean') return v;
   if (v == null) return dflt;
@@ -5159,6 +5288,31 @@ function buildAgentPayload(profile, job, envelope) {
   };
 }
 
+// Build the exact bytes handed to the harness on stdin for a run (#678).
+//
+// Normal run: the JSON job envelope from `buildAgentPayload`. Every non-ACP
+// harness (pipe/PTY/container) reads that JSON off stdin, so the shape is a
+// contract — a re-emit nudge must NOT replace it with a bare string or the
+// harness fails to parse its job. So when a `nudgePayload` (the bounded "re-emit
+// your result" prompt) is present:
+//   - ACP delivers stdin verbatim as the `session/prompt` text, so it takes the
+//     raw nudge string.
+//   - Non-ACP keeps the JSON envelope and overrides its prompt fields (top-level
+//     `prompt` and the reserved `task.task.prompt`, i.e. `envelope.task.prompt`)
+//     so a harness that dispatches on either sees the nudge. The shared envelope
+//     is copied, never mutated.
+function buildAgentStdin(profile, job, envelope, { nudgePayload = null, acp = false } = {}) {
+  if (nudgePayload == null) return JSON.stringify(buildAgentPayload(profile, job, envelope));
+  const nudgeText = String(nudgePayload);
+  if (acp) return nudgeText;
+  const base = buildAgentPayload(profile, job, envelope);
+  base.prompt = nudgeText;
+  if (isPlainObject(base.task) && isPlainObject(base.task.task)) {
+    base.task = { ...base.task, task: { ...base.task.task, prompt: nudgeText } };
+  }
+  return JSON.stringify(base);
+}
+
 function baseAgentEnv(profile, job) {
   return {
     AGENT_PROFILE: profile.name,
@@ -5254,10 +5408,17 @@ function startLockExtender(job, windowMs, intervalMs, tag, logger) {
  * Both paths resolve to the same result contract.
  */
 function runAgentJob(profile, job, opts = {}) {
-  const { timeoutMs, idleTimeoutMs, recoveryWindowMs, envelope, sandbox = 'none', image, runId, secretEnv = {}, passThroughSecretNames = [], cwd, extraEnv = {}, profileEnv = {}, resultFile, stream = false, streamPrefix = '', onStreamOut, onStreamErr, args: commandArgs, terminal = 'pipe', protocol = 'pipe', permission = 'yolo', relaySession = null, ptyFactory } = opts;
+  const { timeoutMs, idleTimeoutMs, recoveryWindowMs, envelope, sandbox = 'none', image, runId, secretEnv = {}, passThroughSecretNames = [], cwd, extraEnv = {}, profileEnv = {}, resultFile, stream = false, streamPrefix = '', onStreamOut, onStreamErr, args: commandArgs, terminal = 'pipe', protocol = 'pipe', permission = 'yolo', relaySession = null, ptyFactory, nudgePayload = null } = opts;
   // #110: `protocol`/`permission` drive the ACP executor branch below. The
   // pipe/PTY paths are unchanged, so `protocol === 'pipe'` behaviour is identical.
-  const payload = JSON.stringify(buildAgentPayload(profile, job, envelope));
+  // A `nudgePayload` (#678) carries the bespoke "re-emit your result" prompt for a
+  // bounded second turn in the SAME workspace; everything else (env, cwd, command,
+  // result file) is identical to the main run. ACP delivers stdin as the prompt
+  // text so it takes the raw nudge; every non-ACP harness reads the JSON envelope
+  // off stdin, so there we keep the envelope and override its prompt fields
+  // (buildAgentStdin). Container sandboxes ignore `protocol` (pipe-only today).
+  const acpStdin = protocol === 'acp' && !CONTAINER_SANDBOXES.has(sandbox);
+  const payload = buildAgentStdin(profile, job, envelope, { nudgePayload, acp: acpStdin });
   const agentEnv = baseAgentEnv(profile, job);
   // The harness command line: the profile command plus its structured switches
   // (persisted `--arg`s, possibly extended at work time via opts.args), each
@@ -7255,7 +7416,7 @@ async function workAgent(req, flags) {
             liveRunDirs.add(resultDir);
           } catch { resultDir = null; resultFile = null; }
 
-          result = await runAgentJob(profile, job, {
+          const runOpts = {
             timeoutMs: effectiveHardCapMs,
             idleTimeoutMs: effectiveIdleTimeoutMs,
             recoveryWindowMs: effectiveRecoveryWindowMs,
@@ -7286,7 +7447,42 @@ async function workAgent(req, flags) {
             // spying never corrupts a structured/JSON output mode.
             onStreamOut: stream ? (line) => logger.info(line) : undefined,
             onStreamErr: stream ? (line) => logger.warn(line) : undefined,
-          });
+          };
+          result = await runAgentJob(profile, job, runOpts);
+
+          // Gap 2 (#678): a clean run that emitted no machine-readable result gets
+          // ONE bounded re-emit nudge in the same workspace, feeding back its own
+          // output, before we accept an empty result. Runs before finalizeGit so
+          // the workspace/result file are still live; the nudge changes no code.
+          // Not gated on `resultFile`: when the temp dir/file could not be created
+          // the result is recoverable only via the stdout `::nano:result::`
+          // sentinel, which `resolveAgentResultWithNudge` handles directly.
+          if (result.ok) {
+            const { stdout, nudged, truncated } = await resolveAgentResultWithNudge({
+              result,
+              resultFile,
+              logger,
+              logPrefix: `[${jobType}] job ${job.jobKey}:`,
+              rerun: (nudgeText) => runAgentJob(profile, job, {
+                ...runOpts,
+                nudgePayload: nudgeText,
+                stream: false,
+                idleTimeoutMs: Math.min(effectiveIdleTimeoutMs || NUDGE_IDLE_TIMEOUT_MS, NUDGE_IDLE_TIMEOUT_MS),
+                // Cap the recovery/probe window to the same 120s idle bound: it is
+                // used by createIdleLivenessMonitor as the probe window when >0, so
+                // inheriting the (possibly minutes-long) `effectiveRecoveryWindowMs`
+                // from runOpts would let a silent nudge run outlive the intended
+                // 120s idle bound and delay convergence on a wedged second turn.
+                recoveryWindowMs: Math.min(effectiveRecoveryWindowMs || NUDGE_IDLE_TIMEOUT_MS, NUDGE_IDLE_TIMEOUT_MS),
+                timeoutMs: Math.min(effectiveHardCapMs || NUDGE_HARD_CAP_MS, NUDGE_HARD_CAP_MS) || NUDGE_HARD_CAP_MS,
+              }),
+            });
+            result.stdout = stdout;
+            if (nudged) {
+              result.nudgedForResult = true;
+              if (truncated) result.truncated = true;
+            }
+          }
 
           // Finalize git only when the harness succeeded — never push a
           // half-finished workspace.
@@ -11991,11 +12187,14 @@ export {
   makeSecretResolver,
   hostEnvSecretResolver,
   buildAgentPayload,
+  buildAgentStdin,
   buildResultEnvelope,
   parseAgentResultObject,
   readAgentResultFile,
   parseResultFromStdout,
   sanitizeResultVars,
+  buildResultNudgePrompt,
+  resolveAgentResultWithNudge,
   parseEnvPairs,
   normalizeEnvMap,
   normalizeArgList,

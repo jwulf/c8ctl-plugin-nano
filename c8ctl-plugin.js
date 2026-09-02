@@ -6327,7 +6327,7 @@ function agenticChannelIsStale({
  *
  * @param {{
  *   everConnected: () => boolean,
- *   presenceHealthySince: () => (number|null),
+ *   presenceHealthySince?: () => (number|null),
  *   now?: () => number,
  *   staleAfterMs?: number,
  * }} opts

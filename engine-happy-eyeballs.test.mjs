@@ -81,9 +81,34 @@ test('missing the timeout setter still asserts the family default (partial API)'
   assert.equal(familyValue, true);
 });
 
+test('a non-object arg (null) fails open instead of throwing', () => {
+  // The reviewer's concern was that `null` threw during destructuring. It must
+  // now be swallowed like any other bad input: no throw, boolean result.
+  assert.doesNotThrow(() => enableEngineHappyEyeballs(null));
+  assert.equal(typeof enableEngineHappyEyeballs(null), 'boolean');
+});
+
+test('a throwing optional timeout setter does not retract the family default', () => {
+  let familyValue;
+  const net = {
+    setDefaultAutoSelectFamily: (v) => { familyValue = v; },
+    setDefaultAutoSelectFamilyAttemptTimeout: () => { throw new Error('boom'); },
+  };
+  // Primary default was asserted, so the contract holds even though the
+  // optional timeout refinement threw.
+  assert.equal(enableEngineHappyEyeballs({ net }), true);
+  assert.equal(familyValue, true);
+});
+
 test('default seam flips the real process-wide net default to Happy-Eyeballs', () => {
   const prev = typeof net.getDefaultAutoSelectFamily === 'function'
     ? net.getDefaultAutoSelectFamily()
+    : undefined;
+  // Capture the attempt-timeout default too: the helper mutates it as well, and
+  // node --test can run files concurrently, so leaking a changed process-wide
+  // default here could cause order-dependent failures in other test files.
+  const prevTimeout = typeof net.getDefaultAutoSelectFamilyAttemptTimeout === 'function'
+    ? net.getDefaultAutoSelectFamilyAttemptTimeout()
     : undefined;
   try {
     if (typeof net.setDefaultAutoSelectFamily === 'function') {
@@ -98,6 +123,9 @@ test('default seam flips the real process-wide net default to Happy-Eyeballs', (
   } finally {
     if (prev !== undefined && typeof net.setDefaultAutoSelectFamily === 'function') {
       net.setDefaultAutoSelectFamily(prev);
+    }
+    if (prevTimeout !== undefined && typeof net.setDefaultAutoSelectFamilyAttemptTimeout === 'function') {
+      net.setDefaultAutoSelectFamilyAttemptTimeout(prevTimeout);
     }
   }
 });

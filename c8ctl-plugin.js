@@ -6072,13 +6072,23 @@ function buildActivityPayload({ pid, updatedAt, jobs, engine, agentic }) {
  * @param {{ net?: object, attemptTimeoutMs?: number }} [opts] injection seam for tests
  * @returns {boolean} true if the net default was (re)asserted to Happy-Eyeballs
  */
-function enableEngineHappyEyeballs({ net = nodeNet, attemptTimeoutMs = 250 } = {}) {
+function enableEngineHappyEyeballs(opts = {}) {
   try {
+    // Destructure INSIDE the try so a non-object arg (e.g. `null`) fails open
+    // like any other throw rather than blowing up before the guard.
+    const { net = nodeNet, attemptTimeoutMs = 250 } = opts || {};
     if (net && typeof net.setDefaultAutoSelectFamily === 'function') {
       net.setDefaultAutoSelectFamily(true);
-      if (typeof net.setDefaultAutoSelectFamilyAttemptTimeout === 'function'
-          && Number.isFinite(attemptTimeoutMs) && attemptTimeoutMs > 0) {
-        net.setDefaultAutoSelectFamilyAttemptTimeout(attemptTimeoutMs);
+      // The attempt timeout is an optional refinement: once the primary family
+      // default is asserted the contract is satisfied, so a throw here must not
+      // retract our `true`. Swallow it independently.
+      try {
+        if (typeof net.setDefaultAutoSelectFamilyAttemptTimeout === 'function'
+            && Number.isFinite(attemptTimeoutMs) && attemptTimeoutMs > 0) {
+          net.setDefaultAutoSelectFamilyAttemptTimeout(attemptTimeoutMs);
+        }
+      } catch {
+        // Fail-open on the optional timeout setter; the family default still holds.
       }
       return true;
     }

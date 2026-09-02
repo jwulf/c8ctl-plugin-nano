@@ -306,3 +306,25 @@ test('startAgenticChannelWatchdog: a heal that throws does not wedge the watchdo
   assert.equal(calls, 2, 'the re-entrancy guard is released even when a heal throws');
   wd.stop();
 });
+
+test('startAgenticChannelWatchdog: after stop() a tick is a no-op (no heal during teardown)', async () => {
+  const h = timerHarness();
+  const ch = fakeChannel({ open: false, ever: true, since: 0 });
+  let calls = 0;
+  const wd = startAgenticChannelWatchdog({
+    getChannel: () => ch,
+    disconnectedSince: () => ch.state.since,
+    onStale: () => { calls += 1; },
+    staleAfterMs: 10_000,
+    now: h.now,
+    setIntervalFn: h.setIntervalFn,
+    clearIntervalFn: h.clearIntervalFn,
+  });
+  // The channel is well past the threshold — a tick would heal…
+  h.advance(20_000);
+  // …but shutdown has already run, so any in-flight/scheduled tick must no-op
+  // and can never re-open the channel mid-teardown.
+  wd.stop();
+  await wd.tick();
+  assert.equal(calls, 0, 'stop() latches the watchdog so a stale tick never reaches onStale');
+});

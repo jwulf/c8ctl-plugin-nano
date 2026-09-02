@@ -6143,8 +6143,11 @@ function agenticChannelIsStale({
  * condition with a successful heal does not retrigger the heal on every tick. Re-entrancy is
  * guarded so a slow heal never overlaps a later tick. Timers, clock, and the
  * channel accessors are injectable so this is unit-testable without real waits.
- * Returns a `{ stop, tick }` handle — `stop()` clears the timer (shutdown), and
- * `tick()` runs a single check (tests drive it directly).
+ * Returns a `{ stop, tick }` handle — `stop()` clears the timer AND latches the
+ * watchdog stopped so any tick already scheduled or in flight around shutdown
+ * becomes a no-op before it can reach `onStale` (shutdown relies on this to
+ * prevent a stale-channel resurrection mid-teardown), and `tick()` runs a single
+ * check (tests drive it directly).
  *
  * @param {{
  *   getChannel: () => (import('./work-channel.mjs').WorkChannel | null),
@@ -6171,13 +6174,17 @@ function startAgenticChannelWatchdog({
   logger = null,
 } = {}) {
   let healing = false;
+  // Set once `stop()` runs so any tick already scheduled/in flight around
+  // shutdown becomes a no-op and can never re-open the channel mid-teardown
+  // (shutdown relies on `stop()` to prevent a stale-channel resurrection).
+  let stopped = false;
   // Per-episode latch: fire `onStale` exactly once when a connected channel goes
   // stale, and don't fire again until it recovers (a fresh episode). Without this
   // the helper would re-heal on every tick whenever `onStale` does not itself
   // clear the staleness signal, causing repeated teardown/re-discovery attempts.
   let firedForEpisode = false;
   const tick = async () => {
-    if (healing) return; // a heal is in flight — don't stack a second re-discovery
+    if (stopped || healing) return; // shutting down, or a heal is in flight — don't stack a second re-discovery
     const ch = typeof getChannel === 'function' ? getChannel() : null;
     // No channel object → the initial open or the cold-start self-heal loop owns
     // recovery; the watchdog only guards a channel that HAS connected and stalled.
@@ -6197,6 +6204,7 @@ function startAgenticChannelWatchdog({
     healing = true;
     firedForEpisode = true;
     try {
+      if (stopped) return; // shutdown raced us between the checks — do not heal
       const since = disconnectedSince();
       const downFor = since != null ? Math.round((now() - since) / 1000) : '?';
       logger?.warn?.(`  agentic channel: no reconnect ${downFor}s after drop — forcing re-discovery (the client lib did not self-heal; likely a half-open drop).`);
@@ -6210,7 +6218,7 @@ function startAgenticChannelWatchdog({
   };
   const timer = setIntervalFn(() => { tick().catch(() => {}); }, intervalMs);
   if (timer && typeof timer.unref === 'function') timer.unref();
-  return { stop: () => { try { clearIntervalFn(timer); } catch { /* best effort */ } }, tick };
+  return { stop: () => { stopped = true; try { clearIntervalFn(timer); } catch { /* best effort */ } }, tick };
 }
 
 /**

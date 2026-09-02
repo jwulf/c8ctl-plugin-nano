@@ -7688,9 +7688,12 @@ async function workAgent(req, flags) {
           if (isContainer) liveRunIds.delete(runId);
           if (runDir && !keepRuns) { try { rmSync(runDir, { recursive: true, force: true }); } catch { /* best effort */ } }
           if (runDir) liveRunDirs.delete(runDir);
-          // Detach the relay session's inbound-frame subscription so it never
-          // outlives the job or leaks a steer listener across jobs.
-          if (relaySession) { try { relaySession.close(); } catch { /* best effort */ } }
+          // Emit the relay session's `phase:close` lifecycle event and drain its
+          // outbound buffer before the job settles (so the live-terminal tail is
+          // flushed, nanobpm/nano-workforce#710), then detach its inbound-frame
+          // subscription so it never outlives the job or leaks a steer listener
+          // across jobs. Bounded internally — a hub outage never wedges completion.
+          if (relaySession) { try { await relaySession.close(); } catch { /* best effort */ } }
         }
 
         // Read the agent's structured result: the file it wrote, else a stdout

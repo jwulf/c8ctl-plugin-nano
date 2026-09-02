@@ -13,6 +13,7 @@ import {
   parseInboundRelayChunk,
   createRelaySession,
   RELAY_OPEN_CHUNK,
+  RELAY_CLOSE_CHUNK,
 } from './work-relay.mjs';
 import { runAgentJob, spawnCapturePty } from './c8ctl-plugin.js';
 
@@ -176,6 +177,113 @@ test('close() detaches the steer subscription', () => {
   assert.equal(ch.subscribed, true);
   session.close();
   assert.equal(ch.subscribed, false);
+});
+
+// ---- createRelaySession: close emits phase:close + drains (fixes #150) -----
+
+// A fake WorkChannel that also models C4's outbound buffer via a controllable
+// buffered() count, so the drain-before-completion path is exercisable.
+function bufferedChannel({ initialBuffered = 0 } = {}) {
+  const produced = [];
+  let buffered = initialBuffered;
+  return {
+    relayLane: () => ({ relay: (stream, chunk) => produced.push({ stream, chunk }) }),
+    client: { onFrame: () => () => {} },
+    produced,
+    buffered: () => buffered,
+    setBuffered: (n) => { buffered = n; },
+    get bufferedValue() { return buffered; },
+  };
+}
+
+test('close() emits exactly one phase:close marker as the final frame and flushes every relayed chunk (fixes the truncated tail)', async () => {
+  const ch = fakeChannel();
+  const session = createRelaySession({ channel: ch, jobKey: '4242' });
+
+  // Relay N chunks (the agent's live terminal), then the agent exits and the job
+  // completes → close(). Today (pre-fix) there is no close frame and the tail can
+  // be abandoned unsent; the fix emits phase:close and drains before completion.
+  const N = 5;
+  for (let i = 0; i < N; i += 1) session.relay(`chunk-${i}\n`);
+
+  const res = await session.close();
+  assert.equal(res.closeEmitted, true);
+  assert.equal(res.drained, true);
+  assert.equal(res.timedOut, false);
+
+  // Every relayed chunk was carried on the stream (no truncated tail).
+  for (let i = 0; i < N; i += 1) {
+    assert.ok(ch.produced.some((f) => f.stream === 'job:4242' && f.chunk === `chunk-${i}\n`), `chunk-${i} flushed`);
+  }
+  // Exactly one phase:close marker, and it is the final frame on the stream.
+  const closeFrames = ch.produced.filter((f) => f.chunk === RELAY_CLOSE_CHUNK);
+  assert.equal(closeFrames.length, 1);
+  assert.equal(ch.produced.at(-1).chunk, RELAY_CLOSE_CHUNK);
+  assert.equal(ch.produced.at(-1).stream, 'job:4242');
+  // The marker is a canonical lifecycle/close event (single-sourced encode).
+  const marker = JSON.parse(RELAY_CLOSE_CHUNK);
+  assert.equal(marker.kind, 'lifecycle');
+  assert.equal(marker.phase, 'close');
+});
+
+test('close() awaits the outbound buffer draining to zero before it resolves', async () => {
+  const ch = bufferedChannel({ initialBuffered: 3 });
+  let clock = 0;
+  const now = () => clock;
+  // Each poll advances the clock and drains one buffered frame — the hub catching up.
+  const sleep = async (ms) => { clock += ms; ch.setBuffered(Math.max(0, ch.bufferedValue - 1)); };
+
+  const session = createRelaySession({
+    channel: ch, jobKey: '1', drainTimeoutMs: 10_000, drainPollMs: 5, sleep, now,
+  });
+  const res = await session.close();
+
+  assert.equal(res.drained, true);
+  assert.equal(res.timedOut, false);
+  assert.equal(ch.bufferedValue, 0);
+});
+
+test('close() is bounded: a stalled sink times out and completes anyway rather than wedging the job', async () => {
+  const ch = bufferedChannel({ initialBuffered: 5 });
+  let clock = 0;
+  const now = () => clock;
+  // The hub is out: sleeping advances time but never drains the buffer.
+  const sleep = async (ms) => { clock += ms; };
+
+  const session = createRelaySession({
+    channel: ch, jobKey: '2', drainTimeoutMs: 100, drainPollMs: 10, sleep, now,
+  });
+  const res = await session.close();
+
+  // Resolves (never hangs) with the timeout signalled; the close marker still went out.
+  assert.equal(res.closeEmitted, true);
+  assert.equal(res.drained, false);
+  assert.equal(res.timedOut, true);
+  assert.ok(ch.produced.some((f) => f.chunk === RELAY_CLOSE_CHUNK));
+});
+
+test('close() is idempotent: a second call re-emits nothing and does not re-drain', async () => {
+  const ch = fakeChannel();
+  const session = createRelaySession({ channel: ch, jobKey: '77' });
+  await session.close();
+  const afterFirst = ch.produced.length;
+  const closeCount = ch.produced.filter((f) => f.chunk === RELAY_CLOSE_CHUNK).length;
+  assert.equal(closeCount, 1);
+
+  const res = await session.close();
+  assert.equal(res.closeEmitted, true);
+  assert.equal(ch.produced.length, afterFirst);
+  assert.equal(ch.produced.filter((f) => f.chunk === RELAY_CLOSE_CHUNK).length, 1);
+});
+
+test('close() drains without a buffered() accessor (older channel) and never throws', async () => {
+  // The bare fakeChannel exposes no buffered() — close() must treat it as already
+  // drained rather than block or crash.
+  const ch = fakeChannel();
+  const session = createRelaySession({ channel: ch, jobKey: '88' });
+  const res = await session.close();
+  assert.equal(res.drained, true);
+  assert.equal(res.timedOut, false);
 });
 
 // ---- spawnCapturePty: PTY allocation + relay + steer ----------------------

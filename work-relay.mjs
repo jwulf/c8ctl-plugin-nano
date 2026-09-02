@@ -63,6 +63,36 @@ export const RELAY_OPEN_CHUNK = `${agenticTranscript.encodeTranscriptEvent({
 })}\n`;
 
 /**
+ * The final produce frame emitted on a relay stream the instant a session is
+ * closed: the closing twin of {@link RELAY_OPEN_CHUNK} — a canonical
+ * `@nanobpm/agentic` lifecycle "close" transcript event.
+ *
+ * It carries no agent output — its sole job is to CLOSE the `job:<jobKey>`
+ * stream so the app can flush the durable transcript deterministically at job
+ * completion (nanobpm/nano-workforce#710), instead of relying only on the
+ * supersede/disconnect fallback (which can abandon the tail frames). Without it,
+ * a completed job's live-terminal transcript is truncated at the tail. Emitted
+ * from {@link RelaySession.close} before the outbound buffer is drained, so the
+ * close marker itself rides the same buffered, QoS-ordered relay lane as the
+ * agent's output (and survives a brief hub outage via C4's ring where possible).
+ * Newline-framed to match `RELAY_OPEN_CHUNK`, and derived through
+ * `encodeTranscriptEvent` (never hand-rolled) so the wire marker stays
+ * single-sourced in `@nanobpm/agentic`.
+ */
+export const RELAY_CLOSE_CHUNK = `${agenticTranscript.encodeTranscriptEvent({
+  kind: 'lifecycle',
+  phase: 'close',
+})}\n`;
+
+/** Default bound on the outbound-buffer drain at session close (ms). A hub
+ * outage must never wedge job completion, so the drain is always bounded: on
+ * timeout the caller completes anyway and the app's supersede/disconnect
+ * fallback still eventually flushes whatever arrived. */
+export const DEFAULT_DRAIN_TIMEOUT_MS = 2_000;
+/** Default poll cadence while awaiting `channel.buffered() → 0` (ms). */
+export const DEFAULT_DRAIN_POLL_MS = 25;
+
+/**
  * Resolve a role's terminal mode — whether the agent harness for this role gets
  * a full PTY or a plain pipe. Honors the vocab's per-role opt-in: a role may set
  * `terminal: 'pty' | 'pipe'` (preferred) or the boolean shorthand `pty: true`.
@@ -113,7 +143,7 @@ export function parseInboundRelayChunk(frame, stream) {
  * @property {string} stream the relay stream name (derived from the jobKey)
  * @property {(chunk: string|Uint8Array) => void} relay publish one framed, jobKey-tagged output chunk on the relay lane
  * @property {(write: (chunk: string) => void) => (() => void)} attachSteer wire inbound steer bytes for this stream to `write`; returns a detach fn
- * @property {() => void} close detach any steer subscription
+ * @property {() => Promise<{ closeEmitted: boolean, drained: boolean, timedOut: boolean }>} close emit the `phase:close` lifecycle event, detach any steer subscription, then drain the outbound buffer (bounded)
  */
 
 /**
@@ -132,9 +162,21 @@ export function parseInboundRelayChunk(frame, stream) {
  * @param {import('./work-channel.mjs').WorkChannel} opts.channel the C2 channel holder (NOT re-instantiated)
  * @param {string|number} opts.jobKey the activated job's key; tags every frame and names the stream
  * @param {{ warn?: Function, debug?: Function }} [opts.logger]
+ * @param {number} [opts.drainTimeoutMs] bound on the close-time outbound-buffer drain (ms); a hub outage must never wedge completion
+ * @param {number} [opts.drainPollMs] poll cadence while awaiting `channel.buffered() → 0` (ms)
+ * @param {(ms: number) => Promise<void>} [opts.sleep] injectable delay (tests); defaults to a `setTimeout` promise
+ * @param {() => number} [opts.now] injectable clock (tests); defaults to `Date.now`
  * @returns {RelaySession}
  */
-export function createRelaySession({ channel, jobKey, logger } = {}) {
+export function createRelaySession({
+  channel,
+  jobKey,
+  logger,
+  drainTimeoutMs = DEFAULT_DRAIN_TIMEOUT_MS,
+  drainPollMs = DEFAULT_DRAIN_POLL_MS,
+  sleep = (ms) => new Promise((resolve) => setTimeout(resolve, ms)),
+  now = () => Date.now(),
+} = {}) {
   if (!channel || typeof channel.relayLane !== 'function') {
     throw new Error('createRelaySession requires a WorkChannel with a relayLane() accessor');
   }
@@ -207,8 +249,56 @@ export function createRelaySession({ channel, jobKey, logger } = {}) {
     return detach;
   };
 
+  // The outbound-buffer drain: poll `channel.buffered()` down to zero, bounded
+  // by drainTimeoutMs. A channel without a buffered() accessor (or one that
+  // throws) is treated as already drained — the drain must never block or crash
+  // completion. Returns whether the buffer emptied and whether we hit the bound.
+  const drain = async () => {
+    if (typeof channel.buffered !== 'function') return { drained: true, timedOut: false };
+    const deadline = now() + Math.max(0, Number(drainTimeoutMs) || 0);
+    for (;;) {
+      let pending;
+      try {
+        pending = channel.buffered();
+      } catch {
+        return { drained: true, timedOut: false };
+      }
+      if (!(Number(pending) > 0)) return { drained: true, timedOut: false };
+      if (now() >= deadline) {
+        try {
+          log.warn?.(`relay drain timed out for ${stream}: ${pending} frame(s) still buffered; completing anyway`);
+        } catch {
+          /* never let a logging failure escape the drain path */
+        }
+        return { drained: false, timedOut: true };
+      }
+      await sleep(Math.max(1, Number(drainPollMs) || 1));
+    }
+  };
+
+  // close() is idempotent: a second call returns the same settled promise
+  // without re-emitting the close marker or re-draining.
+  let closed = false;
+  let closedPromise = Promise.resolve({ closeEmitted: false, drained: true, timedOut: false });
   const close = () => {
+    if (closed) return closedPromise;
+    closed = true;
+    // Emit the closing lifecycle twin of RELAY_OPEN_CHUNK FIRST, so the app can
+    // flush the durable transcript deterministically at completion
+    // (nanobpm/nano-workforce#710). Routed through the internal relay(), which
+    // swallows sink errors, so emitting the close marker never fails the job. It
+    // rides the same buffered relay lane as the agent's output, and is included
+    // in the drain below.
+    relay(RELAY_CLOSE_CHUNK);
+    // Detach every steer subscription so none outlives the job.
     for (const detach of [...activeDetaches]) detach();
+    // Then drain the outbound buffer — a bounded await until the agent's tail
+    // bytes (and the close marker) are actually transmitted before the job
+    // settles. The bound is essential: a hub outage must not wedge completion,
+    // so on timeout we resolve anyway (the app's supersede/disconnect fallback
+    // still eventually flushes what arrived).
+    closedPromise = drain().then((res) => ({ closeEmitted: true, ...res }));
+    return closedPromise;
   };
 
   // Open the stream the instant the session exists, so the app correlates

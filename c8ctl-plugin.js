@@ -6724,7 +6724,12 @@ async function workAgent(req, flags) {
         // point activation surfaces as a handler call, is the cross-poller gate
         // the per-type maxParallelJobs cannot provide.
         if (!singleFlight.tryAcquire()) {
-          const retries = Math.max(1, Number(job.retries) || 1); // not a failure — keep retries
+          // Not a failure — preserve the broker-provided retries verbatim so
+          // re-dispatch doesn't decrement (or resurrect) the job. Keep a real 0
+          // as 0 (an already-incidentable job must stay that way); only default
+          // to 1 when the count is missing/invalid.
+          const rawRetries = Number(job.retries);
+          const retries = Number.isInteger(rawRetries) && rawRetries >= 0 ? rawRetries : 1;
           logger.info(`[${jobType}] job ${job.jobKey} deferred — worker already running another job; releasing lease for re-dispatch.`);
           return job.fail({
             errorMessage: 'worker busy: one job per worker (single-flight across all job types)',

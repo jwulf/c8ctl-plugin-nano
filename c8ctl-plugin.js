@@ -135,6 +135,11 @@ const READINESS_TIMEOUT_MS = 60_000;
 const READINESS_POLL_MS = 500;
 const HEALTH_TIMEOUT_MS = 1_500;
 const STOP_GRACE_MS = 8_000;
+// Backoff applied when a poller fails a lease fast because the worker is already
+// running another job (issue #142 single-flight). Long enough that the deferred
+// job doesn't tight-loop re-activating while the first runs, short enough that it
+// is picked up promptly once the worker frees up.
+const WORKER_BUSY_RETRY_BACKOFF_MS = 5_000;
 // Upper bound on one `--auto` engine-read reconcile (enumerate deployed
 // definitions + fetch each BPMN). A read that stalls past this is treated as a
 // transient failure so the running poller set is KEPT and, crucially, shutdown
@@ -5165,6 +5170,44 @@ function baseAgentEnv(profile, job) {
 }
 
 /**
+ * Process-wide single-flight guard (issue #142).
+ *
+ * `maxParallelJobs = 1` only caps concurrency WITHIN one job-type poller, but a
+ * single `work` process runs one poller per job type (rank×capability matrix, or
+ * every deployed agent type under `--auto`). Without a shared gate a worker
+ * serving N job types could lease and run up to N jobs at once — each holding its
+ * own PTY + git workspace + broker lock-extender — the exact failure the
+ * "one job per worker" invariant exists to prevent.
+ *
+ * This is a capacity-1, non-blocking mutex shared by EVERY per-type poller: the
+ * first poller to `tryAcquire()` runs its job to completion (releasing in a
+ * `finally`); any other poller that finds the permit already held must NOT begin
+ * a second job (the caller fails the lease fast so the broker re-queues it rather
+ * than leaving it "claimed but idle"). `tryAcquire`/`release` are synchronous
+ * check-and-set, so the single-threaded event loop makes them race-free across
+ * the concurrently-invoked async job handlers.
+ */
+function createSingleFlight() {
+  let held = false;
+  return {
+    /** Take the permit if free; returns false when a job is already in flight. */
+    tryAcquire() {
+      if (held) return false;
+      held = true;
+      return true;
+    },
+    /** Release the permit. Idempotent: redundant calls are safe no-ops, though the normal path releases once per acquire (in a `finally`). */
+    release() {
+      held = false;
+    },
+    /** True while a job holds the permit. */
+    get busy() {
+      return held;
+    },
+  };
+}
+
+/**
  * Keep a leased job's broker activation lock ahead of *now* while the harness is
  * running, so a long agent run never has its lock lapse and get re-activated (a
  * second worker starting → the classic stale complete/fail 409). The lock is NOT
@@ -6266,6 +6309,13 @@ async function workAgent(req, flags) {
   // SDK derives maxJobsToActivate = maxParallelJobs - activeJobs, so 1 means
   // "activate one job, then stop polling until it completes".
   const maxParallelJobs = 1;
+  // Process-wide single-flight guard (issue #142). The SDK's maxParallelJobs=1
+  // only serializes ONE job-type poller, but this process runs one poller per
+  // job type, so nothing stops N pollers from each leasing + running a job
+  // concurrently. This capacity-1 mutex, shared by every poller's jobHandler,
+  // enforces the real "one job per worker" invariant: while any job is in flight
+  // on any job type, no other poller starts a second one.
+  const singleFlight = createSingleFlight();
   // The broker job-activation lock is NOT hardcoded up front. A fixed timeout is
   // impossible to size for an agent: too short reclaims a still-working job (a
   // second agent starts + the stale complete/fail is rejected 409), too long
@@ -6465,7 +6515,7 @@ async function workAgent(req, flags) {
   }
   const extraNote = extraJobTypes.length > 0 ? ` (${extraJobTypes.length} via --job-type)` : '';
   logger.info(`  listening on ${jobTypes.length} job type(s)${extraNote}: ${jobTypes.join('  ')}`);
-  logger.info(`  one job per worker; recovery window: ${recoveryWindowMs}ms; idle timeout: ${idleTimeoutMs}ms; hard cap: ${hardCapMs > 0 ? `${hardCapMs}ms` : 'off'}; poll timeout: ${pollTimeoutMs}ms`);
+  logger.info(`  one job per worker (single-flight across all ${jobTypes.length} job type(s)); recovery window: ${recoveryWindowMs}ms; idle timeout: ${idleTimeoutMs}ms; hard cap: ${hardCapMs > 0 ? `${hardCapMs}ms` : 'off'}; poll timeout: ${pollTimeoutMs}ms`);
   // Warm the gh-token cache now, off the job-handling path: githubCloneToken()
   // may consult `gh auth token` (a synchronous spawn, up to 10s) as its default
   // credential fallback, and doing that inside a job handler would block the
@@ -6753,6 +6803,27 @@ async function workAgent(req, flags) {
       jobTimeoutMs: recoveryWindowMs,
       pollTimeoutMs,
       jobHandler: async (job) => {
+        // Process-wide single-flight (issue #142): if another job is already
+        // running on ANY poller, do not start a second harness. Fail this lease
+        // FAST — before recording it active, extending its lock, or provisioning
+        // anything — so the broker re-queues it (retries preserved) instead of it
+        // sitting "claimed but idle" while the first job runs. Gating here, at the
+        // point activation surfaces as a handler call, is the cross-poller gate
+        // the per-type maxParallelJobs cannot provide.
+        if (!singleFlight.tryAcquire()) {
+          // Not a failure — preserve the broker-provided retries verbatim so
+          // re-dispatch doesn't decrement (or resurrect) the job. Keep a real 0
+          // as 0 (an already-incidentable job must stay that way); only default
+          // to 1 when the count is missing/invalid.
+          const rawRetries = Number(job.retries);
+          const retries = Number.isInteger(rawRetries) && rawRetries >= 0 ? rawRetries : 1;
+          logger.info(`[${jobType}] job ${job.jobKey} deferred — worker already running another job; releasing lease for re-dispatch.`);
+          return job.fail({
+            errorMessage: 'worker busy: one job per worker (single-flight across all job types)',
+            retries,
+            retryBackOff: WORKER_BUSY_RETRY_BACKOFF_MS,
+          });
+        }
         recordJobStart(job, jobType);
         // Auto-extend the broker lock for the whole life of this job (harness run
         // + git finalize + complete/fail), stopped in the outer finally. The lock
@@ -7091,6 +7162,10 @@ async function workAgent(req, flags) {
         } finally {
           stopLockExtender();
           recordJobEnd(job);
+          // Release the process-wide single-flight permit LAST, once this job's
+          // lock-extender is stopped and its bookkeeping cleared, so another
+          // poller can only begin after this job is fully settled.
+          singleFlight.release();
         }
       },
     });
@@ -11731,6 +11806,7 @@ export {
   parsePsTime,
   ensureAcpFlag,
   startLockExtender,
+  createSingleFlight,
   provisionRepo,
   finalizeGit,
   describeGitFailure,

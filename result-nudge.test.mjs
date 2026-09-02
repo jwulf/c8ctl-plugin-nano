@@ -184,6 +184,18 @@ test('the nudge does NOT flag truncation when the combined output fits under the
   assert.equal(truncated, false, 'small combined output is not marked truncated');
 });
 
+test('the no-nudge early return echoes the incoming truncated flag (not a hardcoded false)', async () => {
+  // Already-usable result short-circuits the nudge; the returned `stdout` is the
+  // incoming (already truncated) stdout, so the returned `truncated` must reflect
+  // that instead of a hardcoded false.
+  let reruns = 0;
+  const result = { ok: true, stdout: '::nano:result:: {"status":"converged","summary":"done"}', truncated: true };
+  const { nudged, truncated } = await resolveAgentResultWithNudge({ result, resultFile: null, rerun: async () => { reruns++; return { ok: true, stdout: '' }; } });
+  assert.equal(nudged, false, 'a usable result skips the nudge');
+  assert.equal(reruns, 0);
+  assert.equal(truncated, true, 'early return preserves the incoming truncated flag');
+});
+
 test('a throwing / still-empty re-emit turn degrades safely (nudged, but no crash)', async () => {
   const { dir, file } = tmpResultFile();
   try {

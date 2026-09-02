@@ -2674,7 +2674,11 @@ async function resolveAgentResultWithNudge({ result, resultFile, rerun, logger, 
   // prompt explicitly offers the `::nano:result::` stdout sentinel, so recovery
   // still works in stdout-sentinel-only mode.
   if (hasUsableResult(already) || !result?.ok || !stdout0.trim() || typeof rerun !== 'function') {
-    return { stdout: stdout0, nudged: false, truncated: false };
+    // No nudge: `stdout0` is the incoming stdout verbatim, so keep the returned
+    // `truncated` flag consistent with it — echo the incoming `result.truncated`
+    // rather than hardcoding false, so callers that trust the return value don't
+    // see an already-truncated stdout reported as untruncated.
+    return { stdout: stdout0, nudged: false, truncated: result?.truncated === true };
   }
   let nudge = null;
   let nudgeError = null;

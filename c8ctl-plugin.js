@@ -2581,6 +2581,70 @@ const SANDBOXES = ['none', 'docker', 'podman'];
 // Only container-based sandboxes need an image / disk hygiene / a runtime bin.
 const CONTAINER_SANDBOXES = new Set(['docker', 'podman']);
 
+// Result-nudge (#678). A weak / non-Claude agent can finish a result-contract
+// job (exit 0, real work done) yet never emit the machine-readable result — the
+// downstream gateway then falls through to its default (e.g. a completed review
+// silently re-waits instead of converging). Rather than accept the empty result,
+// give the agent exactly ONE bounded "emit your result now" turn, feeding back
+// its own prior output, in the SAME workspace. This never redoes work; it only
+// recovers a dropped result. Bounded independently of the main run so a second
+// hang can't double a long idle window.
+const NUDGE_IDLE_TIMEOUT_MS = 120_000;
+const NUDGE_HARD_CAP_MS = 300_000;
+// Cap the prior transcript we echo back so a huge run can't blow the nudge prompt.
+const NUDGE_CONTEXT_CAP_BYTES = 24_000;
+
+// The bespoke prompt for the re-emit turn: derive the status from the work the
+// agent already did, write ONLY the result, change nothing else.
+function buildResultNudgePrompt(priorStdout) {
+  const ctx = typeof priorStdout === 'string' ? priorStdout.slice(-NUDGE_CONTEXT_CAP_BYTES) : '';
+  return [
+    'You already completed the task in your previous turn, but you did NOT emit a',
+    'machine-readable result, so the orchestrator cannot read your status and the',
+    'run cannot advance.',
+    '',
+    'Do NOT redo the work, re-run tools, edit files, push, or open/modify a PR. Just',
+    'emit the result for the work you already did: write a single flat JSON object of',
+    'your result variables (at minimum {"status":"..."}) to the file named by the',
+    'AGENT_RESULT_FILE environment variable, e.g.:',
+    '',
+    '    printf \'%s\' \'{"status":"...","summary":"..."}\' > "$AGENT_RESULT_FILE"',
+    '',
+    'If you truly cannot write that file, print exactly one line: ::nano:result:: {json}',
+    '',
+    'Your previous output (reference — derive the status/summary from it):',
+    '-----',
+    ctx,
+  ].join('\n');
+}
+
+// Given a finished agent run, decide whether it dropped its result and, if so,
+// perform ONE re-emit nudge via the injected `rerun(nudgeText)` (which re-invokes
+// the agent in the same workspace, writing to the same AGENT_RESULT_FILE).
+// `rerun` is injected so this is unit-testable without a real model. Returns the
+// (possibly appended) stdout and whether a nudge was attempted; the caller reads
+// the structured result from the result file / stdout afterwards as usual.
+async function resolveAgentResultWithNudge({ result, resultFile, rerun, logger, logPrefix = '' }) {
+  const stdout0 = result && typeof result.stdout === 'string' ? result.stdout : '';
+  const already = readAgentResultFile(resultFile) ?? parseResultFromStdout(stdout0);
+  // Only nudge a clean run that produced NO usable result but DID produce output
+  // (silence means a crash/hang the idle path already handles, not a dropped result).
+  if (already || !result?.ok || !resultFile || !stdout0.trim() || typeof rerun !== 'function') {
+    return { stdout: stdout0, nudged: false };
+  }
+  let nudge = null;
+  try { nudge = await rerun(buildResultNudgePrompt(stdout0)); } catch { nudge = null; }
+  const nudgeOut = nudge && typeof nudge.stdout === 'string' ? nudge.stdout : '';
+  const stdout = nudgeOut ? `${stdout0}\n${nudgeOut}` : stdout0;
+  const recovered = readAgentResultFile(resultFile) ?? parseResultFromStdout(stdout);
+  if (logger?.info) {
+    logger.info(recovered
+      ? `${logPrefix} no result on the first turn — recovered it via one re-emit nudge`
+      : `${logPrefix} no result on the first turn — re-emit nudge did not recover one`);
+  }
+  return { stdout, nudged: true };
+}
+
 function coerceBool(v, dflt = false) {
   if (typeof v === 'boolean') return v;
   if (v == null) return dflt;
@@ -5123,10 +5187,13 @@ function startLockExtender(job, windowMs, intervalMs, tag, logger) {
  * Both paths resolve to the same result contract.
  */
 function runAgentJob(profile, job, opts = {}) {
-  const { timeoutMs, idleTimeoutMs, recoveryWindowMs, envelope, sandbox = 'none', image, runId, secretEnv = {}, passThroughSecretNames = [], cwd, extraEnv = {}, profileEnv = {}, resultFile, stream = false, streamPrefix = '', onStreamOut, onStreamErr, args: commandArgs, terminal = 'pipe', protocol = 'pipe', permission = 'yolo', relaySession = null, ptyFactory } = opts;
+  const { timeoutMs, idleTimeoutMs, recoveryWindowMs, envelope, sandbox = 'none', image, runId, secretEnv = {}, passThroughSecretNames = [], cwd, extraEnv = {}, profileEnv = {}, resultFile, stream = false, streamPrefix = '', onStreamOut, onStreamErr, args: commandArgs, terminal = 'pipe', protocol = 'pipe', permission = 'yolo', relaySession = null, ptyFactory, nudgePayload = null } = opts;
   // #110: `protocol`/`permission` drive the ACP executor branch below. The
   // pipe/PTY paths are unchanged, so `protocol === 'pipe'` behaviour is identical.
-  const payload = JSON.stringify(buildAgentPayload(profile, job, envelope));
+  // A `nudgePayload` (#678) replaces the task-envelope stdin with a bespoke
+  // "re-emit your result" prompt for a bounded second turn in the SAME workspace;
+  // everything else (env, cwd, command, result file) is identical to the main run.
+  const payload = nudgePayload != null ? String(nudgePayload) : JSON.stringify(buildAgentPayload(profile, job, envelope));
   const agentEnv = baseAgentEnv(profile, job);
   // The harness command line: the profile command plus its structured switches
   // (persisted `--arg`s, possibly extended at work time via opts.args), each
@@ -6835,7 +6902,7 @@ async function workAgent(req, flags) {
             liveRunDirs.add(resultDir);
           } catch { resultDir = null; resultFile = null; }
 
-          result = await runAgentJob(profile, job, {
+          const runOpts = {
             timeoutMs: effectiveHardCapMs,
             idleTimeoutMs: effectiveIdleTimeoutMs,
             recoveryWindowMs: effectiveRecoveryWindowMs,
@@ -6866,7 +6933,30 @@ async function workAgent(req, flags) {
             // spying never corrupts a structured/JSON output mode.
             onStreamOut: stream ? (line) => logger.info(line) : undefined,
             onStreamErr: stream ? (line) => logger.warn(line) : undefined,
-          });
+          };
+          result = await runAgentJob(profile, job, runOpts);
+
+          // Gap 2 (#678): a clean run that emitted no machine-readable result gets
+          // ONE bounded re-emit nudge in the same workspace, feeding back its own
+          // output, before we accept an empty result. Runs before finalizeGit so
+          // the workspace/result file are still live; the nudge changes no code.
+          if (result.ok && resultFile) {
+            const { stdout, nudged } = await resolveAgentResultWithNudge({
+              result,
+              resultFile,
+              logger,
+              logPrefix: `[${jobType}] job ${job.jobKey}:`,
+              rerun: (nudgeText) => runAgentJob(profile, job, {
+                ...runOpts,
+                nudgePayload: nudgeText,
+                stream: false,
+                idleTimeoutMs: Math.min(effectiveIdleTimeoutMs || NUDGE_IDLE_TIMEOUT_MS, NUDGE_IDLE_TIMEOUT_MS),
+                timeoutMs: Math.min(effectiveHardCapMs || NUDGE_HARD_CAP_MS, NUDGE_HARD_CAP_MS) || NUDGE_HARD_CAP_MS,
+              }),
+            });
+            result.stdout = stdout;
+            if (nudged) result.nudgedForResult = true;
+          }
 
           // Finalize git only when the harness succeeded — never push a
           // half-finished workspace.
@@ -11567,6 +11657,8 @@ export {
   readAgentResultFile,
   parseResultFromStdout,
   sanitizeResultVars,
+  buildResultNudgePrompt,
+  resolveAgentResultWithNudge,
   parseEnvPairs,
   normalizeEnvMap,
   normalizeArgList,

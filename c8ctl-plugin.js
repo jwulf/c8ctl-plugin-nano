@@ -4847,10 +4847,23 @@ function spawnCaptureAcp({ command, args = [], cwd, env, stdinData, timeoutMs, i
       if (!text) return;
       const chunk = encodeTranscriptChunk({ sessionUpdate: 'agent_message_chunk', content: { type: 'text', text } });
       if (!chunk) return;
-      try { relayTap.relayTranscriptChunk(chunk); transcriptChunksPublished++; } catch { /* relay best-effort */ }
-      // Mirror locally (spy tee + captured stdout) so a --stream watcher and the
-      // result envelope also reflect the floor, matching the mapped-update path.
-      captureHuman(text);
+      // Only skip the text lane when the chunk publish ACTUALLY succeeded. If the
+      // seam throws (a downstream tap implementation bug, not just the built-in
+      // best-effort guard), the floor never reached the relay lane — so fall back
+      // to the text lane, exactly like `emitTranscript`, or the cockpit transcript
+      // could still be empty in that failure mode.
+      let published = false;
+      try { relayTap.relayTranscriptChunk(chunk); published = true; } catch { /* relay best-effort */ }
+      if (published) {
+        transcriptChunksPublished++;
+        // Mirror locally (spy tee + captured stdout) so a --stream watcher and the
+        // result envelope also reflect the floor, matching the mapped-update path.
+        captureHuman(text);
+        return;
+      }
+      // Chunk publish threw → emit the floor on the text lane (relay text + spy
+      // tee + capture) so nothing is dropped.
+      emitHuman(text);
     };
 
     const handleMessage = (msg) => {

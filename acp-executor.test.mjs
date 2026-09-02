@@ -1114,3 +1114,36 @@ test('#137 floor: inert (no crash, nothing structured) when the relay exposes no
     rmSync(resDir, { recursive: true, force: true });
   }
 });
+
+test('#137 floor: a throwing transcript-chunk seam falls back to the text lane (floor not dropped)', async () => {
+  const resDir = mkdtempSync(join(tmpdir(), 'acp-res-'));
+  const resultFile = join(resDir, 'result.json');
+  // The relay exposes the transcript-chunk seam but it always throws (a
+  // misbehaving downstream publisher). The turn emits no session/update, so the
+  // floor fires — and must fall back to the text lane instead of being silently
+  // lost, mirroring emitTranscript.
+  const textChunks = [];
+  const tap = {
+    relayTranscriptChunk: () => { throw new Error('boom'); },
+    onData: (d) => { textChunks.push(typeof d === 'string' ? d : Buffer.from(d).toString('utf8')); },
+  };
+  try {
+    const result = await spawnCaptureAcp({
+      command: 'node',
+      args: [FAKE_AGENT],
+      cwd: workRoot,
+      env: { ...baseEnv(), AGENT_RESULT_FILE: resultFile, FAKE_RESULT_JSON: '{"status":"opened","summary":"built the slice","pr":"o/r#7"}' },
+      stdinData: 'prompt',
+      timeoutMs: 20_000,
+      relayTap: tap,
+      permission: 'yolo',
+    });
+    assert.equal(result.ok, true, result.error || result.stderr);
+    // The floor's content reached the relay lane via the text fallback rather
+    // than being silently lost when the chunk seam threw.
+    const relayed = textChunks.join('');
+    assert.ok(relayed.includes('built the slice'), `expected floor text fallback for a throwing seam, got: ${JSON.stringify(textChunks)}`);
+  } finally {
+    rmSync(resDir, { recursive: true, force: true });
+  }
+});

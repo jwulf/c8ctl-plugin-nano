@@ -21,7 +21,19 @@ import { activateWinner, defaultActivationConfig, type ActivationConfig } from "
 import { defaultDispatchConfig, dispatch, type DispatchConfig } from "./dispatch.ts";
 import { makeParkingLot, type ParkingLot } from "./parking.ts";
 import { emptyCache, reconcile, type ReconcileCache } from "./reconcile.ts";
-import { withAgenticConnection, type AgenticConfig, type AgenticEndpoint } from "./agentic.ts";
+import {
+  superviseAgentic,
+  type AgenticConfig,
+  type AgenticEndpoint,
+  type AgenticHandle,
+} from "./agentic.ts";
+import {
+  makeOwnershipContext,
+  makeOwnershipRegistry,
+  resyncOwnership,
+  type OwnershipContext,
+  type OwnershipRegistry,
+} from "./ownership.ts";
 import type {
   EngineClient,
   JobRunner,
@@ -75,6 +87,13 @@ export interface Supervisor {
   /** Run both loops until interrupted. */
   readonly run: Effect.Effect<never>;
   readonly parking: ParkingLot;
+  /**
+   * The claim registry (issue #158) — the race-free `instance → jobKeys` source
+   * of truth that drives the cockpit's `jobKeys` (replacing the fragile
+   * relay-transcript correlation). Exposed so the plugin can seed worker presence
+   * (`register`) and tests can assert live ownership.
+   */
+  readonly ownership: OwnershipRegistry;
 }
 
 export const makeSupervisor = (deps: SupervisorDeps): Effect.Effect<Supervisor> =>
@@ -89,12 +108,24 @@ export const makeSupervisor = (deps: SupervisorDeps): Effect.Effect<Supervisor> 
     const parking = yield* makeParkingLot();
     const cacheRef = yield* Ref.make<ReconcileCache>(emptyCache);
 
+    // Ownership plane (issue #158). The registry is the source of truth; the
+    // context mirrors mutations onto whichever agentic handle is live now, read
+    // from a stable slot that `superviseAgentic` swaps on reconnect.
+    const ownership = yield* makeOwnershipRegistry();
+    const handleRef = yield* Ref.make<AgenticHandle | null>(null);
+    const ownershipContext: OwnershipContext = makeOwnershipContext(
+      ownership,
+      { currentHandle: Ref.get(handleRef) },
+      logger,
+    );
+
     const dispatchDeps = {
       engine: deps.engine,
       runner: deps.runner,
       registry: deps.registry,
       logger,
       config: cfg.dispatch,
+      ownership: ownershipContext,
     };
 
     // Reconcile against the *current* cache each pass and publish job types.
@@ -163,15 +194,19 @@ export const makeSupervisor = (deps: SupervisorDeps): Effect.Effect<Supervisor> 
     });
 
     const runWithAgentic: Effect.Effect<never> = deps.agenticEndpoint
-      ? (withAgenticConnection(
+      ? (superviseAgentic(
           deps.agenticEndpoint,
           logger,
-          () => run,
+          handleRef,
+          // On every (re)connect, replay the full active-claim set before
+          // resuming transcript — re-register each worker and re-claim its jobs.
+          (handle) => resyncOwnership(handle, ownership, logger),
+          run,
           deps.agenticConfig,
         ) as Effect.Effect<never>)
       : run;
 
-    return { tick, reconcileOnce: doReconcile, run: runWithAgentic, parking };
+    return { tick, reconcileOnce: doReconcile, run: runWithAgentic, parking, ownership };
   });
 
 // Re-export the surface a JS consumer (c8ctl-plugin.js) needs.

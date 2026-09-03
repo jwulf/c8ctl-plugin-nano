@@ -19,6 +19,8 @@
 import { Duration, Effect, Fiber } from "effect";
 import type { ActivatedJob, EngineClient, JobRunner, Logger, SupervisorError } from "./ports.ts";
 import type { Registry } from "./registry.ts";
+import type { OwnershipContext } from "./ownership.ts";
+import { withOwnedJob } from "./ownership.ts";
 
 export interface DispatchConfig {
   /** The window the winner's lock is held to and heartbeated at (ms). */
@@ -38,6 +40,13 @@ export interface DispatchDeps {
   readonly registry: Registry;
   readonly logger: Logger;
   readonly config: DispatchConfig;
+  /**
+   * When set, the job is `claim`ed on this ownership context for the lifetime of
+   * the agent child (issue #158): the claim is emitted just before the runner
+   * spawns the child and released on every exit path. The `workerId` is the
+   * explicit `instance` on every ownership frame.
+   */
+  readonly ownership?: OwnershipContext;
 }
 
 export interface DispatchOutcome {
@@ -55,7 +64,7 @@ export const dispatch = (
   workerId: string,
 ): Effect.Effect<DispatchOutcome, never> =>
   Effect.gen(function* () {
-    const { engine, runner, registry, logger, config } = deps;
+    const { engine, runner, registry, logger, config, ownership } = deps;
 
     // (a) Extend the winner FIRST. A failure here means the short lock likely
     // lapsed and the job was reclaimed — do not start; give the slot straight back.
@@ -102,10 +111,16 @@ export const dispatch = (
           Effect.forever,
         ),
       );
-      yield* runner.run(job).pipe(
+      // The agent child runs under a claim whose lifetime == the child's own
+      // (issue #158): claimed just before spawn, released on every exit path so a
+      // silent, zero-transcript agent still reads as `claimed = working` and an
+      // unclean kill clears the jobKey within one window (no leak).
+      const runChild = runner.run(job).pipe(
         Effect.catch((err: SupervisorError) =>
           Effect.sync(() => logger.warn(`[${job.type}] job ${job.jobKey}: run failed — ${err.message}`)),
         ),
+      );
+      yield* (ownership ? withOwnedJob(ownership, workerId, job.jobKey, runChild) : runChild).pipe(
         Effect.ensuring(Fiber.interrupt(heartbeat)),
       );
     }).pipe(Effect.ensuring(registry.releaseWorker(workerId)));

@@ -3250,8 +3250,10 @@ function loadSupervisorRuntime() {
 // `createWorkChannel` fan-out — where every `nano work` process opened its own
 // socket for a single identity — but that per-worker flip is deferred, so
 // `createWorkChannel` is still imported and used elsewhere in this file for now.
-// Deferred until `connect()` so the ~100 KB Effect surface only loads
-// when the supervisor actually runs an agentic connection.
+// The ~100 KB Effect surface loads lazily on the first `createAgenticEndpoint()`
+// call (which awaits `loadSupervisorRuntime()`) — not at module load and not
+// deferred to `endpoint.connect()` — so a plugin invocation that never runs an
+// agentic connection never pays for it.
 //
 // @param {object} opts see `createRawEmitConnect` in `agentic-endpoint.mjs`
 //   (`url`, `token`, `credential`, optional `remoteAdvertisement`, `logger`, …)

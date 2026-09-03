@@ -128,6 +128,19 @@ function openHostConnection({ url, transportFactory, incarnation, support, logge
   };
 
   let transport = null;
+  let closedFired = false;
+
+  // Notify registered onClose subscribers at most once, regardless of whether a
+  // caller-initiated close() or the transport's own onClose fires first. Higher
+  // layers (AgenticHandle.closed) must observe the drop even if the underlying
+  // transport delays or omits its close callback.
+  const fireClosed = () => {
+    if (closedFired) return;
+    closedFired = true;
+    open = false;
+    hasClosed = true;
+    for (const cb of closeCbs) cb();
+  };
 
   const send = (lane, family, payload) => {
     if (!open || transport === null) {
@@ -179,9 +192,7 @@ function openHostConnection({ url, transportFactory, incarnation, support, logge
       handleInbound(bytes);
     },
     onClose() {
-      open = false;
-      hasClosed = true;
-      for (const cb of closeCbs) cb();
+      fireClosed();
     },
     onError(err) {
       // Non-fatal on its own; a close follows and drives the reconnect. Surface
@@ -251,6 +262,11 @@ function openHostConnection({ url, transportFactory, incarnation, support, logge
       } catch {
         /* idempotent best-effort teardown — never throw on close */
       }
+      // Notify subscribers ourselves — never rely on the transport re-entering
+      // onClose after a caller-initiated teardown (it may delay or omit it),
+      // which would leave AgenticHandle.closed pending indefinitely. Idempotent:
+      // a subsequent transport onClose is a no-op.
+      fireClosed();
     },
     supportsClaimRelease: support.claimRelease,
     supportsSteer: support.steer,

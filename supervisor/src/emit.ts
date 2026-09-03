@@ -58,9 +58,21 @@ export interface RawEmitClient {
    * the transport read loop. Only invoked when steer is negotiated.
    */
   onSteer(route: (instance: string, jobKey: string, chunk: Uint8Array) => void): void;
-  /** Fires once when the socket opens (drives connect resolution). */
+  /**
+   * Fires once when the socket opens (drives connect resolution). CONTRACT: if
+   * the connection is ALREADY open when `onOpen` is called, the implementation
+   * MUST invoke `cb` immediately (synchronous/injected transports can open
+   * before the adapter registers). Otherwise the queued callback never runs and
+   * {@link makeAgenticEndpoint}'s `connect` hangs waiting on `opened`.
+   */
   onOpen(cb: () => void): void;
-  /** Fires once when the socket drops (drives {@link AgenticHandle.closed} + reconnect). */
+  /**
+   * Fires once when the socket drops (drives {@link AgenticHandle.closed} +
+   * reconnect). CONTRACT: if the connection has ALREADY closed when `onClose` is
+   * called, the implementation MUST invoke `cb` immediately — otherwise a
+   * close-before-open (neither callback would ever run) leaves `connect`
+   * hanging, and a post-close subscriber never observes the drop.
+   */
   onClose(cb: () => void): void;
   /** Idempotent teardown of this connection. */
   close(): void;

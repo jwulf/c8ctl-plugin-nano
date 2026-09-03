@@ -12,10 +12,13 @@
  * interruption cancels the pending long-poll — this is the backpressure that
  * collapses the polling storm).
  *
- * The over-pull bound is therefore "at most one type's extra batch", which the
- * `maxBatchPerType` cap limits — it can never be an unbounded grab of one hot
- * type. Because activation is genuinely per-type and concurrent, ≥2 polls can
- * each lease jobs before the winner is picked. Those **loser leases are not
+ * The over-pull bound is therefore **per type** "at most that type's own batch"
+ * (`maxBatchPerType`) — never an unbounded grab of one hot type. It is **not**
+ * bounded to a single type's batch overall: because activation is genuinely
+ * per-type and concurrent, in a timing collision ≥2 racing polls can each hand
+ * back (and thus lease) up to their per-type batch before the winner is picked
+ * and the losers are interrupted, so the worst-case surplus is the sum of the
+ * losing types' leases (each ≤ `maxBatchPerType`). Those **loser leases are not
  * failed** — we simply never extend them, so their short initial lock lapses (the
  * honest no-op release; Zeebe has no unlock RPC, and a `fail`-to-yield risks a
  * fleet-wide fail→republish→reactivate hot-loop under saturation). Dropping the

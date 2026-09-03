@@ -216,14 +216,27 @@ function openHostConnection({ url, transportFactory, incarnation, support, logge
       steerRoute = route;
     },
     onOpen(cb) {
+      // If the transport is already open (injected/synchronous factories can
+      // open before this registers), fire immediately — otherwise the queued
+      // callback never runs and connect() hangs waiting for `opened`.
+      if (open) {
+        cb();
+        return;
+      }
       openCbs.push(cb);
     },
     onClose(cb) {
       closeCbs.push(cb);
     },
     close() {
+      // Mark closed and drop the transport reference locally so post-close
+      // send() reliably throws (the not-open contract) even if the underlying
+      // transport delays or omits its close callback.
+      open = false;
+      const t = transport;
+      transport = null;
       try {
-        transport?.close();
+        t?.close();
       } catch {
         /* idempotent best-effort teardown — never throw on close */
       }

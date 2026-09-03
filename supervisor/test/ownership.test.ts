@@ -1,6 +1,6 @@
 import assert from "node:assert/strict";
 import { test } from "node:test";
-import { Deferred, Effect, Fiber, Ref } from "effect";
+import { Deferred, Effect, Fiber } from "effect";
 import type { AgenticCapability, AgenticHandle, OwnershipFrames } from "../src/agentic.ts";
 import {
   claimJob,
@@ -28,12 +28,12 @@ const recordingHandle = (opts: { failClaim?: boolean; closed?: Effect.Effect<voi
   const frames: string[] = [];
   const ok = (s: string) => Effect.sync(() => void frames.push(s));
   const proto: OwnershipFrames = {
-    register: (instance) => ok(`register:${instance}`),
+    register: (instance, _capability) => ok(`register:${instance}`),
     claim: (instance, jobKey) =>
       opts.failClaim
         ? Effect.fail(new SupervisorError("claim wire down"))
         : ok(`claim:${instance}:${jobKey}`),
-    transcript: (instance, jobKey) => ok(`transcript:${instance}:${jobKey}`),
+    transcript: (instance, jobKey, _chunk) => ok(`transcript:${instance}:${jobKey}`),
     release: (instance, jobKey) => ok(`release:${instance}:${jobKey}`),
   };
   return { frames, handle: { disconnect: Effect.void, closed: opts.closed, ...proto } };

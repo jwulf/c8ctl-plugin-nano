@@ -88,3 +88,40 @@ test("createSupervisorDeps: composes runnable deps and drives one dispatch cycle
   assert.equal(fetchImpl.extended[0].timeout, 300_000);
   assert.match(fetchImpl.extended[0].url, /\/v2\/jobs\/job-1\/timeout$/);
 });
+
+test("createSupervisorDeps: derives engine authHeaders from camunda.getAuthHeaders() when no explicit headers/token", async () => {
+  // On OAuth/basic profiles there is no bare REST token, so the engine client
+  // must fall back to the SDK client's ready-made header map — otherwise engine
+  // activations would go out silently unauthenticated.
+  const seen = [];
+  const fetchImpl = async (url, init) => {
+    seen.push({ url: String(url), auth: (init?.headers || {}).Authorization });
+    if (String(url).endsWith("/jobs/activation")) {
+      return { ok: true, status: 200, json: async () => ({ jobs: [] }), text: async () => "" };
+    }
+    return { ok: false, status: 404, json: async () => ({}), text: async () => "" };
+  };
+  let getAuthCalls = 0;
+  const camunda = {
+    getAuthHeaders: async () => {
+      getAuthCalls++;
+      return { Authorization: "Bearer derived-token" };
+    },
+  };
+
+  const { deps, Effect } = await createSupervisorDeps({
+    runner: { run: async () => {} },
+    // baseUrl only, NO token → derivation must kick in.
+    restConfig: { baseUrl: "http://engine:8080" },
+    camunda,
+    worker: "host-under-test",
+    fetchImpl,
+  });
+
+  await Effect.runPromise(deps.engine.activate({ type: "senior:plan", worker: "host-under-test", timeout: 1000, maxJobsToActivate: 1 }));
+
+  assert.ok(getAuthCalls >= 1, "getAuthHeaders() was consulted for the derived auth");
+  const activation = seen.find((r) => r.url.endsWith("/jobs/activation"));
+  assert.ok(activation, "an activation request was issued");
+  assert.equal(activation.auth, "Bearer derived-token", "the derived auth header rode on the engine activation");
+});

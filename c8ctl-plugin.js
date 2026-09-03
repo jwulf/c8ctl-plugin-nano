@@ -3343,8 +3343,23 @@ async function createSupervisorDeps(opts = {}) {
     restConfig ||
     resolveBrokerRestConfig(env, camunda ? { baseUrl: resolveWorkerEngineBase(camunda, env) } : {});
 
+  // Auth: an explicit ready-made `authHeaders` map wins; else a bare REST token
+  // (`rc.token`) is applied by the engine client itself; else — on OAuth/basic
+  // profiles where no bare token exists — derive the header map from the SDK
+  // client's `getAuthHeaders()` (mirroring resolveLinkedPromptSource), so engine
+  // activations aren't silently sent unauthenticated. Guarded so an older or
+  // atypical client runtime degrades to the token/none path rather than throw.
+  let resolvedAuthHeaders = authHeaders;
+  if (!resolvedAuthHeaders && !rc.token && camunda && typeof camunda.getAuthHeaders === 'function') {
+    try {
+      resolvedAuthHeaders = await camunda.getAuthHeaders();
+    } catch {
+      resolvedAuthHeaders = undefined;
+    }
+  }
+
   const engine = rt.makeEngineClient(
-    createRawEngineClient({ baseUrl: rc.baseUrl, token: rc.token, authHeaders, worker, fetchImpl }),
+    createRawEngineClient({ baseUrl: rc.baseUrl, token: rc.token, authHeaders: resolvedAuthHeaders, worker, fetchImpl }),
   );
   // `reconcileReader` (a raw `{ searchProcessDefinitionKeys, getProcessDefinitionXml }`)
   // may be injected to override the default keep-alive `httpC8RestReader` — the

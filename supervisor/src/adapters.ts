@@ -23,7 +23,7 @@
  * client never has to construct an Effect `Duration`.
  */
 import { Effect } from "effect";
-import type { AgenticConfig, AgenticEndpoint } from "./agentic.ts";
+import type { AgenticEndpoint } from "./agentic.ts";
 import type {
   ActivateRequest,
   ActivatedJob,
@@ -31,11 +31,9 @@ import type {
   JobRunner,
   Logger,
   ReconcileReader,
-  ScanAgentLeaves,
 } from "./ports.ts";
 import { noopLogger, SupervisorError } from "./ports.ts";
-import type { Registry } from "./registry.ts";
-import type { SupervisorConfig, SupervisorDeps } from "./supervisor.ts";
+import type { SupervisorDeps } from "./supervisor.ts";
 
 /** Map a thrown/rejected value into the single tagged failure the ports expose. */
 const toSupervisorError = (fallback: string) => (cause: unknown): SupervisorError =>

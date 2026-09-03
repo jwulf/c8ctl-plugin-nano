@@ -9,6 +9,7 @@ import {
   pickWorkerFor,
   serviceableTypes,
   typesWithCapacity,
+  typesWithSlots,
 } from "../src/registry.ts";
 
 test("capability map: freeSlotsFor sums idle capacity over workers servicing a type", () => {
@@ -30,6 +31,20 @@ test("typesWithCapacity omits a type whose workers are all busy (zero-activation
   // Busy w1 → type "a" drops out of the poll set entirely.
   const busy = { workers: new Map(s.workers).set("w1", { ...s.workers.get("w1")!, active: 1 }) };
   assert.deepEqual(typesWithCapacity(busy), ["b"]);
+});
+
+test("typesWithSlots pairs each serviceable-with-capacity type with its free-slot count", () => {
+  let s = emptyRegistry;
+  s = addWorker(s, "w1", ["a", "b"], 1);
+  s = addWorker(s, "w2", ["b"], 2);
+  const byType = new Map(typesWithSlots(s).map((t) => [t.type, t.freeSlots]));
+  assert.equal(byType.get("a"), 1);
+  assert.equal(byType.get("b"), 3); // 1 from w1 + 2 from w2 — the batch size for "b"
+  // A type whose workers are all busy is omitted (same gating as typesWithCapacity).
+  const busy = { workers: new Map(s.workers).set("w1", { ...s.workers.get("w1")!, active: 1 }) };
+  const busyByType = new Map(typesWithSlots(busy).map((t) => [t.type, t.freeSlots]));
+  assert.equal(busyByType.has("a"), false, "type a all busy → omitted");
+  assert.equal(busyByType.get("b"), 2, "b now has 2 free (w2 only)");
 });
 
 test("pickWorkerFor returns an idle worker or null when all servicing workers are busy", () => {

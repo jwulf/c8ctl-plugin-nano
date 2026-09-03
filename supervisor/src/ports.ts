@@ -34,9 +34,10 @@ export interface ActivatedJob {
   readonly variables?: unknown;
 }
 
-/** One per-type activation request. `maxJobsToActivate` is always 1 for agent jobs. */
+/** One per-type activation request. `maxJobsToActivate` is sized per-type to that type's free-slot count (capped by `maxBatchPerType`). */
 export interface ActivateRequest {
   readonly type: string;
+  /** Batch size for this type — its free-slot count, clamped to `[1, maxBatchPerType]`. */
   readonly maxJobsToActivate: number;
   /** Long-poll request timeout (ms) — how long a single `activation` call blocks. */
   readonly requestTimeoutMs: number;

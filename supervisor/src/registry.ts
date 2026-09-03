@@ -113,6 +113,20 @@ export function typesWithCapacity(state: RegistryState): ReadonlyArray<string> {
   return out;
 }
 
+/**
+ * Like {@link typesWithCapacity}, but pairs each serviceable-with-capacity type
+ * with its current free-slot count — the per-type batch size a single activation
+ * round may pull (capacity-sized batched activation).
+ */
+export function typesWithSlots(state: RegistryState): ReadonlyArray<{ type: string; freeSlots: number }> {
+  const out: Array<{ type: string; freeSlots: number }> = [];
+  for (const t of serviceableTypes(state)) {
+    const free = freeSlotsFor(state, t);
+    if (free > 0) out.push({ type: t, freeSlots: free });
+  }
+  return out;
+}
+
 /** Pick an idle worker able to service `type`, or `null` if none is free. */
 export function pickWorkerFor(state: RegistryState, type: string): string | null {
   for (const w of state.workers.values()) {
@@ -131,6 +145,11 @@ export interface Registry {
   claim(type: string): Effect.Effect<string | null>;
   releaseWorker(id: string): Effect.Effect<void>;
   readonly pollTypes: Effect.Effect<ReadonlyArray<string>>;
+  /**
+   * The serviceable-with-capacity types paired with their free-slot count — the
+   * per-type batch size for capacity-sized batched activation.
+   */
+  readonly pollBatch: Effect.Effect<ReadonlyArray<{ type: string; freeSlots: number }>>;
 }
 
 export const makeRegistry = (initial: RegistryState = emptyRegistry): Effect.Effect<Registry> =>
@@ -149,6 +168,7 @@ export const makeRegistry = (initial: RegistryState = emptyRegistry): Effect.Eff
         }),
       releaseWorker: (id) => Ref.update(ref, (s) => release(s, id)),
       pollTypes: Ref.get(ref).pipe(Effect.map(typesWithCapacity)),
+      pollBatch: Ref.get(ref).pipe(Effect.map(typesWithSlots)),
     };
     return registry;
   });

@@ -34,6 +34,15 @@ import {
   type OwnershipContext,
   type OwnershipRegistry,
 } from "./ownership.ts";
+import {
+  defaultPresenceConfig,
+  installSteerRoute,
+  makePresenceSink,
+  makeSteerRouter,
+  projectPresence,
+  type PresenceConfig,
+  type SteerRouter,
+} from "./presence.ts";
 import type {
   EngineClient,
   JobRunner,
@@ -52,6 +61,8 @@ export interface SupervisorConfig {
   readonly reconcileIntervalMs: number;
   /** How long to idle when no serviceable type has a free slot (ms). */
   readonly idleSpacingMs: number;
+  /** Presence-projection cadence (register/heartbeat/deregister over the multiplexed connection). */
+  readonly presence: PresenceConfig;
   /** Optional process-id scope narrowing reconcile to one app/network. */
   readonly scope: string;
 }
@@ -61,6 +72,7 @@ export const defaultSupervisorConfig: SupervisorConfig = {
   dispatch: defaultDispatchConfig,
   reconcileIntervalMs: 30_000,
   idleSpacingMs: 1_000,
+  presence: defaultPresenceConfig,
   scope: "",
 };
 
@@ -94,6 +106,12 @@ export interface Supervisor {
    * (`register`) and tests can assert live ownership.
    */
   readonly ownership: OwnershipRegistry;
+  /**
+   * The inbound steer router (issue #163). Cockpit → agent bytes ride the one
+   * multiplexed connection; the plugin registers a per-instance {@link SteerSink}
+   * around each dispatched job so N agents' steer streams never cross.
+   */
+  readonly steerRouter: SteerRouter;
 }
 
 export const makeSupervisor = (deps: SupervisorDeps): Effect.Effect<Supervisor> =>
@@ -104,6 +122,7 @@ export const makeSupervisor = (deps: SupervisorDeps): Effect.Effect<Supervisor> 
       ...deps.config,
       activation: { ...defaultActivationConfig, ...deps.config?.activation },
       dispatch: { ...defaultDispatchConfig, ...deps.config?.dispatch },
+      presence: { ...defaultPresenceConfig, ...deps.config?.presence },
     };
     const parking = yield* makeParkingLot();
     const cacheRef = yield* Ref.make<ReconcileCache>(emptyCache);
@@ -113,11 +132,15 @@ export const makeSupervisor = (deps: SupervisorDeps): Effect.Effect<Supervisor> 
     // from a stable slot that `superviseAgentic` swaps on reconnect.
     const ownership = yield* makeOwnershipRegistry();
     const handleRef = yield* Ref.make<AgenticHandle | null>(null);
-    const ownershipContext: OwnershipContext = makeOwnershipContext(
-      ownership,
-      { currentHandle: Ref.get(handleRef) },
-      logger,
-    );
+    const supervised = { currentHandle: Ref.get(handleRef) };
+    const ownershipContext: OwnershipContext = makeOwnershipContext(ownership, supervised, logger);
+
+    // Presence plane (issue #163). One multiplexed connection carries every
+    // supervised agent: the presence-projection fiber derives register/heartbeat/
+    // deregister from the registry, and the steer router fans inbound bytes back
+    // to the right agent — all keyed by explicit instance over the single socket.
+    const presenceSink = makePresenceSink(supervised, logger);
+    const steerRouter = yield* makeSteerRouter(logger);
 
     const dispatchDeps = {
       engine: deps.engine,
@@ -190,6 +213,13 @@ export const makeSupervisor = (deps: SupervisorDeps): Effect.Effect<Supervisor> 
 
     const run: Effect.Effect<never> = Effect.gen(function* () {
       yield* Effect.forkChild(doReconcile.pipe(Effect.repeat(Schedule.spaced(Duration.millis(cfg.reconcileIntervalMs)))));
+      // Presence projection (issue #163): heartbeat every registered instance over
+      // the one multiplexed connection on a Schedule cadence, announcing/dropping
+      // identities as workers join/leave the registry. Only meaningful with a live
+      // connection, so it is forked alongside the loops inside the agentic scope.
+      if (deps.agenticEndpoint) {
+        yield* Effect.forkChild(projectPresence(ownership, presenceSink, cfg.presence));
+      }
       return yield* tick.pipe(Effect.forever);
     });
 
@@ -198,15 +228,19 @@ export const makeSupervisor = (deps: SupervisorDeps): Effect.Effect<Supervisor> 
           deps.agenticEndpoint,
           logger,
           handleRef,
-          // On every (re)connect, replay the full active-claim set before
-          // resuming transcript — re-register each worker and re-claim its jobs.
-          (handle) => resyncOwnership(handle, ownership, logger),
+          // On every (re)connect, replay the full active-claim set before resuming
+          // transcript — re-register each worker, re-claim its jobs — and re-install
+          // the inbound steer router so steering survives a socket flap.
+          (handle) =>
+            resyncOwnership(handle, ownership, logger).pipe(
+              Effect.flatMap(() => installSteerRoute(handle, steerRouter, logger)),
+            ),
           run,
           deps.agenticConfig,
         ) as Effect.Effect<never>)
       : run;
 
-    return { tick, reconcileOnce: doReconcile, run: runWithAgentic, parking, ownership };
+    return { tick, reconcileOnce: doReconcile, run: runWithAgentic, parking, ownership, steerRouter };
   });
 
 // Re-export the surface a JS consumer (c8ctl-plugin.js) needs.

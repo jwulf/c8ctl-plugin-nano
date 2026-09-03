@@ -29,12 +29,14 @@ const recordingHandle = (opts: { failClaim?: boolean; closed?: Effect.Effect<voi
   const ok = (s: string) => Effect.sync(() => void frames.push(s));
   const proto: OwnershipFrames = {
     register: (instance, _capability) => ok(`register:${instance}`),
+    heartbeat: (instance) => ok(`heartbeat:${instance}`),
     claim: (instance, jobKey) =>
       opts.failClaim
         ? Effect.fail(new SupervisorError("claim wire down"))
         : ok(`claim:${instance}:${jobKey}`),
     transcript: (instance, jobKey, _chunk) => ok(`transcript:${instance}:${jobKey}`),
     release: (instance, jobKey) => ok(`release:${instance}:${jobKey}`),
+    deregister: (instance, _reason) => ok(`deregister:${instance}`),
   };
   return { frames, handle: { disconnect: Effect.void, closed: opts.closed, ...proto } };
 };

@@ -24,6 +24,7 @@
     "platforms.mjs",
     "agentic.mjs",
     "agentic-loader-hook.mjs",
+    "agentic-endpoint.mjs",
     "work-channel.mjs",
     "work-relay.mjs",
     "work-buffer.mjs",

@@ -125,6 +125,18 @@ every other code path stays Effect-free.
   a per-instance `SteerRouter` fans inbound steer bytes back to the right agent so N
   agents' streams never cross). `supervisor.ts` composes them behind `Schedule`
   cadences.
+- **Concrete agentic endpoint (issue #160).** The `AgenticEndpoint` the supervisor
+  injects as `deps.agenticEndpoint` is a thin, deterministically-testable Effect
+  adapter (`emit.ts`, `makeAgenticEndpoint`) that lifts a plain, Effect-free
+  `RawEmitClient` — ONE multiplexed host connection — into the Effect
+  `AgenticHandle`. The wire itself is CONSUMED through the monolith's single import
+  surface (`agentic-endpoint.mjs` → `agentic.mjs` → `@nanobpm/agentic` `^0.11.0`'s
+  `claim`/`release` families 8/9 + additive negotiation), so it is NOT bundled into
+  the quarantined Effect module. The monolith composes the two via
+  `createAgenticEndpoint()`. Every frame carries its `instance` EXPLICITLY (one
+  connection, N workers); `claim`/`release`/steer are OMITTED from the handle when
+  the negotiated protocol lacks them, so an old hub degrades to a no-op rather than
+  a protocol error.
 - **Ports, not globals.** Everything at the process edge (engine
   `activate`/`extendLock`, reconcile reader, job runner, agentic endpoint, logger)
   is an injected interface in `ports.ts`, so the runtime is driven deterministically

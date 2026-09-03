@@ -62,7 +62,7 @@
     "typescript": "^5.9.3"
   },
   "dependencies": {
-    "@nanobpm/agentic": "^0.10.0",
+    "@nanobpm/agentic": "^0.11.0",
     "@nanobpm/urban-agent-client": "^0.1.10"
   },
   "optionalDependencies": {

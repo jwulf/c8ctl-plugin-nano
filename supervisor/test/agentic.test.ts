@@ -1,6 +1,7 @@
 import assert from "node:assert/strict";
 import { test } from "node:test";
-import { Deferred, Effect, Fiber, Ref } from "effect";
+import { Deferred, Duration, Effect, Fiber, Ref } from "effect";
+import { TestClock } from "effect/testing";
 import { superviseAgentic, withAgenticConnection, type AgenticEndpoint, type AgenticHandle } from "../src/agentic.ts";
 import { noopLogger, SupervisorError } from "../src/ports.ts";
 
@@ -71,6 +72,40 @@ test("connect is retried on transient failure, then the connection is used", asy
       assert.equal(used, "ok");
       assert.equal(attempts, 2);
     }),
+  );
+});
+
+test("connect retries forever with the backoff DELAY capped at reconnectMaxMs (not the total elapsed retry time)", async () => {
+  await Effect.runPromise(
+    Effect.gen(function* () {
+      let attempts = 0;
+      const succeedOn = 5; // fail the first four connects, then succeed
+      const endpoint: AgenticEndpoint = {
+        connect: () =>
+          Effect.suspend(() => {
+            attempts += 1;
+            if (attempts < succeedOn) return Effect.fail(new SupervisorError("refused"));
+            return Effect.succeed({ disconnect: Effect.void } satisfies AgenticHandle);
+          }),
+      };
+      // Base == cap == 10ms, so every backoff is ~10ms and four failures span
+      // ~40ms of cumulative retry time — far beyond reconnectMaxMs (10ms). A
+      // schedule that bounded *total elapsed duration* (the previous
+      // `Schedule.upTo({ duration })` bug) would give up after ~10ms, stranding
+      // the connect; a delay-capped, forever schedule keeps retrying until the
+      // 5th attempt lands.
+      const fiber = yield* Effect.forkChild(
+        withAgenticConnection(endpoint, noopLogger, () => Effect.succeed("ok"), {
+          reconnectBaseMs: 10,
+          reconnectMaxMs: 10,
+        }),
+      );
+      // Advance well past the cumulative backoff so every retry fires.
+      yield* TestClock.adjust(Duration.millis(500));
+      const used = yield* Fiber.join(fiber);
+      assert.equal(used, "ok");
+      assert.equal(attempts, succeedOn, "kept retrying past reconnectMaxMs of elapsed time");
+    }).pipe(Effect.provide(TestClock.layer())),
   );
 });
 

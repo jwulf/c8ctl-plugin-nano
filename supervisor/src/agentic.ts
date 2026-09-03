@@ -81,10 +81,30 @@ export const defaultAgenticConfig: AgenticConfig = {
 };
 
 /**
+ * Jittered exponential reconnect backoff, retried **forever** with each attempt's
+ * *delay* capped at `reconnectMaxMs`.
+ *
+ * `reconnectMaxMs` is a cap on the backoff **delay**, not on total retry time, so
+ * we clamp the per-step delay with `Schedule.modifyDelay` and never bound the
+ * schedule's recurrence count/duration. Using `Schedule.upTo({ duration })` here
+ * would instead limit *total elapsed retry time*, making `Effect.retry` give up
+ * after ~`reconnectMaxMs` of downtime — silently breaking the reconnect-forever
+ * intent of both the initial connect and mid-life reconnect supervision.
+ */
+const reconnectSchedule = (config: AgenticConfig) =>
+  Schedule.exponential(Duration.millis(config.reconnectBaseMs)).pipe(
+    Schedule.jittered,
+    Schedule.modifyDelay(({ duration }) =>
+      Effect.succeed(Duration.min(duration, Duration.millis(config.reconnectMaxMs))),
+    ),
+  );
+
+/**
  * Acquire the agentic connection as a scoped resource. The returned Effect
  * requires a `Scope`; when that scope closes (normally or via interruption) the
  * connection's `disconnect` finalizer runs exactly once. Connect failures are
- * retried with jittered, capped exponential backoff.
+ * retried forever with jittered exponential backoff whose delay is capped at
+ * `reconnectMaxMs`.
  */
 export const acquireAgentic = (
   endpoint: AgenticEndpoint,
@@ -94,12 +114,7 @@ export const acquireAgentic = (
   Effect.acquireRelease(
     endpoint.connect().pipe(
       Effect.tap(() => Effect.sync(() => logger.debug?.("agentic: connected"))),
-      Effect.retry(
-        Schedule.exponential(Duration.millis(config.reconnectBaseMs)).pipe(
-          Schedule.jittered,
-          Schedule.upTo({ duration: Duration.millis(config.reconnectMaxMs) }),
-        ),
-      ),
+      Effect.retry(reconnectSchedule(config)),
     ),
     (handle) =>
       handle.disconnect.pipe(
@@ -120,13 +135,6 @@ export const withAgenticConnection = <A, E, R>(
   config: AgenticConfig = defaultAgenticConfig,
 ): Effect.Effect<A, E | SupervisorError, R> =>
   Effect.scoped(acquireAgentic(endpoint, logger, config).pipe(Effect.flatMap(use)));
-
-/** Jittered, capped exponential reconnect backoff shared by connect + reconnect. */
-const reconnectSchedule = (config: AgenticConfig) =>
-  Schedule.exponential(Duration.millis(config.reconnectBaseMs)).pipe(
-    Schedule.jittered,
-    Schedule.upTo({ duration: Duration.millis(config.reconnectMaxMs) }),
-  );
 
 /**
  * A live agentic connection whose physical socket may reconnect **underneath** a

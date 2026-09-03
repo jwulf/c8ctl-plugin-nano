@@ -3246,9 +3246,11 @@ function loadSupervisorRuntime() {
 // import surface) with the supervisor bundle's `makeAgenticEndpoint` adapter,
 // which lifts the plain client into the Effect `AgenticHandle`. This is the ONE
 // place the ownership/presence/transcript wire is instantiated for the
-// single-owner runtime — replacing the retired per-worker `createWorkChannel`
-// fan-out where every `nano work` process opened its own socket for a single
-// identity. Deferred until `connect()` so the ~100 KB Effect surface only loads
+// single-owner runtime. It is the eventual replacement for the per-worker
+// `createWorkChannel` fan-out — where every `nano work` process opened its own
+// socket for a single identity — but that per-worker flip is deferred, so
+// `createWorkChannel` is still imported and used elsewhere in this file for now.
+// Deferred until `connect()` so the ~100 KB Effect surface only loads
 // when the supervisor actually runs an agentic connection.
 //
 // @param {object} opts see `createRawEmitConnect` in `agentic-endpoint.mjs`

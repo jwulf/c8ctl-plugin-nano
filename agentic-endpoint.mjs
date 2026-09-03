@@ -25,7 +25,6 @@
 import {
   encodeFrame,
   decodeFrame,
-  QOS_LANES,
   MAX_SEQ,
   validatePayload,
   negotiate,

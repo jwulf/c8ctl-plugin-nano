@@ -130,6 +130,13 @@ test("createRawEngineClient rejects a missing/empty baseUrl (required)", () => {
   assert.throws(() => createRawEngineClient({ baseUrl: "   ", fetchImpl }), /baseUrl/);
 });
 
+test("activate: a whitespace-padded baseUrl is trimmed into a clean request URL", async () => {
+  const fetchImpl = makeFakeFetch([{ status: 200, json: { jobs: [] } }]);
+  const engine = createRawEngineClient({ baseUrl: "  http://engine:8080  ", fetchImpl });
+  await engine.activate({ type: "senior:plan", maxJobsToActivate: 1, requestTimeoutMs: 0, lockMs: 1 });
+  assert.equal(fetchImpl.calls[0].url, "http://engine:8080/v2/jobs/activation");
+});
+
 test("activate: a malformed job (missing jobKey/type) throws instead of coercing to empty strings", async () => {
   const missingKey = makeFakeFetch([{ status: 200, json: { jobs: [{ type: "senior:plan" }] } }]);
   const eng1 = createRawEngineClient({ baseUrl: "http://engine:8080", fetchImpl: missingKey });

@@ -125,7 +125,11 @@ export function createRawEngineClient(opts = {}) {
   if (typeof baseUrl !== "string" || baseUrl.trim() === "") {
     throw new TypeError("createRawEngineClient: `baseUrl` is required (the engine REST base, with or without `/v2`)");
   }
-  const base = v2Base(baseUrl);
+  // Trim before deriving the base: `v2Base` strips trailing `/` and `/v2` but
+  // preserves interior/edge whitespace, so a base URL with leading/trailing
+  // spaces (e.g. from env/config) would pass the non-empty check yet yield an
+  // invalid request URL like `http://engine:8080 /v2/...`.
+  const base = v2Base(baseUrl.trim());
   // Auth headers may be a static map OR a resolver function. SDK auth (e.g. an
   // OAuth bearer) rotates on token refresh, so a long-lived client must re-derive
   // headers PER CALL rather than freeze a startup snapshot that silently expires.

@@ -3337,11 +3337,21 @@ async function createSupervisorDeps(opts = {}) {
   const { demand } = await import('./agentic.mjs');
   const { createRawEngineClient } = await import('./supervisor-engine.mjs');
 
-  // Base/auth: the single canonical worker-engine chain (explicit override →
-  // profile restAddress → localhost), run through the token same-origin gate.
-  const rc =
-    restConfig ||
-    resolveBrokerRestConfig(env, camunda ? { baseUrl: resolveWorkerEngineBase(camunda, env) } : {});
+  // Base/auth: the single canonical worker-engine chain (explicit restConfig →
+  // profile restAddress → localhost), ALWAYS run through the token same-origin
+  // gate — even when a caller pins the base via `restConfig` — so token
+  // derivation (env/config REST token, same-origin agentic fallback) is never
+  // bypassed. An explicit `restConfig.token` still wins over the gate's derived
+  // token; a caller passing only `{ baseUrl }` no longer silently skips auth.
+  const gated = resolveBrokerRestConfig(env, {
+    baseUrl:
+      (restConfig && restConfig.baseUrl) ||
+      (camunda ? resolveWorkerEngineBase(camunda, env) : undefined),
+  });
+  const rc = {
+    baseUrl: gated.baseUrl,
+    token: (restConfig && restConfig.token) || gated.token,
+  };
 
   // Auth: an explicit ready-made `authHeaders` map wins; else a bare REST token
   // (`rc.token`) is applied by the engine client itself; else — on OAuth/basic

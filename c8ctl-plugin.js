@@ -3239,6 +3239,28 @@ function loadSupervisorRuntime() {
   return _supervisorRuntime;
 }
 
+// Build the concrete single host-connection agentic endpoint (issue #160) the
+// supervisor consumes as `deps.agenticEndpoint`. Composes the raw-JS wire client
+// (`agentic-endpoint.mjs`, one multiplexed connection over `@nanobpm/agentic`
+// `^0.11.0`'s `claim`/`release` families, consumed through this plugin's single
+// import surface) with the supervisor bundle's `makeAgenticEndpoint` adapter,
+// which lifts the plain client into the Effect `AgenticHandle`. This is the ONE
+// place the ownership/presence/transcript wire is instantiated for the
+// single-owner runtime — replacing the retired per-worker `createWorkChannel`
+// fan-out where every `nano work` process opened its own socket for a single
+// identity. Deferred until `connect()` so the ~100 KB Effect surface only loads
+// when the supervisor actually runs an agentic connection.
+//
+// @param {object} opts see `createRawEmitConnect` in `agentic-endpoint.mjs`
+//   (`url`, `token`, `credential`, optional `remoteAdvertisement`, `logger`, …)
+// @returns {Promise<import('./supervisor.dist.js').AgenticEndpoint>}
+async function createAgenticEndpoint(opts) {
+  const { makeAgenticEndpoint } = await loadSupervisorRuntime();
+  const { createRawEmitConnect } = await import('./agentic-endpoint.mjs');
+  const connect = await createRawEmitConnect(opts);
+  return makeAgenticEndpoint(connect);
+}
+
 // Build the content endpoint. Per issue #63 / nano-bpm #759 the non-binary
 // `/content` variant is deprecated for non-RPA types (Markdown → 406), so the
 // worker always fetches `/content/binary`.
@@ -12556,6 +12578,7 @@ export {
   readDeployedAgentJobTypes,
   resolveAutoJobTypes,
   loadSupervisorRuntime,
+  createAgenticEndpoint,
   enableEngineHappyEyeballs,
   preferIpv4Resolution,
   ipv4FirstNodeOptions,

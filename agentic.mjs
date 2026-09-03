@@ -58,6 +58,12 @@ export {
   validateVocabDocument,
   // per-family payload contracts
   validatePayload,
+  // additive capability/version negotiation (claim/release degrade gracefully)
+  PROTOCOL_VERSION,
+  PROTOCOL_FEATURES,
+  LOCAL_ADVERTISEMENT,
+  parseAdvertisement,
+  negotiate,
   // language-neutral hex helpers (used to hold the codec to the corpus)
   bytesToHex,
   hexToBytes,

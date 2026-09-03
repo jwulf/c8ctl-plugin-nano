@@ -28,6 +28,7 @@ import type {
   Logger,
   ReconcileReader,
   ScanAgentLeaves,
+  ActivatedJob,
 } from "./ports.ts";
 import { noopLogger } from "./ports.ts";
 import type { Registry } from "./registry.ts";
@@ -115,12 +116,25 @@ export const makeSupervisor = (deps: SupervisorDeps): Effect.Effect<Supervisor> 
       ),
     );
 
-    const tick: Effect.Effect<void> = deps.registry.pollTypes.pipe(
-      Effect.flatMap((types) => {
-        if (types.length === 0) {
+    const tick: Effect.Effect<void> = deps.registry.pollBatch.pipe(
+      Effect.flatMap((targets) => {
+        if (targets.length === 0) {
           return Effect.sleep(Duration.millis(cfg.idleSpacingMs));
         }
-        const typeSet = new Set(types);
+        const typeSet = new Set(targets.map((t) => t.type));
+        // Claim a worker per returned job and fork its dispatch; a job whose slot
+        // was raced away goes to the parking lot (promote-on-slot-free), never failed.
+        const dispatchBatch = (jobs: ReadonlyArray<ActivatedJob>): Effect.Effect<void> =>
+          Effect.gen(function* () {
+            for (const j of jobs) {
+              const worker = yield* deps.registry.claim(j.type);
+              if (worker) {
+                yield* Effect.forkChild(dispatch(dispatchDeps, j, worker));
+              } else {
+                yield* parking.park(j, cfg.activation.initialLockMs);
+              }
+            }
+          });
         return parking.takeFor(typeSet).pipe(
           Effect.flatMap((parked) => {
             if (parked) {
@@ -132,17 +146,8 @@ export const makeSupervisor = (deps: SupervisorDeps): Effect.Effect<Supervisor> 
                 ),
               );
             }
-            return activateWinner(deps.engine, types, cfg.activation).pipe(
-              Effect.flatMap((winner) =>
-                deps.registry.claim(winner.type).pipe(
-                  Effect.flatMap((worker) =>
-                    worker
-                      ? Effect.forkChild(dispatch(dispatchDeps, winner, worker)).pipe(Effect.asVoid)
-                      : // Slot raced away by a concurrent dispatch — park, don't fail.
-                        parking.park(winner, cfg.activation.initialLockMs),
-                  ),
-                ),
-              ),
+            return activateWinner(deps.engine, targets, cfg.activation).pipe(
+              Effect.flatMap((winners) => dispatchBatch(winners)),
               Effect.catch((err) =>
                 Effect.sync(() => logger.warn(`activation error — ${err.message}`)),
               ),

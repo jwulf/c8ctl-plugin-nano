@@ -19,6 +19,8 @@ export interface EngineFake extends EngineClient {
   readonly leased: string[];
   readonly extended: Array<{ jobKey: string; ms: number }>;
   readonly activateCalls: string[];
+  /** Every activation request in full — lets a test assert the requested batch size. */
+  readonly activateRequests: ActivateRequest[];
 }
 
 export interface EngineOptions {
@@ -32,12 +34,17 @@ export const makeEngine = (opts: EngineOptions): EngineFake => {
   const leased: string[] = [];
   const extended: Array<{ jobKey: string; ms: number }> = [];
   const activateCalls: string[] = [];
+  const activateRequests: ActivateRequest[] = [];
   return {
     leased,
     extended,
     activateCalls,
+    activateRequests,
     activate: (req) =>
-      Effect.sync(() => activateCalls.push(req.type)).pipe(
+      Effect.sync(() => {
+        activateCalls.push(req.type);
+        activateRequests.push(req);
+      }).pipe(
         Effect.flatMap(() => opts.activate(req)),
         Effect.tap((jobs) => Effect.sync(() => jobs.forEach((j) => leased.push(j.jobKey)))),
       ),
@@ -57,6 +64,21 @@ export const activateAfter =
     const entry = map[req.type];
     if (!entry) return Effect.never as never;
     return Effect.sleep(Duration.millis(entry.delayMs)).pipe(Effect.as([entry.job]));
+  };
+
+/**
+ * A batched activation: after `delayMs`, returns up to `req.maxJobsToActivate` of
+ * the type's `jobs` (models the engine honouring the requested batch size), then
+ * blocks forever for any type not in the map (idle long-poll).
+ */
+export const activateBatchAfter =
+  (map: Record<string, { jobs: ReadonlyArray<ActivatedJob>; delayMs: number }>) =>
+  (req: ActivateRequest): Effect.Effect<ReadonlyArray<ActivatedJob>, SupervisorErrorType> => {
+    const entry = map[req.type];
+    if (!entry) return Effect.never as never;
+    return Effect.sleep(Duration.millis(entry.delayMs)).pipe(
+      Effect.as(entry.jobs.slice(0, Math.max(0, req.maxJobsToActivate))),
+    );
   };
 
 export interface RunnerFake extends JobRunner {

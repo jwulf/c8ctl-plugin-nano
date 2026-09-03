@@ -960,6 +960,15 @@ How it works and where things live:
 
 - The daemon runs **detached + `unref`'d** (like `nano start` nodes), so it
   outlives the CLI invocation that launched it — that is what "detach" means.
+- **macOS: the daemon is wrapped in `caffeinate -i -s`** so a logged-out fleet
+  keeps running. Once your interactive (SSH) session ends, macOS idle-sleeps and
+  tears down the Wi-Fi/network interface, so every worker long-poll to a
+  *routable* engine/agentic address would otherwise storm `EHOSTUNREACH` until
+  you log back in. `caffeinate` holds a "prevent idle sleep" assertion for the
+  daemon's whole lifetime and is reaped with it (no orphan). It's fail-open —
+  hosts without the stock binary, and every non-macOS host, spawn the daemon
+  directly. (Pointing workers at loopback `127.0.0.1`, which never goes
+  unreachable, is the other half of the fix.)
 - A JSON state file `supervisor.json` records `{ pid, socket, workers:[…] }`;
   management commands talk to the daemon over a **control socket** (a Unix domain
   socket, or a named pipe on Windows) and fall back to the state file when the

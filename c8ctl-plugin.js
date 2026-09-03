@@ -9544,6 +9544,47 @@ function supervisorRequest(req, { socketPath, timeoutMs, responseTimeoutMs = SUP
 }
 
 /**
+ * The stock macOS `caffeinate` binary. Present on every supported macOS host;
+ * we reference the absolute path (rather than trusting `PATH`) and gate on its
+ * existence so the wrapper stays fail-open.
+ */
+const CAFFEINATE_PATH = '/usr/bin/caffeinate';
+
+/**
+ * Build the `spawn(command, args)` for the detached supervisor daemon, wrapping
+ * it in macOS `caffeinate` so a logged-out worker fleet keeps running.
+ *
+ * On macOS, once the interactive (SSH) session ends the laptop idle-sleeps and
+ * the Wi-Fi/network interface is torn down, so every worker long-poll to any
+ * *routable* engine/agentic address storms `EHOSTUNREACH` until someone logs
+ * back in (the workers themselves survive — they're detached — but their route
+ * vanishes). `caffeinate -i -s` holds a `PreventUserIdleSystemSleep` (`-i`,
+ * effective on battery too) + `PreventSystemSleep` on AC (`-s`) assertion for
+ * the WHOLE lifetime of the utility it runs, and exits the moment that utility
+ * exits — so stopping the daemon reaps `caffeinate` too (no orphan assertion),
+ * and the daemon still writes its own pid to `supervisor.json`, so the returned
+ * state pid is unaffected by the wrapper.
+ *
+ * Fail-open and platform-scoped: only wraps on darwin when the stock binary
+ * exists; every other host (and a macOS build somehow missing it) spawns the
+ * daemon directly, exactly as before. `platform`/`hasCaffeinate` are injection
+ * seams for tests.
+ *
+ * @param {{ exec: string, entry: string, platform?: string, caffeinatePath?: string, hasCaffeinate?: (p: string) => boolean }} opts
+ * @returns {{ command: string, args: string[] }}
+ */
+function buildSupervisorDaemonSpawn({ exec, entry, platform = osPlatform(), caffeinatePath = CAFFEINATE_PATH, hasCaffeinate } = {}) {
+  const daemonArgs = [entry, 'nano', 'supervisor', '__daemon'];
+  const present = typeof hasCaffeinate === 'function'
+    ? !!hasCaffeinate(caffeinatePath)
+    : existsSync(caffeinatePath);
+  if (platform === 'darwin' && present) {
+    return { command: caffeinatePath, args: ['-i', '-s', exec, ...daemonArgs] };
+  }
+  return { command: exec, args: daemonArgs };
+}
+
+/**
  * Ensure a daemon is running, spawning it detached if not, and return its
  * running state. Polls the control socket until it answers a status request.
  */
@@ -9575,7 +9616,8 @@ async function startSupervisorDaemon() {
   const logFile = supervisorDaemonLogFile();
   let fd;
   try { fd = openSync(logFile, 'a'); } catch { fd = 'ignore'; }
-  const child = spawn(exec, [entry, 'nano', 'supervisor', '__daemon'], {
+  const { command, args } = buildSupervisorDaemonSpawn({ exec, entry });
+  const child = spawn(command, args, {
     env: process.env,
     detached: true,
     stdio: ['ignore', fd, fd],
@@ -12771,6 +12813,7 @@ export {
   supervisorWorkerActivityFile,
   WORK_FORWARD_FLAGS,
   installParentDeathWatchdog,
+  buildSupervisorDaemonSpawn,
   runSupervisorDaemon,
   startSupervisorDaemon,
   supervisorRequest,

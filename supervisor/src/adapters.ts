@@ -35,7 +35,7 @@ import type {
 } from "./ports.ts";
 import { noopLogger, SupervisorError } from "./ports.ts";
 import type { Registry } from "./registry.ts";
-import type { SupervisorConfig } from "./supervisor.ts";
+import type { SupervisorConfig, SupervisorDeps } from "./supervisor.ts";
 
 /** Map a thrown/rejected value into the single tagged failure the ports expose. */
 const toSupervisorError = (fallback: string) => (cause: unknown): SupervisorError =>
@@ -139,19 +139,12 @@ export const asLogger = (raw?: Partial<Logger> | null): Logger => {
  * {@link asLogger} outputs; `registry` is a `Ref`-backed handle the caller built
  * (and seeded with workers) via `makeRegistry`; `scan` is
  * `demand.scanTaskDefinitions` from the plugin's single agentic import surface.
+ *
+ * Derived from {@link SupervisorDeps} so the deps shape has a single source of
+ * truth: adding a dep to `SupervisorDeps` automatically flows here rather than
+ * silently drifting from a hand-maintained duplicate.
  */
-export interface SupervisorDepsInput {
-  readonly engine: EngineClient;
-  readonly runner: JobRunner;
-  readonly registry: Registry;
-  readonly reconcileReader: ReconcileReader;
-  readonly scan: ScanAgentLeaves;
-  readonly logger?: Logger;
-  readonly autoWorkerId?: string;
-  readonly agenticEndpoint?: AgenticEndpoint;
-  readonly agenticConfig?: AgenticConfig;
-  readonly config?: Partial<SupervisorConfig>;
-}
+export type SupervisorDepsInput = SupervisorDeps;
 
 /**
  * Assemble a {@link SupervisorDeps} from already-lifted ports — the single typed

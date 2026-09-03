@@ -3309,9 +3309,10 @@ async function createAgenticEndpoint(opts) {
 // @param {object} [opts.agenticConfig]  reconnect backoff config
 // @param {string} [opts.scope]          reconcile process-id scope narrowing
 // @param {object} [opts.config]         partial SupervisorConfig overrides
+// @param {{ searchProcessDefinitionKeys: Function, getProcessDefinitionXml: Function }} [opts.reconcileReader]  raw reconcile reader overriding the default keep-alive `defaultC8RestReader`
 // @param {typeof fetch} [opts.fetchImpl] injected fetch (tests)
 // @param {NodeJS.ProcessEnv} [opts.env]
-// @returns {Promise<{ deps: object, registry: object, makeSupervisor: Function, Effect: object }>}
+// @returns {Promise<{ deps: object, registry: object, makeSupervisor: Function, Effect: object, Fiber: object }>}
 async function createSupervisorDeps(opts = {}) {
   const {
     runner,

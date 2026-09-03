@@ -122,3 +122,26 @@ test("a rejected fetch (network error) propagates for the port to map", async ()
 test("createRawEngineClient rejects a non-function fetchImpl", () => {
   assert.throws(() => createRawEngineClient({ baseUrl: "http://x", fetchImpl: null }), /fetchImpl/);
 });
+
+test("createRawEngineClient rejects a missing/empty baseUrl (required)", () => {
+  const fetchImpl = makeFakeFetch();
+  assert.throws(() => createRawEngineClient({ fetchImpl }), /baseUrl/);
+  assert.throws(() => createRawEngineClient({ baseUrl: "", fetchImpl }), /baseUrl/);
+  assert.throws(() => createRawEngineClient({ baseUrl: "   ", fetchImpl }), /baseUrl/);
+});
+
+test("activate: a malformed job (missing jobKey/type) throws instead of coercing to empty strings", async () => {
+  const missingKey = makeFakeFetch([{ status: 200, json: { jobs: [{ type: "senior:plan" }] } }]);
+  const eng1 = createRawEngineClient({ baseUrl: "http://engine:8080", fetchImpl: missingKey });
+  await assert.rejects(
+    () => eng1.activate({ type: "senior:plan", maxJobsToActivate: 1, requestTimeoutMs: 0, lockMs: 1 }),
+    /malformed activated job.*jobKey/s,
+  );
+
+  const missingType = makeFakeFetch([{ status: 200, json: { jobs: [{ jobKey: "42" }] } }]);
+  const eng2 = createRawEngineClient({ baseUrl: "http://engine:8080", fetchImpl: missingType });
+  await assert.rejects(
+    () => eng2.activate({ type: "t", maxJobsToActivate: 1, requestTimeoutMs: 0, lockMs: 1 }),
+    /malformed activated job.*type/s,
+  );
+});

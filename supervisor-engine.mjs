@@ -57,12 +57,23 @@ function buildHeaders({ token, authHeaders }) {
   return headers;
 }
 
-/** Map one raw v2 activated-job record to the port's {@link ActivatedJob}. Keys are strings in v2. */
+/**
+ * Map one raw v2 activated-job record to the port's {@link ActivatedJob}. Keys are
+ * strings in v2. A record missing `jobKey`/`type` violates the `ActivatedJob`
+ * contract (an empty key would produce `PATCH .../jobs//timeout`; an empty type
+ * would dispatch a typeless job), so fail the whole activation rather than coerce
+ * to `""` — a malformed engine response surfaces as a rejected activate() call.
+ */
 function mapJob(raw) {
-  const job = {
-    jobKey: String(raw.jobKey ?? raw.key ?? ""),
-    type: String(raw.type ?? ""),
-  };
+  const rawKey = raw?.jobKey ?? raw?.key;
+  const jobKey = rawKey === undefined || rawKey === null ? "" : String(rawKey);
+  const rawType = raw?.type;
+  const type = rawType === undefined || rawType === null ? "" : String(rawType);
+  if (!jobKey || !type) {
+    const missing = !jobKey && !type ? "jobKey and type" : !jobKey ? "jobKey" : "type";
+    throw new Error(`activate: malformed activated job from engine (missing ${missing}): ${JSON.stringify(raw)}`);
+  }
+  const job = { jobKey, type };
   const pdk = raw.processDefinitionKey ?? raw.processDefinitionId;
   if (pdk !== undefined && pdk !== null) job.processDefinitionKey = String(pdk);
   if (raw.variables !== undefined) job.variables = raw.variables;
@@ -101,6 +112,9 @@ export function createRawEngineClient(opts = {}) {
   } = opts;
   if (typeof fetchImpl !== "function") {
     throw new TypeError("createRawEngineClient: `fetchImpl` must be a function (global fetch or an injected fake)");
+  }
+  if (typeof baseUrl !== "string" || baseUrl.trim() === "") {
+    throw new TypeError("createRawEngineClient: `baseUrl` is required (the engine REST base, with or without `/v2`)");
   }
   const base = v2Base(baseUrl);
   const headers = buildHeaders({ token, authHeaders });

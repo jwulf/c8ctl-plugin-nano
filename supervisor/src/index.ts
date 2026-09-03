@@ -15,6 +15,7 @@ export * from "./dispatch.ts";
 export * from "./parking.ts";
 export * from "./agentic.ts";
 export * from "./emit.ts";
+export * from "./adapters.ts";
 export * from "./ownership.ts";
 export * from "./presence.ts";
 export * from "./supervisor.ts";

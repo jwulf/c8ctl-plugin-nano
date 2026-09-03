@@ -137,6 +137,21 @@ every other code path stays Effect-free.
   connection, N workers); `claim`/`release`/steer are OMITTED from the handle when
   the negotiated protocol lacks them, so an old hub degrades to a no-op rather than
   a protocol error.
+- **Concrete engine + deps seam (issue #156).** The same "monolith supplies a
+  plain Effect-free client, a TS lift wraps it into an Effect port" pattern extends
+  to the remaining edges. `adapters.ts` lifts a raw `RawEngineClient`
+  (`activate`/`extendLock`), `RawReconcileReader`, and `RawJobRunner` into their
+  Effect ports (`makeEngineClient`/`makeReconcileReader`/`makeJobRunner`), wraps a
+  monolith logger with `asLogger`, and assembles them with `makeSupervisorDeps` —
+  every promise rejection mapped into the `SupervisorError` channel. The concrete
+  engine wire is `supervisor-engine.mjs` (`createRawEngineClient`): direct C8 v2
+  REST `POST /v2/jobs/activation` + `PATCH /v2/jobs/{key}/timeout`, Effect-free with
+  an injectable `fetch`, so it stays OUT of the quarantined bundle. The monolith
+  composes the whole runtime via `createSupervisorDeps()` → a `makeSupervisor`-ready
+  `deps`. NOTE: this lands the composition seam; the hot-path FLIP (retiring the
+  per-type SDK pollers / `createSingleFlight` / per-worker reconcile crawl and
+  driving `makeSupervisor().run` from `workAgent`) is deferred — it deletes
+  crash-safety code and can only be validated against a live engine.
 - **Ports, not globals.** Everything at the process edge (engine
   `activate`/`extendLock`, reconcile reader, job runner, agentic endpoint, logger)
   is an injected interface in `ports.ts`, so the runtime is driven deterministically

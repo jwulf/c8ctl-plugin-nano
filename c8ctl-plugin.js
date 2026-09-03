@@ -3265,6 +3265,146 @@ async function createAgenticEndpoint(opts) {
   return makeAgenticEndpoint(connect);
 }
 
+// Compose the monolith's real edges into the single-owner supervisor runtime's
+// injected ports (issue #156) — the live-cut-over seam that turns the #154
+// runtime interface into a runnable host owner. This is the ONE place the
+// concrete `EngineClient`/`ReconcileReader`/`JobRunner`/`Logger` are assembled
+// for the runtime, the direct analogue of `createAgenticEndpoint` for the
+// ownership wire:
+//
+//   - engine          → `supervisor-engine.mjs` (direct `POST /v2/jobs/activation`
+//                        + `PATCH /v2/jobs/{key}/timeout`), REPLACING the SDK job
+//                        worker per the issue, base/auth derived from the SAME
+//                        `resolveWorkerEngineBase` chain the reconcile read uses;
+//   - reconcileReader → the existing `defaultC8RestReader` (a keep-alive,
+//                        IPv4-first `httpC8RestReader`), whose shape already IS a
+//                        `RawReconcileReader`;
+//   - scan            → `demand.scanTaskDefinitions` via `scanAgentTaskLeaves`,
+//                        the single agentic-leaf source of truth (no drift);
+//   - logger          → `getLogger()`;
+//   - runner          → the caller's raw `{ run(job): Promise<void> }` (the
+//                        `runAgentJob`-owning-completion harness). REQUIRED to
+//                        actually execute; a test injects a fake.
+//
+// Returns everything a JS caller needs to run `makeSupervisor` — the assembled
+// `deps`, the seeded `registry` (so workers can be add/remove'd live), and the
+// `makeSupervisor` + `Effect` handles from the bundle. NOTE (deferred, issue
+// #156): the actual hot-path flip — deleting the per-type SDK pollers, the
+// process-wide `singleFlight`, and the per-process reconcile crawl in `workAgent`
+// and running `makeSupervisor(deps).run` as the single per-host owner — is NOT
+// wired here; it deletes battle-tested crash-safety code and can only be
+// validated against a live engine, so it is intentionally left as the follow-up
+// this seam unblocks. Constructing deps is side-effect-free (no socket opens, no
+// activation) until the caller forks `supervisor.run`.
+//
+// @param {object} opts
+// @param {{ run(job): Promise<void> }} opts.runner  raw job runner (required to run)
+// @param {object} [opts.camunda]        SDK client, for base/auth derivation
+// @param {{ baseUrl: string, token?: string }} [opts.restConfig]  explicit REST config (else derived)
+// @param {Record<string,string>} [opts.authHeaders]  ready-made auth header map
+// @param {string} [opts.worker]         worker id stamped on activations
+// @param {Array<{id: string, types?: Iterable<string>, capacity?: number}>} [opts.workers]  registry seed
+// @param {string} [opts.autoWorkerId]   worker whose types the reconcile loop rewrites
+// @param {import('./supervisor.dist.js').AgenticEndpoint} [opts.agenticEndpoint]  the ownership wire
+// @param {object} [opts.agenticConfig]  reconnect backoff config
+// @param {string} [opts.scope]          reconcile process-id scope narrowing
+// @param {object} [opts.config]         partial SupervisorConfig overrides
+// @param {{ searchProcessDefinitionKeys: Function, getProcessDefinitionXml: Function }} [opts.reconcileReader]  raw reconcile reader overriding the default keep-alive `defaultC8RestReader`
+// @param {typeof fetch} [opts.fetchImpl] injected fetch (tests)
+// @param {NodeJS.ProcessEnv} [opts.env]
+// @returns {Promise<{ deps: object, registry: object, makeSupervisor: Function, Effect: object, Fiber: object }>}
+async function createSupervisorDeps(opts = {}) {
+  const {
+    runner,
+    camunda,
+    restConfig,
+    authHeaders,
+    worker,
+    workers = [],
+    autoWorkerId,
+    agenticEndpoint,
+    agenticConfig,
+    scope = '',
+    config,
+    fetchImpl,
+    env = process.env,
+  } = opts;
+  if (!runner || typeof runner.run !== 'function') {
+    throw new TypeError('createSupervisorDeps: `runner` must be a raw job runner `{ run(job): Promise<void> }`');
+  }
+
+  const rt = await loadSupervisorRuntime();
+  const { demand } = await import('./agentic.mjs');
+  const { createRawEngineClient } = await import('./supervisor-engine.mjs');
+
+  // Base/auth: the single canonical worker-engine chain (explicit restConfig →
+  // profile restAddress → localhost), ALWAYS run through the token same-origin
+  // gate — even when a caller pins the base via `restConfig` — so token
+  // derivation (env/config REST token, same-origin agentic fallback) is never
+  // bypassed. An explicit `restConfig.token` still wins over the gate's derived
+  // token; a caller passing only `{ baseUrl }` no longer silently skips auth.
+  const gated = resolveBrokerRestConfig(env, {
+    baseUrl:
+      (restConfig && restConfig.baseUrl) ||
+      (camunda ? resolveWorkerEngineBase(camunda, env) : undefined),
+  });
+  const rc = {
+    baseUrl: gated.baseUrl,
+    token: (restConfig && restConfig.token) || gated.token,
+  };
+
+  // Auth: an explicit ready-made `authHeaders` map wins; else a bare REST token
+  // (`rc.token`) is applied by the engine client itself; else — on OAuth/basic
+  // profiles where no bare token exists — derive the headers from the SDK client's
+  // `getAuthHeaders()` (mirroring resolveLinkedPromptSource). Guarded so an older or
+  // atypical client runtime degrades to the token/none path rather than throw.
+  let resolvedAuthHeaders = authHeaders;
+  if (!resolvedAuthHeaders && !rc.token && camunda && typeof camunda.getAuthHeaders === 'function') {
+    // Resolve PER CALL, not once at startup: SDK auth headers (e.g. an OAuth
+    // bearer) rotate on token refresh, so a long-lived supervisor must re-derive
+    // them on every engine call — a cached startup snapshot would silently expire
+    // and fail activations. Pass a resolver the engine client invokes per request.
+    resolvedAuthHeaders = async () => {
+      try {
+        return await camunda.getAuthHeaders();
+      } catch {
+        return undefined;
+      }
+    };
+  }
+
+  const engine = rt.makeEngineClient(
+    createRawEngineClient({ baseUrl: rc.baseUrl, token: rc.token, authHeaders: resolvedAuthHeaders, worker, fetchImpl }),
+  );
+  // `reconcileReader` (a raw `{ searchProcessDefinitionKeys, getProcessDefinitionXml }`)
+  // may be injected to override the default keep-alive `httpC8RestReader` — the
+  // caller may already hold one, and a test drives the crawl without a socket.
+  const rawReader = opts.reconcileReader || (await defaultC8RestReader(rc));
+  const reconcileReader = rt.makeReconcileReader(rawReader);
+  const scan = (xml) => scanAgentTaskLeaves(xml, demand.scanTaskDefinitions);
+  const logger = rt.asLogger(getLogger());
+
+  const registry = await rt.Effect.runPromise(rt.makeRegistry());
+  for (const w of workers) {
+    await rt.Effect.runPromise(registry.add(w.id, w.types || [], w.capacity ?? 1));
+  }
+
+  const deps = rt.makeSupervisorDeps({
+    engine,
+    runner: rt.makeJobRunner(runner),
+    registry,
+    reconcileReader,
+    scan,
+    logger,
+    autoWorkerId,
+    agenticEndpoint,
+    agenticConfig,
+    config: scope ? { ...config, scope } : config,
+  });
+
+  return { deps, registry, makeSupervisor: rt.makeSupervisor, Effect: rt.Effect, Fiber: rt.Fiber };
+}
+
 // Build the content endpoint. Per issue #63 / nano-bpm #759 the non-binary
 // `/content` variant is deprecated for non-RPA types (Markdown → 406), so the
 // worker always fetches `/content/binary`.
@@ -12583,6 +12723,7 @@ export {
   resolveAutoJobTypes,
   loadSupervisorRuntime,
   createAgenticEndpoint,
+  createSupervisorDeps,
   enableEngineHappyEyeballs,
   preferIpv4Resolution,
   ipv4FirstNodeOptions,

@@ -115,8 +115,16 @@ every other code path stays Effect-free.
   lock → extend-winner-before-start → periodic extender; never touch a lapsed job),
   **cached reconcile** (`reconcile.ts`, fetch only new keys, skip the crawl when the
   key-set hash is unchanged), **parking lot** (`parking.ts`, promote-on-slot-free),
-  and **agentic connection** (`agentic.ts`, `acquireRelease` teardown on
-  interruption). `supervisor.ts` composes them behind `Schedule` cadences.
+  **agentic connection** (`agentic.ts`, `acquireRelease` teardown on
+  interruption; `superviseAgentic` reconnect-resync), the **claim registry +
+  ownership frames** (`ownership.ts`, explicit instance-tagged `register`/`claim`/
+  `transcript`/`release`, the race-free `instance → jobKeys` source of truth), and
+  the **presence projection + steer lane** (`presence.ts`, issue #163 — one
+  multiplexed connection carries every supervised agent: a projection fiber derives
+  `register`/`heartbeat`/`deregister` from the registry on a `Schedule` cadence, and
+  a per-instance `SteerRouter` fans inbound steer bytes back to the right agent so N
+  agents' streams never cross). `supervisor.ts` composes them behind `Schedule`
+  cadences.
 - **Ports, not globals.** Everything at the process edge (engine
   `activate`/`extendLock`, reconcile reader, job runner, agentic endpoint, logger)
   is an injected interface in `ports.ts`, so the runtime is driven deterministically

@@ -43,17 +43,51 @@ export interface AgenticCapability {
 export interface OwnershipFrames {
   /** Presence for one worker the supervisor owns (multiple instances per connection). */
   register(instance: string, capability: AgenticCapability): Effect.Effect<void, SupervisorError>;
+  /**
+   * Presence keep-alive for one already-registered worker (issue #163). Emitted
+   * on a `Schedule` cadence by the presence-projection fiber so one multiplexed
+   * connection heartbeats N distinct identities; `instance` is carried explicitly
+   * in the frame, never derived from the connection id.
+   */
+  heartbeat(instance: string): Effect.Effect<void, SupervisorError>;
   /** Emitted at dispatch, held for the agent child's whole life. Drives cockpit `jobKeys`. */
   claim(instance: string, jobKey: string): Effect.Effect<void, SupervisorError>;
   /** Data plane — carries explicit identity (no `conn.id` derivation). Drill-in only. */
   transcript(instance: string, jobKey: string, chunk: Uint8Array): Effect.Effect<void, SupervisorError>;
   /** Emitted on agent-child exit (success/fail/lapse). A late/duplicate release is a no-op. */
   release(instance: string, jobKey: string): Effect.Effect<void, SupervisorError>;
+  /**
+   * Presence removal for one worker the supervisor no longer owns (issue #163).
+   * Emitted when a worker leaves the registry so the cockpit drops its identity
+   * from the multiplexed connection without tearing the socket down. Idempotent —
+   * a duplicate deregister (or one for an unknown instance) is a no-op.
+   */
+  deregister(instance: string, reason?: string): Effect.Effect<void, SupervisorError>;
 }
+
+/**
+ * Inbound **steer** lane (issue #163). Cockpit → agent bytes ride the same
+ * multiplexed connection as the outbound {@link OwnershipFrames.transcript}
+ * lane, keyed by explicit `instance`/`jobKey` so one socket carries N agents'
+ * steer streams without them crossing. A handle exposes it as a *subscription*:
+ * the presence owner installs a single `route` on every (re)connect and fans
+ * each inbound frame out to the per-instance sink registered for the live job.
+ */
+export type SteerRoute = (
+  instance: string,
+  jobKey: string,
+  chunk: Uint8Array,
+) => Effect.Effect<void>;
 
 export interface AgenticHandle extends Partial<OwnershipFrames> {
   /** Idempotent teardown of this connection. Runs as the scope finalizer. */
   readonly disconnect: Effect.Effect<void>;
+  /**
+   * Install the inbound steer router on this connection (issue #163). Absent on
+   * endpoints that predate the steer lane, in which case steering degrades to a
+   * no-op. Re-installed on every reconnect by {@link SupervisedAgentic}.
+   */
+  readonly onSteer?: (route: SteerRoute) => Effect.Effect<void, SupervisorError>;
   /**
    * Completes when the underlying transport drops mid-life (not a graceful
    * teardown). Drives {@link superviseAgentic}'s reconnect-resync loop. When

@@ -116,6 +116,7 @@ function openHostConnection({ url, transportFactory, incarnation, support, logge
   const closeCbs = [];
   let steerRoute = null;
   let open = false;
+  let hasClosed = false;
   let seq = 0;
 
   // Monotonic uint32 sequence with wraparound — the relay resume-from-offset
@@ -179,6 +180,7 @@ function openHostConnection({ url, transportFactory, incarnation, support, logge
     },
     onClose() {
       open = false;
+      hasClosed = true;
       for (const cb of closeCbs) cb();
     },
     onError(err) {
@@ -226,6 +228,14 @@ function openHostConnection({ url, transportFactory, incarnation, support, logge
       openCbs.push(cb);
     },
     onClose(cb) {
+      // Mirror onOpen: if the transport already closed (injected/synchronous
+      // factories can close before this registers), fire immediately —
+      // otherwise a close-before-open is never observable and connect() hangs
+      // waiting for `opened` (neither onOpen nor onClose would ever run).
+      if (hasClosed) {
+        cb();
+        return;
+      }
       closeCbs.push(cb);
     },
     close() {
@@ -233,6 +243,7 @@ function openHostConnection({ url, transportFactory, incarnation, support, logge
       // send() reliably throws (the not-open contract) even if the underlying
       // transport delays or omits its close callback.
       open = false;
+      hasClosed = true;
       const t = transport;
       transport = null;
       try {

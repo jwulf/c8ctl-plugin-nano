@@ -88,3 +88,41 @@ test("heartbeat: the winner's lock is re-extended on the interval while the agen
     }).pipe(Effect.provide(TestClock.layer())),
   );
 });
+
+test("ownership: the job is claimed for the child's whole run and released after (issue #158)", async () => {
+  const { makeOwnershipRegistry, makeOwnershipContext } = await import("../src/ownership.ts");
+  await Effect.runPromise(
+    Effect.gen(function* () {
+      const engine = engineOk();
+      const ownership = yield* makeOwnershipRegistry();
+      const ctx = makeOwnershipContext(ownership, { currentHandle: Effect.succeed(null) });
+      const reg = yield* makeRegistry();
+      yield* reg.add("w1", ["a"], 1);
+      const worker = yield* reg.claim("a");
+
+      // A runner that asserts, mid-run, that its job reads as claimed with zero
+      // transcript output — the "green" acceptance for #158.
+      let claimedDuringRun: readonly string[] = [];
+      const runner = {
+        ran: [] as string[],
+        run: (j: { jobKey: string }) =>
+          ownership.jobKeysFor("w1").pipe(
+            Effect.tap((ks) => Effect.sync(() => {
+              claimedDuringRun = ks;
+              runner.ran.push(j.jobKey);
+            })),
+            Effect.asVoid,
+          ),
+      };
+
+      yield* dispatch(
+        { engine, runner, registry: reg, logger: noopLogger, config: defaultDispatchConfig, ownership: ctx },
+        job("J1", "a"),
+        worker!,
+      );
+
+      assert.deepEqual(claimedDuringRun, ["J1"], "claimed = working during the child's run");
+      assert.deepEqual(yield* ownership.jobKeysFor("w1"), [], "released after the child exits");
+    }).pipe(Effect.provide(TestClock.layer())),
+  );
+});

@@ -92,7 +92,18 @@ export type RawEmitConnect = () => RawEmitClient;
 export const makeAgenticEndpoint = (connect: RawEmitConnect): AgenticEndpoint => ({
   connect: () =>
     Effect.gen(function* () {
-      const raw = connect();
+      // A synchronous throw from `connect()` (e.g. a transportFactory failure
+      // while opening the socket) must land in the SupervisorError channel, not
+      // as a defect — otherwise `superviseAgentic`'s `Effect.retry` can't see it
+      // and the supervisor crashes instead of reconnecting.
+      const raw = yield* Effect.try({
+        try: connect,
+        catch: (cause) =>
+          new SupervisorError(
+            cause instanceof Error ? cause.message : "agentic connect failed",
+            cause,
+          ),
+      });
 
       // `closed` completes on a mid-life drop; `opened` unblocks the connect with
       // `true` on the first open, or `false` if the socket closes before opening.

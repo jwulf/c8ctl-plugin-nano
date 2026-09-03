@@ -64,8 +64,8 @@
     "typescript": "^5.9.3"
   },
   "dependencies": {
-    "@nanobpm/agentic": "^0.11.0",
-    "@nanobpm/urban-agent-client": "^0.1.10"
+    "@nanobpm/agentic": "^0.12.0",
+    "@nanobpm/urban-agent-client": "^0.1.12"
   },
   "optionalDependencies": {
     "node-pty": "^1.0.0"

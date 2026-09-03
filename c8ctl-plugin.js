@@ -3345,17 +3345,22 @@ async function createSupervisorDeps(opts = {}) {
 
   // Auth: an explicit ready-made `authHeaders` map wins; else a bare REST token
   // (`rc.token`) is applied by the engine client itself; else — on OAuth/basic
-  // profiles where no bare token exists — derive the header map from the SDK
-  // client's `getAuthHeaders()` (mirroring resolveLinkedPromptSource), so engine
-  // activations aren't silently sent unauthenticated. Guarded so an older or
+  // profiles where no bare token exists — derive the headers from the SDK client's
+  // `getAuthHeaders()` (mirroring resolveLinkedPromptSource). Guarded so an older or
   // atypical client runtime degrades to the token/none path rather than throw.
   let resolvedAuthHeaders = authHeaders;
   if (!resolvedAuthHeaders && !rc.token && camunda && typeof camunda.getAuthHeaders === 'function') {
-    try {
-      resolvedAuthHeaders = await camunda.getAuthHeaders();
-    } catch {
-      resolvedAuthHeaders = undefined;
-    }
+    // Resolve PER CALL, not once at startup: SDK auth headers (e.g. an OAuth
+    // bearer) rotate on token refresh, so a long-lived supervisor must re-derive
+    // them on every engine call — a cached startup snapshot would silently expire
+    // and fail activations. Pass a resolver the engine client invokes per request.
+    resolvedAuthHeaders = async () => {
+      try {
+        return await camunda.getAuthHeaders();
+      } catch {
+        return undefined;
+      }
+    };
   }
 
   const engine = rt.makeEngineClient(

@@ -71,7 +71,16 @@ function mapJob(raw) {
   const type = rawType === undefined || rawType === null ? "" : String(rawType);
   if (!jobKey || !type) {
     const missing = !jobKey && !type ? "jobKey and type" : !jobKey ? "jobKey" : "type";
-    throw new Error(`activate: malformed activated job from engine (missing ${missing}): ${JSON.stringify(raw)}`);
+    // Summarise the record (keys/type/pdk) — never JSON.stringify the whole raw
+    // job, which can carry `variables` (potentially sensitive payload) into
+    // logs/error messages.
+    const summary =
+      raw && typeof raw === "object"
+        ? `keys=[${Object.keys(raw).join(",")}] type=${JSON.stringify(rawType)} pdk=${JSON.stringify(
+            raw.processDefinitionKey ?? raw.processDefinitionId,
+          )}`
+        : `type=${typeof raw}`;
+    throw new Error(`activate: malformed activated job from engine (missing ${missing}): ${summary}`);
   }
   const job = { jobKey, type };
   const pdk = raw.processDefinitionKey ?? raw.processDefinitionId;
@@ -96,7 +105,7 @@ async function readErrorBody(res) {
  * @param {string} opts.baseUrl          Engine REST base (with or without `/v2`).
  * @param {string} [opts.worker]         Worker id stamped on every activation (required by v2; defaults to `"c8ctl-supervisor"`).
  * @param {string} [opts.token]          Optional bearer token (unauthed when absent and no `authHeaders`).
- * @param {Record<string,string>} [opts.authHeaders] Ready-made auth header map (wins over `token`).
+ * @param {Record<string,string>|(() => (Record<string,string>|Promise<Record<string,string>>))} [opts.authHeaders] Ready-made auth header map, OR a resolver invoked per request (so rotating SDK auth — e.g. an OAuth bearer that refreshes — is re-derived each call rather than frozen). Wins over `token`.
  * @param {typeof fetch} [opts.fetchImpl] Injected `fetch` (defaults to the global; overridden in tests).
  * @param {number} [opts.requestTimeoutSlackMs] Extra ms added to a call's abort budget over its server long-poll (default 5000).
  * @returns {{ activate(req: ActivateRequest): Promise<ReadonlyArray<ActivatedJob>>, extendLock(jobKey: string, ms: number): Promise<void> }}
@@ -117,7 +126,17 @@ export function createRawEngineClient(opts = {}) {
     throw new TypeError("createRawEngineClient: `baseUrl` is required (the engine REST base, with or without `/v2`)");
   }
   const base = v2Base(baseUrl);
-  const headers = buildHeaders({ token, authHeaders });
+  // Auth headers may be a static map OR a resolver function. SDK auth (e.g. an
+  // OAuth bearer) rotates on token refresh, so a long-lived client must re-derive
+  // headers PER CALL rather than freeze a startup snapshot that silently expires.
+  // A static map (or bare token) is resolved once and reused.
+  const resolveHeaders =
+    typeof authHeaders === "function"
+      ? async () => buildHeaders({ token, authHeaders: await authHeaders() })
+      : (() => {
+          const staticHeaders = buildHeaders({ token, authHeaders });
+          return async () => staticHeaders;
+        })();
 
   /**
    * Issue one call with an abort budget. `abortAfterMs <= 0` means no timer
@@ -127,6 +146,7 @@ export function createRawEngineClient(opts = {}) {
     const controller = new AbortController();
     const timer = abortAfterMs > 0 ? setTimeout(() => controller.abort(), abortAfterMs) : null;
     try {
+      const headers = await resolveHeaders();
       return await fetchImpl(url, { ...init, headers, signal: controller.signal });
     } finally {
       if (timer) clearTimeout(timer);

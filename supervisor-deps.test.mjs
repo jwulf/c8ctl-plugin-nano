@@ -118,9 +118,13 @@ test("createSupervisorDeps: derives engine authHeaders from camunda.getAuthHeade
     fetchImpl,
   });
 
-  await Effect.runPromise(deps.engine.activate({ type: "senior:plan", worker: "host-under-test", timeout: 1000, maxJobsToActivate: 1 }));
+  const req = { type: "senior:plan", maxJobsToActivate: 1, requestTimeoutMs: 0, lockMs: 1000 };
+  await Effect.runPromise(deps.engine.activate(req));
+  await Effect.runPromise(deps.engine.activate(req));
 
-  assert.ok(getAuthCalls >= 1, "getAuthHeaders() was consulted for the derived auth");
+  // Per-call, not a cached startup snapshot: a rotating SDK bearer must be
+  // re-derived on every engine call, so two activations consult getAuthHeaders() twice.
+  assert.equal(getAuthCalls, 2, "getAuthHeaders() is consulted per engine call (not cached at startup)");
   const activation = seen.find((r) => r.url.endsWith("/jobs/activation"));
   assert.ok(activation, "an activation request was issued");
   assert.equal(activation.auth, "Bearer derived-token", "the derived auth header rode on the engine activation");

@@ -108,6 +108,10 @@ function negotiatedSupport(remoteAdvertisement) {
  *   producer fences its stale predecessor on the hub's incarnation ring)
  * @param {{ claimRelease: boolean, steer: boolean }} params.support negotiated capabilities
  * @param {{ warn?: Function, debug?: Function }} [params.logger]
+ * @param {(state: 'connected' | 'disconnected') => void} [params.onConnectionState]
+ *   optional observer invoked on connection-state transitions: `'connected'`
+ *   once the transport opens and `'disconnected'` when it drops (fired at most
+ *   once per drop). A throwing observer is caught and logged, never propagated.
  * @returns {import('./supervisor.dist.js').RawEmitClient}
  */
 function openHostConnection({ url, transportFactory, incarnation, support, logger, onConnectionState }) {

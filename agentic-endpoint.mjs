@@ -119,6 +119,12 @@ function makeEmitSocket(url, transportFactory, getSteerRoute, log) {
 
   return {
     send(bytes) {
+      // Drop sends outside the open window: a pre-open send (the client can
+      // emit before the transport's onOpen fires) or a post-close send would
+      // otherwise hit a transport that throws while connecting/torn down,
+      // producing noisy onError logs. The emit client replays presence + active
+      // claims on the next open anyway, so a dropped pre-open frame is not lost.
+      if (!opened || closed) return;
       transport.send(bytes);
     },
     close() {

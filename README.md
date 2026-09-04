@@ -966,6 +966,13 @@ How it works and where things live:
   socket is unreachable (to report a stale/dead daemon).
 - Per-worker and daemon logs live under `logs/supervisor/` in the state home
   (`worker-<id>.log`, `daemon.log`).
+- **Per-worker log cap:** each `worker-<id>.log` is bounded (default **10 MB**) —
+  the daemon pipes the child's stdout/stderr through a rotating ring, keeping the
+  **newest** output and rolling the previous fill to `worker-<id>.log.1` (so
+  on-disk usage stays ~2× the cap). `nano supervisor logs <id>` still tails the
+  live output across a rotation. Set `NANO_SUPERVISOR_LOG_MAX_BYTES` to change the
+  cap (bytes); `0` or a negative value disables the cap (unbounded append). An
+  unset/invalid value falls back to the 10 MB default.
 - **Restart policy:** a crashed child is restarted with exponential backoff
   (1s → 30s cap); a child that stayed up ≥60s resets its backoff. `remove`/`stop`
   cancel any pending restart, and a `restart` cleanly swaps the child (a late

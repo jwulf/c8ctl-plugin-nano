@@ -141,6 +141,7 @@ async function readErrorBody(res) {
  * @param {Record<string,string>|(() => (Record<string,string>|Promise<Record<string,string>>))} [opts.authHeaders] Ready-made auth header map, OR a resolver invoked per request (so rotating SDK auth — e.g. an OAuth bearer that refreshes — is re-derived each call rather than frozen). Wins over `token`.
  * @param {typeof fetch} [opts.fetchImpl] Injected `fetch` (defaults to the global; overridden in tests).
  * @param {number} [opts.requestTimeoutSlackMs] Extra ms added to a call's abort budget over its server long-poll (default 5000).
+ * @param {{ updateJob?: (req: { jobKey: string, changeset: { timeout: number } }) => Promise<unknown> }} [opts.camunda] Optional Camunda SDK client. When present (and it exposes `updateJob`), `extendLock` prefers the SDK's typed `updateJob` (`PATCH /v2/jobs/{jobKey}` with `{ changeset: { timeout } }`) over the raw fetch fallback.
  * @returns {{ activate(req: ActivateRequest): Promise<ReadonlyArray<ActivatedJob>>, extendLock(jobKey: string, ms: number): Promise<void>, complete(jobKey: string, variables?: object): Promise<void>, fail(jobKey: string, opts?: { retries?: number, errorMessage?: string, retryBackOff?: number, variables?: object }): Promise<void> }}
  */
 export function createRawEngineClient(opts = {}) {
@@ -226,7 +227,7 @@ export function createRawEngineClient(opts = {}) {
           await camunda.updateJob({ changeset: { timeout: ms }, jobKey: String(jobKey) });
           return;
         } catch (err) {
-          throw new Error(`extendLock ${jobKey}: SDK updateJob failed: ${err?.message ?? err}`);
+          throw new Error(`extendLock ${jobKey}: SDK updateJob failed: ${err?.message ?? err}`, { cause: err });
         }
       }
       const url = `${base}/jobs/${encodeURIComponent(jobKey)}`;

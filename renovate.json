@@ -4,14 +4,14 @@
   "packageRules": [
     {
       "description": "Auto-merge non-major @nanobpm/* updates once CI is green. These are first-party packages published from nano-ide (@nanobpm/agentic, @nanobpm/urban-agent-client); the PR CI workflow (lint + test) is the gate. For 0.x pins a caret range locks the minor, so Renovate's range bump is what actually pulls a new minor through; automerging it keeps the worker fleet on the latest agentic wire protocol without manual PRs. platformAutomerge is false because this repo has no merge queue and 'Allow auto-merge' is disabled, so Renovate self-merges on a later pass once the PR's branch status is green (the main ruleset requires 0 approvals, and copilot_code_review is advisory not blocking).",
-      "matchPackageNames": ["/^@nanobpm//"],
+      "matchPackageNames": ["/^@nanobpm\\//"],
       "matchUpdateTypes": ["minor", "patch"],
       "automerge": true,
       "platformAutomerge": false
     },
     {
       "description": "Major @nanobpm/* updates may be breaking - require a human to review and merge.",
-      "matchPackageNames": ["/^@nanobpm//"],
+      "matchPackageNames": ["/^@nanobpm\\//"],
       "matchUpdateTypes": ["major"],
       "automerge": false
     }

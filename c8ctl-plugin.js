@@ -8005,12 +8005,22 @@ async function workAgent(req, flags) {
         let stored;
         try {
           stored = readHiresStrict()[name];
-        } catch {
-          return; // config exists but doesn't parse (torn write) — keep current types
+        } catch (err) {
+          // config exists but doesn't parse (torn write) — keep current types
+          logger.warn(`Profile "${name}" reload skipped — ${configFile} unreadable/unparseable (keeping current job types): ${err?.message || err}`);
+          return;
         }
-        if (!stored) return; // profile vanished — keep serving the current types
+        if (!stored) {
+          // profile vanished — keep serving the current types
+          logger.warn(`Profile "${name}" reload skipped — profile no longer present in ${configFile} (keeping current job types)`);
+          return;
+        }
         const norm = normalizeStoredProfile(name, stored);
-        if (norm.error) return; // invalid edit — keep current types
+        if (norm.error) {
+          // invalid edit — keep current types
+          logger.warn(`Profile "${name}" reload skipped — invalid profile edit (keeping current job types): ${norm.error}`);
+          return;
+        }
         const m = jobTypeMatrix(norm.profile.rank, norm.profile.capabilities);
         const desired = [...new Set([...m, ...extraJobTypes])];
         if (draining) return; // teardown began while we were reading — don't write

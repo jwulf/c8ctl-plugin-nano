@@ -248,8 +248,11 @@ export const makeSupervisor = (deps: SupervisorDeps): Effect.Effect<Supervisor> 
           // presence and re-claims every active job from its write-through shadow
           // on every reconnect, so the manual re-register/re-claim resync is
           // retired. The registry stays the authority and the single write path
-          // into the client. On (re)connect we only (re)install the inbound steer
-          // router so steering survives a socket flap.
+          // into the client. Transient reconnects happen inside the emit client
+          // and are not observed here, so this hook installs the inbound steer
+          // router once (on the initial establish); the router then persists
+          // across the client's internal reconnects via the shared steer route
+          // holder, so steering survives a socket flap.
           (handle) => installSteerRoute(handle, steerRouter, logger),
           run,
           deps.agenticConfig,

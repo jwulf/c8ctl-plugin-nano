@@ -58,6 +58,18 @@ function buildHeaders({ token, authHeaders }) {
 }
 
 /**
+ * True only for a plain object map (rejects `null`, arrays, and exotic objects
+ * like `Date`/`Map`). The engine expects `variables`/`customHeaders` to be a
+ * key/value map, so anything else is dropped rather than POSTed as a malformed
+ * body or surfaced to the runner as an unexpected shape.
+ */
+function isPlainObjectMap(v) {
+  if (v === null || typeof v !== "object" || Array.isArray(v)) return false;
+  const proto = Object.getPrototypeOf(v);
+  return proto === Object.prototype || proto === null;
+}
+
+/**
  * Map one raw v2 activated-job record to the port's {@link ActivatedJob}. Keys are
  * strings in v2. A record missing `jobKey`/`type` violates the `ActivatedJob`
  * contract (an empty key would produce `PATCH .../jobs//timeout`; an empty type
@@ -91,11 +103,14 @@ function mapJob(raw) {
   // the retry count (to preserve/decrement it on a `fail`, matching the SDK job
   // object), and the process-instance key (audit/logging). These ride opaquely
   // to the runner exactly as the SDK job worker surfaces them.
-  if (raw.customHeaders !== undefined && raw.customHeaders !== null) job.customHeaders = raw.customHeaders;
+  if (raw.customHeaders !== undefined && raw.customHeaders !== null && isPlainObjectMap(raw.customHeaders))
+    job.customHeaders = raw.customHeaders;
   const rawRetries = raw.retries;
   if (rawRetries !== undefined && rawRetries !== null) {
     const n = Number(rawRetries);
-    if (Number.isFinite(n)) job.retries = n;
+    // Downstream treats retries as a non-negative integer (decremented on fail),
+    // so normalize floats/negatives rather than pass a fractional/negative count.
+    if (Number.isFinite(n)) job.retries = Math.max(0, Math.trunc(n));
   }
   const pik = raw.processInstanceKey;
   if (pik !== undefined && pik !== null) job.processInstanceKey = String(pik);
@@ -218,7 +233,7 @@ export function createRawEngineClient(opts = {}) {
       // result-variable map the model produced is merged onto the process
       // instance. C8 v2 answers 204 No Content on success.
       const url = `${base}/jobs/${encodeURIComponent(jobKey)}/completion`;
-      const body = JSON.stringify(variables && typeof variables === "object" ? { variables } : {});
+      const body = JSON.stringify(isPlainObjectMap(variables) ? { variables } : {});
       const res = await call(url, { method: "POST", body }, 15_000);
       if (!res || !res.ok) {
         const status = res ? res.status : "?";
@@ -239,7 +254,7 @@ export function createRawEngineClient(opts = {}) {
       const payload = { retries };
       if (errorMessage !== undefined && errorMessage !== null) payload.errorMessage = String(errorMessage);
       if (Number.isFinite(retryBackOff) && retryBackOff > 0) payload.retryBackOff = retryBackOff;
-      if (variables && typeof variables === "object") payload.variables = variables;
+      if (isPlainObjectMap(variables)) payload.variables = variables;
       const res = await call(url, { method: "POST", body: JSON.stringify(payload) }, 15_000);
       if (!res || !res.ok) {
         const status = res ? res.status : "?";

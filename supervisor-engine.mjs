@@ -108,7 +108,7 @@ async function readErrorBody(res) {
  * @param {Record<string,string>|(() => (Record<string,string>|Promise<Record<string,string>>))} [opts.authHeaders] Ready-made auth header map, OR a resolver invoked per request (so rotating SDK auth — e.g. an OAuth bearer that refreshes — is re-derived each call rather than frozen). Wins over `token`.
  * @param {typeof fetch} [opts.fetchImpl] Injected `fetch` (defaults to the global; overridden in tests).
  * @param {number} [opts.requestTimeoutSlackMs] Extra ms added to a call's abort budget over its server long-poll (default 5000).
- * @returns {{ activate(req: ActivateRequest): Promise<ReadonlyArray<ActivatedJob>>, extendLock(jobKey: string, ms: number): Promise<void> }}
+ * @returns {{ activate(req: ActivateRequest): Promise<ReadonlyArray<ActivatedJob>>, extendLock(jobKey: string, ms: number): Promise<void>, complete(jobKey: string, variables?: object): Promise<void>, fail(jobKey: string, opts?: { retries?: number, errorMessage?: string, retryBackOff?: number, variables?: object }): Promise<void> }}
  */
 export function createRawEngineClient(opts = {}) {
   const {
@@ -187,6 +187,46 @@ export function createRawEngineClient(opts = {}) {
       if (!res || !res.ok) {
         const status = res ? res.status : "?";
         throw new Error(`extendLock ${jobKey}: HTTP ${status} from ${url}${res ? await readErrorBody(res) : ""}`);
+      }
+    },
+
+    // ---- Job completion / failure ------------------------------------------
+    // The narrow surface the supervisor's JobRunner needs to SETTLE a job once
+    // its agent harness finishes — the direct-REST analogue of the SDK job
+    // object's `job.complete()` / `job.fail()` (which the per-type SDK poller
+    // path in `workAgent` still uses). A plain `ActivatedJob` (jobKey/type/
+    // variables) carries no settle methods, so the supervisor path completes via
+    // these calls instead. Effect-free and wire-testable like `activate` /
+    // `extendLock`; a non-2xx (e.g. a 409 when the lock already lapsed and the
+    // job was reclaimed) surfaces as a rejected promise for the port to map.
+
+    async complete(jobKey, variables) {
+      // `POST <base>/v2/jobs/{jobKey}/completion` with `{ variables }` — the
+      // result-variable map the model produced is merged onto the process
+      // instance. C8 v2 answers 204 No Content on success.
+      const url = `${base}/jobs/${encodeURIComponent(jobKey)}/completion`;
+      const body = JSON.stringify(variables && typeof variables === "object" ? { variables } : {});
+      const res = await call(url, { method: "POST", body }, 15_000);
+      if (!res || !res.ok) {
+        const status = res ? res.status : "?";
+        throw new Error(`complete ${jobKey}: HTTP ${status} from ${url}${res ? await readErrorBody(res) : ""}`);
+      }
+    },
+
+    async fail(jobKey, { retries = 0, errorMessage, retryBackOff, variables } = {}) {
+      // `POST <base>/v2/jobs/{jobKey}/failure` with `{ retries, errorMessage?,
+      // retryBackOff?, variables? }` — `retries > 0` re-queues for another
+      // attempt, `retries === 0` raises an incident. Optional fields are omitted
+      // when absent so the engine applies its own defaults. C8 v2 answers 204.
+      const url = `${base}/jobs/${encodeURIComponent(jobKey)}/failure`;
+      const payload = { retries };
+      if (errorMessage !== undefined && errorMessage !== null) payload.errorMessage = String(errorMessage);
+      if (Number.isFinite(retryBackOff) && retryBackOff > 0) payload.retryBackOff = retryBackOff;
+      if (variables && typeof variables === "object") payload.variables = variables;
+      const res = await call(url, { method: "POST", body: JSON.stringify(payload) }, 15_000);
+      if (!res || !res.ok) {
+        const status = res ? res.status : "?";
+        throw new Error(`fail ${jobKey}: HTTP ${status} from ${url}${res ? await readErrorBody(res) : ""}`);
       }
     },
   };

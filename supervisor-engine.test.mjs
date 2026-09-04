@@ -105,6 +105,59 @@ test("extendLock: a 409 (reclaim race) throws so dispatch declines to start", as
   await assert.rejects(() => engine.extendLock("j1", 1000), /HTTP 409.*timeout.*job not activated/s);
 });
 
+test("complete: POSTs /v2/jobs/{key}/completion with the result variables and 204s cleanly", async () => {
+  const fetchImpl = makeFakeFetch([{ status: 204 }]);
+  const engine = createRawEngineClient({ baseUrl: "http://engine:8080", token: "T", fetchImpl });
+  await engine.complete("job-7", { status: "opened", summary: "done" });
+  const { url, init } = fetchImpl.calls[0];
+  assert.equal(url, "http://engine:8080/v2/jobs/job-7/completion");
+  assert.equal(init.method, "POST");
+  assert.equal(init.headers.Authorization, "Bearer T");
+  assert.deepEqual(JSON.parse(init.body), { variables: { status: "opened", summary: "done" } });
+});
+
+test("complete: no/empty variables POSTs an empty body object (never null variables)", async () => {
+  const fetchImpl = makeFakeFetch([{ status: 204 }, { status: 204 }]);
+  const engine = createRawEngineClient({ baseUrl: "http://engine:8080", fetchImpl });
+  await engine.complete("j1");
+  assert.deepEqual(JSON.parse(fetchImpl.calls[0].init.body), {});
+  await engine.complete("j2", null);
+  assert.deepEqual(JSON.parse(fetchImpl.calls[1].init.body), {});
+});
+
+test("complete: a non-2xx (e.g. 409 lock lapsed) throws with status + endpoint", async () => {
+  const fetchImpl = makeFakeFetch([{ status: 409, text: "job not activated" }]);
+  const engine = createRawEngineClient({ baseUrl: "http://engine:8080", fetchImpl });
+  await assert.rejects(() => engine.complete("j9", { a: 1 }), /complete j9: HTTP 409.*completion.*job not activated/s);
+});
+
+test("fail: POSTs /v2/jobs/{key}/failure with retries, errorMessage, retryBackOff and variables", async () => {
+  const fetchImpl = makeFakeFetch([{ status: 204 }]);
+  const engine = createRawEngineClient({ baseUrl: "http://engine:8080", authHeaders: { Authorization: "Basic dGVzdA==" }, fetchImpl });
+  await engine.fail("job-3", { retries: 2, errorMessage: "boom", retryBackOff: 15_000, variables: { io: 1 } });
+  const { url, init } = fetchImpl.calls[0];
+  assert.equal(url, "http://engine:8080/v2/jobs/job-3/failure");
+  assert.equal(init.method, "POST");
+  assert.equal(init.headers.Authorization, "Basic dGVzdA=="); // authHeaders wins over token
+  assert.deepEqual(JSON.parse(init.body), { retries: 2, errorMessage: "boom", retryBackOff: 15_000, variables: { io: 1 } });
+});
+
+test("fail: omits optional fields (errorMessage/retryBackOff/variables) when absent; defaults retries to 0", async () => {
+  const fetchImpl = makeFakeFetch([{ status: 204 }, { status: 204 }]);
+  const engine = createRawEngineClient({ baseUrl: "http://engine:8080", fetchImpl });
+  await engine.fail("j1");
+  assert.deepEqual(JSON.parse(fetchImpl.calls[0].init.body), { retries: 0 });
+  // A non-positive retryBackOff is dropped (engine applies its own default), not sent as 0.
+  await engine.fail("j2", { retries: 1, retryBackOff: 0 });
+  assert.deepEqual(JSON.parse(fetchImpl.calls[1].init.body), { retries: 1 });
+});
+
+test("fail: a non-2xx response throws with status + endpoint", async () => {
+  const fetchImpl = makeFakeFetch([{ status: 500, text: "boom" }]);
+  const engine = createRawEngineClient({ baseUrl: "http://engine:8080", fetchImpl });
+  await assert.rejects(() => engine.fail("j9", { retries: 0 }), /fail j9: HTTP 500.*failure.*boom/s);
+});
+
 test("unauthenticated: no Authorization header when neither token nor authHeaders given", async () => {
   const fetchImpl = makeFakeFetch([{ status: 200, json: { jobs: [] } }]);
   const engine = createRawEngineClient({ baseUrl: "http://localhost:8080", fetchImpl });

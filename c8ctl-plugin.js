@@ -7989,6 +7989,11 @@ async function workAgent(req, flags) {
   const WATCH_INTERVAL_MS = 1500;
   let draining = false;
   if (!autoMode) {
+    // Serialize reloads on a chain (never overlap a `setTypes` write) and coalesce
+    // with a monotonic generation guard, so a slow older reload can never apply a
+    // stale job-type set after a newer edit has already superseded it.
+    let reloadSeq = 0;
+    let reloadChain = Promise.resolve();
     watchFile(configFile, { interval: WATCH_INTERVAL_MS }, (curr, prev) => {
       // A callback can already be queued when teardown flips `draining`; bail so we
       // never write to the shared registry (or race its teardown) during shutdown.
@@ -8001,7 +8006,12 @@ async function workAgent(req, flags) {
         curr.ctimeMs === prev.ctimeMs &&
         curr.size === prev.size
       ) return;
-      (async () => {
+      const mySeq = ++reloadSeq;
+      reloadChain = reloadChain.then(async () => {
+        if (draining) return;
+        // A newer edit already landed while we were queued — skip this stale
+        // reload so its (older) job-type set never lands after the newer one.
+        if (mySeq !== reloadSeq) return;
         let stored;
         try {
           stored = readHiresStrict()[name];
@@ -8024,9 +8034,10 @@ async function workAgent(req, flags) {
         const m = jobTypeMatrix(norm.profile.rank, norm.profile.capabilities);
         const desired = [...new Set([...m, ...extraJobTypes])];
         if (draining) return; // teardown began while we were reading — don't write
+        if (mySeq !== reloadSeq) return; // superseded during the async read — skip
         await SupervisorEffect.runPromise(workerRegistry.setTypes(workerName, desired));
         logger.info(`Profile "${name}" changed — now servicing ${desired.length} job type(s): ${desired.join('  ')}`);
-      })().catch((err) => logger.warn(`profile reload failed: ${err?.message || err}`));
+      }).catch((err) => logger.warn(`profile reload failed: ${err?.message || err}`));
     });
   }
 

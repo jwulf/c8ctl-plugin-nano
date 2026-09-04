@@ -58,7 +58,6 @@ import {
   createIdleLivenessMonitor,
   resolveLivenessOverrides,
   parsePsTime,
-  startLockExtender,
   provisionRepo,
   finalizeGit,
   describeGitFailure,
@@ -2323,66 +2322,9 @@ test('runAgentJob (docker): pipes envelope, captures output, reaps container', {
   assert.ok(typeof reap.reaped === 'number');
 });
 
-// The broker activation lock is no longer a hardcoded up-front value. Instead the
-// worker keeps it a bounded `recovery-window` ahead of *now* via startLockExtender
-// while the harness runs, so a long agent job never has its lock lapse (which
-// would re-activate the still-retryable job → a second agent + the stale-fail 409
-// race). Each refresh SETS the deadline to now+window (UpdateJobTimeout is a
-// duration-from-now, not a delta), so the deadline never creeps unbounded and a
-// stop() reclaims within one window.
-test('startLockExtender refreshes the lock to the window on an interval, then stop() halts it', async () => {
-  const calls = [];
-  const job = { jobKey: 'jk', modifyJobTimeout: async ({ newTimeoutMs }) => { calls.push(newTimeoutMs); } };
-  const stop = startLockExtender(job, 300_000, 20, 'tag', null);
-  await new Promise((r) => setTimeout(r, 200));
-  const afterRun = calls.length;
-  assert.ok(afterRun >= 2, `expected ≥2 refreshes, got ${afterRun}`);
-  assert.ok(calls.every((ms) => ms === 300_000), 'every refresh sets the deadline to now+window (absolute, not cumulative)');
-  stop();
-  await new Promise((r) => setTimeout(r, 60));
-  assert.equal(calls.length, afterRun, 'stop() halts all further refreshes');
-});
-
-test('startLockExtender renews immediately (harness gets a full window regardless of provisioning time)', async () => {
-  const calls = [];
-  const job = { jobKey: 'jk', modifyJobTimeout: async ({ newTimeoutMs }) => { calls.push(newTimeoutMs); } };
-  const stop = startLockExtender(job, 300_000, 100_000, 'tag', null);
-  // No interval has elapsed, but the first renewal must already have been queued.
-  await new Promise((r) => setTimeout(r, 50));
-  stop();
-  assert.ok(calls.length >= 1, 'the first renewal fires immediately, not after one interval');
-  assert.equal(calls[0], 300_000, 'the immediate renewal sets the deadline to now+window');
-});
-
-test('startLockExtender warns loudly when the SDK cannot extend the timeout', () => {
-  const warned = [];
-  const stop = startLockExtender({ jobKey: 'jk' }, 300_000, 20, 'tag', { warn: (m) => warned.push(m) });
-  stop();
-  assert.equal(warned.length, 1, 'a missing modifyJobTimeout is surfaced, not swallowed silently');
-  assert.ok(warned[0].includes('will NOT be auto-extended'));
-});
-
-test('startLockExtender is a safe no-op when the job cannot extend its timeout', () => {
-  // Older SDKs without modifyJobTimeout, or a non-positive window/interval, must
-  // degrade to the fixed initial lock rather than throw.
-  assert.doesNotThrow(() => startLockExtender({}, 300_000, 20, 'tag', null)());
-  assert.doesNotThrow(() => startLockExtender({ modifyJobTimeout() {} }, 0, 20, 'tag', null)());
-  assert.doesNotThrow(() => startLockExtender({ modifyJobTimeout() {} }, 300_000, 0, 'tag', null)());
-});
-
-test('startLockExtender swallows a failing extend without crashing the handler', async () => {
-  const warned = [];
-  const job = { jobKey: 'jk', modifyJobTimeout: async () => { throw new Error('network blip'); } };
-  const stop = startLockExtender(job, 300_000, 20, 'tag', { warn: (m) => warned.push(m) });
-  await new Promise((r) => setTimeout(r, 55));
-  stop();
-  assert.ok(warned.length >= 1, 'extend failures are logged, not thrown');
-  assert.ok(warned[0].includes('lock extend failed'));
-});
-
-// The idle-timeout is the liveness gate the lock-extender relies on: a harness
-// that goes silent (no stdout/stderr) for longer than the window is killed as
-// wedged, which resolves runAgentJob so the worker can fail+reclaim the job.
+// The idle-timeout is the liveness gate the runtime's lock lifecycle relies on: a
+// harness that goes silent (no stdout/stderr) for longer than the window is killed
+// as wedged, which resolves runAgentJob so the runner can fail+reclaim the job.
 test('runAgentJob (host) idle-timeout kills a silent harness', { skip: process.platform === 'win32' }, async () => {
   const profile = { name: 'p', rank: 'senior', command: 'sleep 5', args: [], model: '', capabilities: [] };
   const job = { jobKey: 'jk', type: 'senior', variables: {}, customHeaders: {} };

@@ -136,11 +136,6 @@ const READINESS_TIMEOUT_MS = 60_000;
 const READINESS_POLL_MS = 500;
 const HEALTH_TIMEOUT_MS = 1_500;
 const STOP_GRACE_MS = 8_000;
-// Backoff applied when a poller fails a lease fast because the worker is already
-// running another job (issue #142 single-flight). Long enough that the deferred
-// job doesn't tight-loop re-activating while the first runs, short enough that it
-// is picked up promptly once the worker frees up.
-const WORKER_BUSY_RETRY_BACKOFF_MS = 5_000;
 // Upper bound on one `--auto` engine-read reconcile (enumerate deployed
 // definitions + fetch each BPMN). A read that stalls past this is treated as a
 // transient failure so the running poller set is KEPT and, crucially, shutdown
@@ -3288,14 +3283,12 @@ async function createAgenticEndpoint(opts) {
 //
 // Returns everything a JS caller needs to run `makeSupervisor` — the assembled
 // `deps`, the seeded `registry` (so workers can be add/remove'd live), and the
-// `makeSupervisor` + `Effect` handles from the bundle. NOTE (deferred, issue
-// #156): the actual hot-path flip — deleting the per-type SDK pollers, the
-// process-wide `singleFlight`, and the per-process reconcile crawl in `workAgent`
-// and running `makeSupervisor(deps).run` as the single per-host owner — is NOT
-// wired here; it deletes battle-tested crash-safety code and can only be
-// validated against a live engine, so it is intentionally left as the follow-up
-// this seam unblocks. Constructing deps is side-effect-free (no socket opens, no
-// activation) until the caller forks `supervisor.run`.
+// `makeSupervisor` + `Effect` handles from the bundle. NOTE (issue #172): the
+// hot-path flip this seam unblocks is now DONE — `workAgent` runs
+// `makeSupervisor(deps).run` as the single per-host owner, having retired the
+// per-type SDK pollers, the process-wide `singleFlight`, the per-process reconcile
+// crawl, and the per-job lock extender. Constructing deps stays side-effect-free
+// (no socket opens, no activation) until the caller forks `supervisor.run`.
 //
 // @param {object} opts
 // @param {{ run(job): Promise<void> }} opts.runner  raw job runner (required to run)
@@ -5529,80 +5522,12 @@ function baseAgentEnv(profile, job) {
   };
 }
 
-/**
- * Process-wide single-flight guard (issue #142).
- *
- * `maxParallelJobs = 1` only caps concurrency WITHIN one job-type poller, but a
- * single `work` process runs one poller per job type (rank×capability matrix, or
- * every deployed agent type under `--auto`). Without a shared gate a worker
- * serving N job types could lease and run up to N jobs at once — each holding its
- * own PTY + git workspace + broker lock-extender — the exact failure the
- * "one job per worker" invariant exists to prevent.
- *
- * This is a capacity-1, non-blocking mutex shared by EVERY per-type poller: the
- * first poller to `tryAcquire()` runs its job to completion (releasing in a
- * `finally`); any other poller that finds the permit already held must NOT begin
- * a second job (the caller fails the lease fast so the broker re-queues it rather
- * than leaving it "claimed but idle"). `tryAcquire`/`release` are synchronous
- * check-and-set, so the single-threaded event loop makes them race-free across
- * the concurrently-invoked async job handlers.
- */
-function createSingleFlight() {
-  let held = false;
-  return {
-    /** Take the permit if free; returns false when a job is already in flight. */
-    tryAcquire() {
-      if (held) return false;
-      held = true;
-      return true;
-    },
-    /** Release the permit. Idempotent: redundant calls are safe no-ops, though the normal path releases once per acquire (in a `finally`). */
-    release() {
-      held = false;
-    },
-    /** True while a job holds the permit. */
-    get busy() {
-      return held;
-    },
-  };
-}
-
-/**
- * Keep a leased job's broker activation lock ahead of *now* while the harness is
- * running, so a long agent run never has its lock lapse and get re-activated (a
- * second worker starting → the classic stale complete/fail 409). The lock is NOT
- * hardcoded up front: we refresh it to `windowMs` — a duration-from-now, per the
- * UpdateJobTimeout contract ("the duration of the new timeout in ms, starting
- * from the current moment"), so calls SET rather than accumulate — every
- * `intervalMs`. The deadline therefore stays a bounded `windowMs` ahead of now.
- * The instant we stop refreshing (harness exit / idle-kill / hard cap) the lock
- * lapses within `windowMs` and the broker reclaims the job — fast node-loss
- * recovery. Because the harness is always killed locally before we stop, the lock
- * strictly outlives our local run, so a reclaim never races a still-running agent.
- *
- * Returns a stop() to call once the run settles. Extension failures are logged
- * and swallowed — a transient network blip must not crash the job handler. Older
- * SDKs without `modifyJobTimeout` degrade to the fixed initial lock (a no-op stop).
- */
-function startLockExtender(job, windowMs, intervalMs, tag, logger) {
-  if (!(windowMs > 0) || !(intervalMs > 0)) {
-    return () => {};
-  }
-  if (typeof job?.modifyJobTimeout !== 'function') {
-    logger?.warn?.(`${tag}: job.modifyJobTimeout unavailable — activation lock will NOT be auto-extended; a run longer than ${windowMs}ms risks being reclaimed and executed twice`);
-    return () => {};
-  }
-  const extend = () => Promise.resolve()
-    .then(() => job.modifyJobTimeout({ newTimeoutMs: windowMs }))
-    .catch((err) => logger?.warn?.(`${tag}: lock extend failed — ${err?.message ?? err}`));
-  // Renew immediately so the harness starts with a full, fresh window no matter
-  // how much of the initial activation lease provisioning (clone/checkout) ate.
-  extend();
-  const timer = setInterval(extend, intervalMs);
-  // Never let the heartbeat keep the process alive on shutdown.
-  if (typeof timer.unref === 'function') timer.unref();
-  return () => clearInterval(timer);
-}
+// Issue #172 retired `createSingleFlight` (the process-wide capacity-1 mutex the
+// per-type SDK pollers shared) and `startLockExtender` (the per-job broker-lock
+// heartbeat). Both are now owned by the single-owner supervisor runtime: race-free
+// per-type slot accounting lives in `supervisor/src/registry.ts` (this worker
+// registers with capacity 1), and the lock lifecycle — extend-winner-before-start
+// plus a `Schedule`-driven heartbeat — lives in `supervisor/src/dispatch.ts`.
 
 /**
  * Run a single activated job through the profile's CLI command (one-shot),
@@ -7032,26 +6957,21 @@ async function workAgent(req, flags) {
   };
   // One job per worker, hard-wired (there is deliberately no --max-parallel
   // flag): an agent harness holds a PTY + a git workspace for the whole life of
-  // a job, so a worker must never lease a second job concurrently. The @camunda8
-  // SDK derives maxJobsToActivate = maxParallelJobs - activeJobs, so 1 means
-  // "activate one job, then stop polling until it completes".
-  const maxParallelJobs = 1;
-  // Process-wide single-flight guard (issue #142). The SDK's maxParallelJobs=1
-  // only serializes ONE job-type poller, but this process runs one poller per
-  // job type, so nothing stops N pollers from each leasing + running a job
-  // concurrently. This capacity-1 mutex, shared by every poller's jobHandler,
-  // enforces the real "one job per worker" invariant: while any job is in flight
-  // on any job type, no other poller starts a second one.
-  const singleFlight = createSingleFlight();
+  // a job, so a worker must never lease a second job concurrently. Issue #172:
+  // this is now enforced by registering this worker with capacity 1 in the
+  // single-owner runtime's shared registry (one worker, capacity 1, across all
+  // job types) — retiring the process-wide capacity-1 single-flight the per-type
+  // SDK pollers needed. Race-free slot accounting lives in the runtime registry.
   // The broker job-activation lock is NOT hardcoded up front. A fixed timeout is
   // impossible to size for an agent: too short reclaims a still-working job (a
   // second agent starts + the stale complete/fail is rejected 409), too long
-  // strands a dead worker's job. Instead the worker keeps the lock a bounded
-  // `recovery-window` ahead of *now* while the harness runs (see
-  // startLockExtender), so long runs never lose their lock, and a dead/killed
-  // worker's job is reclaimed within one window. Liveness is enforced by
-  // `idle-timeout` (max silence before the harness is killed as wedged), so the
-  // lock is held only while the agent is alive AND producing output.
+  // strands a dead worker's job. Instead the runtime's dispatch lifecycle keeps
+  // the lock a bounded `recovery-window` ahead of *now* while the harness runs
+  // (extend-winner-before-start + a Schedule heartbeat in dispatch.ts), so long
+  // runs never lose their lock, and a dead/killed worker's job is reclaimed
+  // within one window. Liveness is enforced by `idle-timeout` (max silence before
+  // the harness is killed as wedged), so the lock is held only while the agent is
+  // alive AND producing output.
   const recoveryWindowMs = intFlag(flags?.['recovery-window'], 5 * 60_000);
   const idleTimeoutMs = intFlag(flags?.['idle-timeout'], 5 * 60_000);
   // `--job-timeout` is now an OPTIONAL absolute hard cap on total harness runtime
@@ -7250,7 +7170,7 @@ async function workAgent(req, flags) {
   }
   const extraNote = extraJobTypes.length > 0 ? ` (${extraJobTypes.length} via --job-type)` : '';
   logger.info(`  listening on ${jobTypes.length} job type(s)${extraNote}: ${jobTypes.join('  ')}`);
-  logger.info(`  one job per worker (single-flight across all ${jobTypes.length} job type(s)); recovery window: ${recoveryWindowMs}ms; idle timeout: ${idleTimeoutMs}ms; hard cap: ${hardCapMs > 0 ? `${hardCapMs}ms` : 'off'}; poll timeout: ${pollTimeoutMs}ms`);
+  logger.info(`  one job per worker (registry capacity 1 across all ${jobTypes.length} job type(s)); recovery window: ${recoveryWindowMs}ms; idle timeout: ${idleTimeoutMs}ms; hard cap: ${hardCapMs > 0 ? `${hardCapMs}ms` : 'off'}; poll timeout: ${pollTimeoutMs}ms`);
   // Warm the gh-token cache now, off the job-handling path: githubCloneToken()
   // may consult `gh auth token` (a synchronous spawn, up to 10s) as its default
   // credential fallback, and doing that inside a job handler would block the
@@ -7646,46 +7566,20 @@ async function workAgent(req, flags) {
   const envPermission = (process.env.NANO_AGENTIC_PERMISSION || '').trim().toLowerCase();
   const rolePermission = resolveAgenticSetting(envPermission, profile.permission, PERMISSION_MODES, 'yolo');
 
-  // A per-job-type worker factory. Captures all the CLI-local + profile context
-  // in closure scope so the profile watcher below can (re)spawn a poller for any
-  // job type on demand without re-reading the flags.
-  const makeWorker = (jobType) =>
-    camunda.createJobWorker({
-      jobType,
-      workerName: `${workerName}:${jobType}`,
-      maxParallelJobs,
-      jobTimeoutMs: recoveryWindowMs,
-      pollTimeoutMs,
-      jobHandler: async (job) => {
-        // Process-wide single-flight (issue #142): if another job is already
-        // running on ANY poller, do not start a second harness. Fail this lease
-        // FAST — before recording it active, extending its lock, or provisioning
-        // anything — so the broker re-queues it (retries preserved) instead of it
-        // sitting "claimed but idle" while the first job runs. Gating here, at the
-        // point activation surfaces as a handler call, is the cross-poller gate
-        // the per-type maxParallelJobs cannot provide.
-        if (!singleFlight.tryAcquire()) {
-          // Not a failure — preserve the broker-provided retries verbatim so
-          // re-dispatch doesn't decrement (or resurrect) the job. Keep a real 0
-          // as 0 (an already-incidentable job must stay that way); only default
-          // to 1 when the count is missing/invalid.
-          const rawRetries = Number(job.retries);
-          const retries = Number.isInteger(rawRetries) && rawRetries >= 0 ? rawRetries : 1;
-          logger.info(`[${jobType}] job ${job.jobKey} deferred — worker already running another job; releasing lease for re-dispatch.`);
-          return job.fail({
-            errorMessage: 'worker busy: one job per worker (single-flight across all job types)',
-            retries,
-            retryBackOff: WORKER_BUSY_RETRY_BACKOFF_MS,
-          });
-        }
-        recordJobStart(job, jobType);
-        // Auto-extend the broker lock for the whole life of this job (harness run
-        // + git finalize + complete/fail), stopped in the outer finally. The lock
-        // is held only while the harness stays alive and productive — a silent
-        // hang is killed by the idle-timeout, which resolves runAgentJob and stops
-        // the extension, so the broker can reclaim the job.
-        let stopLockExtender = () => {};
-        try {
+  // The agent job runner (issue #172 hot-path flip). The single-owner supervisor
+  // runtime dispatches each activated job to this `run(job)`; it executes the
+  // harness exactly as the retired per-type SDK jobHandler did, but SETTLES via the
+  // injected `settle` seam (engine complete/fail) because the plain ActivatedJob
+  // carries no SDK `job.complete()/job.fail()`. Capacity (one job per worker), the
+  // activation long-polls, the lock lifecycle, and reconcile are all owned by the
+  // runtime now — retiring the per-type pollers, the process-wide single-flight,
+  // the per-process 1+N reconcile crawl, and the per-job lock extender.
+  let settle;
+  const runner = {
+    run: async (job) => {
+      const jobType = job.type;
+      recordJobStart(job, jobType);
+      try {
         logger.info(`[${jobType}] job ${job.jobKey} (instance ${job.processInstanceKey ?? '-'}) → ${buildAgentCommandLine(profile.command, effectiveArgs)}`);
 
         // Disk-budget admission shed: if the engine data root is below the free
@@ -7697,7 +7591,7 @@ async function workAgent(req, flags) {
             const freeMb = budget.free != null ? Math.round(budget.free / 1_048_576) : '?';
             const retries = Math.max(0, (Number(job.retries) || 1) - 1);
             logger.warn(`[${jobType}] job ${job.jobKey} shed — low disk (${freeMb}MB free); retries left ${retries}`);
-            return job.fail({ errorMessage: `disk budget exceeded (only ${freeMb}MB free)`, retries, retryBackOff: 30_000 });
+            return settle.fail(job.jobKey, { errorMessage: `disk budget exceeded (only ${freeMb}MB free)`, retries, retryBackOff: 30_000 });
           }
         }
 
@@ -7729,7 +7623,7 @@ async function workAgent(req, flags) {
           const retries = Math.max(0, (Number(job.retries) || 1) - 1);
           const msg = err instanceof ProvisionError ? err.message : `prompt resource fetch failed: ${err.message}`;
           logger.warn(`[${jobType}] job ${job.jobKey} not provisioned — ${msg}; retries left ${retries}`);
-          return job.fail({ errorMessage: msg.slice(0, 2000), retries, retryBackOff: 15_000 });
+          return settle.fail(job.jobKey, { errorMessage: msg.slice(0, 2000), retries, retryBackOff: 15_000 });
         }
 
         // Assemble + normalize the task envelope from headers (defaults) and
@@ -7740,27 +7634,24 @@ async function workAgent(req, flags) {
           const retries = Math.max(0, (Number(job.retries) || 1) - 1);
           const msg = `missing secret(s): ${missing.join(', ')} (resolver: ${secretResolver.kind})`;
           logger.warn(`[${jobType}] job ${job.jobKey} not provisioned — ${msg}; retries left ${retries}`);
-          return job.fail({ errorMessage: msg, retries });
+          return settle.fail(job.jobKey, { errorMessage: msg, retries });
         }
 
         // #130: per-task liveness overrides. Precedence: envelope override →
         // worker-flag default → built-in default, each clamped to a sane max so
         // a task can't request an unbounded window. Absent envelope fields leave
-        // the worker-flag behaviour unchanged. These drive BOTH the harness idle
-        // liveness (idle/recovery) AND the broker lock recovery window, so a
-        // JVM-heavy task can widen its own window without a global flag change.
+        // the worker-flag behaviour unchanged. These drive the harness idle
+        // liveness (idle/recovery/hard-cap) so a JVM-heavy task can widen its own
+        // window without a global flag change. NOTE: after the hot-path flip
+        // (#172) the broker lock cadence/window is owned by the supervisor
+        // runtime dispatch config at the worker level (the `dispatch` config's
+        // `recoveryWindowMs` / `extendIntervalMs`), so a per-task override no
+        // longer widens the broker lock window — only the harness liveness.
         const {
           idleTimeoutMs: effectiveIdleTimeoutMs,
           recoveryWindowMs: effectiveRecoveryWindowMs,
           hardCapMs: effectiveHardCapMs,
         } = resolveLivenessOverrides(envelope.task, { idleTimeoutMs, recoveryWindowMs, hardCapMs });
-        // Recompute the lock-extend cadence from the effective recovery window
-        // (same ~1/3-of-window rule as at startup) so a widened window still
-        // renews comfortably before it lapses.
-        const effectiveLockExtendIntervalMs = Math.min(
-          Math.max(5_000, Math.floor(effectiveRecoveryWindowMs / 3)),
-          Math.max(1, Math.floor(effectiveRecoveryWindowMs * 0.75)),
-        );
         if (
           effectiveIdleTimeoutMs !== idleTimeoutMs ||
           effectiveRecoveryWindowMs !== recoveryWindowMs ||
@@ -7790,7 +7681,7 @@ async function workAgent(req, flags) {
               : 'repository.url is missing';
             const msg = `incomplete repository envelope — ${why}; refusing to run in the launch/temp cwd (likely an orchestrator bug emitting a half-specified repository block)`;
             logger.warn(`[${jobType}] job ${job.jobKey} not provisioned — ${msg}; retries left ${retries}`);
-            return job.fail({ errorMessage: msg.slice(0, 2000), retries, retryBackOff: 15_000 });
+            return settle.fail(job.jobKey, { errorMessage: msg.slice(0, 2000), retries, retryBackOff: 15_000 });
           }
         }
 
@@ -7800,12 +7691,10 @@ async function workAgent(req, flags) {
         const hasRepo = !isContainer && !!envelope.repository?.url;
         let runDir = null;
         let provisioned = null;
-        // Start refreshing the broker activation lock BEFORE any potentially-long
-        // work (host git clone/checkout can outlast the initial window). Starting
-        // here — ahead of provisionRepo — guarantees the first renewal is queued
-        // before the clone, so the lock can't lapse mid-provision and trigger the
-        // duplicate-activation / stale-409 race. The `finally` below stops it.
-        stopLockExtender = startLockExtender(job, effectiveRecoveryWindowMs, effectiveLockExtendIntervalMs, `[${jobType}] job ${job.jobKey}`, logger);
+        // The broker activation lock is owned by the single-owner runtime's dispatch
+        // lifecycle (supervisor/src/dispatch.ts): it extends the winner to the
+        // recovery window BEFORE this runner starts and heartbeats it on a Schedule
+        // for the whole run, so the retired per-job startLockExtender is gone here.
         let cwd;
         let extraEnv;
         let repoToken = null;
@@ -7847,7 +7736,7 @@ async function workAgent(req, flags) {
             const retries = Math.max(0, (Number(job.retries) || 1) - 1);
             const msg = err instanceof ProvisionError ? err.message : `provisioning error: ${err.message}`;
             logger.warn(`[${jobType}] job ${job.jobKey} not provisioned — ${msg}; retries left ${retries}`);
-            return job.fail({ errorMessage: msg.slice(0, 2000), retries, retryBackOff: 15_000 });
+            return settle.fail(job.jobKey, { errorMessage: msg.slice(0, 2000), retries, retryBackOff: 15_000 });
           }
         } else if (!isContainer) {
           // Repo-less host job (issue #129, hardening 1): nothing is provisioned,
@@ -7873,7 +7762,7 @@ async function workAgent(req, flags) {
             const retries = Math.max(0, (Number(job.retries) || 1) - 1);
             const msg = `could not create a temp workspace under the runs root: ${err.message}`;
             logger.warn(`[${jobType}] job ${job.jobKey} not provisioned — ${msg}; retries left ${retries}`);
-            return job.fail({ errorMessage: msg.slice(0, 2000), retries, retryBackOff: 15_000 });
+            return settle.fail(job.jobKey, { errorMessage: msg.slice(0, 2000), retries, retryBackOff: 15_000 });
           }
         }
 
@@ -8029,7 +7918,7 @@ async function workAgent(req, flags) {
           const resultKeys = Object.keys(resultVars);
           if (resultKeys.length === 0) logger.warn(`[${jobType}] job ${job.jobKey}: agent returned no usable result vars — write a JSON object of result variables to $AGENT_RESULT_FILE (or print a "${RESULT_SENTINEL} {…}" line) so downstream gateways see status/summary/etc.`);
           else logger.info(`[${jobType}] job ${job.jobKey}: merged agent result vars [${resultKeys.join(', ')}]`);
-          return await job.complete({
+          return await settle.complete(job.jobKey, {
             ...resultVars,
             [AGENT_RESULT_KEY]: resultEnvelope,
             output: result.stdout,
@@ -8046,249 +7935,136 @@ async function workAgent(req, flags) {
           || (result.stderr || '').trim() + (result.stderrTruncated && (result.stderr || '').trim() ? ' [stderr truncated]' : '')
           || (result.signal ? `terminated by signal ${result.signal}` : `exit code ${result.exitCode}`);
         logger.warn(`[${jobType}] job ${job.jobKey} failed (${detail}); retries left ${retries}`);
-        return await job.fail({
+        return await settle.fail(job.jobKey, {
           errorMessage: `agent "${profile.name}" failed: ${detail}`.slice(0, 2000),
           retries,
           variables: { [AGENT_RESULT_KEY]: resultEnvelope },
         });
-        } finally {
-          stopLockExtender();
-          recordJobEnd(job);
-          // Release the process-wide single-flight permit LAST, once this job's
-          // lock-extender is stopped and its bookkeeping cleared, so another
-          // poller can only begin after this job is fully settled.
-          singleFlight.release();
-        }
-      },
-    });
-
-  // Live worker registry keyed by job type, so the profile watcher can add or
-  // drain individual pollers without disturbing the others. `draining` is the
-  // shutdown latch (shared with the watcher so a reconcile can't race a stop).
-  const workers = new Map();
-  let draining = false;
-
-  const drainWorker = async (w) => {
-    try {
-      if (typeof w.stopGracefully === 'function') {
-        await w.stopGracefully({ waitUpToMs: STOP_GRACE_MS });
-      } else if (typeof w.stop === 'function') {
-        await w.stop();
+      } finally {
+        recordJobEnd(job);
       }
-      return true;
-    } catch {
-      return false; // best-effort: never let one worker's stop failure hang us
-    }
+    },
   };
 
-  const spawnJobType = (jobType) => {
-    if (workers.has(jobType)) return false;
-    workers.set(jobType, makeWorker(jobType));
-    return true;
-  };
+  // Compose the runtime deps over the plugin's real edges (issue #156 seam) and
+  // register THIS worker (capacity 1) into the shared registry. In --auto the
+  // runtime's reconcile loop rewrites this worker's serviceable types from the
+  // engine read (`autoWorkerId`); otherwise the profile watch below does.
+  const composed = await createSupervisorDeps({
+    runner,
+    camunda,
+    restConfig,
+    worker: workerName,
+    workers: [{ id: workerName, types: jobTypes, capacity: 1 }],
+    autoWorkerId: autoMode ? workerName : undefined,
+    scope: autoScope,
+    config: {
+      activation: { requestTimeoutMs: pollTimeoutMs },
+      dispatch: { recoveryWindowMs, extendIntervalMs: lockExtendIntervalMs },
+    },
+  });
+  settle = composed.settle;
+  const {
+    deps: supervisorDeps,
+    registry: workerRegistry,
+    makeSupervisor: makeSupervisorRuntime,
+    Effect: SupervisorEffect,
+    Fiber: SupervisorFiber,
+  } = composed;
 
-  for (const jobType of jobTypes) spawnJobType(jobType);
+  // Run the single per-host owner. `Effect.runFork` keeps the process alive on the
+  // runtime's own Schedule cadences (reconcile + activation/idle loop), so even an
+  // --auto worker that starts with zero types stays up and fills them in on the
+  // next reconcile — the same liveness the retired ref'd auto-poll timer provided.
+  const supervisor = await SupervisorEffect.runPromise(makeSupervisorRuntime(supervisorDeps));
+  const supervisorFiber = SupervisorEffect.runFork(supervisor.run);
 
-  // ---- Live reconcile: keep the poller set in step with the desired job-type
-  // set — start pollers for added types, gracefully drain pollers for removed
-  // types — without a restart and without disturbing unchanged types' in-flight
-  // work. The DESIRED set comes from one of two sources depending on mode:
-  //   - default: the watched profile's rank×capability matrix (∪ --job-type),
-  //     reconciled when the on-disk profile changes (e.g. `nano assign`);
-  //   - --auto:  the engine's deployed *agent* job types, reconciled by polling
-  //     the engine (the deployed set changes as apps deploy/undeploy). ----
+  // Non-auto live retype: the runtime's reconcile loop only rewrites the --auto
+  // worker's types (from the engine read), so keep watching the profile file to
+  // honour `nano assign` — a profile edit rewrites THIS worker's serviceable types
+  // in the shared registry without a restart (a single `registry.setTypes` call,
+  // the direct analogue of the retired per-process reconcile). In --auto the
+  // runtime owns the desired set, so no profile watch is installed.
   const configFile = getConfigFile();
   const WATCH_INTERVAL_MS = 1500;
-  // How often `--auto` re-reads the engine's deployed agent job types to pick up
-  // newly deployed / undeployed agent processes. Deploys are occasional, so a
-  // few seconds of latency is fine; the read is a couple of cheap C8 REST calls.
-  const AUTO_POLL_INTERVAL_MS = 5000;
-  let reconciling = false;
-  // Set when a profile change arrives while a reconcile is already in flight, so
-  // we run one more pass after the current drain completes instead of dropping
-  // the update until the next change fires.
-  let reconcileRequested = false;
-  // Handle to the in-flight reconcile so shutdown can wait for it to finish
-  // before snapshotting `workers` (avoids double-stops / missed drains).
-  let inFlightReconcile = null;
-
-  // Desired job types. In `--auto` this is the engine's deployed agent job types
-  // (∪ --job-type extras), read fresh each pass; a transient engine-read failure
-  // returns { skip } so the running set is KEPT, never torn down. Otherwise it is
-  // the CURRENT on-disk profile's matrix (∪ extras), with { skip } for a
-  // transient/torn read, a vanished profile, or an invalid edit — callers must
-  // then KEEP the running set, never tear down.
-  const desiredJobTypes = async () => {
-    if (autoMode) {
-      try {
-        const autoTypes = await resolveAutoJobTypes({ restConfig, scope: autoScope });
-        return { jobTypes: [...new Set([...autoTypes, ...extraJobTypes])] };
-      } catch (err) {
-        return { skip: `engine read failed: ${err?.message || err}` };
-      }
-    }
-    let stored;
-    try {
-      stored = readHiresStrict()[name];
-    } catch {
-      // config.json exists but doesn't parse (e.g. a torn write): the profile is
-      // NOT necessarily gone, so don't claim it was deleted — skip this pass.
-      return { skip: 'config unreadable' };
-    }
-    if (!stored) return { skip: 'deleted' };
-    const norm = normalizeStoredProfile(name, stored);
-    if (norm.error) return { skip: norm.error };
-    const m = jobTypeMatrix(norm.profile.rank, norm.profile.capabilities);
-    return { jobTypes: [...new Set([...m, ...extraJobTypes])] };
-  };
-
-  const reconcile = () => {
-    if (draining) return inFlightReconcile || Promise.resolve();
-    if (reconciling) {
-      // A change landed mid-reconcile — remember it so the current pass loops
-      // once more rather than leaving the worker set stale until the next edit.
-      // Return the ACTUAL in-flight promise (not a fresh short-lived one) so a
-      // caller — including shutdown — waits for the real reconcile to finish.
-      reconcileRequested = true;
-      return inFlightReconcile || Promise.resolve();
-    }
-    reconciling = true;
-    reconcileRequested = false;
-    inFlightReconcile = (async () => {
-      try {
-        do {
-          reconcileRequested = false;
-          await runReconcilePass();
-        } while (reconcileRequested && !draining);
-      } finally {
-        reconciling = false;
-        inFlightReconcile = null;
-      }
-    })();
-    return inFlightReconcile;
-  };
-
-  const runReconcilePass = async () => {
-      const desired = await desiredJobTypes();
-      if (desired.skip) {
-        if (autoMode) {
-          logger.warn(`--auto reconcile skipped — ${desired.skip}; keeping the current ${workers.size} worker(s) running.`);
-        } else if (desired.skip === 'deleted') {
-          logger.warn(`Profile "${name}" is gone from config — keeping the current ${workers.size} worker(s) running.`);
-        } else {
-          logger.warn(`Profile "${name}" reload skipped — ${desired.skip}; keeping current workers.`);
-        }
-        return;
-      }
-      const { added, removed } = diffJobTypes([...workers.keys()], desired.jobTypes);
-      if (added.length === 0 && removed.length === 0) return;
-      const source = autoMode ? 'engine deployed set' : `Profile "${name}"`;
-      logger.info(`${source} changed — reconciling job types (+${added.length} / -${removed.length}).`);
-      for (const jt of added) {
-        spawnJobType(jt);
-        logger.info(`  + now listening on ${jt}`);
-      }
-      await Promise.all(
-        removed.map(async (jt) => {
-          const w = workers.get(jt);
-          logger.info(`  - draining ${jt} …`);
-          const ok = await drainWorker(w);
-          if (ok) {
-            // Only drop it from the registry once it has actually stopped, so a
-            // failed drain stays tracked and gets retried on the next reconcile
-            // pass (or on shutdown) instead of leaking an untracked poller.
-            workers.delete(jt);
-            logger.info(`  - stopped ${jt}`);
-          } else {
-            logger.warn(`  - ${jt} did not stop cleanly; keeping it tracked so it is retried on the next reconcile or shutdown.`);
-          }
-        }),
-      );
-      logger.info(`  now listening on ${workers.size} job type(s): ${[...workers.keys()].join('  ')}`);
-  };
-
-  // Reconcile trigger. In `--auto` a periodic engine poll re-reads the deployed
-  // agent job types; otherwise a profile-file watch fires on profile edits.
-  let autoPollTimer = null;
-  if (autoMode) {
-    // Self-standing interval poll (not watchFile) since the desired set is
-    // derived from the engine, not the on-disk profile. Skip a tick while a
-    // reconcile is already in flight: calling reconcile() then would set
-    // reconcileRequested and make the in-flight pass loop back-to-back, so an
-    // engine read that consistently outlasts AUTO_POLL_INTERVAL_MS would run
-    // reconciles as fast as the read completes and hammer the broker. Skipping
-    // keeps polling rate-limited to the configured interval regardless of
-    // engine-read latency; the next tick re-reads the latest engine state.
-    autoPollTimer = setInterval(() => {
-      if (inFlightReconcile) return;
-      reconcile().catch((err) => logger.warn(`--auto reconcile failed: ${err?.message || err}`));
-    }, AUTO_POLL_INTERVAL_MS);
-    // Deliberately REF'd (unlike the reaper/run-dir hygiene timers, which are
-    // unref'd): in `--auto` this poll IS the retry loop, and it must keep the
-    // process alive even with zero pollers. When the INITIAL engine read fails
-    // (transient miss, or the engine isn't up yet) the worker registers 0
-    // pollers; nothing else holds the event loop open (the SDK client with no
-    // job workers doesn't, and the hygiene timers are unref'd), so an unref'd
-    // poll timer would let the process exit 0 — the observed crash-loop under a
-    // supervisor (jwulf/c8ctl-plugin-nano#93). Keeping it ref'd makes the worker
-    // stay up and re-read on the next poll, exactly as the initial-read warning
-    // promises. Shutdown clears it (clearInterval), so Ctrl-C/SIGTERM still exit.
-  } else {
-    // `watchFile` (polling stat) is deliberate over `fs.watch`: it survives the
-    // atomic temp+rename that `writeConfig` does (fs.watch would rebind to the old
-    // inode and go silent), and it's uniform across platforms. Profile edits are
-    // rare + manual, so a ~1.5s poll latency is fine.
+  let draining = false;
+  if (!autoMode) {
+    // Serialize reloads on a chain (never overlap a `setTypes` write) and coalesce
+    // with a monotonic generation guard, so a slow older reload can never apply a
+    // stale job-type set after a newer edit has already superseded it.
+    let reloadSeq = 0;
+    let reloadChain = Promise.resolve();
     watchFile(configFile, { interval: WATCH_INTERVAL_MS }, (curr, prev) => {
+      // A callback can already be queued when teardown flips `draining`; bail so we
+      // never write to the shared registry (or race its teardown) during shutdown.
+      if (draining) return;
       // Fires each interval; act only on real changes. Compare mtime, ctime and
-      // size, not mtime alone: on filesystems with coarse mtime resolution (or two
-      // edits within one mtime tick) mtimeMs can be unchanged while size/ctimeMs
-      // differ, and an mtime-only guard would skip a genuine profile update.
+      // size, not mtime alone: coarse-mtime filesystems (or two edits in one tick)
+      // can leave mtimeMs unchanged while size/ctimeMs differ.
       if (
         curr.mtimeMs === prev.mtimeMs &&
         curr.ctimeMs === prev.ctimeMs &&
         curr.size === prev.size
       ) return;
-      // `reconcile()` owns the `inFlightReconcile` handle: a change arriving while
-      // a reconcile is already running coalesces into the current pass and returns
-      // that same in-flight promise, so shutdown always waits for the real one.
-      reconcile().catch((err) => logger.warn(`profile reload failed: ${err?.message || err}`));
+      const mySeq = ++reloadSeq;
+      reloadChain = reloadChain.then(async () => {
+        if (draining) return;
+        // A newer edit already landed while we were queued — skip this stale
+        // reload so its (older) job-type set never lands after the newer one.
+        if (mySeq !== reloadSeq) return;
+        let stored;
+        try {
+          stored = readHiresStrict()[name];
+        } catch (err) {
+          // config exists but doesn't parse (torn write) — keep current types
+          logger.warn(`Profile "${name}" reload skipped — ${configFile} unreadable/unparseable (keeping current job types): ${err?.message || err}`);
+          return;
+        }
+        if (!stored) {
+          // profile vanished — keep serving the current types
+          logger.warn(`Profile "${name}" reload skipped — profile no longer present in ${configFile} (keeping current job types)`);
+          return;
+        }
+        const norm = normalizeStoredProfile(name, stored);
+        if (norm.error) {
+          // invalid edit — keep current types
+          logger.warn(`Profile "${name}" reload skipped — invalid profile edit (keeping current job types): ${norm.error}`);
+          return;
+        }
+        const m = jobTypeMatrix(norm.profile.rank, norm.profile.capabilities);
+        const desired = [...new Set([...m, ...extraJobTypes])];
+        if (draining) return; // teardown began while we were reading — don't write
+        if (mySeq !== reloadSeq) return; // superseded during the async read — skip
+        await SupervisorEffect.runPromise(workerRegistry.setTypes(workerName, desired));
+        logger.info(`Profile "${name}" changed — now servicing ${desired.length} job type(s): ${desired.join('  ')}`);
+      }).catch((err) => logger.warn(`profile reload failed: ${err?.message || err}`));
     });
   }
 
-  // Keep the process alive until a stop signal, then drain gracefully.
+  // Keep the process alive until a stop signal, then interrupt the runtime loop
+  // and tear down visibility. Interrupting the supervisor fiber runs the runtime's
+  // bracketed teardown (release slots, stop the heartbeat + agentic scope).
   await new Promise((resolve) => {
     const stop = async (signal) => {
       if (draining) return;
       draining = true;
-      // Stop the reconcile trigger first so no new reconcile can be triggered,
-      // then wait for any in-flight reconcile to finish before snapshotting
-      // `workers` — this prevents double-stops, missed drains, or a wrong worker
-      // count on exit.
-      if (autoPollTimer) clearInterval(autoPollTimer);
-      else unwatchFile(configFile);
-      if (inFlightReconcile) {
-        logger.info('Waiting for in-flight reconcile to finish before shutdown…');
-        await inFlightReconcile;
-      }
-      const list = [...workers.values()];
-      logger.info(`Received ${signal} — stopping ${list.length} worker(s)...`);
+      if (!autoMode) unwatchFile(configFile);
+      logger.info(`Received ${signal} — stopping worker...`);
       if (reaperTimer) clearInterval(reaperTimer);
       if (runDirTimer) clearInterval(runDirTimer);
       // Stop the #144 liveness watchdog so it can't kick off a re-discovery
       // mid-teardown (which would resurrect the channel we're about to close).
       if (agenticWatchdog) { try { agenticWatchdog.stop(); } catch { /* best effort */ } agenticWatchdog = null; }
-      const results = await Promise.all(list.map(drainWorker));
-      const stopFailures = results.filter((ok) => !ok).length;
-      if (stopFailures > 0) {
-        logger.warn(`${stopFailures} of ${list.length} worker(s) did not stop cleanly; some connections may still be open.`);
-      } else {
-        logger.info('All workers stopped.');
+      try {
+        await SupervisorEffect.runPromise(SupervisorFiber.interrupt(supervisorFiber));
+        logger.info('Worker stopped.');
+      } catch (err) {
+        logger.warn(`supervisor shutdown error — runtime loop may not have shut down cleanly: ${err?.message || err}`);
       }
-      // Deregister from the visibility channel LAST, so the worker disappears
-      // from the page only once its jobs have drained. Best-effort — a channel
-      // teardown must never hang shutdown.
+      // Deregister from the visibility channel LAST, so the worker disappears from
+      // the page only once its jobs have drained. Best-effort — a channel teardown
+      // must never hang shutdown.
       if (workChannel) {
-        // Stop the buffer monitor first so its sampler can't fire mid-teardown.
         try {
           bufferMonitor?.stop();
         } catch { /* best effort */ }
@@ -12708,8 +12484,6 @@ export {
   resolveLivenessOverrides,
   parsePsTime,
   ensureAcpFlag,
-  startLockExtender,
-  createSingleFlight,
   provisionRepo,
   finalizeGit,
   describeGitFailure,

@@ -66,6 +66,7 @@ import { platformForHost } from './platforms.mjs';
 import { redactAgenticUrl, buildAgenticUrl } from './work-channel.mjs';
 import { createHostRelaySession, roleTerminalMode } from './work-relay.mjs';
 import { resolveBufferCapacity } from './work-buffer.mjs';
+import { createLogRing, resolveLogMaxBytes } from './supervisor-log-ring.mjs';
 // Canonical ACP → transcript wire bridge (nanobpm/nano-ide#534), consumed through
 // the single agentic import surface. `acpUpdateToTranscriptChunk(update)` maps one
 // raw ACP `session/update` to the exact transcript-chunk bytes the cockpit decodes,
@@ -8840,9 +8841,21 @@ async function runSupervisorDaemon() {
     }
   };
 
+  // Per-worker log cap (#183). A supervised worker is long-lived and chatty, so
+  // an unbounded append fd could grow `worker-<id>.log` to multiple GB and fill
+  // the disk. When capped (the default), the daemon OWNS the bytes: it pipes the
+  // child's stdout/stderr through a rotating ring (see `supervisor-log-ring.mjs`)
+  // that keeps the newest output and bounds on-disk usage to ~2x the cap. Set
+  // `NANO_SUPERVISOR_LOG_MAX_BYTES=0` to opt out (legacy raw-fd append).
+  const workerLogMaxBytes = resolveLogMaxBytes(process.env.NANO_SUPERVISOR_LOG_MAX_BYTES);
+
   const startWorker = (w) => {
-    let fd;
-    try { fd = openSync(w.logFile, 'a'); } catch { fd = 'ignore'; }
+    // With a cap we pipe stdout/stderr through the daemon so the ring can bound
+    // them; unbounded (opt-out) keeps the legacy direct-fd append. `fd` is only
+    // used on the direct-fd path.
+    const ringed = workerLogMaxBytes > 0;
+    let fd = 'ignore';
+    if (!ringed) { try { fd = openSync(w.logFile, 'a'); } catch { fd = 'ignore'; } }
     // Clear any stale activity marker from a previous incarnation so a freshly
     // (re)started worker never briefly shows a dead job as in-flight.
     const activityFile = supervisorWorkerActivityFile(w.id);
@@ -8858,9 +8871,27 @@ async function runSupervisorDaemon() {
     // child reparents to init.
     const child = spawn(exec, [entry, 'nano', 'work', w.profile, '--name', w.id, ...w.args], {
       env: { ...process.env, NANO_SUPERVISOR_ACTIVITY_FILE: activityFile, NANO_SUPERVISOR_DAEMON_PID: String(process.pid) },
-      stdio: ['ignore', fd, fd],
+      stdio: ['ignore', ringed ? 'pipe' : fd, ringed ? 'pipe' : fd],
     });
     if (typeof fd === 'number') { try { closeSync(fd); } catch { /* dup'd into child */ } }
+    // On the ringed path, relay every stdout/stderr chunk into a bounded,
+    // rotating writer the daemon owns. Sync writes mean received bytes are on
+    // disk before the child can die, and the ring is closed in the death handler
+    // (and before a restart re-opens it) so fds never leak.
+    if (ringed) {
+      try {
+        const ring = createLogRing(w.logFile, workerLogMaxBytes);
+        w.logRing = ring;
+        const feed = (chunk) => { try { ring.write(chunk); } catch { /* never crash the daemon */ } };
+        if (child.stdout) { child.stdout.on('data', feed); child.stdout.on('error', () => {}); }
+        if (child.stderr) { child.stderr.on('data', feed); child.stderr.on('error', () => {}); }
+        // Close THIS child's ring once its stdio streams end ('close' fires after
+        // stdout/stderr have flushed). Bound to the local `ring`, not `w.logRing`,
+        // so a stale child's late close never shuts a restarted worker's live
+        // ring — mirroring the `w.child !== child` guard in the death handler.
+        child.once('close', () => { try { ring.close(); } catch { /* best effort */ } });
+      } catch { w.logRing = null; /* fall back to dropping output rather than crashing */ }
+    }
     w.child = child;
     w.pid = child.pid || null;
     w.startedAt = new Date().toISOString();

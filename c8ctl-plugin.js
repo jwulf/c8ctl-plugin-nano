@@ -3409,9 +3409,13 @@ async function createSupervisorDeps(opts = {}) {
   // supervisor path settles via these `{ complete, fail }` calls. This is the
   // direct analogue of returning `registry` for live worker add/remove: the
   // caller wires it into `runAgentJob`'s completion, replacing the SDK job object.
+  // Route through the LIFTED `engine` port (not `rawEngine`) + `Effect.runPromise`
+  // so a settle rejection surfaces as the normalized `SupervisorError` the rest of
+  // the runtime uses (activate/extendLock), and any future port instrumentation
+  // covers the settle path too.
   const settle = {
-    complete: (jobKey, variables) => rawEngine.complete(jobKey, variables),
-    fail: (jobKey, opts2) => rawEngine.fail(jobKey, opts2),
+    complete: (jobKey, variables) => rt.Effect.runPromise(engine.complete(jobKey, variables)),
+    fail: (jobKey, opts2) => rt.Effect.runPromise(engine.fail(jobKey, opts2)),
   };
 
   return { deps, registry, settle, makeSupervisor: rt.makeSupervisor, Effect: rt.Effect, Fiber: rt.Fiber };

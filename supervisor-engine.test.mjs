@@ -164,13 +164,15 @@ test("complete: POSTs /v2/jobs/{key}/completion with the result variables and 20
   assert.deepEqual(JSON.parse(init.body), { variables: { status: "opened", summary: "done" } });
 });
 
-test("complete: no/empty variables POSTs an empty body object (never null variables)", async () => {
-  const fetchImpl = makeFakeFetch([{ status: 204 }, { status: 204 }]);
+test("complete: nullish variables POST an empty body (never null variables); an explicit {} sends {variables:{}}", async () => {
+  const fetchImpl = makeFakeFetch([{ status: 204 }, { status: 204 }, { status: 204 }]);
   const engine = createRawEngineClient({ baseUrl: "http://engine:8080", fetchImpl });
   await engine.complete("j1");
   assert.deepEqual(JSON.parse(fetchImpl.calls[0].init.body), {});
   await engine.complete("j2", null);
   assert.deepEqual(JSON.parse(fetchImpl.calls[1].init.body), {});
+  await engine.complete("j3", {});
+  assert.deepEqual(JSON.parse(fetchImpl.calls[2].init.body), { variables: {} });
 });
 
 test("complete: a non-2xx (e.g. 409 lock lapsed) throws with status + endpoint", async () => {

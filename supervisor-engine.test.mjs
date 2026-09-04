@@ -200,6 +200,19 @@ test("fail: omits optional fields (errorMessage/retryBackOff/variables) when abs
   assert.deepEqual(JSON.parse(fetchImpl.calls[1].init.body), { retries: 1 });
 });
 
+test("fail: normalizes retries to a non-negative integer (rejects floats/negatives/strings)", async () => {
+  const fetchImpl = makeFakeFetch([{ status: 204 }, { status: 204 }, { status: 204 }, { status: 204 }]);
+  const engine = createRawEngineClient({ baseUrl: "http://engine:8080", fetchImpl });
+  await engine.fail("jf", { retries: 2.9 });
+  assert.deepEqual(JSON.parse(fetchImpl.calls[0].init.body), { retries: 2 });
+  await engine.fail("jn", { retries: -3 });
+  assert.deepEqual(JSON.parse(fetchImpl.calls[1].init.body), { retries: 0 });
+  await engine.fail("js", { retries: "5" });
+  assert.deepEqual(JSON.parse(fetchImpl.calls[2].init.body), { retries: 5 });
+  await engine.fail("jx", { retries: "oops" });
+  assert.deepEqual(JSON.parse(fetchImpl.calls[3].init.body), { retries: 0 });
+});
+
 test("fail: a non-2xx response throws with status + endpoint", async () => {
   const fetchImpl = makeFakeFetch([{ status: 500, text: "boom" }]);
   const engine = createRawEngineClient({ baseUrl: "http://engine:8080", fetchImpl });

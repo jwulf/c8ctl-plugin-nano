@@ -251,7 +251,10 @@ export function createRawEngineClient(opts = {}) {
       // attempt, `retries === 0` raises an incident. Optional fields are omitted
       // when absent so the engine applies its own defaults. C8 v2 answers 204.
       const url = `${base}/jobs/${encodeURIComponent(jobKey)}/failure`;
-      const payload = { retries };
+      // Normalize retries to a non-negative integer (mirrors `mapJob`), so a
+      // string/float/negative never reaches the engine as an invalid count.
+      const nRetries = Number(retries);
+      const payload = { retries: Number.isFinite(nRetries) ? Math.max(0, Math.trunc(nRetries)) : 0 };
       if (errorMessage !== undefined && errorMessage !== null) payload.errorMessage = String(errorMessage);
       if (Number.isFinite(retryBackOff) && retryBackOff > 0) payload.retryBackOff = retryBackOff;
       if (isPlainObjectMap(variables)) payload.variables = variables;

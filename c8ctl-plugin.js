@@ -8882,11 +8882,10 @@ async function runSupervisorDaemon() {
       let ring = null;
       try {
         ring = createLogRing(w.logFile, workerLogMaxBytes);
-        w.logRing = ring;
         const feed = (chunk) => { try { ring.write(chunk); } catch { /* never crash the daemon */ } };
         if (child.stdout) { child.stdout.on('data', feed); child.stdout.on('error', () => {}); }
         if (child.stderr) { child.stderr.on('data', feed); child.stderr.on('error', () => {}); }
-      } catch { w.logRing = null; ring = null; /* fall back to dropping output rather than crashing */ }
+      } catch { ring = null; /* fall back to dropping output rather than crashing */ }
       // If ring setup threw, the child was still spawned with piped stdio, so we
       // MUST still drain stdout/stderr — an undrained pipe applies backpressure
       // and can deadlock the worker once its buffers fill. `resume()` discards
@@ -8898,8 +8897,9 @@ async function runSupervisorDaemon() {
       // Close THIS child's ring once its stdio streams end ('close' fires after
       // stdout/stderr have flushed) AND on a spawn 'error' — an ENOENT/EMFILE
       // spawn failure emits only 'error' with no 'close', so without this the
-      // ring fd would leak. Bound to the local `ring` (not `w.logRing`) so a
-      // stale child's late event never shuts a restarted worker's live ring;
+      // ring fd would leak. Bound to the local `ring` (kept as worker-local
+      // closure state, never on `w`) so a stale child's late event never shuts
+      // a restarted worker's live ring;
       // `ring.close()` is idempotent, so the close+error double-fire is safe.
       const closeRing = () => { if (ring) { try { ring.close(); } catch { /* best effort */ } } };
       child.once('close', closeRing);

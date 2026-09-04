@@ -8046,10 +8046,10 @@ async function workAgent(req, flags) {
       if (agenticWatchdog) { try { agenticWatchdog.stop(); } catch { /* best effort */ } agenticWatchdog = null; }
       try {
         await SupervisorEffect.runPromise(SupervisorFiber.interrupt(supervisorFiber));
+        logger.info('Worker stopped.');
       } catch (err) {
-        logger.warn(`supervisor shutdown error: ${err?.message || err}`);
+        logger.warn(`supervisor shutdown error — runtime loop may not have shut down cleanly: ${err?.message || err}`);
       }
-      logger.info('Worker stopped.');
       // Deregister from the visibility channel LAST, so the worker disappears from
       // the page only once its jobs have drained. Best-effort — a channel teardown
       // must never hang shutdown.

@@ -1,7 +1,6 @@
 /**
  * Hot-path flip (issue #172) — end-to-end integration coverage against the
- * in-process WASM engine testkit (`@nanobpm/engine-wasm` + `@nanobpm/urban-testkit`),
- * no live cluster.
+ * in-process WASM engine testkit (`@nanobpm/engine-wasm`), no live cluster.
  *
  * #172 cut `workAgent` over to drive the Effect single-owner runtime
  * (`createSupervisorDeps()` → `makeSupervisor().run`) as the per-host owner,
@@ -32,7 +31,7 @@ const sleep = (ms) => new Promise((r) => setTimeout(r, ms));
 
 /**
  * Boot the WASM engine once (idempotent per process) and return a fresh
- * `TestEngine`. Mirrors `@nanobpm/urban-testkit`'s own init: read the `.wasm`
+ * `TestEngine`. Mirrors the published testkit's own init: read the `.wasm`
  * bytes via `import.meta.resolve` and `initSync`, so it works from the published
  * package without a bundler. The `/readmodel` variant carries the read model the
  * testkit depends on; `TestEngine` (deploy/createInstance/activateJobs/

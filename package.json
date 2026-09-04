@@ -39,7 +39,7 @@
     "build:supervisor": "node supervisor/build.mjs",
     "vendor:effect": "node scripts/vendor-effect.mjs",
     "test:supervisor": "node --experimental-strip-types --test supervisor/test/*.test.ts",
-    "test": "node --check c8ctl-plugin.js && npm run typecheck:supervisor && npm run build:supervisor && npm run test:supervisor && node --test",
+    "test": "node --check c8ctl-plugin.js && npm run typecheck:supervisor && npm run build:supervisor && npm run test:supervisor && node --test --test-timeout=120000 --test-force-exit",
     "prepublishOnly": "npm run typecheck:supervisor && npm run build:supervisor"
   },
   "license": "MIT",

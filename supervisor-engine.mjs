@@ -9,12 +9,12 @@
  * shared across K types with per-type gating". The supervisor rolls its own race
  * over a NARROW two-call engine surface instead:
  *
- *   - `activate` → `POST <base>/v2/jobs/activation` for exactly ONE type, one
+ *   - `activate` → `POST <base>/jobs/activation` for exactly ONE type, one
  *     long-poll, resolving 0..`maxJobsToActivate` jobs (0 == the long-poll
  *     expired empty). `timeout` is the SHORT initial lock (the crash-safety net);
  *     `requestTimeout` is how long the call blocks server-side.
  *   - `extendLock` → the SDK's typed `updateJob` (operationId `updateJob`,
- *     `PATCH <base>/v2/jobs/{jobKey}` with `{ changeset: { timeout } }`) when a
+ *     `PATCH <base>/jobs/{jobKey}` with `{ changeset: { timeout } }`) when a
  *     `camunda` SDK client is injected, else the SAME call issued raw via
  *     `fetchImpl` (so the module stays wire-testable without a live client).
  *     The C8 contract SETs the lock to `ms` from now (a duration-from-now), which
@@ -249,7 +249,7 @@ export function createRawEngineClient(opts = {}) {
     // job was reclaimed) surfaces as a rejected promise for the port to map.
 
     async complete(jobKey, variables) {
-      // `POST <base>/v2/jobs/{jobKey}/completion` with `{ variables }` — the
+      // `POST <base>/jobs/{jobKey}/completion` with `{ variables }` — the
       // result-variable map the model produced is merged onto the process
       // instance. C8 v2 answers 204 No Content on success.
       const url = `${base}/jobs/${encodeURIComponent(jobKey)}/completion`;
@@ -266,7 +266,7 @@ export function createRawEngineClient(opts = {}) {
       // null-safe `variables`), so a caller passing `null` never trips the
       // signature-destructure TypeError.
       const { retries = 0, errorMessage, retryBackOff, variables } = opts || {};
-      // `POST <base>/v2/jobs/{jobKey}/failure` with `{ retries, errorMessage?,
+      // `POST <base>/jobs/{jobKey}/failure` with `{ retries, errorMessage?,
       // retryBackOff?, variables? }` — `retries > 0` re-queues for another
       // attempt, `retries === 0` raises an incident. Optional fields are omitted
       // when absent so the engine applies its own defaults. C8 v2 answers 204.

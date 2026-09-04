@@ -7644,9 +7644,9 @@ async function workAgent(req, flags) {
         // liveness (idle/recovery/hard-cap) so a JVM-heavy task can widen its own
         // window without a global flag change. NOTE: after the hot-path flip
         // (#172) the broker lock cadence/window is owned by the supervisor
-        // runtime dispatch config at the worker level (worker `recoveryWindowMs`
-        // / `lockExtendIntervalMs`), so a per-task override no longer widens the
-        // broker lock window — only the harness liveness.
+        // runtime dispatch config at the worker level (the `dispatch` config's
+        // `recoveryWindowMs` / `extendIntervalMs`), so a per-task override no
+        // longer widens the broker lock window — only the harness liveness.
         const {
           idleTimeoutMs: effectiveIdleTimeoutMs,
           recoveryWindowMs: effectiveRecoveryWindowMs,

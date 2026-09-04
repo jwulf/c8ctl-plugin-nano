@@ -58,6 +58,18 @@ function buildHeaders({ token, authHeaders }) {
 }
 
 /**
+ * True only for a plain object map (rejects `null`, arrays, and exotic objects
+ * like `Date`/`Map`). The engine expects `variables`/`customHeaders` to be a
+ * key/value map, so anything else is dropped rather than POSTed as a malformed
+ * body or surfaced to the runner as an unexpected shape.
+ */
+function isPlainObjectMap(v) {
+  if (v === null || typeof v !== "object" || Array.isArray(v)) return false;
+  const proto = Object.getPrototypeOf(v);
+  return proto === Object.prototype || proto === null;
+}
+
+/**
  * Map one raw v2 activated-job record to the port's {@link ActivatedJob}. Keys are
  * strings in v2. A record missing `jobKey`/`type` violates the `ActivatedJob`
  * contract (an empty key would produce `PATCH .../jobs//timeout`; an empty type
@@ -86,6 +98,22 @@ function mapJob(raw) {
   const pdk = raw.processDefinitionKey ?? raw.processDefinitionId;
   if (pdk !== undefined && pdk !== null) job.processDefinitionKey = String(pdk);
   if (raw.variables !== undefined) job.variables = raw.variables;
+  // Settle-path passthrough (issue #156): the runner needs the task headers (to
+  // assemble the reserved task envelope + read the `linkName="prompt"` marker),
+  // the retry count (to preserve/decrement it on a `fail`, matching the SDK job
+  // object), and the process-instance key (audit/logging). These ride opaquely
+  // to the runner exactly as the SDK job worker surfaces them.
+  if (raw.customHeaders !== undefined && raw.customHeaders !== null && isPlainObjectMap(raw.customHeaders))
+    job.customHeaders = raw.customHeaders;
+  const rawRetries = raw.retries;
+  if (rawRetries !== undefined && rawRetries !== null) {
+    const n = Number(rawRetries);
+    // Downstream treats retries as a non-negative integer (decremented on fail),
+    // so normalize floats/negatives rather than pass a fractional/negative count.
+    if (Number.isFinite(n)) job.retries = Math.max(0, Math.trunc(n));
+  }
+  const pik = raw.processInstanceKey;
+  if (pik !== undefined && pik !== null) job.processInstanceKey = String(pik);
   return job;
 }
 
@@ -108,7 +136,7 @@ async function readErrorBody(res) {
  * @param {Record<string,string>|(() => (Record<string,string>|Promise<Record<string,string>>))} [opts.authHeaders] Ready-made auth header map, OR a resolver invoked per request (so rotating SDK auth — e.g. an OAuth bearer that refreshes — is re-derived each call rather than frozen). Wins over `token`.
  * @param {typeof fetch} [opts.fetchImpl] Injected `fetch` (defaults to the global; overridden in tests).
  * @param {number} [opts.requestTimeoutSlackMs] Extra ms added to a call's abort budget over its server long-poll (default 5000).
- * @returns {{ activate(req: ActivateRequest): Promise<ReadonlyArray<ActivatedJob>>, extendLock(jobKey: string, ms: number): Promise<void> }}
+ * @returns {{ activate(req: ActivateRequest): Promise<ReadonlyArray<ActivatedJob>>, extendLock(jobKey: string, ms: number): Promise<void>, complete(jobKey: string, variables?: object): Promise<void>, fail(jobKey: string, opts?: { retries?: number, errorMessage?: string, retryBackOff?: number, variables?: object }): Promise<void> }}
  */
 export function createRawEngineClient(opts = {}) {
   const {
@@ -187,6 +215,53 @@ export function createRawEngineClient(opts = {}) {
       if (!res || !res.ok) {
         const status = res ? res.status : "?";
         throw new Error(`extendLock ${jobKey}: HTTP ${status} from ${url}${res ? await readErrorBody(res) : ""}`);
+      }
+    },
+
+    // ---- Job completion / failure ------------------------------------------
+    // The narrow surface the supervisor's JobRunner needs to SETTLE a job once
+    // its agent harness finishes — the direct-REST analogue of the SDK job
+    // object's `job.complete()` / `job.fail()` (which the per-type SDK poller
+    // path in `workAgent` still uses). A plain `ActivatedJob` (jobKey/type/
+    // variables) carries no settle methods, so the supervisor path completes via
+    // these calls instead. Effect-free and wire-testable like `activate` /
+    // `extendLock`; a non-2xx (e.g. a 409 when the lock already lapsed and the
+    // job was reclaimed) surfaces as a rejected promise for the port to map.
+
+    async complete(jobKey, variables) {
+      // `POST <base>/v2/jobs/{jobKey}/completion` with `{ variables }` — the
+      // result-variable map the model produced is merged onto the process
+      // instance. C8 v2 answers 204 No Content on success.
+      const url = `${base}/jobs/${encodeURIComponent(jobKey)}/completion`;
+      const body = JSON.stringify(isPlainObjectMap(variables) ? { variables } : {});
+      const res = await call(url, { method: "POST", body }, 15_000);
+      if (!res || !res.ok) {
+        const status = res ? res.status : "?";
+        throw new Error(`complete ${jobKey}: HTTP ${status} from ${url}${res ? await readErrorBody(res) : ""}`);
+      }
+    },
+
+    async fail(jobKey, opts) {
+      // Tolerate a `null` opts the same as `undefined` (mirrors `complete`'s
+      // null-safe `variables`), so a caller passing `null` never trips the
+      // signature-destructure TypeError.
+      const { retries = 0, errorMessage, retryBackOff, variables } = opts || {};
+      // `POST <base>/v2/jobs/{jobKey}/failure` with `{ retries, errorMessage?,
+      // retryBackOff?, variables? }` — `retries > 0` re-queues for another
+      // attempt, `retries === 0` raises an incident. Optional fields are omitted
+      // when absent so the engine applies its own defaults. C8 v2 answers 204.
+      const url = `${base}/jobs/${encodeURIComponent(jobKey)}/failure`;
+      // Normalize retries to a non-negative integer (mirrors `mapJob`), so a
+      // string/float/negative never reaches the engine as an invalid count.
+      const nRetries = Number(retries);
+      const payload = { retries: Number.isFinite(nRetries) ? Math.max(0, Math.trunc(nRetries)) : 0 };
+      if (errorMessage !== undefined && errorMessage !== null) payload.errorMessage = String(errorMessage);
+      if (Number.isFinite(retryBackOff) && retryBackOff > 0) payload.retryBackOff = retryBackOff;
+      if (isPlainObjectMap(variables)) payload.variables = variables;
+      const res = await call(url, { method: "POST", body: JSON.stringify(payload) }, 15_000);
+      if (!res || !res.ok) {
+        const status = res ? res.status : "?";
+        throw new Error(`fail ${jobKey}: HTTP ${status} from ${url}${res ? await readErrorBody(res) : ""}`);
       }
     },
   };

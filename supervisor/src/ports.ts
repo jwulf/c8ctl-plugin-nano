@@ -32,6 +32,23 @@ export interface ActivatedJob {
   readonly type: string;
   readonly processDefinitionKey?: string;
   readonly variables?: unknown;
+  /**
+   * The job's custom headers (BPMN task headers) — opaque passthrough. The agent
+   * runner needs these to assemble the reserved task envelope (headers=defaults ←
+   * variables=overrides) and to read the `linkName="prompt"` linked-resource
+   * marker, exactly as the SDK job worker path does. Absent on a poll that
+   * carries no headers.
+   */
+  readonly customHeaders?: Record<string, unknown>;
+  /**
+   * The engine-provided retry count. The runner MUST preserve/decrement this when
+   * it settles a failure through {@link EngineClient.fail} (a `retries > 0`
+   * re-queues, `0` raises an incident) — the direct analogue of the SDK job
+   * object's `job.retries`. Absent when the engine did not surface it.
+   */
+  readonly retries?: number;
+  /** The owning process-instance key — surfaced for logging/audit, matching the SDK job. */
+  readonly processInstanceKey?: string;
 }
 
 /** One per-type activation request. `maxJobsToActivate` is sized per-type to that type's free-slot count (capped by `maxBatchPerType`). */
@@ -64,6 +81,32 @@ export interface EngineClient {
    * winner's first extend means the lock likely raced a reclaim — do not start.
    */
   extendLock(jobKey: string, ms: number): Effect.Effect<void, SupervisorError>;
+  /**
+   * `POST /v2/jobs/{jobKey}/completion` — SETTLE a job successfully, merging the
+   * agent's result `variables` onto the process instance. The supervisor owns the
+   * lock lifecycle around the runner; the runner calls this (via its injected
+   * settler) when its harness finishes cleanly, the direct-REST analogue of the
+   * SDK job object's `job.complete()` the per-type poller path uses. A rejection
+   * (e.g. a 409 when the lock already lapsed and the job was reclaimed) surfaces
+   * as a {@link SupervisorError} for the runner to map, never a crash.
+   */
+  complete(jobKey: string, variables?: Record<string, unknown>): Effect.Effect<void, SupervisorError>;
+  /**
+   * `POST /v2/jobs/{jobKey}/failure` — SETTLE a job as failed. `retries > 0`
+   * re-queues for another attempt; `retries === 0` raises an incident. Optional
+   * `errorMessage`/`retryBackOff`/`variables` are applied when present. The
+   * analogue of the SDK job object's `job.fail()`; a rejection surfaces as a
+   * {@link SupervisorError}.
+   */
+  fail(
+    jobKey: string,
+    opts?: {
+      readonly retries?: number;
+      readonly errorMessage?: string;
+      readonly retryBackOff?: number;
+      readonly variables?: Record<string, unknown>;
+    },
+  ): Effect.Effect<void, SupervisorError>;
 }
 
 /**

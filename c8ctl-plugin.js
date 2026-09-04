@@ -3312,7 +3312,7 @@ async function createAgenticEndpoint(opts) {
 // @param {{ searchProcessDefinitionKeys: Function, getProcessDefinitionXml: Function }} [opts.reconcileReader]  raw reconcile reader overriding the default keep-alive `defaultC8RestReader`
 // @param {typeof fetch} [opts.fetchImpl] injected fetch (tests)
 // @param {NodeJS.ProcessEnv} [opts.env]
-// @returns {Promise<{ deps: object, registry: object, makeSupervisor: Function, Effect: object, Fiber: object }>}
+// @returns {Promise<{ deps: object, registry: object, settle: { complete: Function, fail: Function }, makeSupervisor: Function, Effect: object, Fiber: object }>}
 async function createSupervisorDeps(opts = {}) {
   const {
     runner,
@@ -3373,9 +3373,8 @@ async function createSupervisorDeps(opts = {}) {
     };
   }
 
-  const engine = rt.makeEngineClient(
-    createRawEngineClient({ baseUrl: rc.baseUrl, token: rc.token, authHeaders: resolvedAuthHeaders, worker, fetchImpl }),
-  );
+  const rawEngine = createRawEngineClient({ baseUrl: rc.baseUrl, token: rc.token, authHeaders: resolvedAuthHeaders, worker, fetchImpl });
+  const engine = rt.makeEngineClient(rawEngine);
   // `reconcileReader` (a raw `{ searchProcessDefinitionKeys, getProcessDefinitionXml }`)
   // may be injected to override the default keep-alive `httpC8RestReader` — the
   // caller may already hold one, and a test drives the crawl without a socket.
@@ -3402,7 +3401,24 @@ async function createSupervisorDeps(opts = {}) {
     config: scope ? { ...config, scope } : config,
   });
 
-  return { deps, registry, makeSupervisor: rt.makeSupervisor, Effect: rt.Effect, Fiber: rt.Fiber };
+  // The `settle` seam (issue #156, escalation answer (a)): the runner settles a
+  // finished job through the SAME engine client the supervisor activates/extends
+  // with — one base URL, one (rotating) auth resolver — so a `complete`/`fail`
+  // can never drift from the activation's credentials. A plain `ActivatedJob`
+  // carries no `job.complete()`/`job.fail()` (unlike the SDK job object), so the
+  // supervisor path settles via these `{ complete, fail }` calls. This is the
+  // direct analogue of returning `registry` for live worker add/remove: the
+  // caller wires it into `runAgentJob`'s completion, replacing the SDK job object.
+  // Route through the LIFTED `engine` port (not `rawEngine`) + `Effect.runPromise`
+  // so a settle rejection surfaces as the normalized `SupervisorError` the rest of
+  // the runtime uses (activate/extendLock), and any future port instrumentation
+  // covers the settle path too.
+  const settle = {
+    complete: (jobKey, variables) => rt.Effect.runPromise(engine.complete(jobKey, variables)),
+    fail: (jobKey, opts2) => rt.Effect.runPromise(engine.fail(jobKey, opts2)),
+  };
+
+  return { deps, registry, settle, makeSupervisor: rt.makeSupervisor, Effect: rt.Effect, Fiber: rt.Fiber };
 }
 
 // Build the content endpoint. Per issue #63 / nano-bpm #759 the non-binary

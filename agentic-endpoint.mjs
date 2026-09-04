@@ -143,7 +143,12 @@ function openHostConnection({ url, transportFactory, incarnation, support, logge
     closedFired = true;
     open = false;
     hasClosed = true;
-    for (const cb of closeCbs) cb();
+    // Guard each subscriber: a throwing onClose callback must not abort the loop
+    // or prevent notifyState('disconnected') from firing (which would strand the
+    // connection-state observer and could crash the worker/supervisor on a drop).
+    for (const cb of closeCbs) {
+      try { cb(); } catch (err) { log.debug?.(`agentic onClose subscriber threw — ${err?.message || err}`); }
+    }
     notifyState('disconnected');
   };
 
@@ -191,7 +196,11 @@ function openHostConnection({ url, transportFactory, incarnation, support, logge
   transport = transportFactory(url, {
     onOpen() {
       open = true;
-      for (const cb of openCbs) cb();
+      // Guard each subscriber: a throwing onOpen callback must not abort the loop
+      // or prevent notifyState('connected') from firing.
+      for (const cb of openCbs) {
+        try { cb(); } catch (err) { log.debug?.(`agentic onOpen subscriber threw — ${err?.message || err}`); }
+      }
       notifyState('connected');
     },
     onFrame(bytes) {

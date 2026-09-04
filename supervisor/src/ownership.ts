@@ -17,7 +17,8 @@
  * connection can multiplex N workers. The claim's lifetime is bound to the agent
  * child process lifetime (see {@link withOwnedJob}), which is what makes a silent,
  * zero-transcript agent read as `claimed = working`, and lets a reconnect replay
- * the full active-claim set (`snapshot` → {@link resyncOwnership}).
+ * the full active-claim set (`snapshot` feeds the emit client's write-through
+ * shadow, which the client re-emits on reconnect — see #186).
  */
 import { Effect, Ref } from "effect";
 import type { AgenticCapability, AgenticHandle, SupervisedAgentic } from "./agentic.ts";
@@ -226,31 +227,11 @@ export const withOwnedJob = <A, E, R>(
   );
 
 /**
- * The reconnect-resync hook. On every (re)connect the supervisor replays the full
- * active-claim set **before** resuming transcript: re-`register` each worker, then
- * re-`claim` each job it currently owns. Every frame is idempotent, so a resync is
- * safe whether the server already knows the claim or lost it on the dropped
- * socket. This is the replay the relay-open correlation could never do — it is why
- * a mid-job WS reconnect no longer blanks a still-running job's jobKey.
+ * The reconnect wire-level replay of the full active-claim set — re-`register`
+ * each worker, then re-`claim` each job it owns — is **owned by the
+ * `AgenticEmitClient`** (#186): the client keeps a write-through shadow of
+ * presence + in-flight claims (fed by this registry, the single write path) and
+ * re-emits it on every reconnect. The supervisor no longer drives a manual
+ * resync from this registry snapshot; `snapshot` remains the dispatch/cockpit
+ * source of truth.
  */
-export const resyncOwnership = (
-  handle: AgenticHandle,
-  ownership: OwnershipRegistry,
-  logger: Logger = noopLogger,
-): Effect.Effect<void> =>
-  ownership.snapshot.pipe(
-    Effect.flatMap((workers) =>
-      Effect.forEach(
-        workers,
-        (w) =>
-          emitFrame(handle.register?.(w.instance, w.capability), logger, "register").pipe(
-            Effect.flatMap(() =>
-              Effect.forEach(w.jobKeys, (jk) => emitFrame(handle.claim?.(w.instance, jk), logger, "claim"), {
-                discard: true,
-              }),
-            ),
-          ),
-        { discard: true },
-      ),
-    ),
-  );

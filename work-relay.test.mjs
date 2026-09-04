@@ -13,10 +13,10 @@ import {
   parseInboundRelayChunk,
   createRelaySession,
   createHostRelaySession,
-  hostRelayStreamName,
   RELAY_OPEN_CHUNK,
   RELAY_CLOSE_CHUNK,
 } from './work-relay.mjs';
+import { composeStreamId, parseStreamId } from './agentic.mjs';
 import { runAgentJob, spawnCapturePty } from './c8ctl-plugin.js';
 
 // ---- Fakes ----------------------------------------------------------------
@@ -432,14 +432,17 @@ test('runAgentJob(terminal: pty) falls back to a pipe when a PTY cannot be alloc
 // The per-job relay session backed by the single-owner supervisor's ONE
 // multiplexed host connection, instead of a per-worker createWorkChannel socket.
 
-test('hostRelayStreamName keys the stream on BOTH instance and jobKey', () => {
-  // The one connection multiplexes N workers, so the stream must carry the
-  // owning instance explicitly — two workers' jobs can never collide.
-  assert.equal(hostRelayStreamName('senior-1', '42'), 't/senior-1/42');
-  assert.equal(hostRelayStreamName('a/b', 'x y'), 't/a%2Fb/x%20y');
+test('the host-connection transcript stream id keys on BOTH instance and jobKey (composeStreamId)', () => {
+  // #186: the per-job stream id is derived from the package `composeStreamId`
+  // codec (`stream = String(jobKey)`), retiring the plugin's hand-rolled
+  // `t/<instance>/<jobKey>` scheme. The one connection multiplexes N workers, so
+  // the id must carry the owning instance explicitly — two workers' jobs over the
+  // one socket can never collide — and `parseStreamId` round-trips it exactly.
+  assert.deepEqual(parseStreamId(composeStreamId('senior-1', '42')), { instance: 'senior-1', stream: '42' });
+  assert.deepEqual(parseStreamId(composeStreamId('a/b', 'x y')), { instance: 'a/b', stream: 'x y' });
   assert.notEqual(
-    hostRelayStreamName('w1', '42'),
-    hostRelayStreamName('w2', '42'),
+    composeStreamId('w1', '42'),
+    composeStreamId('w2', '42'),
     'same jobKey on two instances must not share a stream',
   );
 });
@@ -451,7 +454,7 @@ test('createHostRelaySession publishes transcript text and brackets it with life
     jobKey: '42',
     publish: (text) => published.push(text),
   });
-  assert.equal(session.stream, 't/senior-1/42');
+  assert.equal(session.stream, composeStreamId('senior-1', '42'));
   // Opens with the lifecycle marker so the app correlates immediately.
   assert.equal(published[0], RELAY_OPEN_CHUNK);
   session.relay('hello-world');

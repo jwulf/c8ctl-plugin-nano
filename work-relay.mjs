@@ -23,7 +23,7 @@
 // a duck-typed terminal handle, so it is unit-testable with a fake terminal and
 // a fake channel.
 
-import { transcript as agenticTranscript } from './agentic.mjs';
+import { transcript as agenticTranscript, composeStreamId } from './agentic.mjs';
 
 /** Prefix for a per-job relay stream name. One stream carries a job's terminal. */
 export const RELAY_STREAM_PREFIX = 'job:';
@@ -311,23 +311,6 @@ export function createRelaySession({
 }
 
 /**
- * The canonical host-connection transcript stream name for a supervised job
- * (issue #173). Unlike {@link relayStreamName} (which keys purely on the
- * jobKey, safe only when one process owns one identity), the single host
- * connection multiplexes N workers, so the stream carries BOTH the owning
- * `instance` and the `jobKey` explicitly — two workers' (or two jobs') streams
- * over the one socket can never collide. Mirrors the endpoint's own
- * `composeTranscriptStream`, exposed here only for observability/parity.
- *
- * @param {string} instance the owning worker instance
- * @param {string|number} jobKey the activated job's key
- * @returns {string}
- */
-export function hostRelayStreamName(instance, jobKey) {
-  return `t/${encodeURIComponent(String(instance))}/${encodeURIComponent(String(jobKey))}`;
-}
-
-/**
  * Create a per-job relay session backed by the single-owner supervisor's ONE
  * multiplexed host connection (issue #173) instead of a per-worker
  * {@link createWorkChannel} socket.
@@ -369,7 +352,13 @@ export function createHostRelaySession({ instance, jobKey, publish, subscribeSte
   if (typeof publish !== 'function') {
     throw new Error('createHostRelaySession requires a publish(text) sink');
   }
-  const stream = hostRelayStreamName(instance, jobKey);
+  // The canonical host-connection transcript stream id for this supervised job:
+  // the single connection multiplexes N workers, so the id carries BOTH the
+  // owning `instance` and the `jobKey` explicitly (the injective `composeStreamId`
+  // codec — `stream = String(jobKey)`), so two workers' (or two jobs') streams
+  // over the one socket can never collide. Used here for observability/logging;
+  // the actual wire id is composed by the emit client at emit time.
+  const stream = composeStreamId(String(instance), String(jobKey));
   const log = logger || {};
 
   const relay = (chunk) => {

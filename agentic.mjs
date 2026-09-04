@@ -103,6 +103,24 @@ export * as sessionAcp from '@nanobpm/agentic/session/acp';
 export * as demand from '@nanobpm/agentic/demand';
 
 // ---------------------------------------------------------------------------
+// Ownership/presence EMIT client — @nanobpm/agentic/emit (nano-ide#557).
+//
+// The blessed client-side emitter: ONE multiplexed host connection that N
+// instances share, emitting register/heartbeat/deregister/claim/release and the
+// relay transcript sink with an EXPLICIT `instance` per frame, owning its own
+// reconnect resync and additive version negotiation. `agentic-endpoint.mjs`
+// builds the plugin's concrete `RawEmitClient` on this instead of hand-rolling a
+// parallel client-ownership layer. `composeStreamId`/`parseStreamId` are the one
+// injective transcript-stream-id codec both this producer (routing inbound steer
+// back to `{instance, jobKey}`) and the nano-workforce consumer derive from.
+// ---------------------------------------------------------------------------
+export {
+  AgenticEmitClient,
+  composeStreamId,
+  parseStreamId,
+} from '@nanobpm/agentic/emit';
+
+// ---------------------------------------------------------------------------
 // Worker-side channel client — @nanobpm/urban-agent-client.
 //
 // The client's published `dist/protocol.js` imports the contract from

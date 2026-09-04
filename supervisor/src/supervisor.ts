@@ -30,7 +30,6 @@ import {
 import {
   makeOwnershipContext,
   makeOwnershipRegistry,
-  resyncOwnership,
   type OwnershipContext,
   type OwnershipRegistry,
 } from "./ownership.ts";
@@ -245,13 +244,13 @@ export const makeSupervisor = (deps: SupervisorDeps): Effect.Effect<Supervisor> 
           deps.agenticEndpoint,
           logger,
           handleRef,
-          // On every (re)connect, replay the full active-claim set before resuming
-          // transcript — re-register each worker, re-claim its jobs — and re-install
-          // the inbound steer router so steering survives a socket flap.
-          (handle) =>
-            resyncOwnership(handle, ownership, logger).pipe(
-              Effect.flatMap(() => installSteerRoute(handle, steerRouter, logger)),
-            ),
+          // The AgenticEmitClient owns reconnect + resync (#186): it re-emits
+          // presence and re-claims every active job from its write-through shadow
+          // on every reconnect, so the manual re-register/re-claim resync is
+          // retired. The registry stays the authority and the single write path
+          // into the client. On (re)connect we only (re)install the inbound steer
+          // router so steering survives a socket flap.
+          (handle) => installSteerRoute(handle, steerRouter, logger),
           run,
           deps.agenticConfig,
         ) as Effect.Effect<never>)

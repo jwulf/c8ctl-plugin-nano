@@ -184,10 +184,12 @@ export const withAgenticConnection = <A, E, R>(
  *    transport; the ownership frame emitters read it each time, so a reconnect
  *    swaps the socket transparently while the supervisor loop and the claim
  *    registry stay put.
- *  - On every (re)connect, `onEstablished` runs **before** anything resumes — this
- *    is the resync hook: re-`register` all workers and re-`claim` all active jobs
- *    (see `resyncOwnership`) so the cockpit never blanks a still-running job.
- *  - The connect→resync→await-`closed`→teardown cycle repeats forever; it races
+ *  - On every (re)connect, `onEstablished` runs **before** anything resumes — the
+ *    hook where the caller (re)installs the inbound steer router so steering
+ *    survives a socket flap. The wire-level replay of presence + active claims is
+ *    **owned by the emit client** (#186): it re-emits its write-through shadow on
+ *    reconnect, so `onEstablished` no longer drives a manual registry resync.
+ *  - The connect→establish→await-`closed`→teardown cycle repeats forever; it races
  *    against `use`, so when `use` finishes (or fails/interrupts) the supervision
  *    fiber is interrupted and the live socket torn down deterministically.
  */

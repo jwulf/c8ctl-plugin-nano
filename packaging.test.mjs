@@ -66,6 +66,14 @@ test('every local module reachable from a published entry is itself published', 
       .map((x) => `  ${x}`)
       .join('\n')}`,
   );
+  // The entry point itself must be in the `files` allowlist, or npm omits it from the tarball —
+  // the same footgun as above, but for `main`: a future `main` change that forgets `files` would
+  // ship a package with no entry point, yet nothing above catches it (crawl seeds ⊇ main).
+  const mainRel = pkg.main.replace(/^\.\//, '');
+  assert.ok(
+    published.has(mainRel),
+    `package.json "main" (${pkg.main}) is missing from the "files" allowlist — npm would omit the plugin entry point from the published tarball`,
+  );
   assert.deepEqual(
     missingFromFiles,
     [],

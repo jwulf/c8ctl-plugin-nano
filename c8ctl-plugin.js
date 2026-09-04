@@ -63,9 +63,9 @@ import { createInterface } from 'node:readline/promises';
 import { StringDecoder } from 'node:string_decoder';
 import { createInterface as createReadline, cursorTo as rlCursorTo, moveCursor as rlMoveCursor, clearScreenDown as rlClearScreenDown } from 'node:readline';
 import { platformForHost } from './platforms.mjs';
-import { createWorkChannel, redactAgenticUrl, buildAgenticUrl } from './work-channel.mjs';
-import { createRelaySession, roleTerminalMode } from './work-relay.mjs';
-import { createBufferMonitor, resolveBufferCapacity } from './work-buffer.mjs';
+import { redactAgenticUrl, buildAgenticUrl } from './work-channel.mjs';
+import { createHostRelaySession, roleTerminalMode } from './work-relay.mjs';
+import { resolveBufferCapacity } from './work-buffer.mjs';
 // Canonical ACP → transcript wire bridge (nanobpm/nano-ide#534), consumed through
 // the single agentic import surface. `acpUpdateToTranscriptChunk(update)` maps one
 // raw ACP `session/update` to the exact transcript-chunk bytes the cockpit decodes,
@@ -7236,58 +7236,54 @@ async function workAgent(req, flags) {
       /* best effort — activity is advisory, never fail a job over it */
     }
   };
-  // The agentic-visibility channel, wired below. Declared here so the job
-  // recorders can refresh presence with the live job set as jobs start/end.
-  /** @type {import('./work-channel.mjs').WorkChannel | null} */
-  let workChannel = null;
-  /** @type {import('./work-buffer.mjs').BufferMonitor | null} */
-  let bufferMonitor = null;
-  // #144 liveness watchdog state. `agenticDisconnectedSince` is the epoch-ms the
-  // channel last dropped (null whenever it is up or has never opened); the
-  // watchdog uses it to force a full re-discovery + reopen when the client lib's
-  // own reconnect fails to bring a previously-connected channel back within the
-  // stale threshold. `agenticWatchdog` is the running timer handle (stopped on
-  // shutdown); `agenticSelfHealing` guards against two concurrent re-discovery
-  // loops (the cold-start one and a watchdog-triggered one).
-  let agenticDisconnectedSince = null;
-  // #147 presence-keyed watchdog state. `agenticConnectedSince` is the epoch-ms
-  // the channel last (re)connected (null while down); the watchdog uses it to
-  // require a stable connection to have held for a grace window before counting
-  // presence as confirmed. `agenticPresenceHealthyAt` is the epoch-ms presence
-  // was last confirmed healthy — advanced on the first connect (buffered REGISTER
-  // drains) and by the watchdog whenever a stable connection is observed, and
-  // reset by a heal. When it ages past the presence-stale threshold — even while
-  // the socket flaps `1006` reconnects — the watchdog forces a re-discovery.
-  let agenticConnectedSince = null;
-  let agenticPresenceHealthyAt = null;
-  /** @type {{ stop: () => void } | null} */
-  let agenticWatchdog = null;
-  let agenticSelfHealing = false;
-  // Maintain `activeJobs` unconditionally: it feeds both the supervisor activity
-  // file (gated inside writeActivity) AND the agentic presence frame's live
-  // jobKey set, so a standalone worker (no NANO_SUPERVISOR_ACTIVITY_FILE) still
-  // reports its current jobs on the visibility page.
+  // The single-owner supervisor's agentic plane (issue #173): ONE multiplexed
+  // host connection carries presence/steer/ownership/transcript for EVERY
+  // supervised agent, retiring the per-`work`-process `createWorkChannel` fan-out
+  // (where each process opened its own socket for a single identity). Built below
+  // from the resolved connect config and injected into the runtime as
+  // `deps.agenticEndpoint`; `agenticPlane` is late-bound to the running
+  // supervisor's presence/steer/transcript seams once `makeSupervisor` returns, so
+  // the per-job runner streams a job's terminal + accepts steer over that one
+  // connection instead of a per-process channel.
+  /** @type {import('./supervisor.dist.js').AgenticEndpoint | null} */
+  let agenticEndpoint = null;
+  /** @type {{ register: () => void, deregister: (reason?: string) => void, relaySessionFor: (jobKey: string|number) => (object|null) } | null} */
+  let agenticPlane = null;
+  // The presence attributes this worker announces on `register` (ENROLMENT
+  // attributes, not routing tokens — jobKeys are carried by the explicit
+  // claim/release ownership frames the dispatch lifecycle emits, never smuggled in
+  // here). Reused for the initial seed and any resync.
+  const agenticCapability = {
+    cognition: profile.rank,
+    family: profile.model || undefined,
+    host: hostname(),
+  };
+  // Maintain `activeJobs` unconditionally: it feeds the supervisor activity file
+  // (gated inside writeActivity) so a standalone worker still reports its current
+  // jobs. Live presence/ownership jobKeys are now owned by the runtime — the
+  // dispatch claim/release lifecycle keyed by this worker's instance drives the
+  // cockpit's jobKeys — so the recorders no longer poke a per-process channel.
   const recordJobStart = (job, jobType) => {
     activeJobs.set(String(job.jobKey), { type: jobType, since: Date.now() });
     writeActivity();
-    workChannel?.refreshPresence();
   };
   const recordJobEnd = (job) => {
     activeJobs.delete(String(job.jobKey));
     writeActivity();
-    workChannel?.refreshPresence();
   };
   // Seed an initial idle marker so status reports 'idle' immediately after spawn.
   writeActivity();
 
-  // ---- Agentic visibility channel (ADR 0056 — slice C2, #41) ----------------
-  // Connect this worker to the app's same-port `/agentic` channel and announce
-  // presence (identity, host, live jobs), heartbeat, and deregister on exit, so
-  // it appears live on the Workforce visibility page. This is the SINGLE place
-  // the connected+authenticated channel client is instantiated in `work`: the
-  // sibling slices C3 (PTY relay, #42) and C4 (buffer, #43) attach to the
-  // accessors on `workChannel` (relay-lane sink + connect/disconnect/reconnect
-  // lifecycle events) rather than opening their own connection.
+  // ---- Agentic visibility connection (ADR 0056; issue #173) -----------------
+  // Resolve WHERE this worker's presence is announced, then hand the connect
+  // config to the single-owner supervisor runtime as its ONE multiplexed host
+  // connection (built below). The supervisor announces presence (identity, host),
+  // heartbeats it, claims/releases jobs, and streams transcript + accepts steer
+  // for EVERY supervised agent over that single connection — replacing the retired
+  // per-`work`-process `createWorkChannel` fan-out where each process opened its
+  // own socket for a single identity. The sibling data planes (C3 PTY relay #42,
+  // steer #163) now ride this connection via the runtime's transcript/steer seams
+  // rather than a per-process channel.
   //
   // Local-first (security opt-in): visibility is ON BY DEFAULT. In LOCAL mode the
   // worker joins with the well-known LOCAL token and no credential; SECURE mode
@@ -7337,222 +7333,60 @@ async function workAgent(req, flags) {
   // diagnostic under the contract `agentic.message` field (not `reason`) so a hub
   // drop explains WHY; a fresh (re)connect clears any stale message.
   const markAgentic = (status, message = null) => { agenticState = { ...agenticState, status, message }; writeActivity(); };
-  // Open (or re-open) the visibility channel for a resolved connect config. This
-  // is the SINGLE place the connected+authenticated client is instantiated — the
-  // initial connect path and the background self-heal loop (#133) both call it,
-  // (re)assigning the shared `workChannel`/`bufferMonitor` closures the job
-  // recorders and shutdown path already track.
-  const openAgenticChannel = async (cfg) => {
+  // Build the ONE multiplexed host-connection endpoint (issue #173) for the
+  // resolved connect config and hand it to the single-owner runtime as
+  // `deps.agenticEndpoint`. This RETIRES the per-`work`-process createWorkChannel
+  // fan-out: the supervisor now owns exactly one connection carrying presence
+  // (register/heartbeat/deregister projected from the registry), ownership
+  // (claim/release per job), inbound steer, and transcript for EVERY supervised
+  // agent — each frame carrying its `instance` explicitly. The endpoint composes
+  // the raw-JS wire (`agentic-endpoint.mjs` → the single agentic import surface)
+  // with the bundle's Effect adapter; additive negotiation still degrades
+  // claim/release/steer to a no-op against an older hub. Reconnect + resync (and
+  // teardown-on-interruption) are owned by the runtime's `superviseAgentic`, so the
+  // retired #133 self-heal loop and #144/#147 liveness watchdog are gone — the
+  // marker's agentic status is driven by the endpoint's connection observer below.
+  // Constructing the endpoint opens NO socket (the runtime's supervision calls the
+  // connect factory), so this stays cheap and side-effect-free until `run` forks.
+  if (agenticCfg) {
     try {
-      workChannel = await createWorkChannel({
-        instance: workerName,
-        host: hostname(),
-        capability: {
-          cognition: profile.rank,
-          family: profile.model || undefined,
-          host: hostname(),
+      agenticEndpoint = await createAgenticEndpoint({
+        url: agenticCfg.url,
+        token: agenticCfg.token,
+        credential: agenticCfg.credential,
+        // Keep the activity marker's agentic status honest across the single
+        // connection's open/drop transitions (#99) — the direct analogue of the
+        // retired createWorkChannel onConnect/onDisconnect marker wiring.
+        onConnectionState: (state) => {
+          if (state === 'connected') markAgentic('connected');
+          else markAgentic('disconnected', 'connection dropped');
         },
-        listJobKeys: () => [...activeJobs.keys()],
-        url: cfg.url,
-        token: cfg.token,
-        credential: cfg.credential,
-        bufferCapacity: cfg.bufferCapacity,
-        // #147: de-synchronise reconnect attempts with equal-jitter backoff so a
-        // fleet dropped on the same lossy link does not reconnect in lockstep and
-        // re-congest it. Wraps the client lib's own exponential policy (which has
-        // no jitter of its own); the base delays/factor stay the lib's defaults.
-        schedule: makeJitteredReconnectSchedule(),
         logger,
       });
-      const shown = redactAgenticUrl(buildAgenticUrl(cfg.url, {}));
-      const mode = cfg.secure ? 'secure' : 'local';
-      if (cfg.discovered) {
-        const d = cfg.discovered;
-        logger.info(`  agentic channel: auto-discovered ${d.project} on the app's /agentic port ${wsHostPart(d.host)}:${d.port} (bypassing the WS-incapable console proxy).`);
-      }
-      logger.info(`  agentic channel (${mode}): announcing presence as ${workerName} on ${shown}`);
-      // onConnect fires only for listeners present at first open, so also
-      // reconcile the already-open case synchronously via connected(). If the
-      // socket opened and then dropped inside the createWorkChannel() await window
-      // (before these listeners existed), connected() is false but everConnected()
-      // is true — record that as `disconnected` rather than leaving it stuck at
-      // `connecting`.
-      // #144: track the drop clock alongside presence — a (re)connect clears it,
-      // a disconnect starts it (first drop wins, so the watchdog measures from the
-      // ORIGINAL drop, not the latest of a reconnect storm). The watchdog reads
-      // this to decide when the client lib has failed to self-heal.
-      workChannel.onConnect(() => {
-        markAgentic('connected');
-        agenticDisconnectedSince = null;
-        agenticConnectedSince = Date.now();
-        // First open drains the buffered REGISTER → presence lands; seed the
-        // presence-health clock so the #147 trigger measures from here (#147).
-        agenticPresenceHealthyAt = Date.now();
-      });
-      workChannel.onReconnect(() => {
-        markAgentic('connected');
-        agenticDisconnectedSince = null;
-        agenticConnectedSince = Date.now();
-        // Deliberately do NOT advance agenticPresenceHealthyAt here: a reconnect
-        // only CLAIMS presence (re-announces). On a lossy link the socket may
-        // re-drop `1006` before presence actually lands, so the watchdog confirms
-        // it only once a connection HOLDS for the grace window — a reconnect that
-        // immediately re-drops must not mask an unrecovered presence (#147).
-      });
-      workChannel.onDisconnect((info) => {
-        markAgentic('disconnected', normalizeAgenticMessage(info));
-        if (agenticDisconnectedSince == null) agenticDisconnectedSince = Date.now();
-        agenticConnectedSince = null;
-      });
-      if (workChannel.connected()) {
-        markAgentic('connected');
-        agenticDisconnectedSince = null;
-        agenticConnectedSince = Date.now();
-        if (agenticPresenceHealthyAt == null) agenticPresenceHealthyAt = Date.now();
-      } else if (workChannel.everConnected()) {
-        markAgentic('disconnected');
-        if (agenticDisconnectedSince == null) agenticDisconnectedSince = Date.now();
-        agenticConnectedSince = null;
-      }
     } catch (err) {
-      // Never let a channel failure stop the worker from doing its actual job.
-      workChannel = null;
-      // Retain the failure reason on the marker so the supervisor can show WHY
-      // presence dropped (bad URL, refused socket, …), not just `disconnected`.
-      // The contract diagnostic field is `agentic.message` (#99), matching the
-      // live-disconnect path above — keep the key consistent, not `reason`.
+      // Never let endpoint construction stop the worker from doing its job — the
+      // agentic plane is best-effort visibility. Record the failure on the marker
+      // and run the supervisor with no agenticEndpoint (presence/steer become no-ops).
+      agenticEndpoint = null;
       agenticState = { ...agenticState, status: 'disconnected', message: normalizeAgenticMessage(err) };
       writeActivity();
-      logger.warn(`  agentic channel unavailable (${err?.message || err}); continuing without visibility.`);
-      return;
+      logger.warn(`  agentic endpoint unavailable (${err?.message || err}); continuing without visibility.`);
     }
-    // C4 (#43): observe the client's built-in outbound buffer across the
-    // channel lifecycle — surface a high-water mark and warn when the bound
-    // is hit so a hub outage that starts shedding frames is never silent. The
-    // monitor is observability-only, so keep it OUTSIDE the channel try/catch:
-    // a monitor failure must never null out a healthy channel and take down
-    // presence/visibility.
-    if (workChannel) {
-      try {
-        bufferMonitor = createBufferMonitor(workChannel, {
-          capacity: cfg.bufferCapacity,
-          logger,
-        });
-      } catch (err) {
-        bufferMonitor = null;
-        logger.warn(`  agentic buffer monitor unavailable (${err?.message || err}); channel presence still active.`);
-      }
-    }
-  };
-
-  // (A) Background self-heal loop, shared by the cold-start advisory path (#133)
-  // AND the #144 liveness watchdog. Re-run discovery on a jittered backoff and,
-  // on the first `connect` target, (re)open the channel WITHOUT a restart. The
-  // `agenticSelfHealing` guard makes it idempotent: the watchdog can call it
-  // after tearing a stale channel down without racing a still-running cold-start
-  // loop. A shared cache lets a brief blip reuse the last known-good hub (#133-C).
-  const armAgenticSelfHeal = () => {
-    if (agenticSelfHealing) return; // a re-discovery loop is already running
-    if (workChannel !== null) return; // a channel already exists — nothing to heal
-    agenticSelfHealing = true;
-    const hubCache = new Map();
-    rediscoverAgenticUntilConnected({
-      resolveTarget: () => resolveAgenticTarget({ camunda, logger, cache: hubCache }),
-      onConnect: async (target) => {
-        agenticCfg = target.config;
-        agenticState = agenticStateForTarget(target, safeAgenticDisplayUrl);
-        writeActivity();
-        logger.info('  agentic channel: background re-discovery succeeded — (re)opening channel.');
-        await openAgenticChannel(agenticCfg);
-        // openAgenticChannel swallows its own open failures (it nulls
-        // workChannel and returns rather than throwing), so a failed open must
-        // be re-thrown here — otherwise the self-heal loop treats this attempt
-        // as success and stops retrying with workChannel still null (#133).
-        if (workChannel === null) {
-          throw new Error('agentic channel failed to open after background re-discovery');
-        }
-      },
-      // Stop as soon as a channel exists (loop won this or a prior attempt did).
-      shouldContinue: () => workChannel === null,
-      logger,
-    })
-      .catch(() => { /* best-effort self-heal — never surfaces an error */ })
-      .finally(() => { agenticSelfHealing = false; });
-  };
-
-  // (B) #144 liveness watchdog: force-heal a wedged channel. When a channel that
-  // HAS connected drops and the client lib's own reconnect never brings it back
-  // within the stale threshold (a half-open drop after a server restart/crash/
-  // partition, or a reconnect that keeps failing), the client sits `disconnected`
-  // forever and the worker vanishes from the Workers view until a supervisor
-  // restart. This tears the wedged channel down (so `shouldContinue` re-arms) and
-  // re-runs full discovery + reopen instead of trusting the client lib alone.
-  const healStaleAgenticChannel = async () => {
-    const stale = workChannel;
-    if (!stale) return;
-    workChannel = null; // re-arms armAgenticSelfHeal()'s shouldContinue gate
-    agenticDisconnectedSince = null; // reset the clock; the fresh open restarts it
-    agenticConnectedSince = null; // #147: the fresh open re-seeds it
-    agenticPresenceHealthyAt = null; // #147: the fresh open re-confirms presence
-    try { bufferMonitor?.stop(); } catch { /* best effort */ }
-    bufferMonitor = null;
-    markAgentic('disconnected', 'stale channel — re-discovering hub');
-    // Deregister + close the wedged client so it stops its own doomed reconnect
-    // attempts and we don't leak two clients once the fresh one connects.
-    try { await stale.stop('stale channel — re-discovering'); } catch { /* best effort */ }
-    armAgenticSelfHeal();
-  };
-
-  const startAgenticWatchdog = () => {
-    if (agenticWatchdog) return;
-    const staleAfterMs = Math.max(5_000, intFlag(process.env.NANO_AGENTIC_STALE_MS, DEFAULT_AGENTIC_STALE_MS));
-    const intervalMs = Math.max(1_000, intFlag(process.env.NANO_AGENTIC_WATCHDOG_MS, DEFAULT_AGENTIC_WATCHDOG_INTERVAL_MS));
-    const presenceStaleAfterMs = Math.max(5_000, intFlag(process.env.NANO_AGENTIC_PRESENCE_STALE_MS, DEFAULT_AGENTIC_PRESENCE_STALE_MS));
-    const presenceGraceMs = Math.max(1_000, intFlag(process.env.NANO_AGENTIC_PRESENCE_GRACE_MS, DEFAULT_AGENTIC_PRESENCE_GRACE_MS));
-    agenticWatchdog = startAgenticChannelWatchdog({
-      getChannel: () => workChannel,
-      disconnectedSince: () => agenticDisconnectedSince,
-      // #147: presence-keyed trigger — heal reconnect-churn that never re-lands
-      // presence, not just a sustained socket drop.
-      connectedSince: () => agenticConnectedSince,
-      presenceHealthySince: () => agenticPresenceHealthyAt,
-      onPresenceHealthy: () => { agenticPresenceHealthyAt = Date.now(); },
-      presenceStaleAfterMs,
-      presenceGraceMs,
-      onStale: healStaleAgenticChannel,
-      staleAfterMs,
-      intervalMs,
-      logger,
-    });
-  };
-
-  if (agenticCfg) {
-    await openAgenticChannel(agenticCfg);
-    // Guard the connected channel: if it later drops and the client lib can't
-    // recover it, the watchdog forces a full re-discovery + reopen (#144).
-    startAgenticWatchdog();
-  } else if (agenticTarget.status === 'advisory') {
-    // A cold-start discovery miss leaves the worker `advisory`; the self-heal
-    // loop upgrades it to `connected` without a restart (#133), and once a
-    // channel exists the watchdog keeps it alive across later drops (#144).
-    armAgenticSelfHeal();
-    startAgenticWatchdog();
   }
-
   // C3 (#42): the role's live-terminal mode — a full PTY (streamed on the relay
   // lane when a relay session exists, steerable) or a plain pipe. Honors the
   // vocab's per-role opt-in read off the hire profile (`terminal: pty|pipe`),
   // with an env override for a one-off worker (`NANO_AGENTIC_TERMINAL`). The PTY
   // itself is allocated locally regardless of enrollment; relay streaming (and
-  // steer-in) only engages when the worker is enrolled on the channel, so
-  // without the channel there's simply no relay tap — the harness still runs on
-  // the chosen local transport.
+  // steer-in) only engages when the worker is enrolled (a live agentic endpoint),
+  // so without it there's simply no relay tap — the harness still runs on the
+  // chosen local transport.
   const envTerminal = (process.env.NANO_AGENTIC_TERMINAL || '').trim().toLowerCase();
   const roleTerminal = (envTerminal === 'pty' || envTerminal === 'pipe')
     ? envTerminal
     : roleTerminalMode(profile);
-  if (workChannel) {
-    logger.info(`  live terminal: ${roleTerminal === 'pty' ? 'PTY (streamed + steerable)' : 'pipe (streamed)'} on the relay lane.`);
+  if (agenticEndpoint) {
+    logger.info(`  live terminal: ${roleTerminal === 'pty' ? 'PTY (streamed + steerable)' : 'pipe (streamed)'} on the supervised connection.`);
   }
 
   // #110: the role's harness protocol (pipe|acp) and ACP permission policy
@@ -7768,18 +7602,15 @@ async function workAgent(req, flags) {
 
         let result;
         let gitResult = null;
-        // C3 (#42): the per-job live-terminal relay session. Streams this job's
-        // harness terminal on the relay lane tagged with its jobKey, and accepts
-        // steer-in. Only when the worker is enrolled on the channel; closed in
-        // the finally so its inbound-frame subscription never leaks across jobs.
+        // The per-job live-terminal relay session (issue #173): streams this job's
+        // harness terminal over the single-owner supervisor's ONE multiplexed host
+        // connection, keyed by this worker's instance + the jobKey, and accepts
+        // cockpit steer-in fanned back to this job's PTY by the runtime's steer
+        // router. Only when the worker is enrolled (a live agentic plane); closed
+        // in the finally so its steer subscription never leaks across jobs.
         let relaySession = null;
-        if (workChannel) {
-          try {
-            relaySession = createRelaySession({ channel: workChannel, jobKey: job.jobKey, logger });
-          } catch (err) {
-            relaySession = null;
-            logger.warn(`[${jobType}] job ${job.jobKey}: relay session unavailable (${err?.message || err}); continuing without live terminal.`);
-          }
+        if (agenticPlane) {
+          relaySession = agenticPlane.relaySessionFor(job.jobKey);
         }
         // Private structured-result channel: hand the agent a file (outside any
         // repo clone so it can't be `git add`ed) to write its job-result vars to.
@@ -7958,6 +7789,11 @@ async function workAgent(req, flags) {
     workers: [{ id: workerName, types: jobTypes, capacity: 1 }],
     autoWorkerId: autoMode ? workerName : undefined,
     scope: autoScope,
+    // The ONE multiplexed host connection (issue #173): the runtime owns its
+    // connect/reconnect/resync + teardown lifecycle. Omitted (undefined) when the
+    // agentic target didn't resolve to a connect — the runtime then runs with no
+    // agentic scope and presence/steer degrade to no-ops.
+    agenticEndpoint: agenticEndpoint || undefined,
     config: {
       activation: { requestTimeoutMs: pollTimeoutMs },
       dispatch: { recoveryWindowMs, extendIntervalMs: lockExtendIntervalMs },
@@ -7978,6 +7814,62 @@ async function workAgent(req, flags) {
   // next reconcile — the same liveness the retired ref'd auto-poll timer provided.
   const supervisor = await SupervisorEffect.runPromise(makeSupervisorRuntime(supervisorDeps));
   const supervisorFiber = SupervisorEffect.runFork(supervisor.run);
+
+  // Seed this worker's presence into the runtime's ownership registry (issue
+  // #173) and late-bind the per-job relay seam to the running supervisor. The
+  // presence-projection fiber announces (register) then heartbeats this instance
+  // over the one multiplexed connection, and drops it (deregister) when it leaves
+  // the registry; ownership jobKeys are driven by the dispatch claim/release
+  // lifecycle keyed by this same instance. Every hop is best-effort — a
+  // visibility seam must never fail the worker.
+  if (agenticEndpoint) {
+    const agenticEncoder = new TextEncoder();
+    const seedPresence = () => {
+      try {
+        SupervisorEffect.runSync(supervisor.ownership.register(workerName, agenticCapability));
+      } catch (err) {
+        logger.warn(`  agentic presence seed failed (${err?.message || err}); continuing.`);
+      }
+    };
+    seedPresence();
+    agenticPlane = {
+      register: seedPresence,
+      // Graceful teardown: emit an explicit deregister for this identity over the
+      // live connection, then drop it from the registry so the projection stops
+      // heartbeating it. Best-effort — teardown must never hang or throw.
+      deregister: (reason) => {
+        try { SupervisorEffect.runSync(supervisor.presence.deregister(workerName, reason)); } catch { /* best effort */ }
+        try { SupervisorEffect.runSync(supervisor.ownership.deregister(workerName)); } catch { /* best effort */ }
+      },
+      // Build a per-job relay session over the supervisor's transcript + steer
+      // seams (issue #173), shape-compatible with the retired createWorkChannel
+      // relay session so `runAgentJob` consumes it unchanged. Transcript rides the
+      // one connection keyed by this instance + jobKey; inbound steer is fanned
+      // back to this job's PTY by the runtime's per-instance steer router.
+      relaySessionFor: (jobKey) => {
+        try {
+          return createHostRelaySession({
+            instance: workerName,
+            jobKey,
+            publish: (text) => {
+              // Fire-and-forget over the live handle; a frame between a drop and
+              // the next reconnect is a harmless no-op (best-effort semantics).
+              try { SupervisorEffect.runSync(supervisor.transcript(workerName, String(jobKey), agenticEncoder.encode(text))); } catch { /* best effort */ }
+            },
+            subscribeSteer: (onChunk) => {
+              const sink = (_jk, chunk) => SupervisorEffect.sync(() => onChunk(chunk));
+              try { SupervisorEffect.runSync(supervisor.steerRouter.register(workerName, sink)); } catch { /* best effort */ }
+              return () => { try { SupervisorEffect.runSync(supervisor.steerRouter.unregister(workerName)); } catch { /* best effort */ } };
+            },
+            logger,
+          });
+        } catch (err) {
+          logger.warn(`  host relay session unavailable (${err?.message || err}); continuing without live terminal.`);
+          return null;
+        }
+      },
+    };
+  }
 
   // Non-auto live retype: the runtime's reconcile loop only rewrites the --auto
   // worker's types (from the engine read), so keep watching the profile file to
@@ -8052,28 +7944,20 @@ async function workAgent(req, flags) {
       logger.info(`Received ${signal} — stopping worker...`);
       if (reaperTimer) clearInterval(reaperTimer);
       if (runDirTimer) clearInterval(runDirTimer);
-      // Stop the #144 liveness watchdog so it can't kick off a re-discovery
-      // mid-teardown (which would resurrect the channel we're about to close).
-      if (agenticWatchdog) { try { agenticWatchdog.stop(); } catch { /* best effort */ } agenticWatchdog = null; }
+      // Deregister this worker's presence BEFORE interrupting the runtime: emit
+      // the explicit deregister while the multiplexed host connection is still
+      // live, so the worker disappears from the cockpit cleanly rather than
+      // lingering until its heartbeat lapses. Best-effort — teardown must never
+      // hang. Interrupting the fiber then runs the runtime's bracketed teardown
+      // (release slots, stop the heartbeat + tear down the agentic scope).
+      if (agenticPlane) {
+        try { agenticPlane.deregister(`worker stopped (${signal})`); } catch { /* best effort */ }
+      }
       try {
         await SupervisorEffect.runPromise(SupervisorFiber.interrupt(supervisorFiber));
         logger.info('Worker stopped.');
       } catch (err) {
         logger.warn(`supervisor shutdown error — runtime loop may not have shut down cleanly: ${err?.message || err}`);
-      }
-      // Deregister from the visibility channel LAST, so the worker disappears from
-      // the page only once its jobs have drained. Best-effort — a channel teardown
-      // must never hang shutdown.
-      if (workChannel) {
-        try {
-          bufferMonitor?.stop();
-        } catch { /* best effort */ }
-        try {
-          await workChannel.stop(`worker stopped (${signal})`);
-          logger.info('Deregistered from the agentic visibility channel.');
-        } catch (err) {
-          logger.warn(`agentic channel deregister failed: ${err?.message || err}`);
-        }
       }
       resolve();
     };

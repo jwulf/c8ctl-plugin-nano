@@ -110,8 +110,12 @@ function negotiatedSupport(remoteAdvertisement) {
  * @param {{ warn?: Function, debug?: Function }} [params.logger]
  * @returns {import('./supervisor.dist.js').RawEmitClient}
  */
-function openHostConnection({ url, transportFactory, incarnation, support, logger }) {
+function openHostConnection({ url, transportFactory, incarnation, support, logger, onConnectionState }) {
   const log = logger || {};
+  const notifyState = (state) => {
+    if (typeof onConnectionState !== 'function') return;
+    try { onConnectionState(state); } catch (err) { log.debug?.(`agentic onConnectionState threw — ${err?.message || err}`); }
+  };
   const openCbs = [];
   const closeCbs = [];
   let steerRoute = null;
@@ -140,6 +144,7 @@ function openHostConnection({ url, transportFactory, incarnation, support, logge
     open = false;
     hasClosed = true;
     for (const cb of closeCbs) cb();
+    notifyState('disconnected');
   };
 
   const send = (lane, family, payload) => {
@@ -187,6 +192,7 @@ function openHostConnection({ url, transportFactory, incarnation, support, logge
     onOpen() {
       open = true;
       for (const cb of openCbs) cb();
+      notifyState('connected');
     },
     onFrame(bytes) {
       handleInbound(bytes);
@@ -293,11 +299,14 @@ function openHostConnection({ url, transportFactory, incarnation, support, logge
  *   the peer's advertised support; omit to assume full support (see {@link negotiatedSupport})
  * @param {number} [opts.incarnationBase] first transcript incarnation (default `Date.now()`)
  * @param {import('@nanobpm/urban-agent-client').TransportFactory} [opts.transportFactory] injectable transport (tests)
+ * @param {(state: 'connected'|'disconnected') => void} [opts.onConnectionState] observer fired
+ *   when a connection opens/drops, so a caller can track the single host connection's
+ *   liveness (e.g. the supervisor activity marker's agentic status)
  * @param {{ warn?: Function, debug?: Function }} [opts.logger]
  * @returns {Promise<() => import('./supervisor.dist.js').RawEmitClient>} a synchronous `connect` factory
  */
 export async function createRawEmitConnect(opts) {
-  const { url, token, credential, remoteAdvertisement, incarnationBase, transportFactory, logger } = opts || {};
+  const { url, token, credential, remoteAdvertisement, incarnationBase, transportFactory, logger, onConnectionState } = opts || {};
   if (typeof url !== 'string' || url.trim() === '') {
     throw new Error('createRawEmitConnect requires an agentic channel base url');
   }
@@ -318,6 +327,7 @@ export async function createRawEmitConnect(opts) {
       incarnation: generation++,
       support,
       logger,
+      onConnectionState,
     });
 }
 

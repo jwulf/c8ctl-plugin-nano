@@ -309,3 +309,150 @@ export function createRelaySession({
 
   return { stream, relay, attachSteer, close };
 }
+
+/**
+ * The canonical host-connection transcript stream name for a supervised job
+ * (issue #173). Unlike {@link relayStreamName} (which keys purely on the
+ * jobKey, safe only when one process owns one identity), the single host
+ * connection multiplexes N workers, so the stream carries BOTH the owning
+ * `instance` and the `jobKey` explicitly — two workers' (or two jobs') streams
+ * over the one socket can never collide. Mirrors the endpoint's own
+ * `composeTranscriptStream`, exposed here only for observability/parity.
+ *
+ * @param {string} instance the owning worker instance
+ * @param {string|number} jobKey the activated job's key
+ * @returns {string}
+ */
+export function hostRelayStreamName(instance, jobKey) {
+  return `t/${encodeURIComponent(String(instance))}/${encodeURIComponent(String(jobKey))}`;
+}
+
+/**
+ * Create a per-job relay session backed by the single-owner supervisor's ONE
+ * multiplexed host connection (issue #173) instead of a per-worker
+ * {@link createWorkChannel} socket.
+ *
+ * It is shape-compatible with {@link createRelaySession} — `runAgentJob`
+ * consumes the identical `{ relay, attachSteer, close }` contract — but every
+ * frame rides the supervisor's connection keyed by explicit `instance`/`jobKey`:
+ *
+ *   - {@link RelaySession.relay} streams a terminal chunk over the connection's
+ *     transcript lane via the injected `publish(text)` (the plugin wires it to
+ *     `supervisor.transcript(instance, jobKey, bytes)`), so N agents' transcript
+ *     streams multiplex over one socket without crossing.
+ *   - {@link RelaySession.attachSteer} registers a per-instance inbound sink via
+ *     the injected `subscribeSteer(onChunk) → unsubscribe` (the plugin wires it
+ *     to `supervisor.steerRouter.register/unregister`), so cockpit → agent steer
+ *     bytes fan back to exactly this job's PTY.
+ *
+ * Kept Effect-free and transport-agnostic (the plugin owns the Effect glue), so
+ * it is unit-testable with plain fakes. Every wire op is best-effort: a publish
+ * or steer failure is logged and swallowed, never crashing the worker — the
+ * ownership registry (claim/release), not the transcript, is the source of truth.
+ *
+ * @param {object} opts
+ * @param {string} opts.instance the owning worker instance (explicit on every frame)
+ * @param {string|number} opts.jobKey the activated job's key
+ * @param {(text: string) => void} opts.publish stream one transcript chunk over the host connection
+ * @param {(onChunk: (chunk: string|Uint8Array) => void) => (() => void)} [opts.subscribeSteer]
+ *   register a steer-in sink for this instance; returns an unsubscribe fn
+ * @param {{ warn?: Function, debug?: Function }} [opts.logger]
+ * @returns {RelaySession}
+ */
+export function createHostRelaySession({ instance, jobKey, publish, subscribeSteer, logger } = {}) {
+  if (instance === undefined || instance === null || String(instance) === '') {
+    throw new Error('createHostRelaySession requires an instance');
+  }
+  if (jobKey === undefined || jobKey === null || String(jobKey) === '') {
+    throw new Error('createHostRelaySession requires a jobKey');
+  }
+  if (typeof publish !== 'function') {
+    throw new Error('createHostRelaySession requires a publish(text) sink');
+  }
+  const stream = hostRelayStreamName(instance, jobKey);
+  const log = logger || {};
+
+  const relay = (chunk) => {
+    if (chunk == null) return;
+    const text = typeof chunk === 'string'
+      ? chunk
+      : Buffer.isBuffer(chunk)
+        ? chunk.toString('utf8')
+        : Buffer.from(chunk).toString('utf8');
+    if (text === '') return;
+    try {
+      publish(text);
+    } catch (err) {
+      try {
+        log.warn?.(`host relay publish failed for ${stream}: ${err?.message || err}`);
+      } catch {
+        /* never let a logging failure escape the relay path */
+      }
+    }
+  };
+
+  // Each attachSteer call owns its own subscription + detach fn (mirrors
+  // createRelaySession), so a second attachSteer can't clobber an earlier one.
+  const activeDetaches = new Set();
+  const attachSteer = (write) => {
+    if (typeof write !== 'function' || typeof subscribeSteer !== 'function') return () => {};
+    let unsub;
+    try {
+      unsub = subscribeSteer((data) => {
+        const text = typeof data === 'string' ? data : Buffer.from(data).toString('utf8');
+        try {
+          write(text);
+        } catch (err) {
+          try {
+            log.warn?.(`host steer-in write failed for ${stream}: ${err?.message || err}`);
+          } catch {
+            /* swallow */
+          }
+        }
+      });
+    } catch (err) {
+      try {
+        log.warn?.(`host steer-in subscribe failed for ${stream}: ${err?.message || err}`);
+      } catch {
+        /* swallow */
+      }
+      return () => {};
+    }
+    let detached = false;
+    const detach = () => {
+      if (detached) return;
+      detached = true;
+      activeDetaches.delete(detach);
+      try {
+        unsub?.();
+      } catch {
+        /* swallow */
+      }
+    };
+    activeDetaches.add(detach);
+    return detach;
+  };
+
+  // close() is idempotent: a second call returns the same settled promise
+  // without re-emitting the close marker or re-detaching. There is no outbound
+  // buffer to drain on the host connection (the supervisor owns reconnect +
+  // resync), so close resolves as soon as the close marker is emitted and every
+  // steer subscription is torn down.
+  let closed = false;
+  let closedPromise = Promise.resolve({ closeEmitted: false, drained: true, timedOut: false });
+  const close = () => {
+    if (closed) return closedPromise;
+    closed = true;
+    // Emit the closing lifecycle twin of RELAY_OPEN_CHUNK so the app can flush the
+    // durable transcript deterministically at completion (nano-workforce#710).
+    relay(RELAY_CLOSE_CHUNK);
+    for (const detach of [...activeDetaches]) detach();
+    closedPromise = Promise.resolve({ closeEmitted: true, drained: true, timedOut: false });
+    return closedPromise;
+  };
+
+  // Open the stream the instant the session exists (parity with createRelaySession).
+  relay(RELAY_OPEN_CHUNK);
+
+  return { stream, relay, attachSteer, close };
+}

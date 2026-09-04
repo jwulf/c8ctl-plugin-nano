@@ -267,3 +267,88 @@ test("supervisor: a registered worker is announced + heartbeated over the one su
     }).pipe(Effect.provide(TestClock.layer())),
   );
 });
+
+// --- Integration: the plugin streams transcript + emits deregister over the one connection (#173) ---
+
+test("supervisor: transcript + explicit deregister ride the SAME supervised connection (issue #173)", async () => {
+  await Effect.runPromise(
+    Effect.gen(function* () {
+      const rec = recordingHandle();
+      const engine = makeEngine({ activate: () => Effect.never as never });
+      const runner = makeRunner(0);
+      const reg = yield* makeRegistry();
+      const reader = makeReader([[]], {});
+
+      const sup = yield* makeSupervisor({
+        engine,
+        runner,
+        registry: reg,
+        reconcileReader: reader,
+        scan: () => [],
+        logger: noopLogger,
+        agenticEndpoint: { connect: () => Effect.succeed(rec.handle) },
+        agenticConfig: { reconnectBaseMs: 0, reconnectMaxMs: 10 },
+        config: { presence: { heartbeatIntervalMs: 1_000 }, idleSpacingMs: 1_000 },
+      });
+
+      yield* sup.ownership.register("agent-1", { cognition: "senior", family: "copilot" });
+      const fiber = yield* Effect.forkChild(sup.run);
+      yield* TestClock.adjust(Duration.millis(1)); // connection establishes
+
+      rec.frames.length = 0;
+      // The plugin's per-job relay streams terminal bytes over the one connection.
+      yield* sup.transcript("agent-1", "job-9", new TextEncoder().encode("hello"));
+      assert.ok(rec.frames.includes("transcript:agent-1:job-9"), "transcript rode the supervised connection");
+
+      // Graceful shutdown emits an explicit deregister for the worker's identity.
+      yield* sup.presence.deregister("agent-1", "worker stopped");
+      assert.ok(rec.frames.includes("deregister:agent-1"), "explicit deregister rode the supervised connection");
+
+      yield* Fiber.interrupt(fiber);
+    }).pipe(Effect.provide(TestClock.layer())),
+  );
+});
+
+// A worker steered from the cockpit: the steer router fans an inbound frame to
+// the per-instance sink the plugin registers around a live job (#173).
+test("supervisor: inbound steer routes to the per-instance sink the plugin registers (issue #173)", async () => {
+  await Effect.runPromise(
+    Effect.gen(function* () {
+      const routeBox: { current: SteerRoute | null } = { current: null };
+      const rec = recordingHandle({ steer: (r) => { routeBox.current = r; } });
+      const engine = makeEngine({ activate: () => Effect.never as never });
+      const reg = yield* makeRegistry();
+      const reader = makeReader([[]], {});
+
+      const sup = yield* makeSupervisor({
+        engine,
+        runner: makeRunner(0),
+        registry: reg,
+        reconcileReader: reader,
+        scan: () => [],
+        logger: noopLogger,
+        agenticEndpoint: { connect: () => Effect.succeed(rec.handle) },
+        agenticConfig: { reconnectBaseMs: 0, reconnectMaxMs: 10 },
+        config: { presence: { heartbeatIntervalMs: 1_000 }, idleSpacingMs: 1_000 },
+      });
+
+      const fiber = yield* Effect.forkChild(sup.run);
+      yield* TestClock.adjust(Duration.millis(1)); // connection establishes → steer route installed
+
+      const received: Array<{ jobKey: string; text: string }> = [];
+      yield* sup.steerRouter.register("agent-1", (jobKey, chunk) =>
+        Effect.sync(() => received.push({ jobKey, text: new TextDecoder().decode(chunk) })),
+      );
+
+      assert.ok(routeBox.current, "the supervisor installed the steer route on the connection");
+      yield* routeBox.current!("agent-1", "job-9", new TextEncoder().encode("\x03"));
+      assert.deepEqual(received, [{ jobKey: "job-9", text: "\x03" }], "inbound steer reached the plugin's sink");
+
+      // A frame for an unknown instance is dropped, never misrouted.
+      yield* routeBox.current!("ghost", "job-0", new TextEncoder().encode("x"));
+      assert.equal(received.length, 1, "steer for an unregistered instance was dropped");
+
+      yield* Fiber.interrupt(fiber);
+    }).pipe(Effect.provide(TestClock.layer())),
+  );
+});

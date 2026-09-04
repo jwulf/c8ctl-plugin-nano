@@ -12,6 +12,8 @@ import {
   roleTerminalMode,
   parseInboundRelayChunk,
   createRelaySession,
+  createHostRelaySession,
+  hostRelayStreamName,
   RELAY_OPEN_CHUNK,
   RELAY_CLOSE_CHUNK,
 } from './work-relay.mjs';
@@ -422,4 +424,94 @@ test('runAgentJob(terminal: pty) falls back to a pipe when node-pty is unavailab
   assert.match(result.stdout, /fallback/);
   assert.ok(ch.produced.some((f) => f.stream === 'job:901' && /fallback/.test(f.chunk)));
   session.close();
+});
+
+// ---- createHostRelaySession (issue #173) ------------------------------------
+// The per-job relay session backed by the single-owner supervisor's ONE
+// multiplexed host connection, instead of a per-worker createWorkChannel socket.
+
+test('hostRelayStreamName keys the stream on BOTH instance and jobKey', () => {
+  // The one connection multiplexes N workers, so the stream must carry the
+  // owning instance explicitly — two workers' jobs can never collide.
+  assert.equal(hostRelayStreamName('senior-1', '42'), 't/senior-1/42');
+  assert.equal(hostRelayStreamName('a/b', 'x y'), 't/a%2Fb/x%20y');
+  assert.notEqual(
+    hostRelayStreamName('w1', '42'),
+    hostRelayStreamName('w2', '42'),
+    'same jobKey on two instances must not share a stream',
+  );
+});
+
+test('createHostRelaySession publishes transcript text and brackets it with lifecycle markers', () => {
+  const published = [];
+  const session = createHostRelaySession({
+    instance: 'senior-1',
+    jobKey: '42',
+    publish: (text) => published.push(text),
+  });
+  assert.equal(session.stream, 't/senior-1/42');
+  // Opens with the lifecycle marker so the app correlates immediately.
+  assert.equal(published[0], RELAY_OPEN_CHUNK);
+  session.relay('hello-world');
+  assert.ok(published.includes('hello-world'));
+  session.close();
+  // Closes with the twin marker so the durable transcript flushes deterministically.
+  assert.equal(published[published.length - 1], RELAY_CLOSE_CHUNK);
+});
+
+test('createHostRelaySession normalizes Buffer/Uint8Array chunks to utf8 text', () => {
+  const published = [];
+  const session = createHostRelaySession({
+    instance: 'w', jobKey: '1', publish: (t) => published.push(t),
+  });
+  session.relay(Buffer.from('buf-chunk'));
+  session.relay(new TextEncoder().encode('u8-chunk'));
+  session.relay('');   // empty chunks are dropped
+  session.relay(null); // nullish chunks are dropped
+  assert.ok(published.includes('buf-chunk'));
+  assert.ok(published.includes('u8-chunk'));
+  assert.equal(published.filter((t) => t === '').length, 0);
+});
+
+test('createHostRelaySession.attachSteer subscribes an inbound sink and detaches it on demand', () => {
+  let onChunk = null;
+  let unsubscribed = false;
+  const session = createHostRelaySession({
+    instance: 'w', jobKey: '1',
+    publish: () => {},
+    subscribeSteer: (fn) => { onChunk = fn; return () => { unsubscribed = true; }; },
+  });
+  const written = [];
+  const detach = session.attachSteer((text) => written.push(text));
+  assert.equal(typeof onChunk, 'function');
+  onChunk('steer-me');
+  onChunk(new TextEncoder().encode('steer-bytes'));
+  assert.deepEqual(written, ['steer-me', 'steer-bytes']);
+  detach();
+  assert.equal(unsubscribed, true);
+});
+
+test('createHostRelaySession is best-effort: a throwing publish never escapes relay()', () => {
+  const session = createHostRelaySession({
+    instance: 'w', jobKey: '1',
+    publish: () => { throw new Error('wire down'); },
+  });
+  assert.doesNotThrow(() => session.relay('boom'));
+  assert.doesNotThrow(() => session.close());
+});
+
+test('createHostRelaySession validates its required inputs', () => {
+  assert.throws(() => createHostRelaySession({ jobKey: '1', publish: () => {} }), /instance/);
+  assert.throws(() => createHostRelaySession({ instance: 'w', publish: () => {} }), /jobKey/);
+  assert.throws(() => createHostRelaySession({ instance: 'w', jobKey: '1' }), /publish/);
+});
+
+test('createHostRelaySession.close is idempotent (emits the close marker once)', () => {
+  const published = [];
+  const session = createHostRelaySession({
+    instance: 'w', jobKey: '1', publish: (t) => published.push(t),
+  });
+  session.close();
+  session.close();
+  assert.equal(published.filter((t) => t === RELAY_CLOSE_CHUNK).length, 1);
 });

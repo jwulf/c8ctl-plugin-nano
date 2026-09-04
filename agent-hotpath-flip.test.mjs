@@ -13,7 +13,7 @@
  * `supervisor-deps.test.mjs` already drives that composed runtime against a
  * hand-rolled fake `fetch`. This test raises the bar the issue asks for: it backs
  * the SAME `createRawEngineClient` REST surface (`POST /v2/jobs/activation`,
- * `PATCH /v2/jobs/{key}/timeout`, `POST /v2/jobs/{key}/completion`,
+ * `PATCH /v2/jobs/{key}`, `POST /v2/jobs/{key}/completion`,
  * `POST /v2/jobs/{key}/failure`) with a REAL nanobpmn engine running a REAL
  * deployed BPMN process. So the whole cut-over path — activate → dispatch (lock
  * extend) → run → settle → the engine actually completing the process instance —
@@ -100,8 +100,11 @@ function engineFetch(engine) {
       return { ok: true, status: 200, json: async () => ({ jobs }), text: async () => "" };
     }
 
-    if (/\/jobs\/[^/]+\/timeout$/.test(u)) {
-      // extendLock — the engine sets the lock from now; a no-op here is sound
+    if (init.method === "PATCH" && /\/jobs\/[^/]+$/.test(u)) {
+      // extendLock — SETs the job's lock via `PATCH /v2/jobs/{key}`
+      // `{ changeset: { timeout } }` (issue #179/#180: NOT the drifted
+      // `/jobs/{key}/timeout` sub-route, which 404s and wedged this test into an
+      // infinite activate→extend-fail→re-activate spin). A no-op 204 here is sound
       // because the virtual clock never advances in-test, so no lock lapses.
       // Lock-extension behaviour (extend-before-start + periodic re-extend) is
       // asserted deterministically under TestClock in supervisor/test/dispatch.test.ts;

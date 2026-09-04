@@ -406,10 +406,12 @@ test('runAgentJob(terminal: pipe) relays output without a PTY', async (t) => {
   session.close();
 });
 
-test('runAgentJob(terminal: pty) falls back to a pipe when node-pty is unavailable', async (t) => {
+test('runAgentJob(terminal: pty) falls back to a pipe when a PTY cannot be allocated', async (t) => {
   if (process.platform === 'win32') return t.skip('POSIX shell required');
-  // No ptyFactory injected and node-pty is an (uninstalled) optionalDependency,
-  // so the PTY path is unavailable → graceful pipe fallback that still relays.
+  // Force the "no PTY" condition deterministically: an injected factory with no
+  // `spawn()` fails `ptyAvailable`, so runAgentJob takes the pipe fallback. This
+  // must not depend on whether the optional native node-pty happens to be built
+  // on the host (it IS on CI/dev with build tools), which made this test flaky.
   const ch = fakeChannel();
   const session = createRelaySession({ channel: ch, jobKey: '901' });
   const job = { jobKey: '901', type: 'senior:feature', variables: {} };
@@ -417,7 +419,7 @@ test('runAgentJob(terminal: pty) falls back to a pipe when node-pty is unavailab
   const result = await runAgentJob(
     { ...PROFILE, command: "printf 'fallback'" },
     job,
-    { terminal: 'pty', relaySession: session, envelope: null },
+    { terminal: 'pty', relaySession: session, envelope: null, ptyFactory: { notAFactory: true } },
   );
 
   assert.equal(result.ok, true);

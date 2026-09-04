@@ -7993,6 +7993,9 @@ async function workAgent(req, flags) {
   let draining = false;
   if (!autoMode) {
     watchFile(configFile, { interval: WATCH_INTERVAL_MS }, (curr, prev) => {
+      // A callback can already be queued when teardown flips `draining`; bail so we
+      // never write to the shared registry (or race its teardown) during shutdown.
+      if (draining) return;
       // Fires each interval; act only on real changes. Compare mtime, ctime and
       // size, not mtime alone: coarse-mtime filesystems (or two edits in one tick)
       // can leave mtimeMs unchanged while size/ctimeMs differ.
@@ -8013,6 +8016,7 @@ async function workAgent(req, flags) {
         if (norm.error) return; // invalid edit — keep current types
         const m = jobTypeMatrix(norm.profile.rank, norm.profile.capabilities);
         const desired = [...new Set([...m, ...extraJobTypes])];
+        if (draining) return; // teardown began while we were reading — don't write
         await SupervisorEffect.runPromise(workerRegistry.setTypes(workerName, desired));
         logger.info(`Profile "${name}" changed — now servicing ${desired.length} job type(s): ${desired.join('  ')}`);
       })().catch((err) => logger.warn(`profile reload failed: ${err?.message || err}`));

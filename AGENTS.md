@@ -145,8 +145,20 @@ every other code path stays Effect-free.
   monolith logger with `asLogger`, and assembles them with `makeSupervisorDeps` —
   every promise rejection mapped into the `SupervisorError` channel. The concrete
   engine wire is `supervisor-engine.mjs` (`createRawEngineClient`): direct C8 v2
-  REST `POST /v2/jobs/activation` + `PATCH /v2/jobs/{key}/timeout`, Effect-free with
-  an injectable `fetch`, so it stays OUT of the quarantined bundle. The monolith
+  REST, Effect-free with an injectable `fetch`, so it stays OUT of the quarantined
+  bundle. **SDK-preference convention (PR #180, issue #179):** every engine
+  job-mutation that has a typed `@camunda8` SDK method PREFERS the injected
+  `camunda` client and hand-rolls the raw REST `call(...)` only as a standalone /
+  wire-test fallback — `extendLock`→`updateJob` (`PATCH /v2/jobs/{key}`, NOT the
+  drifted `/timeout` sub-route that 404s), `complete`→`completeJob`
+  (`POST /v2/jobs/{key}/completion`), `fail`→`failJob`
+  (`POST /v2/jobs/{key}/failure`). `activate` (`POST /v2/jobs/activation`) is the
+  SOLE sanctioned raw-only call (the SDK job worker can't express the supervisor's
+  global-capacity single long-poll). This is ENFORCED by
+  `supervisor-engine-sdk-preference.test.mjs` (a source-scanning `node --test`
+  lint, since the repo has no ESLint): a new engine method hitting a raw route
+  must either add an SDK-preference guard or be added to that test's raw-only
+  allowlist with a reason. The monolith
   composes the whole runtime via `createSupervisorDeps()` → a `makeSupervisor`-ready
   `deps`. NOTE: this lands the composition seam; the hot-path FLIP (retiring the
   per-type SDK pollers / `createSingleFlight` / per-worker reconcile crawl and

@@ -146,15 +146,20 @@ every other code path stays Effect-free.
   every promise rejection mapped into the `SupervisorError` channel. The concrete
   engine wire is `supervisor-engine.mjs` (`createRawEngineClient`): direct C8 v2
   REST, Effect-free with an injectable `fetch`, so it stays OUT of the quarantined
-  bundle. **SDK-preference convention (PR #180, issue #179):** every engine
-  job-mutation that has a typed `@camunda8` SDK method PREFERS the injected
-  `camunda` client and hand-rolls the raw REST `call(...)` only as a standalone /
-  wire-test fallback — `extendLock`→`updateJob` (`PATCH /v2/jobs/{key}`, NOT the
-  drifted `/timeout` sub-route that 404s), `complete`→`completeJob`
-  (`POST /v2/jobs/{key}/completion`), `fail`→`failJob`
-  (`POST /v2/jobs/{key}/failure`). `activate` (`POST /v2/jobs/activation`) is the
-  SOLE sanctioned raw-only call (the SDK job worker can't express the supervisor's
-  global-capacity single long-poll). This is ENFORCED by
+  bundle. **SDK-preference convention (PR #180, issue #179):** EVERY engine method
+  that has a typed `@camunda8` SDK method PREFERS the injected `camunda` client and
+  hand-rolls the raw REST `call(...)` only as a standalone / wire-test fallback —
+  `activate`→`activateJobs` (`POST /v2/jobs/activation`), `extendLock`→`updateJob`
+  (`PATCH /v2/jobs/{key}`, NOT the drifted `/timeout` sub-route that 404s),
+  `complete`→`completeJob` (`POST /v2/jobs/{key}/completion`), `fail`→`failJob`
+  (`POST /v2/jobs/{key}/failure`). There is NO sanctioned raw-only method: the SDK's
+  managed `createJobWorker` loop can't express the supervisor's global-capacity
+  race, but `activate` uses the single-shot `activateJobs` primitive that loop wraps
+  — its input body (`JobActivationRequest`) is 1:1 with the raw POST and its returned
+  `CancelablePromise.cancel()` aborts the in-flight long-poll, wired to the Effect
+  fiber's interruption signal (`makeEngineClient` threads the `tryPromise`
+  `AbortSignal` into `raw.activate(req, signal)`) so a losing `raceAll` fiber stops
+  its poll at once. This is ENFORCED by
   `supervisor-engine-sdk-preference.test.mjs` (a source-scanning `node --test`
   lint, since the repo has no ESLint): a new engine method hitting a raw route
   must either add an SDK-preference guard or be added to that test's raw-only

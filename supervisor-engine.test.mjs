@@ -288,6 +288,92 @@ test("fail: an SDK failJob rejection surfaces so the settle is retried/mapped", 
   await assert.rejects(() => engine.fail("j9", { retries: 0 }), /fail j9: SDK failJob failed.*500/s);
 });
 
+test("activate: delegates to the SDK's typed activateJobs (1:1 body) and maps the batch", async () => {
+  const calls = [];
+  const camunda = {
+    activateJobs: async (input) => {
+      calls.push(input);
+      return {
+        jobs: [
+          { jobKey: 111, type: "senior:plan", processDefinitionKey: 222, variables: { a: 1 } },
+          { jobKey: "333", type: "senior:plan" },
+        ],
+      };
+    },
+  };
+  const fetchImpl = makeFakeFetch([]); // must NOT be touched on the SDK path
+  const engine = createRawEngineClient({ baseUrl: "http://engine:8080", worker: "host-1", fetchImpl, camunda });
+  const jobs = await engine.activate({ type: "senior:plan", maxJobsToActivate: 5, requestTimeoutMs: 10_000, lockMs: 15_000 });
+  assert.deepEqual(jobs, [
+    { jobKey: "111", type: "senior:plan", processDefinitionKey: "222", variables: { a: 1 } },
+    { jobKey: "333", type: "senior:plan" },
+  ]);
+  // The SDK input body is byte-identical to the raw POST body (JobActivationRequest).
+  assert.deepEqual(calls, [
+    { type: "senior:plan", worker: "host-1", maxJobsToActivate: 5, timeout: 15_000, requestTimeout: 10_000 },
+  ]);
+  assert.equal(fetchImpl.calls.length, 0); // SDK path never issues a raw request
+});
+
+test("activate: SDK path maps an absent/empty jobs array to an empty batch (idle)", async () => {
+  const engine = createRawEngineClient({
+    baseUrl: "http://engine:8080",
+    fetchImpl: makeFakeFetch([]),
+    camunda: { activateJobs: async () => ({}) }, // long-poll expired with no jobs
+  });
+  assert.deepEqual(await engine.activate({ type: "t", maxJobsToActivate: 1, requestTimeoutMs: 0, lockMs: 1 }), []);
+});
+
+test("activate: an SDK activateJobs rejection surfaces for the port to map", async () => {
+  const camunda = { activateJobs: async () => { throw new Error("503 unavailable"); } };
+  const engine = createRawEngineClient({ baseUrl: "http://engine:8080", fetchImpl: makeFakeFetch([]), camunda });
+  await assert.rejects(
+    () => engine.activate({ type: "t", maxJobsToActivate: 1, requestTimeoutMs: 1, lockMs: 1 }),
+    /activate t: SDK activateJobs failed.*503/s,
+  );
+});
+
+test("activate: the interruption signal cancels the SDK long-poll via CancelablePromise.cancel()", async () => {
+  let cancelled = false;
+  const camunda = {
+    activateJobs: () => {
+      let rejectFn;
+      const p = new Promise((_resolve, reject) => { rejectFn = reject; }); // pending long-poll
+      p.cancel = () => { cancelled = true; rejectFn(new Error("canceled")); };
+      return p;
+    },
+  };
+  const engine = createRawEngineClient({ baseUrl: "http://engine:8080", fetchImpl: makeFakeFetch([]), camunda });
+  const ac = new AbortController();
+  const pending = engine.activate(
+    { type: "t", maxJobsToActivate: 1, requestTimeoutMs: 30_000, lockMs: 1 },
+    ac.signal,
+  );
+  ac.abort(); // fiber lost the race → Effect aborts the signal
+  await assert.rejects(pending, /activate t: SDK activateJobs failed.*canceled/s);
+  assert.equal(cancelled, true); // .cancel() ended the in-flight long-poll
+});
+
+test("activate: an already-aborted signal cancels the SDK long-poll immediately", async () => {
+  let cancelled = false;
+  const camunda = {
+    activateJobs: () => {
+      let rejectFn;
+      const p = new Promise((_resolve, reject) => { rejectFn = reject; });
+      p.cancel = () => { cancelled = true; rejectFn(new Error("canceled")); };
+      return p;
+    },
+  };
+  const engine = createRawEngineClient({ baseUrl: "http://engine:8080", fetchImpl: makeFakeFetch([]), camunda });
+  const ac = new AbortController();
+  ac.abort();
+  await assert.rejects(
+    engine.activate({ type: "t", maxJobsToActivate: 1, requestTimeoutMs: 30_000, lockMs: 1 }, ac.signal),
+    /canceled/s,
+  );
+  assert.equal(cancelled, true);
+});
+
 test("unauthenticated: no Authorization header when neither token nor authHeaders given", async () => {
   const fetchImpl = makeFakeFetch([{ status: 200, json: { jobs: [] } }]);
   const engine = createRawEngineClient({ baseUrl: "http://localhost:8080", fetchImpl });

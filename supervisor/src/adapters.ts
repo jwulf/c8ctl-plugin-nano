@@ -43,20 +43,25 @@ const toSupervisorError = (fallback: string) => (cause: unknown): SupervisorErro
 
 /**
  * Plain, Effect-free engine surface the monolith implements against the C8 v2
- * REST API (`supervisor-engine.mjs`). `activate` is ONE long-poll for ONE type
- * (`POST /v2/jobs/activation`), resolving 0..`maxJobsToActivate` jobs; a rejected
- * promise (network/5xx) becomes a {@link SupervisorError} so the activation race
- * treats it as that poll losing, never a crash. `extendLock` SETs the job's lock
- * to `ms` from now (`PATCH /v2/jobs/{jobKey}/timeout`); a rejection on the
- * winner's first extend signals a likely reclaim race — {@link dispatch} then
- * declines to start the agent. `complete`/`fail` SETTLE a finished job
- * (`POST /v2/jobs/{jobKey}/completion|failure`) — the direct-REST analogue of the
- * SDK job object's `job.complete()`/`job.fail()` — so the runner can settle a job
+ * REST API (`supervisor-engine.mjs`), preferring the injected `@camunda8` SDK's
+ * typed methods and hand-rolling REST only as a standalone/wire-test fallback.
+ * `activate` is ONE long-poll for ONE type (SDK `activateJobs` →
+ * `POST /v2/jobs/activation`), resolving 0..`maxJobsToActivate` jobs; the optional
+ * `signal` (aborted on fiber interruption) cancels the in-flight long-poll so a
+ * losing race fiber stops at once. A rejected promise (network/5xx) becomes a
+ * {@link SupervisorError} so the activation race treats it as that poll losing,
+ * never a crash. `extendLock` SETs the job's lock to `ms` from now (SDK
+ * `updateJob` → `PATCH /v2/jobs/{jobKey}` `{ changeset: { timeout } }`); a
+ * rejection on the winner's first extend signals a likely reclaim race —
+ * {@link dispatch} then declines to start the agent. `complete`/`fail` SETTLE a
+ * finished job (SDK `completeJob`/`failJob` →
+ * `POST /v2/jobs/{jobKey}/completion|failure`) — the analogue of the SDK job
+ * object's `job.complete()`/`job.fail()` — so the runner can settle a job
  * activated over this surface (a plain {@link ActivatedJob} carries no settle
  * methods); a rejection maps to a {@link SupervisorError} for the runner to handle.
  */
 export interface RawEngineClient {
-  activate(req: ActivateRequest): Promise<ReadonlyArray<ActivatedJob>>;
+  activate(req: ActivateRequest, signal?: AbortSignal): Promise<ReadonlyArray<ActivatedJob>>;
   extendLock(jobKey: string, ms: number): Promise<void>;
   /** `POST /v2/jobs/{jobKey}/completion` — settle a job successfully with result `variables`. */
   complete(jobKey: string, variables?: Record<string, unknown>): Promise<void>;
@@ -76,7 +81,11 @@ export interface RawEngineClient {
 export const makeEngineClient = (raw: RawEngineClient): EngineClient => ({
   activate: (req) =>
     Effect.tryPromise({
-      try: () => Promise.resolve(raw.activate(req)),
+      // Effect aborts `signal` on interruption; the raw client wires it to the
+      // SDK `CancelablePromise.cancel()` (or the raw fetch), so a losing `raceAll`
+      // fiber ends its long-poll immediately instead of leaking it until the
+      // client-side abort budget fires.
+      try: (signal) => Promise.resolve(raw.activate(req, signal)),
       catch: toSupervisorError(`activate ${req.type} failed`),
     }),
   extendLock: (jobKey, ms) =>

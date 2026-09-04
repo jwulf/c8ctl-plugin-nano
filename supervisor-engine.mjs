@@ -4,15 +4,23 @@
  * (issue #156).
  *
  * #154's activation loop deliberately does NOT use the `@camunda8` SDK job
- * worker: the SDK models one poller per type with `maxJobsToActivate =
- * maxParallel − active` and structurally cannot express "global capacity S
- * shared across K types with per-type gating". The supervisor rolls its own race
- * over a NARROW two-call engine surface instead:
+ * worker (`createJobWorker`): that convenience loop models one self-driving
+ * poller per type with `maxJobsToActivate = maxParallel − active` and cannot
+ * express "global capacity S shared across K types with per-type gating". The
+ * supervisor rolls its own race over a NARROW single-shot engine surface — but
+ * every call on that surface still PREFERS the injected `camunda` SDK client's
+ * typed method, hand-rolling REST only as a standalone/wire-test fallback:
  *
- *   - `activate` → `POST <base>/jobs/activation` for exactly ONE type, one
- *     long-poll, resolving 0..`maxJobsToActivate` jobs (0 == the long-poll
- *     expired empty). `timeout` is the SHORT initial lock (the crash-safety net);
- *     `requestTimeout` is how long the call blocks server-side.
+ *   - `activate` → the SDK's typed `activateJobs` (operationId `activateJobs` →
+ *     `POST <base>/jobs/activation`) for exactly ONE type, one long-poll,
+ *     resolving 0..`maxJobsToActivate` jobs (0 == the long-poll expired empty).
+ *     `activateJobs` is the SINGLE-SHOT primitive `createJobWorker` is built on;
+ *     its input body (`JobActivationRequest`) is 1:1 with ours and its returned
+ *     `CancelablePromise.cancel()` aborts the in-flight long-poll, so a losing
+ *     `raceAll` fiber interrupts its poll at once. Falls back to the SAME call
+ *     issued raw via `fetchImpl` when no SDK client is injected. `timeout` is the
+ *     SHORT initial lock (the crash-safety net); `requestTimeout` is how long the
+ *     call blocks server-side.
  *   - `extendLock` → the SDK's typed `updateJob` (operationId `updateJob`,
  *     `PATCH <base>/jobs/{jobKey}` with `{ changeset: { timeout } }`) when a
  *     `camunda` SDK client is injected, else the SAME call issued raw via
@@ -28,14 +36,13 @@
  *     else the SAME calls issued raw via `fetchImpl` — the settle surface the
  *     supervisor's JobRunner uses once an agent finishes.
  *
- * Every engine job-mutation with a typed SDK method (`extendLock`→`updateJob`,
- * `complete`→`completeJob`, `fail`→`failJob`) PREFERS the injected `camunda`
- * client and only hand-rolls the REST call as a standalone/wire-test fallback;
- * `activate` is the sole SANCTIONED raw-only call (the SDK job worker can't
- * express the supervisor's global-capacity long-poll). This convention is pinned
- * by `supervisor-engine-sdk-preference.test.mjs` — a new engine method that hits
- * a raw route must either prefer an SDK method or be added to that test's
- * raw-only allowlist with a reason.
+ * Every method on this surface (`activate`→`activateJobs`,
+ * `extendLock`→`updateJob`, `complete`→`completeJob`, `fail`→`failJob`) PREFERS
+ * the injected `camunda` client and only hand-rolls the REST call as a
+ * standalone/wire-test fallback; there is no sanctioned raw-only method. This
+ * convention is pinned by `supervisor-engine-sdk-preference.test.mjs` — a new
+ * engine method that hits a raw route must either prefer an SDK method or be
+ * added to that test's raw-only allowlist with a reason.
  *
  * This module is the raw-JS analogue of `agentic-endpoint.mjs`: it is Effect-free
  * (the supervisor's `makeEngineClient` lift wraps each method into the Effect
@@ -155,8 +162,8 @@ async function readErrorBody(res) {
  * @param {Record<string,string>|(() => (Record<string,string>|Promise<Record<string,string>>))} [opts.authHeaders] Ready-made auth header map, OR a resolver invoked per request (so rotating SDK auth — e.g. an OAuth bearer that refreshes — is re-derived each call rather than frozen). Wins over `token`.
  * @param {typeof fetch} [opts.fetchImpl] Injected `fetch` (defaults to the global; overridden in tests).
  * @param {number} [opts.requestTimeoutSlackMs] Extra ms added to a call's abort budget over its server long-poll (default 5000).
- * @param {{ updateJob?: (req: { jobKey: string, changeset: { timeout: number } }) => Promise<unknown>, completeJob?: (req: { jobKey: string, variables?: object }) => Promise<unknown>, failJob?: (req: { jobKey: string, retries?: number, errorMessage?: string, retryBackOff?: number, variables?: object }) => Promise<unknown> }} [opts.camunda] Optional Camunda SDK client. When present, each engine job-mutation prefers its typed SDK method over the raw fetch fallback: `extendLock`→`updateJob` (`PATCH /v2/jobs/{jobKey}` `{ changeset: { timeout } }`), `complete`→`completeJob` (`POST /v2/jobs/{jobKey}/completion`), `fail`→`failJob` (`POST /v2/jobs/{jobKey}/failure`).
- * @returns {{ activate(req: ActivateRequest): Promise<ReadonlyArray<ActivatedJob>>, extendLock(jobKey: string, ms: number): Promise<void>, complete(jobKey: string, variables?: object): Promise<void>, fail(jobKey: string, opts?: { retries?: number, errorMessage?: string, retryBackOff?: number, variables?: object }): Promise<void> }}
+ * @param {{ activateJobs?: (input: { type: string, worker?: string, maxJobsToActivate: number, timeout: number, requestTimeout?: number }) => (Promise<{ jobs?: object[] }> & { cancel?: () => void }), updateJob?: (req: { jobKey: string, changeset: { timeout: number } }) => Promise<unknown>, completeJob?: (req: { jobKey: string, variables?: object }) => Promise<unknown>, failJob?: (req: { jobKey: string, retries?: number, errorMessage?: string, retryBackOff?: number, variables?: object }) => Promise<unknown> }} [opts.camunda] Optional Camunda SDK client. When present, each engine method prefers its typed SDK method over the raw fetch fallback: `activate`→`activateJobs` (`POST /v2/jobs/activation`, cancelled via the returned `CancelablePromise.cancel()`), `extendLock`→`updateJob` (`PATCH /v2/jobs/{jobKey}` `{ changeset: { timeout } }`), `complete`→`completeJob` (`POST /v2/jobs/{jobKey}/completion`), `fail`→`failJob` (`POST /v2/jobs/{jobKey}/failure`).
+ * @returns {{ activate(req: ActivateRequest, signal?: AbortSignal): Promise<ReadonlyArray<ActivatedJob>>, extendLock(jobKey: string, ms: number): Promise<void>, complete(jobKey: string, variables?: object): Promise<void>, fail(jobKey: string, opts?: { retries?: number, errorMessage?: string, retryBackOff?: number, variables?: object }): Promise<void> }}
  */
 export function createRawEngineClient(opts = {}) {
   const {
@@ -193,34 +200,78 @@ export function createRawEngineClient(opts = {}) {
 
   /**
    * Issue one call with an abort budget. `abortAfterMs <= 0` means no timer
-   * (the caller relies purely on the server long-poll / connection).
+   * (the caller relies purely on the server long-poll / connection). An optional
+   * `extSignal` (e.g. the Effect fiber's interruption signal for the `activate`
+   * long-poll) also aborts the in-flight fetch, so a losing `raceAll` fiber stops
+   * its poll immediately instead of leaking it until the budget timer fires.
    */
-  async function call(url, init, abortAfterMs) {
+  async function call(url, init, abortAfterMs, extSignal) {
     const controller = new AbortController();
     const timer = abortAfterMs > 0 ? setTimeout(() => controller.abort(), abortAfterMs) : null;
+    const onExtAbort = () => controller.abort();
+    if (extSignal) {
+      if (extSignal.aborted) controller.abort();
+      else extSignal.addEventListener("abort", onExtAbort, { once: true });
+    }
     try {
       const headers = await resolveHeaders();
       return await fetchImpl(url, { ...init, headers, signal: controller.signal });
     } finally {
       if (timer) clearTimeout(timer);
+      if (extSignal) extSignal.removeEventListener("abort", onExtAbort);
     }
   }
 
   return {
-    async activate(req) {
-      const body = JSON.stringify({
+    async activate(req, signal) {
+      // Prefer the SDK's typed `activateJobs` (operationId `activateJobs` →
+      // `POST /v2/jobs/activation`) so the ONE-type long-poll tracks the engine
+      // contract instead of a hand-rolled body/URL. The SDK's `createJobWorker`
+      // convenience loop can't express the supervisor's global-capacity single
+      // race — but `activateJobs` is the SAME single-shot primitive that loop is
+      // built on, and its input body (`JobActivationRequest`) is 1:1 with ours.
+      // Its `CancelablePromise.cancel()` aborts the in-flight long-poll, so a
+      // losing `raceAll` fiber (interruption → `signal.aborted`) stops its poll
+      // immediately. Fall back to the SAME call issued raw via `fetchImpl` when no
+      // SDK client is injected (keeps this module wire-testable and standalone).
+      // `timeout` is the SHORT initial lock applied to any returned job;
+      // `requestTimeout` is the server-side long-poll window.
+      const input = {
         type: req.type,
         worker,
         maxJobsToActivate: req.maxJobsToActivate,
-        // `timeout` is the SHORT initial lock applied to any returned job.
         timeout: req.lockMs,
-        // `requestTimeout` is the server-side long-poll window.
         requestTimeout: req.requestTimeoutMs,
-      });
+      };
       // Give the abort budget slack over the server long-poll so we don't cancel
       // a still-valid long-poll a hair before the server would answer it.
       const abortAfterMs = req.requestTimeoutMs > 0 ? req.requestTimeoutMs + requestTimeoutSlackMs : 0;
-      const res = await call(`${base}/jobs/activation`, { method: "POST", body }, abortAfterMs);
+      if (camunda && typeof camunda.activateJobs === "function") {
+        const p = camunda.activateJobs(input);
+        // Wire BOTH cancellation sources onto the CancelablePromise: the external
+        // interruption signal (fiber lost the race) and the client-side abort
+        // budget (a hung connection past the server window). `cancel()` aborts the
+        // SDK's own AbortController, ending the long-poll.
+        const cancel = typeof p?.cancel === "function" ? () => p.cancel() : () => {};
+        const timer = abortAfterMs > 0 ? setTimeout(cancel, abortAfterMs) : null;
+        const onExtAbort = () => cancel();
+        if (signal) {
+          if (signal.aborted) cancel();
+          else signal.addEventListener("abort", onExtAbort, { once: true });
+        }
+        try {
+          const result = await p;
+          const jobs = Array.isArray(result?.jobs) ? result.jobs : Array.isArray(result) ? result : [];
+          return jobs.map(mapJob);
+        } catch (err) {
+          throw new Error(`activate ${req.type}: SDK activateJobs failed: ${err?.message ?? err}`, { cause: err });
+        } finally {
+          if (timer) clearTimeout(timer);
+          if (signal) signal.removeEventListener("abort", onExtAbort);
+        }
+      }
+      const body = JSON.stringify(input);
+      const res = await call(`${base}/jobs/activation`, { method: "POST", body }, abortAfterMs, signal);
       if (!res || !res.ok) {
         const status = res ? res.status : "?";
         throw new Error(`activate ${req.type}: HTTP ${status} from ${base}/jobs/activation${res ? await readErrorBody(res) : ""}`);

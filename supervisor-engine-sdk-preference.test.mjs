@@ -31,6 +31,7 @@ const SRC = readFileSync(join(HERE, "supervisor-engine.mjs"), "utf8");
 
 /** Engine job-mutation methods that HAVE a typed SDK method → the SDK method they must prefer. */
 const SDK_BACKED = {
+  activate: "activateJobs",
   extendLock: "updateJob",
   complete: "completeJob",
   fail: "failJob",
@@ -38,15 +39,15 @@ const SDK_BACKED = {
 
 /**
  * Methods sanctioned to issue a raw REST call with NO SDK preference, each with a
- * reason. `activate` is the one true raw-only call: the SDK job worker models one
- * poller per type with `maxJobsToActivate = maxParallel − active` and structurally
- * cannot express the supervisor's "global capacity S shared across K types" long-
- * poll, so the supervisor rolls its own activation over the raw route.
+ * documented reason. Currently EMPTY: every engine method maps to a typed SDK
+ * method (`activate`→`activateJobs`, `extendLock`→`updateJob`,
+ * `complete`→`completeJob`, `fail`→`failJob`). `createJobWorker` (the SDK's
+ * managed poll loop) can't express the supervisor's global-capacity race, but
+ * `activateJobs` — the single-shot primitive it wraps, with a cancellable
+ * long-poll — can, so `activate` is SDK-backed, not raw-allowlisted. A future
+ * genuinely raw-only method would be listed here with its reason.
  */
-const RAW_ALLOWLISTED = {
-  activate:
-    "SDK job worker can't express the supervisor's global-capacity single long-poll; rolls its own raw activation.",
-};
+const RAW_ALLOWLISTED = {};
 
 /** Return the brace-matched body `{ ... }` of the object method `async NAME(`, or null. */
 function methodBody(src, name) {
@@ -118,9 +119,11 @@ test("each SDK-backed method prefers `camunda.<sdkMethod>` via a typeof guard BE
 });
 
 test("a raw-allowlisted method does NOT smuggle in an ad-hoc SDK preference without being SDK-backed", () => {
-  // Guards the inverse drift: if `activate` grows a `camunda.` job call it should be
-  // reclassified as SDK-backed (with the ordering assertion above), not left in the
-  // raw allowlist. Keeps the two lists mutually exclusive and honest.
+  // Guards the inverse drift for any future raw-allowlisted method: if it grows a
+  // `camunda.` job call it should be reclassified as SDK-backed (with the ordering
+  // assertion above), not left in the raw allowlist. Keeps the two lists mutually
+  // exclusive and honest. (RAW_ALLOWLISTED is currently empty — every method is
+  // SDK-backed — so this is a no-op today but stays as a standing guard.)
   for (const name of Object.keys(RAW_ALLOWLISTED)) {
     const body = methodBody(SRC, name);
     assert.ok(body, `could not locate the body of raw-allowlisted method \`${name}\``);

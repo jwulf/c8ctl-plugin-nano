@@ -116,12 +116,25 @@ export function createLogRing(logFile, maxBytes, io = {}) {
 
   const rotate = () => {
     try { closeSync(fd); } catch { /* fd may already be gone */ }
-    // Replace any previous rotated file with the just-filled primary. `rename`
-    // is atomic, so a concurrent tail reopening the primary never sees a gap.
-    renameSync(logFile, rotatedFile);
-    fd = openSync(logFile, 'a');
-    size = 0;
-    rotations += 1;
+    try {
+      // Replace any previous rotated file with the just-filled primary. `rename`
+      // is atomic, so a concurrent tail reopening the primary never sees a gap.
+      renameSync(logFile, rotatedFile);
+      fd = openSync(logFile, 'a');
+      size = 0;
+      rotations += 1;
+    } catch {
+      // Rotation failed (permissions / transient FS issue). `renameSync` or the
+      // subsequent `openSync` threw AFTER we closed the primary fd, so leaving it
+      // as-is would strand the ring on a closed fd and silently stop draining.
+      // Instead, best-effort reopen the primary in append mode and keep writing:
+      // we favor continued log capture over strict bounding, briefly exceeding the
+      // cap until rotation can succeed again.
+      try {
+        fd = openSync(logFile, 'a');
+        try { size = fstatSync(fd).size; } catch { size = 0; }
+      } catch { /* can't reopen either; the write() try/catch swallows the fallout */ }
+    }
   };
 
   return {

@@ -178,3 +178,26 @@ test('createLogRing: close is idempotent and post-close writes are no-ops', () =
     assert.equal(readFileSync(file, 'utf8'), 'data');
   } finally { cleanup(); }
 });
+
+test('createLogRing: a failing rotate is best-effort — reopens and keeps draining', () => {
+  // Inject an fs surface (no real filesystem) where renameSync always throws, so
+  // a rotation at the cap fails after the primary fd was already closed. The ring
+  // must reopen the primary and keep writing rather than strand itself on a dead
+  // fd and silently stop draining (the concern raised in review #185).
+  let drained = '';
+  let fdSeq = 10;
+  let renameAttempts = 0;
+  const io = {
+    openSync: () => ++fdSeq, // hand out a fresh fd on every (re)open
+    writeSync: (_fd, buf) => { drained += buf.toString(); return buf.length; },
+    closeSync: () => {},
+    fstatSync: () => ({ size: 0 }),
+    renameSync: () => { renameAttempts += 1; throw new Error('EACCES: rename not permitted'); },
+  };
+  const ring = createLogRing('/virtual/worker-h.log', 10, io);
+  ring.write('AAAAAAAA'); // 8 bytes, empty primary → no rotation
+  ring.write('BBBBBBBB'); // would exceed cap → rotate() attempted, rename throws
+  ring.close();
+  assert.ok(renameAttempts >= 1, 'a rotation was attempted at the cap');
+  assert.equal(drained, 'AAAAAAAABBBBBBBB', 'both chunks were drained despite the failed rotation');
+});

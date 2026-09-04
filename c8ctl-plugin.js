@@ -8879,18 +8879,31 @@ async function runSupervisorDaemon() {
     // disk before the child can die, and the ring is closed in the death handler
     // (and before a restart re-opens it) so fds never leak.
     if (ringed) {
+      let ring = null;
       try {
-        const ring = createLogRing(w.logFile, workerLogMaxBytes);
+        ring = createLogRing(w.logFile, workerLogMaxBytes);
         w.logRing = ring;
         const feed = (chunk) => { try { ring.write(chunk); } catch { /* never crash the daemon */ } };
         if (child.stdout) { child.stdout.on('data', feed); child.stdout.on('error', () => {}); }
         if (child.stderr) { child.stderr.on('data', feed); child.stderr.on('error', () => {}); }
-        // Close THIS child's ring once its stdio streams end ('close' fires after
-        // stdout/stderr have flushed). Bound to the local `ring`, not `w.logRing`,
-        // so a stale child's late close never shuts a restarted worker's live
-        // ring — mirroring the `w.child !== child` guard in the death handler.
-        child.once('close', () => { try { ring.close(); } catch { /* best effort */ } });
-      } catch { w.logRing = null; /* fall back to dropping output rather than crashing */ }
+      } catch { w.logRing = null; ring = null; /* fall back to dropping output rather than crashing */ }
+      // If ring setup threw, the child was still spawned with piped stdio, so we
+      // MUST still drain stdout/stderr — an undrained pipe applies backpressure
+      // and can deadlock the worker once its buffers fill. `resume()` discards
+      // the bytes harmlessly (better than a wedged worker).
+      if (!ring) {
+        if (child.stdout) { child.stdout.on('error', () => {}); child.stdout.resume(); }
+        if (child.stderr) { child.stderr.on('error', () => {}); child.stderr.resume(); }
+      }
+      // Close THIS child's ring once its stdio streams end ('close' fires after
+      // stdout/stderr have flushed) AND on a spawn 'error' — an ENOENT/EMFILE
+      // spawn failure emits only 'error' with no 'close', so without this the
+      // ring fd would leak. Bound to the local `ring` (not `w.logRing`) so a
+      // stale child's late event never shuts a restarted worker's live ring;
+      // `ring.close()` is idempotent, so the close+error double-fire is safe.
+      const closeRing = () => { if (ring) { try { ring.close(); } catch { /* best effort */ } } };
+      child.once('close', closeRing);
+      child.once('error', closeRing);
     }
     w.child = child;
     w.pid = child.pid || null;

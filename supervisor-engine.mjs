@@ -22,6 +22,20 @@
  *     heartbeat" model — set, not accumulate. NOTE: there is no
  *     `/jobs/{jobKey}/timeout` sub-route — that was a drifted URL that 404s on the
  *     engine; the timeout is a `changeset` field on the job resource itself.
+ *   - `complete` / `fail` → the SDK's typed `completeJob` / `failJob` (operationIds
+ *     `completeJob` → `POST <base>/jobs/{jobKey}/completion`, `failJob` →
+ *     `POST <base>/jobs/{jobKey}/failure`) when a `camunda` SDK client is injected,
+ *     else the SAME calls issued raw via `fetchImpl` — the settle surface the
+ *     supervisor's JobRunner uses once an agent finishes.
+ *
+ * Every engine job-mutation with a typed SDK method (`extendLock`→`updateJob`,
+ * `complete`→`completeJob`, `fail`→`failJob`) PREFERS the injected `camunda`
+ * client and only hand-rolls the REST call as a standalone/wire-test fallback;
+ * `activate` is the sole SANCTIONED raw-only call (the SDK job worker can't
+ * express the supervisor's global-capacity long-poll). This convention is pinned
+ * by `supervisor-engine-sdk-preference.test.mjs` — a new engine method that hits
+ * a raw route must either prefer an SDK method or be added to that test's
+ * raw-only allowlist with a reason.
  *
  * This module is the raw-JS analogue of `agentic-endpoint.mjs`: it is Effect-free
  * (the supervisor's `makeEngineClient` lift wraps each method into the Effect
@@ -141,7 +155,7 @@ async function readErrorBody(res) {
  * @param {Record<string,string>|(() => (Record<string,string>|Promise<Record<string,string>>))} [opts.authHeaders] Ready-made auth header map, OR a resolver invoked per request (so rotating SDK auth — e.g. an OAuth bearer that refreshes — is re-derived each call rather than frozen). Wins over `token`.
  * @param {typeof fetch} [opts.fetchImpl] Injected `fetch` (defaults to the global; overridden in tests).
  * @param {number} [opts.requestTimeoutSlackMs] Extra ms added to a call's abort budget over its server long-poll (default 5000).
- * @param {{ updateJob?: (req: { jobKey: string, changeset: { timeout: number } }) => Promise<unknown> }} [opts.camunda] Optional Camunda SDK client. When present (and it exposes `updateJob`), `extendLock` prefers the SDK's typed `updateJob` (`PATCH /v2/jobs/{jobKey}` with `{ changeset: { timeout } }`) over the raw fetch fallback.
+ * @param {{ updateJob?: (req: { jobKey: string, changeset: { timeout: number } }) => Promise<unknown>, completeJob?: (req: { jobKey: string, variables?: object }) => Promise<unknown>, failJob?: (req: { jobKey: string, retries?: number, errorMessage?: string, retryBackOff?: number, variables?: object }) => Promise<unknown> }} [opts.camunda] Optional Camunda SDK client. When present, each engine job-mutation prefers its typed SDK method over the raw fetch fallback: `extendLock`→`updateJob` (`PATCH /v2/jobs/{jobKey}` `{ changeset: { timeout } }`), `complete`→`completeJob` (`POST /v2/jobs/{jobKey}/completion`), `fail`→`failJob` (`POST /v2/jobs/{jobKey}/failure`).
  * @returns {{ activate(req: ActivateRequest): Promise<ReadonlyArray<ActivatedJob>>, extendLock(jobKey: string, ms: number): Promise<void>, complete(jobKey: string, variables?: object): Promise<void>, fail(jobKey: string, opts?: { retries?: number, errorMessage?: string, retryBackOff?: number, variables?: object }): Promise<void> }}
  */
 export function createRawEngineClient(opts = {}) {
@@ -240,21 +254,33 @@ export function createRawEngineClient(opts = {}) {
 
     // ---- Job completion / failure ------------------------------------------
     // The narrow surface the supervisor's JobRunner needs to SETTLE a job once
-    // its agent harness finishes — the direct-REST analogue of the SDK job
-    // object's `job.complete()` / `job.fail()` (which the per-type SDK poller
-    // path in `workAgent` still uses). A plain `ActivatedJob` (jobKey/type/
-    // variables) carries no settle methods, so the supervisor path completes via
-    // these calls instead. Effect-free and wire-testable like `activate` /
-    // `extendLock`; a non-2xx (e.g. a 409 when the lock already lapsed and the
-    // job was reclaimed) surfaces as a rejected promise for the port to map.
+    // its agent harness finishes — the analogue of the SDK job object's
+    // `job.complete()` / `job.fail()` (which the per-type SDK poller path in
+    // `workAgent` still uses). A plain `ActivatedJob` (jobKey/type/variables)
+    // carries no settle methods, so the supervisor path settles via these calls.
+    // Like `extendLock`, each PREFERS the injected `camunda` SDK client's typed
+    // method (`completeJob` / `failJob`) and only hand-rolls the REST call as a
+    // standalone/wire-test fallback. Effect-free and wire-testable; a non-2xx /
+    // SDK rejection (e.g. a 409 when the lock lapsed and the job was reclaimed)
+    // surfaces as a rejected promise for the port to map.
 
     async complete(jobKey, variables) {
-      // `POST <base>/jobs/{jobKey}/completion` with `{ variables }` — the
+      // Prefer the SDK's typed `completeJob` (operationId `completeJob` →
+      // `POST /v2/jobs/{jobKey}/completion` with `{ variables }`) when a `camunda`
+      // SDK client is injected, else the SAME call issued raw via `fetchImpl`. The
       // result-variable map the model produced is merged onto the process
       // instance. C8 v2 answers 204 No Content on success.
+      const vars = isPlainObjectMap(variables) ? { variables } : {};
+      if (camunda && typeof camunda.completeJob === "function") {
+        try {
+          await camunda.completeJob({ jobKey: String(jobKey), ...vars });
+          return;
+        } catch (err) {
+          throw new Error(`complete ${jobKey}: SDK completeJob failed: ${err?.message ?? err}`, { cause: err });
+        }
+      }
       const url = `${base}/jobs/${encodeURIComponent(jobKey)}/completion`;
-      const body = JSON.stringify(isPlainObjectMap(variables) ? { variables } : {});
-      const res = await call(url, { method: "POST", body }, 15_000);
+      const res = await call(url, { method: "POST", body: JSON.stringify(vars) }, 15_000);
       if (!res || !res.ok) {
         const status = res ? res.status : "?";
         throw new Error(`complete ${jobKey}: HTTP ${status} from ${url}${res ? await readErrorBody(res) : ""}`);
@@ -266,19 +292,30 @@ export function createRawEngineClient(opts = {}) {
       // null-safe `variables`), so a caller passing `null` never trips the
       // signature-destructure TypeError.
       const { retries = 0, errorMessage, retryBackOff, variables } = opts || {};
-      // `POST <base>/jobs/{jobKey}/failure` with `{ retries, errorMessage?,
-      // retryBackOff?, variables? }` — `retries > 0` re-queues for another
-      // attempt, `retries === 0` raises an incident. Optional fields are omitted
-      // when absent so the engine applies its own defaults. C8 v2 answers 204.
-      const url = `${base}/jobs/${encodeURIComponent(jobKey)}/failure`;
       // Normalize retries to a non-negative integer (mirrors `mapJob`), so a
-      // string/float/negative never reaches the engine as an invalid count.
+      // string/float/negative never reaches the engine (or SDK) as an invalid
+      // count. `retries > 0` re-queues for another attempt, `retries === 0`
+      // raises an incident. Optional fields are omitted when absent so the engine
+      // applies its own defaults.
       const nRetries = Number(retries);
-      const payload = { retries: Number.isFinite(nRetries) ? Math.max(0, Math.trunc(nRetries)) : 0 };
-      if (errorMessage !== undefined && errorMessage !== null) payload.errorMessage = String(errorMessage);
-      if (Number.isFinite(retryBackOff) && retryBackOff > 0) payload.retryBackOff = retryBackOff;
-      if (isPlainObjectMap(variables)) payload.variables = variables;
-      const res = await call(url, { method: "POST", body: JSON.stringify(payload) }, 15_000);
+      const normRetries = Number.isFinite(nRetries) ? Math.max(0, Math.trunc(nRetries)) : 0;
+      const extra = {};
+      if (errorMessage !== undefined && errorMessage !== null) extra.errorMessage = String(errorMessage);
+      if (Number.isFinite(retryBackOff) && retryBackOff > 0) extra.retryBackOff = retryBackOff;
+      if (isPlainObjectMap(variables)) extra.variables = variables;
+      // Prefer the SDK's typed `failJob` (operationId `failJob` →
+      // `POST /v2/jobs/{jobKey}/failure`) when a `camunda` SDK client is injected,
+      // else the SAME call issued raw via `fetchImpl`. C8 v2 answers 204.
+      if (camunda && typeof camunda.failJob === "function") {
+        try {
+          await camunda.failJob({ jobKey: String(jobKey), retries: normRetries, ...extra });
+          return;
+        } catch (err) {
+          throw new Error(`fail ${jobKey}: SDK failJob failed: ${err?.message ?? err}`, { cause: err });
+        }
+      }
+      const url = `${base}/jobs/${encodeURIComponent(jobKey)}/failure`;
+      const res = await call(url, { method: "POST", body: JSON.stringify({ retries: normRetries, ...extra }) }, 15_000);
       if (!res || !res.ok) {
         const status = res ? res.status : "?";
         throw new Error(`fail ${jobKey}: HTTP ${status} from ${url}${res ? await readErrorBody(res) : ""}`);

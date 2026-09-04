@@ -237,6 +237,57 @@ test("fail: a non-2xx response throws with status + endpoint", async () => {
   await assert.rejects(() => engine.fail("j9", { retries: 0 }), /fail j9: HTTP 500.*failure.*boom/s);
 });
 
+test("complete: delegates to the SDK's typed completeJob ({jobKey,variables}) when a camunda client is injected", async () => {
+  const calls = [];
+  const camunda = { completeJob: async (arg) => { calls.push(arg); } };
+  const fetchImpl = makeFakeFetch([]); // must NOT be touched on the SDK path
+  const engine = createRawEngineClient({ baseUrl: "http://engine:8080/v2", fetchImpl, camunda });
+  await engine.complete("job-7", { status: "opened" });
+  assert.deepEqual(calls, [{ jobKey: "job-7", variables: { status: "opened" } }]);
+  assert.equal(fetchImpl.calls.length, 0); // SDK path never issues a raw request
+});
+
+test("complete: SDK path omits `variables` entirely when nullish (never sends variables:null)", async () => {
+  const calls = [];
+  const camunda = { completeJob: async (arg) => { calls.push(arg); } };
+  const engine = createRawEngineClient({ baseUrl: "http://engine:8080", fetchImpl: makeFakeFetch([]), camunda });
+  await engine.complete("j1");
+  await engine.complete("j2", null);
+  assert.deepEqual(calls, [{ jobKey: "j1" }, { jobKey: "j2" }]);
+});
+
+test("complete: an SDK completeJob rejection surfaces so the settle is retried/mapped", async () => {
+  const camunda = { completeJob: async () => { throw new Error("409 job not activated"); } };
+  const engine = createRawEngineClient({ baseUrl: "http://engine:8080", fetchImpl: makeFakeFetch([]), camunda });
+  await assert.rejects(() => engine.complete("j9", { a: 1 }), /complete j9: SDK completeJob failed.*409/s);
+});
+
+test("fail: delegates to the SDK's typed failJob ({jobKey,retries,...}) when a camunda client is injected", async () => {
+  const calls = [];
+  const camunda = { failJob: async (arg) => { calls.push(arg); } };
+  const fetchImpl = makeFakeFetch([]); // must NOT be touched on the SDK path
+  const engine = createRawEngineClient({ baseUrl: "http://engine:8080", fetchImpl, camunda });
+  await engine.fail("job-3", { retries: 2.9, errorMessage: "boom", retryBackOff: 15_000, variables: { io: 1 } });
+  // retries normalized identically to the raw path; optional fields carried through.
+  assert.deepEqual(calls, [{ jobKey: "job-3", retries: 2, errorMessage: "boom", retryBackOff: 15_000, variables: { io: 1 } }]);
+  assert.equal(fetchImpl.calls.length, 0);
+});
+
+test("fail: SDK path omits optional fields when absent and defaults retries to 0", async () => {
+  const calls = [];
+  const camunda = { failJob: async (arg) => { calls.push(arg); } };
+  const engine = createRawEngineClient({ baseUrl: "http://engine:8080", fetchImpl: makeFakeFetch([]), camunda });
+  await engine.fail("j1");
+  await engine.fail("j2", { retries: 1, retryBackOff: 0 }); // non-positive backOff dropped
+  assert.deepEqual(calls, [{ jobKey: "j1", retries: 0 }, { jobKey: "j2", retries: 1 }]);
+});
+
+test("fail: an SDK failJob rejection surfaces so the settle is retried/mapped", async () => {
+  const camunda = { failJob: async () => { throw new Error("500 boom"); } };
+  const engine = createRawEngineClient({ baseUrl: "http://engine:8080", fetchImpl: makeFakeFetch([]), camunda });
+  await assert.rejects(() => engine.fail("j9", { retries: 0 }), /fail j9: SDK failJob failed.*500/s);
+});
+
 test("unauthenticated: no Authorization header when neither token nor authHeaders given", async () => {
   const fetchImpl = makeFakeFetch([{ status: 200, json: { jobs: [] } }]);
   const engine = createRawEngineClient({ baseUrl: "http://localhost:8080", fetchImpl });

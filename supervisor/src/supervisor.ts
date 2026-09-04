@@ -41,6 +41,7 @@ import {
   makeSteerRouter,
   projectPresence,
   type PresenceConfig,
+  type PresenceSink,
   type SteerRouter,
 } from "./presence.ts";
 import type {
@@ -112,6 +113,22 @@ export interface Supervisor {
    * around each dispatched job so N agents' steer streams never cross.
    */
   readonly steerRouter: SteerRouter;
+  /**
+   * Outbound transcript sink (issue #173). The plugin streams a running agent's
+   * terminal bytes over the SAME multiplexed connection, keyed by explicit
+   * `instance`/`jobKey` (never a per-process socket). Best-effort: a frame emitted
+   * between a drop and the next reconnect is a harmless no-op, and an endpoint that
+   * predates the transcript lane degrades to a no-op.
+   */
+  transcript(instance: string, jobKey: string, chunk: Uint8Array): Effect.Effect<void>;
+  /**
+   * The presence sink (issue #173). Exposed so the plugin can emit an explicit
+   * `deregister` on graceful worker shutdown (the projection otherwise only drops
+   * an identity on the next cadence tick after it leaves the registry). Wire-only
+   * and best-effort — the registry, seeded via {@link ownership}, stays the source
+   * of truth the projection heartbeats.
+   */
+  readonly presence: PresenceSink;
 }
 
 export const makeSupervisor = (deps: SupervisorDeps): Effect.Effect<Supervisor> =>
@@ -240,7 +257,7 @@ export const makeSupervisor = (deps: SupervisorDeps): Effect.Effect<Supervisor> 
         ) as Effect.Effect<never>)
       : run;
 
-    return { tick, reconcileOnce: doReconcile, run: runWithAgentic, parking, ownership, steerRouter };
+    return { tick, reconcileOnce: doReconcile, run: runWithAgentic, parking, ownership, steerRouter, transcript: ownershipContext.transcript, presence: presenceSink };
   });
 
 // Re-export the surface a JS consumer (c8ctl-plugin.js) needs.

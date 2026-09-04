@@ -89,6 +89,113 @@ test("createSupervisorDeps: composes runnable deps and drives one dispatch cycle
   assert.match(fetchImpl.extended[0].url, /\/v2\/jobs\/job-1\/timeout$/);
 });
 
+test("createSupervisorDeps: activate → dispatch → run → SETTLE — the runner completes via the exposed engine settle seam", async () => {
+  // Issue #156 (escalation answer (a)): the plain ActivatedJob has no
+  // job.complete()/job.fail(), so the runner settles through the `settle` seam
+  // createSupervisorDeps exposes — the SAME engine client (base + auth) that
+  // activates/extends. This proves the whole activate → dispatch → run → complete
+  // cycle is wired through the plugin's real edges against a fake fetch, and that
+  // the runner receives the settle-path fields (customHeaders/retries) it needs.
+  const completions = [];
+  const seenJobs = [];
+  let served = false;
+  const fetchImpl = async (url, init) => {
+    const u = String(url);
+    if (u.endsWith("/jobs/activation")) {
+      const jobs = served
+        ? []
+        : [{
+            jobKey: "job-9",
+            type: "senior:feature",
+            processInstanceKey: "7001",
+            retries: 3,
+            customHeaders: { allowPr: "true" },
+            variables: { task: { id: "t9" } },
+          }];
+      served = true;
+      return { ok: true, status: 200, json: async () => ({ jobs }), text: async () => "" };
+    }
+    if (/\/jobs\/.+\/timeout$/.test(u)) {
+      return { ok: true, status: 204, json: async () => ({}), text: async () => "" };
+    }
+    if (/\/jobs\/.+\/completion$/.test(u)) {
+      completions.push({ url: u, body: JSON.parse(init.body) });
+      return { ok: true, status: 204, json: async () => ({}), text: async () => "" };
+    }
+    return { ok: false, status: 404, json: async () => ({}), text: async () => "" };
+  };
+
+  const reconcileReader = {
+    searchProcessDefinitionKeys: async () => [],
+    getProcessDefinitionXml: async () => "",
+  };
+
+  // The runner records the job it received and settles it through `settle`,
+  // exactly as the workAgent hot path's runner will (replacing the SDK job object).
+  let settle;
+  const runner = {
+    run: async (job) => {
+      seenJobs.push(job);
+      await settle.complete(job.jobKey, { status: "opened", summary: "did the thing" });
+    },
+  };
+
+  const composed = await createSupervisorDeps({
+    runner,
+    restConfig: { baseUrl: "http://engine:8080", token: "T" },
+    worker: "host-under-test",
+    workers: [{ id: "w-9", types: ["senior:feature"], capacity: 1 }],
+    reconcileReader,
+    fetchImpl,
+  });
+  settle = composed.settle;
+  const { deps, makeSupervisor, Effect, Fiber } = composed;
+  assert.equal(typeof settle.complete, "function");
+  assert.equal(typeof settle.fail, "function");
+
+  const supervisor = await Effect.runPromise(makeSupervisor(deps));
+  const fiber = Effect.runFork(supervisor.run);
+  try {
+    for (let i = 0; i < 200 && completions.length === 0; i++) await sleep(5);
+  } finally {
+    await Effect.runPromise(Fiber.interrupt(fiber));
+  }
+
+  assert.equal(seenJobs.length, 1, "the runner ran exactly one job");
+  // The settle-path fields survived activate → mapJob → dispatch → runner.
+  assert.equal(seenJobs[0].jobKey, "job-9");
+  assert.equal(seenJobs[0].retries, 3);
+  assert.deepEqual(seenJobs[0].customHeaders, { allowPr: "true" });
+  assert.equal(seenJobs[0].processInstanceKey, "7001");
+  // The completion POST hit the right endpoint with the result variables merged.
+  assert.equal(completions.length, 1, "the job was settled via the engine completion endpoint");
+  assert.match(completions[0].url, /\/v2\/jobs\/job-9\/completion$/);
+  assert.deepEqual(completions[0].body, { variables: { status: "opened", summary: "did the thing" } });
+});
+
+test("createSupervisorDeps: the settle seam fails a job through the engine failure endpoint", async () => {
+  const failures = [];
+  const fetchImpl = async (url, init) => {
+    const u = String(url);
+    if (/\/jobs\/.+\/failure$/.test(u)) {
+      failures.push({ url: u, body: JSON.parse(init.body) });
+      return { ok: true, status: 204, json: async () => ({}), text: async () => "" };
+    }
+    if (u.endsWith("/jobs/activation")) return { ok: true, status: 200, json: async () => ({ jobs: [] }), text: async () => "" };
+    return { ok: false, status: 404, json: async () => ({}), text: async () => "" };
+  };
+  const { settle } = await createSupervisorDeps({
+    runner: { run: async () => {} },
+    restConfig: { baseUrl: "http://engine:8080", token: "T" },
+    worker: "host-under-test",
+    fetchImpl,
+  });
+  await settle.fail("job-x", { retries: 1, errorMessage: "harness exited 1", retryBackOff: 15_000 });
+  assert.equal(failures.length, 1);
+  assert.match(failures[0].url, /\/v2\/jobs\/job-x\/failure$/);
+  assert.deepEqual(failures[0].body, { retries: 1, errorMessage: "harness exited 1", retryBackOff: 15_000 });
+});
+
 test("createSupervisorDeps: derives engine authHeaders from camunda.getAuthHeaders() when no explicit headers/token", async () => {
   // On OAuth/basic profiles there is no bare REST token, so the engine client
   // must fall back to the SDK client's ready-made header map — otherwise engine

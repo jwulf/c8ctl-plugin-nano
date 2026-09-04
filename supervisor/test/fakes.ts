@@ -21,6 +21,10 @@ export interface EngineFake extends EngineClient {
   readonly activateCalls: string[];
   /** Every activation request in full — lets a test assert the requested batch size. */
   readonly activateRequests: ActivateRequest[];
+  /** Every successful settle: `job.complete()` calls with their result variables. */
+  readonly completed: Array<{ jobKey: string; variables?: Record<string, unknown> }>;
+  /** Every failure settle: `job.fail()` calls with their retry/error options. */
+  readonly failed: Array<{ jobKey: string; opts?: Record<string, unknown> }>;
 }
 
 export interface EngineOptions {
@@ -35,11 +39,15 @@ export const makeEngine = (opts: EngineOptions): EngineFake => {
   const extended: Array<{ jobKey: string; ms: number }> = [];
   const activateCalls: string[] = [];
   const activateRequests: ActivateRequest[] = [];
+  const completed: Array<{ jobKey: string; variables?: Record<string, unknown> }> = [];
+  const failed: Array<{ jobKey: string; opts?: Record<string, unknown> }> = [];
   return {
     leased,
     extended,
     activateCalls,
     activateRequests,
+    completed,
+    failed,
     activate: (req) =>
       Effect.sync(() => {
         activateCalls.push(req.type);
@@ -54,6 +62,14 @@ export const makeEngine = (opts: EngineOptions): EngineFake => {
         : Effect.sync(() => {
             extended.push({ jobKey, ms });
           }),
+    complete: (jobKey, variables) =>
+      Effect.sync(() => {
+        completed.push({ jobKey, variables });
+      }),
+    fail: (jobKey, opts2) =>
+      Effect.sync(() => {
+        failed.push({ jobKey, opts: opts2 });
+      }),
   };
 };
 

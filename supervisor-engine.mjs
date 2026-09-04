@@ -86,6 +86,19 @@ function mapJob(raw) {
   const pdk = raw.processDefinitionKey ?? raw.processDefinitionId;
   if (pdk !== undefined && pdk !== null) job.processDefinitionKey = String(pdk);
   if (raw.variables !== undefined) job.variables = raw.variables;
+  // Settle-path passthrough (issue #156): the runner needs the task headers (to
+  // assemble the reserved task envelope + read the `linkName="prompt"` marker),
+  // the retry count (to preserve/decrement it on a `fail`, matching the SDK job
+  // object), and the process-instance key (audit/logging). These ride opaquely
+  // to the runner exactly as the SDK job worker surfaces them.
+  if (raw.customHeaders !== undefined && raw.customHeaders !== null) job.customHeaders = raw.customHeaders;
+  const rawRetries = raw.retries;
+  if (rawRetries !== undefined && rawRetries !== null) {
+    const n = Number(rawRetries);
+    if (Number.isFinite(n)) job.retries = n;
+  }
+  const pik = raw.processInstanceKey;
+  if (pik !== undefined && pik !== null) job.processInstanceKey = String(pik);
   return job;
 }
 

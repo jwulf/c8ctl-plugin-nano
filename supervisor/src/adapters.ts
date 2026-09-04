@@ -49,11 +49,27 @@ const toSupervisorError = (fallback: string) => (cause: unknown): SupervisorErro
  * treats it as that poll losing, never a crash. `extendLock` SETs the job's lock
  * to `ms` from now (`PATCH /v2/jobs/{jobKey}/timeout`); a rejection on the
  * winner's first extend signals a likely reclaim race — {@link dispatch} then
- * declines to start the agent.
+ * declines to start the agent. `complete`/`fail` SETTLE a finished job
+ * (`POST /v2/jobs/{jobKey}/completion|failure`) — the direct-REST analogue of the
+ * SDK job object's `job.complete()`/`job.fail()` — so the runner can settle a job
+ * activated over this surface (a plain {@link ActivatedJob} carries no settle
+ * methods); a rejection maps to a {@link SupervisorError} for the runner to handle.
  */
 export interface RawEngineClient {
   activate(req: ActivateRequest): Promise<ReadonlyArray<ActivatedJob>>;
   extendLock(jobKey: string, ms: number): Promise<void>;
+  /** `POST /v2/jobs/{jobKey}/completion` — settle a job successfully with result `variables`. */
+  complete(jobKey: string, variables?: Record<string, unknown>): Promise<void>;
+  /** `POST /v2/jobs/{jobKey}/failure` — settle a job as failed (`retries > 0` re-queues, `0` incidents). */
+  fail(
+    jobKey: string,
+    opts?: {
+      retries?: number;
+      errorMessage?: string;
+      retryBackOff?: number;
+      variables?: Record<string, unknown>;
+    },
+  ): Promise<void>;
 }
 
 /** Lift a plain {@link RawEngineClient} into the Effect {@link EngineClient} port. */
@@ -67,6 +83,16 @@ export const makeEngineClient = (raw: RawEngineClient): EngineClient => ({
     Effect.tryPromise({
       try: () => Promise.resolve(raw.extendLock(jobKey, ms)).then(() => undefined),
       catch: toSupervisorError(`extendLock ${jobKey} failed`),
+    }),
+  complete: (jobKey, variables) =>
+    Effect.tryPromise({
+      try: () => Promise.resolve(raw.complete(jobKey, variables)).then(() => undefined),
+      catch: toSupervisorError(`complete ${jobKey} failed`),
+    }),
+  fail: (jobKey, opts) =>
+    Effect.tryPromise({
+      try: () => Promise.resolve(raw.fail(jobKey, opts)).then(() => undefined),
+      catch: toSupervisorError(`fail ${jobKey} failed`),
     }),
 });
 

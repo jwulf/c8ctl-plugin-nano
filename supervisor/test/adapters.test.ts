@@ -28,6 +28,9 @@ import { SupervisorError, noopLogger, type ActivatedJob, type Logger } from "../
 /** Run an effect expected to FAIL and resolve with its error (E) for assertion. */
 const errOf = <A, E>(eff: Effect.Effect<A, E>): Promise<E> => Effect.runPromise(Effect.flip(eff));
 
+/** Settle stubs so a raw engine literal satisfies the extended RawEngineClient. */
+const noSettle = { complete: async () => {}, fail: async () => {} } as const;
+
 test("makeEngineClient: activate passes the job batch through", async () => {
   const seen: unknown[] = [];
   const raw: RawEngineClient = {
@@ -35,6 +38,7 @@ test("makeEngineClient: activate passes the job batch through", async () => {
       seen.push(req);
       return [{ jobKey: "j1", type: req.type }];
     },
+    ...noSettle,
     extendLock: async () => {},
   };
   const engine = makeEngineClient(raw);
@@ -52,6 +56,7 @@ test("makeEngineClient: a rejected activate becomes a SupervisorError (not a def
     activate: async () => {
       throw new Error("connect ECONNREFUSED");
     },
+    ...noSettle,
     extendLock: async () => {},
   };
   const err = await errOf(
@@ -71,6 +76,7 @@ test("makeEngineClient: extendLock resolves void and normalizes a non-void resol
   const raw: RawEngineClient = {
     activate: async () => [],
     // Resolve a truthy non-void value to prove the lift normalizes to `void`.
+    ...noSettle,
     extendLock: async (jobKey, ms) => {
       calls.push({ jobKey, ms });
       return "ok" as unknown as void;
@@ -84,6 +90,7 @@ test("makeEngineClient: extendLock resolves void and normalizes a non-void resol
 test("makeEngineClient: a rejected extendLock becomes a SupervisorError", async () => {
   const raw: RawEngineClient = {
     activate: async () => [],
+    ...noSettle,
     extendLock: async () => {
       throw new SupervisorError("HTTP 409 job reclaimed");
     },
@@ -92,6 +99,65 @@ test("makeEngineClient: a rejected extendLock becomes a SupervisorError", async 
   // A raw client that already threw a SupervisorError is passed through as-is.
   assert.ok(err instanceof SupervisorError);
   assert.equal(err.message, "HTTP 409 job reclaimed");
+});
+
+test("makeEngineClient: complete settles with result variables and normalizes to void", async () => {
+  const calls: Array<{ jobKey: string; variables?: Record<string, unknown> }> = [];
+  const raw: RawEngineClient = {
+    activate: async () => [],
+    extendLock: async () => {},
+    // Resolve a truthy non-void value to prove the lift normalizes to `void`.
+    complete: async (jobKey, variables) => {
+      calls.push({ jobKey, variables });
+      return "ok" as unknown as void;
+    },
+    fail: async () => {},
+  };
+  const out = await Effect.runPromise(makeEngineClient(raw).complete("j1", { status: "opened" }));
+  assert.equal(out, undefined);
+  assert.deepEqual(calls, [{ jobKey: "j1", variables: { status: "opened" } }]);
+});
+
+test("makeEngineClient: a rejected complete becomes a SupervisorError", async () => {
+  const raw: RawEngineClient = {
+    activate: async () => [],
+    extendLock: async () => {},
+    complete: async () => {
+      throw new Error("HTTP 409 job already reclaimed");
+    },
+    fail: async () => {},
+  };
+  const err = await errOf(makeEngineClient(raw).complete("j1"));
+  assert.ok(err instanceof SupervisorError);
+  assert.match(err.message, /409/);
+});
+
+test("makeEngineClient: fail forwards retry/error options and maps a rejection", async () => {
+  const calls: Array<{ jobKey: string; opts?: Record<string, unknown> }> = [];
+  const raw: RawEngineClient = {
+    activate: async () => [],
+    extendLock: async () => {},
+    complete: async () => {},
+    fail: async (jobKey, opts) => {
+      calls.push({ jobKey, opts });
+    },
+  };
+  await Effect.runPromise(
+    makeEngineClient(raw).fail("j2", { retries: 2, errorMessage: "boom", retryBackOff: 15_000 }),
+  );
+  assert.deepEqual(calls, [{ jobKey: "j2", opts: { retries: 2, errorMessage: "boom", retryBackOff: 15_000 } }]);
+
+  const boom: RawEngineClient = {
+    activate: async () => [],
+    extendLock: async () => {},
+    complete: async () => {},
+    fail: async () => {
+      throw new SupervisorError("HTTP 500 failure endpoint");
+    },
+  };
+  const err = await errOf(makeEngineClient(boom).fail("j3", { retries: 0 }));
+  assert.ok(err instanceof SupervisorError);
+  assert.match(err.message, /500/);
 });
 
 test("makeReconcileReader: crawl passes keys + xml through, rejection maps to SupervisorError", async () => {
@@ -144,7 +210,7 @@ test("asLogger: coerces a console-shaped object, defaults debug, falls back to n
 
 test("makeSupervisorDeps: omits absent optionals and normalizes the logger", async () => {
   const registry = await Effect.runPromise(makeRegistry());
-  const engine = makeEngineClient({ activate: async () => [], extendLock: async () => {} });
+  const engine = makeEngineClient({ ...noSettle, activate: async () => [], extendLock: async () => {} });
   const runner = makeJobRunner({ run: async () => {} });
   const reconcileReader = makeReconcileReader({
     searchProcessDefinitionKeys: async () => [],
@@ -177,7 +243,7 @@ test("lifted ports drive makeRegistry-backed dispatch shape end to end", async (
   // A tiny sanity weave: the lifted engine's activate result is a plain
   // ActivatedJob[] the registry/dispatch layer consumes unchanged.
   const jobs: ActivatedJob[] = [{ jobKey: "e2e", type: "senior:plan" }];
-  const engine = makeEngineClient({ activate: async () => jobs, extendLock: async () => {} });
+  const engine = makeEngineClient({ ...noSettle, activate: async () => jobs, extendLock: async () => {} });
   const got = await Effect.runPromise(
     engine.activate({ type: "senior:plan", maxJobsToActivate: 1, requestTimeoutMs: 1, lockMs: 1 }),
   );

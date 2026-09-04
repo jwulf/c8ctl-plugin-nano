@@ -72,6 +72,54 @@ test("activate: POSTs the correct body/URL and maps the returned batch", async (
   });
 });
 
+test("activate: maps the settle-path fields (customHeaders/retries/processInstanceKey) through for the runner", async () => {
+  // Issue #156: a job activated over this surface must carry the task headers,
+  // retry count, and process-instance key so the supervisor's runner can
+  // assemble the task envelope and settle via complete()/fail() — the SDK job
+  // object's fields, now surfaced on the plain ActivatedJob.
+  const fetchImpl = makeFakeFetch([
+    {
+      status: 200,
+      json: {
+        jobs: [
+          {
+            jobKey: 111,
+            type: "senior:feature",
+            processInstanceKey: 999,
+            retries: 3,
+            customHeaders: { "io.nanobpm.agentTask": "{}", allowPr: "true" },
+            variables: { task: { id: "t1" } },
+          },
+        ],
+      },
+    },
+  ]);
+  const engine = createRawEngineClient({ baseUrl: "http://engine:8080", fetchImpl });
+  const [j] = await engine.activate({ type: "senior:feature", maxJobsToActivate: 1, requestTimeoutMs: 0, lockMs: 1 });
+  assert.deepEqual(j, {
+    jobKey: "111",
+    type: "senior:feature",
+    processInstanceKey: "999",
+    retries: 3,
+    customHeaders: { "io.nanobpm.agentTask": "{}", allowPr: "true" },
+    variables: { task: { id: "t1" } },
+  });
+});
+
+test("activate: omits settle-path fields the engine did not surface", async () => {
+  const fetchImpl = makeFakeFetch([{ status: 200, json: { jobs: [{ jobKey: "1", type: "t" }] } }]);
+  const engine = createRawEngineClient({ baseUrl: "http://engine:8080", fetchImpl });
+  const [j] = await engine.activate({ type: "t", maxJobsToActivate: 1, requestTimeoutMs: 0, lockMs: 1 });
+  assert.deepEqual(Object.keys(j).sort(), ["jobKey", "type"]);
+});
+
+test("activate: a non-numeric retries value is dropped rather than coerced to NaN", async () => {
+  const fetchImpl = makeFakeFetch([{ status: 200, json: { jobs: [{ jobKey: "1", type: "t", retries: "oops" }] } }]);
+  const engine = createRawEngineClient({ baseUrl: "http://engine:8080", fetchImpl });
+  const [j] = await engine.activate({ type: "t", maxJobsToActivate: 1, requestTimeoutMs: 0, lockMs: 1 });
+  assert.ok(!("retries" in j), "a non-finite retries is omitted, not surfaced as NaN");
+});
+
 test("activate: an empty long-poll return maps to an empty batch (idle)", async () => {
   const fetchImpl = makeFakeFetch([{ status: 200, json: { jobs: [] } }]);
   const engine = createRawEngineClient({ baseUrl: "http://engine:8080", fetchImpl });

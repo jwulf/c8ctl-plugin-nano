@@ -9,14 +9,19 @@
  * shared across K types with per-type gating". The supervisor rolls its own race
  * over a NARROW two-call engine surface instead:
  *
- *   - `activate` → `POST <base>/v2/jobs/activation` for exactly ONE type, one
+ *   - `activate` → `POST <base>/jobs/activation` for exactly ONE type, one
  *     long-poll, resolving 0..`maxJobsToActivate` jobs (0 == the long-poll
  *     expired empty). `timeout` is the SHORT initial lock (the crash-safety net);
  *     `requestTimeout` is how long the call blocks server-side.
- *   - `extendLock` → `PATCH <base>/v2/jobs/{jobKey}/timeout` with `{ timeout }`.
+ *   - `extendLock` → the SDK's typed `updateJob` (operationId `updateJob`,
+ *     `PATCH <base>/jobs/{jobKey}` with `{ changeset: { timeout } }`) when a
+ *     `camunda` SDK client is injected, else the SAME call issued raw via
+ *     `fetchImpl` (so the module stays wire-testable without a live client).
  *     The C8 contract SETs the lock to `ms` from now (a duration-from-now), which
  *     is exactly the supervisor's "extend the winner to the recovery window, then
- *     heartbeat" model — set, not accumulate.
+ *     heartbeat" model — set, not accumulate. NOTE: there is no
+ *     `/jobs/{jobKey}/timeout` sub-route — that was a drifted URL that 404s on the
+ *     engine; the timeout is a `changeset` field on the job resource itself.
  *
  * This module is the raw-JS analogue of `agentic-endpoint.mjs`: it is Effect-free
  * (the supervisor's `makeEngineClient` lift wraps each method into the Effect
@@ -136,6 +141,7 @@ async function readErrorBody(res) {
  * @param {Record<string,string>|(() => (Record<string,string>|Promise<Record<string,string>>))} [opts.authHeaders] Ready-made auth header map, OR a resolver invoked per request (so rotating SDK auth — e.g. an OAuth bearer that refreshes — is re-derived each call rather than frozen). Wins over `token`.
  * @param {typeof fetch} [opts.fetchImpl] Injected `fetch` (defaults to the global; overridden in tests).
  * @param {number} [opts.requestTimeoutSlackMs] Extra ms added to a call's abort budget over its server long-poll (default 5000).
+ * @param {{ updateJob?: (req: { jobKey: string, changeset: { timeout: number } }) => Promise<unknown> }} [opts.camunda] Optional Camunda SDK client. When present (and it exposes `updateJob`), `extendLock` prefers the SDK's typed `updateJob` (`PATCH /v2/jobs/{jobKey}` with `{ changeset: { timeout } }`) over the raw fetch fallback.
  * @returns {{ activate(req: ActivateRequest): Promise<ReadonlyArray<ActivatedJob>>, extendLock(jobKey: string, ms: number): Promise<void>, complete(jobKey: string, variables?: object): Promise<void>, fail(jobKey: string, opts?: { retries?: number, errorMessage?: string, retryBackOff?: number, variables?: object }): Promise<void> }}
  */
 export function createRawEngineClient(opts = {}) {
@@ -146,6 +152,7 @@ export function createRawEngineClient(opts = {}) {
     authHeaders,
     fetchImpl = fetch,
     requestTimeoutSlackMs = 5_000,
+    camunda,
   } = opts;
   if (typeof fetchImpl !== "function") {
     throw new TypeError("createRawEngineClient: `fetchImpl` must be a function (global fetch or an injected fake)");
@@ -210,8 +217,21 @@ export function createRawEngineClient(opts = {}) {
     },
 
     async extendLock(jobKey, ms) {
-      const url = `${base}/jobs/${encodeURIComponent(jobKey)}/timeout`;
-      const res = await call(url, { method: "PATCH", body: JSON.stringify({ timeout: ms }) }, 15_000);
+      // Prefer the SDK's typed `updateJob` (operationId `updateJob` →
+      // `PATCH /v2/jobs/{jobKey}` with `{ changeset: { timeout } }`) so the lock
+      // extension tracks the engine contract instead of a hand-rolled URL. Fall
+      // back to the SAME call issued raw when no SDK client is injected (keeps
+      // this module wire-testable and usable standalone).
+      if (camunda && typeof camunda.updateJob === "function") {
+        try {
+          await camunda.updateJob({ changeset: { timeout: ms }, jobKey: String(jobKey) });
+          return;
+        } catch (err) {
+          throw new Error(`extendLock ${jobKey}: SDK updateJob failed: ${err?.message ?? err}`, { cause: err });
+        }
+      }
+      const url = `${base}/jobs/${encodeURIComponent(jobKey)}`;
+      const res = await call(url, { method: "PATCH", body: JSON.stringify({ changeset: { timeout: ms } }) }, 15_000);
       if (!res || !res.ok) {
         const status = res ? res.status : "?";
         throw new Error(`extendLock ${jobKey}: HTTP ${status} from ${url}${res ? await readErrorBody(res) : ""}`);
@@ -229,7 +249,7 @@ export function createRawEngineClient(opts = {}) {
     // job was reclaimed) surfaces as a rejected promise for the port to map.
 
     async complete(jobKey, variables) {
-      // `POST <base>/v2/jobs/{jobKey}/completion` with `{ variables }` — the
+      // `POST <base>/jobs/{jobKey}/completion` with `{ variables }` — the
       // result-variable map the model produced is merged onto the process
       // instance. C8 v2 answers 204 No Content on success.
       const url = `${base}/jobs/${encodeURIComponent(jobKey)}/completion`;
@@ -246,7 +266,7 @@ export function createRawEngineClient(opts = {}) {
       // null-safe `variables`), so a caller passing `null` never trips the
       // signature-destructure TypeError.
       const { retries = 0, errorMessage, retryBackOff, variables } = opts || {};
-      // `POST <base>/v2/jobs/{jobKey}/failure` with `{ retries, errorMessage?,
+      // `POST <base>/jobs/{jobKey}/failure` with `{ retries, errorMessage?,
       // retryBackOff?, variables? }` — `retries > 0` re-queues for another
       // attempt, `retries === 0` raises an incident. Optional fields are omitted
       // when absent so the engine applies its own defaults. C8 v2 answers 204.

@@ -136,21 +136,37 @@ test("activate: a non-2xx response throws with status + endpoint", async () => {
   );
 });
 
-test("extendLock: PATCHes /v2/jobs/{key}/timeout with the new timeout and 204s cleanly", async () => {
+test("extendLock: without a camunda client, PATCHes /v2/jobs/{key} with {changeset:{timeout}} and 204s cleanly", async () => {
   const fetchImpl = makeFakeFetch([{ status: 204 }]);
   const engine = createRawEngineClient({ baseUrl: "http://engine:8080/v2", authHeaders: { Authorization: "Bearer OAUTH" }, fetchImpl });
   await engine.extendLock("job-key-9", 300_000);
   const { url, init } = fetchImpl.calls[0];
-  assert.equal(url, "http://engine:8080/v2/jobs/job-key-9/timeout");
+  assert.equal(url, "http://engine:8080/v2/jobs/job-key-9"); // the job resource, NOT a /timeout sub-route
   assert.equal(init.method, "PATCH");
   assert.equal(init.headers.Authorization, "Bearer OAUTH"); // authHeaders wins over token
-  assert.deepEqual(JSON.parse(init.body), { timeout: 300_000 });
+  assert.deepEqual(JSON.parse(init.body), { changeset: { timeout: 300_000 } });
 });
 
-test("extendLock: a 409 (reclaim race) throws so dispatch declines to start", async () => {
+test("extendLock: delegates to the SDK's typed updateJob ({changeset:{timeout},jobKey}) when a camunda client is injected", async () => {
+  const calls = [];
+  const camunda = { updateJob: async (arg) => { calls.push(arg); } };
+  const fetchImpl = makeFakeFetch([]); // must NOT be touched on the SDK path
+  const engine = createRawEngineClient({ baseUrl: "http://engine:8080/v2", fetchImpl, camunda });
+  await engine.extendLock("job-key-9", 300_000);
+  assert.deepEqual(calls, [{ changeset: { timeout: 300_000 }, jobKey: "job-key-9" }]);
+  assert.equal(fetchImpl.calls.length, 0); // SDK path never issues a raw request
+});
+
+test("extendLock: a 409 (reclaim race) on the raw path throws so dispatch declines to start", async () => {
   const fetchImpl = makeFakeFetch([{ status: 409, text: "job not activated" }]);
   const engine = createRawEngineClient({ baseUrl: "http://engine:8080", fetchImpl });
-  await assert.rejects(() => engine.extendLock("j1", 1000), /HTTP 409.*timeout.*job not activated/s);
+  await assert.rejects(() => engine.extendLock("j1", 1000), /HTTP 409.*jobs\/j1.*job not activated/s);
+});
+
+test("extendLock: an SDK updateJob rejection surfaces so dispatch declines to start", async () => {
+  const camunda = { updateJob: async () => { throw new Error("409 job not activated"); } };
+  const engine = createRawEngineClient({ baseUrl: "http://engine:8080", fetchImpl: makeFakeFetch([]), camunda });
+  await assert.rejects(() => engine.extendLock("j1", 1000), /extendLock j1: SDK updateJob failed.*409/s);
 });
 
 test("complete: POSTs /v2/jobs/{key}/completion with the result variables and 204s cleanly", async () => {

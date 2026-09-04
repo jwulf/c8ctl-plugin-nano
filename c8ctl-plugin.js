@@ -3366,7 +3366,7 @@ async function createSupervisorDeps(opts = {}) {
     };
   }
 
-  const rawEngine = createRawEngineClient({ baseUrl: rc.baseUrl, token: rc.token, authHeaders: resolvedAuthHeaders, worker, fetchImpl });
+  const rawEngine = createRawEngineClient({ baseUrl: rc.baseUrl, token: rc.token, authHeaders: resolvedAuthHeaders, worker, fetchImpl, camunda });
   const engine = rt.makeEngineClient(rawEngine);
   // `reconcileReader` (a raw `{ searchProcessDefinitionKeys, getProcessDefinitionXml }`)
   // may be injected to override the default keep-alive `httpC8RestReader` — the

@@ -226,7 +226,11 @@ export function createRawEngineClient(opts = {}) {
       }
     },
 
-    async fail(jobKey, { retries = 0, errorMessage, retryBackOff, variables } = {}) {
+    async fail(jobKey, opts) {
+      // Tolerate a `null` opts the same as `undefined` (mirrors `complete`'s
+      // null-safe `variables`), so a caller passing `null` never trips the
+      // signature-destructure TypeError.
+      const { retries = 0, errorMessage, retryBackOff, variables } = opts || {};
       // `POST <base>/v2/jobs/{jobKey}/failure` with `{ retries, errorMessage?,
       // retryBackOff?, variables? }` — `retries > 0` re-queues for another
       // attempt, `retries === 0` raises an incident. Optional fields are omitted

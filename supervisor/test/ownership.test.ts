@@ -11,7 +11,6 @@ import {
   makeOwnershipRegistry,
   registerWorker,
   releaseJob,
-  resyncOwnership,
   snapshotOwnership,
   withOwnedJob,
 } from "../src/ownership.ts";
@@ -202,30 +201,5 @@ test("withOwnedJob: the claim fails the run through (release still fires) on chi
   );
 });
 
-// --- resyncOwnership: replay the full active-claim set ------------------------
-
-test("resyncOwnership: re-registers every worker then re-claims each active job", async () => {
-  await Effect.runPromise(
-    Effect.gen(function* () {
-      const ownership = yield* makeOwnershipRegistry();
-      yield* ownership.register("w1", { cognition: "senior" });
-      yield* ownership.register("w2", { cognition: "junior" });
-      yield* ownership.claim("w1", "J1");
-      yield* ownership.claim("w1", "J2");
-      yield* ownership.claim("w2", "J3");
-
-      const rec = recordingHandle();
-      yield* resyncOwnership(rec.handle, ownership);
-
-      // Every worker re-registered; every active job re-claimed. Register for a
-      // worker precedes its claims (a claim must land on a known instance).
-      assert.ok(rec.frames.includes("register:w1"));
-      assert.ok(rec.frames.includes("register:w2"));
-      assert.ok(rec.frames.indexOf("register:w1") < rec.frames.indexOf("claim:w1:J1"));
-      assert.deepEqual(
-        rec.frames.filter((f) => f.startsWith("claim:")).sort(),
-        ["claim:w1:J1", "claim:w1:J2", "claim:w2:J3"],
-      );
-    }),
-  );
-});
+// --- (resyncOwnership retired in #186 — reconnect replay is owned by the
+// --- AgenticEmitClient's write-through shadow, not a registry-driven resync.) --

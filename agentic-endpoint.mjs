@@ -1,178 +1,78 @@
-// The concrete host-connection agentic endpoint (ADR 0056; issue #160).
+// The concrete host-connection agentic endpoint (ADR 0056; issues #160, #186).
 //
 // #158 shipped the host-owned job-ownership protocol as an Effect *interface*
 // (`AgenticEndpoint` → `AgenticHandle` implementing `register`/`heartbeat`/
 // `deregister`/`claim`/`transcript`/`release`, identity explicit on every frame)
-// but no concrete transport — the `0.10.0` `@nanobpm/agentic` had no `claim`/
-// `release` presence frames to send. `@nanobpm/agentic` is now `^0.11.0`, which
-// lands families 8/9 (`claim`/`release`), the `claim-release`/`multi-instance`
-// negotiable features, and the additive negotiation module. This module is the
-// concrete wire against that bump: ONE multiplexed WebSocket connection over
-// which N supervised workers' presence + ownership + transcript frames ride,
-// each frame carrying its `instance` EXPLICITLY (never the connection id — the
-// assumption #154 structurally breaks).
+// but no concrete transport. #160 wired a bespoke one by hand. Since #546 (in
+// `@nanobpm/agentic` 0.12.0) the package ships a high-level `@nanobpm/agentic/
+// emit` `AgenticEmitClient` that already provides everything this file used to
+// hand-roll: multiplexed multi-instance presence, register/heartbeat/deregister,
+// idempotent claim/release, transcript emit over QoS lanes, additive
+// negotiation, capability shaping, and — critically — reconnect-resync from its
+// own write-through shadow of the presence + in-flight-claim maps. #186 retires
+// the bespoke emit surface in favour of that client and its injective
+// `composeStreamId`/`parseStreamId` stream-id codec.
 //
-// It produces a plain, Effect-free `RawEmitClient` (see `supervisor/src/emit.ts`)
-// that the supervisor bundle lifts into the Effect `AgenticHandle`. Everything on
-// the wire is CONSUMED through this plugin's single import surface (`agentic.mjs`
-// → `@nanobpm/agentic` + `@nanobpm/urban-agent-client`); nothing is re-declared.
+// This module is now a THIN adapter: it lifts one `AgenticEmitClient` into the
+// plain, Effect-free `RawEmitClient` port (`supervisor/src/emit.ts`) the
+// supervisor bundle lifts into the Effect `AgenticHandle`. Two seams remain the
+// adapter's responsibility because the emit client is a pure emitter that holds
+// no inbound sub-protocol:
 //
-// The supervisor's `superviseAgentic` owns reconnect (it calls the endpoint's
-// `connect` again on every drop) and the claim registry owns replay (the resync
-// re-`register`s + re-`claim`s before transcript resumes), so this client is thin
-// on purpose: one socket, encode-and-send, no buffering or reconnect of its own.
+//   1. Inbound steer routing — the client ignores inbound frames, so the
+//      EmitSocket adapter decodes each inbound relay DELIVERY frame and fans it
+//      to the installed steer route, keyed by the package `parseStreamId` codec
+//      (a foreign/blackboard stream is dropped, never misrouted).
+//   2. Reconnect ownership — the emit client OWNS reconnect and re-emits presence
+//      + active claims from its shadow on every reconnect, so the RawEmitClient
+//      surfaces a mid-life drop only as a liveness transition (`onConnectionState`)
+//      and reserves its single-shot `onClose` for a permanent teardown. That
+//      retires the supervisor's manual re-register/re-claim resync (#186): the
+//      `ownership.ts` registry stays the authority and the single write path into
+//      the client, while the wire-level replay is the client's job.
+//
+// Everything on the wire is CONSUMED through this plugin's single import surface
+// (`agentic.mjs` → `@nanobpm/agentic/emit` + `@nanobpm/urban-agent-client`);
+// nothing is re-declared here.
 
 import {
-  encodeFrame,
+  AgenticEmitClient,
+  parseStreamId,
   decodeFrame,
-  MAX_SEQ,
-  validatePayload,
-  negotiate,
-  LOCAL_ADVERTISEMENT,
   loadAgenticClient,
 } from './agentic.mjs';
 import { buildAgenticUrl } from './work-channel.mjs';
 
-// Presence + ownership frames are facts — they ride the CONTROL lane so a
-// transcript storm on the bulk lane can never delay a claim/release (the QoS
-// ordering contract). Transcript chunks ride BULK.
-const CONTROL_LANE = 'control';
-const BULK_LANE = 'bulk';
-
-// A transcript stream name that encodes BOTH the owning instance and the jobKey,
-// so two workers' (or two jobs') transcript streams over the one connection can
-// never collide. `encodeURIComponent` on each segment makes the join
-// unambiguous regardless of what characters an instance/jobKey contains.
-function composeTranscriptStream(instance, jobKey) {
-  return `t/${encodeURIComponent(instance)}/${encodeURIComponent(jobKey)}`;
-}
-
-// Reverse of {@link composeTranscriptStream}. Returns null for a stream that is
-// not one of ours (a foreign/blackboard stream), so an inbound steer frame for
-// an unrecognised stream is dropped rather than misrouted.
-function parseTranscriptStream(stream) {
-  if (typeof stream !== 'string') return null;
-  const parts = stream.split('/');
-  if (parts.length !== 3 || parts[0] !== 't') return null;
-  try {
-    return { instance: decodeURIComponent(parts[1]), jobKey: decodeURIComponent(parts[2]) };
-  } catch {
-    return null;
-  }
-}
-
-// Drop undefined/empty attributes from a declared capability so the enrolment
-// attribute on `register` stays minimal (the S0 validator only requires
-// `capability` to be an object and tolerates extra fields).
-function cleanCapability(capability) {
-  const out = {};
-  if (capability && typeof capability === 'object') {
-    for (const [k, v] of Object.entries(capability)) {
-      if (v !== undefined && v !== null && v !== '') out[k] = v;
-    }
-  }
-  return out;
-}
-
 const textDecoder = new TextDecoder();
 const textEncoder = new TextEncoder();
 
-// Compute the negotiated protocol against the peer's advertisement. There is no
-// wired advertisement-exchange frame in the `0.11.0` protocol yet, so a caller
-// that has not learned the peer's support passes nothing and we assume the peer
-// matches this build (full support) — additive negotiation still degrades
-// correctly the moment a real remote advertisement is supplied (an old hub that
-// never learned `claim`/`release` yields a negotiation without them, so those
-// methods report unsupported and the adapter omits them).
-function negotiatedSupport(remoteAdvertisement) {
-  const negotiated = negotiate(LOCAL_ADVERTISEMENT, remoteAdvertisement ?? LOCAL_ADVERTISEMENT);
-  return {
-    claimRelease:
-      negotiated.supportsFeature('claim-release') &&
-      negotiated.supportsFamily('claim') &&
-      negotiated.supportsFamily('release'),
-    // Inbound steer rides the relay lane as a delivery frame keyed by our
-    // transcript-stream naming; it is installable whenever relay is negotiated.
-    steer: negotiated.supportsFamily('relay'),
-  };
-}
-
 /**
- * Open one multiplexed host connection and return a {@link RawEmitClient}.
+ * Adapt one `@nanobpm/urban-agent-client` websocket transport (the `{ send,
+ * close }` value + `{ onOpen, onFrame, onClose, onError }` hook shape) to the
+ * `EmitSocket` the {@link AgenticEmitClient} drives (`send`/`close` +
+ * `onMessage`/`onOpen`/`onClose` registrations). Opens a fresh transport per
+ * call — the emit client invokes its `connect` factory once per (re)connect.
  *
- * @param {object} params
- * @param {string} params.url the resolved `ws(s)://…/agentic?token=…` channel URL
- * @param {import('@nanobpm/urban-agent-client').TransportFactory} params.transportFactory
- * @param {number} params.incarnation producer generation stamped on transcript
- *   frames (strictly higher on each successive connection so a reconnected
- *   producer fences its stale predecessor on the hub's incarnation ring)
- * @param {{ claimRelease: boolean, steer: boolean }} params.support negotiated capabilities
- * @param {{ warn?: Function, debug?: Function }} [params.logger]
- * @param {(state: 'connected' | 'disconnected') => void} [params.onConnectionState]
- *   optional observer invoked on connection-state transitions: `'connected'`
- *   once the transport opens and `'disconnected'` when it drops (fired at most
- *   once per drop). A throwing observer is caught and logged, never propagated.
- * @returns {import('./supervisor.dist.js').RawEmitClient}
+ * Inbound relay DELIVERY frames are decoded HERE and fanned to the current steer
+ * route (the emit client ignores inbound frames), keyed by {@link parseStreamId}
+ * so a frame for a foreign stream is dropped rather than misrouted.
+ *
+ * @param {string} url the resolved `ws(s)://…/agentic?token=…` channel URL
+ * @param {import('@nanobpm/urban-agent-client').TransportFactory} transportFactory
+ * @param {() => (((instance: string, jobKey: string, chunk: Uint8Array) => void) | null)} getSteerRoute
+ * @param {{ warn?: Function, debug?: Function }} log
+ * @returns {import('@nanobpm/agentic/emit').EmitSocket}
  */
-function openHostConnection({ url, transportFactory, incarnation, support, logger, onConnectionState }) {
-  const log = logger || {};
-  const notifyState = (state) => {
-    if (typeof onConnectionState !== 'function') return;
-    try { onConnectionState(state); } catch (err) { log.debug?.(`agentic onConnectionState threw — ${err?.message || err}`); }
-  };
-  const openCbs = [];
-  const closeCbs = [];
-  let steerRoute = null;
-  let open = false;
-  let hasClosed = false;
-  let seq = 0;
+function makeEmitSocket(url, transportFactory, getSteerRoute, log) {
+  let onMessageCb = () => {};
+  let onOpenCb = () => {};
+  let onCloseCb = () => {};
+  let opened = false;
+  let closed = false;
 
-  // Monotonic uint32 sequence with wraparound — the relay resume-from-offset
-  // counter; mirrors the client lib's own seq handling.
-  const nextSeq = () => {
-    const s = seq;
-    seq = seq >= MAX_SEQ ? 0 : seq + 1;
-    return s;
-  };
-
-  let transport = null;
-  let closedFired = false;
-
-  // Notify registered onClose subscribers at most once, regardless of whether a
-  // caller-initiated close() or the transport's own onClose fires first. Higher
-  // layers (AgenticHandle.closed) must observe the drop even if the underlying
-  // transport delays or omits its close callback.
-  const fireClosed = () => {
-    if (closedFired) return;
-    closedFired = true;
-    open = false;
-    hasClosed = true;
-    // Guard each subscriber: a throwing onClose callback must not abort the loop
-    // or prevent notifyState('disconnected') from firing (which would strand the
-    // connection-state observer and could crash the worker/supervisor on a drop).
-    for (const cb of closeCbs) {
-      try { cb(); } catch (err) { log.debug?.(`agentic onClose subscriber threw — ${err?.message || err}`); }
-    }
-    notifyState('disconnected');
-  };
-
-  const send = (lane, family, payload) => {
-    if (!open || transport === null) {
-      // Contract: a not-open transport throws synchronously so the adapter can
-      // surface a SupervisorError the best-effort caller swallows (the next
-      // resync replays it). Guard here too so we never encode into a dead socket.
-      throw new Error(`agentic transport not open (cannot send ${family})`);
-    }
-    const check = validatePayload(family, payload);
-    if (!check.ok) {
-      const detail = check.errors.map((e) => `${e.code}:${e.message}`).join(', ');
-      throw new Error(`invalid ${family} payload — ${detail}`);
-    }
-    transport.send(encodeFrame({ lane, family, seq: nextSeq(), payload }));
-  };
-
-  const handleInbound = (bytes) => {
-    if (steerRoute === null) return;
+  const routeSteer = (bytes) => {
+    const route = getSteerRoute();
+    if (typeof route !== 'function') return;
     let frame;
     try {
       frame = decodeFrame(bytes);
@@ -182,122 +82,222 @@ function openHostConnection({ url, transportFactory, incarnation, support, logge
     }
     // Inbound steer rides the relay family as a DELIVERY chunk ({ stream, offset,
     // chunk }, no `op`) whose stream is one of our transcript streams; the stream
-    // carries the target instance + jobKey. A frame for a foreign stream is
+    // id carries the target instance + jobKey. A frame for a foreign stream is
     // dropped, never misrouted.
     if (frame.family !== 'relay') return;
     const payload = frame.payload;
     if (!payload || typeof payload !== 'object' || 'op' in payload) return;
-    const target = parseTranscriptStream(payload.stream);
-    if (target === null) return;
+    const target = parseStreamId(payload.stream);
+    if (target === undefined) return;
     const chunk = typeof payload.chunk === 'string' ? textEncoder.encode(payload.chunk) : new Uint8Array(0);
     try {
-      steerRoute(target.instance, target.jobKey, chunk);
+      // `target.stream` is `String(jobKey)` by the transcript convention.
+      route(target.instance, target.stream, chunk);
     } catch (err) {
       log.debug?.(`agentic: steer route threw — ${err?.message || err}`);
     }
   };
 
-  transport = transportFactory(url, {
+  const transport = transportFactory(url, {
     onOpen() {
-      open = true;
-      // Guard each subscriber: a throwing onOpen callback must not abort the loop
-      // or prevent notifyState('connected') from firing.
-      for (const cb of openCbs) {
-        try { cb(); } catch (err) { log.debug?.(`agentic onOpen subscriber threw — ${err?.message || err}`); }
-      }
-      notifyState('connected');
+      opened = true;
+      onOpenCb();
     },
     onFrame(bytes) {
-      handleInbound(bytes);
+      routeSteer(bytes);
+      onMessageCb(bytes);
     },
     onClose() {
-      fireClosed();
+      closed = true;
+      onCloseCb();
     },
     onError(err) {
-      // Non-fatal on its own; a close follows and drives the reconnect. Surface
-      // it for diagnosis only.
+      // Non-fatal on its own; a close follows and drives the client's reconnect.
       log.debug?.(`agentic transport error — ${err?.message || err}`);
     },
   });
 
   return {
-    register(instance, capability) {
-      send(CONTROL_LANE, 'register', { instance, capability: cleanCapability(capability) });
-    },
-    heartbeat(instance) {
-      send(CONTROL_LANE, 'heartbeat', { instance });
-    },
-    deregister(instance, reason) {
-      send(CONTROL_LANE, 'deregister', reason ? { instance, reason } : { instance });
-    },
-    claim(instance, jobKey) {
-      send(CONTROL_LANE, 'claim', { instance, jobKey });
-    },
-    release(instance, jobKey) {
-      send(CONTROL_LANE, 'release', { instance, jobKey });
-    },
-    transcript(instance, jobKey, chunk) {
-      send(BULK_LANE, 'relay', {
-        op: 'produce',
-        stream: composeTranscriptStream(instance, jobKey),
-        incarnation,
-        chunk: textDecoder.decode(chunk),
-      });
-    },
-    onSteer(route) {
-      steerRoute = route;
-    },
-    onOpen(cb) {
-      // If the transport is already open (injected/synchronous factories can
-      // open before this registers), fire immediately — otherwise the queued
-      // callback never runs and connect() hangs waiting for `opened`.
-      if (open) {
-        cb();
-        return;
-      }
-      openCbs.push(cb);
-    },
-    onClose(cb) {
-      // Mirror onOpen: if the transport already closed (injected/synchronous
-      // factories can close before this registers), fire immediately —
-      // otherwise a close-before-open is never observable and connect() hangs
-      // waiting for `opened` (neither onOpen nor onClose would ever run).
-      if (hasClosed) {
-        cb();
-        return;
-      }
-      closeCbs.push(cb);
+    send(bytes) {
+      // Drop sends outside the open window: a pre-open send (the client can
+      // emit before the transport's onOpen fires) or a post-close send would
+      // otherwise hit a transport that throws while connecting/torn down,
+      // producing noisy onError logs. The emit client replays presence + active
+      // claims on the next open anyway, so a dropped pre-open frame is not lost.
+      if (!opened || closed) return;
+      transport.send(bytes);
     },
     close() {
-      // Mark closed and drop the transport reference locally so post-close
-      // send() reliably throws (the not-open contract) even if the underlying
-      // transport delays or omits its close callback.
-      open = false;
-      hasClosed = true;
-      const t = transport;
-      transport = null;
       try {
-        t?.close();
+        transport.close();
       } catch {
         /* idempotent best-effort teardown — never throw on close */
       }
-      // Notify subscribers ourselves — never rely on the transport re-entering
-      // onClose after a caller-initiated teardown (it may delay or omit it),
-      // which would leave AgenticHandle.closed pending indefinitely. Idempotent:
-      // a subsequent transport onClose is a no-op.
-      fireClosed();
     },
-    supportsClaimRelease: support.claimRelease,
-    supportsSteer: support.steer,
+    onMessage(listener) {
+      if (typeof listener === 'function') onMessageCb = listener;
+    },
+    onOpen(listener) {
+      if (typeof listener !== 'function') return;
+      onOpenCb = listener;
+      // If the transport already opened before this registered (synchronous
+      // injected factories can), fire immediately.
+      if (opened) listener();
+    },
+    onClose(listener) {
+      if (typeof listener !== 'function') return;
+      onCloseCb = listener;
+      // Mirror onOpen: a close-before-registration is observable immediately.
+      if (closed) listener();
+    },
+  };
+}
+
+/**
+ * Build a {@link import('./supervisor.dist.js').RawEmitClient} backed by ONE
+ * {@link AgenticEmitClient}. The client owns reconnect + resync internally; this
+ * adapter maps its emitter surface onto the port and installs the inbound-steer
+ * seam the client does not carry.
+ */
+function buildRawEmitClient({ channelUrl, transportFactory, peerAdvertisement, logger, onConnectionState }) {
+  const log = logger || {};
+  // The inbound-steer route, shared with every socket the client opens across
+  // reconnects (each fresh EmitSocket reads it, so steer survives a flap without
+  // a per-reconnect re-install).
+  const steerHolder = { route: null };
+
+  let firstOpenFired = false;
+  let permanentlyClosed = false;
+  const openSubs = [];
+  const closeSubs = [];
+
+  const notifyState = (state) => {
+    if (typeof onConnectionState !== 'function') return;
+    try {
+      onConnectionState(state);
+    } catch (err) {
+      log.debug?.(`agentic onConnectionState threw — ${err?.message || err}`);
+    }
+  };
+
+  const client = new AgenticEmitClient({
+    connect: () => makeEmitSocket(channelUrl, transportFactory, () => steerHolder.route, log),
+    peerAdvertisement,
+    onOpen() {
+      // Fires AFTER the client's resync on every (re)connect. Track liveness on
+      // each, but resolve the single-shot RawEmitClient `onOpen` (which drives
+      // the Effect connect) only once, on the first open.
+      notifyState('connected');
+      if (firstOpenFired) return;
+      firstOpenFired = true;
+      for (const cb of openSubs.splice(0)) {
+        try {
+          cb();
+        } catch (err) {
+          log.debug?.(`agentic onOpen subscriber threw — ${err?.message || err}`);
+        }
+      }
+    },
+    onClose() {
+      // A transient mid-life drop: the client reconnects itself and replays
+      // presence + claims from its write-through shadow. Surface liveness only —
+      // the RawEmitClient's single-shot `onClose` is reserved for a permanent
+      // teardown so `superviseAgentic` never double-reconnects underneath it.
+      if (permanentlyClosed) return;
+      notifyState('disconnected');
+    },
+    onError(err) {
+      log.debug?.(`agentic emit error — ${err?.message || err}`);
+    },
+  });
+
+  // Negotiated protocol is fixed at construction (additive): a legacy hub that
+  // never learned families 8/9 yields a negotiation without claim/release, so the
+  // adapter reports them unsupported and the supervisor degrades to a no-op.
+  const negotiated = client.protocol;
+  const supportsClaimRelease =
+    negotiated.supportsFeature('claim-release') &&
+    negotiated.supportsFamily('claim') &&
+    negotiated.supportsFamily('release');
+  const supportsSteer = negotiated.supportsFamily('relay');
+
+  // Open the first socket; the client drives every subsequent reconnect.
+  client.open();
+
+  return {
+    register(instance, capability) {
+      client.register(instance, capability || {});
+    },
+    heartbeat(instance) {
+      client.heartbeat(instance);
+    },
+    deregister(instance, reason) {
+      client.deregister(instance, reason);
+    },
+    claim(instance, jobKey) {
+      client.claim(instance, jobKey);
+    },
+    release(instance, jobKey) {
+      client.release(instance, jobKey);
+    },
+    transcript(instance, jobKey, chunk) {
+      // The transcript convention: stream = String(jobKey); the client composes
+      // the injective per-instance stream id via composeStreamId.
+      client.transcript({ instance, stream: String(jobKey) }, textDecoder.decode(chunk));
+    },
+    onSteer(route) {
+      steerHolder.route = route;
+    },
+    onOpen(cb) {
+      // If already open (the client can open before this registers), fire now —
+      // otherwise the queued callback never runs and connect() hangs.
+      if (typeof cb !== 'function') return;
+      if (firstOpenFired) {
+        cb();
+        return;
+      }
+      openSubs.push(cb);
+    },
+    onClose(cb) {
+      // Mirror onOpen: if already permanently closed, fire immediately so a
+      // post-close subscriber still observes the drop.
+      if (typeof cb !== 'function') return;
+      if (permanentlyClosed) {
+        cb();
+        return;
+      }
+      closeSubs.push(cb);
+    },
+    close() {
+      if (permanentlyClosed) return;
+      // Mark closed BEFORE teardown so the client's transient onClose observer
+      // no-ops and only this permanent path notifies subscribers + liveness.
+      permanentlyClosed = true;
+      try {
+        client.close();
+      } catch {
+        /* idempotent best-effort teardown — never throw on close */
+      }
+      for (const cb of closeSubs.splice(0)) {
+        try {
+          cb();
+        } catch (err) {
+          log.debug?.(`agentic onClose subscriber threw — ${err?.message || err}`);
+        }
+      }
+      notifyState('disconnected');
+    },
+    supportsClaimRelease,
+    supportsSteer,
   };
 }
 
 /**
  * Build the `RawEmitConnect` factory the supervisor's `makeAgenticEndpoint`
- * lifts into `deps.agenticEndpoint`. Each returned `connect()` opens ONE fresh
- * multiplexed host connection (a reconnect calls it again), stamped with a
- * strictly-increasing incarnation so a reconnected transcript producer fences
- * its stale predecessor.
+ * lifts into `deps.agenticEndpoint`. Each returned `connect()` constructs ONE
+ * {@link AgenticEmitClient} over a single multiplexed host connection; the client
+ * owns its own reconnect + resync, so — unlike the retired bespoke client —
+ * `superviseAgentic` does not re-`connect` or re-emit per drop.
  *
  * The WebSocket transport is loaded once through the plugin's single import
  * surface (`loadAgenticClient()` — which installs the source→dist resolve hook so
@@ -309,40 +309,28 @@ function openHostConnection({ url, transportFactory, incarnation, support, logge
  * @param {string} [opts.token] ADR 0028 identity token (carried as `?token=`)
  * @param {string} [opts.credential] capability credential (carried as `?capability=`)
  * @param {import('@nanobpm/agentic/protocol').ProtocolAdvertisement} [opts.remoteAdvertisement]
- *   the peer's advertised support; omit to assume full support (see {@link negotiatedSupport})
- * @param {number} [opts.incarnationBase] first transcript incarnation (default `Date.now()`)
+ *   the peer's advertised support; omit to assume full support
  * @param {import('@nanobpm/urban-agent-client').TransportFactory} [opts.transportFactory] injectable transport (tests)
  * @param {(state: 'connected'|'disconnected') => void} [opts.onConnectionState] observer fired
- *   when a connection opens/drops, so a caller can track the single host connection's
- *   liveness (e.g. the supervisor activity marker's agentic status)
+ *   when the single host connection opens/drops, so a caller can track its liveness
  * @param {{ warn?: Function, debug?: Function }} [opts.logger]
  * @returns {Promise<() => import('./supervisor.dist.js').RawEmitClient>} a synchronous `connect` factory
  */
 export async function createRawEmitConnect(opts) {
-  const { url, token, credential, remoteAdvertisement, incarnationBase, transportFactory, logger, onConnectionState } = opts || {};
+  const { url, token, credential, remoteAdvertisement, transportFactory, logger, onConnectionState } = opts || {};
   if (typeof url !== 'string' || url.trim() === '') {
     throw new Error('createRawEmitConnect requires an agentic channel base url');
   }
 
   const channelUrl = buildAgenticUrl(url, { token, credential });
   const factory = transportFactory ?? (await loadAgenticClient()).websocketTransport;
-  const support = negotiatedSupport(remoteAdvertisement);
-
-  // Strictly-increasing per-connection incarnation so successive reconnects fence
-  // their predecessor on the hub's transcript ring (a monotonic takeover counter,
-  // seeded from the clock so a later-started process starts ahead).
-  let generation = Number.isInteger(incarnationBase) && incarnationBase >= 0 ? incarnationBase : Date.now();
 
   return () =>
-    openHostConnection({
-      url: channelUrl,
+    buildRawEmitClient({
+      channelUrl,
       transportFactory: factory,
-      incarnation: generation++,
-      support,
+      peerAdvertisement: remoteAdvertisement,
       logger,
       onConnectionState,
     });
 }
-
-// Exposed for unit tests / reuse.
-export { composeTranscriptStream, parseTranscriptStream, negotiatedSupport, cleanCapability };

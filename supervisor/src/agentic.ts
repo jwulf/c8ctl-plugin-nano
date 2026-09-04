@@ -184,12 +184,19 @@ export const withAgenticConnection = <A, E, R>(
  *    transport; the ownership frame emitters read it each time, so a reconnect
  *    swaps the socket transparently while the supervisor loop and the claim
  *    registry stay put.
- *  - On every (re)connect, `onEstablished` runs **before** anything resumes — this
- *    is the resync hook: re-`register` all workers and re-`claim` all active jobs
- *    (see `resyncOwnership`) so the cockpit never blanks a still-running job.
- *  - The connect→resync→await-`closed`→teardown cycle repeats forever; it races
- *    against `use`, so when `use` finishes (or fails/interrupts) the supervision
- *    fiber is interrupted and the live socket torn down deterministically.
+ *  - When the connection is first established, `onEstablished` runs **before**
+ *    anything resumes — the hook where the caller installs the inbound steer
+ *    router so steering survives a socket flap. Transient reconnects are now
+ *    **owned by the emit client** (#186) and happen *inside* the handle without
+ *    surfacing here, so `onEstablished` fires once per live handle rather than per
+ *    physical reconnect. The wire-level replay of presence + active claims is
+ *    likewise owned by the emit client — it re-emits its write-through shadow on
+ *    reconnect — so `onEstablished` no longer drives a manual registry resync.
+ *  - `handle.closed` now signals a **permanent** teardown (not a transient blip),
+ *    so the connect→establish→hold-until-`closed`→teardown cycle effectively holds
+ *    a single live handle until permanent close. It races against `use`, so when
+ *    `use` finishes (or fails/interrupts) the supervision fiber is interrupted and
+ *    the live socket torn down deterministically.
  */
 export interface SupervisedAgentic {
   /** The current transport, or `null` between a drop and the next reconnect. */
@@ -205,15 +212,17 @@ export const superviseAgentic = <A, E, R>(
   config: AgenticConfig = defaultAgenticConfig,
 ): Effect.Effect<A, E | SupervisorError, R> =>
   Effect.gen(function* () {
-    // One connect → publish → resync → hold-until-dropped → teardown cycle.
+    // One connect → establish (install steer route) → hold-until-permanently-closed → teardown cycle.
     const cycle = Effect.acquireUseRelease(
       endpoint.connect().pipe(Effect.retry(reconnectSchedule(config))),
       (handle) =>
         Ref.set(handleRef, handle).pipe(
-          Effect.tap(() => Effect.sync(() => logger.debug?.("agentic: (re)connected — resyncing"))),
-          // Resync BEFORE resuming transcript: re-register + re-claim active jobs.
+          Effect.tap(() => Effect.sync(() => logger.debug?.("agentic: connected"))),
+          // Install the inbound steer router BEFORE resuming transcript. Presence +
+          // active-claim replay on reconnect is owned by the emit client (#186).
           Effect.flatMap(() => onEstablished(handle)),
-          // Stay live until the transport signals a mid-life drop (or forever).
+          // Stay live until the transport signals a PERMANENT close (transient
+          // reconnects are handled inside the emit client and never surface here).
           Effect.flatMap(() => handle.closed ?? Effect.never),
         ),
       (handle) =>

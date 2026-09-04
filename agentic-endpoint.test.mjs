@@ -1,20 +1,23 @@
-// Tests for the concrete host-connection agentic endpoint (issue #160).
+// Tests for the concrete host-connection agentic endpoint (issues #160, #186).
+//
+// Since #186 the endpoint is a thin adapter over `@nanobpm/agentic/emit`'s
+// `AgenticEmitClient`: it lifts one emit client onto the Effect-free
+// `RawEmitClient` port and owns two seams the pure emitter does not — inbound
+// steer routing (decoded here, keyed by the package `parseStreamId`) and mapping
+// a mid-life drop to a liveness transition (the client owns reconnect + resync).
 //
 // A fake transport (implementing the `{ send, close }` contract + driving the
-// hooks) stands in for the WebSocket, so these run under stock `node --test` with
-// no live hub and no client-lib load. Sent frames are DECODED with the real S0
-// codec to assert exact family / lane / per-instance payload — the wire, not a
-// mock of it.
+// `{ onOpen, onFrame, onClose, onError }` hooks) stands in for the WebSocket, so
+// these run under stock `node --test` with no live hub. Sent frames are DECODED
+// with the real S0 codec to assert exact family / lane / per-instance payload —
+// the wire, not a mock of it. Stream ids are the package `composeStreamId` codec.
 
 import assert from 'node:assert/strict';
 import test from 'node:test';
-import { decodeFrame } from './agentic.mjs';
-import {
-  createRawEmitConnect,
-  composeTranscriptStream,
-  parseTranscriptStream,
-  negotiatedSupport,
-} from './agentic-endpoint.mjs';
+import { decodeFrame, encodeFrame, composeStreamId, parseStreamId } from './agentic.mjs';
+import { createRawEmitConnect } from './agentic-endpoint.mjs';
+
+const tick = () => new Promise((resolve) => setTimeout(resolve, 10));
 
 // A minimal in-memory transport double. Records every frame the client sends and
 // lets a test drive open / drop / inbound-deliver deterministically.
@@ -59,11 +62,11 @@ const URL = 'http://localhost:8080';
 
 test('emits presence + ownership frames with explicit per-instance identity on the control lane', async () => {
   const fake = makeFakeTransportFactory();
-  const connect = await createRawEmitConnect({ url: URL, transportFactory: fake.factory, incarnationBase: 100 });
+  const connect = await createRawEmitConnect({ url: URL, transportFactory: fake.factory });
   const client = connect();
   fake.last().fireOpen();
 
-  client.register('worker-a', { cognition: 'senior', host: 'h1', weight: undefined });
+  client.register('worker-a', { cognition: 'senior', host: 'h1' });
   client.register('worker-b', { cognition: 'junior' });
   client.claim('worker-a', 'job-1');
   client.heartbeat('worker-a');
@@ -82,15 +85,15 @@ test('emits presence + ownership frames with explicit per-instance identity on t
       'control/deregister/worker-b',
     ],
   );
-  // capability is cleaned (undefined dropped) and jobKey carried explicitly.
+  // Capability + jobKey are carried explicitly per frame.
   assert.deepEqual(frames[0].payload.capability, { cognition: 'senior', host: 'h1' });
   assert.equal(frames[2].payload.jobKey, 'job-1');
   assert.equal(frames[5].payload.reason, 'left');
 });
 
-test('transcript rides the bulk lane as a relay produce, isolated per {instance, jobKey}', async () => {
+test('transcript rides the bulk lane as a relay produce, isolated per {instance, jobKey} via composeStreamId', async () => {
   const fake = makeFakeTransportFactory();
-  const connect = await createRawEmitConnect({ url: URL, transportFactory: fake.factory, incarnationBase: 42 });
+  const connect = await createRawEmitConnect({ url: URL, transportFactory: fake.factory });
   const client = connect();
   fake.last().fireOpen();
 
@@ -101,43 +104,57 @@ test('transcript rides the bulk lane as a relay produce, isolated per {instance,
   assert.deepEqual(
     frames.map((f) => [f.lane, f.family, f.payload.op, f.payload.stream, f.payload.incarnation, f.payload.chunk]),
     [
-      ['bulk', 'relay', 'produce', composeTranscriptStream('worker-a', 'job-1'), 42, 'hello'],
-      ['bulk', 'relay', 'produce', composeTranscriptStream('worker-b', 'job-1'), 42, 'world'],
+      ['bulk', 'relay', 'produce', composeStreamId('worker-a', 'job-1'), 0, 'hello'],
+      ['bulk', 'relay', 'produce', composeStreamId('worker-b', 'job-1'), 0, 'world'],
     ],
   );
   // The two instances' streams are distinct even for the same jobKey.
   assert.notEqual(frames[0].payload.stream, frames[1].payload.stream);
 });
 
-test('a send before open (or after drop) throws synchronously so the caller can re-buffer', async () => {
+test('a send before open is dropped (the emit client buffers state; the next resync replays it), never thrown', async () => {
   const fake = makeFakeTransportFactory();
   const connect = await createRawEmitConnect({ url: URL, transportFactory: fake.factory });
   const client = connect();
 
-  assert.throws(() => client.register('w', {}), /not open/);
-  fake.last().fireOpen();
+  // Not open yet — the emit send degrades to a no-op on the wire (no throw).
   assert.doesNotThrow(() => client.register('w', {}));
-  fake.last().drop();
-  assert.throws(() => client.heartbeat('w'), /not open/);
+  assert.equal(fake.last().sent.length, 0, 'nothing on the wire before open');
+
+  fake.last().fireOpen();
+  client.register('w', {});
+  assert.equal(fake.last().sentFrames.at(-1).family, 'register');
 });
 
-test('successive connections carry strictly increasing transcript incarnations (fences a stale predecessor)', async () => {
+test('the emit client owns reconnect: on a mid-life drop it re-registers + re-claims from its shadow and bumps the incarnation', async () => {
   const fake = makeFakeTransportFactory();
-  const connect = await createRawEmitConnect({ url: URL, transportFactory: fake.factory, incarnationBase: 7 });
-
-  const first = connect();
+  const connect = await createRawEmitConnect({ url: URL, transportFactory: fake.factory });
+  const client = connect();
   fake.transports[0].fireOpen();
-  first.transcript('w', 'j', new TextEncoder().encode('a'));
 
-  const second = connect();
+  client.register('w', { cognition: 'senior' });
+  client.claim('w', 'j');
+  client.transcript('w', 'j', new TextEncoder().encode('a'));
+  assert.equal(fake.transports[0].sentFrames.find((f) => f.family === 'relay').payload.incarnation, 0);
+
+  // Drop → the client schedules its own reconnect (no supervisor involvement).
+  fake.transports[0].drop();
+  await tick();
+  assert.equal(fake.transports.length, 2, 'the client opened a fresh socket itself');
   fake.transports[1].fireOpen();
-  second.transcript('w', 'j', new TextEncoder().encode('b'));
 
-  assert.equal(fake.transports[0].sentFrames[0].payload.incarnation, 7);
-  assert.equal(fake.transports[1].sentFrames[0].payload.incarnation, 8);
+  // Resync replayed presence + the active claim onto the new socket, before any
+  // new transcript — the reconnect re-emit is the client's, from its shadow.
+  const families = fake.transports[1].sentFrames.map((f) => `${f.family}/${f.payload.instance ?? ''}`);
+  assert.ok(families.includes('register/w'), 're-registered on reconnect');
+  assert.ok(families.includes('claim/w'), 're-claimed the active job on reconnect');
+
+  client.transcript('w', 'j', new TextEncoder().encode('b'));
+  const relay = fake.transports[1].sentFrames.find((f) => f.family === 'relay');
+  assert.equal(relay.payload.incarnation, 1, 'a resumed producer fences its stale predecessor');
 });
 
-test('open/close callbacks fire and close() tears the transport down', async () => {
+test('onOpen fires on connect; onClose is reserved for a PERMANENT close (a transient drop does not fire it)', async () => {
   const fake = makeFakeTransportFactory();
   const connect = await createRawEmitConnect({ url: URL, transportFactory: fake.factory });
   const client = connect();
@@ -146,14 +163,26 @@ test('open/close callbacks fire and close() tears the transport down', async () 
   client.onClose(() => events.push('close'));
 
   fake.last().fireOpen();
-  fake.last().drop();
-  client.close();
+  assert.deepEqual(events, ['open']);
 
+  // A transient mid-life drop must NOT complete the supervisor's `closed` (the
+  // emit client reconnects underneath) — so no 'close' here.
+  fake.last().drop();
+  assert.deepEqual(events, ['open'], 'a transient drop is not a permanent close');
+
+  client.close();
   assert.deepEqual(events, ['open', 'close']);
-  assert.equal(fake.last().closed, true);
+
+  // And a permanent close on a still-live connection tears its transport down.
+  const fake2 = makeFakeTransportFactory();
+  const connect2 = await createRawEmitConnect({ url: URL, transportFactory: fake2.factory });
+  const live = connect2();
+  fake2.last().fireOpen();
+  live.close();
+  assert.equal(fake2.transports[0].closed, true);
 });
 
-test('an inbound relay-delivery frame for our stream is routed to the steer sink by instance/jobKey', async () => {
+test('an inbound relay-delivery frame for our stream is routed to the steer sink by instance/jobKey (parseStreamId)', async () => {
   const fake = makeFakeTransportFactory();
   const connect = await createRawEmitConnect({ url: URL, transportFactory: fake.factory });
   const client = connect();
@@ -163,7 +192,7 @@ test('an inbound relay-delivery frame for our stream is routed to the steer sink
   client.onSteer((instance, jobKey, chunk) => routed.push({ instance, jobKey, text: new TextDecoder().decode(chunk) }));
 
   // Craft an inbound relay DELIVERY chunk (no `op`) for worker-a/job-1.
-  const inbound = encodeRelayDelivery(composeTranscriptStream('worker-a', 'job-1'), 3, 'steer-me');
+  const inbound = encodeRelayDelivery(composeStreamId('worker-a', 'job-1'), 3, 'steer-me');
   fake.last().deliver(inbound);
   // …and a foreign stream, which must be dropped (never misrouted).
   fake.last().deliver(encodeRelayDelivery('blackboard/other', 0, 'nope'));
@@ -171,34 +200,37 @@ test('an inbound relay-delivery frame for our stream is routed to the steer sink
   assert.deepEqual(routed, [{ instance: 'worker-a', jobKey: 'job-1', text: 'steer-me' }]);
 });
 
-test('negotiatedSupport degrades claim/release against a hub that never learned families 8/9', () => {
+test('negotiation degrades claim/release against a hub that never learned families 8/9, but keeps steer', async () => {
+  const fake = makeFakeTransportFactory();
   const legacy = {
     version: 1,
     families: ['register', 'heartbeat', 'deregister', 'serve', 'demand', 'blackboard', 'relay'],
     features: [],
   };
-  const legacySupport = negotiatedSupport(legacy);
-  assert.equal(legacySupport.claimRelease, false, 'no claim/release against a pre-#158 hub');
-  assert.equal(legacySupport.steer, true, 'steer still available (relay negotiated)');
+  const legacyConnect = await createRawEmitConnect({ url: URL, transportFactory: fake.factory, remoteAdvertisement: legacy });
+  const legacyClient = legacyConnect();
+  assert.equal(legacyClient.supportsClaimRelease, false, 'no claim/release against a pre-#158 hub');
+  assert.equal(legacyClient.supportsSteer, true, 'steer still available (relay negotiated)');
 
-  const full = negotiatedSupport(undefined);
-  assert.equal(full.claimRelease, true, 'full support assumed when no remote advertisement is supplied');
+  const fullConnect = await createRawEmitConnect({ url: URL, transportFactory: fake.factory });
+  const fullClient = fullConnect();
+  assert.equal(fullClient.supportsClaimRelease, true, 'full support assumed when no remote advertisement is supplied');
 });
 
-test('parseTranscriptStream is the exact inverse of composeTranscriptStream (round-trip, collision-free)', () => {
-  for (const [instance, jobKey] of [
+test('parseStreamId is the exact inverse of composeStreamId (round-trip, collision-free)', () => {
+  for (const [instance, stream] of [
     ['worker-a', 'job-1'],
     ['a/b', 'c/d'],
     ['inst with spaces', 'jk?&='],
   ]) {
-    assert.deepEqual(parseTranscriptStream(composeTranscriptStream(instance, jobKey)), { instance, jobKey });
+    assert.deepEqual(parseStreamId(composeStreamId(instance, stream)), { instance, stream });
   }
-  assert.equal(parseTranscriptStream('blackboard/x'), null);
-  assert.equal(parseTranscriptStream('t/only-two'), null);
+  // A malformed / foreign id is rejected rather than mistaken for a valid ref.
+  assert.equal(parseStreamId('blackboard/x'), undefined);
+  assert.equal(parseStreamId('t/only-two'), undefined);
 });
 
 // ---- helper: encode a relay DELIVERY frame (as the hub would send inbound) ----
-import { encodeFrame } from './agentic.mjs';
 function encodeRelayDelivery(stream, offset, chunk) {
   return encodeFrame({ lane: 'bulk', family: 'relay', seq: 0, payload: { stream, offset, chunk } });
 }

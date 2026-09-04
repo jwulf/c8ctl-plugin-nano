@@ -125,18 +125,28 @@ every other code path stays Effect-free.
   a per-instance `SteerRouter` fans inbound steer bytes back to the right agent so N
   agents' streams never cross). `supervisor.ts` composes them behind `Schedule`
   cadences.
-- **Concrete agentic endpoint (issue #160).** The `AgenticEndpoint` the supervisor
-  injects as `deps.agenticEndpoint` is a thin, deterministically-testable Effect
-  adapter (`emit.ts`, `makeAgenticEndpoint`) that lifts a plain, Effect-free
+- **Concrete agentic endpoint (issues #160, #186).** The `AgenticEndpoint` the
+  supervisor injects as `deps.agenticEndpoint` is a thin, deterministically-testable
+  Effect adapter (`emit.ts`, `makeAgenticEndpoint`) that lifts a plain, Effect-free
   `RawEmitClient` — ONE multiplexed host connection — into the Effect
-  `AgenticHandle`. The wire itself is CONSUMED through the monolith's single import
-  surface (`agentic-endpoint.mjs` → `agentic.mjs` → `@nanobpm/agentic` `^0.11.0`'s
-  `claim`/`release` families 8/9 + additive negotiation), so it is NOT bundled into
-  the quarantined Effect module. The monolith composes the two via
-  `createAgenticEndpoint()`. Every frame carries its `instance` EXPLICITLY (one
-  connection, N workers); `claim`/`release`/steer are OMITTED from the handle when
-  the negotiated protocol lacks them, so an old hub degrades to a no-op rather than
-  a protocol error.
+  `AgenticHandle`. Since #186 the raw client is itself a thin adapter over
+  `@nanobpm/agentic/emit`'s `AgenticEmitClient` (the blessed emit client): the
+  monolith no longer hand-rolls a parallel emit/ownership layer or its own
+  `t/<instance>/<jobKey>` stream id — it adapts the package client and its injective
+  `composeStreamId`/`parseStreamId` codec (`stream = String(jobKey)`). The wire is
+  CONSUMED through the monolith's single import surface (`agentic-endpoint.mjs` →
+  `agentic.mjs` → `@nanobpm/agentic` `^0.13.0`'s `emit` client, `claim`/`release`
+  families 8/9 + additive negotiation), so it is NOT bundled into the quarantined
+  Effect module. The monolith composes the two via `createAgenticEndpoint()`. Every
+  frame carries its `instance` EXPLICITLY (one connection, N workers);
+  `claim`/`release`/steer are OMITTED from the handle when the negotiated protocol
+  lacks them, so an old hub degrades to a no-op rather than a protocol error.
+  **Reconnect + resync is owned by the emit client**: it re-emits presence + active
+  claims from its write-through shadow on every reconnect (fed by `ownership.ts`,
+  which stays the authority + single write path), so `superviseAgentic` no longer
+  drives a manual registry resync — it only re-installs the inbound steer router.
+  The adapter still owns the inbound-steer seam (the emit client is a pure emitter):
+  it decodes each inbound relay DELIVERY frame and routes it via `parseStreamId`.
 - **Concrete engine + deps seam (issue #156).** The same "monolith supplies a
   plain Effect-free client, a TS lift wraps it into an Effect port" pattern extends
   to the remaining edges. `adapters.ts` lifts a raw `RawEngineClient`

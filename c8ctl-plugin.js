@@ -7329,9 +7329,12 @@ async function workAgent(req, flags) {
   // the socket opens (or without a channel at all).
   writeActivity();
   // Track the live connection state on the activity marker so the supervisor
-  // shows connected↔disconnected transitions (#99). A close carries a normalized
-  // diagnostic under the contract `agentic.message` field (not `reason`) so a hub
-  // drop explains WHY; a fresh (re)connect clears any stale message.
+  // shows connected↔disconnected transitions (#99). Diagnostics ride the contract
+  // `agentic.message` field (not `reason`): the endpoint's connection observer
+  // only reports a state (`connected`/`disconnected`) — the underlying close does
+  // not surface a reason — so a hub drop records a generic 'connection dropped'
+  // message, while an endpoint-construction failure records the normalized error
+  // (see the catch below). A fresh (re)connect clears any stale message.
   const markAgentic = (status, message = null) => { agenticState = { ...agenticState, status, message }; writeActivity(); };
   // Build the ONE multiplexed host-connection endpoint (issue #173) for the
   // resolved connect config and hand it to the single-owner runtime as
@@ -7857,7 +7860,14 @@ async function workAgent(req, flags) {
               try { SupervisorEffect.runSync(supervisor.transcript(workerName, String(jobKey), agenticEncoder.encode(text))); } catch { /* best effort */ }
             },
             subscribeSteer: (onChunk) => {
-              const sink = (_jk, chunk) => SupervisorEffect.sync(() => onChunk(chunk));
+              // The router keys sinks by instance, not jobKey, so it hands every
+              // steer frame for this instance to the active sink. Filter by the
+              // session's own jobKey before delivering: even at capacity=1 a
+              // late/queued steer frame for a PRIOR job could otherwise land in
+              // the NEXT job's PTY. Drop any frame whose jobKey isn't this job's.
+              const sink = (jk, chunk) => SupervisorEffect.sync(() => {
+                if (String(jk) === String(jobKey)) onChunk(chunk);
+              });
               try { SupervisorEffect.runSync(supervisor.steerRouter.register(workerName, sink)); } catch { /* best effort */ }
               return () => { try { SupervisorEffect.runSync(supervisor.steerRouter.unregister(workerName)); } catch { /* best effort */ } };
             },

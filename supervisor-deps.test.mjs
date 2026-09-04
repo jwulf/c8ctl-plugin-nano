@@ -25,8 +25,8 @@ function makeEngineFetch() {
       served = true;
       return { ok: true, status: 200, json: async () => ({ jobs }), text: async () => "" };
     }
-    if (/\/jobs\/.+\/timeout$/.test(String(url))) {
-      extended.push({ url: String(url), timeout: JSON.parse(init.body).timeout });
+    if (init?.method === "PATCH" && /\/jobs\/[^/]+$/.test(String(url))) {
+      extended.push({ url: String(url), timeout: JSON.parse(init.body).changeset.timeout });
       return { ok: true, status: 204, json: async () => ({}), text: async () => "" };
     }
     return { ok: false, status: 404, json: async () => ({}), text: async () => "" };
@@ -86,7 +86,7 @@ test("createSupervisorDeps: composes runnable deps and drives one dispatch cycle
   // via the composed EngineClient over the v2 REST client.
   assert.ok(fetchImpl.extended.length >= 1, "the lock was extended over the v2 REST client");
   assert.equal(fetchImpl.extended[0].timeout, 300_000);
-  assert.match(fetchImpl.extended[0].url, /\/v2\/jobs\/job-1\/timeout$/);
+  assert.match(fetchImpl.extended[0].url, /\/v2\/jobs\/job-1$/);
 });
 
 test("createSupervisorDeps: activate → dispatch → run → SETTLE — the runner completes via the exposed engine settle seam", async () => {
@@ -115,7 +115,7 @@ test("createSupervisorDeps: activate → dispatch → run → SETTLE — the run
       served = true;
       return { ok: true, status: 200, json: async () => ({ jobs }), text: async () => "" };
     }
-    if (/\/jobs\/.+\/timeout$/.test(u)) {
+    if (init?.method === "PATCH" && /\/jobs\/[^/]+$/.test(u)) {
       return { ok: true, status: 204, json: async () => ({}), text: async () => "" };
     }
     if (/\/jobs\/.+\/completion$/.test(u)) {

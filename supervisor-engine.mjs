@@ -13,10 +13,15 @@
  *     long-poll, resolving 0..`maxJobsToActivate` jobs (0 == the long-poll
  *     expired empty). `timeout` is the SHORT initial lock (the crash-safety net);
  *     `requestTimeout` is how long the call blocks server-side.
- *   - `extendLock` → `PATCH <base>/v2/jobs/{jobKey}/timeout` with `{ timeout }`.
+ *   - `extendLock` → the SDK's typed `updateJob` (operationId `updateJob`,
+ *     `PATCH <base>/v2/jobs/{jobKey}` with `{ changeset: { timeout } }`) when a
+ *     `camunda` SDK client is injected, else the SAME call issued raw via
+ *     `fetchImpl` (so the module stays wire-testable without a live client).
  *     The C8 contract SETs the lock to `ms` from now (a duration-from-now), which
  *     is exactly the supervisor's "extend the winner to the recovery window, then
- *     heartbeat" model — set, not accumulate.
+ *     heartbeat" model — set, not accumulate. NOTE: there is no
+ *     `/jobs/{jobKey}/timeout` sub-route — that was a drifted URL that 404s on the
+ *     engine; the timeout is a `changeset` field on the job resource itself.
  *
  * This module is the raw-JS analogue of `agentic-endpoint.mjs`: it is Effect-free
  * (the supervisor's `makeEngineClient` lift wraps each method into the Effect
@@ -146,6 +151,7 @@ export function createRawEngineClient(opts = {}) {
     authHeaders,
     fetchImpl = fetch,
     requestTimeoutSlackMs = 5_000,
+    camunda,
   } = opts;
   if (typeof fetchImpl !== "function") {
     throw new TypeError("createRawEngineClient: `fetchImpl` must be a function (global fetch or an injected fake)");
@@ -210,8 +216,21 @@ export function createRawEngineClient(opts = {}) {
     },
 
     async extendLock(jobKey, ms) {
-      const url = `${base}/jobs/${encodeURIComponent(jobKey)}/timeout`;
-      const res = await call(url, { method: "PATCH", body: JSON.stringify({ timeout: ms }) }, 15_000);
+      // Prefer the SDK's typed `updateJob` (operationId `updateJob` →
+      // `PATCH /v2/jobs/{jobKey}` with `{ changeset: { timeout } }`) so the lock
+      // extension tracks the engine contract instead of a hand-rolled URL. Fall
+      // back to the SAME call issued raw when no SDK client is injected (keeps
+      // this module wire-testable and usable standalone).
+      if (camunda && typeof camunda.updateJob === "function") {
+        try {
+          await camunda.updateJob({ changeset: { timeout: ms }, jobKey: String(jobKey) });
+          return;
+        } catch (err) {
+          throw new Error(`extendLock ${jobKey}: SDK updateJob failed: ${err?.message ?? err}`);
+        }
+      }
+      const url = `${base}/jobs/${encodeURIComponent(jobKey)}`;
+      const res = await call(url, { method: "PATCH", body: JSON.stringify({ changeset: { timeout: ms } }) }, 15_000);
       if (!res || !res.ok) {
         const status = res ? res.status : "?";
         throw new Error(`extendLock ${jobKey}: HTTP ${status} from ${url}${res ? await readErrorBody(res) : ""}`);

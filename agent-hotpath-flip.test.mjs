@@ -104,6 +104,9 @@ function engineFetch(engine) {
     if (/\/jobs\/[^/]+\/timeout$/.test(u)) {
       // extendLock — the engine sets the lock from now; a no-op here is sound
       // because the virtual clock never advances in-test, so no lock lapses.
+      // Lock-extension behaviour (extend-before-start + periodic re-extend) is
+      // asserted deterministically under TestClock in supervisor/test/dispatch.test.ts;
+      // this end-to-end flip test only exercises activation → run → settle.
       return ok204;
     }
 

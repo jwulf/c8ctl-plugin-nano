@@ -7640,21 +7640,18 @@ async function workAgent(req, flags) {
         // #130: per-task liveness overrides. Precedence: envelope override →
         // worker-flag default → built-in default, each clamped to a sane max so
         // a task can't request an unbounded window. Absent envelope fields leave
-        // the worker-flag behaviour unchanged. These drive BOTH the harness idle
-        // liveness (idle/recovery) AND the broker lock recovery window, so a
-        // JVM-heavy task can widen its own window without a global flag change.
+        // the worker-flag behaviour unchanged. These drive the harness idle
+        // liveness (idle/recovery/hard-cap) so a JVM-heavy task can widen its own
+        // window without a global flag change. NOTE: after the hot-path flip
+        // (#172) the broker lock cadence/window is owned by the supervisor
+        // runtime dispatch config at the worker level (worker `recoveryWindowMs`
+        // / `lockExtendIntervalMs`), so a per-task override no longer widens the
+        // broker lock window — only the harness liveness.
         const {
           idleTimeoutMs: effectiveIdleTimeoutMs,
           recoveryWindowMs: effectiveRecoveryWindowMs,
           hardCapMs: effectiveHardCapMs,
         } = resolveLivenessOverrides(envelope.task, { idleTimeoutMs, recoveryWindowMs, hardCapMs });
-        // Recompute the lock-extend cadence from the effective recovery window
-        // (same ~1/3-of-window rule as at startup) so a widened window still
-        // renews comfortably before it lapses.
-        const effectiveLockExtendIntervalMs = Math.min(
-          Math.max(5_000, Math.floor(effectiveRecoveryWindowMs / 3)),
-          Math.max(1, Math.floor(effectiveRecoveryWindowMs * 0.75)),
-        );
         if (
           effectiveIdleTimeoutMs !== idleTimeoutMs ||
           effectiveRecoveryWindowMs !== recoveryWindowMs ||

@@ -37,9 +37,15 @@ test('every local module reachable from a published entry is itself published', 
     if (seen.has(rel)) continue;
     seen.add(rel);
     const abs = join(here, rel);
-    if (!existsSync(abs)) continue; // a published-but-absent entry is caught by the on-disk pass below
+    // a missing declared entry is asserted below; a missing import was already recorded
+    // in missingOnDisk when its importer pushed it, so nothing slips through here
+    if (!existsSync(abs)) continue;
     for (const spec of localImports(readFileSync(abs, 'utf8'))) {
-      const target = normalize(join(dirname(rel), spec)).replace(/^\.\//, '');
+      // package.json#files paths are POSIX, but join/normalize emit backslashes on
+      // Windows — fold them so the whitelist match doesn't false-fail there
+      const target = normalize(join(dirname(rel), spec))
+        .replace(/\\/g, '/')
+        .replace(/^\.\//, '');
       if (!/\.(mjs|js|json)$/.test(target)) continue; // skip dir/extensionless (none today)
       if (!published.has(target)) missingFromFiles.push({ importedBy: rel, target });
       if (!existsSync(join(here, target))) missingOnDisk.push({ importedBy: rel, target });
@@ -47,6 +53,19 @@ test('every local module reachable from a published entry is itself published', 
     }
   }
 
+  // npm silently drops absent `files` entries, so a stale whitelist ships a broken
+  // package even when nothing imports the missing file — assert every declared entry exists
+  const declaredMissingOnDisk = [...new Set([pkg.main, ...pkg.files])].filter(
+    (f) => !existsSync(join(here, f)),
+  );
+
+  assert.deepEqual(
+    declaredMissingOnDisk,
+    [],
+    `Declared package.json entry/ies missing on disk (npm would silently drop them from the tarball):\n${declaredMissingOnDisk
+      .map((x) => `  ${x}`)
+      .join('\n')}`,
+  );
   assert.deepEqual(
     missingFromFiles,
     [],

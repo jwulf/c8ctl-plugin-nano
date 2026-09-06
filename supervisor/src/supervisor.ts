@@ -39,6 +39,7 @@ import {
   makePresenceSink,
   makeSteerRouter,
   projectPresence,
+  resyncPresenceOnEstablish,
   type PresenceConfig,
   type PresenceSink,
   type SteerRouter,
@@ -156,6 +157,12 @@ export const makeSupervisor = (deps: SupervisorDeps): Effect.Effect<Supervisor> 
     // deregister from the registry, and the steer router fans inbound bytes back
     // to the right agent — all keyed by explicit instance over the single socket.
     const presenceSink = makePresenceSink(supervised, logger);
+    // The announced-instance set for the presence projection. Owned here (not
+    // inside `projectPresence`) so `resyncPresenceOnEstablish` can reset it on
+    // every (re)connect, re-`register`ing all owned instances over the fresh
+    // handle — closing the connect-after-first-tick race (#192) where the initial
+    // register was emitted into a still-null `currentHandle` and silently lost.
+    const presenceKnownRef = yield* Ref.make<ReadonlySet<string>>(new Set());
     const steerRouter = yield* makeSteerRouter(logger);
 
     const dispatchDeps = {
@@ -234,7 +241,7 @@ export const makeSupervisor = (deps: SupervisorDeps): Effect.Effect<Supervisor> 
       // identities as workers join/leave the registry. Only meaningful with a live
       // connection, so it is forked alongside the loops inside the agentic scope.
       if (deps.agenticEndpoint) {
-        yield* Effect.forkChild(projectPresence(ownership, presenceSink, cfg.presence));
+        yield* Effect.forkChild(projectPresence(ownership, presenceSink, presenceKnownRef, cfg.presence));
       }
       return yield* tick.pipe(Effect.forever);
     });
@@ -244,16 +251,28 @@ export const makeSupervisor = (deps: SupervisorDeps): Effect.Effect<Supervisor> 
           deps.agenticEndpoint,
           logger,
           handleRef,
-          // The AgenticEmitClient owns reconnect + resync (#186): it re-emits
-          // presence and re-claims every active job from its write-through shadow
-          // on every reconnect, so the manual re-register/re-claim resync is
-          // retired. The registry stays the authority and the single write path
-          // into the client. Transient reconnects happen inside the emit client
-          // and are not observed here, so this hook installs the inbound steer
-          // router once (on the initial establish); the router then persists
-          // across the client's internal reconnects via the shared steer route
-          // holder, so steering survives a socket flap.
-          (handle) => installSteerRoute(handle, steerRouter, logger),
+          // On establish, install the inbound steer router AND re-assert presence.
+          //
+          // The AgenticEmitClient owns reconnect + wire-level replay (#186): on a
+          // transient socket flap it re-emits presence and re-claims every active
+          // job from its write-through shadow, WITHOUT surfacing here — so this
+          // hook fires once per live handle, not per physical reconnect, and the
+          // steer router (installed once) persists across the client's internal
+          // reconnects via the shared route holder.
+          //
+          // But the shadow only replays what was actually written to it, and the
+          // projection's initial `register` is a silent no-op (never reaching the
+          // shadow) if it ticks before `currentHandle` is set on the first open
+          // (#192). So re-assert presence here — reset the announced set and
+          // project one step over the now-live handle — guaranteeing every owned
+          // instance is `register`ed once the socket is up. `register` is an
+          // idempotent presence-store upsert, so this is safe on every establish.
+          (handle) =>
+            installSteerRoute(handle, steerRouter, logger).pipe(
+              Effect.flatMap(() =>
+                resyncPresenceOnEstablish(ownership, presenceSink, presenceKnownRef),
+              ),
+            ),
           run,
           deps.agenticConfig,
         ) as Effect.Effect<never>)

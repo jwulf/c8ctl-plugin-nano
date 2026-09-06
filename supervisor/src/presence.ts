@@ -132,19 +132,49 @@ export const projectPresenceStep = (
  * ticks between a drop and the next reconnect are harmless no-ops (the reconnect
  * resync re-registers + re-claims immediately, and the next tick resumes
  * heartbeats on the fresh handle).
+ *
+ * `knownRef` (the set of already-announced instances) is owned by the caller so
+ * that {@link resyncPresenceOnEstablish} can reset it on every (re)connect,
+ * forcing a re-`register` over the fresh handle — see that function for the
+ * connect-after-first-tick race this closes (#192).
  */
 export const projectPresence = (
   ownership: OwnershipRegistry,
   sink: PresenceSink,
+  knownRef: Ref.Ref<ReadonlySet<string>>,
   config: PresenceConfig = defaultPresenceConfig,
 ): Effect.Effect<never> =>
-  Ref.make<ReadonlySet<string>>(new Set()).pipe(
-    Effect.flatMap((knownRef) =>
-      projectPresenceStep(ownership, sink, knownRef).pipe(
-        Effect.repeat(Schedule.spaced(Duration.millis(config.heartbeatIntervalMs))),
-      ),
-    ),
+  projectPresenceStep(ownership, sink, knownRef).pipe(
+    Effect.repeat(Schedule.spaced(Duration.millis(config.heartbeatIntervalMs))),
   ) as Effect.Effect<never>;
+
+/**
+ * Re-assert presence on a freshly (re)established handle: forget the announced
+ * set (`knownRef`) and run one projection step, so every currently-owned instance
+ * is `register`ed again over the NEW handle.
+ *
+ * Closes the connect-after-first-tick race (#192): the projection emits an
+ * instance's initial `register` exactly once — on the tick it first `appeared` —
+ * then records it in `knownRef` unconditionally. But `sink.register` is a silent
+ * no-op while `superviseAgentic`'s `currentHandle` is still `null` (the socket
+ * hasn't opened yet), and such a dropped pre-open register never reaches the emit
+ * client's write-through shadow either, so the shadow's reconnect replay has
+ * nothing to replay. If that first tick lost the race with the socket open, the
+ * worker then only ever `heartbeat`s (a no-op at the store for an unregistered
+ * instance): it activates jobs on the engine plane yet stays invisible in the
+ * cockpit presence registry — forever. Wiring this into `onEstablished`
+ * guarantees a `register` once the handle is actually live; `register` is
+ * idempotent (a presence-store upsert), so re-asserting on every establish is
+ * safe. The `heartbeat`/`deregister` cadence is unchanged.
+ */
+export const resyncPresenceOnEstablish = (
+  ownership: OwnershipRegistry,
+  sink: PresenceSink,
+  knownRef: Ref.Ref<ReadonlySet<string>>,
+): Effect.Effect<void> =>
+  Ref.set(knownRef, new Set<string>()).pipe(
+    Effect.flatMap(() => projectPresenceStep(ownership, sink, knownRef)),
+  );
 
 // ---- Inbound steer lane (keyed by instance) ------------------------------------------
 

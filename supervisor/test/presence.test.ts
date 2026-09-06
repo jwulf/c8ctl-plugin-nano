@@ -11,6 +11,7 @@ import {
   makeSteerRouter,
   projectPresence,
   projectPresenceStep,
+  resyncPresenceOnEstablish,
   type PresenceSink,
 } from "../src/presence.ts";
 import { makeSupervisor } from "../src/supervisor.ts";
@@ -156,7 +157,8 @@ test("projectPresence: heartbeats every registered instance on the Schedule cade
       yield* ownership.register("w2", {});
       yield* ownership.register("w3", {});
 
-      const fiber = yield* Effect.forkChild(projectPresence(ownership, sink, { heartbeatIntervalMs: 1_000 }));
+      const knownRef = yield* Ref.make<ReadonlySet<string>>(new Set());
+      const fiber = yield* Effect.forkChild(projectPresence(ownership, sink, knownRef, { heartbeatIntervalMs: 1_000 }));
       yield* TestClock.adjust(Duration.millis(1)); // first tick → register all three
       assert.deepEqual(
         rec.frames.filter((f) => f.startsWith("register:")).sort(),
@@ -170,6 +172,98 @@ test("projectPresence: heartbeats every registered instance on the Schedule cade
         rec.frames.filter((f) => f.startsWith("heartbeat:")).sort(),
         ["heartbeat:w1", "heartbeat:w2", "heartbeat:w3"],
       );
+      yield* Fiber.interrupt(fiber);
+    }).pipe(Effect.provide(TestClock.layer())),
+  );
+});
+
+// --- Regression: connect-after-first-tick race (#192) ------------------------
+
+test("resyncPresenceOnEstablish: re-registers an instance whose initial register was dropped into a null handle", async () => {
+  await Effect.runPromise(
+    Effect.gen(function* () {
+      const rec = recordingHandle();
+      const ownership = yield* makeOwnershipRegistry();
+      // `currentHandle` starts null — the socket has not opened yet — exactly as
+      // `superviseAgentic` leaves it until `endpoint.connect()` resolves.
+      const handleRef = yield* Ref.make<AgenticHandle | null>(null);
+      const sink = makePresenceSink({ currentHandle: Ref.get(handleRef) });
+      const knownRef = yield* Ref.make<ReadonlySet<string>>(new Set());
+
+      // The instance is seeded in the registry (the plugin's seedPresence) BEFORE
+      // the first projection tick.
+      yield* ownership.register("agent-1", { cognition: "senior" });
+
+      // First projection tick while the handle is still null: register is a
+      // silent no-op, yet the instance is recorded as "known" — so every later
+      // tick only heartbeats and it is never registered again.
+      yield* projectPresenceStep(ownership, sink, knownRef);
+      assert.equal(rec.frames.length, 0, "nothing reaches the wire while the handle is null");
+
+      // Socket opens: superviseAgentic sets currentHandle, then runs onEstablished.
+      yield* Ref.set(handleRef, rec.handle);
+
+      // Without the resync the next tick only heartbeats (the bug: present on the
+      // job plane, invisible in the cockpit). Assert the projection alone does NOT
+      // recover — pinning the failure mode.
+      yield* projectPresenceStep(ownership, sink, knownRef);
+      assert.ok(
+        !rec.frames.some((f) => f.startsWith("register:")),
+        "the projection alone never re-registers the lost instance (only heartbeats)",
+      );
+      assert.ok(rec.frames.includes("heartbeat:agent-1"), "it heartbeats an unregistered instance (a store no-op)");
+
+      // onEstablished's resync forgets the announced set and re-projects, so the
+      // instance is finally registered over the now-live handle.
+      rec.frames.length = 0;
+      yield* resyncPresenceOnEstablish(ownership, sink, knownRef);
+      assert.ok(rec.frames.includes("register:agent-1"), "resync-on-establish registers the recovered instance");
+    }),
+  );
+});
+
+test("supervisor: a worker whose connect resolves AFTER the first presence tick is still registered (#192)", async () => {
+  await Effect.runPromise(
+    Effect.gen(function* () {
+      const rec = recordingHandle();
+      const engine = makeEngine({ activate: () => Effect.never as never });
+      const runner = makeRunner(0);
+      const reg = yield* makeRegistry();
+      const reader = makeReader([[]], {});
+
+      const sup = yield* makeSupervisor({
+        engine,
+        runner,
+        registry: reg,
+        reconcileReader: reader,
+        scan: () => [],
+        logger: noopLogger,
+        // Connect resolves only after 50ms — so the presence projection's first
+        // (immediate) tick fires while `currentHandle` is still null, dropping the
+        // initial register. This reproduces the macbook cockpit-invisibility bug.
+        agenticEndpoint: {
+          connect: () => Effect.sleep(Duration.millis(50)).pipe(Effect.as(rec.handle)),
+        },
+        agenticConfig: { reconnectBaseMs: 0, reconnectMaxMs: 10 },
+        config: { presence: { heartbeatIntervalMs: 1_000 }, idleSpacingMs: 1_000 },
+      });
+
+      yield* sup.ownership.register("agent-1", { cognition: "senior", family: "copilot" });
+
+      const fiber = yield* Effect.forkChild(sup.run);
+      yield* TestClock.adjust(Duration.millis(1)); // first presence tick — handle still null
+      assert.equal(rec.frames.length, 0, "no frame reaches the wire before the socket opens");
+
+      yield* TestClock.adjust(Duration.millis(50)); // connect resolves → establish → resync
+      assert.ok(
+        rec.frames.includes("register:agent-1"),
+        "the worker is registered once the delayed connection establishes",
+      );
+
+      rec.frames.length = 0;
+      yield* TestClock.adjust(Duration.millis(1_000)); // one cadence later
+      assert.ok(rec.frames.includes("heartbeat:agent-1"), "and then heartbeats on the Schedule cadence");
+
       yield* Fiber.interrupt(fiber);
     }).pipe(Effect.provide(TestClock.layer())),
   );

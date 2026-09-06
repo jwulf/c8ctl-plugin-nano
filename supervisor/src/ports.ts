@@ -49,6 +49,21 @@ export interface ActivatedJob {
   readonly retries?: number;
   /** The owning process-instance key — surfaced for logging/audit, matching the SDK job. */
   readonly processInstanceKey?: string;
+  /**
+   * The element instance the job's element resolves to — the correlation key for an
+   * engine-native AgentInstance (issue #194). Present on an agent job; absent on an
+   * ordinary service job. Opaque passthrough to the runner.
+   */
+  readonly elementInstanceKey?: string;
+  /** The BPMN element id that produced the job — stamped onto AgentHistory turns. */
+  readonly elementId?: string;
+  /**
+   * The opaque per-activation lease token the engine stamps on an `external`
+   * (job-backed) agent job. Distinct from the job's deadline; it lease-gates a
+   * `createAgentInstance`/`updateAgentInstance` so a stale/mismatched lease is
+   * rejected (nanobpmn #1099/#1106). Absent on non-agent jobs.
+   */
+  readonly jobLease?: string;
 }
 
 /** One per-type activation request. `maxJobsToActivate` is sized per-type to that type's free-slot count (capped by `maxBatchPerType`). */

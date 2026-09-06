@@ -21,6 +21,7 @@
   ],
   "files": [
     "c8ctl-plugin.js",
+    "agent-instance.mjs",
     "platforms.mjs",
     "agentic.mjs",
     "agentic-loader-hook.mjs",

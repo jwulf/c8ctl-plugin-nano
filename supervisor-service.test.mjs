@@ -99,6 +99,22 @@ test('buildSystemdUserUnit: __daemon ExecStart, crash-only restart, default.targ
   assert.match(unit, /Environment=C8CTL_NANO_HOME=\/state/);
 });
 
+test('buildSystemdUserUnit: quotes/escapes paths and env values with whitespace or specials', () => {
+  const unit = buildSystemdUserUnit({
+    exec: '/opt/node runtime/bin/node',
+    entry: '/opt/c8 ctl/index.js',
+    env: { WS: '/home/a b/state', PCT: 'a%b', PATH: '/usr/bin' },
+  });
+  // ExecStart args with whitespace are double-quoted; the trailing fixed args stay bare.
+  assert.match(unit, /ExecStart="\/opt\/node runtime\/bin\/node" "\/opt\/c8 ctl\/index\.js" nano supervisor __daemon/);
+  // A value with whitespace quotes the whole KEY=VALUE assignment.
+  assert.match(unit, /Environment="WS=\/home\/a b\/state"/);
+  // A literal % is doubled so systemd never treats it as a specifier.
+  assert.match(unit, /Environment=PCT=a%%b/);
+  // Simple values stay unquoted.
+  assert.match(unit, /Environment=PATH=\/usr\/bin/);
+});
+
 test('shouldWarnSshTeardown: only macOS + SSH + not installed', () => {
   const ssh = { SSH_CONNECTION: 'x' };
   const local = {};

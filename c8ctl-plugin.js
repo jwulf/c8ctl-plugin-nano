@@ -9277,7 +9277,7 @@ function supervisorRequest(req, { socketPath, timeoutMs, responseTimeoutMs = SUP
  * Ensure a daemon is running, spawning it detached if not, and return its
  * running state. Polls the control socket until it answers a status request.
  */
-async function startSupervisorDaemon() {
+async function startSupervisorDaemon({ adoptOnly = false } = {}) {
   const existing = runningSupervisor();
   if (existing) return existing;
 
@@ -9285,18 +9285,32 @@ async function startSupervisorDaemon() {
   // The state file may be missing (deleted, cleaned up, or not yet written)
   // while a daemon is still listening on the deterministic socket. Adopt that
   // live daemon instead of spawning a second one that would orphan the
-  // original and its workers.
-  try {
-    const res = await supervisorRequest({ op: 'status' }, { socketPath, timeoutMs: 500, responseTimeoutMs: SUPERVISOR_PROBE_RESPONSE_TIMEOUT_MS });
-    if (res && res.ok) {
-      // Re-persist the adopted daemon's state so subsequent pid-based checks
-      // (runningSupervisor()) work immediately, instead of staying broken until
-      // some later command happens to heal supervisor.json.
-      const adopted = runningSupervisor() || stateFromStatus(res, socketPath);
-      try { writeSupervisorState(adopted); } catch { /* best effort */ }
-      return adopted;
-    }
-  } catch { /* no live daemon on the socket — safe to (re)spawn */ }
+  // original and its workers. When a service was just installed/reparented
+  // (adoptOnly), the launchd/systemd-owned daemon may still be booting, so poll
+  // the socket up to the connect timeout rather than racing to spawn a second,
+  // session-bound daemon that would fight it over the same socket/state.
+  const adoptDeadline = adoptOnly ? Date.now() + SUPERVISOR_CONNECT_TIMEOUT_MS : 0;
+  for (;;) {
+    try {
+      const res = await supervisorRequest({ op: 'status' }, { socketPath, timeoutMs: 500, responseTimeoutMs: SUPERVISOR_PROBE_RESPONSE_TIMEOUT_MS });
+      if (res && res.ok) {
+        // Re-persist the adopted daemon's state so subsequent pid-based checks
+        // (runningSupervisor()) work immediately, instead of staying broken until
+        // some later command happens to heal supervisor.json.
+        const adopted = runningSupervisor() || stateFromStatus(res, socketPath);
+        try { writeSupervisorState(adopted); } catch { /* best effort */ }
+        return adopted;
+      }
+    } catch { /* no live daemon on the socket yet */ }
+    if (Date.now() >= adoptDeadline) break;
+    await new Promise((r) => setTimeout(r, 150));
+  }
+
+  if (adoptOnly) {
+    // A service owns the daemon; never spawn a competing session-bound one —
+    // that is exactly the wedge reparenting exists to avoid.
+    throw new Error(`supervisor service was installed but its daemon did not become ready (see ${supervisorDaemonLogFile()})`);
+  }
 
   clearSupervisorState(); // clear any stale marker from a dead daemon
 
@@ -9333,8 +9347,8 @@ async function startSupervisorDaemon() {
 
 async function supervisorStartCmd(req, flags) {
   const logger = getLogger();
-  await maybeReparentOrWarnOnStart(logger);
-  const state = await startSupervisorDaemon();
+  const serviceOwned = await maybeReparentOrWarnOnStart(logger);
+  const state = await startSupervisorDaemon({ adoptOnly: serviceOwned });
   logger.info(`Supervisor daemon running (pid ${state.pid}).`);
 
   const specs = normalizeArgList(flags?.worker);
@@ -9814,14 +9828,48 @@ ${envXml}
 }
 
 /**
+ * Quote one `ExecStart` argument for a systemd unit. systemd splits the command
+ * line on unquoted whitespace, so any argument containing whitespace or a shell
+ * metacharacter must be double-quoted with C-style escaping inside. A literal
+ * `%` is doubled so systemd never mistakes it for a specifier (e.g. `%h`).
+ */
+function systemdQuoteExecArg(arg) {
+  const s = String(arg).replace(/%/g, '%%');
+  if (s === '') return '""';
+  if (/[\s"'\\`$;&|<>()]/.test(String(arg))) {
+    return `"${s.replace(/[\\"]/g, (c) => `\\${c}`)}"`;
+  }
+  return s;
+}
+
+/**
+ * Render one `Environment=` line for a systemd unit. When the `KEY=VALUE`
+ * assignment contains whitespace or a quote/backslash, the whole assignment is
+ * double-quoted (systemd otherwise splits it into multiple assignments on
+ * whitespace). A literal `%` is doubled so it is not expanded as a specifier.
+ */
+function systemdEnvLine(k, v) {
+  const key = String(k).replace(/%/g, '%%');
+  const val = String(v).replace(/%/g, '%%');
+  const assignment = `${key}=${val}`;
+  if (/[\s"'\\`$]/.test(`${k}=${v}`)) {
+    return `Environment="${assignment.replace(/[\\"]/g, (c) => `\\${c}`)}"`;
+  }
+  return `Environment=${assignment}`;
+}
+
+/**
  * Build a `systemd --user` unit that runs `nano supervisor __daemon`.
  * `Restart=on-failure` mirrors the launchd KeepAlive: a crash is restarted, an
- * intentional `supervisor stop` (clean exit) stays down.
+ * intentional `supervisor stop` (clean exit) stays down. `exec`/`entry` and env
+ * values are quoted/escaped so paths or values with whitespace or quotes don't
+ * make systemd misparse the line and fail to start the service.
  */
 function buildSystemdUserUnit({ exec, entry, env = {} }) {
+  const cmd = `${systemdQuoteExecArg(exec)} ${systemdQuoteExecArg(entry)} nano supervisor __daemon`;
   const envLines = Object.entries(env)
     .filter(([, v]) => v != null && v !== '')
-    .map(([k, v]) => `Environment=${k}=${String(v)}`)
+    .map(([k, v]) => systemdEnvLine(k, v))
     .join('\n');
   return `[Unit]
 Description=c8ctl nano worker supervisor
@@ -9830,7 +9878,7 @@ Wants=network-online.target
 
 [Service]
 Type=simple
-ExecStart=${exec} ${entry} nano supervisor __daemon
+ExecStart=${cmd}
 ${envLines}
 Restart=on-failure
 RestartSec=5
@@ -10032,18 +10080,21 @@ async function supervisorUninstallCmd() {
  * persistent `gui/$UID` launchd domain (via an installed LaunchAgent) so it
  * survives logout instead of dying with the SSH session. If we cannot (or the
  * operator opts out with C8CTL_NANO_NO_LAUNCHD), warn loudly and fall through to
- * the ordinary detached spawn. A no-op on every non-exposed path (Linux, a
- * local login, an already-installed service, or adopting a live daemon).
+ * the ordinary detached spawn. Returns `true` when a service now owns the daemon
+ * (already installed, or just reparented) so the caller adopts it instead of
+ * spawning a competing session-bound daemon; `false` on every non-exposed path
+ * (Linux, a local login, opt-out/failure, or adopting a live daemon).
  */
 async function maybeReparentOrWarnOnStart(logger) {
-  if (osPlatform() !== 'darwin') return;      // Linux already survives logout
-  if (supervisorServiceInstalled()) return;   // an installed service is session-independent
-  if (!isSshSession()) return;                // a local login session isn't torn down like SSH
-  if (await liveSupervisor()) return;         // adopting an existing daemon — nothing to re-parent
-  if (coerceBool(process.env.C8CTL_NANO_NO_LAUNCHD, false)) { warnSshTeardown(logger); return; }
+  if (osPlatform() !== 'darwin') return false;     // Linux already survives logout
+  if (supervisorServiceInstalled()) return true;   // an installed service already owns the daemon
+  if (!isSshSession()) return false;               // a local login session isn't torn down like SSH
+  if (await liveSupervisor()) return false;        // adopting an existing daemon — nothing to re-parent
+  if (coerceBool(process.env.C8CTL_NANO_NO_LAUNCHD, false)) { warnSshTeardown(logger); return false; }
   logger.info('macOS + SSH detected — re-parenting the supervisor into the gui launchd domain so it survives logout…');
   const ok = await installSupervisorServiceDarwin(logger);
-  if (!ok) warnSshTeardown(logger);
+  if (!ok) { warnSshTeardown(logger); return false; }
+  return true; // the launchd service now owns the daemon — adopt it, don't spawn
 }
 
 /** Dispatch the `supervisor` subcommand's action. */

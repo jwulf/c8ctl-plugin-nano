@@ -1018,11 +1018,19 @@ c8ctl nano supervisor uninstall   # stop + remove it
 - `KeepAlive`/`Restart` are **crash-only**: a `supervisor stop` (clean exit) stays
   down; only a crash is restarted.
 
-When you run `supervisor start` **over SSH on macOS without the installed
-service**, the CLI **auto-reparents** the daemon into the `gui/$UID` launchd
-domain (equivalent to `install`) so it survives logout, and tells you. If it
-cannot (e.g. `launchctl` is unavailable, or you set `C8CTL_NANO_NO_LAUNCHD=1`), it
-prints a prominent **warning** pointing at `supervisor install` instead of
+When the service **is installed**, every path that starts the daemon
+(`supervisor start`, and a bare `supervisor` / `supervisor attach`) brings it up
+**through the service**: it kickstarts the LaunchAgent when a clean `stop` left it
+down (a plain `kickstart`, never `-k`, so a running fleet is not bounced) and then
+**adopts** that service-owned daemon instead of spawning a second, session-bound
+one. Only if the service cannot be started does it fall back to a detached spawn
+(saying so).
+
+When you run `supervisor start` or `attach` **over SSH on macOS without the
+installed service**, the CLI **auto-reparents** the daemon into the `gui/$UID`
+launchd domain (equivalent to `install`) so it survives logout, and tells you. If
+it cannot (e.g. `launchctl` is unavailable, or you set `C8CTL_NANO_NO_LAUNCHD=1`),
+it prints a prominent **warning** pointing at `supervisor install` instead of
 silently leaving a fleet that will wedge on logout.
 
 ## Composing a workforce: `workforce`

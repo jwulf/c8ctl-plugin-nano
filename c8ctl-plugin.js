@@ -9345,10 +9345,21 @@ async function startSupervisorDaemon({ adoptOnly = false } = {}) {
   throw new Error(`supervisor daemon did not become ready (see ${logFile})`);
 }
 
+/**
+ * Bring the daemon up under the session-independence policy: re-parent into the
+ * persistent launchd domain when macOS-over-SSH is exposed (or a service is
+ * already installed), then adopt the service-owned daemon instead of spawning a
+ * competing session-bound one. Every command that starts the daemon goes through
+ * here, so no path can silently bypass the policy and recreate the logout wedge.
+ */
+async function startSupervisorWithServicePolicy(logger = getLogger()) {
+  const serviceOwned = await maybeReparentOrWarnOnStart(logger);
+  return startSupervisorDaemon({ adoptOnly: serviceOwned });
+}
+
 async function supervisorStartCmd(req, flags) {
   const logger = getLogger();
-  const serviceOwned = await maybeReparentOrWarnOnStart(logger);
-  const state = await startSupervisorDaemon({ adoptOnly: serviceOwned });
+  const state = await startSupervisorWithServicePolicy(logger);
   logger.info(`Supervisor daemon running (pid ${state.pid}).`);
 
   const specs = normalizeArgList(flags?.worker);
@@ -9433,7 +9444,7 @@ async function supervisorAddCmd(req, flags) {
     logger.error('--name cannot be combined with --instances > 1 (each instance needs a distinct name); omit --name to auto-name them.');
     process.exit(1);
   }
-  await startSupervisorDaemon();
+  await startSupervisorWithServicePolicy(logger);
   const workArgs = reconstructWorkArgs(flags);
   let added = 0;
   let failed = 0;
@@ -10076,18 +10087,52 @@ async function supervisorUninstallCmd() {
 }
 
 /**
- * On a macOS `supervisor start` over SSH, re-parent the daemon into the
+ * Start an already-installed LaunchAgent when it is not running, so a
+ * service-owned start can adopt it. `RunAtLoad` only fires at bootstrap/login and
+ * `KeepAlive` is crash-only, so nothing brings the daemon back after a clean
+ * `supervisor stop` — adopt-only would poll an empty socket and fail. Plain
+ * `kickstart` (never `-k`) is a no-op when the service is up, so a live fleet is
+ * never bounced; a service launchd no longer has loaded is re-bootstrapped from
+ * its plist. `run`/`uid`/`label`/`plistPath` are injectable for deterministic tests.
+ */
+function ensureLaunchAgentStarted(logger, { run = runLaunchctl, uid, label, plistPath } = {}) {
+  const svcUid = uid ?? (typeof process.getuid === 'function' ? process.getuid() : 0);
+  const target = launchdServiceTarget(svcUid, label ?? supervisorServiceLabel());
+  let kick = run(['kickstart', target]);
+  if (kick.code === 0) return true;
+
+  // Not loaded in the domain (a `bootout` without uninstall, or a login that
+  // predated the plist): reload it from disk. `bootstrap`'s own status is not the
+  // verdict — an already-loaded service reports a non-zero "Input/output error" —
+  // so re-enable, kick again, and let that decide.
+  run(['bootstrap', launchdDomainTarget(svcUid), plistPath ?? launchAgentPlistPath()]);
+  run(['enable', target]);
+  kick = run(['kickstart', target]);
+  if (kick.code === 0) return true;
+  logger.warn(`launchctl kickstart failed: ${kick.stderr || kick.error?.message || 'unknown error'}`);
+  return false;
+}
+
+/**
+ * On a macOS `supervisor start`/`attach` over SSH, re-parent the daemon into the
  * persistent `gui/$UID` launchd domain (via an installed LaunchAgent) so it
  * survives logout instead of dying with the SSH session. If we cannot (or the
  * operator opts out with C8CTL_NANO_NO_LAUNCHD), warn loudly and fall through to
- * the ordinary detached spawn. Returns `true` when a service now owns the daemon
+ * the ordinary detached spawn. Returns `true` when a service owns the daemon
  * (already installed, or just reparented) so the caller adopts it instead of
  * spawning a competing session-bound daemon; `false` on every non-exposed path
- * (Linux, a local login, opt-out/failure, or adopting a live daemon).
+ * (Linux, a local login, opt-out/failure, or a service that would not start).
  */
 async function maybeReparentOrWarnOnStart(logger) {
   if (osPlatform() !== 'darwin') return false;     // Linux already survives logout
-  if (supervisorServiceInstalled()) return true;   // an installed service already owns the daemon
+  if (supervisorServiceInstalled()) {
+    // An installed service owns the daemon — but make sure it is actually up
+    // first, or adopt-only would time out on the empty socket a clean stop left.
+    if (await liveSupervisor()) return true;
+    if (ensureLaunchAgentStarted(logger)) return true;
+    logger.warn('The installed supervisor service would not start; falling back to a detached (session-bound) daemon.');
+    return false;
+  }
   if (!isSshSession()) return false;               // a local login session isn't torn down like SSH
   if (await liveSupervisor()) return false;        // adopting an existing daemon — nothing to re-parent
   if (coerceBool(process.env.C8CTL_NANO_NO_LAUNCHD, false)) { warnSshTeardown(logger); return false; }
@@ -10106,7 +10151,9 @@ async function supervisorCommand(req, flags) {
       return;
     case '':
     case 'attach': {
-      const state = await startSupervisorDaemon();
+      // Same session-independence policy as `supervisor start`: a bare `attach`
+      // must not spawn a session-bound daemon that an SSH logout wedges.
+      const state = await startSupervisorWithServicePolicy();
       await attachSupervisorConsole(runningSupervisor() || state);
       return;
     }
@@ -10936,7 +10983,7 @@ async function workforceStartCmd(req, flags, manifestName) {
     process.exit(1);
   }
 
-  const state = await startSupervisorDaemon();
+  const state = await startSupervisorWithServicePolicy(logger);
   logger.info(`Supervisor daemon running (pid ${state.pid}).`);
   const { reachable, workers: live } = await fetchSupervisorWorkers();
   // A running daemon with an unreachable status socket reports `live: []`, which
@@ -12944,6 +12991,7 @@ export {
   buildSystemdUserUnit,
   supervisorServiceInstalled,
   shouldWarnSshTeardown,
+  ensureLaunchAgentStarted,
 };
 
 export {

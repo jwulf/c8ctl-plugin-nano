@@ -3,9 +3,14 @@
 // systemd --user unit builders, the deterministic per-state-home service
 // label / paths / targets, and the SSH-logout-teardown warning predicate.
 // These are the deterministic, side-effect-free pieces; the launchctl /
-// systemctl IO is best-effort and exercised only on the target platform.
+// systemctl IO itself is best-effort and exercised only on the target platform,
+// but the *decisions* around it (which verbs run, in what order, and when we
+// give up) are covered here through an injected runner.
 import { test } from 'node:test';
 import assert from 'node:assert/strict';
+import { readFileSync } from 'node:fs';
+import { fileURLToPath } from 'node:url';
+import { dirname, join } from 'node:path';
 
 import {
   isSshSession,
@@ -20,7 +25,28 @@ import {
   buildLaunchAgentPlist,
   buildSystemdUserUnit,
   shouldWarnSshTeardown,
+  ensureLaunchAgentStarted,
 } from './c8ctl-plugin.js';
+
+const HERE = dirname(fileURLToPath(import.meta.url));
+
+/** A scripted `runLaunchctl` stand-in: records every argv, replies per verb. */
+function fakeLaunchctl(script = {}) {
+  const calls = [];
+  const ok = { code: 0, stdout: '', stderr: '' };
+  const run = (args) => {
+    calls.push(args);
+    const next = script[args[0]];
+    if (Array.isArray(next)) return next.length > 1 ? next.shift() : (next[0] ?? ok);
+    return next ?? ok;
+  };
+  return { run, calls };
+}
+
+function fakeLogger() {
+  const warns = [];
+  return { warns, logger: { info() {}, warn(m) { warns.push(m); }, error() {} } };
+}
 
 test('isSshSession: true only when an SSH_* marker is present', () => {
   assert.equal(isSshSession({}), false);
@@ -127,4 +153,87 @@ test('shouldWarnSshTeardown: only macOS + SSH + not installed', () => {
   // Not exposed: Linux survives logout under systemd-logind.
   assert.equal(shouldWarnSshTeardown({ platform: 'linux', env: ssh, installed: false }), false);
   assert.equal(shouldWarnSshTeardown({ platform: 'win32', env: ssh, installed: false }), false);
+});
+
+test('ensureLaunchAgentStarted: a plain kickstart is enough when launchd has the service', () => {
+  const { logger } = fakeLogger();
+  const { run, calls } = fakeLaunchctl({ kickstart: { code: 0 } });
+  assert.equal(ensureLaunchAgentStarted(logger, { run, uid: 501, label: 'io.test.sup', plistPath: '/p.plist' }), true);
+  assert.deepEqual(calls, [['kickstart', 'gui/501/io.test.sup']]);
+});
+
+test('ensureLaunchAgentStarted: never passes -k, so a live fleet is not bounced', () => {
+  const { logger } = fakeLogger();
+  const { run, calls } = fakeLaunchctl({ kickstart: [{ code: 5, stderr: 'Bootstrap failed: 5' }, { code: 0 }] });
+  assert.equal(ensureLaunchAgentStarted(logger, { run, uid: 501, label: 'io.test.sup', plistPath: '/p.plist' }), true);
+  assert.ok(calls.length > 0);
+  for (const argv of calls) assert.ok(!argv.includes('-k'), `must not kill/restart: ${argv.join(' ')}`);
+});
+
+test('ensureLaunchAgentStarted: re-bootstraps a service launchd no longer has loaded', () => {
+  const { logger, warns } = fakeLogger();
+  const { run, calls } = fakeLaunchctl({
+    kickstart: [{ code: 113, stderr: 'Could not find service "io.test.sup" in domain for gui/501' }, { code: 0 }],
+    bootstrap: { code: 0 },
+  });
+  assert.equal(ensureLaunchAgentStarted(logger, { run, uid: 501, label: 'io.test.sup', plistPath: '/p.plist' }), true);
+  assert.deepEqual(calls, [
+    ['kickstart', 'gui/501/io.test.sup'],
+    ['bootstrap', 'gui/501', '/p.plist'],
+    ['enable', 'gui/501/io.test.sup'],
+    ['kickstart', 'gui/501/io.test.sup'],
+  ]);
+  assert.deepEqual(warns, []);
+});
+
+test('ensureLaunchAgentStarted: a failed bootstrap is not the verdict — the retry kickstart is', () => {
+  const { logger, warns } = fakeLogger();
+  // launchctl reports a non-zero "Input/output error" when the service is already
+  // loaded, so gating on bootstrap's status would refuse to start a healthy agent.
+  const { run, calls } = fakeLaunchctl({
+    kickstart: [{ code: 5, stderr: 'Bootstrap failed: 5: Input/output error' }, { code: 0 }],
+    bootstrap: { code: 37, stderr: 'Bootstrap failed: 37: Operation already in progress' },
+  });
+  assert.equal(ensureLaunchAgentStarted(logger, { run, uid: 501, label: 'io.test.sup', plistPath: '/p.plist' }), true);
+  assert.deepEqual(warns, []);
+  assert.equal(calls.filter((argv) => argv[0] === 'kickstart').length, 2);
+});
+
+test('ensureLaunchAgentStarted: gives up (false + warn) when launchd will not start it', () => {
+  const { logger, warns } = fakeLogger();
+  const { run, calls } = fakeLaunchctl({
+    kickstart: { code: 113, stderr: 'Could not find service "io.test.sup" in domain for gui/501' },
+    bootstrap: { code: 125, stderr: 'Bootstrap failed: 125: Domain does not support specified action' },
+  });
+  assert.equal(ensureLaunchAgentStarted(logger, { run, uid: 501, label: 'io.test.sup', plistPath: '/p.plist' }), false);
+  assert.match(warns.join('\n'), /kickstart failed/);
+  // It tried the plist reload path too, then reported the kickstart verdict.
+  assert.deepEqual(calls, [
+    ['kickstart', 'gui/501/io.test.sup'],
+    ['bootstrap', 'gui/501', '/p.plist'],
+    ['enable', 'gui/501/io.test.sup'],
+    ['kickstart', 'gui/501/io.test.sup'],
+  ]);
+});
+
+test('every daemon-starting command path goes through the service-policy seam', () => {
+  // WHY a source scan: the wedge this PR fixes came from command paths calling
+  // `startSupervisorDaemon()` directly (a bare `supervisor`/`attach`, `supervisor
+  // add`, `workforce up`), so each spawned a session-bound daemon an SSH logout
+  // tore down — or raced the launchd-owned one for the socket. The cure is the
+  // single `startSupervisorWithServicePolicy` seam (reparent/kickstart → adopt).
+  // This repo has no ESLint, so this test IS the lint: a new direct caller fails it.
+  const src = readFileSync(join(HERE, 'c8ctl-plugin.js'), 'utf8');
+  const count = (re) => (src.match(re) || []).length;
+
+  // 1 definition + exactly 1 caller (the seam itself).
+  assert.equal(count(/startSupervisorDaemon\(/g), 2, 'start the daemon only via startSupervisorWithServicePolicy');
+  // 1 definition + 4 callers: `supervisor start`, `supervisor add`, the
+  // default/`attach` path, and the workforce reconcile.
+  assert.equal(count(/startSupervisorWithServicePolicy\(/g), 5, 'every daemon-starting path must use the seam');
+
+  const seam = src.match(/async function startSupervisorWithServicePolicy\(.*?\)\s*\{([\s\S]*?)\n\}/);
+  assert.ok(seam, 'startSupervisorWithServicePolicy must exist');
+  assert.match(seam[1], /maybeReparentOrWarnOnStart\(logger\)/);
+  assert.match(seam[1], /startSupervisorDaemon\(\{ adoptOnly: serviceOwned \}\)/);
 });

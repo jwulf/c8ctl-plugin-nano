@@ -140,6 +140,18 @@ function mapJob(raw) {
   }
   const pik = raw.processInstanceKey;
   if (pik !== undefined && pik !== null) job.processInstanceKey = String(pik);
+  // Engine-native AgentInstance attribution (issue #194): the element instance the
+  // AgentInstance correlates on, the element id, and the opaque per-activation
+  // `jobLease` token that lease-gates a `createAgentInstance` for an `external`
+  // agent job (nanobpmn #1099/#1106). These ride opaquely to the runner exactly as
+  // the SDK activation surfaces them; absent for ordinary (non-agent) jobs, in which
+  // case the durable-transcript producer stays inert.
+  const eik = raw.elementInstanceKey;
+  if (eik !== undefined && eik !== null) job.elementInstanceKey = String(eik);
+  const eid = raw.elementId;
+  if (eid !== undefined && eid !== null) job.elementId = String(eid);
+  const lease = raw.jobLease;
+  if (lease !== undefined && lease !== null) job.jobLease = String(lease);
   return job;
 }
 

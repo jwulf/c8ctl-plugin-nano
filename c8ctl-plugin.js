@@ -72,6 +72,10 @@ import { createLogRing, resolveLogMaxBytes } from './supervisor-log-ring.mjs';
 // raw ACP `session/update` to the exact transcript-chunk bytes the cockpit decodes,
 // replacing the plugin's former hand-rolled `nwfTranscriptEvent` envelope grammar.
 import { sessionAcp as agenticSessionAcp } from './agentic.mjs';
+// Engine-native AgentInstance / AgentHistory durable-transcript producer (issue
+// #194): mints an AgentInstance for an `external` agent job and appends each ACP
+// turn to the engine's append-only AgentHistory via the host SDK client.
+import { createAgentInstanceProducer, isExternalAgentJob } from './agent-instance.mjs';
 
 const requireFromHere = createRequire(import.meta.url);
 const pluginDir = dirname(fileURLToPath(import.meta.url));
@@ -4879,7 +4883,7 @@ const ACP_MAX_LINE_BYTES = 8 * 1024 * 1024; // 8 MiB
 // and every caller work unchanged. Because the raw stream is JSON-RPC (not human
 // output), `stdout` here is the accumulated human-readable transcript text (what
 // we relay), and `stderr` is the child's real stderr (agent diagnostics).
-function spawnCaptureAcp({ command, args = [], cwd, env, stdinData, timeoutMs, idleTimeoutMs, recoveryWindowMs, relayTap = null, stream = false, streamPrefix = '', onStreamOut, onStreamErr, permission = 'yolo', shell = false }) {
+function spawnCaptureAcp({ command, args = [], cwd, env, stdinData, timeoutMs, idleTimeoutMs, recoveryWindowMs, relayTap = null, stream = false, streamPrefix = '', onStreamOut, onStreamErr, permission = 'yolo', shell = false, onAcpUpdate = null }) {
   return new Promise((resolve) => {
     const logger = getLogger();
     const humanChunks = [];
@@ -5222,7 +5226,17 @@ function spawnCaptureAcp({ command, args = [], cwd, env, stdinData, timeoutMs, i
       }
       // A request or notification FROM the agent.
       if (typeof msg.method === 'string') {
-        if (msg.method === 'session/update') { emitTranscript(msg.params?.update); return; }
+        if (msg.method === 'session/update') {
+          emitTranscript(msg.params?.update);
+          // #194: durable engine-native producer seam. In parallel with the
+          // transcript-chunk relay overlay, hand the SAME raw `session/update` to
+          // the AgentInstance producer so each ACP turn is appended to the engine's
+          // append-only AgentHistory. Best-effort and non-blocking (the producer
+          // enqueues its own SDK append), so a producer failure never disturbs the
+          // ACP loop or the transcript relay. Inert when no producer is wired.
+          if (onAcpUpdate) { try { onAcpUpdate(msg.params?.update); } catch { /* producer best-effort */ } }
+          return;
+        }
         if (msg.method === 'session/request_permission') {
           if (msg.id !== undefined) handlePermission(msg.id, msg.params);
           return;
@@ -5540,7 +5554,7 @@ function baseAgentEnv(profile, job) {
  * Both paths resolve to the same result contract.
  */
 function runAgentJob(profile, job, opts = {}) {
-  const { timeoutMs, idleTimeoutMs, recoveryWindowMs, envelope, sandbox = 'none', image, runId, secretEnv = {}, passThroughSecretNames = [], cwd, extraEnv = {}, profileEnv = {}, resultFile, stream = false, streamPrefix = '', onStreamOut, onStreamErr, args: commandArgs, terminal = 'pipe', protocol = 'pipe', permission = 'yolo', relaySession = null, ptyFactory, nudgePayload = null } = opts;
+  const { timeoutMs, idleTimeoutMs, recoveryWindowMs, envelope, sandbox = 'none', image, runId, secretEnv = {}, passThroughSecretNames = [], cwd, extraEnv = {}, profileEnv = {}, resultFile, stream = false, streamPrefix = '', onStreamOut, onStreamErr, args: commandArgs, terminal = 'pipe', protocol = 'pipe', permission = 'yolo', relaySession = null, ptyFactory, nudgePayload = null, onAcpUpdate = null } = opts;
   // #110: `protocol`/`permission` drive the ACP executor branch below. The
   // pipe/PTY paths are unchanged, so `protocol === 'pipe'` behaviour is identical.
   // A `nudgePayload` (#678) carries the bespoke "re-emit your result" prompt for a
@@ -5628,6 +5642,7 @@ function runAgentJob(profile, job, opts = {}) {
         onStreamOut,
         onStreamErr,
         permission,
+        onAcpUpdate,
       });
     }
 
@@ -7501,6 +7516,25 @@ async function workAgent(req, flags) {
         const runId = randomUUID();
         if (isContainer) liveRunIds.add(runId);
 
+        // #194: durable engine-native AgentInstance producer. For an `external`
+        // agent job (one carrying the activation's lease token + elementInstanceKey)
+        // mint an AgentInstance now — lease-gated on THIS activation — seeding the
+        // concrete definition (model/provider/systemPrompt) from the worker/model
+        // and task prompt. Correlated on the elementInstanceKey, so a reactivation
+        // (ask-a-question loop) folds into the SAME instance rather than a second.
+        // Entirely best-effort and orthogonal to job completion: a mint failure (or
+        // the kill-switch NANO_AGENT_INSTANCE=off) leaves the harness path unchanged.
+        // Each ACP `session/update` is fed to `producer.ingest` (wired via runOpts'
+        // `onAcpUpdate`), which appends the translated turn to AgentHistory; on job
+        // end the instance is driven to COMPLETED (success only) — `job.complete`
+        // fires exactly as before regardless.
+        let agentInstanceProducer = null;
+        const agentInstanceOff = String(process.env.NANO_AGENT_INSTANCE || '').trim().toLowerCase() === 'off';
+        if (!agentInstanceOff && isExternalAgentJob(job)) {
+          agentInstanceProducer = createAgentInstanceProducer({ camunda, job, profile, envelope, logger });
+          try { await agentInstanceProducer.activate(); } catch { /* best effort */ }
+        }
+
         // Fail-closed on a half-specified repository envelope (issue #129,
         // hardening 2): a `repository` block that declares intent (any field set)
         // but whose `url` is absent or not a usable clone target almost always
@@ -7661,6 +7695,11 @@ async function workAgent(req, flags) {
             // spying never corrupts a structured/JSON output mode.
             onStreamOut: stream ? (line) => logger.info(line) : undefined,
             onStreamErr: stream ? (line) => logger.warn(line) : undefined,
+            // #194: feed each raw ACP `session/update` to the durable AgentInstance
+            // producer so its turn is appended to the engine's AgentHistory. Inert
+            // when no producer was minted (non-external job / off / mint failed) and
+            // for non-ACP harnesses (no session/updates are emitted). Best-effort.
+            onAcpUpdate: agentInstanceProducer ? (u) => agentInstanceProducer.ingest(u) : undefined,
           };
           result = await runAgentJob(profile, job, runOpts);
 
@@ -7696,6 +7735,14 @@ async function workAgent(req, flags) {
               result.nudgedForResult = true;
               if (truncated) result.truncated = true;
             }
+          }
+
+          // #194: end the AgentInstance lifecycle. Flush any pending turn and drain
+          // the append queue, then drive the instance to COMPLETED on a successful
+          // job end (a failed run leaves it non-terminal so a retry/reactivation
+          // continues the same instance). Best-effort — never disturbs job settlement.
+          if (agentInstanceProducer) {
+            try { await agentInstanceProducer.complete(result.ok); } catch { /* best effort */ }
           }
 
           // Finalize git only when the harness succeeded — never push a

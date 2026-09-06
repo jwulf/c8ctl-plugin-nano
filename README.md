@@ -980,6 +980,59 @@ How it works and where things live:
 - Stopping is SIGTERM → grace → SIGKILL, per worker and for the daemon; `stop`
   always clears `supervisor.json` so a stale marker never wedges a future start.
 
+### Surviving SSH logout: `supervisor install` / `uninstall`
+
+On **macOS**, a supervisor started over SSH is bound to your SSH login session's
+launchd/bootstrap context. When you **log out of that SSH session**, macOS tears
+the per-session context down and the orphaned daemon + workers lose their
+network / mDNS resolution path — the fleet does **not** exit cleanly, it
+**wedges**: the activation loop spins on `SDK activateJobs failed: fetch failed`
+forever and claims **zero** jobs (workers may still show `running` / agentic
+`disconnected`). `setsid`/double-fork detachment is not enough there — the daemon
+must live in a **persistent per-user launchd domain** (`gui/$UID`). **Linux is
+unaffected**: under systemd-logind with the default `KillUserProcesses=no` a
+`setsid`'d daemon keeps full network access after logout.
+
+Give the supervisor a session-independent launch path so the fleet survives
+logout and comes back at login/reboot:
+
+```bash
+c8ctl nano supervisor install     # install + start the service
+c8ctl nano supervisor uninstall   # stop + remove it
+```
+
+- **macOS** — writes a per-user **LaunchAgent** and bootstraps it into `gui/$UID`
+  (`launchctl bootstrap gui/$UID …`, `RunAtLoad`, crash-only `KeepAlive`). The
+  plist lives at `~/Library/LaunchAgents/io.nanobpm.c8ctl-nano.supervisor.<hash>.plist`
+  (the `<hash>` is derived from the state home, so distinct `C8CTL_NANO_HOME`
+  instances get distinct services).
+- **Linux** — writes a `systemd --user` unit
+  (`~/.config/systemd/user/c8ctl-nano-supervisor-<hash>.service`), enables + starts
+  it, and turns on **lingering** (`loginctl enable-linger`) so it survives logout
+  even where `KillUserProcesses=yes`. Where `systemd --user` is unavailable, no
+  service is needed — the existing `setsid` daemon already survives logout — and
+  `install` says so.
+- The service inherits only a **curated env** (`PATH`, `HOME`, `LANG`,
+  `C8CTL_NANO_HOME`, the CLI entry) — never your whole SSH environment — so
+  short-lived tokens are not persisted into a plist/unit that outlives the session.
+- `KeepAlive`/`Restart` are **crash-only**: a `supervisor stop` (clean exit) stays
+  down; only a crash is restarted.
+
+When the service **is installed**, every path that starts the daemon
+(`supervisor start`, and a bare `supervisor` / `supervisor attach`) brings it up
+**through the service**: it kickstarts the LaunchAgent when a clean `stop` left it
+down (a plain `kickstart`, never `-k`, so a running fleet is not bounced) and then
+**adopts** that service-owned daemon instead of spawning a second, session-bound
+one. Only if the service cannot be started does it fall back to a detached spawn
+(saying so).
+
+When you run `supervisor start` or `attach` **over SSH on macOS without the
+installed service**, the CLI **auto-reparents** the daemon into the `gui/$UID`
+launchd domain (equivalent to `install`) so it survives logout, and tells you. If
+it cannot (e.g. `launchctl` is unavailable, or you set `C8CTL_NANO_NO_LAUNCHD=1`),
+it prints a prominent **warning** pointing at `supervisor install` instead of
+silently leaving a fleet that will wedge on logout.
+
 ## Composing a workforce: `workforce`
 
 `supervisor` is imperative — you compose a fleet with a `start --worker …` plus a

@@ -88,6 +88,20 @@ SDK client (job workers) — do **not** add the SDK as a dependency or use raw
   stop|logs`) are thin socket clients (`supervisorRequest`) needing no
   interactive surface; the interactive `attach` console streams events and can
   **detach** (Ctrl-D / `detach`, leaving the daemon running) or `stop` the fleet.
+- **Session-independent service (`install`/`uninstall`, issue #196).** On macOS a
+  supervisor started over SSH is bound to the SSH login session's launchd domain;
+  on logout macOS tears it down and the fleet **wedges** (activation spins on
+  `activateJobs failed: fetch failed`, claims zero jobs) rather than exiting.
+  `setsid` is insufficient — the daemon must live in a persistent `gui/$UID`
+  launchd domain. `supervisor install`/`uninstall` write + bootstrap a per-user
+  **LaunchAgent** (`gui/$UID`, `RunAtLoad`, crash-only `KeepAlive`) on macOS, and a
+  `systemd --user` unit + `loginctl enable-linger` on Linux (a no-op with guidance
+  where `systemd --user` is absent, since the `setsid` path already survives
+  logout there). Label/unit names are hashed off the state home so distinct
+  `C8CTL_NANO_HOME`s don't collide; the service inherits only a curated env (never
+  the whole SSH env). `supervisor start` over SSH on macOS **without** the service
+  auto-reparents into `gui/$UID` (or warns, pointing at `install`, when it can't /
+  `C8CTL_NANO_NO_LAUNCHD=1`). Linux is unaffected (KillUserProcesses=no).
 - Invariants: `stop` always clears `supervisor.json` (no stale marker wedges a
   future start); `remove`/`stop` cancel a pending restart; a `restart` swaps the
   child under a **child-identity guard** so a late old-child exit is never

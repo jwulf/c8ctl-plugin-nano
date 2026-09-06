@@ -9324,7 +9324,7 @@ function supervisorRequest(req, { socketPath, timeoutMs, responseTimeoutMs = SUP
  * Ensure a daemon is running, spawning it detached if not, and return its
  * running state. Polls the control socket until it answers a status request.
  */
-async function startSupervisorDaemon() {
+async function startSupervisorDaemon({ adoptOnly = false } = {}) {
   const existing = runningSupervisor();
   if (existing) return existing;
 
@@ -9332,18 +9332,32 @@ async function startSupervisorDaemon() {
   // The state file may be missing (deleted, cleaned up, or not yet written)
   // while a daemon is still listening on the deterministic socket. Adopt that
   // live daemon instead of spawning a second one that would orphan the
-  // original and its workers.
-  try {
-    const res = await supervisorRequest({ op: 'status' }, { socketPath, timeoutMs: 500, responseTimeoutMs: SUPERVISOR_PROBE_RESPONSE_TIMEOUT_MS });
-    if (res && res.ok) {
-      // Re-persist the adopted daemon's state so subsequent pid-based checks
-      // (runningSupervisor()) work immediately, instead of staying broken until
-      // some later command happens to heal supervisor.json.
-      const adopted = runningSupervisor() || stateFromStatus(res, socketPath);
-      try { writeSupervisorState(adopted); } catch { /* best effort */ }
-      return adopted;
-    }
-  } catch { /* no live daemon on the socket — safe to (re)spawn */ }
+  // original and its workers. When a service was just installed/reparented
+  // (adoptOnly), the launchd/systemd-owned daemon may still be booting, so poll
+  // the socket up to the connect timeout rather than racing to spawn a second,
+  // session-bound daemon that would fight it over the same socket/state.
+  const adoptDeadline = adoptOnly ? Date.now() + SUPERVISOR_CONNECT_TIMEOUT_MS : 0;
+  for (;;) {
+    try {
+      const res = await supervisorRequest({ op: 'status' }, { socketPath, timeoutMs: 500, responseTimeoutMs: SUPERVISOR_PROBE_RESPONSE_TIMEOUT_MS });
+      if (res && res.ok) {
+        // Re-persist the adopted daemon's state so subsequent pid-based checks
+        // (runningSupervisor()) work immediately, instead of staying broken until
+        // some later command happens to heal supervisor.json.
+        const adopted = runningSupervisor() || stateFromStatus(res, socketPath);
+        try { writeSupervisorState(adopted); } catch { /* best effort */ }
+        return adopted;
+      }
+    } catch { /* no live daemon on the socket yet */ }
+    if (Date.now() >= adoptDeadline) break;
+    await new Promise((r) => setTimeout(r, 150));
+  }
+
+  if (adoptOnly) {
+    // A service owns the daemon; never spawn a competing session-bound one —
+    // that is exactly the wedge reparenting exists to avoid.
+    throw new Error(`supervisor service was installed but its daemon did not become ready (see ${supervisorDaemonLogFile()})`);
+  }
 
   clearSupervisorState(); // clear any stale marker from a dead daemon
 
@@ -9378,9 +9392,21 @@ async function startSupervisorDaemon() {
   throw new Error(`supervisor daemon did not become ready (see ${logFile})`);
 }
 
+/**
+ * Bring the daemon up under the session-independence policy: re-parent into the
+ * persistent launchd domain when macOS-over-SSH is exposed (or a service is
+ * already installed), then adopt the service-owned daemon instead of spawning a
+ * competing session-bound one. Every command that starts the daemon goes through
+ * here, so no path can silently bypass the policy and recreate the logout wedge.
+ */
+async function startSupervisorWithServicePolicy(logger = getLogger()) {
+  const serviceOwned = await maybeReparentOrWarnOnStart(logger);
+  return startSupervisorDaemon({ adoptOnly: serviceOwned });
+}
+
 async function supervisorStartCmd(req, flags) {
   const logger = getLogger();
-  const state = await startSupervisorDaemon();
+  const state = await startSupervisorWithServicePolicy(logger);
   logger.info(`Supervisor daemon running (pid ${state.pid}).`);
 
   const specs = normalizeArgList(flags?.worker);
@@ -9465,7 +9491,7 @@ async function supervisorAddCmd(req, flags) {
     logger.error('--name cannot be combined with --instances > 1 (each instance needs a distinct name); omit --name to auto-name them.');
     process.exit(1);
   }
-  await startSupervisorDaemon();
+  await startSupervisorWithServicePolicy(logger);
   const workArgs = reconstructWorkArgs(flags);
   let added = 0;
   let failed = 0;
@@ -9727,6 +9753,442 @@ async function attachSupervisorConsole(state) {
   });
 }
 
+// ---------------------------------------------------------------------------
+// Session-independent supervisor service (issue #196).
+//
+// On macOS a supervisor started over SSH is bound to the SSH login session's
+// launchd/bootstrap + audit context. On SSH logout macOS tears that per-session
+// context down and the orphaned daemon + workers lose their network / mDNS
+// resolution path — the fleet does NOT cleanly exit, it WEDGES (the activation
+// loop spins on `activateJobs failed: fetch failed` forever and claims zero
+// jobs). `setsid`/double-fork detachment is not sufficient there: the daemon
+// must live in a persistent per-user launchd domain (`gui/$UID`).
+//
+// Linux is unaffected — under systemd-logind with the default
+// `KillUserProcesses=no` a `setsid`'d daemon keeps full network access after
+// logout — so this is a macOS-specific defect in how the supervisor detaches.
+//
+// The fix gives the supervisor a session-independent launch path symmetric with
+// Linux: `supervisor install` writes a per-user LaunchAgent and bootstraps it
+// into `gui/$UID` (macOS) or a `systemd --user` unit with lingering (Linux),
+// and `supervisor start` over SSH on macOS auto-reparents into that domain (or,
+// when it cannot, WARNS that the fleet will die on logout).
+// ---------------------------------------------------------------------------
+
+/** True when the current process is running inside an SSH login session. */
+function isSshSession(env = process.env) {
+  return Boolean(env.SSH_CONNECTION || env.SSH_CLIENT || env.SSH_TTY);
+}
+
+/** Minimal XML text escaping for the LaunchAgent plist. */
+function xmlEscape(s) {
+  return String(s)
+    .replace(/&/g, '&amp;')
+    .replace(/</g, '&lt;')
+    .replace(/>/g, '&gt;')
+    .replace(/"/g, '&quot;')
+    .replace(/'/g, '&apos;');
+}
+
+// Short hash of the (possibly overridden) state home, so distinct
+// C8CTL_NANO_HOME instances get distinct services and never fight over the same
+// launchd label / systemd unit.
+function supervisorServiceHash() {
+  return createHash('sha1').update(getStateHome()).digest('hex').slice(0, 8);
+}
+
+/** Reverse-DNS LaunchAgent label for this state home. */
+function supervisorServiceLabel() {
+  return `io.nanobpm.c8ctl-nano.supervisor.${supervisorServiceHash()}`;
+}
+
+/** Per-user LaunchAgent plist path (macOS). */
+function launchAgentPlistPath() {
+  return join(homedir(), 'Library', 'LaunchAgents', `${supervisorServiceLabel()}.plist`);
+}
+
+/** systemd --user unit file name / path (Linux). */
+function systemdUnitName() {
+  return `c8ctl-nano-supervisor-${supervisorServiceHash()}.service`;
+}
+function systemdUserUnitPath() {
+  const base = process.env.XDG_CONFIG_HOME || join(homedir(), '.config');
+  return join(base, 'systemd', 'user', systemdUnitName());
+}
+
+/** launchd domain / service targets. */
+function launchdDomainTarget(uid) {
+  return `gui/${uid}`;
+}
+function launchdServiceTarget(uid, label) {
+  return `gui/${uid}/${label}`;
+}
+
+// Curate the env a persistent service should inherit — enough to re-invoke the
+// CLI and locate its state, but NOT the whole SSH environment (which could bleed
+// short-lived tokens into a persistent plist/unit that outlives the session).
+const SUPERVISOR_SERVICE_ENV_KEYS = ['PATH', 'HOME', 'LANG', 'LC_ALL', 'C8CTL_NANO_HOME'];
+function supervisorServiceEnv(env = process.env) {
+  const out = {};
+  for (const k of SUPERVISOR_SERVICE_ENV_KEYS) {
+    if (env[k] != null && env[k] !== '') out[k] = String(env[k]);
+  }
+  // Pin the entry point so the daemon can spawn `work` children even if argv[1]
+  // differs under launchd/systemd.
+  const { entry } = c8ctlInvocation();
+  if (entry) out.C8CTL_NANO_ENTRY = entry;
+  return out;
+}
+
+/**
+ * Build a per-user LaunchAgent plist that runs `nano supervisor __daemon`.
+ * `RunAtLoad` starts it at login/reboot; `KeepAlive`={SuccessfulExit:false}
+ * restarts it only on a crash — an intentional `supervisor stop` exits 0 and
+ * stays down, so the invariant "stop stops the fleet" is preserved.
+ */
+function buildLaunchAgentPlist({ label, exec, entry, env = {}, stdoutPath, stderrPath }) {
+  const args = [exec, entry, 'nano', 'supervisor', '__daemon'];
+  const argXml = args.map((a) => `    <string>${xmlEscape(a)}</string>`).join('\n');
+  const envXml = Object.entries(env)
+    .filter(([, v]) => v != null && v !== '')
+    .map(([k, v]) => `    <key>${xmlEscape(k)}</key>\n    <string>${xmlEscape(String(v))}</string>`)
+    .join('\n');
+  return `<?xml version="1.0" encoding="UTF-8"?>
+<!DOCTYPE plist PUBLIC "-//Apple//DTD PLIST 1.0//EN" "http://www.apple.com/DTDs/PropertyList-1.0.dtd">
+<plist version="1.0">
+<dict>
+  <key>Label</key>
+  <string>${xmlEscape(label)}</string>
+  <key>ProgramArguments</key>
+  <array>
+${argXml}
+  </array>
+  <key>EnvironmentVariables</key>
+  <dict>
+${envXml}
+  </dict>
+  <key>RunAtLoad</key>
+  <true/>
+  <key>KeepAlive</key>
+  <dict>
+    <key>SuccessfulExit</key>
+    <false/>
+  </dict>
+  <key>ProcessType</key>
+  <string>Background</string>
+  <key>StandardOutPath</key>
+  <string>${xmlEscape(stdoutPath)}</string>
+  <key>StandardErrorPath</key>
+  <string>${xmlEscape(stderrPath)}</string>
+</dict>
+</plist>
+`;
+}
+
+/**
+ * Quote one `ExecStart` argument for a systemd unit. systemd splits the command
+ * line on unquoted whitespace, so any argument containing whitespace or a shell
+ * metacharacter must be double-quoted with C-style escaping inside. A literal
+ * `%` is doubled so systemd never mistakes it for a specifier (e.g. `%h`).
+ */
+function systemdQuoteExecArg(arg) {
+  const s = String(arg).replace(/%/g, '%%');
+  if (s === '') return '""';
+  if (/[\s"'\\`$;&|<>()]/.test(String(arg))) {
+    return `"${s.replace(/[\\"]/g, (c) => `\\${c}`)}"`;
+  }
+  return s;
+}
+
+/**
+ * Render one `Environment=` line for a systemd unit. When the `KEY=VALUE`
+ * assignment contains whitespace or a quote/backslash, the whole assignment is
+ * double-quoted (systemd otherwise splits it into multiple assignments on
+ * whitespace). A literal `%` is doubled so it is not expanded as a specifier.
+ */
+function systemdEnvLine(k, v) {
+  const key = String(k).replace(/%/g, '%%');
+  const val = String(v).replace(/%/g, '%%');
+  const assignment = `${key}=${val}`;
+  if (/[\s"'\\`$]/.test(`${k}=${v}`)) {
+    return `Environment="${assignment.replace(/[\\"]/g, (c) => `\\${c}`)}"`;
+  }
+  return `Environment=${assignment}`;
+}
+
+/**
+ * Build a `systemd --user` unit that runs `nano supervisor __daemon`.
+ * `Restart=on-failure` mirrors the launchd KeepAlive: a crash is restarted, an
+ * intentional `supervisor stop` (clean exit) stays down. `exec`/`entry` and env
+ * values are quoted/escaped so paths or values with whitespace or quotes don't
+ * make systemd misparse the line and fail to start the service.
+ */
+function buildSystemdUserUnit({ exec, entry, env = {} }) {
+  const cmd = `${systemdQuoteExecArg(exec)} ${systemdQuoteExecArg(entry)} nano supervisor __daemon`;
+  const envLines = Object.entries(env)
+    .filter(([, v]) => v != null && v !== '')
+    .map(([k, v]) => systemdEnvLine(k, v))
+    .join('\n');
+  return `[Unit]
+Description=c8ctl nano worker supervisor
+After=network-online.target
+Wants=network-online.target
+
+[Service]
+Type=simple
+ExecStart=${cmd}
+${envLines}
+Restart=on-failure
+RestartSec=5
+
+[Install]
+WantedBy=default.target
+`;
+}
+
+/** Whether a persistent supervisor service is installed for this state home. */
+function supervisorServiceInstalled(platform = osPlatform()) {
+  if (platform === 'darwin') return existsSync(launchAgentPlistPath());
+  if (platform === 'linux') return existsSync(systemdUserUnitPath());
+  return false;
+}
+
+/**
+ * Pure predicate: should `supervisor start` warn about SSH-logout teardown?
+ * Only macOS over SSH without an installed service is exposed to the wedge.
+ */
+function shouldWarnSshTeardown({
+  platform = osPlatform(),
+  env = process.env,
+  installed = supervisorServiceInstalled(platform),
+} = {}) {
+  return platform === 'darwin' && isSshSession(env) && !installed;
+}
+
+function warnSshTeardown(logger) {
+  logger.warn('⚠ macOS + SSH: this supervisor is bound to your SSH login session.');
+  logger.warn('  When you log out, macOS tears that session down and the fleet WEDGES —');
+  logger.warn('  workers keep showing "running" but stop claiming jobs (the activation');
+  logger.warn('  loop spins on: SDK activateJobs failed: fetch failed).');
+  logger.warn('  Install a session-independent service so it survives logout:');
+  logger.warn('    c8ctl nano supervisor install');
+}
+
+function runLaunchctl(args) {
+  try {
+    const r = spawnSync('launchctl', args, { encoding: 'utf8', timeout: 15_000 });
+    return { code: r.status, stdout: (r.stdout || '').trim(), stderr: (r.stderr || '').trim(), error: r.error };
+  } catch (err) {
+    return { code: null, stdout: '', stderr: '', error: err };
+  }
+}
+
+function runSystemctlUser(args) {
+  try {
+    const r = spawnSync('systemctl', ['--user', ...args], { encoding: 'utf8', timeout: 15_000 });
+    return { code: r.status, stdout: (r.stdout || '').trim(), stderr: (r.stderr || '').trim(), error: r.error };
+  } catch (err) {
+    return { code: null, stdout: '', stderr: '', error: err };
+  }
+}
+
+function systemdUserAvailable() {
+  return runSystemctlUser(['--version']).code === 0;
+}
+
+/**
+ * Stop a running daemon (socket `stop` → SIGTERM → SIGKILL the group), used
+ * before installing a service so the launchd/systemd-owned daemon takes over
+ * the deterministic control socket without a second instance fighting for it.
+ */
+async function stopSupervisorProcess(running) {
+  try { await supervisorRequest({ op: 'stop' }); }
+  catch { try { process.kill(running.pid, 'SIGTERM'); } catch { /* already gone */ } }
+  const deadline = Date.now() + STOP_GRACE_MS + 2_000;
+  while (Date.now() < deadline) {
+    if (!isPidAlive(running.pid)) break;
+    await new Promise((r) => setTimeout(r, 150));
+  }
+  if (isPidAlive(running.pid)) {
+    if (osPlatform() !== 'win32') {
+      try { process.kill(-running.pid, 'SIGKILL'); }
+      catch { try { process.kill(running.pid, 'SIGKILL'); } catch { /* ignore */ } }
+    } else {
+      try { process.kill(running.pid, 'SIGKILL'); } catch { /* ignore */ }
+    }
+  }
+  clearSupervisorState();
+}
+
+async function installSupervisorServiceDarwin(logger) {
+  const uid = process.getuid();
+  const label = supervisorServiceLabel();
+  const plistPath = launchAgentPlistPath();
+  const { exec, entry } = c8ctlInvocation();
+  if (!entry) { logger.error('Cannot resolve the c8ctl entry point to install the service.'); return false; }
+
+  // Hand the socket to the launchd-owned daemon: stop any session-bound one.
+  const running = await liveSupervisor();
+  if (running) {
+    logger.info('Stopping the current session-bound supervisor before installing the service…');
+    await stopSupervisorProcess(running);
+  }
+
+  mkdirSync(dirname(plistPath), { recursive: true });
+  mkdirSync(getSupervisorLogDir(), { recursive: true });
+  const daemonLog = supervisorDaemonLogFile();
+  writeFileSync(plistPath, buildLaunchAgentPlist({
+    label, exec, entry, env: supervisorServiceEnv(), stdoutPath: daemonLog, stderrPath: daemonLog,
+  }));
+
+  runLaunchctl(['bootout', launchdServiceTarget(uid, label)]); // best effort: clear any prior instance
+  const boot = runLaunchctl(['bootstrap', launchdDomainTarget(uid), plistPath]);
+  if (boot.code !== 0 && !/already (loaded|bootstrapped)/i.test(boot.stderr)) {
+    logger.error(`launchctl bootstrap failed: ${boot.stderr || boot.error?.message || 'unknown error'}`);
+    return false;
+  }
+  runLaunchctl(['enable', launchdServiceTarget(uid, label)]);
+  runLaunchctl(['kickstart', '-k', launchdServiceTarget(uid, label)]);
+  logger.info(`Installed LaunchAgent ${label} into ${launchdDomainTarget(uid)}.`);
+  logger.info(`  plist: ${plistPath}`);
+  logger.info('The supervisor now survives SSH logout and restarts at login/reboot.');
+  logger.info('Manage it with: c8ctl nano supervisor status | add | stop | uninstall');
+  return true;
+}
+
+function uninstallSupervisorServiceDarwin(logger) {
+  const uid = process.getuid();
+  const label = supervisorServiceLabel();
+  const plistPath = launchAgentPlistPath();
+  const existed = existsSync(plistPath);
+  runLaunchctl(['bootout', launchdServiceTarget(uid, label)]); // stops + unloads
+  try { if (existed) rmSync(plistPath, { force: true }); } catch { /* best effort */ }
+  clearSupervisorState();
+  if (existed) logger.info(`Removed LaunchAgent ${label}.`);
+  else logger.info('No LaunchAgent was installed for this state home.');
+  return true;
+}
+
+async function installSupervisorServiceLinux(logger) {
+  if (!systemdUserAvailable()) {
+    logger.info('systemd --user is not available on this host.');
+    logger.info('No service is required: the supervisor already detaches with setsid, and under');
+    logger.info('systemd-logind with the default KillUserProcesses=no it survives SSH logout.');
+    return true;
+  }
+  const { exec, entry } = c8ctlInvocation();
+  if (!entry) { logger.error('Cannot resolve the c8ctl entry point to install the service.'); return false; }
+
+  const running = await liveSupervisor();
+  if (running) {
+    logger.info('Stopping the current supervisor before installing the service…');
+    await stopSupervisorProcess(running);
+  }
+
+  const unitPath = systemdUserUnitPath();
+  mkdirSync(dirname(unitPath), { recursive: true });
+  writeFileSync(unitPath, buildSystemdUserUnit({ exec, entry, env: supervisorServiceEnv() }));
+
+  // Enable lingering so the user manager (and the daemon) survive logout even
+  // where KillUserProcesses=yes.
+  const user = process.env.USER || process.env.LOGNAME;
+  try { spawnSync('loginctl', user ? ['enable-linger', user] : ['enable-linger'], { timeout: 10_000 }); }
+  catch { /* best effort */ }
+
+  runSystemctlUser(['daemon-reload']);
+  const en = runSystemctlUser(['enable', '--now', systemdUnitName()]);
+  if (en.code !== 0) { logger.error(`systemctl --user enable failed: ${en.stderr || en.error?.message || 'unknown error'}`); return false; }
+  logger.info(`Installed systemd --user unit ${systemdUnitName()} (enabled + started).`);
+  logger.info(`  unit: ${unitPath}`);
+  logger.info('Lingering is enabled so the fleet survives logout and starts at boot.');
+  logger.info('Manage it with: c8ctl nano supervisor status | add | stop | uninstall');
+  return true;
+}
+
+function uninstallSupervisorServiceLinux(logger) {
+  const unitPath = systemdUserUnitPath();
+  const existed = existsSync(unitPath);
+  if (systemdUserAvailable()) runSystemctlUser(['disable', '--now', systemdUnitName()]);
+  try { if (existed) rmSync(unitPath, { force: true }); } catch { /* best effort */ }
+  if (systemdUserAvailable()) runSystemctlUser(['daemon-reload']);
+  clearSupervisorState();
+  if (existed) logger.info(`Removed systemd --user unit ${systemdUnitName()}.`);
+  else logger.info('No systemd --user unit was installed for this state home.');
+  return true;
+}
+
+async function supervisorInstallCmd() {
+  const logger = getLogger();
+  const plat = osPlatform();
+  if (plat === 'darwin') { await installSupervisorServiceDarwin(logger); return; }
+  if (plat === 'linux') { await installSupervisorServiceLinux(logger); return; }
+  logger.error(`supervisor install is not supported on ${plat}.`);
+}
+
+async function supervisorUninstallCmd() {
+  const logger = getLogger();
+  const plat = osPlatform();
+  if (plat === 'darwin') { uninstallSupervisorServiceDarwin(logger); return; }
+  if (plat === 'linux') { uninstallSupervisorServiceLinux(logger); return; }
+  logger.error(`supervisor uninstall is not supported on ${plat}.`);
+}
+
+/**
+ * Start an already-installed LaunchAgent when it is not running, so a
+ * service-owned start can adopt it. `RunAtLoad` only fires at bootstrap/login and
+ * `KeepAlive` is crash-only, so nothing brings the daemon back after a clean
+ * `supervisor stop` — adopt-only would poll an empty socket and fail. Plain
+ * `kickstart` (never `-k`) is a no-op when the service is up, so a live fleet is
+ * never bounced; a service launchd no longer has loaded is re-bootstrapped from
+ * its plist. `run`/`uid`/`label`/`plistPath` are injectable for deterministic tests.
+ */
+function ensureLaunchAgentStarted(logger, { run = runLaunchctl, uid, label, plistPath } = {}) {
+  const svcUid = uid ?? (typeof process.getuid === 'function' ? process.getuid() : 0);
+  const target = launchdServiceTarget(svcUid, label ?? supervisorServiceLabel());
+  let kick = run(['kickstart', target]);
+  if (kick.code === 0) return true;
+
+  // Not loaded in the domain (a `bootout` without uninstall, or a login that
+  // predated the plist): reload it from disk. `bootstrap`'s own status is not the
+  // verdict — an already-loaded service reports a non-zero "Input/output error" —
+  // so re-enable, kick again, and let that decide.
+  run(['bootstrap', launchdDomainTarget(svcUid), plistPath ?? launchAgentPlistPath()]);
+  run(['enable', target]);
+  kick = run(['kickstart', target]);
+  if (kick.code === 0) return true;
+  logger.warn(`launchctl kickstart failed: ${kick.stderr || kick.error?.message || 'unknown error'}`);
+  return false;
+}
+
+/**
+ * On a macOS `supervisor start`/`attach` over SSH, re-parent the daemon into the
+ * persistent `gui/$UID` launchd domain (via an installed LaunchAgent) so it
+ * survives logout instead of dying with the SSH session. If we cannot (or the
+ * operator opts out with C8CTL_NANO_NO_LAUNCHD), warn loudly and fall through to
+ * the ordinary detached spawn. Returns `true` when a service owns the daemon
+ * (already installed, or just reparented) so the caller adopts it instead of
+ * spawning a competing session-bound daemon; `false` on every non-exposed path
+ * (Linux, a local login, opt-out/failure, or a service that would not start).
+ */
+async function maybeReparentOrWarnOnStart(logger) {
+  if (osPlatform() !== 'darwin') return false;     // Linux already survives logout
+  if (supervisorServiceInstalled()) {
+    // An installed service owns the daemon — but make sure it is actually up
+    // first, or adopt-only would time out on the empty socket a clean stop left.
+    if (await liveSupervisor()) return true;
+    if (ensureLaunchAgentStarted(logger)) return true;
+    logger.warn('The installed supervisor service would not start; falling back to a detached (session-bound) daemon.');
+    return false;
+  }
+  if (!isSshSession()) return false;               // a local login session isn't torn down like SSH
+  if (await liveSupervisor()) return false;        // adopting an existing daemon — nothing to re-parent
+  if (coerceBool(process.env.C8CTL_NANO_NO_LAUNCHD, false)) { warnSshTeardown(logger); return false; }
+  logger.info('macOS + SSH detected — re-parenting the supervisor into the gui launchd domain so it survives logout…');
+  const ok = await installSupervisorServiceDarwin(logger);
+  if (!ok) { warnSshTeardown(logger); return false; }
+  return true; // the launchd service now owns the daemon — adopt it, don't spawn
+}
+
 /** Dispatch the `supervisor` subcommand's action. */
 async function supervisorCommand(req, flags) {
   const action = (req.positional[0] || '').toLowerCase();
@@ -9736,12 +10198,20 @@ async function supervisorCommand(req, flags) {
       return;
     case '':
     case 'attach': {
-      const state = await startSupervisorDaemon();
+      // Same session-independence policy as `supervisor start`: a bare `attach`
+      // must not spawn a session-bound daemon that an SSH logout wedges.
+      const state = await startSupervisorWithServicePolicy();
       await attachSupervisorConsole(runningSupervisor() || state);
       return;
     }
     case 'start':
       await supervisorStartCmd(req, flags);
+      return;
+    case 'install':
+      await supervisorInstallCmd();
+      return;
+    case 'uninstall':
+      await supervisorUninstallCmd();
       return;
     case 'status':
     case 'list':
@@ -9766,7 +10236,7 @@ async function supervisorCommand(req, flags) {
       supervisorLogsCmd(req);
       return;
     default:
-      getLogger().error(`Unknown supervisor action "${action}". Use: start|status|add|remove|restart|stop|logs|attach`);
+      getLogger().error(`Unknown supervisor action "${action}". Use: start|install|uninstall|status|add|remove|restart|stop|logs|attach`);
       process.exit(1);
   }
 }
@@ -10560,7 +11030,7 @@ async function workforceStartCmd(req, flags, manifestName) {
     process.exit(1);
   }
 
-  const state = await startSupervisorDaemon();
+  const state = await startSupervisorWithServicePolicy(logger);
   logger.info(`Supervisor daemon running (pid ${state.pid}).`);
   const { reachable, workers: live } = await fetchSupervisorWorkers();
   // A running daemon with an unreachable status socket reports `live: []`, which
@@ -12555,6 +13025,20 @@ export {
   clearSupervisorState,
   getSupervisorSocketPath,
   getSupervisorStateFile,
+  isSshSession,
+  xmlEscape,
+  supervisorServiceLabel,
+  launchAgentPlistPath,
+  systemdUnitName,
+  systemdUserUnitPath,
+  launchdDomainTarget,
+  launchdServiceTarget,
+  supervisorServiceEnv,
+  buildLaunchAgentPlist,
+  buildSystemdUserUnit,
+  supervisorServiceInstalled,
+  shouldWarnSshTeardown,
+  ensureLaunchAgentStarted,
 };
 
 export {
@@ -12635,6 +13119,8 @@ export const metadata = {
         { command: 'c8ctl nano work coder --sandbox docker --image ghcr.io/acme/agent:1', description: 'Run jobs in isolated containers with disk-hygiene reaping' },
         { command: 'NANO_AGENTIC_URL=http://localhost:8080 NANO_AGENTIC_SECRET=<shared-secret> c8ctl nano work reviewer', description: 'Enrol the worker on the app\'s same-port /agentic channel in SECURE mode (same NANO_AGENTIC_SECRET as the server) so it appears live (presence + relay terminals) on the Workforce visibility page' },
         { command: 'c8ctl nano supervisor start --worker reviewer --worker coder', description: 'Start a detached supervisor managing several workers from one terminal' },
+        { command: 'c8ctl nano supervisor install', description: 'Install a session-independent supervisor service (macOS LaunchAgent in gui/$UID; Linux systemd --user + lingering) so the fleet survives SSH logout and returns at login/reboot' },
+        { command: 'c8ctl nano supervisor uninstall', description: 'Remove the installed supervisor service (LaunchAgent / systemd --user unit)' },
         { command: 'c8ctl nano supervisor', description: 'Attach an interactive console to the supervisor (detach with Ctrl-D, leaving it running)' },
         { command: 'c8ctl nano supervisor status', description: 'List supervised workers (state, ENGINE + AGENTIC visibility diagnostics, serviced job / idle, pid, restarts, uptime) without the console' },
         { command: 'c8ctl nano supervisor add decider', description: 'Add a supervised worker (forwarding work flags) to the running supervisor' },
@@ -12879,7 +13365,7 @@ function printUsage() {
   console.log('  c8ctl nano hire [--name <n>] [--rank <r>] [--command <c>] [--arg <switch> ...] [--model <m>] [--capabilities <a,b>] [--sandbox none|docker|podman] [--image <ref>] [--terminal pty|pipe] [--protocol pipe|acp] [--permission yolo|escalate|filter] [--env NAME=VALUE ...] [--list]');
   console.log('  c8ctl nano assign <profileName> <cap[,cap...]> [--name <n>] [--capabilities <a,b>]');
   console.log('  c8ctl nano work <profileName> [--auto [--auto-scope <p>]] [--arg <switch> ...] [--recovery-window <ms>] [--idle-timeout <ms>] [--job-timeout <ms>] [--poll-timeout <ms>] [--job-type <token> ...] [--sandbox none|docker|podman] [--image <ref>] [--env NAME=VALUE ...] [--secret-resolver host] [--min-free-mb <n>] [--clone-timeout <ms>] [--keep-runs] [--stream]');
-  console.log('  c8ctl nano supervisor [start|status|add|remove|restart|stop|logs|attach] ... (manage many workers from one terminal)');
+  console.log('  c8ctl nano supervisor [start|install|uninstall|status|add|remove|restart|stop|logs|attach] ... (manage many workers from one terminal)');
   console.log('  c8ctl nano workforce [add|remove|list|start|status|stop] ... [--manifest <manifest>] (declarative, reusable fleet manifests)');
   console.log('');
   console.log('Subcommands:');

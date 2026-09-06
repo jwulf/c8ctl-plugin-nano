@@ -208,6 +208,7 @@ test('a tool_call appends an ASSISTANT turn with a toolCalls entry; a tool resul
   assert.equal(call.toolCalls.length, 1);
   assert.equal(call.toolCalls[0].toolCallId, 't1');
   assert.equal(call.toolCalls[0].toolName, 'grep');
+  assert.equal(call.toolCalls[0].elementId, 'agent-task');
   assert.deepEqual(call.toolCalls[0].arguments, { q: 'x' });
   assert.equal(appends[0].status, 'TOOL_CALLING');
 
@@ -216,6 +217,8 @@ test('a tool_call appends an ASSISTANT turn with a toolCalls entry; a tool resul
   assert.equal(res.historyItemId, 'toolresult:t1');
   // The originating tool name is carried through from the tool_call.
   assert.equal(res.toolCalls[0].toolName, 'grep');
+  // The BPMN element attribution is carried through from the activated job.
+  assert.equal(res.toolCalls[0].elementId, 'agent-task');
   // A structured (non-string) result becomes an OBJECT content block.
   assert.equal(res.content[0].contentType, 'OBJECT');
 });

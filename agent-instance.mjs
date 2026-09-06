@@ -254,7 +254,7 @@ export function createAgentInstanceProducer(opts = {}) {
         {
           toolCallId: String(c.callId),
           toolName: isNonBlank(c.name) ? String(c.name) : '',
-          elementId: null,
+          elementId,
           arguments: isPlainObject(c.args) ? c.args : null,
         },
       ],
@@ -274,7 +274,7 @@ export function createAgentInstanceProducer(opts = {}) {
         {
           toolCallId: String(c.callId),
           toolName: toolNames.get(String(c.callId)) || '',
-          elementId: null,
+          elementId,
           arguments: null,
         },
       ],

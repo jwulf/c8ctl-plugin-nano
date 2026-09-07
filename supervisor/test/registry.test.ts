@@ -83,3 +83,47 @@ test("setTypes rewrites an --auto worker's serviceable set (reconcile path)", as
     }),
   );
 });
+
+test("quiesce suppresses ALL activation and is authoritative over a later setTypes (issue #202)", async () => {
+  await Effect.runPromise(
+    Effect.gen(function* () {
+      const reg = yield* makeRegistry();
+      yield* reg.add("auto", ["x", "y"], 1);
+      // Idle worker with serviceable types → normally polled.
+      assert.deepEqual([...(yield* reg.pollTypes)].sort(), ["x", "y"]);
+      assert.equal((yield* reg.pollBatch).length, 2);
+      // Latch the drain quiesce → no type is a poll candidate.
+      yield* reg.quiesce();
+      assert.equal(yield* reg.quiescing, true);
+      assert.deepEqual(yield* reg.pollTypes, []);
+      assert.deepEqual(yield* reg.pollBatch, []);
+      // The `--auto` reconcile rewriting the type set must NOT re-open the poll
+      // set while quiescing — quiesce is authoritative.
+      yield* reg.setTypes("auto", ["x", "y", "z"]);
+      assert.deepEqual(yield* reg.pollTypes, []);
+      assert.deepEqual(yield* reg.pollBatch, []);
+      // Un-latching restores the (reconciled) poll set.
+      yield* reg.quiesce(false);
+      assert.deepEqual([...(yield* reg.pollTypes)].sort(), ["x", "y", "z"]);
+    }),
+  );
+});
+
+test("activeCount tracks in-flight claims so a drain can await zero (issue #202)", async () => {
+  await Effect.runPromise(
+    Effect.gen(function* () {
+      const reg = yield* makeRegistry();
+      yield* reg.add("w1", ["a"], 1);
+      assert.equal(yield* reg.activeCount, 0);
+      const claimed = yield* reg.claim("a");
+      assert.equal(claimed, "w1");
+      assert.equal(yield* reg.activeCount, 1);
+      // Quiescing does not touch an already-claimed slot — the in-flight job
+      // runs on and releases normally, which is what makes stop a DRAIN.
+      yield* reg.quiesce();
+      assert.equal(yield* reg.activeCount, 1);
+      yield* reg.releaseWorker("w1");
+      assert.equal(yield* reg.activeCount, 0);
+    }),
+  );
+});

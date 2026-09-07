@@ -88,6 +88,22 @@ SDK client (job workers) — do **not** add the SDK as a dependency or use raw
   stop|logs`) are thin socket clients (`supervisorRequest`) needing no
   interactive surface; the interactive `attach` console streams events and can
   **detach** (Ctrl-D / `detach`, leaving the daemon running) or `stop` the fleet.
+- **Graceful drain on stop (issue #202).** `supervisor stop` (and `workforce
+  stop`) **drain by default**: the daemon quiesces each `nano work` child with a
+  `SIGUSR2` (registry `quiesce()` latches the activation loop so it leases NO new
+  job — authoritative over `--auto` reconcile), the child lets its in-flight jobs
+  finish and exits, and the streaming stop client live-updates the shrinking
+  in-flight count. **Ctrl-C detaches the client** (the daemon keeps draining in
+  the background). `--force` aborts instead: `SIGTERM`/`SIGINT` interrupts the
+  runtime, whose interruption **cancels** each running job's `AbortSignal` (the
+  `makeJobRunner` seam → `runAgentJob` killTree's the harness process group) and
+  yields the job (`settle.fail`, retries preserved → immediately retryable); a
+  `--force` request also **escalates** a drain already in progress. The drain
+  waits INDEFINITELY (a force stop is the only escape hatch); `stop --force`
+  keeps the grace-window + SIGKILL backstop on the daemon pid. A daemon-driven
+  signal shutdown (its own SIGTERM/SIGINT/SIGHUP) stays a fast force stop. The
+  stop socket op streams status and ends with a terminal `stopped` frame, so a
+  one-shot `supervisorRequest({op:'stop'})` still sees a clean end-of-response.
 - **Session-independent service (`install`/`uninstall`, issue #196).** On macOS a
   supervisor started over SSH is bound to the SSH login session's launchd domain;
   on logout macOS tears it down and the fleet **wedges** (activation spins on

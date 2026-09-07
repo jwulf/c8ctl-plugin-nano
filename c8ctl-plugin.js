@@ -141,6 +141,10 @@ const READINESS_TIMEOUT_MS = 60_000;
 const READINESS_POLL_MS = 500;
 const HEALTH_TIMEOUT_MS = 1_500;
 const STOP_GRACE_MS = 8_000;
+// #202: the signal a graceful `supervisor stop`/`workforce stop` sends each
+// `nano work` child to quiesce it — stop leasing new jobs, finish in-flight work,
+// then exit. SIGTERM/SIGINT remain the FORCE abort (kill harness, yield jobs).
+const SUPERVISOR_DRAIN_SIGNAL = 'SIGUSR2';
 // Upper bound on one `--auto` engine-read reconcile (enumerate deployed
 // definitions + fetch each BPMN). A read that stalls past this is treated as a
 // transient failure so the running poller set is KEPT and, crucially, shutdown
@@ -4460,7 +4464,7 @@ const MAX_CAPTURE_BYTES = 1_048_576; // 1 MiB per stream
 // Spawn a child, pipe `stdinData`, capture byte-capped stdout/stderr, enforce a
 // timeout (invoking `onTimeout(child)` to tear the child down), and resolve to a
 // uniform result. Used by both the host and container executors.
-function spawnCaptureOneShot({ command, args = [], shell = false, detached = false, cwd, env, stdinData, timeoutMs, idleTimeoutMs, recoveryWindowMs, onTimeout, stream = false, streamPrefix = '', onStreamOut, onStreamErr, relayTap = null }) {
+function spawnCaptureOneShot({ command, args = [], shell = false, detached = false, cwd, env, stdinData, timeoutMs, idleTimeoutMs, recoveryWindowMs, onTimeout, stream = false, streamPrefix = '', onStreamOut, onStreamErr, relayTap = null, abortSignal = null }) {
   return new Promise((resolve) => {
     let child;
     const stdoutChunks = [];
@@ -4472,6 +4476,7 @@ function spawnCaptureOneShot({ command, args = [], shell = false, detached = fal
     let settled = false;
     let timer = null;
     let idleMon = null;
+    let onAbort = null;
 
     // Live "spy" tee (--stream): mirror the child's output line-by-line to a
     // caller-supplied emitter (the worker routes these through c8ctl's
@@ -4509,6 +4514,7 @@ function spawnCaptureOneShot({ command, args = [], shell = false, detached = fal
       settled = true;
       if (timer) clearTimeout(timer);
       if (idleMon) idleMon.stop();
+      if (onAbort && abortSignal) { try { abortSignal.removeEventListener('abort', onAbort); } catch { /* best effort */ } onAbort = null; }
       if (teeOut) teeOut('', true);
       if (teeErr) teeErr('', true);
       resolve(result);
@@ -4519,6 +4525,24 @@ function spawnCaptureOneShot({ command, args = [], shell = false, detached = fal
     } catch (err) {
       finish({ ok: false, exitCode: null, stdout: '', stderr: '', error: err.message, truncated: false, stderrTruncated: false });
       return;
+    }
+
+    // #202: a `stop --force`/abort aborts this signal — kill the harness process
+    // group (via the same onTimeout kill that the hard-cap/idle paths use) and
+    // settle as aborted so the worker fails/yields the job for immediate retry
+    // instead of letting the detached child outlive the interrupt (orphaned to
+    // init) and the lock lapse.
+    if (abortSignal) {
+      if (abortSignal.aborted) {
+        try { if (onTimeout) onTimeout(child); } catch { /* best effort */ }
+        finish({ ok: false, exitCode: null, stdout: joinCapped(stdoutChunks), stderr: joinCapped(stderrChunks), error: 'aborted', aborted: true, truncated: stdoutTruncated, stderrTruncated });
+        return;
+      }
+      onAbort = () => {
+        try { if (onTimeout) onTimeout(child); } catch { /* best effort */ }
+        finish({ ok: false, exitCode: null, stdout: joinCapped(stdoutChunks), stderr: joinCapped(stderrChunks), error: 'aborted', aborted: true, truncated: stdoutTruncated, stderrTruncated });
+      };
+      abortSignal.addEventListener('abort', onAbort);
     }
 
     timer = timeoutMs && timeoutMs > 0
@@ -4630,7 +4654,7 @@ function ptyAvailable(ptyFactory) {
 // spawnCaptureOneShot. A PTY merges stdout+stderr into one stream, so stderr is
 // always '' here; that is expected for a live terminal. `ptyFactory` is
 // injectable for tests (defaults to node-pty).
-function spawnCapturePty({ command, args = [], cwd, env, stdinData, timeoutMs, idleTimeoutMs, recoveryWindowMs, cols = 120, rows = 30, ptyFactory, relayTap = null, stream = false, streamPrefix = '', onStreamOut }) {
+function spawnCapturePty({ command, args = [], cwd, env, stdinData, timeoutMs, idleTimeoutMs, recoveryWindowMs, cols = 120, rows = 30, ptyFactory, relayTap = null, stream = false, streamPrefix = '', onStreamOut, abortSignal = null }) {
   return new Promise((resolve) => {
     const factory = ptyFactory || loadPtyModule();
     if (!factory || typeof factory.spawn !== 'function') {
@@ -4646,6 +4670,7 @@ function spawnCapturePty({ command, args = [], cwd, env, stdinData, timeoutMs, i
     let idleMon = null;
     let detachSteer = null;
     let term;
+    let onAbort = null;
 
     // Live "spy" tee (--stream), line-buffered, mirroring spawnCaptureOneShot.
     const STREAM_TEE_LINE_CAP = 64 * 1024;
@@ -4676,6 +4701,7 @@ function spawnCapturePty({ command, args = [], cwd, env, stdinData, timeoutMs, i
       if (timer) clearTimeout(timer);
       if (idleMon) idleMon.stop();
       if (detachSteer) { try { detachSteer(); } catch { /* best effort */ } detachSteer = null; }
+      if (onAbort && abortSignal) { try { abortSignal.removeEventListener('abort', onAbort); } catch { /* best effort */ } onAbort = null; }
       if (teeSink) tee('', true);
       resolve(result);
     };
@@ -4685,6 +4711,18 @@ function spawnCapturePty({ command, args = [], cwd, env, stdinData, timeoutMs, i
     } catch (err) {
       finish({ ok: false, exitCode: null, stdout: '', stderr: '', error: `pty spawn failed: ${err?.message || err}`, truncated: false, stderrTruncated: false });
       return;
+    }
+
+    // #202: abort (stop --force) kills the PTY and settles as aborted so the job
+    // is failed/yielded for immediate retry rather than left to lock-lapse.
+    if (abortSignal) {
+      const abortNow = () => {
+        killTerm();
+        finish({ ok: false, exitCode: null, stdout: joinCapped(chunks), stderr: '', error: 'aborted', aborted: true, truncated, stderrTruncated: false });
+      };
+      if (abortSignal.aborted) { abortNow(); return; }
+      onAbort = abortNow;
+      abortSignal.addEventListener('abort', onAbort);
     }
 
     timer = timeoutMs && timeoutMs > 0
@@ -4883,7 +4921,7 @@ const ACP_MAX_LINE_BYTES = 8 * 1024 * 1024; // 8 MiB
 // and every caller work unchanged. Because the raw stream is JSON-RPC (not human
 // output), `stdout` here is the accumulated human-readable transcript text (what
 // we relay), and `stderr` is the child's real stderr (agent diagnostics).
-function spawnCaptureAcp({ command, args = [], cwd, env, stdinData, timeoutMs, idleTimeoutMs, recoveryWindowMs, relayTap = null, stream = false, streamPrefix = '', onStreamOut, onStreamErr, permission = 'yolo', shell = false, onAcpUpdate = null }) {
+function spawnCaptureAcp({ command, args = [], cwd, env, stdinData, timeoutMs, idleTimeoutMs, recoveryWindowMs, relayTap = null, stream = false, streamPrefix = '', onStreamOut, onStreamErr, permission = 'yolo', shell = false, onAcpUpdate = null, abortSignal = null }) {
   return new Promise((resolve) => {
     const logger = getLogger();
     const humanChunks = [];
@@ -4897,6 +4935,7 @@ function spawnCaptureAcp({ command, args = [], cwd, env, stdinData, timeoutMs, i
     let idleMon = null;
     let detachSteer = null;
     let child;
+    let onAbort = null;
     let sessionId = null;
     let nextId = 1;
     const pending = new Map();
@@ -4985,6 +5024,7 @@ function spawnCaptureAcp({ command, args = [], cwd, env, stdinData, timeoutMs, i
       if (idleMon) idleMon.stop();
       if (settleTimer) { clearTimeout(settleTimer); settleTimer = null; }
       if (detachSteer) { try { detachSteer(); } catch { /* best effort */ } detachSteer = null; }
+      if (onAbort && abortSignal) { try { abortSignal.removeEventListener('abort', onAbort); } catch { /* best effort */ } onAbort = null; }
       // #137: a turn that completed but produced no mappable session/update gets a
       // synthesised structured floor so the cockpit drill-in isn't empty. Only for
       // a resolved turn (`promptResolved`) — a handshake/spawn failure has nothing
@@ -5252,6 +5292,15 @@ function spawnCaptureAcp({ command, args = [], cwd, env, stdinData, timeoutMs, i
     } catch (err) {
       finish({ ok: false, exitCode: null, stdout: '', stderr: '', error: err.message, truncated: false, stderrTruncated: false });
       return;
+    }
+
+    // #202: abort (stop --force) — finish() reaps the still-alive child via
+    // killTree, so settle as aborted and let it reap the ACP harness group.
+    if (abortSignal) {
+      const abortNow = () => finish({ ok: false, exitCode: null, stdout: humanStdout(), stderr: joinCapped(stderrChunks), error: 'aborted', aborted: true, truncated: humanTruncated, stderrTruncated });
+      if (abortSignal.aborted) { abortNow(); return; }
+      onAbort = abortNow;
+      abortSignal.addEventListener('abort', onAbort);
     }
 
     timer = timeoutMs && timeoutMs > 0
@@ -5554,7 +5603,7 @@ function baseAgentEnv(profile, job) {
  * Both paths resolve to the same result contract.
  */
 function runAgentJob(profile, job, opts = {}) {
-  const { timeoutMs, idleTimeoutMs, recoveryWindowMs, envelope, sandbox = 'none', image, runId, secretEnv = {}, passThroughSecretNames = [], cwd, extraEnv = {}, profileEnv = {}, resultFile, stream = false, streamPrefix = '', onStreamOut, onStreamErr, args: commandArgs, terminal = 'pipe', protocol = 'pipe', permission = 'yolo', relaySession = null, ptyFactory, nudgePayload = null, onAcpUpdate = null } = opts;
+  const { timeoutMs, idleTimeoutMs, recoveryWindowMs, envelope, sandbox = 'none', image, runId, secretEnv = {}, passThroughSecretNames = [], cwd, extraEnv = {}, profileEnv = {}, resultFile, stream = false, streamPrefix = '', onStreamOut, onStreamErr, args: commandArgs, terminal = 'pipe', protocol = 'pipe', permission = 'yolo', relaySession = null, ptyFactory, nudgePayload = null, onAcpUpdate = null, abortSignal = null } = opts;
   // #110: `protocol`/`permission` drive the ACP executor branch below. The
   // pipe/PTY paths are unchanged, so `protocol === 'pipe'` behaviour is identical.
   // A `nudgePayload` (#678) carries the bespoke "re-emit your result" prompt for a
@@ -5643,6 +5692,7 @@ function runAgentJob(profile, job, opts = {}) {
         onStreamErr,
         permission,
         onAcpUpdate,
+        abortSignal,
       });
     }
 
@@ -5665,6 +5715,7 @@ function runAgentJob(profile, job, opts = {}) {
         stream,
         streamPrefix,
         onStreamOut,
+        abortSignal,
       });
     }
 
@@ -5688,6 +5739,7 @@ function runAgentJob(profile, job, opts = {}) {
       onStreamOut,
       onStreamErr,
       relayTap,
+      abortSignal,
     });
   }
 
@@ -5763,6 +5815,7 @@ function runAgentJob(profile, job, opts = {}) {
       try { spawnSync(engine, ['rm', '-f', containerName], { timeout: 15_000 }); } catch { /* best effort */ }
       try { killTree(child); } catch { /* best effort */ }
     },
+    abortSignal,
   });
 }
 
@@ -7376,7 +7429,7 @@ async function workAgent(req, flags) {
   // dispatch claim/release lifecycle keyed by this worker's instance drives the
   // cockpit's jobKeys — so the recorders no longer poke a per-process channel.
   const recordJobStart = (job, jobType) => {
-    activeJobs.set(String(job.jobKey), { type: jobType, since: Date.now() });
+    activeJobs.set(String(job.jobKey), { type: jobType, since: Date.now(), retries: Number(job.retries) });
     writeActivity();
   };
   const recordJobEnd = (job) => {
@@ -7525,7 +7578,7 @@ async function workAgent(req, flags) {
   // the per-process 1+N reconcile crawl, and the per-job lock extender.
   let settle;
   const runner = {
-    run: async (job) => {
+    run: async (job, abortSignal) => {
       const jobType = job.type;
       recordJobStart(job, jobType);
       try {
@@ -7764,6 +7817,12 @@ async function workAgent(req, flags) {
             timeoutMs: effectiveHardCapMs,
             idleTimeoutMs: effectiveIdleTimeoutMs,
             recoveryWindowMs: effectiveRecoveryWindowMs,
+            // #202: the supervisor fiber's interruption AbortSignal (a
+            // `stop --force`/abort). runAgentJob wires it to killTree the harness
+            // process group so an abort CANCELS the work instead of orphaning the
+            // detached agent grandchild to init. Absent (undefined) on the normal
+            // and graceful-drain paths, where the harness runs to completion.
+            abortSignal,
             envelope,
             sandbox,
             image,
@@ -7798,6 +7857,17 @@ async function workAgent(req, flags) {
             onAcpUpdate: agentInstanceProducer ? (u) => agentInstanceProducer.ingest(u) : undefined,
           };
           result = await runAgentJob(profile, job, runOpts);
+
+          // #202: a `stop --force`/abort killed the harness mid-run. Do NOT settle
+          // here — the worker's force-stop handler yields the job (settle.fail with
+          // its retries preserved) so it is immediately retryable, and the process
+          // is about to exit. Settling here (or nudging/finalizing git) would race
+          // that yield. The finally below still runs (container/run-dir/relay
+          // cleanup); recordJobEnd fires in the outer finally.
+          if (result && result.aborted) {
+            logger.warn(`[${jobType}] job ${job.jobKey} aborted (worker force-stop) — harness killed; yielding job for retry.`);
+            return;
+          }
 
           // Gap 2 (#678): a clean run that emitted no machine-readable result gets
           // ONE bounded re-emit nudge in the same workspace, feeding back its own
@@ -8087,23 +8157,29 @@ async function workAgent(req, flags) {
     });
   }
 
-  // Keep the process alive until a stop signal, then interrupt the runtime loop
-  // and tear down visibility. Interrupting the supervisor fiber runs the runtime's
-  // bracketed teardown (release slots, stop the heartbeat + agentic scope).
+  // Keep the process alive until a stop signal. Three stop modes (issue #202):
+  //  - SIGUSR2  → GRACEFUL DRAIN: quiesce the activation loop (lease no new job),
+  //    wait for in-flight jobs to settle normally, then interrupt the idle runtime
+  //    and exit 0. No harness is killed — work completes.
+  //  - SIGTERM / SIGINT → FORCE ABORT: interrupt the runtime (which aborts each
+  //    running job's AbortSignal → runAgentJob killTree's the harness process
+  //    group) and yield each in-flight job (settle.fail, retries preserved) so it
+  //    is immediately retryable, then exit.
+  // A SIGTERM arriving mid-drain ESCALATES the drain to a force abort.
   await new Promise((resolve) => {
-    const stop = async (signal) => {
-      if (draining) return;
-      draining = true;
-      if (!autoMode) unwatchFile(configFile);
-      logger.info(`Received ${signal} — stopping worker...`);
+    let quiescing = false;
+    let aborting = false;
+    let finished = false;
+
+    // Shared teardown: stop timers, deregister presence over the still-live
+    // connection, interrupt the runtime fiber (bracketed teardown: release slots,
+    // stop heartbeats, tear down the agentic scope), then resolve.
+    const teardownAndExit = async (signal) => {
+      if (finished) return;
+      finished = true;
+      if (!autoMode) { try { unwatchFile(configFile); } catch { /* best effort */ } }
       if (reaperTimer) clearInterval(reaperTimer);
       if (runDirTimer) clearInterval(runDirTimer);
-      // Deregister this worker's presence BEFORE interrupting the runtime: emit
-      // the explicit deregister while the multiplexed host connection is still
-      // live, so the worker disappears from the cockpit cleanly rather than
-      // lingering until its heartbeat lapses. Best-effort — teardown must never
-      // hang. Interrupting the fiber then runs the runtime's bracketed teardown
-      // (release slots, stop the heartbeat + tear down the agentic scope).
       if (agenticPlane) {
         try { agenticPlane.deregister(`worker stopped (${signal})`); } catch { /* best effort */ }
       }
@@ -8115,8 +8191,76 @@ async function workAgent(req, flags) {
       }
       resolve();
     };
-    process.once('SIGINT', () => { stop('SIGINT'); });
-    process.once('SIGTERM', () => { stop('SIGTERM'); });
+
+    const inFlightCount = () => {
+      try { return SupervisorEffect.runSync(workerRegistry.activeCount); }
+      catch { return activeJobs.size; }
+    };
+
+    const forceAbort = async (signal) => {
+      if (aborting || finished) return;
+      aborting = true;
+      draining = true;
+      if (!autoMode) { try { unwatchFile(configFile); } catch { /* best effort */ } }
+      logger.info(`Received ${signal} — aborting in-flight work and stopping worker...`);
+      // Snapshot in-flight jobs (with their retry budget) BEFORE the interrupt
+      // clears the ownership registry, so we can yield each one afterwards.
+      const inflight = [...activeJobs.entries()].map(([jobKey, info]) => ({ jobKey, retries: info?.retries }));
+      // Interrupt the runtime: this aborts each running job's AbortSignal (the
+      // makeJobRunner seam) so runAgentJob killTree's the harness process group,
+      // and runs dispatch's bracketed teardown (release ownership + slot). The
+      // runner sees the aborted result and, by contract, does NOT settle — we do.
+      if (agenticPlane) { try { agenticPlane.deregister(`worker aborted (${signal})`); } catch { /* best effort */ } }
+      try {
+        await SupervisorEffect.runPromise(SupervisorFiber.interrupt(supervisorFiber));
+      } catch (err) {
+        logger.warn(`supervisor abort error — runtime loop may not have shut down cleanly: ${err?.message || err}`);
+      }
+      // Yield each in-flight job so the broker re-activates it at once (retries
+      // preserved — a force-stop doesn't consume an attempt). Best-effort: a
+      // failed yield just lets the lock lapse (the honest fallback).
+      for (const { jobKey, retries } of inflight) {
+        try {
+          await SupervisorEffect.runPromise(settle.fail(jobKey, {
+            errorMessage: `worker force-stopped (${signal}); job yielded for retry`,
+            retries: Number.isFinite(retries) && retries > 0 ? retries : 1,
+            retryBackOff: 0,
+          }));
+          logger.info(`  yielded job ${jobKey} for immediate retry.`);
+        } catch (err) {
+          logger.warn(`  could not yield job ${jobKey} (${err?.message || err}); its lock will lapse and the broker will reclaim it.`);
+        }
+      }
+      finished = true; // teardown already interrupted the fiber; just resolve.
+      logger.info('Worker stopped.');
+      resolve();
+    };
+
+    const gracefulDrain = async (signal) => {
+      if (quiescing || aborting || finished) return;
+      quiescing = true;
+      draining = true;
+      // Authoritative quiesce: the activation loop leases no new job even if the
+      // --auto reconcile rewrites this worker's job types (registry.quiesce wins).
+      try { SupervisorEffect.runSync(workerRegistry.quiesce()); } catch { /* best effort */ }
+      if (!autoMode) { try { unwatchFile(configFile); } catch { /* best effort */ } }
+      const n0 = inFlightCount();
+      logger.info(`Received ${signal} — draining: polling stopped; waiting on ${n0} in-flight job(s) to finish (send SIGTERM to abort).`);
+      // Poll until every in-flight job has settled and released its slot, then
+      // interrupt the now-idle runtime and exit. Wait INDEFINITELY — a force
+      // abort (SIGTERM) is the only escape hatch.
+      const tick = async () => {
+        if (aborting || finished) return; // escalated to a force abort — let it own exit
+        const n = inFlightCount();
+        if (n <= 0) { await teardownAndExit(signal); return; }
+        setTimeout(tick, 200);
+      };
+      setTimeout(tick, 200);
+    };
+
+    process.once('SIGUSR2', () => { gracefulDrain('SIGUSR2'); });
+    process.once('SIGINT', () => { forceAbort('SIGINT'); });
+    process.once('SIGTERM', () => { forceAbort('SIGTERM'); });
   });
 }
 
@@ -8860,8 +9004,10 @@ function waitForChildExit(child, timeoutMs) {
   return new Promise((resolve) => {
     if (!child || child.exitCode !== null || child.signalCode !== null) return resolve();
     let done = false;
-    const finish = () => { if (done) return; done = true; clearTimeout(t); resolve(); };
-    const t = setTimeout(finish, timeoutMs);
+    // #202: a null/undefined timeout means WAIT INDEFINITELY (graceful drain) —
+    // no timer is armed, so we only resolve when the child actually exits.
+    const t = timeoutMs == null ? null : setTimeout(() => finish(), timeoutMs);
+    function finish() { if (done) return; done = true; if (t) clearTimeout(t); resolve(); }
     child.once('exit', finish);
   });
 }
@@ -8939,7 +9085,18 @@ async function runSupervisorDaemon() {
 
   const workers = new Map();
   const attachClients = new Set();
+  // #202: sockets that issued a `stop`/drain and are waiting for the daemon to
+  // finish. They get a terminal `stopped` (final) frame when shutdown completes,
+  // so both the streaming `stop` client AND a one-shot `supervisorRequest` see a
+  // clean end-of-response instead of a bare socket close.
+  const stopClients = new Set();
   let shuttingDown = false;
+  // #202: a graceful-drain shutdown is in progress (SIGUSR2 sent to workers,
+  // awaiting them to finish in-flight jobs and exit). `forcing` records that a
+  // `stop --force` has escalated that drain to a hard abort. Both gate the
+  // restart-on-exit path and let a second `stop --force` escalate a live drain.
+  let draining = false;
+  let forcing = false;
   // Live-view monitor: tracks the last-broadcast fleet signature so we push a
   // refreshed status to attached consoles only on real change (see below).
   let monitorTimer = null;
@@ -9070,7 +9227,23 @@ async function runSupervisorDaemon() {
       try { rmSync(w.activityFile || supervisorWorkerActivityFile(w.id), { force: true }); } catch { /* best effort */ }
       const ranMs = Date.now() - (w.spawnedAt || Date.now());
       if (ranMs >= SUPERVISOR_HEALTHY_UPTIME_MS) w.restarts = 0;
-      if (w.stopping || shuttingDown || !workers.has(w.id)) { persist(); return; }
+      if (w.stopping || shuttingDown || !workers.has(w.id)) {
+        // #202 drain-remove: a worker flagged for removal has now drained and
+        // exited — delete it and announce its removal (mirrors the synchronous
+        // force-remove path). Do this before persist() so the state reflects it.
+        if (w.removeOnExit && workers.get(w.id) === w) {
+          workers.delete(w.id);
+          try { rmSync(w.activityFile || supervisorWorkerActivityFile(w.id), { force: true }); } catch { /* best effort */ }
+          dlog(`worker '${w.id}' removed (drained)`);
+          broadcast({ type: 'event', event: 'worker-remove', id: w.id });
+        }
+        persist();
+        // #202: during a graceful drain, push a fresh status so an attached
+        // `stop` client sees the in-flight count shrink as each worker finishes
+        // and exits — even when the periodic monitor is disabled.
+        if (draining) { try { broadcast(statusFrame(false)); } catch { /* best effort */ } }
+        return;
+      }
       const delay = supervisorBackoffMs(w.restarts);
       w.restarts += 1;
       dlog(`worker '${w.id}' down (${reason}); restarting in ${delay}ms (restart #${w.restarts})`);
@@ -9109,23 +9282,55 @@ async function runSupervisorDaemon() {
     return w;
   };
 
-  const stopWorker = async (id) => {
-    const w = workers.get(id);
-    if (!w) return false;
-    w.stopping = true;
-    if (w.restartTimer) { clearTimeout(w.restartTimer); w.restartTimer = null; }
+  const forceStopWorker = async (w) => {
     const pid = w.pid;
     if (w.child && pid) {
       try { process.kill(pid, 'SIGTERM'); } catch { /* already gone */ }
       await waitForChildExit(w.child, STOP_GRACE_MS);
       if (isPidAlive(pid)) { try { process.kill(pid, 'SIGKILL'); } catch { /* ignore */ } }
     }
+  };
+
+  const stopWorker = async (id, { force = true } = {}) => {
+    const w = workers.get(id);
+    if (!w) return false;
+    w.stopping = true;
+    if (w.restartTimer) { clearTimeout(w.restartTimer); w.restartTimer = null; }
+    const pid = w.pid;
+    if (!force) {
+      // #202 graceful drain: send SIGUSR2 so the child quiesces its activation
+      // loop, lets in-flight jobs finish, and exits on its own. Wait INDEFINITELY
+      // — a `stop --force` escalation (forceStopWorker) is the only way to cut a
+      // stuck drain short, and it resolves this same wait when the child dies.
+      if (w.child && pid) {
+        try { process.kill(pid, SUPERVISOR_DRAIN_SIGNAL); } catch { /* already gone */ }
+        await waitForChildExit(w.child, null);
+      }
+      return true;
+    }
+    await forceStopWorker(w);
     return true;
   };
 
-  const removeWorker = async (id) => {
-    if (!workers.has(id)) return false;
-    await stopWorker(id);
+  const removeWorker = async (id, { force = true } = {}) => {
+    const w = workers.get(id);
+    if (!w) return false;
+    if (!force) {
+      // #202 drain-remove (used by `workforce stop`): quiesce this worker and let
+      // it finish its in-flight jobs, then let the death handler delete it once
+      // it exits. Return immediately so the control loop keeps serving (the
+      // client polls status to watch the worker disappear) rather than blocking
+      // the request queue for the whole — possibly long — drain.
+      w.stopping = true;
+      w.removeOnExit = true;
+      if (w.restartTimer) { clearTimeout(w.restartTimer); w.restartTimer = null; }
+      const pid = w.pid;
+      if (w.child && pid) { try { process.kill(pid, SUPERVISOR_DRAIN_SIGNAL); } catch { /* already gone */ } }
+      else { workers.delete(id); try { rmSync(supervisorWorkerActivityFile(id), { force: true }); } catch { /* best effort */ } broadcast({ type: 'event', event: 'worker-remove', id }); persist(); }
+      dlog(`worker '${id}' draining for removal`);
+      return true;
+    }
+    await stopWorker(id, { force: true });
     workers.delete(id);
     try { rmSync(supervisorWorkerActivityFile(id), { force: true }); } catch { /* best effort */ }
     dlog(`worker '${id}' removed`);
@@ -9166,15 +9371,30 @@ async function runSupervisorDaemon() {
     ...(final ? { final: true } : {}),
   });
 
-  const shutdown = async (signal) => {
-    if (shuttingDown) return;
+  const shutdown = async (signal, { force = true } = {}) => {
+    if (shuttingDown) {
+      // A shutdown is already running. A `stop --force` arriving mid-DRAIN
+      // escalates it: hard-stop every worker still finishing its jobs so the
+      // operator isn't stuck waiting. Idempotent — only the first force escalates.
+      if (force && draining && !forcing) {
+        forcing = true;
+        dlog('stop --force received during drain — escalating to hard abort');
+        broadcast({ type: 'event', event: 'draining-escalated' });
+        await Promise.all([...workers.values()].map((w) => forceStopWorker(w)));
+      }
+      return;
+    }
     shuttingDown = true;
+    draining = !force;
     // Let any in-flight mutation finish before we snapshot the worker set, so
     // an add/restart racing the shutdown can't leave an orphaned child behind.
     try { await opQueue; } catch { /* mutation already logged */ }
+    dlog(`received ${signal || 'stop'} — ${force ? 'stopping' : 'draining'} ${workers.size} worker(s)`);
+    if (!force) broadcast({ type: 'event', event: 'draining', workers: [...workers.values()].map(workerPublic) });
+    await Promise.all([...workers.keys()].map((id) => stopWorker(id, { force })));
     if (monitorTimer) { try { clearInterval(monitorTimer); } catch { /* ignore */ } monitorTimer = null; }
-    dlog(`received ${signal || 'stop'} — stopping ${workers.size} worker(s)`);
-    await Promise.all([...workers.keys()].map((id) => stopWorker(id)));
+    // Terminal frame for every waiting `stop` client (streaming or one-shot).
+    for (const s of stopClients) { try { s.write(encodeFrame({ ok: true, type: 'stopped', final: true })); } catch { /* client gone */ } }
     broadcast({ type: 'event', event: 'daemon-stop' });
     try { server.close(); } catch { /* ignore */ }
     if (osPlatform() !== 'win32') { try { rmSync(socketPath, { force: true }); } catch { /* ignore */ } }
@@ -9213,12 +9433,17 @@ async function runSupervisorDaemon() {
         }
         case 'remove': {
           if (shuttingDown) { sock.write(encodeFrame({ ok: false, error: 'supervisor is shutting down', final: true })); break; }
+          // #202: `req.force === false` drains each worker (finish in-flight jobs
+          // then exit); the default remains a fast force-stop (used by reconcile
+          // and interactive remove). A drain-remove returns immediately and the
+          // worker disappears from status once it has drained.
+          const removeForce = req.force !== false;
           const removed = await serializeOp(async () => {
             const ids = resolveTargets(req.target);
-            for (const id of ids) await removeWorker(id);
+            for (const id of ids) await removeWorker(id, { force: removeForce });
             return ids;
           });
-          sock.write(encodeFrame({ ok: true, type: 'removed', removed, final: true }));
+          sock.write(encodeFrame({ ok: true, type: 'removed', removed, draining: !removeForce, final: true }));
           break;
         }
         case 'restart': {
@@ -9235,10 +9460,25 @@ async function runSupervisorDaemon() {
           attachClients.add(sock);
           sock.write(encodeFrame(statusFrame(false)));
           break;
-        case 'stop':
-          sock.write(encodeFrame({ ok: true, type: 'stopping', final: true }));
-          setTimeout(() => shutdown('stop'), 50);
+        case 'stop': {
+          // #202: default is a GRACEFUL DRAIN — quiesce workers, let in-flight
+          // jobs finish, exit when idle. `req.force` hard-aborts (kill harness,
+          // yield jobs) and can also ESCALATE a drain already in progress.
+          const force = !!req.force;
+          // Register this client as an attach consumer so it streams drain
+          // progress (shrinking in-flight counts), and as a stop client so it
+          // gets a terminal `stopped` frame when the daemon has finished.
+          attachClients.add(sock);
+          stopClients.add(sock);
+          sock.write(encodeFrame(force
+            ? { ok: true, type: 'stopping', force: true }
+            : { ok: true, type: 'draining' }));
+          sock.write(encodeFrame(statusFrame(false)));
+          // Kick the shutdown asynchronously; don't await it here so the control
+          // loop keeps serving (streaming status, accepting a force escalation).
+          setTimeout(() => { shutdown('stop', { force }); }, 20);
           break;
+        }
         default:
           sock.write(encodeFrame({ ok: false, error: `unknown op "${op}"`, final: true }));
       }
@@ -9276,8 +9516,8 @@ async function runSupervisorDaemon() {
         queue = queue.then(() => handleRequest(req, sock)).catch((err) => dlog(`request error: ${err?.message || err}`));
       }
     });
-    sock.on('close', () => attachClients.delete(sock));
-    sock.on('error', () => attachClients.delete(sock));
+    sock.on('close', () => { attachClients.delete(sock); stopClients.delete(sock); });
+    sock.on('error', () => { attachClients.delete(sock); stopClients.delete(sock); });
   });
 
   // Create the control socket owner-only from the start. The socket file lives
@@ -9622,7 +9862,29 @@ async function supervisorRestartCmd(req) {
   else { logger.error(res.error); process.exit(1); }
 }
 
-async function supervisorStopCmd() {
+/**
+ * Count the in-flight jobs across a fleet snapshot (array of
+ * `summarizeSupervisorWorker` results) — the number an operator is waiting on
+ * when draining.
+ */
+function countSupervisorInFlight(workers) {
+  let n = 0;
+  for (const w of workers || []) {
+    if (w && w.activity && Array.isArray(w.activity.jobs)) n += w.activity.jobs.length;
+  }
+  return n;
+}
+
+/**
+ * Stop the supervisor. By default (issue #202) this GRACEFULLY DRAINS: the
+ * daemon quiesces its workers (they stop leasing new jobs, finish the ones in
+ * flight, and exit), streaming the shrinking in-flight count to this client the
+ * whole time. Ctrl-C DETACHES — the daemon keeps draining in the background.
+ * `force` hard-aborts instead: each worker's harness is killed and its job is
+ * yielded for immediate retry. A `force` request also escalates a drain that is
+ * already in progress.
+ */
+async function supervisorStopCmd(force = false) {
   const logger = getLogger();
   const running = await liveSupervisor();
   if (!running) {
@@ -9630,35 +9892,100 @@ async function supervisorStopCmd() {
     else logger.warn('Supervisor is not running — nothing to stop.');
     return;
   }
-  try {
-    await supervisorRequest({ op: 'stop' });
-  } catch {
-    // Socket unreachable — fall back to signalling the daemon pid directly.
-    try { process.kill(running.pid, 'SIGTERM'); } catch { /* already gone */ }
-  }
-  // Gate the wait loop and the SIGKILL fallback on the daemon pid we captured,
-  // not on runningSupervisor()/the state file: the daemon clears its state file
-  // as part of shutting down (and liveSupervisor()/external cleanup can remove
-  // it too), so a state-file check can report "gone" while the process is still
-  // alive — which would break the loop early and skip the SIGKILL fallback,
-  // leaving a wedged daemon and its worker process group running.
-  const deadline = Date.now() + STOP_GRACE_MS + 2_000;
-  while (Date.now() < deadline) {
-    if (!isPidAlive(running.pid)) break;
-    await new Promise((r) => setTimeout(r, 150));
-  }
-  if (isPidAlive(running.pid)) {
-    logger.warn(`Supervisor (pid ${running.pid}) did not stop gracefully — sending SIGKILL.`);
-    // The daemon is spawned detached (a process-group leader) and its workers
-    // are children in that group, so SIGKILL the whole group to avoid orphaning
-    // `nano work` processes. Fall back to the bare pid (e.g. on Windows, or if
-    // the daemon isn't a group leader).
-    let killedGroup = false;
-    if (osPlatform() !== 'win32') {
-      try { process.kill(-running.pid, 'SIGKILL'); killedGroup = true; } catch { /* fall back below */ }
+  const socketPath = running.socket || getSupervisorSocketPath();
+  const daemonPid = running.pid;
+
+  // Stream drain/stop progress. Resolves with the outcome that ended the stream.
+  const outcome = await new Promise((resolve) => {
+    let sock = null;
+    let buf = '';
+    let done = false;
+    let lastCount = null;
+    let onSigint = null;
+    const cleanup = () => {
+      if (onSigint) { try { process.removeListener('SIGINT', onSigint); } catch { /* ignore */ } }
+      try { if (sock) sock.end(); } catch { /* ignore */ }
+    };
+    const finish = (result) => { if (done) return; done = true; cleanup(); resolve(result); };
+
+    supervisorConnect(socketPath).then((s) => {
+      sock = s;
+      sock.setEncoding('utf8');
+      // Ctrl-C detaches the client only — the daemon keeps draining. (Force
+      // stops don't wait on the operator, so a Ctrl-C there just stops watching.)
+      onSigint = () => {
+        if (force) {
+          logger.info('Detached — supervisor is aborting in the background.');
+        } else {
+          logger.info('Detached — supervisor keeps draining in the background. Rerun `nano supervisor stop` to watch again, or `nano supervisor stop --force` to abort in-flight work.');
+        }
+        finish('detached');
+      };
+      process.on('SIGINT', onSigint);
+
+      sock.on('data', (chunk) => {
+        buf += chunk;
+        const { frames, rest } = decodeFrames(buf);
+        buf = rest;
+        for (const frame of frames) {
+          if (frame && frame.type === 'stopping') {
+            logger.info('Aborting in-flight work — killing harnesses and yielding jobs for retry...');
+          } else if (frame && frame.event === 'draining-escalated') {
+            logger.info('Escalating to --force — aborting in-flight work...');
+          } else if (frame && (frame.type === 'status' || frame.type === 'draining' || frame.event === 'draining')) {
+            const n = countSupervisorInFlight(frame.workers);
+            if (!force && n !== lastCount) {
+              lastCount = n;
+              if (n > 0) logger.info(`Draining — waiting on ${n} in-flight job(s) to finish. Press Ctrl-C to detach, or rerun with --force to abort.`);
+              else logger.info('No jobs in flight — stopping.');
+            }
+          } else if (frame && frame.event === 'daemon-stop') {
+            finish('stopped');
+          } else if (frame && (frame.type === 'stopped' || frame.final)) {
+            finish('stopped');
+          }
+        }
+      });
+      sock.on('error', () => finish('closed'));
+      sock.on('close', () => finish('closed'));
+      sock.write(encodeFrame({ op: 'stop', force: !!force }));
+    }).catch(() => finish('unreachable'));
+  });
+
+  if (outcome === 'detached') return;
+
+  if (outcome === 'unreachable') {
+    if (force) {
+      // Socket unreachable — fall back to signalling the daemon pid directly.
+      try { process.kill(daemonPid, 'SIGTERM'); } catch { /* already gone */ }
+    } else {
+      logger.warn('Could not reach the supervisor control socket to drain it. Rerun with --force to abort, or stop it manually.');
+      return;
     }
-    if (!killedGroup) { try { process.kill(running.pid, 'SIGKILL'); } catch { /* ignore */ } }
-    clearSupervisorState();
+  }
+
+  // Wait for the daemon process itself to exit. A drain waits INDEFINITELY (the
+  // operator opted to wait); a force stop applies the grace window + a SIGKILL
+  // backstop so a wedged daemon/worker group can't linger.
+  if (force) {
+    const deadline = Date.now() + STOP_GRACE_MS + 2_000;
+    while (Date.now() < deadline) {
+      if (!isPidAlive(daemonPid)) break;
+      await new Promise((r) => setTimeout(r, 150));
+    }
+    if (isPidAlive(daemonPid)) {
+      logger.warn(`Supervisor (pid ${daemonPid}) did not stop gracefully — sending SIGKILL.`);
+      let killedGroup = false;
+      if (osPlatform() !== 'win32') {
+        try { process.kill(-daemonPid, 'SIGKILL'); killedGroup = true; } catch { /* fall back below */ }
+      }
+      if (!killedGroup) { try { process.kill(daemonPid, 'SIGKILL'); } catch { /* ignore */ } }
+      clearSupervisorState();
+    }
+  } else {
+    while (isPidAlive(daemonPid)) {
+      await new Promise((r) => setTimeout(r, 150));
+    }
   }
   logger.info('Supervisor stopped.');
 }
@@ -10335,7 +10662,7 @@ async function supervisorCommand(req, flags) {
       await supervisorRestartCmd(req);
       return;
     case 'stop':
-      await supervisorStopCmd();
+      await supervisorStopCmd(coerceBool(flags?.force, false));
       return;
     case 'logs':
     case 'log':
@@ -11234,14 +11561,38 @@ async function workforceStopCmd(req, flags, manifestName) {
     })
     .map((w) => w.id);
   let hadError = false;
+  const force = coerceBool(flags?.force, false);
   if (owned.length === 0) {
     logger.info(`No workers from workforce "${manifestName}" are running.`);
-  } else {
+  } else if (force) {
     for (const id of owned) {
-      const res = await supervisorRequest({ op: 'remove', target: id });
-      if (res && res.ok) logger.info(`Removed worker "${id}".`);
+      const res = await supervisorRequest({ op: 'remove', target: id, force: true });
+      if (res && res.ok) logger.info(`Removed worker "${id}" (aborted in-flight work).`);
       else { logger.error(`Could not remove "${id}": ${(res && res.error) || 'unknown error'}`); hadError = true; }
     }
+  } else {
+    // #202 graceful drain: ask the daemon to quiesce each owned worker (finish
+    // in-flight jobs, then exit) and poll status until they've all drained away.
+    for (const id of owned) {
+      const res = await supervisorRequest({ op: 'remove', target: id, force: false });
+      if (res && res.ok) logger.info(`Draining worker "${id}"...`);
+      else { logger.error(`Could not drain "${id}": ${(res && res.error) || 'unknown error'}`); hadError = true; }
+    }
+    const ownedSet = new Set(owned);
+    let lastInFlight = null;
+    for (;;) {
+      const snap = await fetchSupervisorWorkers();
+      if (!snap.running || !snap.reachable) break;
+      const remaining = (snap.workers || []).filter((w) => w && ownedSet.has(w.id));
+      if (remaining.length === 0) break;
+      const inFlight = countSupervisorInFlight(remaining);
+      if (inFlight !== lastInFlight) {
+        lastInFlight = inFlight;
+        logger.info(`Draining "${manifestName}" — ${remaining.length} worker(s) still finishing ${inFlight} in-flight job(s). Rerun with --force to abort.`);
+      }
+      await new Promise((r) => setTimeout(r, 300));
+    }
+    if (lastInFlight !== null) logger.info(`Workforce "${manifestName}" drained.`);
   }
   // If no supervised workers remain, stop the daemon too — but only when the
   // status socket actually answered. A `{ workers: [] }` from an *unreachable*
@@ -11257,7 +11608,7 @@ async function workforceStopCmd(req, flags, manifestName) {
     logger.warn('Supervisor status socket became unreachable; leaving the daemon running.');
   } else if (remaining.length === 0) {
     logger.info('No supervised workers remain — stopping the supervisor daemon.');
-    await supervisorStopCmd();
+    await supervisorStopCmd(force);
   } else {
     logger.info(`${remaining.length} other supervised worker(s) remain; leaving the daemon running.`);
   }
@@ -13281,7 +13632,7 @@ export const commands = {
       console: { type: 'string', description: 'start: runtime console profile off|observe|studio (NANOBPMN_CONSOLE; default studio)' },
       follow: { type: 'boolean', description: 'logs: stream output (tail -F)', short: 'f' },
       purge: { type: 'boolean', description: 'stop/restart: also delete per-node engine data' },
-      force: { type: 'boolean', description: 'start: stop any existing cluster first' },
+      force: { type: 'boolean', description: 'start: stop any existing cluster first; supervisor/workforce stop: abort in-flight work (kill harness, yield jobs for retry) instead of the default graceful drain' },
       workspace: { type: 'boolean', description: 'clean: also delete the workspace (models + workers)' },
       check: { type: 'boolean', description: 'update: report whether a new release is available (with the changelog since the installed version); do not install' },
       binary: { type: 'string', description: 'Path to the nanobpmn server binary' },

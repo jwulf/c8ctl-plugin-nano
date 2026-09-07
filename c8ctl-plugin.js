@@ -4676,7 +4676,7 @@ function reapOwnedNamespace(nsDir, { maxAgeMs = 0, liveRunDirs = new Set(), now 
     maxAgeMs,
     liveRunDirs,
     now,
-    onReap: (p) => { if (logger) logger.info(`[reaper] ${new Date(now).toISOString()} incarnation=${incarnation ?? '?'} removed own finished ${basename(p)} (owner-scoped, not in-flight)`); },
+    onReap: (p) => { if (logger) logger.info(`[reaper] ${new Date(now).toISOString()} incarnation=${incarnation ?? '?'} removed own aged, not-in-flight ${basename(p)} (owner-scoped)`); },
   });
 }
 
@@ -6108,6 +6108,11 @@ function runAgentJob(profile, job, opts = {}) {
     onStreamOut,
     onStreamErr,
     relayTap,
+    // #205: thread the harness-PID callback through the container path too, so a
+    // crashed worker's in-flight job marker records the spawned client PID and
+    // orphan reclamation can tell a possibly-surviving harness from an abandoned
+    // namespace (an empty `harnessPids` otherwise forces indefinite retention).
+    onSpawn,
     onTimeout: (child) => {
       try { spawnSync(engine, ['rm', '-f', containerName], { timeout: 15_000 }); } catch { /* best effort */ }
       try { killTree(child); } catch { /* best effort */ }
@@ -7554,7 +7559,7 @@ async function workAgent(req, flags) {
     if (reclaimStartup.reclaimed.length > 0) logger.info(`Reclaimed ${reclaimStartup.reclaimed.length} abandoned worker namespace(s) at startup.`);
     runDirTimer = setInterval(() => {
       const r = reapOwnedNamespace(workerNsDir, { maxAgeMs: reapAgeMs, liveRunDirs, logger, incarnation: workerIncarnation });
-      if (r.reaped > 0) logger.info(`Reaper removed ${r.reaped} finished job workspace(s) from this worker's namespace.`);
+      if (r.reaped > 0) logger.info(`Reaper removed ${r.reaped} aged, not-in-flight job workspace(s) from this worker's namespace.`);
       const rc = reclaimOrphanNamespaces({ selfIncarnation: workerIncarnation, minAgeMs: reapAgeMs, logger });
       if (rc.reclaimed.length > 0) logger.info(`Reclaimed ${rc.reclaimed.length} abandoned worker namespace(s).`);
     }, reapIntervalMs);

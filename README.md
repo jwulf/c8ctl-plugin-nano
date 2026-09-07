@@ -1033,6 +1033,42 @@ it cannot (e.g. `launchctl` is unavailable, or you set `C8CTL_NANO_NO_LAUNCHD=1`
 it prints a prominent **warning** pointing at `supervisor install` instead of
 silently leaving a fleet that will wedge on logout.
 
+> **macOS Local Network Privacy + a LAN engine (macOS 15 Sequoia / 26 Tahoe).**
+> The `gui/$UID` LaunchAgent that keeps the fleet alive across SSH logout is a
+> **distinct TCC identity** — and on macOS 15+ it is **not** granted **Local
+> Network** access, which an interactive SSH/Terminal session inherits for free.
+> So a service-owned fleet whose engine is on the **LAN** (`merlin.local`,
+> `192.168.x.x`, `10.x`, …) hits the **same wedge** as the logout case —
+> `activateJobs failed: fetch failed`, `reconcile skipped — fetch failed`,
+> `listening on 0 job type(s)`, agentic `disconnected` — **even while you are
+> still logged in**. The tell is `EHOSTUNREACH` (or a silent connect failure) to
+> the engine's **LAN IP** from the service, while the *same* fetch works from an
+> interactive SSH shell and **internet-reachable** hosts still work from the
+> service. This is *not* the IPv6/mDNS case above — it fails even against the raw
+> IPv4 literal, because the OS is blocking LAN egress for the launchd identity.
+>
+> There is **no `tccutil` / CLI grant** for a headless launchd tool. Pick one:
+> - **Grant the launch program Local Network access (simplest).** On the Mac's
+>   GUI, **System Settings → Privacy & Security → Local Network**, enable the
+>   entry for the service's program — the **Node.js** runtime (it may surface as
+>   *“Node.js Foundation”* / *“App Background Activity”*). Then
+>   `c8ctl nano supervisor stop && c8ctl nano supervisor start`. The grant is
+>   keyed to the node binary, so it persists across restarts.
+> - **Route over Tailscale (keeps logout survival, no LAN grant needed).** Traffic
+>   over the Tailscale `utun` interface is **not** classified as “local network”,
+>   so the launchd service reaches it fine. Point the engine at the tailnet
+>   address (e.g. `NANO_REST_URL=http://<host>.<tailnet>.ts.net:8080`, or bake it
+>   into the active profile so the service inherits it).
+> - **Run in the SSH session instead** (`supervisor uninstall`) — inherits the
+>   Terminal grant, but reverts to dying on logout unless you pin a `tmux`/SSH
+>   session. Note that on macOS `supervisor start` over SSH **auto-reparents**
+>   back into the `gui/$UID` launchd identity (reinstalling the LaunchAgent)
+>   unless you set `C8CTL_NANO_NO_LAUNCHD=1` — without that opt-out you land in
+>   the same blocked identity. Start from a **local Terminal** session (or export
+>   `C8CTL_NANO_NO_LAUNCHD=1`) to keep the interactive grant.
+> - **Run the daemon as root** — root retains LAN access, but running agent
+>   harnesses as root is a poor trade; prefer the options above.
+
 ## Composing a workforce: `workforce`
 
 `supervisor` is imperative — you compose a fleet with a `start --worker …` plus a

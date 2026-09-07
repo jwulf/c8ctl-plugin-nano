@@ -27,9 +27,27 @@ export interface WorkerState {
 
 export interface RegistryState {
   readonly workers: ReadonlyMap<string, WorkerState>;
+  /**
+   * Graceful-drain latch (issue #202). When set, {@link typesWithCapacity} /
+   * {@link typesWithSlots} return NOTHING regardless of the workers' serviceable
+   * types or free slots, so the activation loop leases no new job. This is
+   * **authoritative over the `--auto` reconcile**: a reconcile pass that rewrites
+   * a worker's types via {@link setWorkerTypes} still cannot re-open the poll set
+   * while quiescing, so a draining worker can never re-lease work. In-flight jobs
+   * (already-claimed slots) are unaffected — they run to completion and release
+   * their slot normally, which is exactly what lets a `stop` DRAIN rather than
+   * abort.
+   */
+  readonly quiescing?: boolean;
 }
 
 export const emptyRegistry: RegistryState = { workers: new Map() };
+
+/** Latch/unlatch the graceful-drain quiesce flag. Pure. */
+export function setQuiesce(state: RegistryState, on: boolean): RegistryState {
+  if (!!state.quiescing === on) return state;
+  return { ...state, quiescing: on };
+}
 
 export function addWorker(
   state: RegistryState,
@@ -45,14 +63,14 @@ export function addWorker(
     capacity,
     active: prev?.active ?? 0,
   });
-  return { workers };
+  return { ...state, workers };
 }
 
 export function removeWorker(state: RegistryState, id: string): RegistryState {
   if (!state.workers.has(id)) return state;
   const workers = new Map(state.workers);
   workers.delete(id);
-  return { workers };
+  return { ...state, workers };
 }
 
 /** Rewrite an existing worker's serviceable type set (the `--auto` reconcile path). */
@@ -61,7 +79,7 @@ export function setWorkerTypes(state: RegistryState, id: string, types: Iterable
   if (!prev) return state;
   const workers = new Map(state.workers);
   workers.set(id, { ...prev, types: new Set(types) });
-  return { workers };
+  return { ...state, workers };
 }
 
 /** Mark one unit of the worker busy. Throws past capacity — the caller must gate first. */
@@ -71,7 +89,7 @@ export function acquire(state: RegistryState, id: string): RegistryState {
   if (prev.active >= prev.capacity) throw new Error(`acquire: worker ${id} at capacity`);
   const workers = new Map(state.workers);
   workers.set(id, { ...prev, active: prev.active + 1 });
-  return { workers };
+  return { ...state, workers };
 }
 
 /** Release one unit. Clamped at 0 so a double-release is a safe no-op. */
@@ -80,7 +98,7 @@ export function release(state: RegistryState, id: string): RegistryState {
   if (!prev) return state;
   const workers = new Map(state.workers);
   workers.set(id, { ...prev, active: Math.max(0, prev.active - 1) });
-  return { workers };
+  return { ...state, workers };
 }
 
 /** Free slots for one job type = idle capacity summed over workers that service it. */
@@ -106,6 +124,9 @@ export function serviceableTypes(state: RegistryState): ReadonlySet<string> {
  * not one mega-poll — is where the polling storm collapses.
  */
 export function typesWithCapacity(state: RegistryState): ReadonlyArray<string> {
+  // Graceful drain (issue #202): a quiescing registry polls for NOTHING, even
+  // when workers are idle with serviceable types — authoritative over reconcile.
+  if (state.quiescing) return [];
   const out: string[] = [];
   for (const t of serviceableTypes(state)) {
     if (freeSlotsFor(state, t) > 0) out.push(t);
@@ -119,6 +140,8 @@ export function typesWithCapacity(state: RegistryState): ReadonlyArray<string> {
  * round may pull (capacity-sized batched activation).
  */
 export function typesWithSlots(state: RegistryState): ReadonlyArray<{ type: string; freeSlots: number }> {
+  // See typesWithCapacity: quiescing suppresses ALL activation (issue #202).
+  if (state.quiescing) return [];
   const out: Array<{ type: string; freeSlots: number }> = [];
   for (const t of serviceableTypes(state)) {
     const free = freeSlotsFor(state, t);
@@ -150,6 +173,17 @@ export interface Registry {
    * per-type batch size for capacity-sized batched activation.
    */
   readonly pollBatch: Effect.Effect<ReadonlyArray<{ type: string; freeSlots: number }>>;
+  /**
+   * Latch the graceful-drain quiesce flag (issue #202): after this, `pollTypes`/
+   * `pollBatch` resolve empty so the activation loop leases no new job, even if a
+   * subsequent `setTypes` (the `--auto` reconcile) rewrites a worker's types. A
+   * `false` argument un-latches it. Idempotent.
+   */
+  quiesce(on?: boolean): Effect.Effect<void>;
+  /** Whether the registry is currently quiescing (drain latch set). */
+  readonly quiescing: Effect.Effect<boolean>;
+  /** Total in-flight jobs across all workers (Σ active). Zero == fully drained. */
+  readonly activeCount: Effect.Effect<number>;
 }
 
 export const makeRegistry = (initial: RegistryState = emptyRegistry): Effect.Effect<Registry> =>
@@ -169,6 +203,15 @@ export const makeRegistry = (initial: RegistryState = emptyRegistry): Effect.Eff
       releaseWorker: (id) => Ref.update(ref, (s) => release(s, id)),
       pollTypes: Ref.get(ref).pipe(Effect.map(typesWithCapacity)),
       pollBatch: Ref.get(ref).pipe(Effect.map(typesWithSlots)),
+      quiesce: (on = true) => Ref.update(ref, (s) => setQuiesce(s, on)),
+      quiescing: Ref.get(ref).pipe(Effect.map((s) => !!s.quiescing)),
+      activeCount: Ref.get(ref).pipe(
+        Effect.map((s) => {
+          let n = 0;
+          for (const w of s.workers.values()) n += w.active;
+          return n;
+        }),
+      ),
     };
     return registry;
   });

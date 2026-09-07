@@ -11,7 +11,7 @@
  */
 import assert from "node:assert/strict";
 import { test } from "node:test";
-import { Effect } from "effect";
+import { Effect, Fiber } from "effect";
 import {
   asLogger,
   makeEngineClient,
@@ -194,6 +194,39 @@ test("makeJobRunner: run resolves void; a rejection maps to SupervisorError", as
   const err = await errOf(makeJobRunner(boom).run({ jobKey: "x", type: "t" }));
   assert.ok(err instanceof SupervisorError);
   assert.match(err.message, /spawn failed/);
+});
+
+test("makeJobRunner: forwards the interruption AbortSignal so an abort CANCELS the harness (issue #202)", async () => {
+  // The seam guard for the "interruption abandons a promise" defect class: the
+  // lift MUST hand the raw runner an AbortSignal that fires on fiber interruption
+  // (a `stop --force`), so the raw `runAgentJob` can killTree the harness rather
+  // than orphan it. Mirrors `activate`, which already forwards `signal`.
+  let seenSignal: AbortSignal | undefined;
+  let aborted = false;
+  let signalRan!: () => void;
+  const ranOnce = new Promise<void>((resolve) => { signalRan = resolve; });
+  const raw: RawJobRunner = {
+    run: (_job, signal) => {
+      seenSignal = signal;
+      signalRan();
+      return new Promise<void>((resolve) => {
+        // Never resolves on its own — only an abort (interrupt) ends it, exactly
+        // like a long-running harness that must be killed to stop.
+        if (signal) signal.addEventListener("abort", () => { aborted = true; resolve(); });
+      });
+    },
+  };
+  await Effect.runPromise(
+    Effect.gen(function* () {
+      const fiber = yield* Effect.forkChild(makeJobRunner(raw).run({ jobKey: "int", type: "t" }));
+      // Wait until the run has actually started (and captured its signal) before
+      // interrupting — deterministic, no wall-clock race under a loaded suite.
+      yield* Effect.promise(() => ranOnce);
+      yield* Fiber.interrupt(fiber);
+    }),
+  );
+  assert.ok(seenSignal instanceof AbortSignal, "raw.run received an AbortSignal");
+  assert.equal(aborted, true, "interrupting the fiber aborted the forwarded signal");
 });
 
 test("asLogger: coerces a console-shaped object, defaults debug, falls back to noop", () => {

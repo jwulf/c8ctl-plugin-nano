@@ -6,10 +6,11 @@
 // (so no createClient/broker is needed).
 import { test } from 'node:test';
 import assert from 'node:assert/strict';
-import { mkdtempSync, writeFileSync, readFileSync, readdirSync, rmSync, statSync } from 'node:fs';
+import { mkdtempSync, writeFileSync, readFileSync, readdirSync, rmSync, statSync, existsSync } from 'node:fs';
 import { tmpdir, platform as osPlatform } from 'node:os';
 import { join, dirname } from 'node:path';
 import { fileURLToPath } from 'node:url';
+import { createConnection } from 'node:net';
 
 const here = dirname(fileURLToPath(import.meta.url));
 const pluginUrl = new URL('./c8ctl-plugin.js', import.meta.url).href;
@@ -53,7 +54,7 @@ function restoreEnv(key, prev) {
 // also records the child's own argv to `<workArgvDir>/<pid>.json` (so tests can
 // assert on spawn flags); `ignoreSigterm` traps SIGTERM to force the daemon's
 // SIGKILL path on restart; `crash` exits immediately (code 1) with no watchdog.
-function writeShim(shimPath, { recordArgv = false, workArgvDir = null, ignoreSigterm = false, crash = false } = {}) {
+function writeShim(shimPath, { recordArgv = false, workArgvDir = null, ignoreSigterm = false, crash = false, busy = null } = {}) {
   if (recordArgv && typeof workArgvDir !== 'string') {
     throw new Error('writeShim: recordArgv requires a string workArgvDir path');
   }
@@ -79,6 +80,32 @@ function writeShim(shimPath, { recordArgv = false, workArgvDir = null, ignoreSig
   }
   if (crash) {
     lines.push(`  process.exit(1); // crash immediately`);
+  } else if (busy) {
+    // A "busy" stand-in reports one in-flight job in its activity file (so
+    // `supervisor status` counts it), then models the #202 stop contract:
+    //   - SIGUSR2 (graceful drain): after `drainMs`, clear the marker and exit 0.
+    //   - SIGTERM (force abort): record and exit at once.
+    // It records which signal it received to `sigFile`, so a test can prove a
+    // drain finished the job vs a force cut it short.
+    const { drainMs = 300, sigFile } = busy;
+    lines.push(
+      `  const { writeFileSync: wf, rmSync: rm, mkdirSync: mk } = await import('node:fs');`,
+      `  const { dirname } = await import('node:path');`,
+      `  const actFile = process.env.NANO_SUPERVISOR_ACTIVITY_FILE;`,
+      `  try { mk(dirname(actFile), { recursive: true }); wf(actFile, JSON.stringify({ pid: process.pid, jobs: [{ key: 'J1', type: 'faker:senior', since: Date.now() }] })); } catch {}`,
+      `  let ending = false;`,
+      `  const endWith = (how, delay) => {`,
+      `    if (ending && how !== 'forced') return; ending = true;`,
+      `    try { wf(${JSON.stringify(sigFile)}, how); } catch {}`,
+      `    setTimeout(() => { try { rm(actFile, { force: true }); } catch {} process.exit(0); }, delay);`,
+      `  };`,
+      `  process.on('SIGUSR2', () => endWith('drained', ${Number(drainMs)}));`,
+      `  process.on('SIGTERM', () => endWith('forced', 0));`,
+      `  const { installParentDeathWatchdog } = await import(${JSON.stringify(pluginUrl)});`,
+      `  const dp = Number.parseInt(process.env.NANO_SUPERVISOR_DAEMON_PID ?? '', 10);`,
+      `  installParentDeathWatchdog({ intervalMs: 100, parentPid: Number.isInteger(dp) ? dp : undefined });`,
+      `  setInterval(() => {}, 1 << 30);`,
+    );
   } else {
     if (ignoreSigterm) lines.push(`  process.on('SIGTERM', () => {}); // force the SIGKILL path on restart`);
     lines.push(
@@ -413,4 +440,126 @@ test('supervisor add --instances N: spawns N distinct auto-named workers, forwar
   }
 
   await mod.supervisorRequest({ op: 'stop' });
+});
+
+// A tiny streaming stop client: opens the control socket, sends `{op:'stop'}`
+// (optionally forced), and collects every decoded frame until the terminal
+// `stopped` frame (or the socket closes). Returns the frames so a test can
+// assert on the drain progress + terminal frame the daemon streamed.
+async function stopStream(mod, { force = false, sendAfter = null } = {}) {
+  const socketPath = mod.getSupervisorSocketPath();
+  const { encodeFrame, decodeFrames } = mod;
+  return await new Promise((resolve, reject) => {
+    const sock = createConnection(socketPath);
+    const frames = [];
+    let buf = '';
+    let done = false;
+    const finish = () => { if (done) return; done = true; try { sock.end(); } catch {} resolve(frames); };
+    sock.setEncoding('utf8');
+    sock.on('connect', () => {
+      sock.write(encodeFrame({ op: 'stop', force }));
+      if (sendAfter) setTimeout(() => { try { sock.write(encodeFrame(sendAfter)); } catch {} }, 150);
+    });
+    sock.on('data', (chunk) => {
+      buf += chunk;
+      const { frames: fr, rest } = decodeFrames(buf);
+      buf = rest;
+      for (const f of fr) { frames.push(f); if (f && (f.type === 'stopped' || f.final)) finish(); }
+    });
+    sock.on('close', () => finish());
+    sock.on('error', (err) => { if (!done) { done = true; reject(err); } });
+  });
+}
+
+async function bootBusyDaemon(t, { drainMs = 300 } = {}) {
+  const HOME = mkdtempSync(join(tmpdir(), 'c8ctl-sup-drain-'));
+  const prevHome = process.env.C8CTL_NANO_HOME;
+  const prevEntry = process.env.C8CTL_NANO_ENTRY;
+  const prevMon = process.env.NANO_SUPERVISOR_MONITOR_MS;
+  process.env.C8CTL_NANO_HOME = HOME;
+  process.env.NANO_SUPERVISOR_MONITOR_MS = '80'; // keep status broadcasts prompt
+  writeFileSync(join(HOME, 'config.json'), JSON.stringify({
+    hires: { faker: { name: 'faker', rank: 'senior', command: 'true', model: '', capabilities: [] } },
+  }));
+  const sigFile = join(HOME, 'worker-signal.txt');
+  const shim = join(HOME, 'fake-entry.mjs');
+  writeShim(shim, { busy: { drainMs, sigFile } });
+  process.env.C8CTL_NANO_ENTRY = shim;
+  const mod = await import(pluginUrl);
+  t.after(async () => {
+    const st = mod.runningSupervisor();
+    if (st) { try { process.kill(st.pid, 'SIGKILL'); } catch {} }
+    mod.clearSupervisorState();
+    restoreEnv('C8CTL_NANO_ENTRY', prevEntry);
+    restoreEnv('C8CTL_NANO_HOME', prevHome);
+    restoreEnv('NANO_SUPERVISOR_MONITOR_MS', prevMon);
+    try { rmSync(HOME, { recursive: true, force: true }); } catch {}
+  });
+  const state = await mod.startSupervisorDaemon();
+  assert.ok(state && state.pid, 'daemon should report a pid');
+  const added = await mod.supervisorRequest({ op: 'add', profile: 'faker' });
+  assert.equal(added.ok, true);
+  // Wait until the busy worker reports its in-flight job.
+  let inFlight = 0;
+  for (let i = 0; i < 40 && inFlight === 0; i++) {
+    const s = await mod.supervisorRequest({ op: 'status' });
+    inFlight = (s.workers || []).reduce((n, w) => n + (w.activity?.jobs?.length || 0), 0);
+    if (inFlight === 0) await sleep(50);
+  }
+  assert.equal(inFlight, 1, 'the busy worker should report one in-flight job');
+  return { mod, sigFile };
+}
+
+test('supervisor stop (default): drains in-flight work, then stops (issue #202)', async (t) => {
+  const { mod, sigFile } = await bootBusyDaemon(t, { drainMs: 250 });
+  const frames = await stopStream(mod, { force: false });
+  // The daemon announced a DRAIN (not a hard stop) and ended with `stopped`.
+  assert.ok(frames.some((f) => f && f.type === 'draining'), `expected a draining frame: ${JSON.stringify(frames)}`);
+  assert.ok(frames.some((f) => f && f.type === 'stopped' && f.final), 'expected a terminal stopped frame');
+  // The worker finished its job via the graceful drain signal — NOT a force kill.
+  assert.ok(existsSync(sigFile), 'the worker should have recorded its stop signal');
+  assert.equal(readFileSync(sigFile, 'utf8'), 'drained', 'the worker drained (SIGUSR2), not force-killed');
+  // The daemon exited and cleared its state.
+  let stopped = false;
+  for (let i = 0; i < 40 && !stopped; i++) { if (!mod.runningSupervisor()) { stopped = true; break; } await sleep(50); }
+  assert.ok(stopped, 'daemon should stop and clear its state after draining');
+});
+
+test('supervisor stop --force: aborts in-flight work immediately (issue #202)', async (t) => {
+  const { mod, sigFile } = await bootBusyDaemon(t, { drainMs: 10_000 });
+  const frames = await stopStream(mod, { force: true });
+  assert.ok(frames.some((f) => f && f.type === 'stopping' && f.force), `expected a forced stopping frame: ${JSON.stringify(frames)}`);
+  assert.ok(frames.some((f) => f && f.type === 'stopped' && f.final), 'expected a terminal stopped frame');
+  assert.equal(readFileSync(sigFile, 'utf8'), 'forced', 'the worker was force-aborted (SIGTERM)');
+});
+
+test('supervisor stop: a force request escalates an in-progress drain (issue #202)', async (t) => {
+  const { mod, sigFile } = await bootBusyDaemon(t, { drainMs: 10_000 });
+  // Start a drain (which would otherwise wait ~10s), then escalate with force.
+  const frames = await stopStream(mod, { force: false, sendAfter: { op: 'stop', force: true } });
+  assert.ok(frames.some((f) => f && f.type === 'draining'), 'drain started first');
+  assert.ok(frames.some((f) => f && f.type === 'stopped' && f.final), 'the escalated stop completed');
+  assert.equal(readFileSync(sigFile, 'utf8'), 'forced', 'the escalation force-aborted the draining worker');
+});
+
+test('supervisor remove (force:false): drains a worker without killing it (issue #202)', async (t) => {
+  const { mod, sigFile } = await bootBusyDaemon(t, { drainMs: 200 });
+  const before = await mod.supervisorRequest({ op: 'status' });
+  const id = before.workers[0].id;
+  // Drain-remove: the daemon acks immediately; the worker finishes its job and
+  // then disappears from status once it exits.
+  const res = await mod.supervisorRequest({ op: 'remove', target: id, force: false });
+  assert.equal(res.ok, true);
+  assert.equal(res.draining, true, 'a force:false remove is a drain');
+  let gone = false;
+  for (let i = 0; i < 60 && !gone; i++) {
+    const s = await mod.supervisorRequest({ op: 'status' });
+    gone = !(s.workers || []).some((w) => w.id === id);
+    if (!gone) await sleep(50);
+  }
+  assert.ok(gone, 'the drained worker should be removed from status');
+  assert.equal(readFileSync(sigFile, 'utf8'), 'drained', 'the worker drained (SIGUSR2), not force-killed');
+  // The daemon itself stays up (only the worker was removed).
+  assert.ok(mod.runningSupervisor(), 'the daemon should keep running after a drain-remove');
+  await mod.supervisorRequest({ op: 'stop', force: true });
 });

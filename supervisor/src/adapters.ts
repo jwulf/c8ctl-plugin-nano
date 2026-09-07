@@ -139,14 +139,26 @@ export const makeReconcileReader = (raw: RawReconcileReader): ReconcileReader =>
  * rejection is surfaced (and logged) by {@link dispatch}, never crashing the loop.
  */
 export interface RawJobRunner {
-  run(job: ActivatedJob): Promise<void>;
+  /**
+   * Run one activated job to completion. The optional `signal` is aborted when
+   * the supervisor fiber running this job is interrupted (a `stop --force` /
+   * abort, issue #202): the raw runner MUST wire it to `killTree` the harness
+   * process group so an interrupt CANCELS the work rather than merely abandoning
+   * the awaited promise (the "interruption abandons a promise" defect class). It
+   * mirrors {@link RawEngineClient.activate}'s `signal`, which cancels an
+   * in-flight long-poll on the same interruption.
+   */
+  run(job: ActivatedJob, signal?: AbortSignal): Promise<void>;
 }
 
 /** Lift a plain {@link RawJobRunner} into the Effect {@link JobRunner} port. */
 export const makeJobRunner = (raw: RawJobRunner): JobRunner => ({
   run: (job) =>
     Effect.tryPromise({
-      try: () => Promise.resolve(raw.run(job)).then(() => undefined),
+      // Effect aborts `signal` on interruption; forward it so the raw runner can
+      // `killTree` the harness (issue #202) — an interrupt cancels the work
+      // instead of orphaning the detached agent grandchild to init.
+      try: (signal) => Promise.resolve(raw.run(job, signal)).then(() => undefined),
       catch: toSupervisorError(`run ${job.jobKey} failed`),
     }),
 });

@@ -892,9 +892,35 @@ quoting isn't honoured by `cmd.exe` — so use a container sandbox
 (`--sandbox docker|podman`) or bake the switches into `--command` there.
 
 **Disk hygiene.** Host job **workspaces** and container sandboxes both get
-automatic cleanup so leaked artifacts can't fill the disk. Workspaces under
-`<state>/agent-runs` are removed after each job and swept at startup + on
-`--reap-interval` (leftovers older than `--reap-age`, in-flight dirs skipped).
+automatic cleanup so leaked artifacts can't fill the disk. Each worker
+**process** gets its own private namespace under
+`<state>/agent-runs/worker-<incarnation>/` (a fresh incarnation id every process
+start, published with an immutable `owner.json` before any child dir appears);
+its `run-*` job workspaces and `res-*` result channels live there and are removed
+after each job and swept at startup + on `--reap-interval` (leftovers older than
+`--reap-age`, in-flight dirs skipped, `--keep-runs` preserves them). That
+ordinary sweep is **owner-scoped** — a worker only ever reaps *its own*
+namespace, so it can never delete a sibling worker's active checkout or result
+channel out from under an in-flight job (the cross-worker data-loss defect fixed
+in [#205](https://github.com/jwulf/c8ctl-plugin-nano/issues/205); age is **not**
+evidence of completion — editing files inside a checkout does not refresh the
+enclosing dir's mtime). Reclaiming an *abandoned* namespace left by a crashed
+worker is a **separate, cross-process-safe** operation: it deletes only a
+namespace whose owning process is *provably* dead (PID-reuse-safe, via a recorded
+process-start token) **and** has no surviving harness, under an exclusive lock
+with a final recheck. Anything uncertain — a live/unknown owner, a possibly-alive
+harness, missing/malformed ownership, a lock held by another reclaimer — is
+**retained with a diagnostic**, never guessed away.
+
+> **Mixed-version rollout.** The `worker-*` namespace is deliberately invisible
+> to the old flat `run-*`/`res-*` sweep, and the new reclaimer never deletes
+> unowned legacy flat `run-*`/`res-*` directories. This makes an upgrade safe
+> while **old** worker processes are still running the pre-#205 code. Updating the
+> package on disk does **not** replace code already loaded by a running worker:
+> every old worker must be **drained/restarted onto the fixed version** before any
+> leftover legacy flat directories can be cleaned up, and legacy flat dirs whose
+> owner cannot be proven dead are never auto-migrated or deleted.
+
 For container sandboxes a **label-scoped** reaper runs at worker startup
 and on an interval (`--reap-interval`, **milliseconds**, default `300000` = 5m),
 removing finished/`exited` containers older than `--reap-age` (**milliseconds**,

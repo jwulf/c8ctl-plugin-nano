@@ -6896,6 +6896,97 @@ function withIpv4FirstNodeOptions(env) {
   return { ...base, NODE_OPTIONS: ipv4FirstNodeOptions(base.NODE_OPTIONS) };
 }
 
+// The reverse-DNS label prefix of the session-independent supervisor LaunchAgent
+// (macOS). A daemon/worker spawned by that service inherits `XPC_SERVICE_NAME`
+// set to `<prefix><stateHomeHash>`, so its presence is a reliable "am I running
+// under the launchd `gui/$UID` service (not an interactive SSH/Terminal
+// session)?" signal — the axis that decides whether macOS Local Network Privacy
+// applies. `supervisorServiceLabel()` composes the full label from this prefix.
+const SUPERVISOR_SERVICE_LABEL_PREFIX = 'io.nanobpm.c8ctl-nano.supervisor.';
+
+/**
+ * True when THIS process is running under the supervisor's launchd LaunchAgent
+ * (the `gui/$UID` service, macOS). Keyed off the inherited `XPC_SERVICE_NAME`.
+ * @param {Record<string,string|undefined>} [env]
+ */
+function isUnderLaunchdSupervisorService(env = process.env) {
+  const xpc = env?.XPC_SERVICE_NAME;
+  return typeof xpc === 'string' && xpc.startsWith(SUPERVISOR_SERVICE_LABEL_PREFIX);
+}
+
+/**
+ * True when `address` is a private (RFC1918) or link-local IPv4 — i.e. a *local
+ * network* peer, the class macOS 15+ Local Network Privacy gates. Tailscale's
+ * CGNAT range (100.64.0.0/10) is deliberately EXCLUDED: it rides the `utun`
+ * tunnel, which the OS does not treat as "local network", so it is not blocked
+ * and must not trip the heuristic. Loopback and public addresses are excluded.
+ * @param {unknown} address
+ */
+function isPrivateLanIPv4(address) {
+  if (typeof address !== 'string') return false;
+  const m = /^(\d{1,3})\.(\d{1,3})\.(\d{1,3})\.(\d{1,3})$/.exec(address);
+  if (!m) return false;
+  const a = Number(m[1]);
+  const b = Number(m[2]);
+  if (a > 255 || b > 255 || Number(m[3]) > 255 || Number(m[4]) > 255) return false;
+  if (a === 10) return true; // 10.0.0.0/8
+  if (a === 172 && b >= 16 && b <= 31) return true; // 172.16.0.0/12
+  if (a === 192 && b === 168) return true; // 192.168.0.0/16
+  if (a === 169 && b === 254) return true; // 169.254.0.0/16 link-local
+  return false;
+}
+
+// Walk an error and its `.cause` chain (undici wraps the OS-level `code`/`address`
+// under `.cause`), returning the first defined value of `field`. Bounded depth so
+// a self-referential cause can't loop.
+function errorChainField(error, field, maxDepth = 6) {
+  let e = error;
+  for (let i = 0; i < maxDepth && e && typeof e === 'object'; i++) {
+    if (e[field] !== undefined && e[field] !== null) return e[field];
+    e = e.cause;
+  }
+  return undefined;
+}
+
+/**
+ * Heuristic: does this engine-read / activation failure look like a macOS Local
+ * Network Privacy (TCC) block rather than an ordinary connectivity error?
+ *
+ * On macOS 15 Sequoia / 26 Tahoe the supervisor's `gui/$UID` LaunchAgent is a
+ * distinct TCC identity that is NOT granted Local Network access, so every
+ * connection to a LAN peer fails `EHOSTUNREACH` (even the raw IPv4 literal) while
+ * internet hosts still work — the fleet wedges with `fetch failed` / `0` job
+ * types even though an interactive SSH shell reaches the same engine fine. The
+ * signature that distinguishes it from the IPv6/mDNS case (#139/#151 — which
+ * fails against a dead `fe80::…` but succeeds on IPv4) is: running under the
+ * launchd service, `EHOSTUNREACH`, to a *private IPv4* address.
+ *
+ * Injection seams (`platform`, `env`) keep it unit-testable without a Mac.
+ * @param {{ error?: unknown, platform?: string, env?: Record<string,string|undefined> }} [opts]
+ */
+function isLikelyLocalNetworkTccBlock({ error, platform = osPlatform(), env = process.env } = {}) {
+  if (platform !== 'darwin') return false;
+  if (!isUnderLaunchdSupervisorService(env)) return false;
+  if (errorChainField(error, 'code') !== 'EHOSTUNREACH') return false;
+  return isPrivateLanIPv4(errorChainField(error, 'address'));
+}
+
+/** Actionable multi-line hint shown when {@link isLikelyLocalNetworkTccBlock}. */
+function localNetworkTccHint() {
+  return [
+    '↳ This looks like macOS Local Network Privacy blocking the supervisor service.',
+    '  The gui/$UID LaunchAgent has no Local Network grant, so it cannot reach a LAN',
+    '  engine (an interactive SSH/Terminal session can). Fix it with one of:',
+    '    • System Settings → Privacy & Security → Local Network → enable Node.js',
+    '      (may show as "Node.js Foundation" / "App Background Activity"), then',
+    '      `c8ctl nano supervisor stop && c8ctl nano supervisor start`.',
+    '    • Route over Tailscale (utun is exempt): point the engine at the tailnet',
+    '      address, e.g. NANO_REST_URL=http://<host>.<tailnet>.ts.net:8080',
+    '    • Or run in the SSH session (`c8ctl nano supervisor uninstall`) and pin a',
+    '      tmux/SSH session so the fleet does not die on logout.',
+  ].join('\n');
+}
+
 /**
  * work — turn a hire profile into live Nano job workers (one per job-type in
  * the rank×capability matrix) and poll for work in the foreground until Ctrl-C.
@@ -7169,6 +7260,7 @@ async function workAgent(req, flags) {
       jobTypes = [...new Set([...autoTypes, ...extraJobTypes])];
     } catch (err) {
       logger.warn(`--auto: initial engine read failed (${err?.message || err}); starting with no auto pollers — will retry on the next poll.`);
+      if (isLikelyLocalNetworkTccBlock({ error: err })) logger.warn(localNetworkTccHint());
       jobTypes = [...new Set(extraJobTypes)];
     }
   } else {
@@ -9773,6 +9865,16 @@ async function attachSupervisorConsole(state) {
 // into `gui/$UID` (macOS) or a `systemd --user` unit with lingering (Linux),
 // and `supervisor start` over SSH on macOS auto-reparents into that domain (or,
 // when it cannot, WARNS that the fleet will die on logout).
+//
+// CAVEAT (macOS 15 Sequoia / 26 Tahoe — Local Network Privacy): the `gui/$UID`
+// LaunchAgent is a distinct TCC identity that is NOT granted Local Network
+// access (an interactive SSH/Terminal session inherits it for free). So a
+// service-owned fleet whose engine is on the LAN (`merlin.local`, `192.168.x.x`)
+// hits the SAME wedge — `fetch failed` / `EHOSTUNREACH` to the LAN IP, `0` job
+// types — even while logged in, while internet hosts still work. There is no
+// `tccutil`/CLI grant for a headless tool: grant the node runtime Local Network
+// access in System Settings, route over Tailscale (utun is exempt), or run in
+// the SSH session / as root. See README "Surviving SSH logout" for the full note.
 // ---------------------------------------------------------------------------
 
 /** True when the current process is running inside an SSH login session. */
@@ -9799,7 +9901,7 @@ function supervisorServiceHash() {
 
 /** Reverse-DNS LaunchAgent label for this state home. */
 function supervisorServiceLabel() {
-  return `io.nanobpm.c8ctl-nano.supervisor.${supervisorServiceHash()}`;
+  return `${SUPERVISOR_SERVICE_LABEL_PREFIX}${supervisorServiceHash()}`;
 }
 
 /** Per-user LaunchAgent plist path (macOS). */
@@ -12971,6 +13073,11 @@ export {
   createSupervisorDeps,
   enableEngineHappyEyeballs,
   preferIpv4Resolution,
+  isLikelyLocalNetworkTccBlock,
+  isUnderLaunchdSupervisorService,
+  isPrivateLanIPv4,
+  localNetworkTccHint,
+  SUPERVISOR_SERVICE_LABEL_PREFIX,
   ipv4FirstNodeOptions,
   withIpv4FirstNodeOptions,
   DNS_RESULT_ORDER_IPV4_FIRST,

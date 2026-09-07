@@ -8258,7 +8258,7 @@ async function workAgent(req, flags) {
       setTimeout(tick, 200);
     };
 
-    process.once('SIGUSR2', () => { gracefulDrain('SIGUSR2'); });
+    process.once(SUPERVISOR_DRAIN_SIGNAL, () => { gracefulDrain(SUPERVISOR_DRAIN_SIGNAL); });
     process.once('SIGINT', () => { forceAbort('SIGINT'); });
     process.once('SIGTERM', () => { forceAbort('SIGTERM'); });
   });
@@ -9932,7 +9932,7 @@ async function supervisorStopCmd(force = false) {
             logger.info('Aborting in-flight work — killing harnesses and yielding jobs for retry...');
           } else if (frame && frame.event === 'draining-escalated') {
             logger.info('Escalating to --force — aborting in-flight work...');
-          } else if (frame && (frame.type === 'status' || frame.type === 'draining' || frame.event === 'draining')) {
+          } else if (frame && (frame.type === 'status' || frame.event === 'draining')) {
             const n = countSupervisorInFlight(frame.workers);
             if (!force && n !== lastCount) {
               lastCount = n;

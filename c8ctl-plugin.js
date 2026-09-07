@@ -9396,9 +9396,23 @@ async function runSupervisorDaemon() {
     if (!force) broadcast({ type: 'event', event: 'draining', workers: [...workers.values()].map(workerPublic) });
     await Promise.all([...workers.keys()].map((id) => stopWorker(id, { force })));
     if (monitorTimer) { try { clearInterval(monitorTimer); } catch { /* ignore */ } monitorTimer = null; }
-    // Terminal frame for every waiting `stop` client (streaming or one-shot).
-    for (const s of stopClients) { try { s.write(encodeFrame({ ok: true, type: 'stopped', final: true })); } catch { /* client gone */ } }
     broadcast({ type: 'event', event: 'daemon-stop' });
+    // Terminal frame for every waiting `stop` client (streaming or one-shot).
+    // We must FLUSH these before exiting: `process.exit()` does NOT drain pending
+    // socket I/O, so an immediate exit can drop the final frame and turn the
+    // clean end-of-response the streaming stop client waits for into a bare
+    // socket close. `end(frame, cb)` writes the frame then sends FIN, and its
+    // callback fires once the bytes are handed off; await them all (with a short
+    // timeout guard so a wedged/slow client can't block the exit indefinitely).
+    await Promise.all([...stopClients].map((s) => new Promise((resolve) => {
+      let done = false;
+      const finish = () => { if (!done) { done = true; resolve(); } };
+      try {
+        const timer = setTimeout(finish, 2000);
+        if (typeof timer.unref === 'function') timer.unref();
+        s.end(encodeFrame({ ok: true, type: 'stopped', final: true }), () => { clearTimeout(timer); finish(); });
+      } catch { finish(); /* client gone */ }
+    })));
     try { server.close(); } catch { /* ignore */ }
     if (osPlatform() !== 'win32') { try { rmSync(socketPath, { force: true }); } catch { /* ignore */ } }
     clearSupervisorState();

@@ -6985,7 +6985,9 @@ function localNetworkTccHint() {
     '    • Route over Tailscale (utun is exempt): point the engine at the tailnet',
     '      address, e.g. NANO_REST_URL=http://<host>.<tailnet>.ts.net:8080',
     '    • Or run in the SSH session (`c8ctl nano supervisor uninstall`) and pin a',
-    '      tmux/SSH session so the fleet does not die on logout.',
+    '      tmux/SSH session so the fleet does not die on logout. Note: over SSH,',
+    '      `supervisor start` auto-reparents back under launchd (same block) unless',
+    '      you set C8CTL_NANO_NO_LAUNCHD=1 or start from a local Terminal.',
   ].join('\n');
 }
 

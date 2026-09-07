@@ -1061,7 +1061,11 @@ silently leaving a fleet that will wedge on logout.
 >   into the active profile so the service inherits it).
 > - **Run in the SSH session instead** (`supervisor uninstall`) — inherits the
 >   Terminal grant, but reverts to dying on logout unless you pin a `tmux`/SSH
->   session.
+>   session. Note that on macOS `supervisor start` over SSH **auto-reparents**
+>   back into the `gui/$UID` launchd identity (reinstalling the LaunchAgent)
+>   unless you set `C8CTL_NANO_NO_LAUNCHD=1` — without that opt-out you land in
+>   the same blocked identity. Start from a **local Terminal** session (or export
+>   `C8CTL_NANO_NO_LAUNCHD=1`) to keep the interactive grant.
 > - **Run the daemon as root** — root retains LAN access, but running agent
 >   harnesses as root is a poor trade; prefer the options above.
 

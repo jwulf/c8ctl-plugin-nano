@@ -102,8 +102,11 @@ SDK client (job workers) — do **not** add the SDK as a dependency or use raw
   waits INDEFINITELY (a force stop is the only escape hatch); `stop --force`
   keeps the grace-window + SIGKILL backstop on the daemon pid. A daemon-driven
   signal shutdown (its own SIGTERM/SIGINT/SIGHUP) stays a fast force stop. The
-  stop socket op streams status and ends with a terminal `stopped` frame, so a
-  one-shot `supervisorRequest({op:'stop'})` still sees a clean end-of-response.
+  stop socket op streams status and ends with a terminal `stopped` frame, so the
+  streaming stop client (which waits indefinitely) sees a clean end-of-response
+  instead of a bare socket close; a one-shot `supervisorRequest({op:'stop'})` only
+  observes that frame if the drain completes within its fixed 15s response
+  deadline, and otherwise times out client-side while the daemon keeps draining.
 - **Session-independent service (`install`/`uninstall`, issue #196).** On macOS a
   supervisor started over SSH is bound to the SSH login session's launchd domain;
   on logout macOS tears it down and the fleet **wedges** (activation spins on

@@ -9087,8 +9087,11 @@ async function runSupervisorDaemon() {
   const attachClients = new Set();
   // #202: sockets that issued a `stop`/drain and are waiting for the daemon to
   // finish. They get a terminal `stopped` (final) frame when shutdown completes,
-  // so both the streaming `stop` client AND a one-shot `supervisorRequest` see a
-  // clean end-of-response instead of a bare socket close.
+  // so the streaming `stop` client (which waits indefinitely) sees a clean
+  // end-of-response instead of a bare socket close. A one-shot `supervisorRequest`
+  // has a fixed 15s `SUPERVISOR_RESPONSE_TIMEOUT_MS` deadline, so it only observes
+  // that frame when the drain completes within it; a longer drain times out
+  // client-side while the daemon keeps draining in the background.
   const stopClients = new Set();
   let shuttingDown = false;
   // #202: a graceful-drain shutdown is in progress (SIGUSR2 sent to workers,

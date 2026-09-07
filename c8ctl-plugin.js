@@ -6976,7 +6976,9 @@ function localNetworkTccHint() {
   return [
     '↳ This looks like macOS Local Network Privacy blocking the supervisor service.',
     '  The gui/$UID LaunchAgent has no Local Network grant, so it cannot reach a LAN',
-    '  engine (an interactive SSH/Terminal session can). Fix it with one of:',
+    '  engine (an interactive SSH/Terminal session can). Common fixes (see the',
+    '  README "macOS Local Network Privacy" section for the full list, including',
+    '  running the daemon as root):',
     '    • System Settings → Privacy & Security → Local Network → enable Node.js',
     '      (may show as "Node.js Foundation" / "App Background Activity"), then',
     '      `c8ctl nano supervisor stop && c8ctl nano supervisor start`.',

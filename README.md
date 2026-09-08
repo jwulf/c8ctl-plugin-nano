@@ -898,7 +898,10 @@ automatic cleanup so leaked artifacts can't fill the disk. Each worker
 start, published with an immutable `owner.json` before any child dir appears);
 its `run-*` job workspaces and `res-*` result channels live there and are removed
 after each job and swept at startup + on `--reap-interval` (leftovers older than
-`--reap-age`, in-flight dirs skipped, `--keep-runs` preserves them). That
+`--reap-age`, in-flight dirs skipped). `--keep-runs` only skips the *per-job*
+deletion (so a finished job's workspace survives for inspection); the age-based
+owner-scoped sweep still applies, so a kept dir is eventually reaped once it ages
+past `--reap-age`. That
 ordinary sweep is **owner-scoped** — a worker only ever reaps *its own*
 namespace, so it can never delete a sibling worker's active checkout or result
 channel out from under an in-flight job (the cross-worker data-loss defect fixed

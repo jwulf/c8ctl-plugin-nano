@@ -42,6 +42,7 @@ import {
   readdirSync,
   chmodSync,
   renameSync,
+  linkSync,
   realpathSync,
   statfsSync,
   lstatSync,
@@ -4554,7 +4555,17 @@ function allocateWorkerNamespace({ incarnation, worker = null, pid = process.pid
     const owner = { schema: 1, incarnation, worker, pid, pidStart, host: hostname(), createdAt: new Date().toISOString(), version };
     const tmp = `${ownerFile}.${process.pid}.${Date.now()}.tmp`;
     writeFileSync(tmp, JSON.stringify(owner, null, 2));
-    try { renameSync(tmp, ownerFile); } catch (err) { try { rmSync(tmp, { force: true }); } catch { /* */ } throw err; }
+    // Publish EXCLUSIVELY: linkSync is an atomic create-if-absent on POSIX and
+    // Windows, so a racing allocator can never overwrite an already-published
+    // owner record (the immutability guarantee). EEXIST ⇒ a peer won the race,
+    // which is success — the record is immutable, so whoever wrote it is fine.
+    try {
+      linkSync(tmp, ownerFile);
+    } catch (err) {
+      if (err?.code !== 'EEXIST') { try { rmSync(tmp, { force: true }); } catch { /* */ } throw err; }
+    } finally {
+      try { rmSync(tmp, { force: true }); } catch { /* */ }
+    }
   }
   mkdirSync(join(nsDir, LIVE_MARKER_DIR), { recursive: true });
   return { nsDir, owner: readOwnerRecord(nsDir) };

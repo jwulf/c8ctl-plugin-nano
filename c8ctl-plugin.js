@@ -42,6 +42,7 @@ import {
   readdirSync,
   chmodSync,
   renameSync,
+  linkSync,
   realpathSync,
   statfsSync,
   lstatSync,
@@ -4427,9 +4428,16 @@ function finalizeGit({ workspaceDir, gitEnv, startSha, workingBranch, envelope, 
   return out;
 }
 
-// Reap leftover job workspaces under the runs root. Age-gated, skips in-flight
-// run dirs, best-effort, bounded to our own directory (never touches anything we
-// did not create).
+// LEGACY flat reaper (pre-issue-#205). Reaps `run-*`/`res-*` directly under the
+// runs ROOT — the shared-namespace design that caused the cross-worker data-loss
+// incident. It is NO LONGER CALLED by the worker (which now allocates a private
+// `worker-<incarnation>/` namespace and uses `reapOwnedNamespace` +
+// `reclaimOrphanNamespaces`), and is retained ONLY so that (a) a mixed-version
+// host with an OLD worker still running this code stays interoperable, and (b)
+// the mixed-version regression test can assert this flat sweep never descends
+// into a new `worker-*` namespace (it only matches the `run-`/`res-` prefixes at
+// the root, so `worker-*` dirs are invisible to it). Do not reintroduce it into
+// the worker cleanup path.
 function reapAgentRunDirs({ maxAgeMs = 0, liveRunDirs = new Set() } = {}) {
   let reaped = 0;
   const root = agentRunsRoot();
@@ -4458,13 +4466,321 @@ function reapAgentRunDirs({ maxAgeMs = 0, liveRunDirs = new Set() } = {}) {
   return { reaped };
 }
 
+// ---- Cross-process-safe worker run/result namespaces (issue #205) ----------
+// The old shared flat `agent-runs/{run,res}-*` layout let ANY worker process's
+// age-gated reaper delete another live worker's active checkout or result
+// channel: `reapAgentRunDirs` excludes only ITS OWN caller's in-flight dirs, so
+// a sibling process (empty `liveRunDirs`) treated an aged-but-active dir as
+// garbage and removed it (data loss — see the incident in issue #205). Age is
+// not evidence of completion; editing files inside a checkout does not refresh
+// the enclosing dir's mtime.
+//
+// The fix isolates each worker PROCESS INCARNATION under its own
+// `agent-runs/worker-<incarnation>/` namespace and splits cleanup in two:
+//
+//   * OWNER-SCOPED ordinary cleanup — a worker's startup/periodic reaper only
+//     ever traverses its OWN namespace, where its `liveRunDirs` set is the sole
+//     authority. It can never see, let alone delete, a sibling's dir.
+//   * ORPHAN RECLAMATION — a separate, cross-process-safe sweep that may reclaim
+//     ANOTHER incarnation's namespace ONLY on positive proof the owner process
+//     is dead (PID-reuse-safe) and no harness it spawned survives, under an
+//     exclusive lock with a final recheck. Unknown ownership/liveness always
+//     RETAINS and logs an actionable diagnostic, never deletes.
+//
+// The `worker-` namespace prefix is deliberately invisible to the legacy flat
+// `run-*`/`res-*` sweep, so an OLD worker still running the pre-fix code cannot
+// enter a new namespace, and the new reaper never touches unowned legacy flat
+// dirs. See issue #205 and the mixed-version rollout note in the README.
+
+const WORKER_NS_PREFIX = 'worker-';
+const OWNER_RECORD = 'owner.json';
+const RECLAIM_LOCK = '.reclaiming';
+const LIVE_MARKER_DIR = 'live';
+
+// A process-start fingerprint for `pid`, used to defeat PID reuse: a recorded
+// owner is only "the same process" if the PID is alive AND its start token still
+// matches. Best-effort + cross-platform: Linux reads field 22 (starttime) from
+// `/proc/<pid>/stat`; elsewhere (macOS/BSD) it shells out to `ps -o lstart=`.
+// Returns null when neither source is available — callers treat a null/absent
+// token conservatively (cannot prove reuse ⇒ never reclaim).
+function pidStartToken(pid = process.pid) {
+  if (!Number.isInteger(pid) || pid <= 0) return null;
+  try {
+    const stat = readFileSync(`/proc/${pid}/stat`, 'utf-8');
+    // comm (field 2) is parenthesised and may itself contain spaces/parens, so
+    // split AFTER the last ')'. starttime is overall field 22 ⇒ index 19 of the
+    // remaining whitespace-separated fields.
+    const rparen = stat.lastIndexOf(')');
+    if (rparen !== -1) {
+      const rest = stat.slice(rparen + 2).trim().split(/\s+/);
+      const starttime = rest[19];
+      if (starttime && /^\d+$/.test(starttime)) return `lx:${starttime}`;
+    }
+  } catch { /* not Linux / no procfs */ }
+  try {
+    const out = execFileSync('ps', ['-o', 'lstart=', '-p', String(pid)], { encoding: 'utf-8', timeout: 5_000 }).trim();
+    if (out) return `ps:${out}`;
+  } catch { /* best effort */ }
+  return null;
+}
+
+// A fresh, unique-per-process incarnation id. NOT the reusable configured worker
+// name: two processes running the same profile must land in distinct namespaces.
+function newIncarnationId() {
+  return `${process.pid}-${Date.now().toString(36)}-${randomBytes(6).toString('hex')}`;
+}
+
+// Sanitise an incarnation id for safe use as a single path segment.
+function workerNamespaceDir(incarnation, root = agentRunsRoot()) {
+  return join(root, `${WORKER_NS_PREFIX}${String(incarnation).replace(/[^\w.#-]/g, '_')}`);
+}
+
+function readOwnerRecord(nsDir) {
+  try {
+    const rec = JSON.parse(readFileSync(join(nsDir, OWNER_RECORD), 'utf-8'));
+    if (!rec || typeof rec !== 'object' || typeof rec.incarnation !== 'string') return null;
+    return rec;
+  } catch { return null; }
+}
+
+// Allocate (idempotently) this incarnation's namespace and publish its immutable
+// ownership record ATOMICALLY *before* any reapable child dir can exist inside
+// it. A concurrent reclaimer that catches the dir mid-creation sees no owner
+// record and RETAINS it (never reclaims an incompletely-registered namespace).
+function allocateWorkerNamespace({ incarnation, worker = null, pid = process.pid, pidStart = null, version = null, root = agentRunsRoot() } = {}) {
+  const nsDir = workerNamespaceDir(incarnation, root);
+  mkdirSync(nsDir, { recursive: true });
+  const ownerFile = join(nsDir, OWNER_RECORD);
+  if (!existsSync(ownerFile)) {
+    const owner = { schema: 1, incarnation, worker, pid, pidStart, host: hostname(), createdAt: new Date().toISOString(), version };
+    const tmp = `${ownerFile}.${process.pid}.${Date.now()}.tmp`;
+    writeFileSync(tmp, JSON.stringify(owner, null, 2));
+    // Publish EXCLUSIVELY: linkSync is an atomic create-if-absent on POSIX and
+    // Windows, so a racing allocator can never overwrite an already-published
+    // owner record (the immutability guarantee). EEXIST ⇒ a peer won the race,
+    // which is success — the record is immutable, so whoever wrote it is fine.
+    try {
+      linkSync(tmp, ownerFile);
+    } catch (err) {
+      if (err?.code !== 'EEXIST') { try { rmSync(tmp, { force: true }); } catch { /* */ } throw err; }
+    } finally {
+      try { rmSync(tmp, { force: true }); } catch { /* */ }
+    }
+  }
+  mkdirSync(join(nsDir, LIVE_MARKER_DIR), { recursive: true });
+  return { nsDir, owner: readOwnerRecord(nsDir) };
+}
+
+// Classify a recorded owner's incarnation as 'alive' | 'dead' | 'unknown'.
+// PID-reuse-safe: a live PID whose start token no longer matches the record is a
+// DIFFERENT process ⇒ the recorded incarnation is 'dead'. A missing pid, or a
+// live pid we cannot re-fingerprint (null token on either side), is 'unknown' —
+// never 'dead' — so reclamation errs toward preservation.
+function incarnationLiveness(owner, { isAlive = isPidAlive, startToken = pidStartToken } = {}) {
+  if (!owner || !Number.isInteger(owner.pid) || owner.pid <= 0) return 'unknown';
+  let alive;
+  try { alive = isAlive(owner.pid); } catch { return 'unknown'; }
+  if (!alive) return 'dead';
+  if (owner.pidStart == null) return 'unknown'; // never recorded ⇒ can't disprove reuse
+  let current;
+  try { current = startToken(owner.pid); } catch { current = null; }
+  if (current == null) return 'unknown'; // can't re-fingerprint ⇒ conservative
+  return current === owner.pidStart ? 'alive' : 'dead';
+}
+
+function jobMarkerPath(nsDir, jobKey) {
+  return join(nsDir, LIVE_MARKER_DIR, `${String(jobKey).replace(/[^\w.#-]/g, '_')}.json`);
+}
+
+// Record that a job is in-flight in this namespace (a harness may be spawned).
+// Written BEFORE the harness starts so a crash mid-spawn still leaves evidence
+// that a harness could be orphaned (an empty `harnessPids` ⇒ retain conservatively).
+function writeJobMarker(nsDir, { jobKey, workerPid = process.pid, incarnation = null }) {
+  try {
+    mkdirSync(join(nsDir, LIVE_MARKER_DIR), { recursive: true });
+    const p = jobMarkerPath(nsDir, jobKey);
+    writeFileSync(p, JSON.stringify({ jobKey: String(jobKey), workerPid, incarnation, harnessPids: [], startedAt: new Date().toISOString() }));
+    return p;
+  } catch { return null; }
+}
+
+// Append the spawned harness's PID (its process-group leader) to the in-flight
+// job marker, so orphan reclamation can probe whether it survived the worker.
+function recordHarnessPid(nsDir, jobKey, pid) {
+  if (!nsDir || !Number.isInteger(pid) || pid <= 0) return;
+  try {
+    const p = jobMarkerPath(nsDir, jobKey);
+    const rec = JSON.parse(readFileSync(p, 'utf-8'));
+    if (!Array.isArray(rec.harnessPids)) rec.harnessPids = [];
+    if (!rec.harnessPids.includes(pid)) {
+      rec.harnessPids.push(pid);
+      const tmp = `${p}.${process.pid}.tmp`;
+      writeFileSync(tmp, JSON.stringify(rec));
+      renameSync(tmp, p);
+    }
+  } catch { /* best effort */ }
+}
+
+function removeJobMarker(nsDir, jobKey) {
+  try { rmSync(jobMarkerPath(nsDir, jobKey), { force: true }); } catch { /* best effort */ }
+}
+
+function readJobMarkers(nsDir) {
+  let names;
+  try { names = readdirSync(join(nsDir, LIVE_MARKER_DIR)); }
+  catch (err) {
+    // ENOENT ⇒ the live/ dir never existed: genuinely no in-flight markers.
+    // Any other error (EACCES, transient FS) means marker liveness is UNKNOWN,
+    // so return a synthetic malformed marker to force a conservative retain
+    // (never reclaim a namespace whose harness state we couldn't determine).
+    if (err && err.code === 'ENOENT') return [];
+    return [{ jobKey: '(unreadable)', harnessPids: [], malformed: true }];
+  }
+  const out = [];
+  for (const n of names) {
+    if (!n.endsWith('.json')) continue;
+    try { out.push(JSON.parse(readFileSync(join(nsDir, LIVE_MARKER_DIR, n), 'utf-8'))); }
+    catch { out.push({ jobKey: n, harnessPids: [], malformed: true }); }
+  }
+  return out;
+}
+
+// Does a (presumed-dead-owner) namespace still have a possibly-live harness? An
+// in-flight marker that is malformed or records no harness pid (a registration
+// race — the job started but the harness pid was not yet recorded) is treated as
+// possibly-live (conservative). Otherwise probe each recorded pid.
+function namespaceHasLiveHarness(nsDir, { isAlive = isPidAlive } = {}) {
+  for (const m of readJobMarkers(nsDir)) {
+    const pids = Array.isArray(m.harnessPids) ? m.harnessPids : [];
+    if (m.malformed || pids.length === 0) return true;
+    for (const pid of pids) { try { if (isAlive(pid)) return true; } catch { return true; } }
+  }
+  return false;
+}
+
+// Shared eligibility used by BOTH the startup and periodic owner-scoped sweeps
+// (so they can never drift): reap the `run-*`/`res-*` children of `dir` that are
+// (a) not in `liveRunDirs`, (b) older than `maxAgeMs`, (c) a real directory (an
+// lstat rejects a symlink — never followed). `onReap(path)` fires per removal for
+// evidence logging. Confined to `dir`; unrelated entries (owner.json, live/,
+// .reclaiming, operator files) are ignored.
+function reapChildRunDirs(dir, { maxAgeMs = 0, liveRunDirs = new Set(), now = Date.now(), onReap } = {}) {
+  let reaped = 0;
+  try {
+    if (!existsSync(dir)) return { reaped };
+    for (const name of readdirSync(dir)) {
+      if (!name.startsWith('run-') && !name.startsWith('res-')) continue;
+      const p = join(dir, name);
+      if (liveRunDirs.has(p)) continue;
+      try {
+        const st = lstatSync(p);
+        if (!st.isDirectory()) continue;
+        if (maxAgeMs > 0 && now - st.mtimeMs < maxAgeMs) continue;
+        rmSync(p, { recursive: true, force: true });
+        reaped++;
+        if (onReap) { try { onReap(p); } catch { /* */ } }
+      } catch { /* skip */ }
+    }
+  } catch (err) {
+    return { reaped, error: err.message };
+  }
+  return { reaped };
+}
+
+// OWNER-SCOPED ordinary cleanup: reap aged, not-in-flight job/result dirs inside THIS
+// worker's own namespace only. Safe by construction — no sibling shares this
+// namespace, and `liveRunDirs` authoritatively excludes in-flight dirs.
+function reapOwnedNamespace(nsDir, { maxAgeMs = 0, liveRunDirs = new Set(), now = Date.now(), logger, incarnation } = {}) {
+  return reapChildRunDirs(nsDir, {
+    maxAgeMs,
+    liveRunDirs,
+    now,
+    onReap: (p) => { if (logger) logger.info(`[reaper] ${new Date(now).toISOString()} incarnation=${incarnation ?? '?'} removed own aged, not-in-flight ${basename(p)} (owner-scoped)`); },
+  });
+}
+
+// ORPHAN RECLAMATION (cross-process-safe). Sweep sibling `worker-*` namespaces
+// and reclaim ONLY those whose owner incarnation is provably dead and which have
+// no surviving harness, under an exclusive per-namespace lock with a final
+// recheck. Everything uncertain — a missing/malformed owner record, a live or
+// unknown owner, a possibly-live harness, a lock held by another reclaimer, a
+// namespace younger than `minAgeMs`, a symlink, or a path escaping `root` — is
+// RETAINED with a diagnostic. Legacy flat `run-*`/`res-*` (no `worker-` prefix)
+// are never considered. Injectable probes (`liveness`, `harnessAlive`, `now`)
+// make every branch deterministically testable.
+function reclaimOrphanNamespaces({
+  root = agentRunsRoot(),
+  selfIncarnation = null,
+  now = Date.now(),
+  minAgeMs = 0,
+  liveness = incarnationLiveness,
+  harnessAlive = isPidAlive,
+  logger,
+} = {}) {
+  const reclaimed = [];
+  const retained = [];
+  const stamp = () => new Date(now).toISOString();
+  const note = (name, reason, owner) => {
+    retained.push({ name, reason });
+    if (logger) logger.info(`[reclaim] ${stamp()} actor=${selfIncarnation ?? '?'} target=${name} owner=${owner?.incarnation ?? 'unknown'}(pid ${owner?.pid ?? '?'}) RETAINED — ${reason}`);
+  };
+  let rootReal;
+  try { rootReal = realpathSync(root); } catch (err) {
+    if (logger) logger.info(`[reclaim] ${stamp()} actor=${selfIncarnation ?? '?'} RETAINED all — could not resolve runs root ${root} (${err.code || err.message})`);
+    return { reclaimed, retained };
+  }
+  let names;
+  try { names = readdirSync(root); } catch (err) {
+    if (logger) logger.info(`[reclaim] ${stamp()} actor=${selfIncarnation ?? '?'} RETAINED all — could not scan runs root ${root} (${err.code || err.message})`);
+    return { reclaimed, retained };
+  }
+  for (const name of names) {
+    if (!name.startsWith(WORKER_NS_PREFIX)) continue;
+    const nsDir = join(root, name);
+    let st;
+    try { st = lstatSync(nsDir); } catch (err) { note(name, `could not lstat (${err.code || err.message}) — retained`, null); continue; }
+    if (!st.isDirectory()) { note(name, 'not a directory (symlink?) — skipped', null); continue; }
+    if (minAgeMs > 0 && now - st.mtimeMs < minAgeMs) { note(name, 'younger than min reclaim age', null); continue; }
+    // Containment: the resolved namespace must sit directly under the resolved root.
+    let nsReal;
+    try { nsReal = realpathSync(nsDir); } catch (err) { note(name, `could not resolve real path (${err.code || err.message}) — retained`, null); continue; }
+    if (dirname(nsReal) !== rootReal) { note(name, 'path escapes runs root — skipped', null); continue; }
+    const owner = readOwnerRecord(nsDir);
+    if (!owner) { note(name, 'missing/malformed owner record — not garbage', null); continue; }
+    if (selfIncarnation && owner.incarnation === selfIncarnation) continue; // never our own
+    const state = liveness(owner);
+    if (state !== 'dead') { note(name, `owner ${state}`, owner); continue; }
+    if (namespaceHasLiveHarness(nsDir, { isAlive: harnessAlive })) { note(name, 'a spawned harness may still be alive', owner); continue; }
+    // Exclusive reclamation ownership: an atomic mkdir lock. A loser retains.
+    const lock = join(nsDir, RECLAIM_LOCK);
+    try { mkdirSync(lock); } catch { note(name, 'another reclaimer holds the lock', owner); continue; }
+    try {
+      // FINAL recheck under the lock: identity + liveness + harness must all hold.
+      const owner2 = readOwnerRecord(nsDir);
+      if (!owner2 || owner2.incarnation !== owner.incarnation) { note(name, 'ownership changed under lock', owner2 || owner); continue; }
+      if (liveness(owner2) !== 'dead') { note(name, 'owner became alive under lock', owner2); continue; }
+      if (namespaceHasLiveHarness(nsDir, { isAlive: harnessAlive })) { note(name, 'harness became live under lock', owner2); continue; }
+      let real2;
+      try { real2 = realpathSync(nsDir); } catch (err) { note(name, `could not resolve real path under lock (${err.code || err.message}) — retained`, owner2); continue; }
+      if (dirname(real2) !== rootReal) { note(name, 'path escaped runs root under lock', owner2); continue; }
+      rmSync(nsDir, { recursive: true, force: true });
+      reclaimed.push({ name, owner: owner2 });
+      if (logger) logger.info(`[reclaim] ${stamp()} actor=${selfIncarnation ?? '?'} target=${name} owner=${owner2.incarnation}(pid ${owner2.pid}) RECLAIMED — owner proven dead, no surviving harness`);
+    } finally {
+      // Drop the lock unless the whole namespace was reclaimed (lock gone with it).
+      try { if (existsSync(nsDir)) rmSync(lock, { recursive: true, force: true }); } catch { /* best effort */ }
+    }
+  }
+  return { reclaimed, retained };
+}
+
 // ---- One-shot capture (shared by host + container executors) ---------------
 const MAX_CAPTURE_BYTES = 1_048_576; // 1 MiB per stream
 
 // Spawn a child, pipe `stdinData`, capture byte-capped stdout/stderr, enforce a
 // timeout (invoking `onTimeout(child)` to tear the child down), and resolve to a
 // uniform result. Used by both the host and container executors.
-function spawnCaptureOneShot({ command, args = [], shell = false, detached = false, cwd, env, stdinData, timeoutMs, idleTimeoutMs, recoveryWindowMs, onTimeout, stream = false, streamPrefix = '', onStreamOut, onStreamErr, relayTap = null, abortSignal = null }) {
+function spawnCaptureOneShot({ command, args = [], shell = false, detached = false, cwd, env, stdinData, timeoutMs, idleTimeoutMs, recoveryWindowMs, onTimeout, stream = false, streamPrefix = '', onStreamOut, onStreamErr, relayTap = null, abortSignal = null, onSpawn = null }) {
   return new Promise((resolve) => {
     let child;
     const stdoutChunks = [];
@@ -4526,6 +4842,7 @@ function spawnCaptureOneShot({ command, args = [], shell = false, detached = fal
       finish({ ok: false, exitCode: null, stdout: '', stderr: '', error: err.message, truncated: false, stderrTruncated: false });
       return;
     }
+    if (onSpawn) { try { onSpawn(child.pid); } catch { /* best effort */ } }
 
     // #202: a `stop --force`/abort aborts this signal — kill the harness process
     // group (via the same onTimeout kill that the hard-cap/idle paths use) and
@@ -4654,7 +4971,7 @@ function ptyAvailable(ptyFactory) {
 // spawnCaptureOneShot. A PTY merges stdout+stderr into one stream, so stderr is
 // always '' here; that is expected for a live terminal. `ptyFactory` is
 // injectable for tests (defaults to node-pty).
-function spawnCapturePty({ command, args = [], cwd, env, stdinData, timeoutMs, idleTimeoutMs, recoveryWindowMs, cols = 120, rows = 30, ptyFactory, relayTap = null, stream = false, streamPrefix = '', onStreamOut, abortSignal = null }) {
+function spawnCapturePty({ command, args = [], cwd, env, stdinData, timeoutMs, idleTimeoutMs, recoveryWindowMs, cols = 120, rows = 30, ptyFactory, relayTap = null, stream = false, streamPrefix = '', onStreamOut, abortSignal = null, onSpawn = null }) {
   return new Promise((resolve) => {
     const factory = ptyFactory || loadPtyModule();
     if (!factory || typeof factory.spawn !== 'function') {
@@ -4712,6 +5029,7 @@ function spawnCapturePty({ command, args = [], cwd, env, stdinData, timeoutMs, i
       finish({ ok: false, exitCode: null, stdout: '', stderr: '', error: `pty spawn failed: ${err?.message || err}`, truncated: false, stderrTruncated: false });
       return;
     }
+    if (onSpawn) { try { onSpawn(term?.pid); } catch { /* best effort */ } }
 
     // #202: abort (stop --force) kills the PTY and settles as aborted so the job
     // is failed/yielded for immediate retry rather than left to lock-lapse.
@@ -4921,7 +5239,7 @@ const ACP_MAX_LINE_BYTES = 8 * 1024 * 1024; // 8 MiB
 // and every caller work unchanged. Because the raw stream is JSON-RPC (not human
 // output), `stdout` here is the accumulated human-readable transcript text (what
 // we relay), and `stderr` is the child's real stderr (agent diagnostics).
-function spawnCaptureAcp({ command, args = [], cwd, env, stdinData, timeoutMs, idleTimeoutMs, recoveryWindowMs, relayTap = null, stream = false, streamPrefix = '', onStreamOut, onStreamErr, permission = 'yolo', shell = false, onAcpUpdate = null, abortSignal = null }) {
+function spawnCaptureAcp({ command, args = [], cwd, env, stdinData, timeoutMs, idleTimeoutMs, recoveryWindowMs, relayTap = null, stream = false, streamPrefix = '', onStreamOut, onStreamErr, permission = 'yolo', shell = false, onAcpUpdate = null, abortSignal = null, onSpawn = null }) {
   return new Promise((resolve) => {
     const logger = getLogger();
     const humanChunks = [];
@@ -5293,6 +5611,7 @@ function spawnCaptureAcp({ command, args = [], cwd, env, stdinData, timeoutMs, i
       finish({ ok: false, exitCode: null, stdout: '', stderr: '', error: err.message, truncated: false, stderrTruncated: false });
       return;
     }
+    if (onSpawn) { try { onSpawn(child.pid); } catch { /* best effort */ } }
 
     // #202: abort (stop --force) — finish() reaps the still-alive child via
     // killTree, so settle as aborted and let it reap the ACP harness group.
@@ -5603,7 +5922,7 @@ function baseAgentEnv(profile, job) {
  * Both paths resolve to the same result contract.
  */
 function runAgentJob(profile, job, opts = {}) {
-  const { timeoutMs, idleTimeoutMs, recoveryWindowMs, envelope, sandbox = 'none', image, runId, secretEnv = {}, passThroughSecretNames = [], cwd, extraEnv = {}, profileEnv = {}, resultFile, stream = false, streamPrefix = '', onStreamOut, onStreamErr, args: commandArgs, terminal = 'pipe', protocol = 'pipe', permission = 'yolo', relaySession = null, ptyFactory, nudgePayload = null, onAcpUpdate = null, abortSignal = null } = opts;
+  const { timeoutMs, idleTimeoutMs, recoveryWindowMs, envelope, sandbox = 'none', image, runId, secretEnv = {}, passThroughSecretNames = [], cwd, extraEnv = {}, profileEnv = {}, resultFile, stream = false, streamPrefix = '', onStreamOut, onStreamErr, args: commandArgs, terminal = 'pipe', protocol = 'pipe', permission = 'yolo', relaySession = null, ptyFactory, nudgePayload = null, onAcpUpdate = null, abortSignal = null, onSpawn = null } = opts;
   // #110: `protocol`/`permission` drive the ACP executor branch below. The
   // pipe/PTY paths are unchanged, so `protocol === 'pipe'` behaviour is identical.
   // A `nudgePayload` (#678) carries the bespoke "re-emit your result" prompt for a
@@ -5693,6 +6012,7 @@ function runAgentJob(profile, job, opts = {}) {
         permission,
         onAcpUpdate,
         abortSignal,
+        onSpawn,
       });
     }
 
@@ -5716,6 +6036,7 @@ function runAgentJob(profile, job, opts = {}) {
         streamPrefix,
         onStreamOut,
         abortSignal,
+        onSpawn,
       });
     }
 
@@ -5740,6 +6061,7 @@ function runAgentJob(profile, job, opts = {}) {
       onStreamErr,
       relayTap,
       abortSignal,
+      onSpawn,
     });
   }
 
@@ -5811,6 +6133,11 @@ function runAgentJob(profile, job, opts = {}) {
     onStreamOut,
     onStreamErr,
     relayTap,
+    // #205: thread the harness-PID callback through the container path too, so a
+    // crashed worker's in-flight job marker records the spawned client PID and
+    // orphan reclamation can tell a possibly-surviving harness from an abandoned
+    // namespace (an empty `harnessPids` otherwise forces indefinite retention).
+    onSpawn,
     onTimeout: (child) => {
       try { spawnSync(engine, ['rm', '-f', containerName], { timeout: 15_000 }); } catch { /* best effort */ }
       try { killTree(child); } catch { /* best effort */ }
@@ -7218,15 +7545,50 @@ async function workAgent(req, flags) {
   let reaperTimer = null;
   let runDirTimer = null;
 
+  // --- Cross-process-safe run/result namespace (issue #205) ----------------
+  // Every worker PROCESS gets a fresh incarnation id and its OWN namespace under
+  // agent-runs/worker-<incarnation>/. All of this process's run-*/res- dirs live
+  // there, and its ordinary reaper only ever traverses that namespace, so it can
+  // never delete a sibling worker's active checkout or result channel (the
+  // data-loss defect this issue fixes). The immutable ownership record is
+  // published atomically before any child dir is created.
+  const workerIncarnation = newIncarnationId();
+  const workerPidStart = pidStartToken(process.pid);
+  let pluginVersion = null;
+  try { pluginVersion = JSON.parse(readFileSync(join(pluginDir, 'package.json'), 'utf-8')).version ?? null; } catch { /* best effort */ }
+  let workerNsDir;
+  try {
+    ({ nsDir: workerNsDir } = allocateWorkerNamespace({
+      incarnation: workerIncarnation,
+      worker: profile?.name ?? null,
+      pid: process.pid,
+      pidStart: workerPidStart,
+      version: pluginVersion,
+    }));
+    logger.info(`Worker namespace ${basename(workerNsDir)} (incarnation ${workerIncarnation}, pid ${process.pid}) — run/result dirs are isolated here.`);
+  } catch (err) {
+    logger.error(`Could not allocate the worker run/result namespace under ${agentRunsRoot()}: ${err.message}`);
+    process.exit(1);
+  }
+
   // Run-dir hygiene runs regardless of sandbox: any sandbox=none job that carries
-  // a repository clones a throwaway workspace under the runs root, and a crashed
-  // worker can leave one behind. Bounded to our own directory, age-gated.
+  // a repository clones a throwaway workspace under this worker's namespace, and a
+  // crashed job handler can leave one behind. OWNER-SCOPED: bounded to our own
+  // namespace, age-gated, and skipping in-flight dirs (liveRunDirs) — never a
+  // sibling's namespace or a legacy flat run-*/res- dir. A SEPARATE,
+  // cross-process-safe reclamation sweep handles other incarnations' abandoned namespaces.
   {
-    const initialRuns = reapAgentRunDirs({ maxAgeMs: reapAgeMs, liveRunDirs });
-    if (initialRuns.reaped > 0) logger.info(`Reaped ${initialRuns.reaped} leftover job workspace(s) at startup.`);
+    const initialRuns = reapOwnedNamespace(workerNsDir, { maxAgeMs: reapAgeMs, liveRunDirs, logger, incarnation: workerIncarnation });
+    if (initialRuns.reaped > 0) logger.info(`Reaped ${initialRuns.reaped} leftover job workspace(s) in this worker's namespace at startup.`);
+    if (initialRuns.error) logger.warn(`Startup workspace reap warning: ${initialRuns.error}`);
+    const reclaimStartup = reclaimOrphanNamespaces({ selfIncarnation: workerIncarnation, minAgeMs: reapAgeMs, logger });
+    if (reclaimStartup.reclaimed.length > 0) logger.info(`Reclaimed ${reclaimStartup.reclaimed.length} abandoned worker namespace(s) at startup.`);
     runDirTimer = setInterval(() => {
-      const r = reapAgentRunDirs({ maxAgeMs: reapAgeMs, liveRunDirs });
-      if (r.reaped > 0) logger.info(`Reaper removed ${r.reaped} finished job workspace(s).`);
+      const r = reapOwnedNamespace(workerNsDir, { maxAgeMs: reapAgeMs, liveRunDirs, logger, incarnation: workerIncarnation });
+      if (r.reaped > 0) logger.info(`Reaper removed ${r.reaped} aged, not-in-flight job workspace(s) from this worker's namespace.`);
+      if (r.error) logger.warn(`Workspace reaper warning: ${r.error}`);
+      const rc = reclaimOrphanNamespaces({ selfIncarnation: workerIncarnation, minAgeMs: reapAgeMs, logger });
+      if (rc.reclaimed.length > 0) logger.info(`Reclaimed ${rc.reclaimed.length} abandoned worker namespace(s).`);
     }, reapIntervalMs);
     if (typeof runDirTimer.unref === 'function') runDirTimer.unref();
   }
@@ -7724,8 +8086,8 @@ async function workAgent(req, flags) {
           const authRef = envelope.repository.authRef;
           repoToken = githubCloneToken({ provider, authRef, secretResolver }); // absent → anonymous clone
           try {
-            mkdirSync(agentRunsRoot(), { recursive: true });
-            runDir = mkdtempSync(join(agentRunsRoot(), 'run-'));
+            mkdirSync(workerNsDir, { recursive: true });
+            runDir = mkdtempSync(join(workerNsDir, 'run-'));
             liveRunDirs.add(runDir);
             provisioned = provisionRepo({ envelope, token: repoToken, runDir, timeoutMs: cloneTimeoutMs });
             if (provisioned.baseFetchError) {
@@ -7774,14 +8136,14 @@ async function workAgent(req, flags) {
           // `cd` to a known absolute path). True confinement is the container
           // increment; a provisioned repository envelope stays the preferred path.
           try {
-            mkdirSync(agentRunsRoot(), { recursive: true });
-            runDir = mkdtempSync(join(agentRunsRoot(), 'run-'));
+            mkdirSync(workerNsDir, { recursive: true });
+            runDir = mkdtempSync(join(workerNsDir, 'run-'));
             liveRunDirs.add(runDir);
             cwd = runDir;
           } catch (err) {
             if (runDir) { try { rmSync(runDir, { recursive: true, force: true }); } catch { /* best effort */ } liveRunDirs.delete(runDir); runDir = null; }
             const retries = Math.max(0, (Number(job.retries) || 1) - 1);
-            const msg = `could not create a temp workspace under the runs root: ${err.message}`;
+            const msg = `could not create a temp workspace under the worker namespace: ${err.message}`;
             logger.warn(`[${jobType}] job ${job.jobKey} not provisioned — ${msg}; retries left ${retries}`);
             return settle.fail(job.jobKey, { errorMessage: msg.slice(0, 2000), retries, retryBackOff: 15_000 });
           }
@@ -7805,18 +8167,29 @@ async function workAgent(req, flags) {
         let resultFile = null;
         try {
           try {
-            mkdirSync(agentRunsRoot(), { recursive: true });
-            resultDir = mkdtempSync(join(agentRunsRoot(), 'res-'));
+            mkdirSync(workerNsDir, { recursive: true });
+            resultDir = mkdtempSync(join(workerNsDir, 'res-'));
             resultFile = join(resultDir, 'result.json');
             // Track it so the run-dir reaper skips it while in-flight and reaps it
             // (as a `res-*` dir) if this worker crashes before the cleanup below.
             liveRunDirs.add(resultDir);
           } catch { resultDir = null; resultFile = null; }
 
+          // Record an in-flight job marker in this worker's namespace BEFORE the
+          // harness starts (#205). A later orphan reclamation of a dead owner uses
+          // it to detect a possibly-surviving harness: an empty `harnessPids`
+          // (registration race) forces conservative retention; once `onSpawn`
+          // records the harness PID, reclamation can probe whether it outlived us.
+          writeJobMarker(workerNsDir, { jobKey: job.jobKey, workerPid: process.pid, incarnation: workerIncarnation });
+
           const runOpts = {
             timeoutMs: effectiveHardCapMs,
             idleTimeoutMs: effectiveIdleTimeoutMs,
             recoveryWindowMs: effectiveRecoveryWindowMs,
+            // #205: record the spawned harness's PID (its process-group leader) in
+            // the in-flight job marker so cross-process orphan reclamation can tell
+            // a still-running orphaned harness from a genuinely abandoned namespace.
+            onSpawn: (pid) => recordHarnessPid(workerNsDir, job.jobKey, pid),
             // #202: the supervisor fiber's interruption AbortSignal (a
             // `stop --force`/abort). runAgentJob wires it to killTree the harness
             // process group so an abort CANCELS the work instead of orphaning the
@@ -7931,6 +8304,10 @@ async function workAgent(req, flags) {
           }
         } finally {
           if (isContainer) liveRunIds.delete(runId);
+          // #205: clear the in-flight job marker now the harness has stopped — the
+          // owning lifecycle's finally is the authoritative "job finished" signal,
+          // so this namespace no longer holds a surviving harness for this job.
+          removeJobMarker(workerNsDir, job.jobKey);
           if (runDir && !keepRuns) { try { rmSync(runDir, { recursive: true, force: true }); } catch { /* best effort */ } }
           if (runDir) liveRunDirs.delete(runDir);
           // Emit the relay session's `phase:close` lifecycle event and drain its
@@ -8189,6 +8566,12 @@ async function workAgent(req, flags) {
       } catch (err) {
         logger.warn(`supervisor shutdown error — runtime loop may not have shut down cleanly: ${err?.message || err}`);
       }
+      // #205: tear down this worker's own namespace on a clean exit. All in-flight
+      // jobs' finallys have run by now (markers cleared, run/res dirs removed), so
+      // nothing here is in use. Skipped under --keep-runs so kept workspaces stay
+      // for debugging and age out via cross-process reclamation, exactly like the
+      // pre-fix age-gated behavior.
+      if (workerNsDir && !keepRuns) { try { rmSync(workerNsDir, { recursive: true, force: true }); } catch { /* best effort */ } }
       resolve();
     };
 
@@ -13422,6 +13805,20 @@ export {
   isPlaceholderEmail,
   postAgentAttribution,
   reapAgentRunDirs,
+  reapChildRunDirs,
+  reapOwnedNamespace,
+  reclaimOrphanNamespaces,
+  allocateWorkerNamespace,
+  workerNamespaceDir,
+  readOwnerRecord,
+  incarnationLiveness,
+  pidStartToken,
+  newIncarnationId,
+  writeJobMarker,
+  recordHarnessPid,
+  removeJobMarker,
+  readJobMarkers,
+  namespaceHasLiveHarness,
   authUrl,
   githubCloneToken,
   ghAuthTokenFromCli,

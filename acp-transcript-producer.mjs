@@ -64,9 +64,9 @@ function nonBlankId(value) {
  * for an update with no canonical meaning (an `ignored` classification), exactly like
  * the underlying bridge, so a caller skips it.
  *
- * Pure and total: any classifier or encoder throw degrades to the canonical bridge
- * (and any bridge throw is the caller's concern), so the producer hot path never
- * crashes on one malformed update.
+ * Pure and total: any classifier or encoder throw degrades to the canonical bridge,
+ * and a bridge throw is itself caught (yielding `null`), so the producer hot path
+ * never crashes on one malformed update.
  *
  * @param {unknown} update The raw ACP `session/update` `params.update` object.
  * @param {object} [deps]
@@ -115,11 +115,11 @@ export function acpUpdateToDisplayChunk(update, deps = {}) {
   // Carry the available semantics into the additive `MessageEvent` fields: the
   // producer identity (`messageId`) so the fold groups this message's fragments and
   // separates distinct same-speaker messages, and `mode: "delta"` because ACP
-  // message chunks are incremental deltas — never a cumulative snapshot. `offset` is
-  // a placeholder the encoder strips; the real store offset is assigned on append.
+  // message chunks are incremental deltas — never a cumulative snapshot. No `offset`
+  // is supplied here; the real store offset is assigned on append (matching every
+  // other `encodeTranscriptEvent` call site).
   const event = {
     kind: 'message',
-    offset: 0,
     role: transcriptRole(classified.role),
     text: classified.text,
     messageId,

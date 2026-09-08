@@ -4717,9 +4717,15 @@ function reclaimOrphanNamespaces({
     if (logger) logger.info(`[reclaim] ${stamp()} actor=${selfIncarnation ?? '?'} target=${name} owner=${owner?.incarnation ?? 'unknown'}(pid ${owner?.pid ?? '?'}) RETAINED — ${reason}`);
   };
   let rootReal;
-  try { rootReal = realpathSync(root); } catch { return { reclaimed, retained }; }
+  try { rootReal = realpathSync(root); } catch (err) {
+    if (logger) logger.info(`[reclaim] ${stamp()} actor=${selfIncarnation ?? '?'} RETAINED all — could not resolve runs root ${root} (${err.code || err.message})`);
+    return { reclaimed, retained };
+  }
   let names;
-  try { names = readdirSync(root); } catch { return { reclaimed, retained }; }
+  try { names = readdirSync(root); } catch (err) {
+    if (logger) logger.info(`[reclaim] ${stamp()} actor=${selfIncarnation ?? '?'} RETAINED all — could not scan runs root ${root} (${err.code || err.message})`);
+    return { reclaimed, retained };
+  }
   for (const name of names) {
     if (!name.startsWith(WORKER_NS_PREFIX)) continue;
     const nsDir = join(root, name);
@@ -7566,11 +7572,13 @@ async function workAgent(req, flags) {
   {
     const initialRuns = reapOwnedNamespace(workerNsDir, { maxAgeMs: reapAgeMs, liveRunDirs, logger, incarnation: workerIncarnation });
     if (initialRuns.reaped > 0) logger.info(`Reaped ${initialRuns.reaped} leftover job workspace(s) in this worker's namespace at startup.`);
+    if (initialRuns.error) logger.warn(`Startup workspace reap warning: ${initialRuns.error}`);
     const reclaimStartup = reclaimOrphanNamespaces({ selfIncarnation: workerIncarnation, minAgeMs: reapAgeMs, logger });
     if (reclaimStartup.reclaimed.length > 0) logger.info(`Reclaimed ${reclaimStartup.reclaimed.length} abandoned worker namespace(s) at startup.`);
     runDirTimer = setInterval(() => {
       const r = reapOwnedNamespace(workerNsDir, { maxAgeMs: reapAgeMs, liveRunDirs, logger, incarnation: workerIncarnation });
       if (r.reaped > 0) logger.info(`Reaper removed ${r.reaped} aged, not-in-flight job workspace(s) from this worker's namespace.`);
+      if (r.error) logger.warn(`Workspace reaper warning: ${r.error}`);
       const rc = reclaimOrphanNamespaces({ selfIncarnation: workerIncarnation, minAgeMs: reapAgeMs, logger });
       if (rc.reclaimed.length > 0) logger.info(`Reclaimed ${rc.reclaimed.length} abandoned worker namespace(s).`);
     }, reapIntervalMs);

@@ -69,7 +69,7 @@
   },
   "dependencies": {
     "@nanobpm/agentic": "^0.14.0",
-    "@nanobpm/urban-agent-client": "^0.1.13"
+    "@nanobpm/urban-agent-client": "^0.1.14"
   },
   "optionalDependencies": {
     "node-pty": "^1.0.0"

@@ -22,6 +22,7 @@
   "files": [
     "c8ctl-plugin.js",
     "agent-instance.mjs",
+    "acp-transcript-producer.mjs",
     "platforms.mjs",
     "agentic.mjs",
     "agentic-loader-hook.mjs",
@@ -67,8 +68,8 @@
     "typescript": "^5.9.3"
   },
   "dependencies": {
-    "@nanobpm/agentic": "^0.13.0",
-    "@nanobpm/urban-agent-client": "^0.1.13"
+    "@nanobpm/agentic": "^0.14.0",
+    "@nanobpm/urban-agent-client": "^0.1.14"
   },
   "optionalDependencies": {
     "node-pty": "^1.0.0"

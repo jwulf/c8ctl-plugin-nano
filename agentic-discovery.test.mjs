@@ -22,8 +22,6 @@ import {
   resolveProbeCandidates,
   raceProbeCandidates,
   isLinkLocalAddress,
-  rediscoverAgenticUntilConnected,
-  defaultAgenticRediscoveryDelays,
   LOCAL_AGENTIC_TOKEN,
 } from './c8ctl-plugin.js';
 
@@ -500,98 +498,4 @@ test('resolveAgenticTarget without a cache still drops to advisory on a miss', a
   const res = await withEnv({}, null, () =>
     resolveAgenticTarget({ fetchImpl: fetchReturning(null, { ok: false }), wsProbe: probeUpgrades(3000) }));
   assert.equal(res.status, 'advisory');
-});
-
-// ---------------------------------------------------------------------------
-// (A) Background re-discovery self-heals advisory → connected (#133)
-// ---------------------------------------------------------------------------
-
-test('defaultAgenticRediscoveryDelays grows 2s→…→30s cap and spans several minutes', () => {
-  const delays = defaultAgenticRediscoveryDelays({ rng: () => 0.5 }); // no jitter
-  assert.equal(delays[0], 2_000);
-  assert.equal(delays[1], 4_000);
-  assert.equal(delays[2], 8_000);
-  assert.ok(delays[delays.length - 1] <= 30_000, 'capped at 30s');
-  assert.ok(delays.reduce((a, b) => a + b, 0) >= 4 * 60_000, 'spans several minutes of retries');
-});
-
-test('rediscoverAgenticUntilConnected flips advisory → connected on a later attempt', async () => {
-  // First two attempts miss (advisory); the third discovers a hub.
-  const outcomes = [
-    { status: 'advisory' },
-    { status: 'advisory' },
-    { status: 'connect', config: { url: 'http://192.168.0.21:3000' } },
-  ];
-  let calls = 0;
-  let connectedTarget = null;
-  const result = await rediscoverAgenticUntilConnected({
-    resolveTarget: async () => outcomes[calls++],
-    onConnect: async (target) => { connectedTarget = target; },
-    delaysMs: [1, 1, 1, 1],
-    sleep: async () => {}, // no real waiting
-  });
-  assert.equal(calls, 3, 'stopped as soon as a connect target appeared');
-  assert.equal(result.status, 'connect');
-  assert.equal(connectedTarget.config.url, 'http://192.168.0.21:3000');
-});
-
-test('rediscoverAgenticUntilConnected swallows a throwing attempt and keeps trying', async () => {
-  let calls = 0;
-  const result = await rediscoverAgenticUntilConnected({
-    resolveTarget: async () => {
-      calls += 1;
-      if (calls === 1) throw new Error('transient');
-      return { status: 'connect', config: { url: 'http://h:1' } };
-    },
-    onConnect: async () => {},
-    delaysMs: [1, 1, 1],
-    sleep: async () => {},
-    logger: { debug: () => {} },
-  });
-  assert.equal(calls, 2);
-  assert.equal(result.status, 'connect');
-});
-
-test('rediscoverAgenticUntilConnected keeps retrying when onConnect throws, then stops on success', async () => {
-  // A transient channel-open failure in onConnect must NOT prematurely stop the
-  // self-heal loop: it should keep re-discovering until a connect callback
-  // actually succeeds (#133).
-  let attempts = 0;
-  let onConnectCalls = 0;
-  const result = await rediscoverAgenticUntilConnected({
-    resolveTarget: async () => { attempts += 1; return { status: 'connect', config: { url: `http://h:${attempts}` } }; },
-    onConnect: async () => {
-      onConnectCalls += 1;
-      if (onConnectCalls === 1) throw new Error('channel-open transient');
-    },
-    delaysMs: [1, 1, 1],
-    sleep: async () => {},
-    logger: { debug: () => {} },
-  });
-  assert.equal(onConnectCalls, 2, 'retried after the failing onConnect');
-  assert.equal(attempts, 2, 're-resolved on the retry');
-  assert.equal(result.config.url, 'http://h:2', 'returned the target whose onConnect succeeded');
-});
-
-test('rediscoverAgenticUntilConnected stops early when shouldContinue() turns false', async () => {
-  let calls = 0;
-  const result = await rediscoverAgenticUntilConnected({
-    resolveTarget: async () => { calls += 1; return { status: 'advisory' }; },
-    onConnect: async () => {},
-    delaysMs: [1, 1, 1, 1],
-    sleep: async () => {},
-    shouldContinue: () => false, // e.g. a channel already came up
-  });
-  assert.equal(calls, 0, 'never resolves when cancelled up front');
-  assert.equal(result, null);
-});
-
-test('rediscoverAgenticUntilConnected returns null when the schedule is exhausted with no hit', async () => {
-  const result = await rediscoverAgenticUntilConnected({
-    resolveTarget: async () => ({ status: 'advisory' }),
-    onConnect: async () => { throw new Error('should not be called'); },
-    delaysMs: [1, 1],
-    sleep: async () => {},
-  });
-  assert.equal(result, null);
 });

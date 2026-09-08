@@ -314,23 +314,82 @@ function buildRawEmitClient({ channelUrl, transportFactory, peerAdvertisement, l
  * @param {(state: 'connected'|'disconnected') => void} [opts.onConnectionState] observer fired
  *   when the single host connection opens/drops, so a caller can track its liveness
  * @param {{ warn?: Function, debug?: Function }} [opts.logger]
- * @returns {Promise<() => import('./supervisor.dist.js').RawEmitClient>} a synchronous `connect` factory
+ * @param {() => Promise<{url:string, token?:string, credential?:string}|null>} [opts.resolveConfig]
+ *   OPTIONAL self-heal resolver (jwulf/c8ctl-plugin-nano#133). When present the
+ *   base URL is NOT fixed: each (re)connect consults a background-refreshed,
+ *   memoised config, and while none is known the synchronous factory THROWS —
+ *   which `superviseAgentic` turns into its jittered, ≤30s-capped reconnect
+ *   retry — and kicks a guarded async re-discovery, so a later retry finds the
+ *   hub and connects (`advisory → connected` without a restart). A moved hub
+ *   self-heals the same way. Fail-open: a throwing resolver is swallowed.
+ * @returns {Promise<() => import('./supervisor.dist.js').RawEmitClient>} a synchronous
+ *   `connect` factory. In self-heal (`resolveConfig`) mode it may THROW when the
+ *   hub is not yet discoverable — by contract that drives `superviseAgentic`'s retry.
  */
 export async function createRawEmitConnect(opts) {
-  const { url, token, credential, remoteAdvertisement, transportFactory, logger, onConnectionState } = opts || {};
-  if (typeof url !== 'string' || url.trim() === '') {
+  const { url, token, credential, remoteAdvertisement, transportFactory, logger, onConnectionState, resolveConfig } =
+    opts || {};
+  const hasResolver = typeof resolveConfig === 'function';
+  const hasStaticUrl = typeof url === 'string' && url.trim() !== '';
+  if (!hasResolver && !hasStaticUrl) {
     throw new Error('createRawEmitConnect requires an agentic channel base url');
   }
 
-  const channelUrl = buildAgenticUrl(url, { token, credential });
   const factory = transportFactory ?? (await loadAgenticClient()).websocketTransport;
 
-  return () =>
-    buildRawEmitClient({
-      channelUrl,
+  // Static mode: a fixed, known URL (explicit NANO_AGENTIC_URL or an
+  // already-discovered hub). The channel URL is built once; the emit client owns
+  // reconnect to it and `superviseAgentic` re-`connect`s to the SAME URL on a
+  // permanent close. Unchanged behaviour.
+  if (!hasResolver) {
+    const channelUrl = buildAgenticUrl(url, { token, credential });
+    return () =>
+      buildRawEmitClient({
+        channelUrl,
+        transportFactory: factory,
+        peerAdvertisement: remoteAdvertisement,
+        logger,
+        onConnectionState,
+      });
+  }
+
+  // Self-heal mode: re-resolve discovery on each (re)connect via a guarded,
+  // background-refreshed memoised config. While unresolved the factory throws so
+  // `superviseAgentic`'s ≤30s-capped retry doubles as periodic re-discovery.
+  let current = hasStaticUrl ? { url, token, credential } : null;
+  let refreshing = false;
+  const kickRefresh = () => {
+    if (refreshing) return;
+    refreshing = true;
+    Promise.resolve()
+      .then(() => resolveConfig())
+      .then((next) => {
+        if (next && typeof next.url === 'string' && next.url.trim() !== '') {
+          current = { url: next.url, token: next.token ?? token, credential: next.credential ?? credential };
+        }
+      })
+      .catch((err) => {
+        logger?.debug?.(`agentic re-discovery attempt failed: ${err?.message || err}`);
+      })
+      .finally(() => {
+        refreshing = false;
+      });
+  };
+
+  return () => {
+    // Kick a background refresh on every (re)connect so a moved hub self-heals on
+    // the next attempt; it's a no-op while one is in flight, and only runs on a
+    // (re)connect (a steady socket never re-enters this factory).
+    kickRefresh();
+    if (!current) {
+      throw new Error('agentic hub not yet discoverable — retrying via supervised reconnect');
+    }
+    return buildRawEmitClient({
+      channelUrl: buildAgenticUrl(current.url, { token: current.token, credential: current.credential }),
       transportFactory: factory,
       peerAdvertisement: remoteAdvertisement,
       logger,
       onConnectionState,
     });
+  };
 }

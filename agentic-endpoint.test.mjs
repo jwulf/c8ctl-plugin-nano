@@ -234,3 +234,88 @@ test('parseStreamId is the exact inverse of composeStreamId (round-trip, collisi
 function encodeRelayDelivery(stream, offset, chunk) {
   return encodeFrame({ lane: 'bulk', family: 'relay', seq: 0, payload: { stream, offset, chunk } });
 }
+
+// ---- self-heal (dynamic `resolveConfig`) mode (jwulf/c8ctl-plugin-nano#133) ----
+// A cold-start discovery miss leaves the worker `advisory` with no base URL. The
+// endpoint is still built, but its connect factory THROWS until a background
+// re-discovery yields a hub — which `superviseAgentic`'s ≤30s-capped retry turns
+// into periodic re-discovery, upgrading `advisory → connected` without a restart.
+
+test('self-heal mode: connect THROWS while undiscoverable, then connects once resolveConfig yields a hub', async () => {
+  const fake = makeFakeTransportFactory();
+  let resolved = null; // starts undiscoverable (advisory at startup)
+  let attempts = 0;
+  const resolveConfig = async () => {
+    attempts += 1;
+    return resolved;
+  };
+  const connect = await createRawEmitConnect({ transportFactory: fake.factory, resolveConfig });
+
+  // First attempt: no hub known → throws (drives the supervised reconnect retry)
+  // and kicks a background re-discovery.
+  assert.throws(() => connect(), /not yet discoverable/);
+  await tick();
+  assert.ok(attempts >= 1, 'the throwing attempt kicked a background re-discovery');
+  assert.equal(fake.transports.length, 0, 'no socket opened while undiscoverable');
+
+  // The hub appears; the next background refresh memoises it.
+  resolved = { url: 'http://hub.local:3000', token: 'tok', credential: '' };
+  assert.throws(() => connect(), /not yet discoverable/); // kicks the refresh that finds it
+  await tick();
+
+  // A subsequent attempt now connects to the discovered URL.
+  const client = connect();
+  assert.equal(fake.transports.length, 1, 'a socket opened once the hub was discovered');
+  assert.match(fake.last().url, /^ws:\/\/hub\.local:3000\/agentic\?/);
+  assert.match(fake.last().url, /token=tok/);
+  assert.ok(typeof client.register === 'function', 'a real emit client was built');
+});
+
+test('self-heal mode: a throwing resolveConfig is swallowed — the worker keeps retrying, never crashes', async () => {
+  const fake = makeFakeTransportFactory();
+  let mode = 'throw';
+  const resolveConfig = async () => {
+    if (mode === 'throw') throw new Error('engine hiccup');
+    return { url: 'http://hub.local:3000' };
+  };
+  const connect = await createRawEmitConnect({ transportFactory: fake.factory, resolveConfig });
+
+  assert.throws(() => connect(), /not yet discoverable/);
+  await tick(); // background resolveConfig rejects — must be swallowed (no crash)
+  assert.throws(() => connect(), /not yet discoverable/);
+  await tick();
+
+  mode = 'ok';
+  assert.throws(() => connect(), /not yet discoverable/); // kicks the now-succeeding refresh
+  await tick();
+  connect();
+  assert.match(fake.last().url, /^ws:\/\/hub\.local:3000\/agentic/);
+});
+
+test('self-heal mode: a moved hub is re-discovered on the next reconnect', async () => {
+  const fake = makeFakeTransportFactory();
+  let resolved = { url: 'http://old.local:3000' };
+  const resolveConfig = async () => resolved;
+  const connect = await createRawEmitConnect({ transportFactory: fake.factory, resolveConfig });
+
+  // Seed the memo, then connect to the original hub.
+  assert.throws(() => connect(), /not yet discoverable/);
+  await tick();
+  connect();
+  assert.match(fake.last().url, /old\.local:3000/);
+
+  // The hub moves; a later reconnect (kickRefresh on connect) picks up the new URL.
+  resolved = { url: 'http://new.local:3000' };
+  connect(); // kicks the refresh (still returns the old memo this call)
+  await tick();
+  connect();
+  assert.match(fake.last().url, /new\.local:3000/);
+});
+
+test('static mode is unchanged: an explicit url needs no resolver and connects immediately', async () => {
+  const fake = makeFakeTransportFactory();
+  const connect = await createRawEmitConnect({ url: URL, transportFactory: fake.factory });
+  connect();
+  assert.equal(fake.transports.length, 1);
+  assert.match(fake.last().url, /^ws:\/\/localhost:8080\/agentic/);
+});

@@ -6715,94 +6715,6 @@ async function resolveAgenticTarget({ camunda, cache, ...opts } = {}) {
   };
 }
 
-/**
- * A jittered backoff schedule (ms) for background agentic re-discovery (#133-A):
- * ~2s → 4s → 8s → 16s → 30s (capped), each waited value randomised ±20%, spanning
- * roughly `ceilingMs` (default ~5 minutes) of total elapsed retry time before the
- * loop gives up. A worker that lost the cold-start discovery race walks this
- * schedule to upgrade `advisory → connected` without a restart.
- * @param {{ base?: number, cap?: number, ceilingMs?: number, rng?: () => number }} [opts]
- * @returns {number[]} the ordered per-attempt wait durations
- */
-function defaultAgenticRediscoveryDelays({
-  base = 2_000,
-  cap = 30_000,
-  ceilingMs = 5 * 60 * 1_000,
-  rng = Math.random,
-} = {}) {
-  const delays = [];
-  let d = base;
-  let total = 0;
-  while (total < ceilingMs) {
-    const jitter = Math.round((rng() - 0.5) * 0.4 * d); // ±20%
-    const wait = Math.max(500, d + jitter);
-    delays.push(wait);
-    total += wait;
-    d = Math.min(cap, d * 2);
-  }
-  return delays;
-}
-
-/**
- * Background self-heal loop for agentic discovery (#133-A). After an initial
- * cold-start miss leaves a worker in `advisory`, re-run `resolveTarget` on a
- * jittered backoff schedule and, on the FIRST attempt that yields a
- * `status:'connect'` target, invoke `onConnect(target)` and stop — so the worker
- * upgrades to `connected` without a restart. Fail-open: an attempt whose
- * `resolveTarget` throws is swallowed and the loop continues; likewise, if
- * `onConnect` itself throws (a transient channel-open failure), the loop keeps
- * re-discovering rather than stopping, so retries proceed until a connect
- * callback actually succeeds. The loop also stops early whenever
- * `shouldContinue()` returns false (e.g. a channel already came up, or the worker
- * is shutting down). Returns the connecting target, or `null` if the schedule was
- * exhausted / cancelled without a hit. Timers and the resolver are injectable so
- * this is unit-testable without real waits or sockets.
- *
- * @param {{
- *   resolveTarget: () => Promise<{status:string, config?:object}>,
- *   onConnect?: (target: {status:string, config?:object}) => (void|Promise<void>),
- *   delaysMs?: number[],
- *   sleep?: (ms:number) => Promise<void>,
- *   shouldContinue?: () => boolean,
- *   logger?: object,
- * }} opts
- * @returns {Promise<object|null>}
- */
-async function rediscoverAgenticUntilConnected({
-  resolveTarget,
-  onConnect,
-  delaysMs = defaultAgenticRediscoveryDelays(),
-  sleep = (ms) => new Promise((r) => setTimeout(r, ms)),
-  shouldContinue = () => true,
-  logger = null,
-} = {}) {
-  if (typeof resolveTarget !== 'function') return null;
-  for (const delay of delaysMs) {
-    if (!shouldContinue()) return null;
-    try { await sleep(delay); } catch { return null; }
-    if (!shouldContinue()) return null;
-    let target;
-    try {
-      target = await resolveTarget();
-    } catch (err) {
-      logger?.debug?.(`agentic re-discovery attempt failed: ${err?.message || err}`);
-      continue;
-    }
-    if (target && target.status === 'connect') {
-      try {
-        await onConnect?.(target);
-      } catch (err) {
-        // A transient channel-open failure must not prematurely stop self-heal:
-        // keep re-discovering until an onConnect callback actually succeeds.
-        logger?.debug?.(`agentic re-discovery onConnect failed, will retry: ${err?.message || err}`);
-        continue;
-      }
-      return target;
-    }
-  }
-  return null;
-}
-
 // Worker-side liveness watchdog defaults (jwulf/c8ctl-plugin-nano#144). A
 // previously-connected agentic channel that has been `disconnected` for longer
 // than the stale threshold — because the client lib's own reconnect never
@@ -7828,8 +7740,24 @@ async function workAgent(req, flags) {
   // worker joins with the well-known LOCAL token and no credential; SECURE mode
   // (NANO_AGENTIC_SECRET) sends a real per-peer shared secret as the identity;
   // NANO_AGENTIC=off disables it (see resolveAgenticConfig).
-  const agenticTarget = await resolveAgenticTarget({ camunda, logger });
+  const agenticDiscoveryCache = new Map();
+  const agenticTarget = await resolveAgenticTarget({ camunda, logger, cache: agenticDiscoveryCache });
   let agenticCfg = null;
+  let agenticSelfHeal = false;
+  // Self-heal resolver (jwulf/c8ctl-plugin-nano#133): re-run discovery on demand
+  // and hand back a fresh connect config, or null while still undiscoverable. The
+  // endpoint's connect factory calls this in the background so `superviseAgentic`'s
+  // ≤30s-capped reconnect doubles as periodic re-discovery — an `advisory`-at-
+  // startup worker (a cold-start discovery miss during an engine hiccup) upgrades
+  // to `connected` without a restart when the hub reappears. The shared cache lets
+  // a later transient miss reuse the last known-good hub (#133-C).
+  const resolveAgenticConnectConfig = async () => {
+    const t = await resolveAgenticTarget({ camunda, logger, cache: agenticDiscoveryCache });
+    if (t && t.status === 'connect') {
+      return { url: t.config.url, token: t.config.token, credential: t.config.credential };
+    }
+    return null;
+  };
   // buildAgenticUrl can throw on a malformed/unsupported explicit NANO_AGENTIC_URL.
   // This is only the display URL for the activity marker, so compute it
   // defensively: a bad URL must be recorded as a channel failure (via the
@@ -7854,8 +7782,15 @@ async function workAgent(req, flags) {
       process.exit(1);
       break;
     case 'advisory':
-      agenticState = agenticStateForTarget(agenticTarget);
-      logger.info(`  agentic channel: ${agenticTarget.message}`);
+      // Don't give up: build a SELF-HEALING endpoint whose connect re-discovers
+      // on each of `superviseAgentic`'s ≤30s-capped reconnects, so a cold-start
+      // discovery miss (e.g. the engine hiccuped just as the worker started)
+      // upgrades to `connected` without a restart (jwulf/c8ctl-plugin-nano#133).
+      agenticSelfHeal = true;
+      agenticState = { status: 'connecting', mode: 'local', url: null, message: agenticTarget.message };
+      logger.info(
+        `  agentic channel: ${agenticTarget.message.replace('Continuing without it.', 'Retrying discovery on each ≤30s reconnect until it self-heals.')}`,
+      );
       break;
     case 'off':
     default:
@@ -7885,17 +7820,23 @@ async function workAgent(req, flags) {
   // the raw-JS wire (`agentic-endpoint.mjs` → the single agentic import surface)
   // with the bundle's Effect adapter; additive negotiation still degrades
   // claim/release/steer to a no-op against an older hub. Reconnect + resync (and
-  // teardown-on-interruption) are owned by the runtime's `superviseAgentic`, so the
-  // retired #133 self-heal loop and #144/#147 liveness watchdog are gone — the
-  // marker's agentic status is driven by the endpoint's connection observer below.
-  // Constructing the endpoint opens NO socket (the runtime's supervision calls the
-  // connect factory), so this stays cheap and side-effect-free until `run` forks.
-  if (agenticCfg) {
+  // teardown-on-interruption) are owned by the runtime's `superviseAgentic`; the
+  // #133 self-heal is REINSTATED without a parallel loop by handing the `advisory`
+  // case a re-discovering connect factory (`resolveConfig`), so `superviseAgentic`'s
+  // own ≤30s-capped reconnect retry IS the periodic re-discovery (the #144/#147
+  // liveness watchdog remains retired) — the marker's agentic status is driven by
+  // the endpoint's connection observer below. Constructing the endpoint opens NO
+  // socket (the runtime's supervision calls the connect factory), so this stays
+  // cheap and side-effect-free until `run` forks.
+  if (agenticCfg || agenticSelfHeal) {
     try {
       agenticEndpoint = await createAgenticEndpoint({
-        url: agenticCfg.url,
-        token: agenticCfg.token,
-        credential: agenticCfg.credential,
+        // Discovered/explicit connect: a fixed URL (static factory). Advisory
+        // self-heal: no URL yet — the resolver supplies it (and heals a moved hub)
+        // on each supervised reconnect.
+        ...(agenticCfg
+          ? { url: agenticCfg.url, token: agenticCfg.token, credential: agenticCfg.credential }
+          : { resolveConfig: resolveAgenticConnectConfig }),
         // Keep the activity marker's agentic status honest across the single
         // connection's open/drop transitions (#99) — the direct analogue of the
         // retired createWorkChannel onConnect/onDisconnect marker wiring.
@@ -13744,8 +13685,6 @@ export {
   resolveProbeCandidates,
   raceProbeCandidates,
   isLinkLocalAddress,
-  rediscoverAgenticUntilConnected,
-  defaultAgenticRediscoveryDelays,
   agenticChannelIsStale,
   agenticPresenceIsStale,
   jitteredDelay,

@@ -22,7 +22,7 @@
   "files": [
     "c8ctl-plugin.js",
     "agent-instance.mjs",
- "acp-transcript-producer.mjs",
+    "acp-transcript-producer.mjs",
     "platforms.mjs",
     "agentic.mjs",
     "agentic-loader-hook.mjs",

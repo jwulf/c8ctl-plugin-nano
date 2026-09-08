@@ -4679,7 +4679,7 @@ function reapChildRunDirs(dir, { maxAgeMs = 0, liveRunDirs = new Set(), now = Da
   return { reaped };
 }
 
-// OWNER-SCOPED ordinary cleanup: reap finished job/result dirs inside THIS
+// OWNER-SCOPED ordinary cleanup: reap aged, not-in-flight job/result dirs inside THIS
 // worker's own namespace only. Safe by construction — no sibling shares this
 // namespace, and `liveRunDirs` authoritatively excludes in-flight dirs.
 function reapOwnedNamespace(nsDir, { maxAgeMs = 0, liveRunDirs = new Set(), now = Date.now(), logger, incarnation } = {}) {
@@ -4724,12 +4724,12 @@ function reclaimOrphanNamespaces({
     if (!name.startsWith(WORKER_NS_PREFIX)) continue;
     const nsDir = join(root, name);
     let st;
-    try { st = lstatSync(nsDir); } catch { continue; }
+    try { st = lstatSync(nsDir); } catch (err) { note(name, `could not lstat (${err.code || err.message}) — retained`, null); continue; }
     if (!st.isDirectory()) { note(name, 'not a directory (symlink?) — skipped', null); continue; }
     if (minAgeMs > 0 && now - st.mtimeMs < minAgeMs) { note(name, 'younger than min reclaim age', null); continue; }
     // Containment: the resolved namespace must sit directly under the resolved root.
     let nsReal;
-    try { nsReal = realpathSync(nsDir); } catch { continue; }
+    try { nsReal = realpathSync(nsDir); } catch (err) { note(name, `could not resolve real path (${err.code || err.message}) — retained`, null); continue; }
     if (dirname(nsReal) !== rootReal) { note(name, 'path escapes runs root — skipped', null); continue; }
     const owner = readOwnerRecord(nsDir);
     if (!owner) { note(name, 'missing/malformed owner record — not garbage', null); continue; }
@@ -4747,7 +4747,7 @@ function reclaimOrphanNamespaces({
       if (liveness(owner2) !== 'dead') { note(name, 'owner became alive under lock', owner2); continue; }
       if (namespaceHasLiveHarness(nsDir, { isAlive: harnessAlive })) { note(name, 'harness became live under lock', owner2); continue; }
       let real2;
-      try { real2 = realpathSync(nsDir); } catch { continue; }
+      try { real2 = realpathSync(nsDir); } catch (err) { note(name, `could not resolve real path under lock (${err.code || err.message}) — retained`, owner2); continue; }
       if (dirname(real2) !== rootReal) { note(name, 'path escaped runs root under lock', owner2); continue; }
       rmSync(nsDir, { recursive: true, force: true });
       reclaimed.push({ name, owner: owner2 });
@@ -7561,8 +7561,8 @@ async function workAgent(req, flags) {
   // a repository clones a throwaway workspace under this worker's namespace, and a
   // crashed job handler can leave one behind. OWNER-SCOPED: bounded to our own
   // namespace, age-gated, and skipping in-flight dirs (liveRunDirs) — never a
-  // sibling's namespace or a legacy flat run-*/res- dir. A SEPARATE, cross-process
-  // -safe reclamation sweep handles other incarnations' abandoned namespaces.
+  // sibling's namespace or a legacy flat run-*/res- dir. A SEPARATE,
+  // cross-process-safe reclamation sweep handles other incarnations' abandoned namespaces.
   {
     const initialRuns = reapOwnedNamespace(workerNsDir, { maxAgeMs: reapAgeMs, liveRunDirs, logger, incarnation: workerIncarnation });
     if (initialRuns.reaped > 0) logger.info(`Reaped ${initialRuns.reaped} leftover job workspace(s) in this worker's namespace at startup.`);

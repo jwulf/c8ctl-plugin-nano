@@ -377,3 +377,26 @@ test('job marker lifecycle: write → record harness pid → remove clears the s
     assert.equal(namespaceHasLiveHarness(nsDir, { isAlive: () => true }), false, 'no markers ⇒ no surviving harness');
   } finally { cleanup(); }
 });
+
+// ---- 15. Unreadable marker dir ⇒ possibly-live (conservative) ---------------
+
+test('readJobMarkers: missing live/ dir ⇒ [] but an unreadable live/ dir ⇒ synthetic malformed marker', () => {
+  const { root, cleanup } = freshRoot();
+  try {
+    const inc = newIncarnationId();
+    const { nsDir } = allocateWorkerNamespace({ incarnation: inc, pid: process.pid, root });
+    // No markers written: live/ dir absent (ENOENT) ⇒ genuinely empty ⇒ reclaimable.
+    assert.deepEqual(readJobMarkers(nsDir), [], 'ENOENT live/ dir ⇒ no markers');
+    assert.equal(namespaceHasLiveHarness(nsDir, { isAlive: () => false }), false, 'absent live/ dir ⇒ no live harness');
+
+    // A live/ dir that exists but cannot be listed (a file where a dir is
+    // expected forces ENOTDIR on readdir) ⇒ liveness UNKNOWN ⇒ conservative retain.
+    const liveDir = join(nsDir, 'live');
+    rmSync(liveDir, { recursive: true, force: true });
+    writeFileSync(liveDir, 'not a directory');
+    const markers = readJobMarkers(nsDir);
+    assert.equal(markers.length, 1, 'unreadable live/ dir ⇒ one synthetic marker');
+    assert.equal(markers[0].malformed, true, 'synthetic marker is malformed ⇒ possibly-live');
+    assert.equal(namespaceHasLiveHarness(nsDir, { isAlive: () => false }), true, 'unreadable live/ dir ⇒ possibly-live (conservative)');
+  } finally { cleanup(); }
+});

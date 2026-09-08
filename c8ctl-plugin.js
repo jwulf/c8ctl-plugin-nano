@@ -4627,7 +4627,15 @@ function removeJobMarker(nsDir, jobKey) {
 
 function readJobMarkers(nsDir) {
   let names;
-  try { names = readdirSync(join(nsDir, LIVE_MARKER_DIR)); } catch { return []; }
+  try { names = readdirSync(join(nsDir, LIVE_MARKER_DIR)); }
+  catch (err) {
+    // ENOENT ⇒ the live/ dir never existed: genuinely no in-flight markers.
+    // Any other error (EACCES, transient FS) means marker liveness is UNKNOWN,
+    // so return a synthetic malformed marker to force a conservative retain
+    // (never reclaim a namespace whose harness state we couldn't determine).
+    if (err && err.code === 'ENOENT') return [];
+    return [{ jobKey: '(unreadable)', harnessPids: [], malformed: true }];
+  }
   const out = [];
   for (const n of names) {
     if (!n.endsWith('.json')) continue;

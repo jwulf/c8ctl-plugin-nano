@@ -73,6 +73,13 @@ import { createLogRing, resolveLogMaxBytes } from './supervisor-log-ring.mjs';
 // raw ACP `session/update` to the exact transcript-chunk bytes the cockpit decodes,
 // replacing the plugin's former hand-rolled `nwfTranscriptEvent` envelope grammar.
 import { sessionAcp as agenticSessionAcp } from './agentic.mjs';
+// Producer-side message-boundary preservation (jwulf/c8ctl-plugin-nano#206). Wraps
+// the canonical bridge to carry the ACP `messageId` / role / delta semantics into
+// the shared additive `MessageEvent` contract (nanobpm/nano-ide#566), so a consumer
+// folding these chunks through `deriveDisplay` reconstructs transport-fragmented
+// deltas into coherent blocks and keeps distinct same-speaker messages apart —
+// falling back to byte-identical bridge output when the provider omits identity.
+import { acpUpdateToDisplayChunk } from './acp-transcript-producer.mjs';
 // Engine-native AgentInstance / AgentHistory durable-transcript producer (issue
 // #194): mints an AgentInstance for an `external` agent job and appends each ACP
 // turn to the engine's append-only AgentHistory via the host SDK client.
@@ -5455,20 +5462,25 @@ function spawnCaptureAcp({ command, args = [], cwd, env, stdinData, timeoutMs, i
       }
     };
 
-    // #110 / nanobpm/nano-ide#534: map an ACP session/update to the CANONICAL
-    // transcript-chunk wire form via the shared `@nanobpm/agentic` bridge —
-    // `classifyUpdate` composed with `encodeTranscriptEvent` behind the single
-    // `acpUpdateToTranscriptChunk` helper. It returns the exact
-    // `{ nwfTranscriptEvent: 1, kind, … }` bytes the cockpit's `parseTranscriptEvent`
-    // decodes and `deriveView` folds into messages / tool cards, or `null` for an
+    // #110 / nanobpm/nano-ide#534 / jwulf/c8ctl-plugin-nano#206: map an ACP
+    // session/update to the CANONICAL transcript-chunk wire form via the shared
+    // `@nanobpm/agentic` seams. `acpUpdateToDisplayChunk` (this plugin's producer)
+    // wraps the canonical bridge (`classifyUpdate` composed with
+    // `encodeTranscriptEvent`) and additionally carries the ACP `messageId` / role /
+    // delta semantics into the shared additive `MessageEvent` contract (#566) so a
+    // consumer folding these chunks through `deriveDisplay` reconstructs
+    // transport-fragmented deltas into coherent blocks and keeps distinct
+    // same-speaker messages apart — degrading to byte-identical bridge output when
+    // the provider omits identity. It returns the exact `{ nwfTranscriptEvent: 1,
+    // kind, … }` bytes the cockpit's `parseTranscriptEvent` decodes, or `null` for an
     // update with no canonical meaning (an `ignored` classification: a plan, an
     // intermediate tool_call_update, a non-text chunk, or a malformed update). No
-    // envelope grammar or vocab is hand-rolled here anymore — the marker, version,
-    // kinds and fields all come from the package, so a producer and a consumer can
-    // never diverge on the wire again. `null` (and any bridge throw) falls through
-    // to the minimal human-text path below, so nothing is ever dropped.
+    // envelope grammar or vocab is hand-rolled here — the marker, version, kinds and
+    // additive fields all come from the package, so a producer and a consumer can
+    // never diverge on the wire again. `null` (and any throw) falls through to the
+    // minimal human-text path below, so nothing is ever dropped.
     const encodeTranscriptChunk = (update) => {
-      try { return agenticSessionAcp.acpUpdateToTranscriptChunk(update); }
+      try { return acpUpdateToDisplayChunk(update, { sessionAcp: agenticSessionAcp }); }
       catch { return null; }
     };
 

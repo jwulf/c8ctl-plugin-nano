@@ -162,7 +162,13 @@ test('discoverAgenticHubs discovers a remote (LAN) engine against the engine hos
     lookupImpl: async () => ([{ address: '192.168.0.21', family: 4 }]),
     wsProbe: async (_port, { host } = {}) => { probedHost = host; return true; },
   });
-  assert.deepEqual(hubs, [{ project: 'Nano_Workforce', port: 3000, label: 'Nano Workforce', host: '192.168.0.21' }]);
+  // Tunnel-first (#97): the engine-host probe upgrades, so the hub rides the
+  // console app-view WS tunnel on the engine's own port (8080), carrying the
+  // engine host discovered by the resolver.
+  assert.deepEqual(hubs, [{
+    project: 'Nano_Workforce', port: 3000, label: 'Nano Workforce', host: '192.168.0.21',
+    via: 'tunnel', enginePort: '8080', scheme: 'http:',
+  }]);
   assert.equal(fetchedUrl, 'http://merlin.local:8080/console/api/projects', 'reads the remote engine projects API');
   assert.equal(probedHost, '192.168.0.21', 'probes the engine host address, not the worker loopback');
 });
@@ -231,6 +237,71 @@ test('discoverAgenticHubs still fails open to [] when the fetch outlasts its own
   });
   assert.deepEqual(hubs, []);
   assert.equal(probed, false, 'a fetch that blows its own budget never reaches the probe');
+});
+
+// ---------------------------------------------------------------------------
+// (#97) Single-port: tunnel through the console app-view WS bridge first, fall
+// back to the app's direct port on a pre-#1054 engine that refuses the upgrade.
+// ---------------------------------------------------------------------------
+
+// A pathPrefix-aware probe: upgrades a WS only on the given `pathPrefix` (and,
+// when a port set is supplied, only for those ports). Lets a test assert whether
+// discovery took the tunnel route (prefix `/console/app-view/<project>`) or the
+// direct route (empty prefix).
+function probeUpgradesPath(wantPrefix, ...ports) {
+  const set = ports.length ? new Set(ports) : null;
+  return async (port, { pathPrefix = '' } = {}) =>
+    pathPrefix === wantPrefix && (!set || set.has(port));
+}
+
+test('discoverAgenticHubs prefers the console app-view WS tunnel on the engine port (#97)', async () => {
+  const hubs = await discoverAgenticHubs('http://merlin.local:8080', {
+    fetchImpl: fetchReturning(NANO_WORKFORCE),
+    lookupImpl: async () => ([{ address: '192.168.0.21', family: 4 }]),
+    // Only the tunnel path upgrades; the app's direct port is NOT LAN-open.
+    wsProbe: probeUpgradesPath('/console/app-view/Nano_Workforce'),
+  });
+  assert.deepEqual(hubs, [{
+    project: 'Nano_Workforce', port: 3000, label: 'Nano Workforce', host: '192.168.0.21',
+    via: 'tunnel', enginePort: '8080', scheme: 'http:',
+  }]);
+});
+
+test('resolveAgenticTarget builds the console app-view tunnel URL for a tunnel hub (#97)', async () => {
+  const res = await withEnv({}, { nanoUrl: 'http://merlin.local:8080' }, () =>
+    resolveAgenticTarget({
+      fetchImpl: fetchReturning(NANO_WORKFORCE),
+      lookupImpl: async () => ([{ address: '192.168.0.21', family: 4 }]),
+      wsProbe: probeUpgradesPath('/console/app-view/Nano_Workforce'),
+    }));
+  assert.equal(res.status, 'connect');
+  // buildAgenticUrl appends `/agentic` to this base → the tunnel WS URL.
+  assert.equal(res.config.url, 'http://192.168.0.21:8080/console/app-view/Nano_Workforce');
+  assert.deepEqual(res.config.discovered, { project: 'Nano_Workforce', port: 3000, host: '192.168.0.21' });
+});
+
+test('discoverAgenticHubs falls back to the direct app port when the tunnel is refused (pre-#1054)', async () => {
+  const hubs = await discoverAgenticHubs('http://merlin.local:8080', {
+    fetchImpl: fetchReturning(NANO_WORKFORCE),
+    lookupImpl: async () => ([{ address: '192.168.0.21', family: 4 }]),
+    // The engine predates #1054 and 501s the tunnel upgrade; only the direct
+    // app port (empty prefix) upgrades.
+    wsProbe: probeUpgradesPath('', 3000),
+  });
+  assert.deepEqual(hubs, [{
+    project: 'Nano_Workforce', port: 3000, label: 'Nano Workforce', host: '192.168.0.21', via: 'direct',
+  }]);
+});
+
+test('resolveAgenticTarget keeps the direct #96 URL when discovery falls back to direct', async () => {
+  const res = await withEnv({}, { nanoUrl: 'http://merlin.local:8080' }, () =>
+    resolveAgenticTarget({
+      fetchImpl: fetchReturning(NANO_WORKFORCE),
+      lookupImpl: async () => ([{ address: '192.168.0.21', family: 4 }]),
+      wsProbe: probeUpgradesPath('', 3000),
+    }));
+  assert.equal(res.status, 'connect');
+  assert.equal(res.config.url, 'http://192.168.0.21:3000');
 });
 
 // ---------------------------------------------------------------------------
@@ -462,7 +533,10 @@ test('discoverAgenticHubs prefers a routable address when the resolver returns l
     lookupImpl,
     probeTimeoutMs: 500,
   });
-  assert.deepEqual(hubs, [{ project: 'Nano_Workforce', port: 3000, label: 'Nano Workforce', host: '192.168.0.21' }]);
+  assert.deepEqual(hubs, [{
+    project: 'Nano_Workforce', port: 3000, label: 'Nano Workforce', host: '192.168.0.21',
+    via: 'tunnel', enginePort: '8080', scheme: 'http:',
+  }]);
 });
 
 // ---------------------------------------------------------------------------

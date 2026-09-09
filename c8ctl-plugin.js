@@ -6373,16 +6373,20 @@ function normalizeProjectApps(projects) {
 }
 
 /**
- * Probe whether an embedded app's `/agentic` endpoint answers a WebSocket
- * upgrade. Connects to `ws://<host>:<port>/agentic?token=…` (host defaults to
+ * Probe whether a `/agentic` endpoint answers a WebSocket upgrade. Connects to
+ * `ws://<host>:<port><pathPrefix>/agentic?token=…` (host defaults to
  * `127.0.0.1`; a bare IPv6 literal is bracketed for the URL authority) and
  * resolves `true` only if the socket opens within `timeoutMs`; a refused
- * connection, the console proxy's deliberate `501`, a `404`, or a timeout all
- * resolve `false`. Self-cleaning — the probe socket is closed as soon as the
- * outcome is known. Never throws.
+ * connection, a `404`/`501`, or a timeout all resolve `false`. Self-cleaning —
+ * the probe socket is closed as soon as the outcome is known. Never throws.
  *
- * @param {number} port the app's direct agentic port (`appUi.port`)
- * @param {{ host?: string, token?: string, WebSocketImpl?: Function, timeoutMs?: number }} [opts]
+ * `pathPrefix` targets either the app's own port (empty prefix → `/agentic`) or
+ * the engine's console **app-view WebSocket tunnel** (engine #1054), where the
+ * prefix is `/console/app-view/<project>` so the channel rides the single engine
+ * port instead of the app's direct port (see {@link discoverAgenticHubs}).
+ *
+ * @param {number|string} port the port the WS connects to (app port, or engine port for the tunnel)
+ * @param {{ host?: string, token?: string, WebSocketImpl?: Function, timeoutMs?: number, pathPrefix?: string }} [opts]
  * @returns {Promise<boolean>}
  */
 function probeAgenticChannel(port, {
@@ -6390,9 +6394,10 @@ function probeAgenticChannel(port, {
   token = LOCAL_AGENTIC_TOKEN,
   WebSocketImpl = globalThis.WebSocket,
   timeoutMs = AGENTIC_DISCOVERY_TIMEOUT_MS,
+  pathPrefix = '',
 } = {}) {
   if (typeof WebSocketImpl !== 'function') return Promise.resolve(false);
-  const url = `ws://${wsHostPart(host)}:${port}/agentic?token=${encodeURIComponent(token)}`;
+  const url = `ws://${wsHostPart(host)}:${port}${pathPrefix}/agentic?token=${encodeURIComponent(token)}`;
   return new Promise((resolve) => {
     let done = false;
     let ws;
@@ -6499,8 +6504,8 @@ async function resolveProbeCandidates(host, { lookupImpl = dnsLookup } = {}) {
  * slow-to-open one can't stall the whole probe: a fast later candidate still
  * wins. Each per-host probe is bounded by `timeoutMs`. A single candidate skips
  * the racing machinery entirely (unchanged legacy path).
- * @param {number} port
- * @param {{ hosts?: string[], token?: string, timeoutMs?: number, wsProbe?: Function, staggerMs?: number }} [opts]
+ * @param {number|string} port
+ * @param {{ hosts?: string[], token?: string, timeoutMs?: number, wsProbe?: Function, staggerMs?: number, pathPrefix?: string }} [opts]
  * @returns {Promise<string|null>} the winning host, or null
  */
 async function raceProbeCandidates(port, {
@@ -6509,12 +6514,13 @@ async function raceProbeCandidates(port, {
   timeoutMs = AGENTIC_DISCOVERY_TIMEOUT_MS,
   wsProbe = probeAgenticChannel,
   staggerMs = 250,
+  pathPrefix = '',
 } = {}) {
   const list = Array.isArray(hosts) ? hosts.filter(Boolean) : [];
   if (list.length === 0) return null;
   if (list.length === 1) {
     try {
-      return (await wsProbe(port, { host: list[0], token, timeoutMs })) ? list[0] : null;
+      return (await wsProbe(port, { host: list[0], token, timeoutMs, pathPrefix })) ? list[0] : null;
     } catch {
       return null;
     }
@@ -6531,7 +6537,7 @@ async function raceProbeCandidates(port, {
     };
     const start = (host) => {
       Promise.resolve()
-        .then(() => wsProbe(port, { host, token, timeoutMs }))
+        .then(() => wsProbe(port, { host, token, timeoutMs, pathPrefix }))
         .catch(() => false)
         .then((ok) => {
           if (ok) done(host);
@@ -6547,23 +6553,32 @@ async function raceProbeCandidates(port, {
 
 /**
  * Auto-discover the embedded nwf agentic hub(s) reachable from an engine base
- * URL (#75, #96). Reads `GET <engine>/console/api/projects`, keeps the apps that
- * advertise an agentic UI port, and WS-probes each app's `/agentic` **on the
- * engine's own host** to confirm the channel is actually served there (bypassing
- * the WS-incapable console proxy). Works cross-machine on a trusted LAN: a
- * loopback engine probes `127.0.0.1`, a remote engine (e.g. `merlin.local`)
- * probes that same host — the port is taken from the projects API but the host is
- * always the engine's, so a rogue projects API can never steer a probe at the
- * worker's own loopback (#76). Gives the projects fetch and each WS probe
- * INDEPENDENT deadlines (#133) so a slow fetch can't starve the probe, prefers a
- * routable address over a link-local `fe80::` one (Happy-Eyeballs), and is
- * fail-open: any error — not a nano engine (Camunda), network failure, malformed
- * body, or a timeout — degrades to `[]` so the worker's real job is never
- * blocked.
+ * URL (#75, #96, #97). Reads `GET <engine>/console/api/projects`, keeps the apps
+ * that advertise an agentic UI port, and WS-probes each app's `/agentic` **on the
+ * engine's own host** to confirm the channel is actually served there. Works
+ * cross-machine on a trusted LAN: a loopback engine probes `127.0.0.1`, a remote
+ * engine (e.g. `merlin.local`) probes that same host — the port is taken from the
+ * projects API but the host is always the engine's, so a rogue projects API can
+ * never steer a probe at the worker's own loopback (#76).
+ *
+ * **Single-port hardening (#97, engine #1054):** each app is probed **tunnel-first** —
+ * `ws://<engineHost>:<enginePort>/console/app-view/<project>/agentic`, the console
+ * app-view WebSocket tunnel on the engine's *own* port (the same host:port the
+ * worker already reached for the projects read). A surviving tunnel hub is marked
+ * `via:'tunnel'` and needs only the engine port to be reachable — the app's direct
+ * port need not be LAN-open. If the tunnel probe fails (an engine that predates
+ * #1054 refuses the `/agentic` WS upgrade with `501`), it falls back to probing the
+ * app's **direct** port and marks the hub `via:'direct'` (unchanged #96 behaviour).
+ *
+ * Gives the projects fetch and each WS probe INDEPENDENT deadlines (#133) so a slow
+ * fetch can't starve the probe, prefers a routable address over a link-local `fe80::`
+ * one (Happy-Eyeballs), and is fail-open: any error — not a nano engine (Camunda),
+ * network failure, malformed body, or a timeout — degrades to `[]` so the worker's
+ * real job is never blocked.
  *
  * @param {string} engineBaseUrl the engine base URL (e.g. `http://merlin.local:8080`)
  * @param {{ token?: string, fetchImpl?: Function, wsProbe?: Function, lookupImpl?: Function, timeoutMs?: number, fetchTimeoutMs?: number, probeTimeoutMs?: number }} [opts]
- * @returns {Promise<Array<{ project: string, port: number, label?: string, host: string }>>}
+ * @returns {Promise<Array<{ project: string, port: number, label?: string, host: string, via: 'tunnel'|'direct', enginePort?: string, scheme?: string }>>}
  */
 async function discoverAgenticHubs(engineBaseUrl, {
   token = LOCAL_AGENTIC_TOKEN,
@@ -6586,12 +6601,15 @@ async function discoverAgenticHubs(engineBaseUrl, {
   // loopback services — which was the actual #76 concern (a rogue projects API
   // making the worker probe its own localhost). So the port comes from the
   // engine's projects API, but the HOST is always the engine's, never guessed.
-  let host;
+  let engineUrl;
   try {
-    host = new URL(base).hostname;
+    engineUrl = new URL(base);
   } catch {
     return [];
   }
+  const host = engineUrl.hostname;
+  const engineScheme = engineUrl.protocol; // 'http:' | 'https:'
+  const enginePort = engineUrl.port || (engineScheme === 'https:' ? '443' : '80');
   const probeHost = isLoopbackHost(host) ? '127.0.0.1' : host;
   // (C) Decoupled budgets (#133): the projects fetch and each WS probe get their
   // OWN independent deadline. Previously they shared one 2s budget, so a fetch
@@ -6623,13 +6641,28 @@ async function discoverAgenticHubs(engineBaseUrl, {
   const candidates = await resolveProbeCandidates(probeHost, { lookupImpl });
   const settled = await Promise.all(apps.map(async (app) => {
     try {
-      const winner = await raceProbeCandidates(app.port, {
+      // Tunnel-first (#97): confirm the channel over the console app-view WS
+      // tunnel on the ENGINE port — the same host:port the projects read just
+      // used — so the app's direct port need not be reachable. A pre-#1054
+      // engine 501s the upgrade and the probe fails; we then fall back to the
+      // app's direct port (unchanged #96 path).
+      const tunnelHost = await raceProbeCandidates(enginePort, {
+        hosts: candidates,
+        token,
+        timeoutMs: probeTimeoutMs,
+        wsProbe,
+        pathPrefix: `/console/app-view/${app.project}`,
+      });
+      if (tunnelHost) {
+        return { ...app, host: tunnelHost, via: 'tunnel', enginePort, scheme: engineScheme };
+      }
+      const directHost = await raceProbeCandidates(app.port, {
         hosts: candidates,
         token,
         timeoutMs: probeTimeoutMs,
         wsProbe,
       });
-      return winner ? { ...app, host: winner } : null;
+      return directHost ? { ...app, host: directHost, via: 'direct' } : null;
     } catch {
       return null;
     }
@@ -6646,8 +6679,11 @@ async function discoverAgenticHubs(engineBaseUrl, {
  *     half-configured. No discovery attempted.
  *   - `{ status: 'connect', config }` — a target to connect to. Either the
  *     explicit `NANO_AGENTIC_URL`/`agenticUrl` verbatim (no discovery), or the
- *     single discovered app's `ws://<engineHost>:<port>/agentic` (loopback for a
- *     local engine, the engine's LAN host for a remote one).
+ *     single discovered app: the console app-view WS tunnel on the engine port
+ *     (`<engineHost>:<enginePort>/console/app-view/<project>/agentic`, `via:'tunnel'`,
+ *     #97) when available, else the direct app port
+ *     (`ws://<engineHost>:<appPort>/agentic`, `via:'direct'`, #96) — loopback for a
+ *     local engine, the engine's LAN host for a remote one.
  *   - `{ status: 'ambiguous', message, candidates }` — two+ apps expose a
  *     channel. Hard stop for the worker: it must not silently pick one.
  *   - `{ status: 'advisory', message }` — nothing discoverable (zero matches,
@@ -6681,10 +6717,18 @@ async function resolveAgenticTarget({ camunda, cache, ...opts } = {}) {
   } catch { /* keep the loopback default */ }
 
   if (hubs.length === 1) {
-    const { project, port, host } = hubs[0];
+    const { project, port, host, via, enginePort, scheme } = hubs[0];
+    // A tunnel hub rides the console app-view WS bridge on the engine's own port
+    // (#97): `<scheme>//<engineHost>:<enginePort>/console/app-view/<project>`, to
+    // which `buildAgenticUrl` appends `/agentic`. A direct hub keeps the #96
+    // `http://<host>:<appPort>` form. `discovered.port` stays the app's advertised
+    // port either way (the hub identity), while `discovered.via` records the route.
+    const url = via === 'tunnel'
+      ? `${scheme}//${wsHostPart(host)}:${enginePort}/console/app-view/${project}`
+      : `http://${wsHostPart(host)}:${port}`;
     const config = {
       ...base,
-      url: `http://${wsHostPart(host)}:${port}`,
+      url,
       discovered: { project, port, host },
     };
     // Cache the known-good hub so a later blip self-heals from cache (#133-C).

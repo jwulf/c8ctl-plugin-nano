@@ -21,7 +21,7 @@ function sleep(ms) { return new Promise((r) => setTimeout(r, ms)); }
 function argvName(argv) {
   if (!Array.isArray(argv)) return null;
   const i = argv.indexOf('--name');
-  return i !== -1 ? argv[i + 1] : null;
+  return i !== -1 && i + 1 < argv.length ? argv[i + 1] : null;
 }
 
 // Read the argv a shim child recorded for a given pid. The file is written on

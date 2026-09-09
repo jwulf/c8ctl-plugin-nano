@@ -7781,12 +7781,19 @@ async function workAgent(req, flags) {
       logger.error(`  agentic visibility is ambiguous: ${agenticTarget.message}`);
       process.exit(1);
       break;
-    case 'advisory':
+    case 'advisory': {
       // Don't give up: build a SELF-HEALING endpoint whose connect re-discovers
       // on each of `superviseAgentic`'s ≤30s-capped reconnects, so a cold-start
       // discovery miss (e.g. the engine hiccuped just as the worker started)
       // upgrades to `connected` without a restart (jwulf/c8ctl-plugin-nano#133).
       agenticSelfHeal = true;
+      // Derive one retry-aware message so the marker's `agentic.message` and the
+      // log line agree: consumers of `supervisor status`/markers must see that the
+      // worker WILL self-heal, not the raw "Continuing without it." advisory text.
+      const retryMessage = agenticTarget.message.replace(
+        'Continuing without it.',
+        'Retrying discovery on each ≤30s reconnect until it self-heals.',
+      );
       // Derive the auth mode from the resolved agentic config so `supervisor
       // status`/markers report SECURE (NANO_AGENTIC_SECRET) correctly while the
       // worker is still reconnecting, instead of hard-coding 'local'.
@@ -7794,12 +7801,11 @@ async function workAgent(req, flags) {
         status: 'connecting',
         mode: resolveAgenticConfig(camunda)?.secure ? 'secure' : 'local',
         url: null,
-        message: agenticTarget.message,
+        message: retryMessage,
       };
-      logger.info(
-        `  agentic channel: ${agenticTarget.message.replace('Continuing without it.', 'Retrying discovery on each ≤30s reconnect until it self-heals.')}`,
-      );
+      logger.info(`  agentic channel: ${retryMessage}`);
       break;
+    }
     case 'off':
     default:
       agenticState = agenticStateForTarget(agenticTarget);

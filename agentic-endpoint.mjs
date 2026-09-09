@@ -305,7 +305,10 @@ function buildRawEmitClient({ channelUrl, transportFactory, peerAdvertisement, l
  * `transportFactory` and never touches the real client.
  *
  * @param {object} opts
- * @param {string} opts.url the app's HTTP(S) base URL (channel served same-port at `/agentic`)
+ * @param {string} [opts.url] the app's HTTP(S) base URL (channel served same-port at
+ *   `/agentic`). OPTIONAL in self-heal mode: when `resolveConfig` is supplied the base
+ *   URL is not fixed, but a static `url` may still be passed to SEED the initial memo
+ *   before the first re-discovery lands. Required only when `resolveConfig` is absent.
  * @param {string} [opts.token] ADR 0028 identity token (carried as `?token=`)
  * @param {string} [opts.credential] capability credential (carried as `?capability=`)
  * @param {import('@nanobpm/agentic/protocol').ProtocolAdvertisement} [opts.remoteAdvertisement]

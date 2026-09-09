@@ -335,7 +335,9 @@ export async function createRawEmitConnect(opts) {
   const hasResolver = typeof resolveConfig === 'function';
   const hasStaticUrl = typeof url === 'string' && url.trim() !== '';
   if (!hasResolver && !hasStaticUrl) {
-    throw new Error('createRawEmitConnect requires an agentic channel base url');
+    throw new Error(
+      'createRawEmitConnect requires an agentic channel base `url`, or a `resolveConfig` self-heal resolver to discover one',
+    );
   }
 
   const factory = transportFactory ?? (await loadAgenticClient()).websocketTransport;

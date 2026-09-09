@@ -34,9 +34,10 @@ const isPlainObject = (v) => v != null && typeof v === 'object' && !Array.isArra
  * element carries `zeebe:agentDefinition agentType="external"`?
  *
  * The engine surfaces exactly this eligibility as the pair of fields it stamps on
- * an external agent job's activation: an opaque per-activation `jobLease` token
- * (distinct from the job's `deadline`; nanobpmn #1106) plus the `elementInstanceKey`
- * the AgentInstance correlates on. The engine-native `aiAgentTask`/`aiAgentSubProcess`
+ * an external agent job's activation: an opaque per-activation lease token —
+ * `leaseToken` on the activated job (Camunda v10 ActivatedJobResult; distinct from
+ * the job's `deadline`, nanobpmn #1106) — plus the `elementInstanceKey` the
+ * AgentInstance correlates on. The engine-native `aiAgentTask`/`aiAgentSubProcess`
  * variants auto-mint their AgentInstance and never create an activatable job, so any
  * job a worker actually activates that carries a lease token IS an external agent
  * job. Absence of either field means "not an external agent job" → the producer
@@ -44,7 +45,7 @@ const isPlainObject = (v) => v != null && typeof v === 'object' && !Array.isArra
  */
 export function isExternalAgentJob(job) {
   if (!isPlainObject(job)) return false;
-  return isNonBlank(job.jobLease) && isNonBlank(job.elementInstanceKey);
+  return isNonBlank(job.leaseToken) && isNonBlank(job.elementInstanceKey);
 }
 
 /** Best-effort provider inference from a model identifier (openai/anthropic/…). */
@@ -145,7 +146,7 @@ function contentForResult(result) {
  *
  * @param {object} opts
  * @param {object} opts.camunda   Host SDK client (createAgentInstance/updateAgentInstance).
- * @param {object} opts.job       The activated job (jobKey/jobLease/elementInstanceKey/elementId).
+ * @param {object} opts.job       The activated job (jobKey/leaseToken/elementInstanceKey/elementId).
  * @param {object} [opts.profile] The worker profile (model/provider seed the definition).
  * @param {object} [opts.envelope] The normalized task envelope (task.prompt → systemPrompt).
  * @param {object} [opts.logger]  Output-mode-aware logger (warn/info/debug).
@@ -166,7 +167,12 @@ export function createAgentInstanceProducer(opts = {}) {
   const classify = typeof sessionAcp?.classifyUpdate === 'function' ? sessionAcp.classifyUpdate : null;
 
   const jobKey = job?.jobKey != null ? String(job.jobKey) : '';
-  const jobLease = job?.jobLease != null ? String(job.jobLease) : '';
+  // The activation lease is carried on the job as `leaseToken` (Camunda v10
+  // ActivatedJobResult). It is submitted BACK to createAgentInstance/updateAgentInstance
+  // as the request-body field `jobLease` (agent-instances.yaml) — the same opaque token,
+  // named differently on the two sides of the contract. One internal name here; the
+  // translation to `jobLease` happens only at each SDK call below.
+  const leaseToken = job?.leaseToken != null ? String(job.leaseToken) : '';
   const elementInstanceKey = job?.elementInstanceKey != null ? String(job.elementInstanceKey) : '';
   const elementId = job?.elementId != null ? String(job.elementId) : null;
 
@@ -212,7 +218,7 @@ export function createAgentInstanceProducer(opts = {}) {
         agentInstanceKey,
         elementInstanceKey,
         jobKey,
-        jobLease,
+        jobLease: leaseToken,
         history: [turn],
       };
       if (status) req.status = status;
@@ -321,7 +327,7 @@ export function createAgentInstanceProducer(opts = {}) {
         const res = await camunda[SDK_CREATE]({
           elementInstanceKey,
           jobKey,
-          jobLease,
+          jobLease: leaseToken,
           history: [configTurn],
         });
         agentInstanceKey =
@@ -425,7 +431,7 @@ export function createAgentInstanceProducer(opts = {}) {
             agentInstanceKey,
             elementInstanceKey,
             jobKey,
-            jobLease,
+            jobLease: leaseToken,
             status: 'COMPLETED',
           });
         });

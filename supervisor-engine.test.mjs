@@ -69,6 +69,7 @@ test("activate: POSTs the correct body/URL and maps the returned batch", async (
     maxJobsToActivate: 5,
     timeout: 15_000, // lockMs → the short initial lock
     requestTimeout: 10_000, // requestTimeoutMs → the server long-poll window
+    withLease: true, // request a per-activation lease token (parity with the SDK path)
   });
 });
 
@@ -309,10 +310,40 @@ test("activate: delegates to the SDK's typed activateJobs (1:1 body) and maps th
     { jobKey: "333", type: "senior:plan" },
   ]);
   // The SDK input body is byte-identical to the raw POST body (JobActivationRequest).
+  // `withLease: true` is REQUIRED so the engine stamps a per-activation lease token on
+  // each job (returned as ActivatedJobResult.leaseToken) — the token that lease-gates a
+  // `createAgentInstance` for an external agent job (nanobpmn #1099/#1106).
   assert.deepEqual(calls, [
-    { type: "senior:plan", worker: "host-1", maxJobsToActivate: 5, timeout: 15_000, requestTimeout: 10_000 },
+    { type: "senior:plan", worker: "host-1", maxJobsToActivate: 5, timeout: 15_000, requestTimeout: 10_000, withLease: true },
   ]);
   assert.equal(fetchImpl.calls.length, 0); // SDK path never issues a raw request
+});
+
+test("activate: maps the Camunda-v10 activation lease field `leaseToken` onto the job's `leaseToken`", async () => {
+  // The v10 REST contract carries the per-activation lease on the activated job as
+  // `leaseToken` (jobs.yaml ActivatedJobResult), NOT `jobLease` — the latter is the
+  // field name only on the createAgentInstance REQUEST body (agent-instances.yaml). The
+  // harness carries ONE internal name — `leaseToken` — all the way through, and
+  // translates to `jobLease` only at the createAgentInstance/updateAgentInstance body.
+  const camunda = {
+    activateJobs: async () => ({
+      jobs: [
+        {
+          jobKey: 13954,
+          type: "senior:feature",
+          leaseToken: "LEASE-abc",
+          elementInstanceKey: "EIK-7",
+          elementId: "agent-task",
+        },
+      ],
+    }),
+  };
+  const engine = createRawEngineClient({ baseUrl: "http://engine:8080", fetchImpl: makeFakeFetch([]), camunda });
+  const [job] = await engine.activate({ type: "senior:feature", maxJobsToActivate: 1, requestTimeoutMs: 0, lockMs: 1 });
+  assert.equal(job.leaseToken, "LEASE-abc");
+  assert.equal(job.elementInstanceKey, "EIK-7");
+  assert.equal(job.elementId, "agent-task");
+  assert.equal(job.jobLease, undefined); // the harness no longer reads/emits the activation lease under `jobLease`
 });
 
 test("activate: SDK path maps an absent/empty jobs array to an empty batch (idle)", async () => {

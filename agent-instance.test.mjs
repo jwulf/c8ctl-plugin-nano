@@ -37,7 +37,7 @@ function fakeClient({ createResult = { agentInstanceKey: 'AGENT-1' }, failCreate
 const EXTERNAL_JOB = {
   jobKey: '13954',
   type: 'senior:feature',
-  jobLease: '99001',
+  leaseToken: '99001',
   elementInstanceKey: 'EIK-7',
   elementId: 'agent-task',
   processInstanceKey: '13951',
@@ -70,8 +70,8 @@ function makeProducer(client, overrides = {}) {
 
 test('isExternalAgentJob requires both a lease token and an elementInstanceKey', () => {
   assert.equal(isExternalAgentJob(EXTERNAL_JOB), true);
-  assert.equal(isExternalAgentJob({ ...EXTERNAL_JOB, jobLease: undefined }), false);
-  assert.equal(isExternalAgentJob({ ...EXTERNAL_JOB, jobLease: '' }), false);
+  assert.equal(isExternalAgentJob({ ...EXTERNAL_JOB, leaseToken: undefined }), false);
+  assert.equal(isExternalAgentJob({ ...EXTERNAL_JOB, leaseToken: '' }), false);
   assert.equal(isExternalAgentJob({ ...EXTERNAL_JOB, elementInstanceKey: undefined }), false);
   assert.equal(isExternalAgentJob({ jobKey: '1', type: 't' }), false);
   assert.equal(isExternalAgentJob(null), false);

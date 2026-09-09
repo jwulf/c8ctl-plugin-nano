@@ -7787,7 +7787,15 @@ async function workAgent(req, flags) {
       // discovery miss (e.g. the engine hiccuped just as the worker started)
       // upgrades to `connected` without a restart (jwulf/c8ctl-plugin-nano#133).
       agenticSelfHeal = true;
-      agenticState = { status: 'connecting', mode: 'local', url: null, message: agenticTarget.message };
+      // Derive the auth mode from the resolved agentic config so `supervisor
+      // status`/markers report SECURE (NANO_AGENTIC_SECRET) correctly while the
+      // worker is still reconnecting, instead of hard-coding 'local'.
+      agenticState = {
+        status: 'connecting',
+        mode: resolveAgenticConfig(camunda)?.secure ? 'secure' : 'local',
+        url: null,
+        message: agenticTarget.message,
+      };
       logger.info(
         `  agentic channel: ${agenticTarget.message.replace('Continuing without it.', 'Retrying discovery on each ≤30s reconnect until it self-heals.')}`,
       );

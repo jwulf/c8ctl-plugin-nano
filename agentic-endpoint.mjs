@@ -365,7 +365,14 @@ export async function createRawEmitConnect(opts) {
       .then(() => resolveConfig())
       .then((next) => {
         if (next && typeof next.url === 'string' && next.url.trim() !== '') {
-          current = { url: next.url, token: next.token ?? token, credential: next.credential ?? credential };
+          // Preserve the last memoised credentials when a later refresh omits
+          // them, falling back to the initial opts only when nothing was ever
+          // discovered — so a partial refresh never clears a known-good token.
+          current = {
+            url: next.url,
+            token: next.token ?? current?.token ?? token,
+            credential: next.credential ?? current?.credential ?? credential,
+          };
         }
       })
       .catch((err) => {

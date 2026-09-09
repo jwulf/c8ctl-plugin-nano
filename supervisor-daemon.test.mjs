@@ -17,17 +17,48 @@ const pluginUrl = new URL('./c8ctl-plugin.js', import.meta.url).href;
 
 function sleep(ms) { return new Promise((r) => setTimeout(r, ms)); }
 
-// Read the argv a shim child recorded for a given pid (best effort — the file
-// is written on the child's first tick after spawn, so retry with real delays).
-async function readChildArgv(dir, pid) {
-  for (let i = 0; i < 30; i++) {
-    try { return JSON.parse(readFileSync(join(dir, `${pid}.json`), 'utf8')); } catch { /* not yet */ }
-    // Fall back to scanning the dir in case the reported pid differs — but ONLY
-    // when there is a single recorded child, so we never return a *different*
-    // worker's argv when several are running (each keyed by its own pid).
+// Extract the `--name <id>` value from a recorded argv array (null if absent).
+function argvName(argv) {
+  if (!Array.isArray(argv)) return null;
+  const i = argv.indexOf('--name');
+  return i !== -1 && i + 1 < argv.length ? argv[i + 1] : null;
+}
+
+// Read the argv a shim child recorded for a given pid. The file is written on
+// the child's first tick after spawn (atomically — temp + rename), so a present
+// file is always complete; we poll until it appears.
+//
+// Under full-suite concurrency several children spawn at once and their argv
+// files land staggered, so a pid-keyed read can miss and a naive "scan the dir"
+// fallback could return a *different* worker's argv (tripping the `--name`
+// assertion). To stay race-free we key on the worker's stable identity: pass
+// `expectedId` and we only ever return a record whose `--name` matches it — the
+// exact-pid file is preferred, but a scan fallback also validates identity so a
+// slow/pid-drifted child is never confused with a sibling. `expectedId` is
+// optional; without it (single-child callers) we keep the single-file fallback.
+async function readChildArgv(dir, pid, expectedId = null) {
+  for (let i = 0; i < 60; i++) {
+    // Preferred: the child's own pid-keyed record. Accept it only if it matches
+    // the expected identity (guards against stale/pid-reused files).
+    try {
+      const rec = JSON.parse(readFileSync(join(dir, `${pid}.json`), 'utf8'));
+      if (expectedId == null || argvName(rec) === expectedId) return rec;
+    } catch { /* not yet */ }
+    // Fallback: scan the dir. With an expected id, return the record whose
+    // `--name` matches it (never a sibling's argv). Without one, fall back to
+    // the sole recorded child only (the single-worker callers).
     try {
       const files = readdirSync(dir);
-      if (files.length === 1) return JSON.parse(readFileSync(join(dir, files[0]), 'utf8'));
+      if (expectedId != null) {
+        for (const f of files) {
+          try {
+            const rec = JSON.parse(readFileSync(join(dir, f), 'utf8'));
+            if (argvName(rec) === expectedId) return rec;
+          } catch { /* partial/absent — skip */ }
+        }
+      } else if (files.length === 1) {
+        return JSON.parse(readFileSync(join(dir, files[0]), 'utf8'));
+      }
     } catch { /* dir not created yet */ }
     await sleep(50);
   }
@@ -61,7 +92,7 @@ function writeShim(shimPath, { recordArgv = false, workArgvDir = null, ignoreSig
   const lines = [];
   if (recordArgv) {
     lines.push(
-      `import { writeFileSync, mkdirSync } from 'node:fs';`,
+      `import { writeFileSync, mkdirSync, renameSync } from 'node:fs';`,
       `import { join } from 'node:path';`,
     );
   }
@@ -75,7 +106,9 @@ function writeShim(shimPath, { recordArgv = false, workArgvDir = null, ignoreSig
   if (recordArgv) {
     lines.push(
       `  try { mkdirSync(${JSON.stringify(workArgvDir)}, { recursive: true }); ` +
-      `writeFileSync(join(${JSON.stringify(workArgvDir)}, process.pid + '.json'), JSON.stringify(argv)); } catch {}`,
+      `const dst = join(${JSON.stringify(workArgvDir)}, process.pid + '.json'); ` +
+      `const tmp = dst + '.' + process.pid + '.tmp'; ` +
+      `writeFileSync(tmp, JSON.stringify(argv)); renameSync(tmp, dst); } catch {}`,
     );
   }
   if (crash) {
@@ -187,7 +220,7 @@ test('supervisor daemon: start → add → status → remove → stop', async (t
   // The daemon must spawn the child with `--name <w.id>` so the child's broker
   // workerName matches its supervisor id (the core same-profile-distinctness
   // mechanism). The shim recorded its own argv keyed by pid.
-  const childArgv = await readChildArgv(workArgvDir, added.worker.pid);
+  const childArgv = await readChildArgv(workArgvDir, added.worker.pid, added.worker.id);
   assert.ok(childArgv, 'the child should have recorded its argv');
   const nameIdx = childArgv.indexOf('--name');
   assert.ok(nameIdx !== -1, `child argv should carry --name: ${JSON.stringify(childArgv)}`);
@@ -429,7 +462,7 @@ test('supervisor add --instances N: spawns N distinct auto-named workers, forwar
   // Every child got the forwarded `--job-timeout 600000` and its `--name <id>`, but
   // never the `--instances` flag (that is consumed by the CLI, not `nano work`).
   for (const w of workers) {
-    const childArgv = await readChildArgv(workArgvDir, w.pid);
+    const childArgv = await readChildArgv(workArgvDir, w.pid, w.id);
     assert.ok(childArgv, `child argv for ${w.id} should be recorded`);
     assert.deepEqual(childArgv.slice(0, 3), ['nano', 'work', 'faker']);
     assert.ok(!childArgv.includes('--instances'), `child must not receive --instances: ${JSON.stringify(childArgv)}`);

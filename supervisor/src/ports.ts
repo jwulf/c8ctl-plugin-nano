@@ -59,11 +59,12 @@ export interface ActivatedJob {
   readonly elementId?: string;
   /**
    * The opaque per-activation lease token the engine stamps on an `external`
-   * (job-backed) agent job. Distinct from the job's deadline; it lease-gates a
-   * `createAgentInstance`/`updateAgentInstance` so a stale/mismatched lease is
-   * rejected (nanobpmn #1099/#1106). Absent on non-agent jobs.
+   * (job-backed) agent job — `leaseToken` on the Camunda v10 ActivatedJobResult.
+   * Distinct from the job's deadline; it lease-gates a `createAgentInstance`/
+   * `updateAgentInstance` (where it is submitted as the body field `jobLease`) so a
+   * stale/mismatched lease is rejected (nanobpmn #1099/#1106). Absent on non-agent jobs.
    */
-  readonly jobLease?: string;
+  readonly leaseToken?: string;
 }
 
 /** One per-type activation request. `maxJobsToActivate` is sized per-type to that type's free-slot count (capped by `maxBatchPerType`). */

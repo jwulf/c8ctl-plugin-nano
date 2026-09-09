@@ -304,6 +304,25 @@ test('resolveAgenticTarget keeps the direct #96 URL when discovery falls back to
   assert.equal(res.config.url, 'http://192.168.0.21:3000');
 });
 
+test('discoverAgenticHubs probes the tunnel leg with wss:// for an https engine base', async () => {
+  const probes = [];
+  const hubs = await discoverAgenticHubs('https://merlin.local:8443', {
+    fetchImpl: fetchReturning(NANO_WORKFORCE),
+    lookupImpl: async () => ([{ address: '192.168.0.21', family: 4 }]),
+    wsProbe: async (_port, { pathPrefix = '', secure = false } = {}) => {
+      probes.push({ pathPrefix, secure });
+      // Only the secure tunnel upgrades — proves the tunnel leg carried `secure`.
+      return pathPrefix === '/console/app-view/Nano_Workforce' && secure === true;
+    },
+  });
+  assert.deepEqual(hubs, [{
+    project: 'Nano_Workforce', port: 3000, label: 'Nano Workforce', host: '192.168.0.21',
+    via: 'tunnel', enginePort: '8443', scheme: 'https:',
+  }]);
+  const tunnelProbe = probes.find((p) => p.pathPrefix === '/console/app-view/Nano_Workforce');
+  assert.equal(tunnelProbe.secure, true, 'tunnel leg must probe over wss:// for an https engine');
+});
+
 // ---------------------------------------------------------------------------
 // isLoopbackHost — address classification
 // ---------------------------------------------------------------------------
@@ -337,6 +356,18 @@ test('probeAgenticChannel resolves true on open and false on error', async () =>
 test('probeAgenticChannel resolves false on timeout without a socket event', async () => {
   class SilentWS { close() {} }
   assert.equal(await probeAgenticChannel(3000, { WebSocketImpl: SilentWS, timeoutMs: 20 }), false);
+});
+
+test('probeAgenticChannel uses ws:// by default and wss:// when secure', async () => {
+  const seen = [];
+  class CapturingWS {
+    constructor(url) { seen.push(url); queueMicrotask(() => this.onopen && this.onopen()); }
+    close() {}
+  }
+  await probeAgenticChannel(8080, { WebSocketImpl: CapturingWS, host: 'merlin.local' });
+  await probeAgenticChannel(8080, { WebSocketImpl: CapturingWS, host: 'merlin.local', secure: true });
+  assert.ok(seen[0].startsWith('ws://merlin.local:8080/agentic?'), seen[0]);
+  assert.ok(seen[1].startsWith('wss://merlin.local:8080/agentic?'), seen[1]);
 });
 
 // ---------------------------------------------------------------------------

@@ -6374,7 +6374,7 @@ function normalizeProjectApps(projects) {
 
 /**
  * Probe whether a `/agentic` endpoint answers a WebSocket upgrade. Connects to
- * `ws://<host>:<port><pathPrefix>/agentic?token=…` (host defaults to
+ * `ws(s)://<host>:<port><pathPrefix>/agentic?token=…` (host defaults to
  * `127.0.0.1`; a bare IPv6 literal is bracketed for the URL authority) and
  * resolves `true` only if the socket opens within `timeoutMs`; a refused
  * connection, a `404`/`501`, or a timeout all resolve `false`. Self-cleaning —
@@ -6385,8 +6385,13 @@ function normalizeProjectApps(projects) {
  * prefix is `/console/app-view/<project>` so the channel rides the single engine
  * port instead of the app's direct port (see {@link discoverAgenticHubs}).
  *
+ * `secure` selects the WS scheme: `false` → `ws://` (plain), `true` → `wss://`.
+ * The tunnel leg rides the engine's own port, so an `https://` engine base
+ * requires a `wss://` upgrade — probing it with plain `ws://` would spuriously
+ * fail the tunnel and force the direct-port fallback (see {@link discoverAgenticHubs}).
+ *
  * @param {number|string} port the port the WS connects to (app port, or engine port for the tunnel)
- * @param {{ host?: string, token?: string, WebSocketImpl?: Function, timeoutMs?: number, pathPrefix?: string }} [opts]
+ * @param {{ host?: string, token?: string, WebSocketImpl?: Function, timeoutMs?: number, pathPrefix?: string, secure?: boolean }} [opts]
  * @returns {Promise<boolean>}
  */
 function probeAgenticChannel(port, {
@@ -6395,9 +6400,11 @@ function probeAgenticChannel(port, {
   WebSocketImpl = globalThis.WebSocket,
   timeoutMs = AGENTIC_DISCOVERY_TIMEOUT_MS,
   pathPrefix = '',
+  secure = false,
 } = {}) {
   if (typeof WebSocketImpl !== 'function') return Promise.resolve(false);
-  const url = `ws://${wsHostPart(host)}:${port}${pathPrefix}/agentic?token=${encodeURIComponent(token)}`;
+  const wsScheme = secure ? 'wss' : 'ws';
+  const url = `${wsScheme}://${wsHostPart(host)}:${port}${pathPrefix}/agentic?token=${encodeURIComponent(token)}`;
   return new Promise((resolve) => {
     let done = false;
     let ws;
@@ -6505,7 +6512,7 @@ async function resolveProbeCandidates(host, { lookupImpl = dnsLookup } = {}) {
  * wins. Each per-host probe is bounded by `timeoutMs`. A single candidate skips
  * the racing machinery entirely (unchanged legacy path).
  * @param {number|string} port
- * @param {{ hosts?: string[], token?: string, timeoutMs?: number, wsProbe?: Function, staggerMs?: number, pathPrefix?: string }} [opts]
+ * @param {{ hosts?: string[], token?: string, timeoutMs?: number, wsProbe?: Function, staggerMs?: number, pathPrefix?: string, secure?: boolean }} [opts]
  * @returns {Promise<string|null>} the winning host, or null
  */
 async function raceProbeCandidates(port, {
@@ -6515,12 +6522,13 @@ async function raceProbeCandidates(port, {
   wsProbe = probeAgenticChannel,
   staggerMs = 250,
   pathPrefix = '',
+  secure = false,
 } = {}) {
   const list = Array.isArray(hosts) ? hosts.filter(Boolean) : [];
   if (list.length === 0) return null;
   if (list.length === 1) {
     try {
-      return (await wsProbe(port, { host: list[0], token, timeoutMs, pathPrefix })) ? list[0] : null;
+      return (await wsProbe(port, { host: list[0], token, timeoutMs, pathPrefix, secure })) ? list[0] : null;
     } catch {
       return null;
     }
@@ -6537,7 +6545,7 @@ async function raceProbeCandidates(port, {
     };
     const start = (host) => {
       Promise.resolve()
-        .then(() => wsProbe(port, { host, token, timeoutMs, pathPrefix }))
+        .then(() => wsProbe(port, { host, token, timeoutMs, pathPrefix, secure }))
         .catch(() => false)
         .then((ok) => {
           if (ok) done(host);
@@ -6652,6 +6660,10 @@ async function discoverAgenticHubs(engineBaseUrl, {
         timeoutMs: probeTimeoutMs,
         wsProbe,
         pathPrefix: `/console/app-view/${encodeURIComponent(app.project)}`,
+        // The tunnel rides the engine's own port, so match its TLS: an
+        // `https://` engine base upgrades over `wss://`, not `ws://` (else the
+        // tunnel probe spuriously fails and we drop to the direct port).
+        secure: engineScheme === 'https:',
       });
       if (tunnelHost) {
         return { ...app, host: tunnelHost, via: 'tunnel', enginePort, scheme: engineScheme };

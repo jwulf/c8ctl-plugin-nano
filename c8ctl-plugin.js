@@ -6651,7 +6651,7 @@ async function discoverAgenticHubs(engineBaseUrl, {
         token,
         timeoutMs: probeTimeoutMs,
         wsProbe,
-        pathPrefix: `/console/app-view/${app.project}`,
+        pathPrefix: `/console/app-view/${encodeURIComponent(app.project)}`,
       });
       if (tunnelHost) {
         return { ...app, host: tunnelHost, via: 'tunnel', enginePort, scheme: engineScheme };
@@ -6722,9 +6722,9 @@ async function resolveAgenticTarget({ camunda, cache, ...opts } = {}) {
     // (#97): `<scheme>//<engineHost>:<enginePort>/console/app-view/<project>`, to
     // which `buildAgenticUrl` appends `/agentic`. A direct hub keeps the #96
     // `http://<host>:<appPort>` form. `discovered.port` stays the app's advertised
-    // port either way (the hub identity), while `discovered.via` records the route.
+    // port either way (the hub identity); the local `via` records the route taken.
     const url = via === 'tunnel'
-      ? `${scheme}//${wsHostPart(host)}:${enginePort}/console/app-view/${project}`
+      ? `${scheme}//${wsHostPart(host)}:${enginePort}/console/app-view/${encodeURIComponent(project)}`
       : `http://${wsHostPart(host)}:${port}`;
     const config = {
       ...base,

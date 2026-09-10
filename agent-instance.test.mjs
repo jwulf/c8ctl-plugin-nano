@@ -18,13 +18,34 @@ import {
 } from './agent-instance.mjs';
 
 // A fake SDK client that records calls and returns a fixed agentInstanceKey.
-function fakeClient({ createResult = { agentInstanceKey: 'AGENT-1' }, failCreate = false } = {}) {
+//
+// `enforceContract` mimics the engine's request-model validation of the two
+// invariants that matter here — every history item's loopIteration is a positive
+// int32 (`LoopIterationId` min 1) — so a body that violates the contract is
+// rejected with the same HTTP 400 the live engine returns, rather than silently
+// accepted by a permissive mock.
+function fakeClient({
+  createResult = { agentInstanceKey: 'AGENT-1' },
+  failCreate = false,
+  enforceContract = false,
+} = {}) {
   const calls = { create: [], update: [] };
+  const validate = (req) => {
+    if (!enforceContract) return;
+    for (const item of req.history ?? []) {
+      if (!(Number.isInteger(item.loopIteration) && item.loopIteration >= 1)) {
+        throw new Error(
+          `HTTP 400: body.history[].loop_iteration: Validation error: range [min:1, value:${item.loopIteration}]`,
+        );
+      }
+    }
+  };
   return {
     calls,
     createAgentInstance: async (req) => {
       calls.create.push(req);
       if (failCreate) throw new Error('stale lease');
+      validate(req);
       return createResult;
     },
     updateAgentInstance: async (req) => {
@@ -117,13 +138,31 @@ test('activate mints exactly one AgentInstance, lease-gated, with an opening CON
   assert.equal(req.history.length, 1);
   const cfg = req.history[0];
   assert.equal(cfg.role, 'CONFIGURATION');
-  assert.equal(cfg.loopIteration, 0);
+  assert.equal(cfg.loopIteration, 1);
   assert.equal(cfg.model, 'Opus 4.8');
   assert.equal(cfg.provider, 'anthropic');
   assert.deepEqual(cfg.systemPrompt, [{ contentType: 'TEXT', text: 'You are a helpful engineering agent.' }]);
   assert.equal(cfg.producedAt, '2026-02-03T04:05:06.000Z');
   // A stable, element-instance-scoped historyItemId so a reactivation dedups it.
   assert.equal(cfg.historyItemId, 'configuration:EIK-7');
+});
+
+test('the opening CONFIGURATION turn satisfies the engine loopIteration contract (min 1) — create is not 400-rejected', async () => {
+  // Regression for issue #218: a CONFIGURATION turn with loopIteration 0 violates
+  // the engine's LoopIterationId contract (positive int32), so createAgentInstance
+  // is rejected HTTP 400 and no durable transcript is ever written. The
+  // contract-enforcing client rejects any sub-1 loopIteration exactly as the engine
+  // does; activate() must still mint the instance.
+  const client = fakeClient({ enforceContract: true });
+  const p = makeProducer(client);
+  const ok = await p.activate();
+  assert.equal(ok, true);
+  assert.equal(p.agentInstanceKey, 'AGENT-1');
+  assert.equal(client.calls.create.length, 1);
+  assert.ok(
+    client.calls.create[0].history.every((h) => Number.isInteger(h.loopIteration) && h.loopIteration >= 1),
+    'every created history item must carry a positive int32 loopIteration',
+  );
 });
 
 test('activate is idempotent within a single producer (never mints twice)', async () => {

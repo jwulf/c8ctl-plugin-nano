@@ -17,13 +17,34 @@ import { fileURLToPath } from "node:url";
 import { dirname, join } from "node:path";
 
 const here = dirname(fileURLToPath(import.meta.url));
-const repoRoot = join(here, "..");
+// `CHECK_BUNDLE_ROOT` lets the test suite point the gate at a throwaway repo;
+// unset, it resolves to this repository's root as it does in CI.
+const repoRoot = process.env.CHECK_BUNDLE_ROOT
+  ? process.env.CHECK_BUNDLE_ROOT
+  : join(here, "..");
 const bundle = "supervisor.dist.js";
 
 const fail = (msg) => {
   console.error(`\n\u274c ${msg}\n`);
   process.exit(1);
 };
+
+// 0. The committed bundle must be tracked by git. `git diff` only reports
+// changes to *tracked* paths, so if the bundle is deleted/absent the rebuild
+// below recreates it as an untracked file and the diff stays empty — the gate
+// would pass with no production artifact committed. Assert it is tracked first.
+try {
+  execFileSync("git", ["ls-files", "--error-unmatch", "--", bundle], {
+    cwd: repoRoot,
+    stdio: "pipe",
+  });
+} catch {
+  fail(
+    `${bundle} is not tracked by git — the committed production bundle is ` +
+      `missing.\n\n` +
+      `   Run \`npm run build:supervisor\` and commit ${bundle}.`,
+  );
+}
 
 // 1. Clean rebuild from source.
 try {

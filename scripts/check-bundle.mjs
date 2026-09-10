@@ -3,6 +3,8 @@
 // The published/production runtime imports the *committed* `supervisor.dist.js`
 // (it is in package.json `files`, and c8ctl-plugin.js does
 // `await import('./supervisor.dist.js')`). That bundle is generated from
+// `supervisor/src/*.ts` by `npm run build:supervisor` (esbuild).
+//
 // This gate exists because, historically, `npm test` rebuilt the bundle
 // mid-run: a *stale committed* bundle still passed the suite, since the drift
 // between the committed file and its source was never detected. (That mid-run

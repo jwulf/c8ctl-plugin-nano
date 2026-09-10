@@ -62,7 +62,7 @@ const toSupervisorError = (fallback: string) => (cause: unknown): SupervisorErro
  */
 export interface RawEngineClient {
   activate(req: ActivateRequest, signal?: AbortSignal): Promise<ReadonlyArray<ActivatedJob>>;
-  extendLock(jobKey: string, ms: number, leaseToken?: string): Promise<void>;
+  extendLock(jobKey: string, ms: number, leaseToken?: string, signal?: AbortSignal): Promise<void>;
   /** `POST /v2/jobs/{jobKey}/completion` — settle a job successfully with result `variables`; `leaseToken` fences a leased job. */
   complete(jobKey: string, variables?: Record<string, unknown>, leaseToken?: string): Promise<void>;
   /** `POST /v2/jobs/{jobKey}/failure` — settle a job as failed (`retries > 0` re-queues, `0` incidents); `leaseToken` fences a leased job. */
@@ -91,7 +91,11 @@ export const makeEngineClient = (raw: RawEngineClient): EngineClient => ({
     }),
   extendLock: (jobKey, ms, leaseToken) =>
     Effect.tryPromise({
-      try: () => Promise.resolve(raw.extendLock(jobKey, ms, leaseToken)).then(() => undefined),
+      // Effect aborts `signal` on interruption (including the dispatch-side
+      // `Effect.timeout` on a hung beat), and the raw client wires it to the SDK
+      // `updateJob` cancel / the raw fetch — so a timed-out extend is genuinely
+      // CANCELLED, not just abandoned to run on and (late) re-lock a lost job.
+      try: (signal) => Promise.resolve(raw.extendLock(jobKey, ms, leaseToken, signal)).then(() => undefined),
       catch: toSupervisorError(`extendLock ${jobKey} failed`),
     }),
   complete: (jobKey, variables, leaseToken) =>

@@ -32,9 +32,37 @@ import { withOwnedJob } from "./ownership.ts";
  * loss and must not, on its own, stop lock renewal.
  */
 export const isLeaseLostError = (err: SupervisorError): boolean =>
-  /HTTP 4(?:09|04)\b|\bnot activated\b|joblease\s*mismatch|lease\s*mismatch|\bnot found\b|\breclaim/i.test(
-    err.message,
-  );
+  LEASE_LOST_RE.test(err.message) || isLostStatus(httpStatusOf(err.cause));
+
+/**
+ * Match the textual lease-loss signals. Beyond the raw client's own `HTTP 409`/
+ * `HTTP 404` prefixes, an injected SDK rejection is often shaped like
+ * `Request failed with status code 409`, so recognise `status code 409/404` too.
+ */
+const LEASE_LOST_RE =
+  /HTTP 4(?:09|04)\b|status\s*code\s*4(?:09|04)\b|\bnot activated\b|joblease\s*mismatch|lease\s*mismatch|\bnot found\b|\breclaim/i;
+
+const isLostStatus = (status: number | undefined): boolean => status === 409 || status === 404;
+
+/**
+ * Pull an HTTP status off an arbitrary (SDK/fetch) error, walking its `cause`
+ * chain: SDK rejections frequently expose the status NUMERICALLY (`err.status`,
+ * `err.statusCode`, `err.response.status`) rather than only in the message, and
+ * `toSupervisorError` preserves the original error on `.cause`. Bounded depth so
+ * a cyclic cause can't loop.
+ */
+const httpStatusOf = (err: unknown, depth = 0): number | undefined => {
+  if (!err || typeof err !== "object" || depth > 4) return undefined;
+  const e = err as {
+    status?: unknown;
+    statusCode?: unknown;
+    response?: { status?: unknown };
+    cause?: unknown;
+  };
+  const s = e.status ?? e.statusCode ?? e.response?.status;
+  if (typeof s === "number") return s;
+  return httpStatusOf(e.cause, depth + 1);
+};
 
 /**
  * Does this extend rejection mean renewal can NEVER succeed by retrying — a
@@ -116,16 +144,23 @@ export const dispatch = (
 ): Effect.Effect<DispatchOutcome, never> =>
   Effect.gen(function* () {
     const { engine, runner, registry, logger, config, ownership } = deps;
+    // A single extend must never AWAIT unboundedly — a hung SDK/HTTP call would
+    // otherwise stall both the winner extend (wedging the claimed slot forever) and
+    // each heartbeat beat (freezing renewal). Bound every extend by this deadline.
+    const extendTimeoutMs = Math.max(1, config.extendTimeoutMs ?? config.extendIntervalMs);
 
-    // (a) Extend the winner FIRST. A failure here means the short lock likely
-    // lapsed and the job was reclaimed — do not start; give the slot straight back.
+    // (a) Extend the winner FIRST. A failure (or a blown deadline) here means the
+    // short lock likely lapsed and the job was reclaimed — or the extend path is
+    // wedged — so do not start; give the slot straight back rather than block the
+    // worker indefinitely on a hung call.
     const extended = yield* engine
       .extendLock(job.jobKey, config.recoveryWindowMs, job.leaseToken)
       .pipe(
+        Effect.timeout(Duration.millis(extendTimeoutMs)),
         Effect.as(true),
-        Effect.catch((err: SupervisorError) => {
+        Effect.catch((err: { message?: string }) => {
           logger.warn(
-            `[${job.type}] job ${job.jobKey}: winner extend failed (${err.message}) — not starting; slot released`,
+            `[${job.type}] job ${job.jobKey}: winner extend failed (${err?.message ?? String(err)}) — not starting; slot released`,
           );
           return Effect.succeed(false);
         }),
@@ -168,7 +203,6 @@ export const dispatch = (
       // burning its whole `extendTimeoutMs` before failing. Under the deterministic
       // TestClock the clock advances exactly with `TestClock.adjust`, so this is
       // still fully deterministic.
-      const extendTimeoutMs = Math.max(1, config.extendTimeoutMs ?? config.extendIntervalMs);
       const lastOkAtRef = yield* Ref.make(yield* Clock.currentTimeMillis);
       const retryUnlessLapsed = (reason: string) =>
         Effect.all([Clock.currentTimeMillis, Ref.get(lastOkAtRef)]).pipe(

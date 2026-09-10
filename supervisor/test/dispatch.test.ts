@@ -86,6 +86,45 @@ test("winner-extend races a reclaim: extend fails → do NOT start the agent; sl
   );
 });
 
+test("winner-extend HANGS: a wedged initial extend is bounded by extendTimeoutMs → do NOT start, release the slot (no permanently-stuck worker)", async () => {
+  await Effect.runPromise(
+    Effect.gen(function* () {
+      let extendCalls = 0;
+      const engine = makeEngine({
+        activate: () => Effect.succeed([]),
+        // The winner extend never resolves (models a wedged SDK updateJob). Without
+        // a deadline dispatch would block here forever, holding the claimed slot and
+        // never handing it back — the worker would go permanently unavailable.
+        extend: () => {
+          extendCalls += 1;
+          return Effect.never as never;
+        },
+      });
+      const runner = makeRunner(0);
+      const reg = yield* makeRegistry();
+      yield* reg.add("w1", ["a"], 1);
+      const worker = yield* reg.claim("a");
+
+      const fiber = yield* Effect.forkChild(
+        dispatch(
+          { engine, runner, registry: reg, logger: noopLogger, config: { recoveryWindowMs: 300_000, extendIntervalMs: 60_000, extendTimeoutMs: 60_000 } },
+          job("J1", "a"),
+          worker!,
+        ),
+      );
+      // Advance past the extend deadline; dispatch must give up rather than hang.
+      yield* TestClock.adjust(Duration.millis(60_000));
+      const outcome = yield* Fiber.join(fiber);
+
+      assert.equal(extendCalls, 1);
+      assert.equal(outcome.started, false);
+      assert.equal(outcome.reason, "extend-failed");
+      assert.deepEqual(runner.ran, [], "agent never started on a wedged extend");
+      assert.deepEqual(yield* reg.pollTypes, ["a"], "slot released, worker stays available");
+    }).pipe(Effect.provide(TestClock.layer())),
+  );
+});
+
 test("heartbeat: the winner's lock is re-extended on the interval while the agent runs", async () => {
   await Effect.runPromise(
     Effect.gen(function* () {
@@ -220,15 +259,31 @@ test("isLeaseLostError: definitive ownership-loss signals stop the heartbeat; tr
     "extendLock J1: HTTP 404 from http://engine/v2/jobs/J1",
     "extendLock J1: SDK updateJob failed: JobLeaseMismatch",
     "extendLock J1: SDK updateJob failed: job not found",
+    // SDK-shaped rejections that expose the status only in a generic message:
+    "extendLock J1: SDK updateJob failed: Request failed with status code 409",
+    "extendLock J1: SDK updateJob failed: Request failed with status code 404",
   ];
   const transient = [
     "extendLock J1: HTTP 503 from http://engine/v2/jobs/J1 — engine unavailable",
     "extendLock J1: HTTP 500 from http://engine/v2/jobs/J1",
     "extendLock J1: SDK updateJob failed: ETIMEDOUT",
     "extendLock J1: SDK updateJob failed: fetch failed",
+    "extendLock J1: SDK updateJob failed: Request failed with status code 503",
   ];
   for (const m of lost) assert.equal(isLeaseLostError(new SupervisorError(m)), true, m);
   for (const m of transient) assert.equal(isLeaseLostError(new SupervisorError(m)), false, m);
+
+  // SDK errors that carry the status NUMERICALLY (not in the message) are still
+  // recognised by walking the `.cause` chain the port preserves.
+  const sdk409 = new SupervisorError("extendLock J1 failed", { message: "boom", status: 409 });
+  const sdkNested404 = new SupervisorError("extendLock J1 failed", {
+    message: "wrapper",
+    cause: { response: { status: 404 } },
+  });
+  const sdk500 = new SupervisorError("extendLock J1 failed", { message: "boom", statusCode: 500 });
+  assert.equal(isLeaseLostError(sdk409), true, "numeric 409 on cause");
+  assert.equal(isLeaseLostError(sdkNested404), true, "nested 404 via cause.response.status");
+  assert.equal(isLeaseLostError(sdk500), false, "numeric 500 stays transient");
 });
 
 test("HUNG extend mid-run: a wedged extend that never resolves is bounded by extendTimeoutMs, counts toward the window, and interrupts the agent (a stall is not silent forever)", async () => {

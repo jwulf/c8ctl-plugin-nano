@@ -198,8 +198,8 @@ async function readErrorBody(res) {
  * @param {Record<string,string>|(() => (Record<string,string>|Promise<Record<string,string>>))} [opts.authHeaders] Ready-made auth header map, OR a resolver invoked per request (so rotating SDK auth — e.g. an OAuth bearer that refreshes — is re-derived each call rather than frozen). Wins over `token`.
  * @param {typeof fetch} [opts.fetchImpl] Injected `fetch` (defaults to the global; overridden in tests).
  * @param {number} [opts.requestTimeoutSlackMs] Extra ms added to a call's abort budget over its server long-poll (default 5000).
- * @param {{ activateJobs?: (input: { type: string, worker?: string, maxJobsToActivate: number, timeout: number, requestTimeout?: number }) => (Promise<{ jobs?: object[] }> & { cancel?: () => void }), updateJob?: (req: { jobKey: string, changeset: { timeout: number } }) => Promise<unknown>, completeJob?: (req: { jobKey: string, variables?: object }) => Promise<unknown>, failJob?: (req: { jobKey: string, retries?: number, errorMessage?: string, retryBackOff?: number, variables?: object }) => Promise<unknown> }} [opts.camunda] Optional Camunda SDK client. When present, each engine method prefers its typed SDK method over the raw fetch fallback: `activate`→`activateJobs` (`POST /v2/jobs/activation`, cancelled via the returned `CancelablePromise.cancel()`), `extendLock`→`updateJob` (`PATCH /v2/jobs/{jobKey}` `{ changeset: { timeout } }`), `complete`→`completeJob` (`POST /v2/jobs/{jobKey}/completion`), `fail`→`failJob` (`POST /v2/jobs/{jobKey}/failure`).
- * @returns {{ activate(req: ActivateRequest, signal?: AbortSignal): Promise<ReadonlyArray<ActivatedJob>>, extendLock(jobKey: string, ms: number, leaseToken?: string): Promise<void>, complete(jobKey: string, variables?: object, leaseToken?: string): Promise<void>, fail(jobKey: string, opts?: { retries?: number, errorMessage?: string, retryBackOff?: number, variables?: object, leaseToken?: string }): Promise<void> }} Every post-activation method takes the activation's `leaseToken` (Camunda-v10 lease fence): the engine validates it before mutating a leased job, so `extendLock`/`complete`/`fail` must each carry the token from the activation that owns the lock — omitting it is rejected once a job is leased.
+ * @param {{ activateJobs?: (input: { type: string, worker?: string, maxJobsToActivate: number, timeout: number, requestTimeout?: number }) => (Promise<{ jobs?: object[] }> & { cancel?: () => void }), updateJob?: (req: { jobKey: string, changeset: { timeout: number }, leaseToken?: string }) => (Promise<unknown> & { cancel?: () => void }), completeJob?: (req: { jobKey: string, variables?: object, leaseToken?: string }) => Promise<unknown>, failJob?: (req: { jobKey: string, retries?: number, errorMessage?: string, retryBackOff?: number, variables?: object, leaseToken?: string }) => Promise<unknown> }} [opts.camunda] Optional Camunda SDK client. When present, each engine method prefers its typed SDK method over the raw fetch fallback: `activate`→`activateJobs` (`POST /v2/jobs/activation`, cancelled via the returned `CancelablePromise.cancel()`), `extendLock`→`updateJob` (`PATCH /v2/jobs/{jobKey}` `{ changeset: { timeout }, leaseToken? }`, likewise cancelled via `cancel()` when the extend's `AbortSignal` fires), `complete`→`completeJob` (`POST /v2/jobs/{jobKey}/completion`), `fail`→`failJob` (`POST /v2/jobs/{jobKey}/failure`). Each post-activation request carries the activation's top-level `leaseToken` (camelCase wire field) so the engine's lease fence accepts it.
+ * @returns {{ activate(req: ActivateRequest, signal?: AbortSignal): Promise<ReadonlyArray<ActivatedJob>>, extendLock(jobKey: string, ms: number, leaseToken?: string, signal?: AbortSignal): Promise<void>, complete(jobKey: string, variables?: object, leaseToken?: string): Promise<void>, fail(jobKey: string, opts?: { retries?: number, errorMessage?: string, retryBackOff?: number, variables?: object, leaseToken?: string }): Promise<void> }} Every post-activation method takes the activation's `leaseToken` (Camunda-v10 lease fence): the engine validates it before mutating a leased job, so `extendLock`/`complete`/`fail` must each carry the token from the activation that owns the lock — omitting it is rejected once a job is leased. `extendLock` also accepts an optional `AbortSignal` so a hung extend can be cancelled (not merely abandoned) when the caller's deadline fires.
  */
 export function createRawEngineClient(opts = {}) {
   const {
@@ -323,7 +323,7 @@ export function createRawEngineClient(opts = {}) {
       return jobs.map(mapJob);
     },
 
-    async extendLock(jobKey, ms, leaseToken) {
+    async extendLock(jobKey, ms, leaseToken, signal) {
       // Prefer the SDK's typed `updateJob` (operationId `updateJob` →
       // `PATCH /v2/jobs/{jobKey}` with `{ changeset: { timeout } }`) so the lock
       // extension tracks the engine contract instead of a hand-rolled URL. Fall
@@ -342,11 +342,25 @@ export function createRawEngineClient(opts = {}) {
       // so the unfenced operator/bulk path is unchanged.
       const fence = isNonBlankString(leaseToken) ? { leaseToken } : {};
       if (camunda && typeof camunda.updateJob === "function") {
+        // Mirror `activate`: wire the external abort `signal` (fired when the
+        // dispatch-side `Effect.timeout`/interruption cancels a hung beat) onto the
+        // SDK call's `CancelablePromise.cancel()` when it exposes one, so a wedged
+        // `updateJob` is actually cancelled rather than left in flight to (late)
+        // re-lock a job whose lease we've already treated as lost.
+        const p = camunda.updateJob({ changeset: { timeout: ms }, jobKey: String(jobKey), ...fence });
+        const cancel = typeof p?.cancel === "function" ? () => p.cancel() : () => {};
+        const onExtAbort = () => cancel();
+        if (signal) {
+          if (signal.aborted) cancel();
+          else signal.addEventListener("abort", onExtAbort, { once: true });
+        }
         try {
-          await camunda.updateJob({ changeset: { timeout: ms }, jobKey: String(jobKey), ...fence });
+          await p;
           return;
         } catch (err) {
           throw new Error(`extendLock ${jobKey}: SDK updateJob failed: ${err?.message ?? err}`, { cause: err });
+        } finally {
+          if (signal) signal.removeEventListener("abort", onExtAbort);
         }
       }
       const url = `${base}/jobs/${encodeURIComponent(jobKey)}`;
@@ -354,6 +368,7 @@ export function createRawEngineClient(opts = {}) {
         url,
         { method: "PATCH", body: JSON.stringify({ changeset: { timeout: ms }, ...fence }) },
         15_000,
+        signal,
       );
       if (!res || !res.ok) {
         const status = res ? res.status : "?";

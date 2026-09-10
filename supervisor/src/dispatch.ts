@@ -16,11 +16,28 @@
  *  (b) **never touch a parked/lapsed job again** — losers are dropped upstream in
  *      activation and never reach here, so a late complete/fail can't 409.
  */
-import { Duration, Effect, Fiber } from "effect";
+import { Duration, Effect } from "effect";
 import type { ActivatedJob, EngineClient, JobRunner, Logger, SupervisorError } from "./ports.ts";
 import type { Registry } from "./registry.ts";
 import type { OwnershipContext } from "./ownership.ts";
 import { withOwnedJob } from "./ownership.ts";
+
+/**
+ * Does this extend/settle rejection mean the worker has DEFINITIVELY lost the job
+ * (the lock lapsed and the broker reclaimed it, or the lease was superseded)? Only
+ * these unambiguous ownership-loss signals — a 409 (reclaim / `JobLeaseMismatch`),
+ * a 404 (job gone), or the engine's "not activated" body — end the heartbeat and
+ * interrupt the run. Everything else (a 5xx, a network blip, a timeout) is TRANSIENT
+ * and must NOT stop lock renewal, or one flaky beat would needlessly kill a healthy
+ * agent mid-run.
+ */
+export const isLeaseLostError = (err: SupervisorError): boolean =>
+  /HTTP 4(?:09|04)\b|\bnot activated\b|joblease\s*mismatch|lease\s*mismatch|\bnot found\b|\breclaim/i.test(
+    err.message,
+  );
+
+const defectText = (defect: unknown): string =>
+  defect instanceof Error ? defect.message : String(defect);
 
 export interface DispatchConfig {
   /** The window the winner's lock is held to and heartbeated at (ms). */
@@ -51,7 +68,7 @@ export interface DispatchDeps {
 
 export interface DispatchOutcome {
   readonly started: boolean;
-  readonly reason?: "extend-failed";
+  readonly reason?: "extend-failed" | "lock-lost";
 }
 
 /**
@@ -85,32 +102,49 @@ export const dispatch = (
       return { started: false, reason: "extend-failed" };
     }
 
-    // (b) Heartbeat + run, releasing the slot on every exit path.
-    yield* Effect.gen(function* () {
-      // We already extended the winner to the full recovery window above, so the
-      // first heartbeat extend is redundant if it fires immediately. Wait one
-      // interval before the first beat, then repeat on the cadence — this drops
-      // one engine call on every job start.
-      const beat = engine
-        .extendLock(job.jobKey, config.recoveryWindowMs, job.leaseToken)
-        .pipe(
-          // Log (and continue) when a heartbeat extend fails, rather than
-          // silently swallowing it — an invisible extend outage makes
-          // "job reclaimed while agent still running" much harder to diagnose.
-          Effect.catch((err: SupervisorError) =>
-            Effect.sync(() =>
-              logger.warn(
-                `[${job.type}] job ${job.jobKey}: heartbeat extend failed — ${err.message}`,
+    // (b) Heartbeat + run. The heartbeat holds the lock for the agent's whole
+    // run; the run and the heartbeat RACE so that either terminates the other:
+    //   * agent finishes first → the heartbeat is interrupted (loser of the race);
+    //   * the lease is definitively lost first → the heartbeat ends the race and
+    //     the still-running agent is interrupted — a SUPERSEDED worker must stop,
+    //     never run on to a doomed completeJob (which is what left empty transcript
+    //     husks and let the broker redeliver the job in a loop).
+    // The slot is released on every exit path.
+    const lostLock = yield* Effect.gen(function* () {
+      // One heartbeat beat: wait an interval, then SET the lock to the recovery
+      // window (lease-fenced with `job.leaseToken`). Resilience is the whole point
+      // here — this fiber must NOT die silently and stop renewing:
+      //   * a TRANSIENT typed failure (5xx / network blip) is logged and swallowed
+      //     so the next beat still fires;
+      //   * a DEFECT (e.g. the deployed `Not a valid effect: [object Promise]`,
+      //     which a typed-only `Effect.catch` would let escape and KILL the fiber)
+      //     is caught via `catchDefect` and swallowed the same way;
+      //   * ONLY a definitive lease-loss (`isLeaseLostError`) is re-raised, ending
+      //     the `forever` loop so the race interrupts the run.
+      const beatOnce = Effect.sleep(Duration.millis(config.extendIntervalMs)).pipe(
+        Effect.flatMap(() =>
+          engine.extendLock(job.jobKey, config.recoveryWindowMs, job.leaseToken).pipe(
+            Effect.catch((err: SupervisorError) =>
+              isLeaseLostError(err)
+                ? Effect.fail(err)
+                : Effect.sync(() =>
+                    logger.warn(
+                      `[${job.type}] job ${job.jobKey}: heartbeat extend failed (transient, retrying) — ${err.message}`,
+                    ),
+                  ),
+            ),
+            Effect.catchDefect((defect) =>
+              Effect.sync(() =>
+                logger.warn(
+                  `[${job.type}] job ${job.jobKey}: heartbeat extend defect (ignored, retrying) — ${defectText(defect)}`,
+                ),
               ),
             ),
           ),
-        );
-      const heartbeat = yield* Effect.forkChild(
-        Effect.sleep(Duration.millis(config.extendIntervalMs)).pipe(
-          Effect.flatMap(() => beat),
-          Effect.forever,
         ),
       );
+      const heartbeatUntilLost = Effect.forever(beatOnce);
+
       // The agent child runs under a claim whose lifetime == the child's own
       // (issue #158): claimed just before spawn, released on every exit path so a
       // silent, zero-transcript agent still reads as `claimed = working` and an
@@ -120,10 +154,25 @@ export const dispatch = (
           Effect.sync(() => logger.warn(`[${job.type}] job ${job.jobKey}: run failed — ${err.message}`)),
         ),
       );
-      yield* (ownership ? withOwnedJob(ownership, workerId, job.jobKey, runChild) : runChild).pipe(
-        Effect.ensuring(Fiber.interrupt(heartbeat)),
+      const owned = ownership ? withOwnedJob(ownership, workerId, job.jobKey, runChild) : runChild;
+
+      // `raceFirst`: the FIRST side to complete (success OR failure) wins and the
+      // loser is interrupted. If the heartbeat loses the lease it fails → wins the
+      // race → `owned` (the agent) is interrupted; otherwise the agent finishes and
+      // the heartbeat is interrupted. A lease-loss failure is caught here → the run
+      // stopped because it was superseded.
+      return yield* Effect.raceFirst(owned, heartbeatUntilLost).pipe(
+        Effect.as(false),
+        Effect.catch((err: SupervisorError) =>
+          Effect.sync(() => {
+            logger.warn(
+              `[${job.type}] job ${job.jobKey}: lock lost mid-run — agent interrupted (superseded); slot released — ${err.message}`,
+            );
+            return true;
+          }),
+        ),
       );
     }).pipe(Effect.ensuring(registry.releaseWorker(workerId)));
 
-    return { started: true };
+    return lostLock ? { started: true, reason: "lock-lost" } : { started: true };
   });

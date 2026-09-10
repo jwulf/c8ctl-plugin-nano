@@ -2,7 +2,7 @@ import assert from "node:assert/strict";
 import { test } from "node:test";
 import { Duration, Effect, Fiber } from "effect";
 import { TestClock } from "effect/testing";
-import { defaultDispatchConfig, dispatch, isLeaseLostError } from "../src/dispatch.ts";
+import { defaultDispatchConfig, dispatch, isLeaseLostError, isPermanentRenewalError, isTerminalRenewalError } from "../src/dispatch.ts";
 import { makeRegistry } from "../src/registry.ts";
 import { noopLogger, SupervisorError } from "../src/ports.ts";
 import { failing, job, makeEngine, makeRunner } from "./fakes.ts";
@@ -229,6 +229,86 @@ test("isLeaseLostError: definitive ownership-loss signals stop the heartbeat; tr
   ];
   for (const m of lost) assert.equal(isLeaseLostError(new SupervisorError(m)), true, m);
   for (const m of transient) assert.equal(isLeaseLostError(new SupervisorError(m)), false, m);
+});
+
+test("renewal permanently impossible mid-run: a persistent 401/403/400 on a heartbeat INTERRUPTS the agent (never retries forever into a reclaim)", async () => {
+  await Effect.runPromise(
+    Effect.gen(function* () {
+      let extendCalls = 0;
+      let finished = false;
+      const engine = makeEngine({
+        activate: () => Effect.succeed([]),
+        extend: () => {
+          extendCalls += 1;
+          // Winner extend (call 1) succeeds so the agent STARTS; every heartbeat
+          // beat thereafter hits a permanent 403 that retrying can never fix. The
+          // OLD behaviour swallowed this as "transient" and retried forever while
+          // the lock lapsed → broker reclaim → duplicate run. It must now be
+          // terminal and interrupt the agent.
+          return extendCalls === 1
+            ? Effect.void
+            : failing("extendLock J1: HTTP 403 from http://engine/v2/jobs/J1 — forbidden");
+        },
+      });
+      const runner = {
+        ran: [] as string[],
+        run: (j: { jobKey: string }) =>
+          Effect.sync(() => runner.ran.push(j.jobKey)).pipe(
+            Effect.flatMap(() => Effect.sleep(Duration.millis(10_000_000))),
+            Effect.flatMap(() => Effect.sync(() => { finished = true; })),
+          ),
+      };
+      const reg = yield* makeRegistry();
+      yield* reg.add("w1", ["a"], 1);
+      const worker = yield* reg.claim("a");
+
+      const fiber = yield* Effect.forkChild(
+        dispatch(
+          { engine, runner, registry: reg, logger: noopLogger, config: { recoveryWindowMs: 300_000, extendIntervalMs: 60_000 } },
+          job("J1", "a", "lease-J1"),
+          worker!,
+        ),
+      );
+
+      yield* TestClock.adjust(Duration.millis(60_000)); // first heartbeat beat → permanent 403
+      const outcome = yield* Fiber.join(fiber);
+
+      assert.deepEqual(runner.ran, ["J1"], "agent started");
+      assert.equal(finished, false, "agent was INTERRUPTED once renewal became impossible, not run to completion");
+      assert.ok(extendCalls <= 2, `beat must not retry a permanent error forever; got ${extendCalls} extends`);
+      assert.equal(outcome.started, true);
+      assert.equal(outcome.reason, "lock-lost");
+      assert.deepEqual(yield* reg.pollTypes, ["a"], "slot released after the unrenewable run stopped");
+    }).pipe(Effect.provide(TestClock.layer())),
+  );
+});
+
+test("isPermanentRenewalError / isTerminalRenewalError: permanent 4xx are terminal; 429 + 5xx stay transient", () => {
+  const permanent = [
+    "extendLock J1: HTTP 400 from http://engine/v2/jobs/J1 — bad request",
+    "extendLock J1: HTTP 401 from http://engine/v2/jobs/J1 — unauthorized",
+    "extendLock J1: HTTP 403 from http://engine/v2/jobs/J1 — forbidden",
+    "extendLock J1: HTTP 422 from http://engine/v2/jobs/J1",
+  ];
+  const transient = [
+    "extendLock J1: HTTP 429 from http://engine/v2/jobs/J1 — rate limited",
+    "extendLock J1: HTTP 503 from http://engine/v2/jobs/J1 — engine unavailable",
+    "extendLock J1: HTTP 500 from http://engine/v2/jobs/J1",
+    "extendLock J1: SDK updateJob failed: ETIMEDOUT",
+  ];
+  for (const m of permanent) {
+    assert.equal(isPermanentRenewalError(new SupervisorError(m)), true, m);
+    assert.equal(isTerminalRenewalError(new SupervisorError(m)), true, m);
+  }
+  for (const m of transient) {
+    assert.equal(isPermanentRenewalError(new SupervisorError(m)), false, m);
+    assert.equal(isTerminalRenewalError(new SupervisorError(m)), false, m);
+  }
+  // A definitive lease-loss (409/404) is terminal but is NOT a "permanent renewal"
+  // error — it is ownership loss, classified by isLeaseLostError.
+  const leaseLost = new SupervisorError("extendLock J1: HTTP 409 from http://engine/v2/jobs/J1 — not activated");
+  assert.equal(isPermanentRenewalError(leaseLost), false);
+  assert.equal(isTerminalRenewalError(leaseLost), true);
 });
 
 test("ownership: the job is claimed for the child's whole run and released after (issue #158)", async () => {

@@ -7775,6 +7775,14 @@ async function workAgent(req, flags) {
     writeActivity();
   };
   const recordJobEnd = (job) => {
+    // Delete only if the current entry is THIS activation. A same-key
+    // reactivation may have replaced the entry (new leaseToken) while this
+    // (interrupted) run unwinds — deleting then would erase the NEWER activation
+    // from status and can make force-stop miss its yield. The per-activation
+    // leaseToken is the identity; an unleased job (no token both sides) deletes as
+    // before.
+    const cur = activeJobs.get(String(job.jobKey));
+    if (cur && cur.leaseToken !== job.leaseToken) return;
     activeJobs.delete(String(job.jobKey));
     writeActivity();
   };
@@ -7966,6 +7974,17 @@ async function workAgent(req, flags) {
     run: async (job, abortSignal) => {
       const jobType = job.type;
       recordJobStart(job, jobType);
+      // Bind the settler to THIS activation's lease token, captured from the job
+      // in closure scope. A settlement is fenced with the exact activation that
+      // ran — NOT a token re-read from the shared activeJobs map at settle time: a
+      // same-key reactivation can overwrite that entry while an interrupted runner
+      // is still unwinding, so a map lookup could fence the completion with the
+      // WRONG (newer) token and clobber the new activation — the very lease bypass
+      // this fence exists to prevent. `job.leaseToken` in the closure cannot drift.
+      const settleJob = {
+        complete: (variables) => settle.complete(job.jobKey, variables, job.leaseToken),
+        fail: (opts2) => settle.fail(job.jobKey, { ...(opts2 || {}), leaseToken: job.leaseToken }),
+      };
       try {
         logger.info(`[${jobType}] job ${job.jobKey} (instance ${job.processInstanceKey ?? '-'}) → ${buildAgentCommandLine(profile.command, effectiveArgs)}`);
 
@@ -7978,7 +7997,7 @@ async function workAgent(req, flags) {
             const freeMb = budget.free != null ? Math.round(budget.free / 1_048_576) : '?';
             const retries = Math.max(0, (Number(job.retries) || 1) - 1);
             logger.warn(`[${jobType}] job ${job.jobKey} shed — low disk (${freeMb}MB free); retries left ${retries}`);
-            return settle.fail(job.jobKey, { errorMessage: `disk budget exceeded (only ${freeMb}MB free)`, retries, retryBackOff: 30_000 });
+            return settleJob.fail({ errorMessage: `disk budget exceeded (only ${freeMb}MB free)`, retries, retryBackOff: 30_000 });
           }
         }
 
@@ -8010,7 +8029,7 @@ async function workAgent(req, flags) {
           const retries = Math.max(0, (Number(job.retries) || 1) - 1);
           const msg = err instanceof ProvisionError ? err.message : `prompt resource fetch failed: ${err.message}`;
           logger.warn(`[${jobType}] job ${job.jobKey} not provisioned — ${msg}; retries left ${retries}`);
-          return settle.fail(job.jobKey, { errorMessage: msg.slice(0, 2000), retries, retryBackOff: 15_000 });
+          return settleJob.fail({ errorMessage: msg.slice(0, 2000), retries, retryBackOff: 15_000 });
         }
 
         // Assemble + normalize the task envelope from headers (defaults) and
@@ -8021,7 +8040,7 @@ async function workAgent(req, flags) {
           const retries = Math.max(0, (Number(job.retries) || 1) - 1);
           const msg = `missing secret(s): ${missing.join(', ')} (resolver: ${secretResolver.kind})`;
           logger.warn(`[${jobType}] job ${job.jobKey} not provisioned — ${msg}; retries left ${retries}`);
-          return settle.fail(job.jobKey, { errorMessage: msg, retries });
+          return settleJob.fail({ errorMessage: msg, retries });
         }
 
         // #130: per-task liveness overrides. Precedence: envelope override →
@@ -8087,7 +8106,7 @@ async function workAgent(req, flags) {
               : 'repository.url is missing';
             const msg = `incomplete repository envelope — ${why}; refusing to run in the launch/temp cwd (likely an orchestrator bug emitting a half-specified repository block)`;
             logger.warn(`[${jobType}] job ${job.jobKey} not provisioned — ${msg}; retries left ${retries}`);
-            return settle.fail(job.jobKey, { errorMessage: msg.slice(0, 2000), retries, retryBackOff: 15_000 });
+            return settleJob.fail({ errorMessage: msg.slice(0, 2000), retries, retryBackOff: 15_000 });
           }
         }
 
@@ -8142,7 +8161,7 @@ async function workAgent(req, flags) {
             const retries = Math.max(0, (Number(job.retries) || 1) - 1);
             const msg = err instanceof ProvisionError ? err.message : `provisioning error: ${err.message}`;
             logger.warn(`[${jobType}] job ${job.jobKey} not provisioned — ${msg}; retries left ${retries}`);
-            return settle.fail(job.jobKey, { errorMessage: msg.slice(0, 2000), retries, retryBackOff: 15_000 });
+            return settleJob.fail({ errorMessage: msg.slice(0, 2000), retries, retryBackOff: 15_000 });
           }
         } else if (!isContainer) {
           // Repo-less host job (issue #129, hardening 1): nothing is provisioned,
@@ -8168,7 +8187,7 @@ async function workAgent(req, flags) {
             const retries = Math.max(0, (Number(job.retries) || 1) - 1);
             const msg = `could not create a temp workspace under the worker namespace: ${err.message}`;
             logger.warn(`[${jobType}] job ${job.jobKey} not provisioned — ${msg}; retries left ${retries}`);
-            return settle.fail(job.jobKey, { errorMessage: msg.slice(0, 2000), retries, retryBackOff: 15_000 });
+            return settleJob.fail({ errorMessage: msg.slice(0, 2000), retries, retryBackOff: 15_000 });
           }
         }
 
@@ -8366,7 +8385,7 @@ async function workAgent(req, flags) {
           const resultKeys = Object.keys(resultVars);
           if (resultKeys.length === 0) logger.warn(`[${jobType}] job ${job.jobKey}: agent returned no usable result vars — write a JSON object of result variables to $AGENT_RESULT_FILE (or print a "${RESULT_SENTINEL} {…}" line) so downstream gateways see status/summary/etc.`);
           else logger.info(`[${jobType}] job ${job.jobKey}: merged agent result vars [${resultKeys.join(', ')}]`);
-          return await settle.complete(job.jobKey, {
+          return await settleJob.complete({
             ...resultVars,
             [AGENT_RESULT_KEY]: resultEnvelope,
             output: result.stdout,
@@ -8383,7 +8402,7 @@ async function workAgent(req, flags) {
           || (result.stderr || '').trim() + (result.stderrTruncated && (result.stderr || '').trim() ? ' [stderr truncated]' : '')
           || (result.signal ? `terminated by signal ${result.signal}` : `exit code ${result.exitCode}`);
         logger.warn(`[${jobType}] job ${job.jobKey} failed (${detail}); retries left ${retries}`);
-        return await settle.fail(job.jobKey, {
+        return await settleJob.fail({
           errorMessage: `agent "${profile.name}" failed: ${detail}`.slice(0, 2000),
           retries,
           variables: { [AGENT_RESULT_KEY]: resultEnvelope },
@@ -8416,26 +8435,13 @@ async function workAgent(req, flags) {
       dispatch: { recoveryWindowMs, extendIntervalMs: lockExtendIntervalMs },
     },
   });
-  // Lease-fence every settle: a leased job's complete/fail MUST carry its
-  // activation lease token (the engine validates these commands with
-  // required=true), so a superseded worker is rejected (JobLeaseMismatch)
-  // instead of clobbering the newer activation. The token is looked up from
-  // activeJobs by jobKey (recorded at recordJobStart); an explicit token
-  // (or opts.leaseToken) wins. A non-leased job has no token → omitted, and the
-  // engine accepts an unfenced settle. The force-stop yield path (below) passes
-  // the captured token explicitly because activeJobs may already be cleared by
-  // the interrupted runner's finally.
-  const composedSettle = composed.settle;
-  const leaseFor = (jobKey) => activeJobs.get(String(jobKey))?.leaseToken;
-  settle = {
-    complete: (jobKey, variables, leaseToken) =>
-      composedSettle.complete(jobKey, variables, leaseToken ?? leaseFor(jobKey)),
-    fail: (jobKey, opts2) =>
-      composedSettle.fail(
-        jobKey,
-        opts2 && opts2.leaseToken ? opts2 : { ...(opts2 || {}), leaseToken: leaseFor(jobKey) },
-      ),
-  };
+  // The settle seam is used directly with an EXPLICIT lease token per call: the
+  // runner binds `settleJob` to its activation's `job.leaseToken` (race-free —
+  // see the runner), and the force-stop yield passes the token captured in
+  // `inflight`. We deliberately do NOT wrap `settle` to look the token up from the
+  // shared `activeJobs` map by jobKey, because a same-key reactivation could make
+  // that lookup fence a settlement with the wrong activation's token.
+  settle = composed.settle;
   const {
     deps: supervisorDeps,
     registry: workerRegistry,

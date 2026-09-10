@@ -36,6 +36,13 @@
  *     else the SAME calls issued raw via `fetchImpl` — the settle surface the
  *     supervisor's JobRunner uses once an agent finishes.
  *
+ * The three POST-ACTIVATION commands take an optional lease token that FENCES them
+ * against a superseded worker (the engine validates `updateJob` and requires it on
+ * `completeJob`/`failJob`): `extendLock(jobKey, ms, leaseToken?)`,
+ * `complete(jobKey, variables?, leaseToken?)`, and `fail(jobKey, { …, leaseToken? })`.
+ * On every path (SDK + raw) it is sent as the TOP-LEVEL camelCase `leaseToken` wire
+ * field and OMITTED when blank/absent (a non-leased job needs no fence).
+ *
  * Every method on this surface (`activate`→`activateJobs`,
  * `extendLock`→`updateJob`, `complete`→`completeJob`, `fail`→`failJob`) PREFERS
  * the injected `camunda` client and only hand-rolls the REST call as a

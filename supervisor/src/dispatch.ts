@@ -26,15 +26,37 @@ import { withOwnedJob } from "./ownership.ts";
  * Does this extend/settle rejection mean the worker has DEFINITIVELY lost the job
  * (the lock lapsed and the broker reclaimed it, or the lease was superseded)? Only
  * these unambiguous ownership-loss signals — a 409 (reclaim / `JobLeaseMismatch`),
- * a 404 (job gone), or the engine's "not activated" body — end the heartbeat and
- * interrupt the run. Everything else (a 5xx, a network blip, a timeout) is TRANSIENT
- * and must NOT stop lock renewal, or one flaky beat would needlessly kill a healthy
- * agent mid-run.
+ * a 404 (job gone), or the engine's "not activated" body — mean the lease is gone.
+ * Everything TRANSIENT (a 5xx, a 429, a network blip, a timeout) is NOT ownership
+ * loss and must not, on its own, stop lock renewal.
  */
 export const isLeaseLostError = (err: SupervisorError): boolean =>
   /HTTP 4(?:09|04)\b|\bnot activated\b|joblease\s*mismatch|lease\s*mismatch|\bnot found\b|\breclaim/i.test(
     err.message,
   );
+
+/**
+ * Does this extend rejection mean renewal can NEVER succeed by retrying — a
+ * permanent client-side failure (a 400 bad-request / validation, or a 401/403
+ * auth failure)? These are not transient: retrying them forever while the agent
+ * keeps running would let the finite recovery window lapse with no successful
+ * beat, so the broker reclaims and RE-RUNS the job — the exact duplicate-execution
+ * this heartbeat exists to prevent. A 429 (rate-limited) and any 5xx are TRANSIENT
+ * (the server is asking us to back off / is briefly unhealthy), so they are
+ * excluded — only a definitively permanent 4xx counts.
+ */
+export const isPermanentRenewalError = (err: SupervisorError): boolean =>
+  /HTTP 4(?:00|01|03|22)\b|\bunauthori[sz]ed\b|\bforbidden\b/i.test(err.message);
+
+/**
+ * A heartbeat beat must END the renewal loop (and so interrupt the run) when the
+ * lock can no longer be held: either the lease is already lost
+ * ({@link isLeaseLostError}) OR renewal is permanently impossible
+ * ({@link isPermanentRenewalError}). Continuing the agent past either is pointless
+ * and dangerous — the lock will lapse and the job will be redelivered.
+ */
+export const isTerminalRenewalError = (err: SupervisorError): boolean =>
+  isLeaseLostError(err) || isPermanentRenewalError(err);
 
 const defectText = (defect: unknown): string =>
   defect instanceof Error ? defect.message : String(defect);
@@ -114,18 +136,21 @@ export const dispatch = (
       // One heartbeat beat: wait an interval, then SET the lock to the recovery
       // window (lease-fenced with `job.leaseToken`). Resilience is the whole point
       // here — this fiber must NOT die silently and stop renewing:
-      //   * a TRANSIENT typed failure (5xx / network blip) is logged and swallowed
-      //     so the next beat still fires;
+      //   * a TRANSIENT typed failure (5xx / 429 / network blip) is logged and
+      //     swallowed so the next beat still fires;
       //   * a DEFECT (e.g. the deployed `Not a valid effect: [object Promise]`,
       //     which a typed-only `Effect.catch` would let escape and KILL the fiber)
       //     is caught via `catchDefect` and swallowed the same way;
-      //   * ONLY a definitive lease-loss (`isLeaseLostError`) is re-raised, ending
-      //     the `forever` loop so the race interrupts the run.
+      //   * a TERMINAL renewal error (`isTerminalRenewalError`: a definitive
+      //     lease-loss OR a permanent 400/401/403 that retrying can never fix) is
+      //     re-raised, ending the `forever` loop so the race interrupts the run —
+      //     because the lock cannot be held, continuing the agent only invites the
+      //     broker to reclaim and re-run the job.
       const beatOnce = Effect.sleep(Duration.millis(config.extendIntervalMs)).pipe(
         Effect.flatMap(() =>
           engine.extendLock(job.jobKey, config.recoveryWindowMs, job.leaseToken).pipe(
             Effect.catch((err: SupervisorError) =>
-              isLeaseLostError(err)
+              isTerminalRenewalError(err)
                 ? Effect.fail(err)
                 : Effect.sync(() =>
                     logger.warn(
@@ -157,16 +182,17 @@ export const dispatch = (
       const owned = ownership ? withOwnedJob(ownership, workerId, job.jobKey, runChild) : runChild;
 
       // `raceFirst`: the FIRST side to complete (success OR failure) wins and the
-      // loser is interrupted. If the heartbeat loses the lease it fails → wins the
-      // race → `owned` (the agent) is interrupted; otherwise the agent finishes and
-      // the heartbeat is interrupted. A lease-loss failure is caught here → the run
-      // stopped because it was superseded.
+      // loser is interrupted. If a beat hits a TERMINAL renewal error it fails →
+      // wins the race → `owned` (the agent) is interrupted; otherwise the agent
+      // finishes and the heartbeat is interrupted. The failure is caught here → the
+      // run stopped because the lock can no longer be held (superseded, or renewal
+      // permanently impossible).
       return yield* Effect.raceFirst(owned, heartbeatUntilLost).pipe(
         Effect.as(false),
         Effect.catch((err: SupervisorError) =>
           Effect.sync(() => {
             logger.warn(
-              `[${job.type}] job ${job.jobKey}: lock lost mid-run — agent interrupted (superseded); slot released — ${err.message}`,
+              `[${job.type}] job ${job.jobKey}: lock lost mid-run — agent interrupted (lock unrenewable); slot released — ${err.message}`,
             );
             return true;
           }),

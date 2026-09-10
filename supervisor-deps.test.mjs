@@ -196,6 +196,40 @@ test("createSupervisorDeps: the settle seam fails a job through the engine failu
   assert.deepEqual(failures[0].body, { retries: 1, errorMessage: "harness exited 1", retryBackOff: 15_000 });
 });
 
+test("createSupervisorDeps: the settle seam FENCES complete/fail — the activation leaseToken reaches the completion/failure wire", async () => {
+  // The runner binds `settleJob` to its activation's job.leaseToken and calls the
+  // seam explicitly (settle.complete(jobKey, vars, leaseToken) / settle.fail(jobKey,
+  // {..., leaseToken})). This proves the token survives the seam all the way to the
+  // engine wire — a leased job's settle is fenced, so a superseded worker is
+  // rejected (JobLeaseMismatch) instead of clobbering the newer activation.
+  const completions = [];
+  const failures = [];
+  const fetchImpl = async (url, init) => {
+    const u = String(url);
+    if (/\/jobs\/.+\/completion$/.test(u)) {
+      completions.push(JSON.parse(init.body));
+      return { ok: true, status: 204, json: async () => ({}), text: async () => "" };
+    }
+    if (/\/jobs\/.+\/failure$/.test(u)) {
+      failures.push(JSON.parse(init.body));
+      return { ok: true, status: 204, json: async () => ({}), text: async () => "" };
+    }
+    if (u.endsWith("/jobs/activation")) return { ok: true, status: 200, json: async () => ({ jobs: [] }), text: async () => "" };
+    return { ok: false, status: 404, json: async () => ({}), text: async () => "" };
+  };
+  const { settle } = await createSupervisorDeps({
+    runner: { run: async () => {} },
+    restConfig: { baseUrl: "http://engine:8080", token: "T" },
+    worker: "host-under-test",
+    fetchImpl,
+  });
+  // As settleJob does: complete carries the token as the 3rd arg; fail carries it in opts.
+  await settle.complete("job-c", { status: "opened" }, "lease-c");
+  await settle.fail("job-f", { retries: 1, errorMessage: "boom", leaseToken: "lease-f" });
+  assert.deepEqual(completions, [{ variables: { status: "opened" }, leaseToken: "lease-c" }]);
+  assert.deepEqual(failures, [{ retries: 1, errorMessage: "boom", leaseToken: "lease-f" }]);
+});
+
 test("createSupervisorDeps: derives engine authHeaders from camunda.getAuthHeaders() when no explicit headers/token", async () => {
   // On OAuth/basic profiles there is no bare REST token, so the engine client
   // must fall back to the SDK client's ready-made header map — otherwise engine

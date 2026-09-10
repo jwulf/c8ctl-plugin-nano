@@ -3775,6 +3775,169 @@ function agentRunsRoot() {
   return join(getStateHome(), 'agent-runs');
 }
 
+// A settlement handoff is the durable boundary between an agent's external
+// side effect and the broker's job settlement. It lives outside any one
+// worker-incarnation namespace so a same-host reactivation can be recovered by
+// another worker process, while the job key digest keeps arbitrary broker keys
+// out of the filesystem path.
+function settlementJournalPath(root, jobKey) {
+  const digest = createHash('sha256').update(String(jobKey)).digest('hex');
+  return join(root, `${digest}.json`);
+}
+
+function readPendingSettlement(root, jobKey) {
+  const path = settlementJournalPath(root, jobKey);
+  if (!existsSync(path)) return null;
+  let record;
+  try {
+    record = JSON.parse(readFileSync(path, 'utf8'));
+  } catch (err) {
+    throw new SettlementRecoveryError(`settlement journal ${path} is unreadable: ${err.message}`, { cause: err });
+  }
+  if (
+    !record
+    || record.schema !== 1
+    || String(record.jobKey) !== String(jobKey)
+    || !['complete', 'fail'].includes(record.operation)
+    || !isPlainObject(record.payload)
+  ) {
+    throw new SettlementRecoveryError(`settlement journal ${path} is malformed; refusing to rerun job ${jobKey}`);
+  }
+  return record;
+}
+
+function writePendingSettlement(root, record) {
+  if (!record || !['complete', 'fail'].includes(record.operation) || !isPlainObject(record.payload)) {
+    throw new SettlementRecoveryError(`cannot persist malformed settlement for job ${record?.jobKey ?? '?'}`);
+  }
+  const jobKey = String(record.jobKey);
+  const path = settlementJournalPath(root, jobKey);
+  const next = {
+    schema: 1,
+    jobKey,
+    type: record.type == null ? null : String(record.type),
+    processInstanceKey: record.processInstanceKey == null ? null : String(record.processInstanceKey),
+    operation: record.operation,
+    payload: record.payload,
+    createdAt: record.createdAt || new Date().toISOString(),
+  };
+  let encoded;
+  try {
+    encoded = JSON.stringify(next);
+  } catch (err) {
+    throw new SettlementRecoveryError(`settlement for job ${jobKey} is not JSON-serializable: ${err.message}`, { cause: err });
+  }
+  mkdirSync(root, { recursive: true });
+  if (existsSync(path)) {
+    const existing = readPendingSettlement(root, jobKey);
+    if (JSON.stringify(existing) !== encoded) {
+      throw new SettlementRecoveryError(`conflicting settlement journal already exists for job ${jobKey}: ${path}`);
+    }
+    return path;
+  }
+  const tmp = `${path}.${process.pid}.${randomUUID()}.tmp`;
+  writeFileSync(tmp, encoded, { mode: 0o600 });
+  try {
+    try {
+      linkSync(tmp, path);
+    } catch (err) {
+      if (err?.code !== 'EEXIST') throw err;
+      const existing = readPendingSettlement(root, jobKey);
+      if (JSON.stringify(existing) !== encoded) {
+        throw new SettlementRecoveryError(`conflicting settlement journal won the race for job ${jobKey}: ${path}`);
+      }
+    }
+  } catch (err) {
+    if (err instanceof SettlementRecoveryError) throw err;
+    throw new SettlementRecoveryError(`could not persist settlement for job ${jobKey}: ${err.message}`, { cause: err });
+  } finally {
+    try { rmSync(tmp, { force: true }); } catch { /* best effort */ }
+  }
+  return path;
+}
+
+function removePendingSettlement(root, jobKey) {
+  rmSync(settlementJournalPath(root, jobKey), { force: true });
+}
+
+function settlementCall(settle, operation, payload) {
+  return operation === 'complete' ? settle.complete(payload) : settle.fail(payload);
+}
+
+/**
+ * Persist the exact settle intent before calling the engine. If activation
+ * ownership is lost, the record remains and the next activation replays this
+ * intent instead of running the agent again.
+ */
+async function settleWithRecovery({ root, job, operation, payload, settle, logger = null }) {
+  let path;
+  try {
+    path = writePendingSettlement(root, {
+      jobKey: job.jobKey,
+      type: job.type,
+      processInstanceKey: job.processInstanceKey,
+      operation,
+      payload,
+    });
+  } catch (err) {
+    logger?.error?.(
+      `[${job.type}] job ${job.jobKey}: CRITICAL settlement journal write failed; ` +
+      `the agent result cannot be recovered safely and operator intervention is required (${err?.message ?? err})`,
+    );
+    throw err;
+  }
+  try {
+    await settlementCall(settle, operation, payload);
+    removePendingSettlement(root, job.jobKey);
+    return { settled: true, recovered: false, path };
+  } catch (err) {
+    logger?.warn?.(
+      `[${job.type}] job ${job.jobKey}: settlement lost or failed after agent exit; ` +
+      `recovery journal retained at ${path}; future activations will replay ${operation} without rerunning the agent (${err?.message ?? err})`,
+    );
+    throw err;
+  }
+}
+
+/**
+ * Replay a pending settle intent against the current activation's lease. A
+ * successful replay removes the journal; a failed replay leaves it in place so
+ * another activation can retry without repeating the agent's side effects.
+ */
+async function recoverPendingSettlement({ root, job, settle, logger = null }) {
+  const record = readPendingSettlement(root, job.jobKey);
+  if (!record) return false;
+  if (record.type && job.type && String(record.type) !== String(job.type)) {
+    throw new SettlementRecoveryError(
+      `settlement journal for job ${job.jobKey} belongs to type ${record.type}, not ${job.type}`,
+    );
+  }
+  if (
+    record.processInstanceKey
+    && job.processInstanceKey
+    && String(record.processInstanceKey) !== String(job.processInstanceKey)
+  ) {
+    throw new SettlementRecoveryError(
+      `settlement journal for job ${job.jobKey} belongs to process ${record.processInstanceKey}, not ${job.processInstanceKey}`,
+    );
+  }
+  const path = settlementJournalPath(root, job.jobKey);
+  try {
+    await settlementCall(settle, record.operation, record.payload);
+    removePendingSettlement(root, job.jobKey);
+    logger?.info?.(
+      `[${job.type}] job ${job.jobKey}: replayed pending ${record.operation} settlement from ${path}; agent was not rerun`,
+    );
+    return true;
+  } catch (err) {
+    logger?.warn?.(
+      `[${job.type}] job ${job.jobKey}: pending ${record.operation} settlement still cannot be applied; ` +
+      `journal retained at ${path}; agent will not be rerun (${err?.message ?? err})`,
+    );
+    throw err;
+  }
+}
+
 // Redact a token that may have been embedded in a URL or surfaced in git output,
 // plus any https userinfo (x-access-token:secret@host), before it hits a log or
 // the result envelope.
@@ -3918,6 +4081,7 @@ function authUrl(url, provider, hasToken) {
 }
 
 class ProvisionError extends Error {}
+class SettlementRecoveryError extends Error {}
 
 // Never let git invoke the host's configured credential helper for our clone/
 // push. Reset the helper list ("") so no helper runs — even when we DO have a
@@ -7127,7 +7291,7 @@ function agenticStateForTarget(target, safeUrl = (u) => u) {
  * `agentic` from THIS payload — leaving every supervised worker's Engine/Agentic
  * column stuck at `?` — would otherwise slip through. `jobs` is the live active-job
  * list; `busy` is derived so callers can't desync it from `jobs`.
- * @param {{ pid:number, updatedAt:number, jobs:Array<{key:string,type:string,since:number}>, engine:(string|null), agentic:object }} fields
+ * @param {{ pid:number, updatedAt:number, jobs:Array<{key:string,type:string,since:number,state?:string}>, engine:(string|null), agentic:object }} fields
  */
 function buildActivityPayload({ pid, updatedAt, jobs, engine, agentic }) {
   const jobList = Array.isArray(jobs) ? jobs : [];
@@ -7748,7 +7912,12 @@ async function workAgent(req, flags) {
   let agenticState = { status: 'starting' };
   const writeActivity = () => {
     if (!activityFile) return;
-    const jobs = [...activeJobs.entries()].map(([key, v]) => ({ key, type: v.type, since: v.since }));
+    const jobs = [...activeJobs.entries()].map(([key, v]) => ({
+      key,
+      type: v.type,
+      since: v.since,
+      ...(v.state ? { state: v.state } : {}),
+    }));
     const payload = buildActivityPayload({ pid: process.pid, updatedAt: Date.now(), jobs, engine: workerEngine, agentic: agenticState });
     const tmp = `${activityFile}.${process.pid}.tmp`;
     try {
@@ -7800,6 +7969,24 @@ async function workAgent(req, flags) {
     // before.
     const cur = activeJobs.get(String(job.jobKey));
     if (cur && cur.leaseToken !== job.leaseToken) return;
+    let pending = false;
+    try {
+      pending = Boolean(readPendingSettlement(join(agentRunsRoot(), 'settlements'), job.jobKey));
+    } catch (err) {
+      pending = true;
+      logger.error?.(`[${job.type}] job ${job.jobKey}: settlement journal could not be read after run exit — operator recovery required (${err?.message || err})`);
+    }
+    if (pending) {
+      activeJobs.set(String(job.jobKey), {
+        type: job.type,
+        since: cur?.since ?? Date.now(),
+        retries: Number(job.retries),
+        leaseToken: job.leaseToken,
+        state: 'settlement-pending',
+      });
+      writeActivity();
+      return;
+    }
     activeJobs.delete(String(job.jobKey));
     writeActivity();
   };
@@ -7999,7 +8186,31 @@ async function workAgent(req, flags) {
       // WRONG (newer) token and clobber the new activation — the very lease bypass
       // this fence exists to prevent. `job.leaseToken` in the closure cannot drift.
       const settleJob = bindJobSettle(settle, job);
+      const settlementRoot = join(agentRunsRoot(), 'settlements');
+      const settleComplete = (variables) =>
+        settleWithRecovery({
+          root: settlementRoot,
+          job,
+          operation: 'complete',
+          payload: variables,
+          settle: settleJob,
+          logger,
+        });
+      const settleFail = (opts2) =>
+        settleWithRecovery({
+          root: settlementRoot,
+          job,
+          operation: 'fail',
+          payload: opts2 || {},
+          settle: settleJob,
+          logger,
+        });
       try {
+        // A previous activation may have completed the agent's external work
+        // but lost ownership before settlement. Replay that exact intent before
+        // provisioning or spawning anything; rerunning would duplicate the
+        // side effect.
+        if (await recoverPendingSettlement({ root: settlementRoot, job, settle: settleJob, logger })) return;
         logger.info(`[${jobType}] job ${job.jobKey} (instance ${job.processInstanceKey ?? '-'}) → ${buildAgentCommandLine(profile.command, effectiveArgs)}`);
 
         // Disk-budget admission shed: if the engine data root is below the free
@@ -8011,7 +8222,7 @@ async function workAgent(req, flags) {
             const freeMb = budget.free != null ? Math.round(budget.free / 1_048_576) : '?';
             const retries = Math.max(0, (Number(job.retries) || 1) - 1);
             logger.warn(`[${jobType}] job ${job.jobKey} shed — low disk (${freeMb}MB free); retries left ${retries}`);
-            return settleJob.fail({ errorMessage: `disk budget exceeded (only ${freeMb}MB free)`, retries, retryBackOff: 30_000 });
+            return settleFail({ errorMessage: `disk budget exceeded (only ${freeMb}MB free)`, retries, retryBackOff: 30_000 });
           }
         }
 
@@ -8043,7 +8254,7 @@ async function workAgent(req, flags) {
           const retries = Math.max(0, (Number(job.retries) || 1) - 1);
           const msg = err instanceof ProvisionError ? err.message : `prompt resource fetch failed: ${err.message}`;
           logger.warn(`[${jobType}] job ${job.jobKey} not provisioned — ${msg}; retries left ${retries}`);
-          return settleJob.fail({ errorMessage: msg.slice(0, 2000), retries, retryBackOff: 15_000 });
+          return settleFail({ errorMessage: msg.slice(0, 2000), retries, retryBackOff: 15_000 });
         }
 
         // Assemble + normalize the task envelope from headers (defaults) and
@@ -8054,7 +8265,7 @@ async function workAgent(req, flags) {
           const retries = Math.max(0, (Number(job.retries) || 1) - 1);
           const msg = `missing secret(s): ${missing.join(', ')} (resolver: ${secretResolver.kind})`;
           logger.warn(`[${jobType}] job ${job.jobKey} not provisioned — ${msg}; retries left ${retries}`);
-          return settleJob.fail({ errorMessage: msg, retries });
+          return settleFail({ errorMessage: msg, retries });
         }
 
         // #130: per-task liveness overrides. Precedence: envelope override →
@@ -8120,7 +8331,7 @@ async function workAgent(req, flags) {
               : 'repository.url is missing';
             const msg = `incomplete repository envelope — ${why}; refusing to run in the launch/temp cwd (likely an orchestrator bug emitting a half-specified repository block)`;
             logger.warn(`[${jobType}] job ${job.jobKey} not provisioned — ${msg}; retries left ${retries}`);
-            return settleJob.fail({ errorMessage: msg.slice(0, 2000), retries, retryBackOff: 15_000 });
+            return settleFail({ errorMessage: msg.slice(0, 2000), retries, retryBackOff: 15_000 });
           }
         }
 
@@ -8175,7 +8386,7 @@ async function workAgent(req, flags) {
             const retries = Math.max(0, (Number(job.retries) || 1) - 1);
             const msg = err instanceof ProvisionError ? err.message : `provisioning error: ${err.message}`;
             logger.warn(`[${jobType}] job ${job.jobKey} not provisioned — ${msg}; retries left ${retries}`);
-            return settleJob.fail({ errorMessage: msg.slice(0, 2000), retries, retryBackOff: 15_000 });
+            return settleFail({ errorMessage: msg.slice(0, 2000), retries, retryBackOff: 15_000 });
           }
         } else if (!isContainer) {
           // Repo-less host job (issue #129, hardening 1): nothing is provisioned,
@@ -8201,7 +8412,7 @@ async function workAgent(req, flags) {
             const retries = Math.max(0, (Number(job.retries) || 1) - 1);
             const msg = `could not create a temp workspace under the worker namespace: ${err.message}`;
             logger.warn(`[${jobType}] job ${job.jobKey} not provisioned — ${msg}; retries left ${retries}`);
-            return settleJob.fail({ errorMessage: msg.slice(0, 2000), retries, retryBackOff: 15_000 });
+            return settleFail({ errorMessage: msg.slice(0, 2000), retries, retryBackOff: 15_000 });
           }
         }
 
@@ -8399,7 +8610,7 @@ async function workAgent(req, flags) {
           const resultKeys = Object.keys(resultVars);
           if (resultKeys.length === 0) logger.warn(`[${jobType}] job ${job.jobKey}: agent returned no usable result vars — write a JSON object of result variables to $AGENT_RESULT_FILE (or print a "${RESULT_SENTINEL} {…}" line) so downstream gateways see status/summary/etc.`);
           else logger.info(`[${jobType}] job ${job.jobKey}: merged agent result vars [${resultKeys.join(', ')}]`);
-          return await settleJob.complete({
+          return await settleComplete({
             ...resultVars,
             [AGENT_RESULT_KEY]: resultEnvelope,
             output: result.stdout,
@@ -8416,7 +8627,7 @@ async function workAgent(req, flags) {
           || (result.stderr || '').trim() + (result.stderrTruncated && (result.stderr || '').trim() ? ' [stderr truncated]' : '')
           || (result.signal ? `terminated by signal ${result.signal}` : `exit code ${result.exitCode}`);
         logger.warn(`[${jobType}] job ${job.jobKey} failed (${detail}); retries left ${retries}`);
-        return await settleJob.fail({
+        return await settleFail({
           errorMessage: `agent "${profile.name}" failed: ${detail}`.slice(0, 2000),
           retries,
           variables: { [AGENT_RESULT_KEY]: resultEnvelope },
@@ -8650,7 +8861,9 @@ async function workAgent(req, flags) {
       logger.info(`Received ${signal} — aborting in-flight work and stopping worker...`);
       // Snapshot in-flight jobs (with their retry budget) BEFORE the interrupt
       // clears the ownership registry, so we can yield each one afterwards.
-      const inflight = [...activeJobs.entries()].map(([jobKey, info]) => ({ jobKey, retries: info?.retries, leaseToken: info?.leaseToken }));
+      const inflight = [...activeJobs.entries()]
+        .filter(([, info]) => info?.state !== 'settlement-pending')
+        .map(([jobKey, info]) => ({ jobKey, retries: info?.retries, leaseToken: info?.leaseToken }));
       // Interrupt the runtime: this aborts each running job's AbortSignal (the
       // makeJobRunner seam) so runAgentJob killTree's the harness process group,
       // and runs dispatch's bracketed teardown (release ownership + slot). The
@@ -9045,6 +9258,7 @@ function summarizeSupervisorWorker(w, now = Date.now()) {
         ? act.jobs.map((j) => ({
             key: String(j.key),
             type: j.type ?? null,
+            ...(j.state ? { state: String(j.state) } : {}),
             // Both the snapshot-time duration and its absolute base, so the
             // console can re-age the job cell locally (mirrors uptimeMs above).
             sinceMs: Number.isFinite(j.since) ? Math.max(0, now - j.since) : null,
@@ -9100,7 +9314,7 @@ function supervisorStatusSignature(workers) {
       w.lastExit ?? '',
       w.activity ? w.activity.state : null,
       w.activity
-        ? w.activity.jobs.map((j) => `${j.key}\u0000${j.type ?? ''}`).sort()
+        ? w.activity.jobs.map((j) => `${j.key}\u0000${j.type ?? ''}\u0000${j.state ?? ''}`).sort()
         : null,
       // Engine + agentic-channel status: a connect/disconnect or an engine
       // change is a real transition that must repaint attached consoles (#99).
@@ -9119,6 +9333,7 @@ function supervisorJobCell(w) {
   const [first, ...rest] = a.jobs;
   const dur = first.sinceMs != null ? ` (${formatDuration(first.sinceMs)})` : '';
   const more = rest.length > 0 ? ` +${rest.length}` : '';
+  if (first.state === 'settlement-pending') return `pending ${first.key}${dur}${more}`;
   return `${first.key}${more}${dur}`;
 }
 
@@ -13887,7 +14102,14 @@ export {
   ghAuthEnv,
   redactToken,
   agentRunsRoot,
+  settlementJournalPath,
+  readPendingSettlement,
+  writePendingSettlement,
+  removePendingSettlement,
+  settleWithRecovery,
+  recoverPendingSettlement,
   ProvisionError,
+  SettlementRecoveryError,
   normalizeStoredProfile,
   applyAssign,
   resolveAssignInputs,

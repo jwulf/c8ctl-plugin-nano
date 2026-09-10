@@ -9,7 +9,17 @@
  */
 import assert from "node:assert/strict";
 import { test } from "node:test";
-import { bindJobSettle, createSupervisorDeps } from "./c8ctl-plugin.js";
+import { mkdtempSync, readFileSync, rmSync } from "node:fs";
+import { tmpdir } from "node:os";
+import { join } from "node:path";
+import {
+  bindJobSettle,
+  createSupervisorDeps,
+  readPendingSettlement,
+  recoverPendingSettlement,
+  settlementJournalPath,
+  settleWithRecovery,
+} from "./c8ctl-plugin.js";
 
 const sleep = (ms) => new Promise((r) => setTimeout(r, ms));
 
@@ -256,6 +266,100 @@ test("bindJobSettle: each bound settler fences with ITS OWN activation's leaseTo
     { op: "fail", jobKey: "J", retries: 3, errorMessage: "x", leaseToken: "lease-OLD" },
     { op: "fail", jobKey: "J", leaseToken: "lease-NEW" },
   ]);
+});
+
+test("settlement recovery: a lost completion is replayed on reactivation without rerunning the side effect", async (t) => {
+  const root = mkdtempSync(join(tmpdir(), "c8ctl-settlement-recovery-"));
+  t.after(() => rmSync(root, { recursive: true, force: true }));
+
+  const completions = [];
+  let sideEffects = 0;
+  const rawSettle = {
+    complete: async (jobKey, variables, leaseToken) => {
+      completions.push({ jobKey, variables, leaseToken });
+      if (leaseToken === "lease-old") throw new Error("HTTP 409 — Job not activated");
+    },
+    fail: async () => {},
+  };
+  const oldJob = { jobKey: "job-recovered", type: "senior:feature", processInstanceKey: "pi-1", leaseToken: "lease-old" };
+
+  // The harness has already performed its external side effect exactly once.
+  sideEffects++;
+  await assert.rejects(
+    () =>
+      settleWithRecovery({
+        root,
+        job: oldJob,
+        operation: "complete",
+        payload: { status: "opened", summary: "side effect already applied" },
+        settle: bindJobSettle(rawSettle, oldJob),
+      }),
+    /409.*not activated/i,
+  );
+
+  const pendingPath = settlementJournalPath(root, oldJob.jobKey);
+  assert.equal(readFileSync(pendingPath, "utf8").includes("side effect already applied"), true);
+  assert.deepEqual(readPendingSettlement(root, oldJob.jobKey)?.operation, "complete");
+
+  // Model the engine's stale CREATED row: the old worker is gone, but the job
+  // remains visible with a future deadline and is later activated again.
+  const staleSearchRow = { jobKey: oldJob.jobKey, state: "CREATED", worker: "stale-worker", deadline: "2099-01-01T00:00:00Z" };
+  assert.equal(staleSearchRow.state, "CREATED");
+  const newJob = { ...oldJob, leaseToken: "lease-new" };
+  const replayed = await recoverPendingSettlement({
+    root,
+    job: newJob,
+    settle: bindJobSettle(rawSettle, newJob),
+  });
+
+  assert.equal(replayed, true);
+  assert.equal(sideEffects, 1, "reactivation must not rerun the external side effect");
+  assert.deepEqual(completions, [
+    { jobKey: oldJob.jobKey, variables: { status: "opened", summary: "side effect already applied" }, leaseToken: "lease-old" },
+    { jobKey: oldJob.jobKey, variables: { status: "opened", summary: "side effect already applied" }, leaseToken: "lease-new" },
+  ]);
+  assert.equal(readPendingSettlement(root, oldJob.jobKey), null, "successful replay clears the durable handoff");
+});
+
+test("settlement recovery: a lost failure is replayed with the original retry decision", async (t) => {
+  const root = mkdtempSync(join(tmpdir(), "c8ctl-failure-recovery-"));
+  t.after(() => rmSync(root, { recursive: true, force: true }));
+
+  const failures = [];
+  const rawSettle = {
+    complete: async () => {},
+    fail: async (jobKey, opts) => {
+      failures.push({ jobKey, opts });
+      if (opts?.leaseToken === "lease-old") throw new Error("HTTP 409 — Job not activated");
+    },
+  };
+  const oldJob = { jobKey: "job-failed", type: "senior:feature", leaseToken: "lease-old" };
+  await assert.rejects(
+    () =>
+      settleWithRecovery({
+        root,
+        job: oldJob,
+        operation: "fail",
+        payload: { retries: 2, errorMessage: "agent failed", retryBackOff: 15_000 },
+        settle: bindJobSettle(rawSettle, oldJob),
+      }),
+    /409.*not activated/i,
+  );
+
+  const newJob = { ...oldJob, leaseToken: "lease-new" };
+  assert.equal(
+    await recoverPendingSettlement({
+      root,
+      job: newJob,
+      settle: bindJobSettle(rawSettle, newJob),
+    }),
+    true,
+  );
+  assert.deepEqual(failures, [
+    { jobKey: oldJob.jobKey, opts: { retries: 2, errorMessage: "agent failed", retryBackOff: 15_000, leaseToken: "lease-old" } },
+    { jobKey: oldJob.jobKey, opts: { retries: 2, errorMessage: "agent failed", retryBackOff: 15_000, leaseToken: "lease-new" } },
+  ]);
+  assert.equal(readPendingSettlement(root, oldJob.jobKey), null);
 });
 
 test("createSupervisorDeps: derives engine authHeaders from camunda.getAuthHeaders() when no explicit headers/token", async () => {

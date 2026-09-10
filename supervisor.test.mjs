@@ -905,6 +905,19 @@ test('buildActivityPayload carries engine + agentic and derives busy from jobs',
   assert.equal(noJobs.busy, false);
 });
 
+test('supervisorJobCell marks a pending settlement instead of reporting a misleading idle worker', () => {
+  assert.equal(
+    supervisorJobCell({
+      state: 'running',
+      activity: {
+        state: 'busy',
+        jobs: [{ key: 'JOB-SETTLE', type: 'senior:feature', state: 'settlement-pending', sinceMs: 0 }],
+      },
+    }),
+    'pending JOB-SETTLE (0s)',
+  );
+});
+
 test('supervisorStatusSignature changes when the polled engine changes', () => {
   const a = pub({ engine: 'http://merlin.local:8080' });
   const b = pub({ engine: 'http://omarchy.local:8080' });

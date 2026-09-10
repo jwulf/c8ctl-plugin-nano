@@ -16,7 +16,7 @@
  *  (b) **never touch a parked/lapsed job again** — losers are dropped upstream in
  *      activation and never reach here, so a late complete/fail can't 409.
  */
-import { Duration, Effect, Ref } from "effect";
+import { Clock, Duration, Effect, Ref } from "effect";
 import type { ActivatedJob, EngineClient, JobRunner, Logger } from "./ports.ts";
 import { SupervisorError } from "./ports.ts";
 import type { Registry } from "./registry.ts";
@@ -67,6 +67,17 @@ export interface DispatchConfig {
   readonly recoveryWindowMs: number;
   /** How often to re-extend the winner's lock while it runs (ms). */
   readonly extendIntervalMs: number;
+  /**
+   * Max time to AWAIT a single lock extend before abandoning it as a (transient)
+   * renewal failure (ms). Defaults to {@link DispatchConfig.extendIntervalMs}. A
+   * hung/slow extend — e.g. the SDK `updateJob` awaiting a wedged connection with
+   * no timeout of its own — must NOT silently stall the heartbeat: without this
+   * bound the beat would block inside the extend forever, `sinceOk` would never
+   * advance, and the lapse guard could never fire, so the broker could reclaim the
+   * job while the agent runs on. Bounding each extend turns a stall into a normal
+   * failed beat that counts toward the recovery window.
+   */
+  readonly extendTimeoutMs?: number;
 }
 
 export const defaultDispatchConfig: DispatchConfig = {
@@ -142,26 +153,31 @@ export const dispatch = (
       //     lease-loss OR a permanent 400/401/403 that retrying can never fix) is
       //     re-raised IMMEDIATELY, ending the `forever` loop so the race interrupts
       //     the run;
-      //   * a SPORADIC failure — a transient typed error (5xx / 429 / network blip)
-      //     or a DEFECT (e.g. the deployed `Not a valid effect: [object Promise]`,
-      //     which a typed-only `Effect.catch` would let escape and KILL the fiber)
-      //     — is logged and retried, BUT bounded: we track how long it has been
-      //     since the last SUCCESSFUL extend and, once that reaches the recovery
-      //     window, the lock has lapsed (the broker will reclaim and re-run the
-      //     job) so we stop retrying and interrupt the agent. A persistent outage
-      //     is therefore treated as a lease loss the moment the lock can no longer
-      //     be guaranteed — a sporadic blip still just retries.
-      // `sinceOkMs` accumulates the inter-beat interval on each failed beat and
-      // resets to 0 on each success. Under the deterministic TestClock (where the
-      // extend itself takes 0ms) this is exactly wall-time-since-last-success.
-      const sinceOkRef = yield* Ref.make(0);
+      //   * a SPORADIC failure — a transient typed error (5xx / 429 / network blip),
+      //     a HUNG extend that blew its deadline (a wedged SDK/HTTP call), or a
+      //     DEFECT (e.g. the deployed `Not a valid effect: [object Promise]`, which
+      //     a typed-only `Effect.catch` would let escape and KILL the fiber) — is
+      //     logged and retried, BUT bounded: we compare NOW against the timestamp of
+      //     the last SUCCESSFUL extend and, once the gap reaches the recovery window,
+      //     the lock has lapsed (the broker will reclaim and re-run the job) so we
+      //     stop retrying and interrupt the agent. A persistent outage is therefore
+      //     treated as a lease loss the moment the lock can no longer be guaranteed
+      //     — a sporadic blip still just retries.
+      // Elapsed-since-success is read from the Effect `Clock` (NOT a fixed per-beat
+      // increment), so it stays honest even when a beat is delayed by a hung extend
+      // burning its whole `extendTimeoutMs` before failing. Under the deterministic
+      // TestClock the clock advances exactly with `TestClock.adjust`, so this is
+      // still fully deterministic.
+      const extendTimeoutMs = Math.max(1, config.extendTimeoutMs ?? config.extendIntervalMs);
+      const lastOkAtRef = yield* Ref.make(yield* Clock.currentTimeMillis);
       const retryUnlessLapsed = (reason: string) =>
-        Ref.updateAndGet(sinceOkRef, (s) => s + config.extendIntervalMs).pipe(
-          Effect.flatMap((sinceOk) =>
+        Effect.all([Clock.currentTimeMillis, Ref.get(lastOkAtRef)]).pipe(
+          Effect.flatMap(([now, lastOkAt]) => {
+            const sinceOk = now - lastOkAt;
             // If the NEXT beat would land at/after the window, the lock is (about
             // to be) lapsed — give up now, a beat BEFORE expiry, rather than run
             // the agent on unlocked.
-            sinceOk + config.extendIntervalMs >= config.recoveryWindowMs
+            return sinceOk + config.extendIntervalMs >= config.recoveryWindowMs
               ? Effect.fail(
                   new SupervisorError(
                     `job ${job.jobKey}: lock lapsed — no successful extend in ${sinceOk}ms (recovery window ${config.recoveryWindowMs}ms); last error: ${reason}`,
@@ -171,15 +187,23 @@ export const dispatch = (
                   logger.warn(
                     `[${job.type}] job ${job.jobKey}: heartbeat extend failed (transient, retrying) — ${reason}`,
                   ),
-                ),
-          ),
+                );
+          }),
         );
       const beatOnce = Effect.sleep(Duration.millis(config.extendIntervalMs)).pipe(
         Effect.flatMap(() =>
           engine.extendLock(job.jobKey, config.recoveryWindowMs, job.leaseToken).pipe(
-            Effect.flatMap(() => Ref.set(sinceOkRef, 0)),
-            Effect.catch((err: SupervisorError) =>
-              isTerminalRenewalError(err) ? Effect.fail(err) : retryUnlessLapsed(err.message),
+            // Bound each extend: a hung call is interrupted at its deadline and
+            // surfaces a `TimeoutException` on the error channel, which the
+            // `Effect.catch` below routes through `retryUnlessLapsed` — so a stall
+            // burns toward the recovery window instead of freezing the heartbeat.
+            Effect.timeout(Duration.millis(extendTimeoutMs)),
+            Effect.flatMap(() => Clock.currentTimeMillis),
+            Effect.flatMap((now) => Ref.set(lastOkAtRef, now)),
+            Effect.catch((err: SupervisorError | { message?: string }) =>
+              err instanceof SupervisorError && isTerminalRenewalError(err)
+                ? Effect.fail(err)
+                : retryUnlessLapsed(err?.message ?? String(err)),
             ),
             Effect.catchDefect((defect) => retryUnlessLapsed(defectText(defect))),
           ),

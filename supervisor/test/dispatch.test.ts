@@ -231,6 +231,66 @@ test("isLeaseLostError: definitive ownership-loss signals stop the heartbeat; tr
   for (const m of transient) assert.equal(isLeaseLostError(new SupervisorError(m)), false, m);
 });
 
+test("HUNG extend mid-run: a wedged extend that never resolves is bounded by extendTimeoutMs, counts toward the window, and interrupts the agent (a stall is not silent forever)", async () => {
+  await Effect.runPromise(
+    Effect.gen(function* () {
+      let extendCalls = 0;
+      let finished = false;
+      const engine = makeEngine({
+        activate: () => Effect.succeed([]),
+        extend: () => {
+          extendCalls += 1;
+          // Winner extend (call 1) succeeds so the agent starts; every heartbeat
+          // extend thereafter HANGS forever (models a wedged SDK `updateJob` /
+          // socket with no timeout of its own). Without a per-extend deadline the
+          // heartbeat fiber would block inside the first hung extend, never advance
+          // its since-success clock, and never interrupt — letting the broker
+          // reclaim the job while the agent runs on. With the bound, each hang is a
+          // failed beat that burns toward the recovery window.
+          return extendCalls === 1 ? Effect.void : (Effect.never as never);
+        },
+      });
+      const runner = {
+        ran: [] as string[],
+        run: (j: { jobKey: string }) =>
+          Effect.sync(() => runner.ran.push(j.jobKey)).pipe(
+            Effect.flatMap(() => Effect.sleep(Duration.millis(10_000_000))),
+            Effect.flatMap(() => Effect.sync(() => { finished = true; })),
+          ),
+      };
+      const reg = yield* makeRegistry();
+      yield* reg.add("w1", ["a"], 1);
+      const worker = yield* reg.claim("a");
+
+      const fiber = yield* Effect.forkChild(
+        dispatch(
+          {
+            engine,
+            runner,
+            registry: reg,
+            logger: noopLogger,
+            config: { recoveryWindowMs: 300_000, extendIntervalMs: 60_000, extendTimeoutMs: 60_000 },
+          },
+          job("J1", "a", "lease-J1"),
+          worker!,
+        ),
+      );
+
+      // Each hung beat burns interval (60s wait) + timeout (60s hang) = 120s. Two
+      // such beats reach the window at t=240s → interrupt one beat before expiry.
+      yield* TestClock.adjust(Duration.millis(240_000));
+      const outcome = yield* Fiber.join(fiber);
+
+      assert.deepEqual(runner.ran, ["J1"], "agent started");
+      assert.ok(extendCalls >= 2, `heartbeat kept attempting extends through the hangs, got ${extendCalls}`);
+      assert.equal(finished, false, "agent was INTERRUPTED at window expiry, not left running on a hung heartbeat");
+      assert.equal(outcome.started, true);
+      assert.equal(outcome.reason, "lock-lost");
+      assert.deepEqual(yield* reg.pollTypes, ["a"], "slot released after the lapsed run stopped");
+    }).pipe(Effect.provide(TestClock.layer())),
+  );
+});
+
 test("persistent TRANSIENT outage mid-run: retries a while, then interrupts once the recovery window elapses with no successful extend (no reclaim/duplicate run)", async () => {
   await Effect.runPromise(
     Effect.gen(function* () {

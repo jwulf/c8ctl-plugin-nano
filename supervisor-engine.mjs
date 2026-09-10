@@ -324,8 +324,11 @@ export function createRawEngineClient(opts = {}) {
       // this module wire-testable and usable standalone).
       //
       // `leaseToken` (when present) is a TOP-LEVEL sibling of `changeset`/`jobKey`
-      // — NOT nested in the changeset — matching the Camunda v10 `JobUpdateRequest`
-      // (nanobpmn reads `body.lease_token`). It FENCES the extend: a superseded
+      // — NOT nested in the changeset — matching the Camunda v10 `JobUpdateRequest`.
+      // The wire field is camelCase `leaseToken` (the engine's `JobUpdateRequest`
+      // deserializes it via `#[serde(rename = "leaseToken")]` into its internal
+      // `lease_token` field), so BOTH the SDK and this raw PATCH send the same
+      // camelCase key. It FENCES the extend: a superseded
       // worker whose lease has been reassigned is rejected 409 (`JobLeaseMismatch`)
       // rather than renewing a lock it no longer owns, which is what let a reclaimed
       // agent job keep running and loop (empty transcript husks). Omitted when blank

@@ -98,14 +98,21 @@ test("heartbeat: the winner's lock is re-extended on the interval while the agen
       const fiber = yield* Effect.forkChild(
         dispatch(
           { engine, runner, registry: reg, logger: noopLogger, config: { recoveryWindowMs: 300_000, extendIntervalMs: 60_000 } },
-          job("J1", "a"),
+          job("J1", "a", "lease-J1"),
           worker!,
         ),
       );
 
       yield* TestClock.adjust(Duration.millis(130_000)); // ~2 interval fires + first extends
-      const extendsSoFar = engine.extended.filter((e) => e.jobKey === "J1").length;
-      assert.ok(extendsSoFar >= 3, `expected repeated extends, got ${extendsSoFar}`);
+      const j1Extends = engine.extended.filter((e) => e.jobKey === "J1");
+      assert.ok(j1Extends.length >= 3, `expected repeated extends, got ${j1Extends.length}`);
+      // Every extend — the winner AND each heartbeat beat — must carry the activation
+      // lease so a superseded worker's renewal deterministically 409s; a regression
+      // dropping job.leaseToken from the heartbeat path (not just the winner) fails here.
+      assert.ok(
+        j1Extends.every((e) => e.leaseToken === "lease-J1"),
+        "every heartbeat extend must thread job.leaseToken",
+      );
 
       yield* TestClock.adjust(Duration.millis(100_000)); // let the agent finish
       yield* Fiber.join(fiber);

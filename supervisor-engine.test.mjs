@@ -158,6 +158,35 @@ test("extendLock: delegates to the SDK's typed updateJob ({changeset:{timeout},j
   assert.equal(fetchImpl.calls.length, 0); // SDK path never issues a raw request
 });
 
+test("extendLock: threads the activation leaseToken as a TOP-LEVEL field on the SDK updateJob (fences a superseded worker)", async () => {
+  const calls = [];
+  const camunda = { updateJob: async (arg) => { calls.push(arg); } };
+  const engine = createRawEngineClient({ baseUrl: "http://engine:8080/v2", fetchImpl: makeFakeFetch([]), camunda });
+  await engine.extendLock("job-key-9", 300_000, "lease-abc");
+  // leaseToken is a sibling of changeset/jobKey, NOT nested in the changeset — the engine
+  // reads it from the request root and 409s (JobLeaseMismatch) if it is stale.
+  assert.deepEqual(calls, [{ changeset: { timeout: 300_000 }, jobKey: "job-key-9", leaseToken: "lease-abc" }]);
+});
+
+test("extendLock: threads the leaseToken as a TOP-LEVEL field in the raw PATCH body", async () => {
+  const fetchImpl = makeFakeFetch([{ status: 204 }]);
+  const engine = createRawEngineClient({ baseUrl: "http://engine:8080/v2", fetchImpl });
+  await engine.extendLock("job-key-9", 300_000, "lease-xyz");
+  assert.deepEqual(JSON.parse(fetchImpl.calls[0].init.body), { changeset: { timeout: 300_000 }, leaseToken: "lease-xyz" });
+});
+
+test("extendLock: a blank/absent leaseToken is OMITTED (preserves the unfenced operator/bulk extend path)", async () => {
+  const calls = [];
+  const camunda = { updateJob: async (arg) => { calls.push(arg); } };
+  const engine = createRawEngineClient({ baseUrl: "http://engine:8080/v2", fetchImpl: makeFakeFetch([{ status: 204 }]), camunda });
+  await engine.extendLock("j1", 1000, "   "); // whitespace-only == blank
+  await engine.extendLock("j2", 1000); // omitted entirely
+  assert.deepEqual(calls, [
+    { changeset: { timeout: 1000 }, jobKey: "j1" },
+    { changeset: { timeout: 1000 }, jobKey: "j2" },
+  ]);
+});
+
 test("extendLock: a 409 (reclaim race) on the raw path throws so dispatch declines to start", async () => {
   const fetchImpl = makeFakeFetch([{ status: 409, text: "job not activated" }]);
   const engine = createRawEngineClient({ baseUrl: "http://engine:8080", fetchImpl });

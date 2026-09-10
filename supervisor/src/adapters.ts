@@ -62,7 +62,7 @@ const toSupervisorError = (fallback: string) => (cause: unknown): SupervisorErro
  */
 export interface RawEngineClient {
   activate(req: ActivateRequest, signal?: AbortSignal): Promise<ReadonlyArray<ActivatedJob>>;
-  extendLock(jobKey: string, ms: number): Promise<void>;
+  extendLock(jobKey: string, ms: number, leaseToken?: string): Promise<void>;
   /** `POST /v2/jobs/{jobKey}/completion` — settle a job successfully with result `variables`. */
   complete(jobKey: string, variables?: Record<string, unknown>): Promise<void>;
   /** `POST /v2/jobs/{jobKey}/failure` — settle a job as failed (`retries > 0` re-queues, `0` incidents). */
@@ -88,9 +88,9 @@ export const makeEngineClient = (raw: RawEngineClient): EngineClient => ({
       try: (signal) => Promise.resolve(raw.activate(req, signal)),
       catch: toSupervisorError(`activate ${req.type} failed`),
     }),
-  extendLock: (jobKey, ms) =>
+  extendLock: (jobKey, ms, leaseToken) =>
     Effect.tryPromise({
-      try: () => Promise.resolve(raw.extendLock(jobKey, ms)).then(() => undefined),
+      try: () => Promise.resolve(raw.extendLock(jobKey, ms, leaseToken)).then(() => undefined),
       catch: toSupervisorError(`extendLock ${jobKey} failed`),
     }),
   complete: (jobKey, variables) =>

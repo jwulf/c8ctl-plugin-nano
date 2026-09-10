@@ -69,7 +69,7 @@ export const dispatch = (
     // (a) Extend the winner FIRST. A failure here means the short lock likely
     // lapsed and the job was reclaimed — do not start; give the slot straight back.
     const extended = yield* engine
-      .extendLock(job.jobKey, config.recoveryWindowMs)
+      .extendLock(job.jobKey, config.recoveryWindowMs, job.leaseToken)
       .pipe(
         Effect.as(true),
         Effect.catch((err: SupervisorError) => {
@@ -92,7 +92,7 @@ export const dispatch = (
       // interval before the first beat, then repeat on the cadence — this drops
       // one engine call on every job start.
       const beat = engine
-        .extendLock(job.jobKey, config.recoveryWindowMs)
+        .extendLock(job.jobKey, config.recoveryWindowMs, job.leaseToken)
         .pipe(
           // Log (and continue) when a heartbeat extend fails, rather than
           // silently swallowing it — an invisible extend outage makes

@@ -95,8 +95,13 @@ export interface EngineClient {
    * duration-from-now, so calls set rather than accumulate). Used to extend the
    * winner to the recovery window, then to heartbeat it. A failure here on the
    * winner's first extend means the lock likely raced a reclaim — do not start.
+   *
+   * `leaseToken` (the activation's {@link ActivatedJob.leaseToken}) FENCES the
+   * extend when present: a superseded worker whose lease was reassigned is
+   * rejected 409 (`JobLeaseMismatch`) instead of renewing a lock it no longer
+   * owns. Omitted/blank preserves the unfenced path.
    */
-  extendLock(jobKey: string, ms: number): Effect.Effect<void, SupervisorError>;
+  extendLock(jobKey: string, ms: number, leaseToken?: string): Effect.Effect<void, SupervisorError>;
   /**
    * `POST /v2/jobs/{jobKey}/completion` — SETTLE a job successfully, merging the
    * agent's result `variables` onto the process instance. The supervisor owns the

@@ -96,6 +96,18 @@ function isPlainObjectMap(v) {
 }
 
 /**
+ * A non-blank lease token — the opaque per-activation `leaseToken` the engine
+ * stamps on an agent job. When present it fences a post-activation command
+ * (`updateJob`/complete/fail) so a SUPERSEDED worker's call is rejected 409
+ * (`JobLeaseMismatch`) instead of silently mutating a job it no longer owns. A
+ * blank/absent token is OMITTED so the unfenced operator/bulk path (the engine
+ * treats a missing token as "always applies") is preserved untouched.
+ */
+function isNonBlankString(v) {
+  return typeof v === "string" && v.trim() !== "";
+}
+
+/**
  * Map one raw v2 activated-job record to the port's {@link ActivatedJob}. Keys are
  * strings in v2. A record missing `jobKey`/`type` violates the `ActivatedJob`
  * contract (an empty key would produce `PATCH .../jobs//timeout`; an empty type
@@ -304,22 +316,35 @@ export function createRawEngineClient(opts = {}) {
       return jobs.map(mapJob);
     },
 
-    async extendLock(jobKey, ms) {
+    async extendLock(jobKey, ms, leaseToken) {
       // Prefer the SDK's typed `updateJob` (operationId `updateJob` →
       // `PATCH /v2/jobs/{jobKey}` with `{ changeset: { timeout } }`) so the lock
       // extension tracks the engine contract instead of a hand-rolled URL. Fall
       // back to the SAME call issued raw when no SDK client is injected (keeps
       // this module wire-testable and usable standalone).
+      //
+      // `leaseToken` (when present) is a TOP-LEVEL sibling of `changeset`/`jobKey`
+      // — NOT nested in the changeset — matching the Camunda v10 `JobUpdateRequest`
+      // (nanobpmn reads `body.lease_token`). It FENCES the extend: a superseded
+      // worker whose lease has been reassigned is rejected 409 (`JobLeaseMismatch`)
+      // rather than renewing a lock it no longer owns, which is what let a reclaimed
+      // agent job keep running and loop (empty transcript husks). Omitted when blank
+      // so the unfenced operator/bulk path is unchanged.
+      const fence = isNonBlankString(leaseToken) ? { leaseToken } : {};
       if (camunda && typeof camunda.updateJob === "function") {
         try {
-          await camunda.updateJob({ changeset: { timeout: ms }, jobKey: String(jobKey) });
+          await camunda.updateJob({ changeset: { timeout: ms }, jobKey: String(jobKey), ...fence });
           return;
         } catch (err) {
           throw new Error(`extendLock ${jobKey}: SDK updateJob failed: ${err?.message ?? err}`, { cause: err });
         }
       }
       const url = `${base}/jobs/${encodeURIComponent(jobKey)}`;
-      const res = await call(url, { method: "PATCH", body: JSON.stringify({ changeset: { timeout: ms } }) }, 15_000);
+      const res = await call(
+        url,
+        { method: "PATCH", body: JSON.stringify({ changeset: { timeout: ms }, ...fence }) },
+        15_000,
+      );
       if (!res || !res.ok) {
         const status = res ? res.status : "?";
         throw new Error(`extendLock ${jobKey}: HTTP ${status} from ${url}${res ? await readErrorBody(res) : ""}`);

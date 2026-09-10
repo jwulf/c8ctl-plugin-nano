@@ -35,6 +35,31 @@ test("happy path: winner is extended to the recovery window before the agent run
   );
 });
 
+test("winner extend is lease-fenced: the job's activation leaseToken is threaded to extendLock", async () => {
+  await Effect.runPromise(
+    Effect.gen(function* () {
+      const engine = engineOk();
+      const runner = makeRunner(0);
+      const reg = yield* makeRegistry();
+      yield* reg.add("w1", ["a"], 1);
+      const worker = yield* reg.claim("a");
+
+      yield* dispatch(
+        { engine, runner, registry: reg, logger: noopLogger, config: defaultDispatchConfig },
+        job("J1", "a", "lease-J1"),
+        worker!,
+      );
+
+      // The winner extend (invariant a) carries the activation lease so a superseded
+      // worker's extend deterministically 409s instead of silently renewing a lock it lost.
+      assert.ok(
+        engine.extended.some((e) => e.jobKey === "J1" && e.leaseToken === "lease-J1"),
+        "winner extend must thread job.leaseToken",
+      );
+    }).pipe(Effect.provide(TestClock.layer())),
+  );
+});
+
 test("winner-extend races a reclaim: extend fails → do NOT start the agent; slot released", async () => {
   await Effect.runPromise(
     Effect.gen(function* () {

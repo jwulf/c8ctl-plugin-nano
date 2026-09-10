@@ -40,9 +40,10 @@
     "lint": "node --check c8ctl-plugin.js",
     "typecheck:supervisor": "tsc -p supervisor/tsconfig.json",
     "build:supervisor": "node supervisor/build.mjs",
+    "check:bundle": "node scripts/check-bundle.mjs",
     "vendor:effect": "node scripts/vendor-effect.mjs",
     "test:supervisor": "node --experimental-strip-types --test supervisor/test/*.test.ts",
-    "test": "node --check c8ctl-plugin.js && npm run typecheck:supervisor && npm run build:supervisor && npm run test:supervisor && node --test --test-timeout=120000 --test-force-exit",
+    "test": "npm run check:bundle && node --check c8ctl-plugin.js && npm run typecheck:supervisor && npm run test:supervisor && node --test --test-timeout=120000 --test-force-exit",
     "prepublishOnly": "npm run typecheck:supervisor && npm run build:supervisor"
   },
   "license": "MIT",

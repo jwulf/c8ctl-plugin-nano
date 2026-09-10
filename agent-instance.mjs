@@ -311,7 +311,7 @@ export function createAgentInstanceProducer(opts = {}) {
       const def = deriveAgentDefinition({ profile, envelope });
       const configTurn = {
         historyItemId: `configuration:${elementInstanceKey}`,
-        loopIteration: 0,
+        loopIteration: 1,
         role: 'CONFIGURATION',
         content: [],
         producedAt: iso(),

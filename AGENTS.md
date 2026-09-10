@@ -223,7 +223,12 @@ every other code path stays Effect-free.
   run in `npm test`, alongside the existing `node --check` + `node --test`. Tests
   are **red-first, deterministic** — drive time via `TestClock`, never wall-clock
   sleeps or `flaky`. Rebuild the committed `supervisor.dist.js` whenever you touch
-  `supervisor/src/**` (CI and `prepublishOnly` rebuild it too).
+  `supervisor/src/**` (CI and `prepublishOnly` rebuild it too). `npm test` runs
+  `npm run check:bundle` **first** — it rebuilds the bundle from source and
+  `git diff`s it against the committed copy, so a stale `supervisor.dist.js`
+  **reddens CI** rather than being silently rebuilt later in the same `npm test`
+  run; on failure it tells you to run `npm run build:supervisor` and commit the
+  result.
 
 ### Writing Effect (v4) — read the vendored source first
 

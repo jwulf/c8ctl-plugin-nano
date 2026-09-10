@@ -318,6 +318,56 @@ test("fail: an SDK failJob rejection surfaces so the settle is retried/mapped", 
   await assert.rejects(() => engine.fail("j9", { retries: 0 }), /fail j9: SDK failJob failed.*500/s);
 });
 
+test("complete: threads the activation leaseToken as a TOP-LEVEL field on the SDK completeJob (fences a superseded worker)", async () => {
+  const calls = [];
+  const camunda = { completeJob: async (arg) => { calls.push(arg); } };
+  const engine = createRawEngineClient({ baseUrl: "http://engine:8080", fetchImpl: makeFakeFetch([]), camunda });
+  await engine.complete("job-7", { status: "opened" }, "lease-abc");
+  // leaseToken is a sibling of jobKey/variables — the engine validates the completion with
+  // required=true, so the matching activation token must ride at the top level.
+  assert.deepEqual(calls, [{ jobKey: "job-7", variables: { status: "opened" }, leaseToken: "lease-abc" }]);
+});
+
+test("complete: threads the leaseToken as a TOP-LEVEL field in the raw completion body", async () => {
+  const fetchImpl = makeFakeFetch([{ status: 204 }]);
+  const engine = createRawEngineClient({ baseUrl: "http://engine:8080", fetchImpl });
+  await engine.complete("job-7", { status: "opened" }, "lease-xyz");
+  assert.deepEqual(JSON.parse(fetchImpl.calls[0].init.body), { variables: { status: "opened" }, leaseToken: "lease-xyz" });
+});
+
+test("complete: a blank/absent leaseToken is OMITTED (a non-leased job needs no fence)", async () => {
+  const calls = [];
+  const camunda = { completeJob: async (arg) => { calls.push(arg); } };
+  const engine = createRawEngineClient({ baseUrl: "http://engine:8080", fetchImpl: makeFakeFetch([]), camunda });
+  await engine.complete("j1", { a: 1 }, "   "); // whitespace-only == blank
+  await engine.complete("j2", { a: 1 }); // omitted entirely
+  assert.deepEqual(calls, [{ jobKey: "j1", variables: { a: 1 } }, { jobKey: "j2", variables: { a: 1 } }]);
+});
+
+test("fail: threads the activation leaseToken as a TOP-LEVEL field on the SDK failJob (fences a superseded worker)", async () => {
+  const calls = [];
+  const camunda = { failJob: async (arg) => { calls.push(arg); } };
+  const engine = createRawEngineClient({ baseUrl: "http://engine:8080", fetchImpl: makeFakeFetch([]), camunda });
+  await engine.fail("job-3", { retries: 2, errorMessage: "boom", leaseToken: "lease-abc" });
+  assert.deepEqual(calls, [{ jobKey: "job-3", retries: 2, errorMessage: "boom", leaseToken: "lease-abc" }]);
+});
+
+test("fail: threads the leaseToken as a TOP-LEVEL field in the raw failure body", async () => {
+  const fetchImpl = makeFakeFetch([{ status: 204 }]);
+  const engine = createRawEngineClient({ baseUrl: "http://engine:8080", fetchImpl });
+  await engine.fail("job-3", { retries: 1, leaseToken: "lease-xyz" });
+  assert.deepEqual(JSON.parse(fetchImpl.calls[0].init.body), { retries: 1, leaseToken: "lease-xyz" });
+});
+
+test("fail: a blank/absent leaseToken is OMITTED (a non-leased job needs no fence)", async () => {
+  const calls = [];
+  const camunda = { failJob: async (arg) => { calls.push(arg); } };
+  const engine = createRawEngineClient({ baseUrl: "http://engine:8080", fetchImpl: makeFakeFetch([]), camunda });
+  await engine.fail("j1", { retries: 1, leaseToken: "   " }); // whitespace-only == blank
+  await engine.fail("j2", { retries: 1 }); // omitted entirely
+  assert.deepEqual(calls, [{ jobKey: "j1", retries: 1 }, { jobKey: "j2", retries: 1 }]);
+});
+
 test("activate: delegates to the SDK's typed activateJobs (1:1 body) and maps the batch", async () => {
   const calls = [];
   const camunda = {

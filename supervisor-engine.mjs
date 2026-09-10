@@ -363,23 +363,31 @@ export function createRawEngineClient(opts = {}) {
     // SDK rejection (e.g. a 409 when the lock lapsed and the job was reclaimed)
     // surfaces as a rejected promise for the port to map.
 
-    async complete(jobKey, variables) {
+    async complete(jobKey, variables, leaseToken) {
       // Prefer the SDK's typed `completeJob` (operationId `completeJob` →
       // `POST /v2/jobs/{jobKey}/completion` with `{ variables }`) when a `camunda`
       // SDK client is injected, else the SAME call issued raw via `fetchImpl`. The
       // result-variable map the model produced is merged onto the process
       // instance. C8 v2 answers 204 No Content on success.
+      //
+      // `leaseToken` (top-level, like the extend) FENCES the completion: the engine
+      // validates it with `required=true`, so for a LEASED job the matching token
+      // MUST be supplied — a superseded worker (whose token rotated when the job was
+      // re-activated) is rejected `JobLeaseMismatch`, never clobbering the newer
+      // activation's result. A non-leased job carries no `job.leaseToken`, so the
+      // field is omitted and no token is required.
       const vars = isPlainObjectMap(variables) ? { variables } : {};
+      const fence = isNonBlankString(leaseToken) ? { leaseToken } : {};
       if (camunda && typeof camunda.completeJob === "function") {
         try {
-          await camunda.completeJob({ jobKey: String(jobKey), ...vars });
+          await camunda.completeJob({ jobKey: String(jobKey), ...vars, ...fence });
           return;
         } catch (err) {
           throw new Error(`complete ${jobKey}: SDK completeJob failed: ${err?.message ?? err}`, { cause: err });
         }
       }
       const url = `${base}/jobs/${encodeURIComponent(jobKey)}/completion`;
-      const res = await call(url, { method: "POST", body: JSON.stringify(vars) }, 15_000);
+      const res = await call(url, { method: "POST", body: JSON.stringify({ ...vars, ...fence }) }, 15_000);
       if (!res || !res.ok) {
         const status = res ? res.status : "?";
         throw new Error(`complete ${jobKey}: HTTP ${status} from ${url}${res ? await readErrorBody(res) : ""}`);
@@ -390,7 +398,7 @@ export function createRawEngineClient(opts = {}) {
       // Tolerate a `null` opts the same as `undefined` (mirrors `complete`'s
       // null-safe `variables`), so a caller passing `null` never trips the
       // signature-destructure TypeError.
-      const { retries = 0, errorMessage, retryBackOff, variables } = opts || {};
+      const { retries = 0, errorMessage, retryBackOff, variables, leaseToken } = opts || {};
       // Normalize retries to a non-negative integer (mirrors `mapJob`), so a
       // string/float/negative never reaches the engine (or SDK) as an invalid
       // count. `retries > 0` re-queues for another attempt, `retries === 0`
@@ -402,6 +410,10 @@ export function createRawEngineClient(opts = {}) {
       if (errorMessage !== undefined && errorMessage !== null) extra.errorMessage = String(errorMessage);
       if (Number.isFinite(retryBackOff) && retryBackOff > 0) extra.retryBackOff = retryBackOff;
       if (isPlainObjectMap(variables)) extra.variables = variables;
+      // Same lease fencing as `complete` (engine validates `failJob` with
+      // `required=true`): a leased job's failure must carry the matching token or a
+      // superseded worker's fail is rejected; omitted for a non-leased job.
+      if (isNonBlankString(leaseToken)) extra.leaseToken = leaseToken;
       // Prefer the SDK's typed `failJob` (operationId `failJob` →
       // `POST /v2/jobs/{jobKey}/failure`) when a `camunda` SDK client is injected,
       // else the SAME call issued raw via `fetchImpl`. C8 v2 answers 204.

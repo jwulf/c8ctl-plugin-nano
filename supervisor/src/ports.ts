@@ -110,12 +110,22 @@ export interface EngineClient {
    * SDK job object's `job.complete()` the per-type poller path uses. A rejection
    * (e.g. a 409 when the lock already lapsed and the job was reclaimed) surfaces
    * as a {@link SupervisorError} for the runner to map, never a crash.
+   *
+   * `leaseToken` (the activation's {@link ActivatedJob.leaseToken}) FENCES the
+   * completion: the engine validates it as REQUIRED for a leased job, so a
+   * superseded worker (whose token rotated on re-activation) is rejected rather
+   * than clobbering the newer activation's result. Omitted for a non-leased job.
    */
-  complete(jobKey: string, variables?: Record<string, unknown>): Effect.Effect<void, SupervisorError>;
+  complete(
+    jobKey: string,
+    variables?: Record<string, unknown>,
+    leaseToken?: string,
+  ): Effect.Effect<void, SupervisorError>;
   /**
    * `POST /v2/jobs/{jobKey}/failure` — SETTLE a job as failed. `retries > 0`
    * re-queues for another attempt; `retries === 0` raises an incident. Optional
-   * `errorMessage`/`retryBackOff`/`variables` are applied when present. The
+   * `errorMessage`/`retryBackOff`/`variables` are applied when present, and
+   * `leaseToken` fences the failure exactly as {@link EngineClient.complete}. The
    * analogue of the SDK job object's `job.fail()`; a rejection surfaces as a
    * {@link SupervisorError}.
    */
@@ -126,6 +136,7 @@ export interface EngineClient {
       readonly errorMessage?: string;
       readonly retryBackOff?: number;
       readonly variables?: Record<string, unknown>;
+      readonly leaseToken?: string;
     },
   ): Effect.Effect<void, SupervisorError>;
 }

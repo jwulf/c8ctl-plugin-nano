@@ -3424,7 +3424,7 @@ async function createSupervisorDeps(opts = {}) {
   // the runtime uses (activate/extendLock), and any future port instrumentation
   // covers the settle path too.
   const settle = {
-    complete: (jobKey, variables) => rt.Effect.runPromise(engine.complete(jobKey, variables)),
+    complete: (jobKey, variables, leaseToken) => rt.Effect.runPromise(engine.complete(jobKey, variables, leaseToken)),
     fail: (jobKey, opts2) => rt.Effect.runPromise(engine.fail(jobKey, opts2)),
   };
 
@@ -7771,7 +7771,7 @@ async function workAgent(req, flags) {
   // dispatch claim/release lifecycle keyed by this worker's instance drives the
   // cockpit's jobKeys — so the recorders no longer poke a per-process channel.
   const recordJobStart = (job, jobType) => {
-    activeJobs.set(String(job.jobKey), { type: jobType, since: Date.now(), retries: Number(job.retries) });
+    activeJobs.set(String(job.jobKey), { type: jobType, since: Date.now(), retries: Number(job.retries), leaseToken: job.leaseToken });
     writeActivity();
   };
   const recordJobEnd = (job) => {
@@ -8416,7 +8416,26 @@ async function workAgent(req, flags) {
       dispatch: { recoveryWindowMs, extendIntervalMs: lockExtendIntervalMs },
     },
   });
-  settle = composed.settle;
+  // Lease-fence every settle: a leased job's complete/fail MUST carry its
+  // activation lease token (the engine validates these commands with
+  // required=true), so a superseded worker is rejected (JobLeaseMismatch)
+  // instead of clobbering the newer activation. The token is looked up from
+  // activeJobs by jobKey (recorded at recordJobStart); an explicit token
+  // (or opts.leaseToken) wins. A non-leased job has no token → omitted, and the
+  // engine accepts an unfenced settle. The force-stop yield path (below) passes
+  // the captured token explicitly because activeJobs may already be cleared by
+  // the interrupted runner's finally.
+  const composedSettle = composed.settle;
+  const leaseFor = (jobKey) => activeJobs.get(String(jobKey))?.leaseToken;
+  settle = {
+    complete: (jobKey, variables, leaseToken) =>
+      composedSettle.complete(jobKey, variables, leaseToken ?? leaseFor(jobKey)),
+    fail: (jobKey, opts2) =>
+      composedSettle.fail(
+        jobKey,
+        opts2 && opts2.leaseToken ? opts2 : { ...(opts2 || {}), leaseToken: leaseFor(jobKey) },
+      ),
+  };
   const {
     deps: supervisorDeps,
     registry: workerRegistry,
@@ -8611,7 +8630,7 @@ async function workAgent(req, flags) {
       logger.info(`Received ${signal} — aborting in-flight work and stopping worker...`);
       // Snapshot in-flight jobs (with their retry budget) BEFORE the interrupt
       // clears the ownership registry, so we can yield each one afterwards.
-      const inflight = [...activeJobs.entries()].map(([jobKey, info]) => ({ jobKey, retries: info?.retries }));
+      const inflight = [...activeJobs.entries()].map(([jobKey, info]) => ({ jobKey, retries: info?.retries, leaseToken: info?.leaseToken }));
       // Interrupt the runtime: this aborts each running job's AbortSignal (the
       // makeJobRunner seam) so runAgentJob killTree's the harness process group,
       // and runs dispatch's bracketed teardown (release ownership + slot). The
@@ -8625,12 +8644,13 @@ async function workAgent(req, flags) {
       // Yield each in-flight job so the broker re-activates it at once (retries
       // preserved — a force-stop doesn't consume an attempt). Best-effort: a
       // failed yield just lets the lock lapse (the honest fallback).
-      for (const { jobKey, retries } of inflight) {
+      for (const { jobKey, retries, leaseToken } of inflight) {
         try {
           await SupervisorEffect.runPromise(settle.fail(jobKey, {
             errorMessage: `worker force-stopped (${signal}); job yielded for retry`,
             retries: Number.isFinite(retries) && retries > 0 ? retries : 1,
             retryBackOff: 0,
+            leaseToken,
           }));
           logger.info(`  yielded job ${jobKey} for immediate retry.`);
         } catch (err) {

@@ -16,8 +16,9 @@
  *  (b) **never touch a parked/lapsed job again** — losers are dropped upstream in
  *      activation and never reach here, so a late complete/fail can't 409.
  */
-import { Duration, Effect } from "effect";
-import type { ActivatedJob, EngineClient, JobRunner, Logger, SupervisorError } from "./ports.ts";
+import { Duration, Effect, Ref } from "effect";
+import type { ActivatedJob, EngineClient, JobRunner, Logger } from "./ports.ts";
+import { SupervisorError } from "./ports.ts";
 import type { Registry } from "./registry.ts";
 import type { OwnershipContext } from "./ownership.ts";
 import { withOwnedJob } from "./ownership.ts";
@@ -135,36 +136,52 @@ export const dispatch = (
     const lostLock = yield* Effect.gen(function* () {
       // One heartbeat beat: wait an interval, then SET the lock to the recovery
       // window (lease-fenced with `job.leaseToken`). Resilience is the whole point
-      // here — this fiber must NOT die silently and stop renewing:
-      //   * a TRANSIENT typed failure (5xx / 429 / network blip) is logged and
-      //     swallowed so the next beat still fires;
-      //   * a DEFECT (e.g. the deployed `Not a valid effect: [object Promise]`,
-      //     which a typed-only `Effect.catch` would let escape and KILL the fiber)
-      //     is caught via `catchDefect` and swallowed the same way;
+      // here — this fiber must NOT die silently and stop renewing, but it must also
+      // NOT keep an agent alive past its lock:
       //   * a TERMINAL renewal error (`isTerminalRenewalError`: a definitive
       //     lease-loss OR a permanent 400/401/403 that retrying can never fix) is
-      //     re-raised, ending the `forever` loop so the race interrupts the run —
-      //     because the lock cannot be held, continuing the agent only invites the
-      //     broker to reclaim and re-run the job.
+      //     re-raised IMMEDIATELY, ending the `forever` loop so the race interrupts
+      //     the run;
+      //   * a SPORADIC failure — a transient typed error (5xx / 429 / network blip)
+      //     or a DEFECT (e.g. the deployed `Not a valid effect: [object Promise]`,
+      //     which a typed-only `Effect.catch` would let escape and KILL the fiber)
+      //     — is logged and retried, BUT bounded: we track how long it has been
+      //     since the last SUCCESSFUL extend and, once that reaches the recovery
+      //     window, the lock has lapsed (the broker will reclaim and re-run the
+      //     job) so we stop retrying and interrupt the agent. A persistent outage
+      //     is therefore treated as a lease loss the moment the lock can no longer
+      //     be guaranteed — a sporadic blip still just retries.
+      // `sinceOkMs` accumulates the inter-beat interval on each failed beat and
+      // resets to 0 on each success. Under the deterministic TestClock (where the
+      // extend itself takes 0ms) this is exactly wall-time-since-last-success.
+      const sinceOkRef = yield* Ref.make(0);
+      const retryUnlessLapsed = (reason: string) =>
+        Ref.updateAndGet(sinceOkRef, (s) => s + config.extendIntervalMs).pipe(
+          Effect.flatMap((sinceOk) =>
+            // If the NEXT beat would land at/after the window, the lock is (about
+            // to be) lapsed — give up now, a beat BEFORE expiry, rather than run
+            // the agent on unlocked.
+            sinceOk + config.extendIntervalMs >= config.recoveryWindowMs
+              ? Effect.fail(
+                  new SupervisorError(
+                    `job ${job.jobKey}: lock lapsed — no successful extend in ${sinceOk}ms (recovery window ${config.recoveryWindowMs}ms); last error: ${reason}`,
+                  ),
+                )
+              : Effect.sync(() =>
+                  logger.warn(
+                    `[${job.type}] job ${job.jobKey}: heartbeat extend failed (transient, retrying) — ${reason}`,
+                  ),
+                ),
+          ),
+        );
       const beatOnce = Effect.sleep(Duration.millis(config.extendIntervalMs)).pipe(
         Effect.flatMap(() =>
           engine.extendLock(job.jobKey, config.recoveryWindowMs, job.leaseToken).pipe(
+            Effect.flatMap(() => Ref.set(sinceOkRef, 0)),
             Effect.catch((err: SupervisorError) =>
-              isTerminalRenewalError(err)
-                ? Effect.fail(err)
-                : Effect.sync(() =>
-                    logger.warn(
-                      `[${job.type}] job ${job.jobKey}: heartbeat extend failed (transient, retrying) — ${err.message}`,
-                    ),
-                  ),
+              isTerminalRenewalError(err) ? Effect.fail(err) : retryUnlessLapsed(err.message),
             ),
-            Effect.catchDefect((defect) =>
-              Effect.sync(() =>
-                logger.warn(
-                  `[${job.type}] job ${job.jobKey}: heartbeat extend defect (ignored, retrying) — ${defectText(defect)}`,
-                ),
-              ),
-            ),
+            Effect.catchDefect((defect) => retryUnlessLapsed(defectText(defect))),
           ),
         ),
       );

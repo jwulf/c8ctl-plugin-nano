@@ -9,7 +9,7 @@
  */
 import assert from "node:assert/strict";
 import { test } from "node:test";
-import { createSupervisorDeps } from "./c8ctl-plugin.js";
+import { bindJobSettle, createSupervisorDeps } from "./c8ctl-plugin.js";
 
 const sleep = (ms) => new Promise((r) => setTimeout(r, ms));
 
@@ -228,6 +228,34 @@ test("createSupervisorDeps: the settle seam FENCES complete/fail — the activat
   await settle.fail("job-f", { retries: 1, errorMessage: "boom", leaseToken: "lease-f" });
   assert.deepEqual(completions, [{ variables: { status: "opened" }, leaseToken: "lease-c" }]);
   assert.deepEqual(failures, [{ retries: 1, errorMessage: "boom", leaseToken: "lease-f" }]);
+});
+
+test("bindJobSettle: each bound settler fences with ITS OWN activation's leaseToken — two same-jobKey activations never cross tokens", async () => {
+  // Regression guard for the TOCTOU the runner's closure-capture prevents: the
+  // token that fences a settlement must come from the activation that ran, not a
+  // shared-map re-read that a same-key reactivation could have overwritten. Two
+  // activations SHARE jobKey "J" but carry different lease tokens; each bound
+  // settler must use its own — a mix-up would let a stale run's completion fence
+  // (and clobber) the newer activation.
+  const calls = [];
+  const settle = {
+    complete: (jobKey, variables, leaseToken) => calls.push({ op: "complete", jobKey, variables, leaseToken }),
+    fail: (jobKey, opts) => calls.push({ op: "fail", jobKey, ...opts }),
+  };
+  const older = bindJobSettle(settle, { jobKey: "J", leaseToken: "lease-OLD" });
+  const newer = bindJobSettle(settle, { jobKey: "J", leaseToken: "lease-NEW" });
+
+  older.complete({ a: 1 });
+  newer.complete({ a: 2 });
+  older.fail({ retries: 3, errorMessage: "x" });
+  newer.fail();
+
+  assert.deepEqual(calls, [
+    { op: "complete", jobKey: "J", variables: { a: 1 }, leaseToken: "lease-OLD" },
+    { op: "complete", jobKey: "J", variables: { a: 2 }, leaseToken: "lease-NEW" },
+    { op: "fail", jobKey: "J", retries: 3, errorMessage: "x", leaseToken: "lease-OLD" },
+    { op: "fail", jobKey: "J", leaseToken: "lease-NEW" },
+  ]);
 });
 
 test("createSupervisorDeps: derives engine authHeaders from camunda.getAuthHeaders() when no explicit headers/token", async () => {

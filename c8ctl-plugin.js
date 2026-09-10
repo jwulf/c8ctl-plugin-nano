@@ -3323,6 +3323,23 @@ async function createAgenticEndpoint(opts) {
 // @param {typeof fetch} [opts.fetchImpl] injected fetch (tests)
 // @param {NodeJS.ProcessEnv} [opts.env]
 // @returns {Promise<{ deps: object, registry: object, settle: { complete: Function, fail: Function }, makeSupervisor: Function, Effect: object, Fiber: object }>}
+// Bind a settle seam to a SINGLE activation's lease token, captured from `job`
+// in closure scope. A settlement is thereby fenced with the exact activation
+// that ran — NOT a token re-read from a shared activeJobs map at settle time: a
+// same-key reactivation can overwrite that entry while an interrupted runner is
+// still unwinding, so a map lookup could fence the completion with the WRONG
+// (newer) token and clobber the new activation — the very lease bypass this
+// fence exists to prevent. `job.leaseToken` in the returned closures cannot drift.
+// @param {{ complete: Function, fail: Function }} settle  the raw settle seam
+// @param {{ jobKey: string, leaseToken?: string }} job    the activation whose lease fences the settlement
+// @returns {{ complete: (variables:any)=>any, fail: (opts?:object)=>any }}
+function bindJobSettle(settle, job) {
+  return {
+    complete: (variables) => settle.complete(job.jobKey, variables, job.leaseToken),
+    fail: (opts2) => settle.fail(job.jobKey, { ...(opts2 || {}), leaseToken: job.leaseToken }),
+  };
+}
+
 async function createSupervisorDeps(opts = {}) {
   const {
     runner,
@@ -7981,10 +7998,7 @@ async function workAgent(req, flags) {
       // is still unwinding, so a map lookup could fence the completion with the
       // WRONG (newer) token and clobber the new activation — the very lease bypass
       // this fence exists to prevent. `job.leaseToken` in the closure cannot drift.
-      const settleJob = {
-        complete: (variables) => settle.complete(job.jobKey, variables, job.leaseToken),
-        fail: (opts2) => settle.fail(job.jobKey, { ...(opts2 || {}), leaseToken: job.leaseToken }),
-      };
+      const settleJob = bindJobSettle(settle, job);
       try {
         logger.info(`[${jobType}] job ${job.jobKey} (instance ${job.processInstanceKey ?? '-'}) → ${buildAgentCommandLine(profile.command, effectiveArgs)}`);
 
@@ -13887,6 +13901,7 @@ export {
   loadSupervisorRuntime,
   createAgenticEndpoint,
   createSupervisorDeps,
+  bindJobSettle,
   enableEngineHappyEyeballs,
   preferIpv4Resolution,
   isLikelyLocalNetworkTccBlock,

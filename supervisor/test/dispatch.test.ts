@@ -231,8 +231,62 @@ test("isLeaseLostError: definitive ownership-loss signals stop the heartbeat; tr
   for (const m of transient) assert.equal(isLeaseLostError(new SupervisorError(m)), false, m);
 });
 
-test("renewal permanently impossible mid-run: a persistent 401/403/400 on a heartbeat INTERRUPTS the agent (never retries forever into a reclaim)", async () => {
+test("persistent TRANSIENT outage mid-run: retries a while, then interrupts once the recovery window elapses with no successful extend (no reclaim/duplicate run)", async () => {
   await Effect.runPromise(
+    Effect.gen(function* () {
+      let extendCalls = 0;
+      let finished = false;
+      const engine = makeEngine({
+        activate: () => Effect.succeed([]),
+        extend: () => {
+          extendCalls += 1;
+          // Winner extend (call 1) succeeds so the agent STARTS; every heartbeat
+          // beat thereafter hits a TRANSIENT 503. Each is individually retryable,
+          // but once the window (300s) passes with no successful extend the lock
+          // has lapsed — the beat must stop retrying and interrupt the agent rather
+          // than let it run on unlocked into a broker reclaim + duplicate run.
+          return extendCalls === 1
+            ? Effect.void
+            : failing("extendLock J1: HTTP 503 from http://engine/v2/jobs/J1 — engine unavailable");
+        },
+      });
+      const runner = {
+        ran: [] as string[],
+        run: (j: { jobKey: string }) =>
+          Effect.sync(() => runner.ran.push(j.jobKey)).pipe(
+            Effect.flatMap(() => Effect.sleep(Duration.millis(10_000_000))),
+            Effect.flatMap(() => Effect.sync(() => { finished = true; })),
+          ),
+      };
+      const reg = yield* makeRegistry();
+      yield* reg.add("w1", ["a"], 1);
+      const worker = yield* reg.claim("a");
+
+      const fiber = yield* Effect.forkChild(
+        dispatch(
+          { engine, runner, registry: reg, logger: noopLogger, config: { recoveryWindowMs: 300_000, extendIntervalMs: 60_000 } },
+          job("J1", "a", "lease-J1"),
+          worker!,
+        ),
+      );
+
+      // Advance a full window of continuous failure (5 × 60s beats).
+      yield* TestClock.adjust(Duration.millis(300_000));
+      const outcome = yield* Fiber.join(fiber);
+
+      assert.deepEqual(runner.ran, ["J1"], "agent started");
+      // It DID keep retrying transient blips (not give up on the first one) …
+      assert.ok(extendCalls >= 4, `expected several retries before giving up, got ${extendCalls}`);
+      // … but interrupted once the lock could no longer be held, never running on.
+      assert.equal(finished, false, "agent was INTERRUPTED at window expiry, not run to completion");
+      assert.equal(outcome.started, true);
+      assert.equal(outcome.reason, "lock-lost");
+      assert.deepEqual(yield* reg.pollTypes, ["a"], "slot released after the lapsed run stopped");
+    }).pipe(Effect.provide(TestClock.layer())),
+  );
+});
+
+test("renewal permanently impossible mid-run: a persistent 401/403/400 on a heartbeat INTERRUPTS the agent (never retries forever into a reclaim)", async () => {  await Effect.runPromise(
     Effect.gen(function* () {
       let extendCalls = 0;
       let finished = false;

@@ -72,19 +72,21 @@ test("makeEngineClient: a rejected activate becomes a SupervisorError (not a def
 });
 
 test("makeEngineClient: extendLock resolves void and normalizes a non-void resolution", async () => {
-  const calls: Array<{ jobKey: string; ms: number }> = [];
+  const calls: Array<{ jobKey: string; ms: number; leaseToken?: string }> = [];
   const raw: RawEngineClient = {
     activate: async () => [],
     // Resolve a truthy non-void value to prove the lift normalizes to `void`.
     ...noSettle,
-    extendLock: async (jobKey, ms) => {
-      calls.push({ jobKey, ms });
+    extendLock: async (jobKey, ms, leaseToken) => {
+      calls.push({ jobKey, ms, leaseToken });
       return "ok" as unknown as void;
     },
   };
-  const out = await Effect.runPromise(makeEngineClient(raw).extendLock("j9", 300_000));
+  const out = await Effect.runPromise(makeEngineClient(raw).extendLock("j9", 300_000, "lease-j9"));
   assert.equal(out, undefined);
-  assert.deepEqual(calls, [{ jobKey: "j9", ms: 300_000 }]);
+  // The adapter must forward the activation lease token as the third argument, else
+  // the fence is silently dropped before the raw client ever sees it.
+  assert.deepEqual(calls, [{ jobKey: "j9", ms: 300_000, leaseToken: "lease-j9" }]);
 });
 
 test("makeEngineClient: a rejected extendLock becomes a SupervisorError", async () => {
@@ -102,20 +104,21 @@ test("makeEngineClient: a rejected extendLock becomes a SupervisorError", async 
 });
 
 test("makeEngineClient: complete settles with result variables and normalizes to void", async () => {
-  const calls: Array<{ jobKey: string; variables?: Record<string, unknown> }> = [];
+  const calls: Array<{ jobKey: string; variables?: Record<string, unknown>; leaseToken?: string }> = [];
   const raw: RawEngineClient = {
     activate: async () => [],
     extendLock: async () => {},
     // Resolve a truthy non-void value to prove the lift normalizes to `void`.
-    complete: async (jobKey, variables) => {
-      calls.push({ jobKey, variables });
+    complete: async (jobKey, variables, leaseToken) => {
+      calls.push({ jobKey, variables, leaseToken });
       return "ok" as unknown as void;
     },
     fail: async () => {},
   };
-  const out = await Effect.runPromise(makeEngineClient(raw).complete("j1", { status: "opened" }));
+  const out = await Effect.runPromise(makeEngineClient(raw).complete("j1", { status: "opened" }, "lease-j1"));
   assert.equal(out, undefined);
-  assert.deepEqual(calls, [{ jobKey: "j1", variables: { status: "opened" } }]);
+  // The adapter forwards the lease token as the third argument so a leased completion is fenced.
+  assert.deepEqual(calls, [{ jobKey: "j1", variables: { status: "opened" }, leaseToken: "lease-j1" }]);
 });
 
 test("makeEngineClient: a rejected complete becomes a SupervisorError", async () => {
@@ -143,9 +146,10 @@ test("makeEngineClient: fail forwards retry/error options and maps a rejection",
     },
   };
   await Effect.runPromise(
-    makeEngineClient(raw).fail("j2", { retries: 2, errorMessage: "boom", retryBackOff: 15_000 }),
+    makeEngineClient(raw).fail("j2", { retries: 2, errorMessage: "boom", retryBackOff: 15_000, leaseToken: "lease-j2" }),
   );
-  assert.deepEqual(calls, [{ jobKey: "j2", opts: { retries: 2, errorMessage: "boom", retryBackOff: 15_000 } }]);
+  // The opts object (leaseToken included) is forwarded verbatim so a leased failure is fenced.
+  assert.deepEqual(calls, [{ jobKey: "j2", opts: { retries: 2, errorMessage: "boom", retryBackOff: 15_000, leaseToken: "lease-j2" } }]);
 
   const boom: RawEngineClient = {
     activate: async () => [],

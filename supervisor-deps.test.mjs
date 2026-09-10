@@ -9,7 +9,7 @@
  */
 import assert from "node:assert/strict";
 import { test } from "node:test";
-import { createSupervisorDeps } from "./c8ctl-plugin.js";
+import { bindJobSettle, createSupervisorDeps } from "./c8ctl-plugin.js";
 
 const sleep = (ms) => new Promise((r) => setTimeout(r, ms));
 
@@ -194,6 +194,68 @@ test("createSupervisorDeps: the settle seam fails a job through the engine failu
   assert.equal(failures.length, 1);
   assert.match(failures[0].url, /\/v2\/jobs\/job-x\/failure$/);
   assert.deepEqual(failures[0].body, { retries: 1, errorMessage: "harness exited 1", retryBackOff: 15_000 });
+});
+
+test("createSupervisorDeps: the settle seam FENCES complete/fail — the activation leaseToken reaches the completion/failure wire", async () => {
+  // The runner binds `settleJob` to its activation's job.leaseToken and calls the
+  // seam explicitly (settle.complete(jobKey, vars, leaseToken) / settle.fail(jobKey,
+  // {..., leaseToken})). This proves the token survives the seam all the way to the
+  // engine wire — a leased job's settle is fenced, so a superseded worker is
+  // rejected (JobLeaseMismatch) instead of clobbering the newer activation.
+  const completions = [];
+  const failures = [];
+  const fetchImpl = async (url, init) => {
+    const u = String(url);
+    if (/\/jobs\/.+\/completion$/.test(u)) {
+      completions.push(JSON.parse(init.body));
+      return { ok: true, status: 204, json: async () => ({}), text: async () => "" };
+    }
+    if (/\/jobs\/.+\/failure$/.test(u)) {
+      failures.push(JSON.parse(init.body));
+      return { ok: true, status: 204, json: async () => ({}), text: async () => "" };
+    }
+    if (u.endsWith("/jobs/activation")) return { ok: true, status: 200, json: async () => ({ jobs: [] }), text: async () => "" };
+    return { ok: false, status: 404, json: async () => ({}), text: async () => "" };
+  };
+  const { settle } = await createSupervisorDeps({
+    runner: { run: async () => {} },
+    restConfig: { baseUrl: "http://engine:8080", token: "T" },
+    worker: "host-under-test",
+    fetchImpl,
+  });
+  // As settleJob does: complete carries the token as the 3rd arg; fail carries it in opts.
+  await settle.complete("job-c", { status: "opened" }, "lease-c");
+  await settle.fail("job-f", { retries: 1, errorMessage: "boom", leaseToken: "lease-f" });
+  assert.deepEqual(completions, [{ variables: { status: "opened" }, leaseToken: "lease-c" }]);
+  assert.deepEqual(failures, [{ retries: 1, errorMessage: "boom", leaseToken: "lease-f" }]);
+});
+
+test("bindJobSettle: each bound settler fences with ITS OWN activation's leaseToken — two same-jobKey activations never cross tokens", async () => {
+  // Regression guard for the TOCTOU the runner's closure-capture prevents: the
+  // token that fences a settlement must come from the activation that ran, not a
+  // shared-map re-read that a same-key reactivation could have overwritten. Two
+  // activations SHARE jobKey "J" but carry different lease tokens; each bound
+  // settler must use its own — a mix-up would let a stale run's completion fence
+  // (and clobber) the newer activation.
+  const calls = [];
+  const settle = {
+    complete: (jobKey, variables, leaseToken) => calls.push({ op: "complete", jobKey, variables, leaseToken }),
+    fail: (jobKey, opts) => calls.push({ op: "fail", jobKey, ...opts }),
+  };
+  const older = bindJobSettle(settle, { jobKey: "J", leaseToken: "lease-OLD" });
+  const newer = bindJobSettle(settle, { jobKey: "J", leaseToken: "lease-NEW" });
+
+  older.complete({ a: 1 });
+  newer.complete({ a: 2 });
+  older.fail({ retries: 3, errorMessage: "x" });
+  newer.fail();
+
+  assert.deepEqual(calls, [
+    { op: "complete", jobKey: "J", variables: { a: 1 }, leaseToken: "lease-OLD" },
+    { op: "complete", jobKey: "J", variables: { a: 2 }, leaseToken: "lease-NEW" },
+    { op: "fail", jobKey: "J", retries: 3, errorMessage: "x", leaseToken: "lease-OLD" },
+    { op: "fail", jobKey: "J", leaseToken: "lease-NEW" },
+  ]);
 });
 
 test("createSupervisorDeps: derives engine authHeaders from camunda.getAuthHeaders() when no explicit headers/token", async () => {

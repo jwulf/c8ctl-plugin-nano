@@ -13,11 +13,12 @@ import type {
 } from "../src/ports.ts";
 import { SupervisorError } from "../src/ports.ts";
 
-export const job = (jobKey: string, type: string): ActivatedJob => ({ jobKey, type });
+export const job = (jobKey: string, type: string, leaseToken?: string): ActivatedJob =>
+  leaseToken === undefined ? { jobKey, type } : { jobKey, type, leaseToken };
 
 export interface EngineFake extends EngineClient {
   readonly leased: string[];
-  readonly extended: Array<{ jobKey: string; ms: number }>;
+  readonly extended: Array<{ jobKey: string; ms: number; leaseToken?: string }>;
   readonly activateCalls: string[];
   /** Every activation request in full — lets a test assert the requested batch size. */
   readonly activateRequests: ActivateRequest[];
@@ -31,12 +32,12 @@ export interface EngineOptions {
   /** Per-type activation behaviour. Return the jobs (may sleep to model a long-poll). */
   activate: (req: ActivateRequest) => Effect.Effect<ReadonlyArray<ActivatedJob>, SupervisorErrorType>;
   /** Optional extendLock override (e.g. to fail the winner extend). */
-  extend?: (jobKey: string, ms: number) => Effect.Effect<void, SupervisorErrorType>;
+  extend?: (jobKey: string, ms: number, leaseToken?: string) => Effect.Effect<void, SupervisorErrorType>;
 }
 
 export const makeEngine = (opts: EngineOptions): EngineFake => {
   const leased: string[] = [];
-  const extended: Array<{ jobKey: string; ms: number }> = [];
+  const extended: Array<{ jobKey: string; ms: number; leaseToken?: string }> = [];
   const activateCalls: string[] = [];
   const activateRequests: ActivateRequest[] = [];
   const completed: Array<{ jobKey: string; variables?: Record<string, unknown> }> = [];
@@ -56,11 +57,13 @@ export const makeEngine = (opts: EngineOptions): EngineFake => {
         Effect.flatMap(() => opts.activate(req)),
         Effect.tap((jobs) => Effect.sync(() => jobs.forEach((j) => leased.push(j.jobKey)))),
       ),
-    extendLock: (jobKey, ms) =>
+    extendLock: (jobKey, ms, leaseToken) =>
       opts.extend
-        ? opts.extend(jobKey, ms).pipe(Effect.tap(() => Effect.sync(() => extended.push({ jobKey, ms }))))
+        ? opts.extend(jobKey, ms, leaseToken).pipe(
+            Effect.tap(() => Effect.sync(() => extended.push({ jobKey, ms, leaseToken }))),
+          )
         : Effect.sync(() => {
-            extended.push({ jobKey, ms });
+            extended.push({ jobKey, ms, leaseToken });
           }),
     complete: (jobKey, variables) =>
       Effect.sync(() => {

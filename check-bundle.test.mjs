@@ -53,6 +53,9 @@ test('check-bundle: fails when the committed bundle is stale', () => {
     const res = runChecker(root);
     assert.equal(res.status, 1, 'expected non-zero exit for a stale bundle');
     assert.match(res.stderr, /stale/i);
+    // The acceptance criterion is an *actionable* message: it must tell the
+    // contributor how to restore the production artifact.
+    assert.match(res.stderr, /npm run build:supervisor/i);
   } finally {
     rmSync(root, { recursive: true, force: true });
   }
@@ -70,6 +73,9 @@ test('check-bundle: fails when the bundle is missing / untracked', () => {
     const res = runChecker(root);
     assert.equal(res.status, 1, 'expected non-zero exit for a missing bundle');
     assert.match(res.stderr, /not tracked/i);
+    // As with the stale path, the failure must point at the documented recovery
+    // command so a contributor knows how to regenerate the missing artifact.
+    assert.match(res.stderr, /npm run build:supervisor/i);
   } finally {
     rmSync(root, { recursive: true, force: true });
   }

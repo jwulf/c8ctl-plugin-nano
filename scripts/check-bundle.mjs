@@ -3,11 +3,13 @@
 // The published/production runtime imports the *committed* `supervisor.dist.js`
 // (it is in package.json `files`, and c8ctl-plugin.js does
 // `await import('./supervisor.dist.js')`). That bundle is generated from
-// `supervisor/src/*.ts` by `supervisor/build.mjs`. `npm test` rebuilds the
-// bundle mid-run, so a *stale committed* bundle still passes the test suite —
-// the drift between the committed file and its source is never detected.
+// This gate exists because, historically, `npm test` rebuilt the bundle
+// mid-run: a *stale committed* bundle still passed the suite, since the drift
+// between the committed file and its source was never detected. (That mid-run
+// `build:supervisor` is now gone — `npm test` runs `check:bundle` first — so
+// this gate is what actually catches the drift.)
 //
-// This gate rebuilds the bundle from source and fails when the committed file
+// The gate rebuilds the bundle from source and fails when the committed file
 // differs from the clean rebuild, so a PR that edits `supervisor/src/*.ts`
 // without regenerating `supervisor.dist.js` reddens CI with an actionable
 // message. The rebuild is byte-stable (esbuild `minify` output is

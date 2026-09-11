@@ -4383,6 +4383,17 @@ function provisionRepo({ envelope, token, runDir, runId, timeoutMs = 120_000, co
     // Cut a fallback off the unborn branch name so finalizeGit still pushes it
     // once the harness makes that first commit.
     cutFallbackBranch(unbornBranch);
+  } else if (wantPush && explicitCreate && explicitCreate === effectiveBase) {
+    // Detached HEAD (a tag/sha checkout leaves checkedOut AND unbornBranch both
+    // null) where an explicit branch.create NAMES the effective base: the first
+    // `if` above suppressed the explicit checkout (to avoid committing on the
+    // base), but with no symbolic branch for the arms above to fall back from,
+    // workingBranch would stay null — so finalizeGit skips BOTH the push and its
+    // failed-push preservation path, silently deleting any commits the harness
+    // makes from the detached HEAD (issue #231 silent work-loss). Cut the fallback
+    // from the CURRENT (detached) HEAD so those commits ride a pushable work
+    // branch instead of being reaped with the throwaway workspace.
+    cutFallbackBranch(effectiveBase);
   } else {
     // Detached HEAD (tag/sha ⇒ null, no branch to push) or a read-only clone
     // (push disabled) — safe to stay on the checked-out ref; nothing is pushed.
@@ -4597,7 +4608,15 @@ function finalizeGit({ workspaceDir, gitEnv, startSha, workingBranch, baseBranch
       if (bf.status === 0) {
         const fetched = runGit(['rev-parse', '--verify', '--quiet', 'FETCH_HEAD'], { cwd: workspaceDir, env: gitEnv });
         const fetchedSha = fetched.status === 0 ? ((fetched.stdout || '').trim() || null) : null;
-        const ahead = runGit(['rev-list', '--count', 'HEAD..FETCH_HEAD'], { cwd: workspaceDir, env: gitEnv });
+        // Measure how far the BASE advanced since we cloned, not how far our post-
+        // work HEAD sits behind the new base tip: `beforeSha` is the base ref as of
+        // clone, so `beforeSha..FETCH_HEAD` counts exactly the commits the base
+        // gained. `HEAD..FETCH_HEAD` would misreport this — a work branch rebased
+        // onto the new base counts 0, while one that merely diverged counts
+        // unrelated commits. Fall back to `HEAD..FETCH_HEAD` only when there was no
+        // prior remote-tracking ref to anchor the range (beforeSha null).
+        const staleRange = beforeSha ? `${beforeSha}..FETCH_HEAD` : 'HEAD..FETCH_HEAD';
+        const ahead = runGit(['rev-list', '--count', staleRange], { cwd: workspaceDir, env: gitEnv });
         const n = ahead.status === 0 ? parseInt((ahead.stdout || '').trim(), 10) : 0;
         if (Number.isFinite(n) && n > 0) {
           out.baseAdvanced = n;
@@ -8624,18 +8643,25 @@ async function workAgent(req, flags) {
         const resultEnvelope = buildResultEnvelope(result, { sandbox, image, git: gitResult, result: rawResult, promptResourceKey });
         if (result.ok) {
           const gitNote = gitResult
-            ? ` [${gitResult.branch ? `branch ${gitResult.branch}` : 'detached HEAD'}: ${gitResult.commits.length} commit(s), ${gitResult.branch ? (gitResult.pushed ? 'pushed' : (gitResult.pushError ? 'push FAILED' : 'not pushed')) : 'no branch to push'}${gitResult.pr?.found ? `, PR #${gitResult.pr.number}` : ''}]`
+            ? ` [${gitResult.branch ? `branch ${gitResult.branch}` : 'detached HEAD'}: ${gitResult.commits.length} commit(s), ${gitResult.branch ? (gitResult.pushed ? 'pushed' : (gitResult.pushFailed ? 'push FAILED' : 'not pushed')) : 'no branch to push'}${gitResult.pr?.found ? `, PR #${gitResult.pr.number}` : ''}]`
             : '';
           logger.info(`[${jobType}] job ${job.jobKey} complete (exit 0)${result.truncated ? ' [output truncated]' : ''}${gitNote}`);
-          if (gitResult?.pushError) {
+          if (gitResult?.pushFailed) {
             // Elevate a push failure from a terse info tail to a loud, actionable
             // error naming the stranded commit SHAs (issue #231): these commits are
             // unpushed in a throwaway workspace and will be lost with no PR unless
-            // recovered from these SHAs.
+            // recovered from these SHAs. Key off `pushFailed`, not `pushError`, so
+            // the branch-mismatch strand (HEAD moved off the work branch — no push
+            // attempted, so no pushError) is reported too; use its `branchMismatch`
+            // as the failure detail when there is no push error string.
             const stranded = gitResult.strandedCommits && gitResult.strandedCommits.length ? gitResult.strandedCommits : (gitResult.commits || []);
             const shaNote = stranded.length ? ` — ${stranded.length} commit(s) on branch '${gitResult.branch}' are UNPUSHED and will be lost, no PR [stranded: ${stranded.join(', ')}]` : '';
             const corr = `instance ${job.processInstanceKey ?? '-'}/elem ${job.elementInstanceKey ?? '-'}`;
-            logger.error(`[${jobType}] job ${job.jobKey} (${corr}): branch push FAILED${shaNote} — ${gitResult.pushError}`);
+            const failDetail = gitResult.pushError
+              || (gitResult.branchMismatch
+                ? `HEAD moved to '${gitResult.branchMismatch.actual || '(detached)'}' off work branch '${gitResult.branchMismatch.expected}' — refused to push stale work`
+                : 'push not attempted');
+            logger.error(`[${jobType}] job ${job.jobKey} (${corr}): branch push FAILED${shaNote} — ${failDetail}`);
           }
           // Guard the operator against silent empty escalations: a success that
           // yields no *effective* result vars (no file/sentinel at all, an empty

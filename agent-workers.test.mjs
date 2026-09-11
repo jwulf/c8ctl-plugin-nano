@@ -1619,6 +1619,51 @@ test('provisionRepo honours branch.create equal to a TAG ref instead of silently
   }
 });
 
+test('provisionRepo cuts a fallback from a DETACHED HEAD when branch.create equals the base (issue #231, thread 4380)', { skip: !gitOk }, () => {
+  const { root, origin } = makeOriginRepo();
+  // Tag the seed so we can clone a detached-HEAD checkout (repository.ref = tag).
+  const tagClone = mkdtempSync(join(root, 'tag-'));
+  g(['clone', '-q', origin, tagClone], undefined);
+  g(['tag', 'v1'], tagClone);
+  g(['push', '-q', 'origin', 'v1'], tagClone);
+  const runDir = mkdtempSync(join(root, 'run-'));
+  try {
+    const envelope = {
+      schemaVersion: 1,
+      // A tag checkout leaves HEAD DETACHED (checkedOut & unbornBranch both null),
+      // while branch.base and branch.create BOTH name the base 'main'. The old code
+      // suppressed the explicit checkout (create === effectiveBase) but then hit no
+      // fallback arm → workingBranch stayed null, so finalizeGit skipped the push
+      // AND its preservation path, silently deleting the harness's commits.
+      repository: { provider: 'github', url: origin, ref: 'v1', submodules: false },
+      branch: { base: 'main', create: 'main', push: true },
+      setup: { commands: [], env: {}, secretRefs: [] },
+      task: { allowPr: false },
+    };
+    const prov = provisionRepo({ envelope, token: null, runDir });
+    assert.equal(prov.detached, false, 'the detached HEAD is promoted to a pushable fallback, not left null');
+    assert.equal(prov.fallbackBranch, true, 'a fallback work branch is cut from the detached HEAD');
+    assert.notEqual(prov.workingBranch, 'main', 'never commits directly on the base');
+    assert.match(prov.workingBranch, /^nano\/agent-work\/main-/, 'fallback is namespaced off the base');
+    assert.equal(g(['rev-parse', '--abbrev-ref', 'HEAD'], prov.workspaceDir), prov.workingBranch, 'HEAD is on the fallback branch');
+    // End-to-end: the harness commits, and finalizeGit PUSHES the fallback (the
+    // commits are no longer silently stranded on a detached HEAD).
+    writeFileSync(join(prov.workspaceDir, 'work.txt'), 'work\n');
+    g(['add', '-A'], prov.workspaceDir);
+    g(['-c', 'user.name=nano', '-c', 'user.email=nano@example.com', 'commit', '-q', '-m', 'agent work'], prov.workspaceDir);
+    const out = finalizeGit({ ...prov, envelope, token: null });
+    assert.equal(out.pushed, true, 'the fallback branch is pushed (no silent work-loss)');
+    assert.equal(out.commits.length, 1, 'the agent commit is enumerated');
+    assert.equal(
+      g(['-c', 'safe.bareRepository=all', 'rev-parse', '--verify', `refs/heads/${prov.workingBranch}`], origin).length,
+      40,
+      'the fallback branch reached the remote',
+    );
+  } finally {
+    rmSync(root, { recursive: true, force: true });
+  }
+});
+
 test('provisionRepo cuts a fallback when branch.create equals the UNBORN default on an empty repo (issue #231, thread 4337)', { skip: !gitOk }, () => {
   const root = mkdtempSync(join(tmpdir(), 'nano-git-'));
   const origin = join(root, 'origin.git');

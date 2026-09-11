@@ -1558,6 +1558,96 @@ test('finalizeGit surfaces stranded commit SHAs on a non-ff push rejection (issu
   }
 });
 
+test('finalizeGit refuses to push when the harness moved HEAD off the work branch (issue #231, thread 4524)', { skip: !gitOk }, () => {
+  const { root, origin } = makeOriginRepo();
+  const runDir = mkdtempSync(join(root, 'run-'));
+  try {
+    const envelope = {
+      schemaVersion: 1,
+      repository: { provider: 'github', url: origin, submodules: false },
+      branch: { base: 'main', create: 'feat/work', push: true },
+      setup: { commands: [], env: {}, secretRefs: [] },
+      task: { allowPr: false },
+    };
+    const prov = provisionRepo({ envelope, token: null, runDir });
+    assert.equal(prov.workingBranch, 'feat/work');
+    // The harness checks out the base branch and commits THERE instead of on the
+    // provisioned work branch — the silent work-loss shape: pushing 'feat/work'
+    // would report success while the base commit is reaped with the workspace.
+    g(['checkout', '-B', 'main', 'origin/main'], prov.workspaceDir);
+    writeFileSync(join(prov.workspaceDir, 'stray.txt'), 'stray\n');
+    g(['add', '-A'], prov.workspaceDir);
+    g(['-c', 'user.name=nano', '-c', 'user.email=nano@example.com', 'commit', '-q', '-m', 'stray work on base'], prov.workspaceDir);
+    const strayedSha = g(['rev-parse', 'HEAD'], prov.workspaceDir);
+
+    const out = finalizeGit({ ...prov, envelope, token: null });
+    assert.equal(out.pushed, false, 'the misdirected push is refused');
+    assert.equal(out.pushFailed, true, 'a branch mismatch is a hard, preserved failure');
+    assert.deepEqual(out.branchMismatch, { expected: 'feat/work', actual: 'main' }, 'the mismatch is reported');
+    assert.deepEqual(out.strandedCommits, [strayedSha], 'the at-risk commit is surfaced for recovery');
+    // Nothing was published: the provisioned work branch never reached the remote.
+    assert.throws(() => g(['-c', 'safe.bareRepository=all', 'rev-parse', '--verify', 'refs/heads/feat/work'], origin), 'no stale ref was published');
+  } finally {
+    rmSync(root, { recursive: true, force: true });
+  }
+});
+
+test('provisionRepo honours branch.create equal to a TAG ref instead of silently skipping the push (issue #231, suppressed 4337)', { skip: !gitOk }, () => {
+  const { root, origin } = makeOriginRepo();
+  const tagClone = mkdtempSync(join(root, 'tag-'));
+  g(['clone', '-q', origin, tagClone], undefined);
+  g(['tag', 'v1'], tagClone);
+  g(['push', '-q', 'origin', 'v1'], tagClone);
+  const runDir = mkdtempSync(join(root, 'run-'));
+  try {
+    const envelope = {
+      schemaVersion: 1,
+      // repository.ref is a TAG and branch.create coincidentally equals it. The tag
+      // must NOT be treated as the effective base (which would skip the explicit
+      // checkout and leave workingBranch null → a silent no-push work-loss).
+      repository: { provider: 'github', url: origin, ref: 'v1', submodules: false },
+      branch: { base: '', create: 'v1', push: true },
+      setup: { commands: [], env: {}, secretRefs: [] },
+      task: { allowPr: false },
+    };
+    const prov = provisionRepo({ envelope, token: null, runDir });
+    assert.equal(prov.workingBranch, 'v1', 'the explicit work branch is honoured off the detached tag');
+    assert.equal(prov.detached, false, 'not left detached/null');
+    assert.equal(g(['rev-parse', '--verify', '--quiet', 'refs/heads/v1'], prov.workspaceDir).length, 40, 'a real branch ref was created (not left detached at the tag)');
+  } finally {
+    rmSync(root, { recursive: true, force: true });
+  }
+});
+
+test('provisionRepo cuts a fallback when branch.create equals the UNBORN default on an empty repo (issue #231, thread 4337)', { skip: !gitOk }, () => {
+  const root = mkdtempSync(join(tmpdir(), 'nano-git-'));
+  const origin = join(root, 'origin.git');
+  g(['init', '-q', '--bare', origin], undefined);
+  // Force the empty remote's symbolic default so the clone's unborn branch is 'master'.
+  g(['-c', 'safe.bareRepository=all', 'symbolic-ref', 'HEAD', 'refs/heads/master'], origin);
+  const runDir = mkdtempSync(join(root, 'run-'));
+  try {
+    const envelope = {
+      schemaVersion: 1,
+      repository: { provider: 'github', url: origin, submodules: false },
+      // Explicit branch.create equal to the symbolic default: on an empty repo the
+      // default is unborn (checkedOut null), so it must be treated like the base and
+      // cut a fallback rather than committing the first commit directly on it.
+      branch: { base: '', create: 'master', push: true },
+      setup: { commands: [], env: {}, secretRefs: [] },
+      task: { allowPr: false },
+    };
+    const prov = provisionRepo({ envelope, token: null, runDir });
+    assert.equal(prov.detached, false);
+    assert.equal(prov.fallbackBranch, true, 'branch.create==unborn default cuts a fallback');
+    assert.notEqual(prov.workingBranch, 'master', 'never commits the first commit directly on the base');
+    assert.match(prov.workingBranch, /^nano\/agent-work\/master-/, 'fallback is namespaced off the unborn default');
+    assert.equal(g(['symbolic-ref', '--short', 'HEAD'], prov.workspaceDir), prov.workingBranch, 'HEAD is on the (unborn) fallback branch, not the base');
+  } finally {
+    rmSync(root, { recursive: true, force: true });
+  }
+});
+
 test('provisionRepo checks out a commit SHA via repository.sha (detached, not via --branch)', { skip: !gitOk }, () => {
   const { root, origin } = makeOriginRepo();
   // add a second commit so we can pin the FIRST one by SHA

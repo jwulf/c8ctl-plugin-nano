@@ -802,8 +802,9 @@ Token-backed jobs keep global config (e.g. `http.proxy`). A push failure is
 reported as `pushError` (the job still completes) so a later BPMN step can drive
 the merge; a clone/checkout failure sheds the job (retryable). Workspaces are
 deleted after each job (keep them with `--keep-runs`) — **except** a job whose
-`git push` failed for any reason (a non-fast-forward rejection, but also auth,
-hook, or network errors), whose workspace is preserved best-effort so its
+`git push` **could not be confirmed as landed** (a non-fast-forward rejection, or
+an auth/hook/network error whose `ls-remote` re-check did not find `origin/<branch>`
+at `headSha`), whose workspace is preserved best-effort so its
 `strandedCommits` stay recoverable; that preservation is still age-gated by the
 reaper and cleared on worker shutdown, so recover the SHAs promptly.
 

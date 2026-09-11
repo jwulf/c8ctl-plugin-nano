@@ -4329,12 +4329,19 @@ function provisionRepo({ envelope, token, runDir, runId, timeoutMs = 120_000, co
     const symref = runGit(['symbolic-ref', '-q', '--short', 'HEAD'], { cwd: workspaceDir, env: gitEnv });
     if (symref.status === 0) unbornBranch = (symref.stdout || '').trim() || null;
   }
-  // The base we must never commit-and-push onto. When BOTH branch.base and
-  // repository.ref are omitted, baseBranchName is empty even though the clone may
-  // have landed on the remote default branch (e.g. 'main') — so fall back to the
-  // actually-checked-out ref. Otherwise an explicit branch.create='main' would
-  // slip past the guard below (=== '' is false) and commit directly on default.
-  const effectiveBase = baseBranchName || checkedOut || '';
+  // The base we must never commit-and-push onto. Derive it ONLY from an explicit
+  // `branch.base` or a SYMBOLIC checked-out/unborn branch — never from
+  // `repository.ref`, which may be a TAG: a tag clone leaves detached HEAD
+  // (checkedOut null), and if `branch.create` happened to equal that tag the old
+  // `baseBranchName`-derived compare would make the guard below skip the explicit
+  // checkout, leaving workingBranch null and silently skipping the push. When both
+  // branch.base and repository.ref are omitted, fall back to the actually
+  // checked-out ref (e.g. the remote default 'main') so an explicit
+  // branch.create='main' can't slip past the guard (=== '' is false) and commit
+  // directly on default — and to the UNBORN branch name for an empty-repo clone
+  // (checkedOut null) so branch.create equal to the symbolic default ('master')
+  // is likewise treated as the base and cut a fallback instead of committing on it.
+  const effectiveBase = (envelope.branch?.base || '') || checkedOut || unbornBranch || '';
   // Correlation suffix (issue #231 observability): jobKey/instance/element keys so
   // concurrent workers' branch-decision logs can be joined to the AgentInstance
   // timeline. Threaded from workAgent; empty when provisioning runs out of band.
@@ -4544,13 +4551,29 @@ function finalizeGit({ workspaceDir, gitEnv, startSha, workingBranch, baseBranch
   } else if (coerceBool(envelope.branch?.push, true) && out.commits.length > 0) {
     const log = getLogger();
     const pushTimeoutMs = 120_000; // matches runGit's default; surfaced in a timeout reason
-    // Pre-push staleness check (issue #229/#231 observability): if the base branch
+    // Verify HEAD is still on the branch we intend to push (issue #231). The
+    // harness runs arbitrary code; if it checked out a DIFFERENT ref (e.g. the
+    // base branch) and committed there, out.commits (startSha..HEAD) enumerates
+    // those new commits but `git push origin <workingBranch>` would push the
+    // UNTOUCHED work branch and report success — after which the workspace is
+    // reaped and the real commits are lost. Treat a branch mismatch as a failed,
+    // preserved result: surface the stranded SHAs, skip the misdirected push (and,
+    // via pushFailed, the PR reconcile) so the recovery handle survives.
+    const headBranchNow = runGit(['rev-parse', '--abbrev-ref', 'HEAD'], { cwd: workspaceDir, env: gitEnv });
+    const currentBranch = headBranchNow.status === 0 ? ((headBranchNow.stdout || '').trim()) : '';
+    if (currentBranch !== workingBranch) {
+      out.pushFailed = true;
+      out.strandedCommits = out.commits.slice();
+      out.branchMismatch = { expected: workingBranch, actual: currentBranch || null };
+      log.warn?.(`finalizeGit${corr ? ' (' + corr + ')' : ''}: HEAD is on '${currentBranch || '(detached)'}' but the provisioned work branch is '${workingBranch}' — the harness moved HEAD off it; refusing to push '${workingBranch}' (it would publish stale work and strand the ${out.commits.length} new commit(s)). Preserving workspace for recovery.`);
+    } else {
     // advanced on the remote since we cloned, a push can be rejected non-ff. Fetch
     // the base and report how far it moved so the non-ff cause is visible in the
     // log BEFORE the push, not inferred after the fact. Best-effort — never fatal.
-    // Prefer the effective base resolved during provisioning (which falls back to
-    // repository.ref when branch.base is empty) so this diagnostic still fires in
-    // that valid shape; only fall back to the raw envelope field if it was absent.
+    // Prefer the effective base resolved during provisioning (an explicit
+    // branch.base or the symbolic branch the clone landed on) so this diagnostic
+    // still fires in that valid shape; only fall back to the raw envelope field if
+    // it was absent.
     const baseBranch = String(effectiveBase || envelope.branch?.base || '');
     if (baseBranch && baseBranch.startsWith('-')) {
       // Git permits ref names beginning with '-', and passing an untrusted base
@@ -4564,9 +4587,13 @@ function finalizeGit({ workspaceDir, gitEnv, startSha, workingBranch, baseBranch
       // advance can be tied to an exact ref movement, not just a bare count.
       const beforeRef = runGit(['rev-parse', '--verify', '--quiet', `refs/remotes/origin/${baseBranch}`], { cwd: workspaceDir, env: gitEnv });
       const beforeSha = beforeRef.status === 0 ? ((beforeRef.stdout || '').trim() || null) : null;
-      // `--end-of-options` terminates option parsing so the (now leading-'-'-free)
-      // ref can never be reinterpreted as a flag even for future/edge values.
-      const bf = runGit([...credArgs(), 'fetch', '--no-tags', '--end-of-options', 'origin', baseBranch], { cwd: workspaceDir, env: gitEnv, timeoutMs: pushTimeoutMs });
+      // Fetch the EXACT `refs/heads/<branch>` ref, not the bare name: git treats a
+      // bare refspec beginning with '+' as the force-update prefix, so a valid
+      // branch like '+release' would fetch the wrong ref and make the staleness
+      // count unreliable. The `refs/heads/` prefix makes the leading char always
+      // 'r', and `--end-of-options` terminates option parsing so the ref can never
+      // be reinterpreted as a flag even for future/edge values.
+      const bf = runGit([...credArgs(), 'fetch', '--no-tags', '--end-of-options', 'origin', `refs/heads/${baseBranch}`], { cwd: workspaceDir, env: gitEnv, timeoutMs: pushTimeoutMs });
       if (bf.status === 0) {
         const fetched = runGit(['rev-parse', '--verify', '--quiet', 'FETCH_HEAD'], { cwd: workspaceDir, env: gitEnv });
         const fetchedSha = fetched.status === 0 ? ((fetched.stdout || '').trim() || null) : null;
@@ -4577,6 +4604,14 @@ function finalizeGit({ workspaceDir, gitEnv, startSha, workingBranch, baseBranch
           const shaNote = ` [base '${baseBranch}': ${beforeSha ? beforeSha.slice(0, 12) : '(unknown)'} → ${fetchedSha ? fetchedSha.slice(0, 12) : '(unknown)'}]`;
           log.warn?.(`finalizeGit${corr ? ' (' + corr + ')' : ''}: remote base '${baseBranch}' advanced ${n} commit(s) since clone${shaNote} — pushing branch '${workingBranch}'${workingBranch === baseBranch ? ' (which IS the base — a non-ff reject would strand the commits)' : ''}`);
         }
+      } else {
+        // The pre-push staleness diagnostic disappears exactly when the best-effort
+        // fetch fails: a subsequent non-ff (or other) push failure is then
+        // indistinguishable from an unchanged base. Surface the fetch failure so
+        // that lost observability is itself visible (issue #229/#231). Best-effort
+        // — still never fatal.
+        out.stalenessFetchError = describeGitFailure(`git fetch origin refs/heads/${baseBranch}`, bf, { token, timeoutMs: pushTimeoutMs });
+        log.warn?.(`finalizeGit${corr ? ' (' + corr + ')' : ''}: pre-push staleness check could not fetch base '${baseBranch}' (${out.stalenessFetchError}) — a later non-ff or other push failure will be indistinguishable from an unchanged base`);
       }
     }
     const push = runGit([...credArgs(), 'push', '--set-upstream', 'origin', workingBranch], { cwd: workspaceDir, env: gitEnv, timeoutMs: pushTimeoutMs });
@@ -4612,6 +4647,7 @@ function finalizeGit({ workspaceDir, gitEnv, startSha, workingBranch, baseBranch
         out.strandedCommits = out.commits.slice();
       }
     }
+    } // end HEAD-on-workingBranch else
   }
 
   // Skip PR reconciliation when the push FAILED (issue #231): a non-fast-forward

@@ -837,3 +837,20 @@ test('describeSdkError pulls HTTP status and body from common SDK error shapes',
 
   assert.equal(describeSdkError(null).message, 'null');
 });
+
+test('describeSdkError caps an oversized response body so it cannot flood the log (issue #230)', () => {
+  const huge = 'x'.repeat(5000);
+  const capped = describeSdkError({ statusCode: 500, body: huge });
+  assert.equal(capped.status, 500);
+  assert.ok(capped.body.length < huge.length, 'the body is truncated');
+  assert.ok(capped.body.startsWith('x'.repeat(500)), 'the first 500 chars are preserved');
+  assert.match(capped.body, /\(5000 chars\)/, 'the original length is noted');
+
+  // A serialized (non-string) oversized body is capped too.
+  const bigObj = describeSdkError({ status: 400, body: { detail: 'y'.repeat(5000) } });
+  assert.ok(bigObj.body.length <= 540, 'a serialized oversized body is bounded');
+
+  // A short body is left intact.
+  const small = describeSdkError({ statusCode: 400, body: 'short body' });
+  assert.equal(small.body, 'short body');
+});

@@ -61,6 +61,10 @@ const DEFAULT_PRE_MINT_BUFFER_MAX_BYTES = 8_000_000;
 // instance non-terminal forever (issue #230).
 const DEFAULT_TERMINAL_RETRY_MAX = 3;
 
+// Cap the normalized SDK error body before logging so an oversized/multiline engine
+// response can't overwhelm the per-worker log (matches supervisor-engine.mjs).
+const SDK_ERROR_BODY_MAX = 500;
+
 /**
  * Pull the diagnosable facts out of an SDK/transport rejection so a create/append
  * failure is LOUD and root-causable (issue #230 ask 1 / #229): the HTTP status and
@@ -91,6 +95,13 @@ export function describeSdkError(err) {
     } catch {
       body = String(body);
     }
+  }
+  // Bound the response body so a large/multiline engine response (times retries)
+  // can't flood the per-worker log and evict the correlation lines this diagnostic
+  // is meant to preserve — matches the raw engine adapter's 500-char cap
+  // (supervisor-engine.mjs readErrorBody).
+  if (typeof body === 'string' && body.length > SDK_ERROR_BODY_MAX) {
+    body = `${body.slice(0, SDK_ERROR_BODY_MAX)}… (${body.length} chars)`;
   }
   const message = isNonBlank(err.message) ? String(err.message) : String(err);
   return { status: status ?? null, body: body ?? null, message };

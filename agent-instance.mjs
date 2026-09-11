@@ -71,24 +71,28 @@ const DEFAULT_TERMINAL_RETRY_MAX = 3;
 // background) and let the job settle. `0`/non-positive disables the bound.
 const DEFAULT_FINALIZE_TIMEOUT_MS = 10_000;
 
-// Await a best-effort promise up to `timeoutMs`, then give up WITHOUT rejecting. Used
-// to keep complete()'s last-chance telemetry create from blocking job settlement on a
-// hung SDK call (issue #230): resolves either when the promise settles (success OR
-// failure — both are best-effort) or when the timeout elapses, whichever is first. The
-// underlying attempt is not cancelled (the SDK call is not cancellable) but is left to
-// settle in the background; createAgentInstance is idempotent per elementInstanceKey.
-function awaitBounded(promise, timeoutMs, setTimer = setTimeout) {
-  const safe = Promise.resolve(promise).then(
-    () => undefined,
-    () => undefined,
+// Race a best-effort promise against `timeoutMs`, reporting WHICH won, without ever
+// rejecting. Used to bound every create attempt so a hung createAgentInstance can
+// neither block activate() (which gates whether the harness runs at all) nor
+// complete() (which gates job settlement / lease expiry) — issue #230. Resolves `true`
+// when the promise settles (success OR failure — both are best-effort) within the
+// window, or `false` when the timeout wins. `timeoutMs<=0` waits unbounded (always
+// resolves `true` once the promise settles). The underlying attempt is not cancelled
+// (the SDK call is not cancellable) but is left to settle in the background; its late
+// result is neutralised by the caller's identity guard, and createAgentInstance is
+// idempotent per elementInstanceKey.
+function settleWithin(promise, timeoutMs, setTimer = setTimeout) {
+  const settled = Promise.resolve(promise).then(
+    () => true,
+    () => true,
   );
-  if (!(timeoutMs > 0)) return safe;
+  if (!(timeoutMs > 0)) return settled;
   return new Promise((resolve) => {
-    const timer = setTimer(() => resolve(undefined), timeoutMs);
+    const timer = setTimer(() => resolve(false), timeoutMs);
     if (timer && typeof timer.unref === 'function') timer.unref();
-    safe.then(() => {
+    settled.then((won) => {
       clearTimeout(timer);
-      resolve(undefined);
+      resolve(won);
     });
   });
 }
@@ -96,6 +100,16 @@ function awaitBounded(promise, timeoutMs, setTimer = setTimeout) {
 // Cap the normalized SDK error body before logging so an oversized/multiline engine
 // response can't overwhelm the per-worker log (matches supervisor-engine.mjs).
 const SDK_ERROR_BODY_MAX = 500;
+
+// Fold newlines into a visible inline marker and cap length so a diagnostic stays ONE
+// correlatable, volume-bounded log line: a multiline SDK body/message would otherwise
+// split the worker log across lines (breaking correlation), and an over-long message
+// that embeds a large body would bypass the body cap and flood the log (issue #230).
+function normalizeSdkText(value, max) {
+  let s = String(value).replace(/[\r\n]+/g, ' ⏎ ');
+  if (s.length > max) s = `${s.slice(0, max)}… (${s.length} chars)`;
+  return s;
+}
 
 /**
  * Pull the diagnosable facts out of an SDK/transport rejection so a create/append
@@ -128,15 +142,15 @@ export function describeSdkError(err) {
       body = String(body);
     }
   }
-  // Bound the response body so a large/multiline engine response (times retries)
-  // can't flood the per-worker log and evict the correlation lines this diagnostic
-  // is meant to preserve — matches the raw engine adapter's 500-char cap
-  // (supervisor-engine.mjs readErrorBody).
-  if (typeof body === 'string' && body.length > SDK_ERROR_BODY_MAX) {
-    body = `${body.slice(0, SDK_ERROR_BODY_MAX)}… (${body.length} chars)`;
-  }
-  const message = isNonBlank(err.message) ? String(err.message) : String(err);
-  return { status: status ?? null, body: body ?? null, message };
+  // Normalize line breaks and cap BOTH the response body and the error message so a
+  // multiline or oversized engine response/error can neither split the single
+  // correlatable log line nor bypass the length cap (a message that embeds a large
+  // body must not sneak past the body cap) — issue #230. Matches the raw engine
+  // adapter's 500-char cap (supervisor-engine.mjs readErrorBody).
+  const normalizedBody = body != null ? normalizeSdkText(body, SDK_ERROR_BODY_MAX) : null;
+  const rawMessage = isNonBlank(err.message) ? String(err.message) : String(err);
+  const message = normalizeSdkText(rawMessage, SDK_ERROR_BODY_MAX);
+  return { status: status ?? null, body: normalizedBody, message };
 }
 
 // Redact a lease token down to a presence + short tail so it can be logged for
@@ -323,8 +337,17 @@ export function createAgentInstanceProducer(opts = {}) {
   // Create-retry bookkeeping. `creating` dedups a concurrent in-flight attempt;
   // `createAttempts` / `lastCreateAttemptAt` pace the exponential backoff so a
   // failing create is re-attempted (idempotently, on the ACP hot path) without
-  // hammering the engine.
+  // hammering the engine. Every attempt carries a monotonic identity (`createGen`);
+  // `creatingGen` is the identity of the attempt currently owning the `creating`
+  // slot. A bounded await that times out RETIRES its attempt by bumping `createGen`
+  // past `creatingGen`, so the hung request's eventual result is dropped by the guard
+  // in `doCreate` (it cannot latch a key / replay the buffer late) and the slot is
+  // freed for a fresh retry. `finalized` latches once complete() has run its terminal
+  // path, hard-stopping any late create from minting an orphaned instance (issue #230).
   let creating = null;
+  let creatingGen = 0;
+  let createGen = 0;
+  let finalized = false;
   let createAttempts = 0;
   let lastCreateAttemptAt = 0;
   let loopIteration = 0;
@@ -485,11 +508,21 @@ export function createAgentInstanceProducer(opts = {}) {
   const backoffForAttempt = (attempt) =>
     Math.min(createRetryMaxMs, createRetryBaseMs * Math.pow(2, Math.max(0, attempt - 1)));
 
-  // Perform ONE createAgentInstance attempt. On success the instance key is
-  // latched; on failure it is logged LOUDLY (status + body + lease presence +
-  // correlation) and the producer is left retryable — NOT disabled (issue #230).
-  const doCreate = async () => {
+  // Perform ONE createAgentInstance attempt, tagged with the caller-supplied identity
+  // `gen`. On success the instance key is latched (unless the attempt was retired or
+  // the producer finalized — see the guard below); on failure it is logged LOUDLY
+  // (status + body + lease presence + correlation) and the producer is left retryable
+  // — NOT disabled (issue #230). `final` marks complete()'s one last-chance attempt,
+  // after which NO further retry happens, so the diagnostic must not promise one.
+  const doCreate = async ({ gen = 0, final = false } = {}) => {
     createAttempts += 1;
+    // A failure on the FINAL attempt won't be retried (the producer is about to be
+    // discarded), so don't tell operators to wait for a recovery that can't happen.
+    const retryClause = final
+      ? `no further create will be attempted (final finalization attempt; ` +
+        `job completion unaffected).`
+      : `will retry (durable transcript resumes once the create succeeds; ` +
+        `job completion unaffected).`;
     const { def, configTurn } = buildConfigTurn();
     try {
       const res = await camunda[SDK_CREATE]({
@@ -513,7 +546,22 @@ export function createAgentInstanceProducer(opts = {}) {
           `AgentInstance producer: createAgentInstance returned no agentInstanceKey ` +
             `(attempt ${createAttempts}) — status=n/a body=n/a ` +
             `jobLease=${leaseTokenLabel(leaseToken)} model=${def.model} provider=${def.provider} ` +
-            `${correlation()}; will retry.`,
+            `${correlation()}; ${retryClause}`,
+        );
+        return false;
+      }
+      // Identity + finalization guard: a RETIRED attempt (its bounded await timed out,
+      // so `createGen` was bumped past our `gen`) or a producer that has already
+      // finalized (complete() returned) must NOT latch state. A late success would
+      // otherwise set agentInstanceKey and replay the pre-mint buffer into an orphaned,
+      // non-terminal AgentInstance AFTER the job was settled without a COMPLETED update
+      // (issue #230). The mint is idempotent per elementInstanceKey, so dropping the
+      // late result is safe — a live retry (or none) owns the state instead.
+      if (finalized || gen !== createGen) {
+        logger?.debug?.(
+          `AgentInstance producer: createAgentInstance succeeded late for a retired ` +
+            `attempt (attempt ${createAttempts}) ${correlation()}; result dropped ` +
+            `(idempotent per element instance).`,
         );
         return false;
       }
@@ -531,8 +579,7 @@ export function createAgentInstanceProducer(opts = {}) {
         `AgentInstance producer: createAgentInstance failed (attempt ${createAttempts}) — ` +
           `status=${d.status ?? 'n/a'} message=${d.message} body=${d.body ?? 'n/a'} ` +
           `jobLease=${leaseTokenLabel(leaseToken)} model=${def.model} provider=${def.provider} ` +
-          `${correlation()}; will retry (durable transcript resumes once the create succeeds; ` +
-          `job completion unaffected).`,
+          `${correlation()}; ${retryClause}`,
       );
       return false;
     } finally {
@@ -545,18 +592,54 @@ export function createAgentInstanceProducer(opts = {}) {
     }
   };
 
+  // Start ONE create attempt, own the `creating` slot, and track its identity so a
+  // retired (timed-out) attempt's late settle can neither clear a newer attempt's slot
+  // nor latch orphaned state. Returns the (wrapped, never-rejecting) attempt promise.
+  const startCreate = (opts = {}) => {
+    const gen = (createGen += 1);
+    creatingGen = gen;
+    const p = doCreate({ ...opts, gen })
+      .catch(() => false)
+      .finally(() => {
+        // Only free the shared slot if THIS attempt still owns it — a retired attempt
+        // that settles late must not null a newer attempt's `creating` promise.
+        if (creatingGen === gen) {
+          creating = null;
+          creatingGen = 0;
+        }
+      });
+    creating = p;
+    return p;
+  };
+
+  // Await the in-flight create up to `finalizeTimeoutMs`, reporting nothing but
+  // RETIRING the attempt on timeout: a hung createAgentInstance must not block
+  // activate() (which gates whether the harness runs) or complete() (which gates job
+  // settlement / lease expiry). Retiring bumps the identity past the hung attempt (so
+  // its late result is dropped in doCreate) and frees the slot so a later retry isn't
+  // wedged behind the stuck request forever (issue #230).
+  const awaitCreateBounded = async () => {
+    const pending = creating;
+    if (!pending) return;
+    const settled = await settleWithin(pending, finalizeTimeoutMs);
+    // Only retire if it genuinely timed out AND still owns the slot (it may have
+    // settled in the same tick the timer fired, in which case its finally already
+    // freed the slot / started nothing new).
+    if (!settled && creating === pending) {
+      createGen += 1; // > creatingGen ⇒ the hung attempt's late success is dropped
+      creating = null;
+      creatingGen = 0;
+    }
+  };
+
   // Kick off a create attempt if one is warranted and the backoff window has
   // elapsed. Non-blocking: dedups a concurrent attempt and never throws. Called
   // from the ACP hot path (`ingest`) so a create that becomes possible mid-run is
   // retried without a dedicated timer.
   const maybeStartCreate = () => {
-    if (disabled || agentInstanceKey || creating) return;
+    if (disabled || agentInstanceKey || creating || finalized) return;
     if (createAttempts > 0 && now() - lastCreateAttemptAt < backoffForAttempt(createAttempts)) return;
-    creating = doCreate()
-      .catch(() => false)
-      .finally(() => {
-        creating = null;
-      });
+    startCreate();
   };
 
   // Classify one raw ACP `session/update` and append the resulting turn(s). Assumes
@@ -715,7 +798,12 @@ export function createAgentInstanceProducer(opts = {}) {
       // still inside the backoff window is throttled and simply returns the current
       // (not-yet-active) state without a new attempt.
       maybeStartCreate();
-      if (creating) await creating;
+      // BOUND the wait: c8ctl-plugin.js awaits activate() before it starts
+      // runAgentJob, so a hung createAgentInstance must not be able to block the
+      // harness from ever running. On timeout the attempt is RETIRED (identity-guarded,
+      // so a late success cannot corrupt state) and the create simply resumes on the
+      // ACP hot path; activate() returns the current (not-yet-active) state (issue #230).
+      await awaitCreateBounded();
       return this.active;
     },
 
@@ -765,24 +853,28 @@ export function createAgentInstanceProducer(opts = {}) {
       // same lifecycle contract as ingest().
       if (!disabled && !agentInstanceKey && createAttempts > 0) {
         // A throttled, ingest-triggered attempt may already be in flight — await it
-        // first so we don't start a duplicate. If it (or the lack of one) leaves us
-        // un-minted, make one explicit, un-throttled final attempt regardless of the
-        // backoff window, so a transient failure right before completion doesn't lose
-        // the record. Both awaits are BOUNDED (finalizeTimeoutMs): the harness awaits
-        // complete() before it settles the job, so a hung createAgentInstance must not
-        // be able to block settlement / expire the lease (issue #230).
+        // first (bounded) so we don't start a duplicate. If it (or the lack of one)
+        // leaves us un-minted, make one explicit, un-throttled FINAL attempt regardless
+        // of the backoff window, so a transient failure right before completion doesn't
+        // lose the record. Both awaits are BOUNDED (finalizeTimeoutMs): the harness
+        // awaits complete() before it settles the job, so a hung createAgentInstance
+        // must not block settlement / expire the lease. A timed-out attempt is RETIRED
+        // (identity-guarded) so its late success can't mint+replay after we return
+        // (issue #230).
         if (creating) {
-          await awaitBounded(creating, finalizeTimeoutMs);
+          await awaitCreateBounded();
         }
         if (!agentInstanceKey && !creating) {
-          creating = doCreate()
-            .catch(() => false)
-            .finally(() => {
-              creating = null;
-            });
-          await awaitBounded(creating, finalizeTimeoutMs);
+          startCreate({ final: true });
+          await awaitCreateBounded();
         }
       }
+      // Point of no return: from here the producer is finalized. Any create still in
+      // flight (a retired last-chance attempt, or one that raced the bound) must NOT
+      // latch a key or replay the pre-mint buffer later — doing so would resurrect an
+      // orphaned, non-terminal AgentInstance after the job is settled without a
+      // COMPLETED update (issue #230). doCreate's guard drops any such late success.
+      finalized = true;
       if (disabled || !agentInstanceKey) {
         // Still drain any queued appends so a caller awaiting completion settles.
         try { await this.drain(); } catch { /* best effort */ }

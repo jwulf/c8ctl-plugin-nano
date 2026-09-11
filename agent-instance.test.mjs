@@ -547,6 +547,117 @@ test('complete()\'s last-chance create is bounded — a hung createAgentInstance
   );
 });
 
+test('activate() is bounded — a hung create cannot block the harness, and the attempt is retired so a later retry proceeds (issue #230)', async () => {
+  // c8ctl-plugin.js awaits activate() before it starts runAgentJob, so a hung
+  // createAgentInstance must NOT block activate() forever. The FIRST attempt hangs;
+  // activate() must still return (bounded by finalizeTimeoutMs), and the hung attempt
+  // must be RETIRED so a later ingest can start a fresh attempt rather than being
+  // wedged behind the stuck request. A subsequent attempt that succeeds mints normally.
+  let createCall = 0;
+  let t = Date.parse('2026-02-03T04:05:06.000Z');
+  const client = {
+    calls: { create: [], update: [] },
+    createAgentInstance: (req) => {
+      client.calls.create.push(req);
+      createCall += 1;
+      if (createCall === 1) return new Promise(() => {}); // first attempt hangs forever
+      return Promise.resolve({ agentInstanceKey: 'AGENT-9' });
+    },
+    updateAgentInstance: async (req) => {
+      client.calls.update.push(req);
+      return { createdHistory: [] };
+    },
+  };
+  const p = createAgentInstanceProducer({
+    camunda: client,
+    job: EXTERNAL_JOB,
+    profile: PROFILE,
+    envelope: ENVELOPE,
+    logger: nullLogger,
+    now: () => t,
+    finalizeTimeoutMs: 20,
+    createRetryBaseMs: 1000,
+    createRetryMaxMs: 30000,
+  });
+  // If activate() awaited the hung create unbounded this would never resolve.
+  await p.activate();
+  assert.equal(p.active, false, 'activate() returned without minting — the hung create was retired, not awaited');
+  assert.equal(client.calls.create.length, 1, 'one (hung) attempt so far');
+  // Past the backoff window, an ingest must be able to start a FRESH attempt — the
+  // retired hung attempt must not leave `creating` set and wedge every later retry.
+  t += 2000;
+  p.ingest({ sessionUpdate: 'agent_message_chunk', messageId: 'm1', content: { type: 'text', text: 'hello' } });
+  await p.drain();
+  assert.equal(client.calls.create.length, 2, 'a later ingest started a fresh attempt despite the hung first one');
+  assert.equal(p.active, true, 'the fresh attempt minted the instance');
+});
+
+test('a create that succeeds late for a RETIRED/finalized attempt is dropped — no orphaned mint or replay after complete() (issue #230)', async () => {
+  // If a bounded wait times out, the underlying create is left running. Should it
+  // succeed AFTER complete() has returned (job settled without a COMPLETED update),
+  // it must NOT set agentInstanceKey or replay buffered turns — that would resurrect
+  // an orphaned, non-terminal AgentInstance receiving late history. Here the final
+  // last-chance create is deferred past complete()'s bound, then released.
+  const warnings = [];
+  let createCall = 0;
+  let releaseSecond = null;
+  const secondSettled = new Promise((resolve) => { releaseSecond = resolve; });
+  const client = {
+    calls: { create: [], update: [] },
+    createAgentInstance: (req) => {
+      client.calls.create.push(req);
+      createCall += 1;
+      if (createCall === 1) return Promise.reject(new Error('transient')); // activate fails fast
+      // The final attempt resolves only when the test releases it — AFTER complete().
+      return secondSettled.then(() => ({ agentInstanceKey: 'AGENT-LATE' }));
+    },
+    updateAgentInstance: async (req) => {
+      client.calls.update.push(req);
+      return { createdHistory: [] };
+    },
+  };
+  const p = makeProducer(client, {
+    finalizeTimeoutMs: 20,
+    logger: { info() {}, warn: (m) => warnings.push(m), debug() {} },
+  });
+  await p.activate();
+  assert.equal(p.active, false);
+  await p.complete(true); // final attempt is still pending → bounded out + retired/finalized
+  assert.equal(p.active, false, 'complete() returned un-minted (the final create had not settled)');
+  assert.equal(
+    client.calls.update.filter((u) => u.status === 'COMPLETED').length,
+    0,
+    'no COMPLETED update was sent',
+  );
+  // Now let the retired create succeed. Its late result MUST be dropped.
+  releaseSecond();
+  await secondSettled;
+  await new Promise((r) => setTimeout(r, 5)); // let the late .then run
+  assert.equal(p.active, false, 'the late create did NOT mint an orphaned instance');
+  assert.equal(
+    client.calls.update.length,
+    0,
+    'no buffered turns were replayed to a late-minted instance',
+  );
+});
+
+test('the FINAL last-chance create failure does not promise a retry that cannot happen (issue #230)', async () => {
+  // doCreate() is shared by the hot path (which WILL retry) and complete()'s one final
+  // attempt (which will NOT — the producer is about to be discarded). The finalization
+  // failure diagnostic must not tell operators to wait for a recovery that can't come.
+  const warnings = [];
+  const client = fakeClient({ failCreate: true }); // every create fails
+  const p = makeProducer(client, { logger: { info() {}, warn: (m) => warnings.push(m), debug() {} } });
+  await p.activate();
+  await p.complete(true);
+  const hotPathFailure = warnings.find((m) => /createAgentInstance failed \(attempt 1\)/.test(m));
+  const finalFailure = warnings.find((m) => /createAgentInstance failed \(attempt 2\)/.test(m));
+  assert.ok(hotPathFailure && /will retry/.test(hotPathFailure), 'the hot-path failure still promises a retry');
+  assert.ok(finalFailure, 'the final attempt failure was logged');
+  assert.ok(/no further create will be attempted/.test(finalFailure), 'the final failure does not promise a retry');
+  assert.ok(!/will retry/.test(finalFailure), 'the final failure does not say "will retry"');
+});
+
 test('create backoff is anchored on when the attempt settles, not when it starts (issue #230)', async () => {
   // A create that FAILS SLOWLY must still pace the next attempt from the moment it
   // settled. Anchoring on request START would let a failure that outlasts the backoff
@@ -1033,4 +1144,19 @@ test('describeSdkError caps an oversized response body so it cannot flood the lo
   // A short body is left intact.
   const small = describeSdkError({ statusCode: 400, body: 'short body' });
   assert.equal(small.body, 'short body');
+});
+
+test('describeSdkError folds newlines and caps the message so a multiline error stays one bounded log line (issue #230)', () => {
+  // A multiline body/message would split the single correlatable worker-log line, and a
+  // message that embeds a large body would bypass the body cap and flood the log.
+  const multiline = describeSdkError({ statusCode: 502, body: 'line1\nline2\r\nline3', message: 'oops\nsecond line' });
+  assert.ok(!/\n|\r/.test(multiline.body), 'the body has no raw newlines');
+  assert.ok(!/\n|\r/.test(multiline.message), 'the message has no raw newlines');
+  assert.match(multiline.body, /line1.*line2.*line3/, 'the body content is preserved inline');
+
+  // A message that embeds a huge body must be capped too — it cannot bypass the cap.
+  const huge = 'z'.repeat(5000);
+  const bigMessage = describeSdkError(new Error(`create failed: ${huge}`));
+  assert.ok(bigMessage.message.length < huge.length, 'the message is bounded');
+  assert.match(bigMessage.message, /chars\)/, 'the message notes its length when capped');
 });

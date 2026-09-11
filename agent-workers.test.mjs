@@ -1269,6 +1269,47 @@ test('provisionRepo warns (correlated) that the agent commits DIRECTLY on a symb
   }
 });
 
+test('provisionRepo warns (correlated) when branch.create EQUALS the effective base (create===base is no PR branch) (#229)', { skip: !gitOk }, () => {
+  const { root, origin } = makeOriginRepo();
+  const runDir = mkdtempSync(join(root, 'run-'));
+  const warnings = [];
+  const infos = [];
+  try {
+    // `checkout -B main` off base `main` resets the base in place — the agent
+    // commits DIRECTLY on the base with no distinct PR branch, so a non-ff push
+    // loses every commit. The effective base is `repository.ref || branch.base`,
+    // so pin it via repository.ref here to also cover the normalized-envelope path.
+    const envelope = {
+      schemaVersion: 1,
+      repository: { provider: 'github', url: origin, ref: 'main', submodules: false },
+      branch: { base: '', create: 'main', push: true },
+      setup: { commands: [], env: {}, secretRefs: [] },
+      task: { allowPr: true },
+    };
+    const prov = provisionRepo({
+      envelope,
+      token: null,
+      runDir,
+      logger: { warn: (m) => warnings.push(m), info: (m) => infos.push(m) },
+      corr: 'job 9 eik 8 pik 7',
+    });
+    assert.equal(prov.workingBranch, 'main', 'checkout -B main keeps working on base');
+    assert.ok(
+      warnings.some((m) => /branch\.create='main' equals the checkout base/.test(m)
+        && /commit DIRECTLY on base branch 'main'/.test(m)
+        && /no distinct PR branch/.test(m)
+        && /\[job 9 eik 8 pik 7\]/.test(m)),
+      'warns (with correlation) that create===base leaves the agent on the base with no PR branch',
+    );
+    assert.ok(
+      !infos.some((m) => /cut feat branch/.test(m)),
+      'does NOT falsely claim a feat branch was cut when create===base',
+    );
+  } finally {
+    rmSync(root, { recursive: true, force: true });
+  }
+});
+
 test('finalizeGit pushes the first commit into an empty repo (no base sha)', { skip: !gitOk }, () => {
   const root = mkdtempSync(join(tmpdir(), 'nano-git-'));
   const origin = join(root, 'origin.git');

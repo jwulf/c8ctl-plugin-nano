@@ -473,8 +473,27 @@ test('activate() rejection logs HTTP status + body + correlation + lease tail at
   assert.match(line, /job 13954/);
   assert.match(line, /eik EIK-7/);
   assert.match(line, /pik 13951/);
-  assert.match(line, /lease …99001/); // lease present, tail only
+  assert.match(line, /lease present \(len 5\)/); // short token masked — not printed whole
   assert.match(line, /Opus 4\.8\/anthropic/);
+});
+
+test('activate() rejection collapses a multiline error body/message to one log line (#229)', async () => {
+  const client = fakeClient();
+  client.createAgentInstance = async (req) => {
+    client.calls.create.push(req);
+    // A pretty-printed / multiline engine error must NOT split the correlation
+    // record across several worker-log lines (diagnostic dilution + log spoofing).
+    throw { status: 500, body: 'line1\nline2\r\nline3', message: 'boom\ninjected: fake log line' };
+  };
+  const logger = recordingLogger();
+  const p = makeProducer(client, { logger });
+  const ok = await p.activate();
+  assert.equal(ok, false);
+  const line = logger.lines.warn.find((l) => l.includes('createAgentInstance REJECTED'));
+  assert.ok(line, 'expected a REJECTED warn line');
+  assert.ok(!/[\r\n]/.test(line), 'the rendered SDK error must not contain CR/LF');
+  assert.match(line, /body line1 line2 line3/);
+  assert.match(line, /msg boom injected: fake log line/);
 });
 
 test('complete() logs a turn counter separating the 0-turns husk from a healthy run (#229)', async () => {

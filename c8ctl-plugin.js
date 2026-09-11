@@ -4290,9 +4290,20 @@ function provisionRepo({ envelope, token, runDir, timeoutMs = 120_000, logger = 
     const cb = runGit(['checkout', '-B', envelope.branch.create], { cwd: workspaceDir, env: gitEnv, timeoutMs });
     if (cb.status !== 0) throw new ProvisionError(describeGitFailure(`git checkout -B ${envelope.branch.create}`, cb, { token, timeoutMs }));
     workingBranch = envelope.branch.create;
-    // #229: make the working-branch decision explicit — a feat branch was cut, so
-    // the agent's commits land on their own branch and a PR can be opened.
-    logger?.info?.(`git provision: branch.create=${envelope.branch.create} → cut feat branch '${workingBranch}' off '${branchName || 'HEAD'}'.${cs}`);
+    // #229: make the working-branch decision explicit. A `checkout -B` whose target
+    // is DISTINCT from the effective checkout base (`branchName` = repository.ref ||
+    // branch.base) genuinely cuts a feat branch — the agent's commits land on their
+    // own branch and a PR can be opened. But when `branch.create` EQUALS that base
+    // (e.g. `{ base:'main', create:'main' }`, or `repository.ref:'main'` +
+    // `create:'main'`) the `-B` just resets the base branch in place: the agent
+    // commits DIRECTLY on the base with no distinct PR branch, so a non-fast-forward
+    // push (the base advanced on the remote since clone) loses every commit — the
+    // same 20974 work-loss shape as the no-create path. Warn loudly in that case.
+    if (branchName && workingBranch === branchName) {
+      logger?.warn?.(`git provision: branch.create='${envelope.branch.create}' equals the checkout base → agent will commit DIRECTLY on base branch '${workingBranch}'; no distinct PR branch — a non-fast-forward push (the branch advanced on the remote since clone) would lose every commit.${cs}`);
+    } else {
+      logger?.info?.(`git provision: branch.create=${envelope.branch.create} → cut feat branch '${workingBranch}' off '${branchName || 'HEAD'}'.${cs}`);
+    }
   } else {
     const head = runGit(['rev-parse', '--abbrev-ref', 'HEAD'], { cwd: workspaceDir, env: gitEnv });
     const name = (head.stdout || '').trim();
@@ -4470,10 +4481,15 @@ function finalizeGit({ workspaceDir, gitEnv, startSha, workingBranch, envelope, 
     const staleFetchTimeoutMs = 15_000;
     const staleFetch = runGit([...credArgs(), 'fetch', '--no-tags', 'origin', workingBranch], { cwd: workspaceDir, env: gitEnv, timeoutMs: staleFetchTimeoutMs });
     if (staleFetch.status === 0) {
-      const behind = runGit(['rev-list', '--count', `HEAD..origin/${workingBranch}`], { cwd: workspaceDir, env: gitEnv });
+      // Budget the local graph walks on the SAME short diagnostic timeout, not
+      // runGit's 120s default: a `rev-list --count HEAD..origin/<branch>` on a
+      // large/shallow repo can block this event loop long enough to starve the
+      // dispatch-lock extender and lapse the lease. Best-effort — a slow walk just
+      // skips the hint and still reaches the push below.
+      const behind = runGit(['rev-list', '--count', `HEAD..origin/${workingBranch}`], { cwd: workspaceDir, env: gitEnv, timeoutMs: staleFetchTimeoutMs });
       const n = behind.status === 0 ? Number((behind.stdout || '').trim()) : NaN;
       if (Number.isFinite(n) && n > 0) {
-        const remoteSha = runGit(['rev-parse', `origin/${workingBranch}`], { cwd: workspaceDir, env: gitEnv });
+        const remoteSha = runGit(['rev-parse', `origin/${workingBranch}`], { cwd: workspaceDir, env: gitEnv, timeoutMs: staleFetchTimeoutMs });
         out.baseAdvanced = n;
         // Frame this as "remote is N ahead of local HEAD", NOT "advanced since
         // clone": for a `branch.create` branch the local ref is reset from the
@@ -4495,8 +4511,11 @@ function finalizeGit({ workspaceDir, gitEnv, startSha, workingBranch, envelope, 
       // PR branch and a failed push still LOSES the commits. `task.allowPr` only
       // enables PR *reconciliation* — it does NOT create a branch — so it is not
       // part of this decision. Treat create===base (and no create) as "no PR
-      // branch" and keep the loud signal.
-      const effectiveBase = envelope.branch?.base || '';
+      // branch" and keep the loud signal. The effective checkout base is
+      // `repository.ref || branch.base` (the same precedence provisionRepo clones
+      // with) — using `branch.base` alone would miss a normalized envelope that
+      // pins the base via `repository.ref` (e.g. ref:'main', create:'main').
+      const effectiveBase = envelope.repository?.ref || envelope.branch?.base || '';
       const hasPrBranch = !!envelope.branch?.create && workingBranch !== effectiveBase;
       const lossNote = hasPrBranch
         ? `${out.commits.length} commit(s) are unpushed on branch '${workingBranch}'`

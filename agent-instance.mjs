@@ -28,6 +28,11 @@ const SDK_UPDATE = 'updateAgentInstance';
 
 const isNonBlank = (v) => v != null && String(v).trim() !== '';
 const isPlainObject = (v) => v != null && typeof v === 'object' && !Array.isArray(v);
+// #229: collapse CR/LF (and other line/para separators) to a single space so a
+// multiline engine error can't split one correlation record across several
+// worker-log lines — that would both dilute the status/body diagnostic and let a
+// crafted error body spoof extra log lines. Used when rendering SDK errors.
+const oneLine = (v) => String(v).replace(/[\r\n\t\f\v\u0085\u2028\u2029]+/g, ' ');
 
 /**
  * Extract the HTTP status + response body from an SDK rejection (#229).
@@ -70,8 +75,8 @@ export function describeSdkError(err) {
 function formatSdkError(err) {
   const { status, body, message } = describeSdkError(err);
   const parts = [`status ${status ?? 'unknown'}`];
-  if (isNonBlank(body)) parts.push(`body ${String(body).slice(0, 600)}`);
-  parts.push(`msg ${message}`);
+  if (isNonBlank(body)) parts.push(`body ${oneLine(String(body).slice(0, 600))}`);
+  parts.push(`msg ${oneLine(message)}`);
   return parts.join('; ');
 }
 
@@ -228,9 +233,17 @@ export function createAgentInstanceProducer(opts = {}) {
   const processInstanceKey = job?.processInstanceKey != null ? String(job.processInstanceKey) : '';
   const corr = () =>
     `job ${jobKey || '?'} eik ${elementInstanceKey || '?'} pik ${processInstanceKey || '?'}`;
-  // The lease token is a secret-ish fence token — never log it whole; a short tail
-  // is enough to tell "present" from "absent" and to correlate the activation.
-  const leaseNote = () => (leaseToken ? `lease …${leaseToken.slice(-6)}` : 'lease absent');
+  // The lease token is a secret-ish fence token — never log it whole. `slice(-6)`
+  // would print a short/malformed lease (≤6 chars) IN FULL, so only surface a tail
+  // when the token is long enough that the tail still hides most of it; otherwise
+  // emit a safe digest (presence + length). Enough either way to tell "present"
+  // from "absent" and to correlate the activation without exposing the token.
+  const leaseNote = () =>
+    !leaseToken
+      ? 'lease absent'
+      : leaseToken.length > 8
+        ? `lease …${leaseToken.slice(-4)}`
+        : `lease present (len ${leaseToken.length})`;
 
   // The producer is a no-op unless every precondition holds: a usable SDK client,
   // an external agent job, and the ACP classifier. Any missing piece leaves the

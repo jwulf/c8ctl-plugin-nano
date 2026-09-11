@@ -7897,7 +7897,7 @@ async function workAgent(req, flags) {
   // connection instead of a per-process channel.
   /** @type {import('./supervisor.dist.js').AgenticEndpoint | null} */
   let agenticEndpoint = null;
-  /** @type {{ register: () => void, deregister: (reason?: string) => void, relaySessionFor: (jobKey: string|number, extra?: { elementInstanceKey?: string|number, processInstanceKey?: string|number, agentInstanceKey?: string|number }) => (object|null) } | null} */
+  /** @type {{ register: () => void, deregister: (reason?: string) => void, relaySessionFor: (jobKey: string|number, extra?: { elementInstanceKey?: string|number, processInstanceKey?: string|number, agentInstanceKey?: string|number|(() => string|number|undefined) }) => (object|null) } | null} */
   let agenticPlane = null;
   // The presence attributes this worker announces on `register` (ENROLMENT
   // attributes, not routing tokens — jobKeys are carried by the explicit

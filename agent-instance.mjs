@@ -720,7 +720,11 @@ export function createAgentInstanceProducer(opts = {}) {
       // Last chance: if the instance never minted (create kept failing) make one
       // final, un-throttled attempt so at least the CONFIGURATION turn + terminal
       // status survive when the create finally becomes possible (issue #230).
-      if (!disabled && !agentInstanceKey) {
+      // Only after an activation attempt (createAttempts > 0): if activate() was
+      // never called this stays a no-op rather than minting — and potentially
+      // completing — an AgentInstance for a run that never activated, preserving the
+      // same lifecycle contract as ingest().
+      if (!disabled && !agentInstanceKey && createAttempts > 0) {
         // A throttled, ingest-triggered attempt may already be in flight — await it
         // first so we don't start a duplicate. If it (or the lack of one) leaves us
         // un-minted, make one explicit, un-throttled final attempt regardless of the
@@ -741,11 +745,16 @@ export function createAgentInstanceProducer(opts = {}) {
       if (disabled || !agentInstanceKey) {
         // Still drain any queued appends so a caller awaiting completion settles.
         try { await this.drain(); } catch { /* best effort */ }
-        logger?.warn?.(
-          `AgentInstance producer: no durable AgentInstance for this job after ` +
-            `${createAttempts} create attempt(s) ${correlation()}; ` +
-            `no engine transcript was recorded (job completion unaffected).`,
-        );
+        // Only warn when we actually attempted to mint (createAttempts > 0). A
+        // producer that was never activated is a clean no-op — there is no missing
+        // transcript to report.
+        if (createAttempts > 0) {
+          logger?.warn?.(
+            `AgentInstance producer: no durable AgentInstance for this job after ` +
+              `${createAttempts} create attempt(s) ${correlation()}; ` +
+              `no engine transcript was recorded (job completion unaffected).`,
+          );
+        }
         return;
       }
       flushMessage();

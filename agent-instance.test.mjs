@@ -490,6 +490,20 @@ test('complete() makes a final un-throttled create attempt when the instance nev
   assert.equal(client.calls.update.filter((u) => u.status === 'COMPLETED').length, 1);
 });
 
+test('complete() without a prior activate() is a no-op — it does NOT mint an instance (issue #230)', async () => {
+  // A producer that was never activated (createAttempts === 0) must not mint — and
+  // therefore not complete — an AgentInstance for a run that never activated. The
+  // last-chance create is gated on an activation attempt, matching ingest()'s
+  // lifecycle contract, and no misleading "no durable AgentInstance" warning fires.
+  const warnings = [];
+  const client = fakeClient();
+  const p = makeProducer(client, { logger: { info() {}, warn: (m) => warnings.push(m), debug() {} } });
+  await p.complete(true);
+  assert.equal(client.calls.create.length, 0);
+  assert.equal(client.calls.update.length, 0);
+  assert.equal(warnings.length, 0);
+});
+
 test('pre-mint ACP updates are buffered and replayed once a retried create succeeds (issue #230)', async () => {
   // The create fails on activate; turns then stream in while it is still failing.
   // They must be buffered and durably replayed against the instance once a later

@@ -4659,14 +4659,17 @@ function finalizeGit({ workspaceDir, gitEnv, startSha, workingBranch, baseBranch
     // reaped and the real commits are lost. Treat a branch mismatch as a failed,
     // preserved result: surface the stranded SHAs, skip the misdirected push (and,
     // via pushFailed, the PR reconcile) so the recovery handle survives.
-    const headBranchNow = runGit(['rev-parse', '--abbrev-ref', 'HEAD'], { cwd: workspaceDir, env: gitEnv });
-    const rawHeadBranch = headBranchNow.status === 0 ? ((headBranchNow.stdout || '').trim()) : '';
-    // `git rev-parse --abbrev-ref HEAD` echoes the literal 'HEAD' for a DETACHED
-    // checkout, so normalize that sentinel to '' — otherwise the harness detaching
-    // HEAD would record `branchMismatch.actual: 'HEAD'` and the completion error
-    // would claim it "moved to a branch named HEAD" instead of identifying the
-    // detached state (branchMismatch.actual: null / '(detached)').
-    const currentBranch = (rawHeadBranch && rawHeadBranch !== 'HEAD') ? rawHeadBranch : '';
+    // Read the current branch via `git symbolic-ref -q HEAD`, NOT
+    // `git rev-parse --abbrev-ref HEAD`. When a TAG shares the work branch's name
+    // (e.g. refs/tags/v1 alongside refs/heads/v1), `--abbrev-ref` disambiguates by
+    // emitting the qualified 'heads/v1' form, so `currentBranch !== workingBranch`
+    // spuriously reads as a branch mismatch and finalizeGit REFUSES to push a branch
+    // HEAD never actually left (thread 4767). `symbolic-ref` returns the full,
+    // unambiguous `refs/heads/<name>` and exits nonzero for a DETACHED HEAD, so the
+    // detached case maps cleanly to '' (no 'HEAD' sentinel to special-case).
+    const headBranchNow = runGit(['symbolic-ref', '-q', 'HEAD'], { cwd: workspaceDir, env: gitEnv });
+    const rawHeadRef = headBranchNow.status === 0 ? ((headBranchNow.stdout || '').trim()) : '';
+    const currentBranch = rawHeadRef.startsWith('refs/heads/') ? rawHeadRef.slice('refs/heads/'.length) : '';
     const movedOff = currentBranch !== workingBranch;
     // Commits pushing `workingBranch` would NOT publish — the harness made them off
     // the work branch: either HEAD moved away and committed there (out.commits =
@@ -4695,6 +4698,25 @@ function finalizeGit({ workspaceDir, gitEnv, startSha, workingBranch, baseBranch
         : `HEAD is back on '${workingBranch}' but ${offBranchStray.length} commit(s) were left on another local branch`;
       log.warn?.(`finalizeGit${corr ? ' (' + corr + ')' : ''}: ${where} — the harness moved HEAD off the provisioned work branch; refusing to push '${workingBranch}' (it would publish stale work and strand the ${out.strandedCommits.length} new commit(s)). Preserving workspace for recovery.`);
     } else {
+    // We are pushing `workingBranch`. Promote the WORK-BRANCH tip + its commit list
+    // into the authoritative output/recovery metadata BEFORE push verification
+    // (threads 4646/4810, suppressed advisories 4781/4812). out.headSha (final HEAD)
+    // and out.commits (startSha..HEAD) describe wherever the harness left HEAD, which
+    // — in the newly supported case where it committed on the work branch then moved
+    // HEAD back to the base/detached — is the BASE, not the branch we publish. Left
+    // uncorrected: (1) a successful push reports the base SHA + zero commits; (2) the
+    // landed-check below compares origin/<branch> against the base out.headSha, so a
+    // diverged work branch can look like a descendant of the base head → false
+    // landed → pushFailed suppressed → the recovery workspace deleted though the work
+    // never landed; (3) a genuine non-ff reject copies an empty out.commits into
+    // strandedCommits, dropping the recovery SHAs. Anchoring on refs/heads/<branch>
+    // (a no-op when HEAD is already on it) makes the metadata track what we push.
+    const branchTip = runGit(['rev-parse', '--verify', '--quiet', `refs/heads/${workingBranch}`], { cwd: workspaceDir, env: gitEnv });
+    const branchTipSha = branchTip.status === 0 ? ((branchTip.stdout || '').trim() || null) : null;
+    if (branchTipSha) {
+      out.headSha = branchTipSha;
+      out.commits = branchCommits.slice();
+    }
     // advanced on the remote since we cloned, a push can be rejected non-ff. Fetch
     // the base and report how far it moved so the non-ff cause is visible in the
     // log BEFORE the push, not inferred after the fact. Best-effort — never fatal.
@@ -4764,7 +4786,14 @@ function finalizeGit({ workspaceDir, gitEnv, startSha, workingBranch, baseBranch
         log.warn?.(`finalizeGit${corr ? ' (' + corr + ')' : ''}: pre-push staleness check could not fetch base '${baseBranch}' (${out.stalenessFetchError}) — a later non-ff or other push failure will be indistinguishable from an unchanged base`);
       }
     }
-    const push = runGit([...credArgs(), 'push', '--set-upstream', 'origin', workingBranch], { cwd: workspaceDir, env: gitEnv, timeoutMs: pushTimeoutMs });
+    // Push the EXPLICIT refs/heads/<branch>:refs/heads/<branch> refspec, not the bare
+    // `workingBranch`: a bare source ref is ambiguous when a same-named TAG also
+    // exists (e.g. workingBranch 'v1' while origin — and thus the local clone — has
+    // refs/tags/v1), so `git push origin v1` fails "src refspec v1 matches more than
+    // one" and misreports the work as unpublished (threads 4767/4777). The fully
+    // qualified heads ref resolves unambiguously; --set-upstream still tracks the
+    // local branch.
+    const push = runGit([...credArgs(), 'push', '--set-upstream', 'origin', `refs/heads/${workingBranch}:refs/heads/${workingBranch}`], { cwd: workspaceDir, env: gitEnv, timeoutMs: pushTimeoutMs });
     if (push.status === 0) out.pushed = true;
     else {
       // A nonzero `git push` does NOT prove the ref was not updated: a timeout or
@@ -4809,7 +4838,12 @@ function finalizeGit({ workspaceDir, gitEnv, startSha, workingBranch, baseBranch
         // the commits to recover — not a soft pushError that reads as "completed".
         out.pushError = describeGitFailure('git push', push, { token, timeoutMs: pushTimeoutMs });
         out.pushFailed = true;
-        out.strandedCommits = out.commits.slice();
+        // Union the work-branch commit list into the stranded set: out.commits is now
+        // the promoted branchCommits, but if HEAD sat off the branch and promotion
+        // found no tip, out.commits could still be the (empty) final-HEAD range —
+        // branchCommits carries the commits the rejected push actually strands, so
+        // include them explicitly (suppressed advisory 4812).
+        out.strandedCommits = [...new Set([...out.commits, ...branchCommits])];
       }
     }
     } // end HEAD-on-workingBranch else

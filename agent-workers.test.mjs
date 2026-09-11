@@ -1769,6 +1769,11 @@ test('finalizeGit PUSHES the work branch when the harness committed on it but le
     assert.equal(out.pushed, true, 'the work branch is published even though HEAD moved off it');
     assert.ok(!out.pushFailed, 'no strand — all new work is on the pushable work branch');
     assert.equal(out.strandedCommits, undefined, 'nothing is stranded');
+    // The output metadata must describe the branch we PUSHED (its tip + commits),
+    // not the base HEAD was left on — otherwise a successful push reports the base
+    // SHA and zero commits (threads 4646/4810, suppressed 4781/4812).
+    assert.equal(out.headSha, workSha, 'headSha is promoted to the pushed work-branch tip, not the base HEAD');
+    assert.deepEqual(out.commits, [workSha], 'commits describe the work-branch content, not the empty startSha..HEAD range');
     assert.equal(
       g(['-c', 'safe.bareRepository=all', 'rev-parse', '--verify', 'refs/heads/feat/work'], origin),
       workSha,
@@ -1870,6 +1875,47 @@ test('provisionRepo honours branch.create equal to a TAG ref instead of silently
     assert.equal(prov.workingBranch, 'v1', 'the explicit work branch is honoured off the detached tag');
     assert.equal(prov.detached, false, 'not left detached/null');
     assert.equal(g(['rev-parse', '--verify', '--quiet', 'refs/heads/v1'], prov.workspaceDir).length, 40, 'a real branch ref was created (not left detached at the tag)');
+  } finally {
+    rmSync(root, { recursive: true, force: true });
+  }
+});
+
+test('finalizeGit pushes a work branch whose name collides with a remote TAG via the explicit heads refspec (issue #231, thread 4767)', { skip: !gitOk }, () => {
+  const { root, origin } = makeOriginRepo();
+  // Put a tag named 'v1' on the origin so a normal clone fetches refs/tags/v1 into
+  // the workspace. The work branch is ALSO named 'v1' (refs/heads/v1), so a bare
+  // `git push origin v1` is ambiguous ("src refspec v1 matches more than one") and
+  // would misreport the work as unpushed — the explicit refs/heads/v1:refs/heads/v1
+  // refspec must disambiguate and publish it.
+  const tagClone = mkdtempSync(join(root, 'tag-'));
+  g(['clone', '-q', origin, tagClone], undefined);
+  g(['tag', 'v1'], tagClone);
+  g(['push', '-q', 'origin', 'v1'], tagClone);
+  const runDir = mkdtempSync(join(root, 'run-'));
+  try {
+    const envelope = {
+      schemaVersion: 1,
+      repository: { provider: 'github', url: origin, submodules: false },
+      branch: { base: 'main', create: 'v1', push: true },
+      setup: { commands: [], env: {}, secretRefs: [] },
+      task: { allowPr: false },
+    };
+    const prov = provisionRepo({ envelope, token: null, runDir });
+    assert.equal(prov.workingBranch, 'v1', 'the work branch is the tag-colliding name');
+    assert.equal(g(['rev-parse', '--verify', '--quiet', 'refs/tags/v1'], prov.workspaceDir).length, 40, 'the clone fetched the same-named tag, so a bare push would be ambiguous');
+    writeFileSync(join(prov.workspaceDir, 'work.txt'), 'work\n');
+    g(['add', '-A'], prov.workspaceDir);
+    g(['-c', 'user.name=nano', '-c', 'user.email=nano@example.com', 'commit', '-q', '-m', 'work on v1'], prov.workspaceDir);
+    const workSha = g(['rev-parse', 'HEAD'], prov.workspaceDir);
+
+    const out = finalizeGit({ ...prov, envelope, token: null });
+    assert.equal(out.pushed, true, 'the explicit heads refspec disambiguates the tag collision and publishes the work');
+    assert.ok(!out.pushFailed, 'the collision no longer misreports a failed push');
+    assert.equal(
+      g(['-c', 'safe.bareRepository=all', 'rev-parse', '--verify', 'refs/heads/v1'], origin),
+      workSha,
+      'origin refs/heads/v1 (the branch, not the tag) carries the work commit',
+    );
   } finally {
     rmSync(root, { recursive: true, force: true });
   }

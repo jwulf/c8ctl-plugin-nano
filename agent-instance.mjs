@@ -29,6 +29,54 @@ const SDK_UPDATE = 'updateAgentInstance';
 const isNonBlank = (v) => v != null && String(v).trim() !== '';
 const isPlainObject = (v) => v != null && typeof v === 'object' && !Array.isArray(v);
 
+// #229: collapse CR/LF (and other line/para separators) to a single space so a
+// multiline engine error can't split one correlation record across several
+// worker-log lines — that would both dilute the status/body diagnostic and let a
+// crafted error body spoof extra log lines. Used by the one-line #229 renderers.
+const oneLine = (v) => String(v).replace(/[\r\n\t\f\v\u0085\u2028\u2029]+/g, ' ');
+
+// Raw (uncapped/unfolded) extraction of the diagnosable facts out of an SDK/transport
+// rejection, tolerant of the shapes the `@camunda8/orchestration-cluster-api` client
+// and the underlying transport surface. Used by {@link formatSdkError} for the compact
+// one-line #229 diagnostics; the richer, capped/normalized public renderer is
+// {@link describeSdkError} below (issue #230). Kept separate because the two apply
+// different normalization (oneLine → single space here vs. an inline ⏎ marker there).
+function rawSdkFields(err) {
+  if (err == null) return { status: undefined, body: undefined, message: String(err) };
+  const status =
+    err.status ??
+    err.statusCode ??
+    err?.response?.status ??
+    err?.response?.statusCode ??
+    (typeof err.code === 'number' ? err.code : undefined);
+  let body =
+    err.body ??
+    err.responseBody ??
+    err?.response?.data ??
+    err?.response?.body ??
+    undefined;
+  if (body != null && typeof body !== 'string') {
+    try {
+      body = JSON.stringify(body);
+    } catch {
+      body = String(body);
+    }
+  }
+  const message = err.message ? String(err.message) : String(err);
+  return { status, body, message };
+}
+
+// One-line rendering of an SDK error for a #229 log line: `status N; body …; msg …`
+// with CR/LF folded to spaces and the body capped so a multiline/oversized engine
+// response can neither split the single correlatable worker-log line nor flood it.
+function formatSdkError(err) {
+  const { status, body, message } = rawSdkFields(err);
+  const parts = [`status ${status ?? 'unknown'}`];
+  if (isNonBlank(body)) parts.push(`body ${oneLine(String(body).slice(0, 600))}`);
+  parts.push(`msg ${oneLine(message)}`);
+  return parts.join('; ');
+}
+
 // Default create-retry backoff (issue #230). A transient createAgentInstance
 // rejection at second 0 (e.g. a lease fence that has not yet settled) must NOT
 // forfeit the whole run's durable transcript, so a failed/absent create is
@@ -358,6 +406,22 @@ export function createAgentInstanceProducer(opts = {}) {
   const elementInstanceKey = job?.elementInstanceKey != null ? String(job.elementInstanceKey) : '';
   const elementId = job?.elementId != null ? String(job.elementId) : null;
   const processInstanceKey = job?.processInstanceKey != null ? String(job.processInstanceKey) : '';
+  // #229 cross-channel correlation, compact form. Stamps job/eik/pik so the
+  // AgentInstance channel can be joined to the job / relay / git channels. This is the
+  // terse rendering used by the observability lines; `correlation()` below is the
+  // richer key=value rendering used by the #230 retry diagnostics.
+  const corr = () =>
+    `job ${jobKey || '?'} eik ${elementInstanceKey || '?'} pik ${processInstanceKey || '?'}`;
+  // The lease token is a secret-ish fence token — never log it whole. Only surface a
+  // tail when the token is long enough that the tail still hides most of it; otherwise
+  // emit a safe digest (presence + length). Enough either way to tell "present" from
+  // "absent" and to correlate the activation without exposing the token (#229).
+  const leaseNote = () =>
+    !leaseToken
+      ? 'lease absent'
+      : leaseToken.length > 8
+        ? `lease …${leaseToken.slice(-4)}`
+        : `lease present (len ${leaseToken.length})`;
 
   // The producer is a no-op unless every precondition holds: a usable SDK client,
   // an external agent job, and the ACP classifier. Any missing piece leaves the
@@ -413,12 +477,24 @@ export function createAgentInstanceProducer(opts = {}) {
   let pendingMessage = null;
   // callId → toolName, so a TOOL_RESULT turn can reference the originating call name.
   const toolNames = new Map();
-  // Count of AgentHistory turns successfully appended, for the completion diagnostic
-  // (separates "create failed" from "created but nothing ingested over a long run").
+  // Count of AgentHistory turns the ENGINE actually created (via `res.createdHistory`,
+  // not the attempt), for the completion diagnostic — separates "create failed" from
+  // "created but nothing ingested over a long run", and a deduplicated no-op from a
+  // real append (issue #230 / #229 / #232).
   let appendedTurns = 0;
   // Elevate the FIRST per-turn append failure to `warn` (repeats stay `debug`) so a
-  // 400/404 append storm is visible without flooding the log (issue #230 / #229).
+  // 400/404 append storm is visible without flooding the log (issue #230 / #229). Two
+  // flags: `appendFailureLogged` gates the #230 key=value diagnostic line, and
+  // `appendInstrFailureLogged` gates the #229 `updateAgentInstance(append) failed`
+  // observability line — they are DISTINCT so each first-failure line elevates once.
   let appendFailureLogged = false;
+  let appendInstrFailureLogged = false;
+  // #229 first-failure elevation for ingest faults (classifier OR handler): the FIRST
+  // per-instance ingest failure logs at `warn`, repeats stay at `debug`.
+  let ingestFailureLogged = false;
+  // #229 turn accounting: when the instance was minted, so `complete()` can log
+  // "N turns over Xm" and separate the 0-turns husk from a healthy run.
+  let activatedAt = 0;
   // Pre-mint replay buffer (issue #230): ACP updates that arrive after an activation
   // attempt but before the instance has minted are held here (bounded) and replayed
   // in arrival order once `agentInstanceKey` becomes available, so a create that
@@ -461,10 +537,19 @@ export function createAgentInstanceProducer(opts = {}) {
         // until it expires during an AgentInstance outage. A timeout is tagged
         // `__nanoTimeout` and swallowed by the catch below like any other append
         // failure — best-effort, never breaks the chain (issue #230).
-        await callWithin(camunda[SDK_UPDATE](req), finalizeTimeoutMs);
-        appendedTurns += 1;
+        const res = await callWithin(camunda[SDK_UPDATE](req), finalizeTimeoutMs);
+        // #229/#232: the engine dedups appends by historyItemId, so a retry or a
+        // reactivation can return 200 while creating ZERO new history entries. Count
+        // what the engine actually CREATED (`res.createdHistory`) — not the attempt —
+        // so the completion counter separates a real append from a deduplicated no-op
+        // and keeps the 0-turns husk diagnosis honest. Fall back to +1 only when the
+        // response omits the field (older engine), so a genuine append is never
+        // under-counted.
+        appendedTurns += Array.isArray(res?.createdHistory) ? res.createdHistory.length : 1;
       } catch (err) {
         const d = describeSdkError(err);
+        // #230 diagnostic: the shaped key=value line (status/message/body + the richer
+        // correlation()) — asserted by the #230 append-failure test.
         const line =
           `AgentInstance producer: ${SDK_UPDATE} append failed — ` +
           `status=${d.status ?? 'n/a'} message=${d.message} body=${d.body ?? 'n/a'} ${correlation()}.`;
@@ -473,6 +558,18 @@ export function createAgentInstanceProducer(opts = {}) {
           logger?.warn?.(line);
         } else {
           logger?.debug?.(line);
+        }
+        // #229 observability: the compact `updateAgentInstance(append) failed` line
+        // (labelled verb + terse corr()) — asserted by the #229 append-failure test.
+        // Independently first-failure-elevated so it too warns exactly once.
+        const instr =
+          `AgentInstance producer: updateAgentInstance(append) failed (${corr()}) — ` +
+          `status ${d.status ?? 'unknown'}: ${oneLine(d.message)}`;
+        if (!appendInstrFailureLogged) {
+          appendInstrFailureLogged = true;
+          logger?.warn?.(`${instr}; further append failures for this instance stay at debug.`);
+        } else {
+          logger?.debug?.(instr);
         }
       }
     });
@@ -544,6 +641,20 @@ export function createAgentInstanceProducer(opts = {}) {
   const correlation = () =>
     `[jobKey=${jobKey || 'n/a'} elementInstanceKey=${elementInstanceKey || 'n/a'} ` +
     `processInstanceKey=${processInstanceKey || 'n/a'}]`;
+
+  // #229: first-failure elevation for ingest faults (classifier OR handler). The FIRST
+  // ingest failure per instance logs at `warn`; repeats stay at `debug` so a
+  // persistently-faulting instance doesn't flood the log.
+  const noteIngestFailure = (err) => {
+    if (!ingestFailureLogged) {
+      ingestFailureLogged = true;
+      logger?.warn?.(
+        `AgentInstance producer: ingest failed (${corr()}) — ${oneLine(err?.message || err)}; further ingest failures for this instance stay at debug.`,
+      );
+    } else {
+      logger?.debug?.(`AgentInstance producer: ingest failed (${corr()}) — ${oneLine(err?.message || err)}`);
+    }
+  };
 
   // Build the opening CONFIGURATION turn from the concrete runtime definition.
   const buildConfigTurn = () => {
@@ -648,9 +759,11 @@ export function createAgentInstanceProducer(opts = {}) {
       }
       agentInstanceKey = key;
       loopIteration = 1;
+      activatedAt = now();
       logger?.info?.(
         `AgentInstance ${agentInstanceKey} minted for element instance ${elementInstanceKey} ` +
-          `(job ${jobKey}, attempt ${attempt}) ${correlation()}.`,
+          `(job ${jobKey}, attempt ${attempt}) ${correlation()} ` +
+          `(${leaseNote()}; model ${oneLine(def.model)}/${oneLine(def.provider)}).`,
       );
       replayPreMintBuffer();
       return true;
@@ -674,6 +787,15 @@ export function createAgentInstanceProducer(opts = {}) {
           `status=${d.status ?? 'n/a'} message=${d.message} body=${d.body ?? 'n/a'} ` +
           `jobLease=${leaseTokenLabel(leaseToken)} model=${def.model} provider=${def.provider} ` +
           `${correlation()}; ${retryClause}`,
+      );
+      // #229 observability: the compact, root-causable `REJECTED` summary (HTTP
+      // status + body via formatSdkError, terse corr(), masked lease, model/provider).
+      // Layered ALONGSIDE the #230 line above — the two carry the same facts in the two
+      // frozen log formats the respective test suites assert. Honest about the retry
+      // (uses the #230 retryClause), NOT "continuing without a durable transcript".
+      logger?.warn?.(
+        `AgentInstance producer: createAgentInstance REJECTED (${corr()}; ${leaseNote()}; ` +
+          `model ${oneLine(def.model)}/${oneLine(def.provider)}) — ${formatSdkError(err)}; ${retryClause}`,
       );
       return false;
     } finally {
@@ -815,7 +937,11 @@ export function createAgentInstanceProducer(opts = {}) {
     let classified;
     try {
       classified = classify(rawUpdate);
-    } catch {
+    } catch (err) {
+      // A classifier/translation fault is an ingest failure too — route it through the
+      // same first-failure elevation (#229) instead of returning silently, or the
+      // ingest path can still drop every turn with no warning.
+      noteIngestFailure(err);
       return;
     }
     if (!classified || typeof classified !== 'object') return;
@@ -854,7 +980,10 @@ export function createAgentInstanceProducer(opts = {}) {
           break;
       }
     } catch (err) {
-      logger?.debug?.(`AgentInstance producer: ingest failed — ${err?.message || err}`);
+      // #229: elevate the FIRST ingest failure per instance to `warn` (repeats stay
+      // `debug`) so a translation/append fault that silently drops every turn is
+      // visible at normal verbosity.
+      noteIngestFailure(err);
     }
   };
 
@@ -1172,15 +1301,22 @@ export function createAgentInstanceProducer(opts = {}) {
             `this transition ${correlation()}.`,
         );
       }
+      // #229/#232 turn counter — "N turn(s) appended over Xm, <transition>" — so the
+      // 0-turns husk ("created but nothing ingested") is distinguishable from a healthy
+      // run at a glance. Render the HONEST terminal transition: only claim
+      // `status→COMPLETED` when the terminal update actually confirmed (terminalOk);
+      // on a rejected/timed-out update say so (the instance stays non-terminal, so a
+      // retry/reactivation still continues it) and flag manual reconciliation; on a
+      // failed job end no COMPLETED update was attempted at all.
+      const elapsedMs = activatedAt ? Math.max(0, now() - activatedAt) : 0;
+      const mins = (elapsedMs / 60000).toFixed(1);
+      const transition = !ok
+        ? 'left non-terminal (retry/reactivation continues it)'
+        : terminalOk
+          ? 'status→COMPLETED'
+          : 'COMPLETED update FAILED — left non-terminal (retry/reactivation continues it); manual reconciliation required';
       logger?.info?.(
-        `AgentInstance ${agentInstanceKey}: ${appendedTurns} turn(s) appended` +
-          `${
-            terminalOk
-              ? ', status→COMPLETED'
-              : ok
-                ? ' (COMPLETED update rejected — manual reconciliation required)'
-                : ' (left non-terminal for retry)'
-          } ${correlation()}.`,
+        `AgentInstance ${agentInstanceKey} (${corr()}): ${appendedTurns} turn(s) appended over ${mins}m, ${transition}.`,
       );
     },
   };

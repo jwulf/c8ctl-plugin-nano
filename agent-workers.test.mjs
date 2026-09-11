@@ -1234,6 +1234,220 @@ test('provisionRepo reports detached HEAD (tag ref, no create) and finalizeGit s
   }
 });
 
+test('provisionRepo warns (correlated) that the agent commits DIRECTLY on a symbolic checkout with no branch.create (#229)', { skip: !gitOk }, () => {
+  const { root, origin } = makeOriginRepo();
+  const runDir = mkdtempSync(join(root, 'run-'));
+  const warnings = [];
+  try {
+    // A branch ref (not a tag/sha) with NO branch.create: the clone lands on a
+    // real symbolic branch, so workingBranch is that branch and the agent would
+    // commit directly onto it — the acceptance-critical 20974 direct-branch case.
+    const envelope = {
+      schemaVersion: 1,
+      repository: { provider: 'github', url: origin, ref: 'main', submodules: false },
+      branch: { base: 'main', create: '', push: true },
+      setup: { commands: [], env: {}, secretRefs: [] },
+      task: { allowPr: true },
+    };
+    const prov = provisionRepo({
+      envelope,
+      token: null,
+      runDir,
+      logger: { warn: (m) => warnings.push(m), info: () => {} },
+      corr: 'job 1 eik 2 pik 3',
+    });
+    assert.equal(prov.workingBranch, 'main', 'a symbolic branch checkout keeps its branch');
+    assert.notEqual(prov.detached, true, 'not detached — it is a real branch');
+    assert.ok(
+      warnings.some((m) => /commit DIRECTLY on the checked-out branch 'main'/.test(m)
+        && /no PR branch/.test(m)
+        && /\[job 1 eik 2 pik 3\]/.test(m)),
+      'warns (with correlation) that commits land directly on the checked-out branch with no PR branch',
+    );
+  } finally {
+    rmSync(root, { recursive: true, force: true });
+  }
+});
+
+test('provisionRepo warns (correlated) when branch.create EQUALS the effective base (create===base is no PR branch) (#229)', { skip: !gitOk }, () => {
+  const { root, origin } = makeOriginRepo();
+  const runDir = mkdtempSync(join(root, 'run-'));
+  const warnings = [];
+  const infos = [];
+  try {
+    // `checkout -B main` off base `main` resets the base in place — the agent
+    // commits DIRECTLY on the base with no distinct PR branch, so a non-ff push
+    // loses every commit. The effective base is `repository.ref || branch.base`,
+    // so pin it via repository.ref here to also cover the normalized-envelope path.
+    const envelope = {
+      schemaVersion: 1,
+      repository: { provider: 'github', url: origin, ref: 'main', submodules: false },
+      branch: { base: '', create: 'main', push: true },
+      setup: { commands: [], env: {}, secretRefs: [] },
+      task: { allowPr: true },
+    };
+    const prov = provisionRepo({
+      envelope,
+      token: null,
+      runDir,
+      logger: { warn: (m) => warnings.push(m), info: (m) => infos.push(m) },
+      corr: 'job 9 eik 8 pik 7',
+    });
+    assert.equal(prov.workingBranch, 'main', 'checkout -B main keeps working on base');
+    assert.ok(
+      warnings.some((m) => /branch\.create='main' equals the checkout base/.test(m)
+        && /commit DIRECTLY on base branch 'main'/.test(m)
+        && /no distinct PR branch/.test(m)
+        && /\[job 9 eik 8 pik 7\]/.test(m)),
+      'warns (with correlation) that create===base leaves the agent on the base with no PR branch',
+    );
+    assert.ok(
+      !infos.some((m) => /cut feat branch/.test(m)),
+      'does NOT falsely claim a feat branch was cut when create===base',
+    );
+  } finally {
+    rmSync(root, { recursive: true, force: true });
+  }
+});
+
+test('provisionRepo warns when branch.create equals the cloned default even with NO ref/base pinned (empty branchName) (#229)', { skip: !gitOk }, () => {
+  const { root, origin } = makeOriginRepo();
+  const runDir = mkdtempSync(join(root, 'run-'));
+  const warnings = [];
+  const infos = [];
+  try {
+    // Neither repository.ref NOR branch.base is set, so `branchName` is empty and
+    // the clone lands on the remote's default branch ('main'). `create:'main'` then
+    // does `checkout -B main` in place — the agent commits DIRECTLY on the base with
+    // no PR branch. The warning must still fire off the cloned-default detection,
+    // not just an explicit ref/base.
+    const envelope = {
+      schemaVersion: 1,
+      repository: { provider: 'github', url: origin, submodules: false },
+      branch: { base: '', create: 'main', push: true },
+      setup: { commands: [], env: {}, secretRefs: [] },
+      task: { allowPr: true },
+    };
+    const prov = provisionRepo({
+      envelope,
+      token: null,
+      runDir,
+      logger: { warn: (m) => warnings.push(m), info: (m) => infos.push(m) },
+      corr: 'job 3 eik 2 pik 1',
+    });
+    assert.equal(prov.workingBranch, 'main');
+    assert.equal(prov.hasPrBranch, false, 'create===cloned-default is NOT a distinct PR branch');
+    assert.ok(
+      warnings.some((m) => /branch\.create='main' equals the checkout base/.test(m)
+        && /commit DIRECTLY on base branch 'main'/.test(m)
+        && /\[job 3 eik 2 pik 1\]/.test(m)),
+      'warns even when branchName is empty, using the cloned default branch as the effective base',
+    );
+    assert.ok(
+      !infos.some((m) => /cut feat branch/.test(m)),
+      'does NOT falsely claim a feat branch was cut when create equals the cloned default',
+    );
+  } finally {
+    rmSync(root, { recursive: true, force: true });
+  }
+});
+
+test('provisionRepo treats a detached TAG base as a distinct PR branch even when the tag name equals branch.create (#232)', { skip: !gitOk }, () => {
+  const { root, origin } = makeOriginRepo();
+  const runDir = mkdtempSync(join(root, 'run-'));
+  const warnings = [];
+  const infos = [];
+  try {
+    // Publish a tag 'v1' at main so the clone can pin `repository.ref: 'v1'`.
+    const tagger = mkdtempSync(join(root, 'tag-'));
+    g(['clone', '-q', origin, tagger], undefined);
+    g(['tag', 'v1'], tagger);
+    g(['push', '-q', 'origin', 'v1'], tagger);
+
+    // `repository.ref: 'v1'` (a TAG) makes the clone land on DETACHED HEAD, and
+    // `branch.create: 'v1'` then `checkout -B v1` cuts a REAL branch off that
+    // detached HEAD — a genuine distinct PR branch. The old effective-base test
+    // used `branchName` (== the tag name 'v1'), so it wrongly reported the tag as a
+    // symbolic base and classified this as direct-on-base. The cloned-branch signal
+    // ('HEAD', detached) is authoritative: this IS a PR branch.
+    const envelope = {
+      schemaVersion: 1,
+      repository: { provider: 'github', url: origin, ref: 'v1', submodules: false },
+      branch: { create: 'v1', push: true },
+      setup: { commands: [], env: {}, secretRefs: [] },
+      task: { allowPr: true },
+    };
+    const prov = provisionRepo({
+      envelope,
+      token: null,
+      runDir,
+      logger: { warn: (m) => warnings.push(m), info: (m) => infos.push(m) },
+      corr: 'job 7 eik 8 pik 9',
+    });
+    assert.equal(prov.workingBranch, 'v1', 'checkout -B v1 makes a real branch');
+    assert.equal(prov.hasPrBranch, true, 'a branch cut off a detached tag IS a distinct PR branch');
+    assert.ok(
+      !warnings.some((m) => /equals the checkout base/.test(m)),
+      'does NOT warn direct-on-base for a branch cut off a detached tag',
+    );
+    assert.ok(
+      infos.some((m) => /cut feat branch 'v1'/.test(m)),
+      'reports a feat branch was cut',
+    );
+  } finally {
+    rmSync(root, { recursive: true, force: true });
+  }
+});
+
+test('finalizeGit reports the RETAINED workspace (not LOST) for a no-PR-branch push failure under --keep-runs (#232)', { skip: !gitOk }, () => {
+  const { root, origin } = makeOriginRepo();
+  const runDir = mkdtempSync(join(root, 'run-'));
+  try {
+    // { base:'main', create:'main' } → no distinct PR branch. But with keepRuns the
+    // worker's `finally` preserves runDir, so the commits are NOT lost — the loud
+    // signal must say "retained in the run workspace (--keep-runs)", not "LOST".
+    const envelope = {
+      schemaVersion: 1,
+      repository: { provider: 'github', url: origin, submodules: false },
+      branch: { base: 'main', create: 'main', push: true },
+      setup: { commands: [], env: {}, secretRefs: [] },
+      task: { allowPr: true },
+    };
+    const prov = provisionRepo({ envelope, token: null, runDir });
+    assert.equal(prov.hasPrBranch, false, 'create===base is NOT a distinct PR branch');
+    writeFileSync(join(prov.workspaceDir, 'AGENT.txt'), 'agent change\n');
+    g(['add', '-A'], prov.workspaceDir);
+    g(['commit', '-q', '-m', 'agent: add AGENT.txt'], prov.workspaceDir);
+
+    const rival = mkdtempSync(join(root, 'rival-'));
+    g(['clone', '-q', origin, rival], undefined);
+    writeFileSync(join(rival, 'RIVAL.txt'), 'rival change\n');
+    g(['add', '-A'], rival);
+    g(['-c', 'user.name=rival', '-c', 'user.email=rival@example.com', 'commit', '-q', '-m', 'rival: add RIVAL.txt'], rival);
+    g(['push', '-q', 'origin', 'main'], rival);
+
+    const errors = [];
+    const out = finalizeGit({
+      workspaceDir: prov.workspaceDir,
+      gitEnv: prov.gitEnv,
+      startSha: prov.startSha,
+      workingBranch: prov.workingBranch,
+      hasPrBranch: prov.hasPrBranch,
+      envelope,
+      token: null,
+      logger: { warn: () => {}, error: (m) => errors.push(m), info: () => {} },
+      keepRuns: true,
+    });
+    assert.equal(out.pushed, false, 'a non-fast-forward push is rejected');
+    assert.ok(
+      errors.some((m) => /no PR branch/.test(m) && /retained in the run workspace \(--keep-runs\)/.test(m) && !/will be LOST/.test(m)),
+      'no-PR-branch + keepRuns reports the retained workspace, not LOST',
+    );
+  } finally {
+    rmSync(root, { recursive: true, force: true });
+  }
+});
+
 test('finalizeGit pushes the first commit into an empty repo (no base sha)', { skip: !gitOk }, () => {
   const root = mkdtempSync(join(tmpdir(), 'nano-git-'));
   const origin = join(root, 'origin.git');
@@ -1647,6 +1861,203 @@ test('finalizeGit enumerates new commits and pushes the branch', { skip: !gitOk 
     assert.equal(out.branch, 'feat/work');
     // Origin now carries the pushed branch.
     assert.match(g(['--git-dir', origin, 'rev-parse', 'feat/work'], undefined), /^[0-9a-f]{40}$/);
+  } finally {
+    rmSync(root, { recursive: true, force: true });
+  }
+});
+
+test('finalizeGit reports baseAdvanced + push failure when the remote branch moved ahead (#229)', { skip: !gitOk }, () => {
+  const { root, origin } = makeOriginRepo();
+  const runDir = mkdtempSync(join(root, 'run-'));
+  try {
+    const envelope = {
+      schemaVersion: 1,
+      repository: { provider: 'github', url: origin, submodules: false },
+      branch: { base: 'main', create: 'feat/work', push: true },
+      setup: { commands: [], env: {}, secretRefs: [] },
+      task: { allowPr: false },
+    };
+    const prov = provisionRepo({ envelope, token: null, runDir });
+    // The agent commits locally on feat/work (off main).
+    writeFileSync(join(prov.workspaceDir, 'AGENT.txt'), 'agent change\n');
+    g(['add', '-A'], prov.workspaceDir);
+    g(['commit', '-q', '-m', 'agent: add AGENT.txt'], prov.workspaceDir);
+
+    // Meanwhile the remote feat/work branch advances independently (a divergent
+    // commit off main), so the branch we're about to push to has moved ahead.
+    const rival = mkdtempSync(join(root, 'rival-'));
+    g(['clone', '-q', origin, rival], undefined);
+    g(['checkout', '-q', '-B', 'feat/work', 'origin/main'], rival);
+    writeFileSync(join(rival, 'RIVAL.txt'), 'rival change\n');
+    g(['add', '-A'], rival);
+    g(['-c', 'user.name=rival', '-c', 'user.email=rival@example.com', 'commit', '-q', '-m', 'rival: add RIVAL.txt'], rival);
+    g(['push', '-q', 'origin', 'feat/work'], rival);
+
+    const warnings = [];
+    const errors = [];
+    const out = finalizeGit({
+      workspaceDir: prov.workspaceDir,
+      gitEnv: prov.gitEnv,
+      startSha: prov.startSha,
+      workingBranch: prov.workingBranch,
+      envelope,
+      token: null,
+      logger: { warn: (m) => warnings.push(m), error: (m) => errors.push(m), info: () => {} },
+      corr: 'job 7 eik 8 pik 9',
+    });
+    assert.equal(out.commits.length, 1, 'one new local commit since start');
+    assert.equal(out.baseAdvanced, 1, 'detects the remote branch advanced by one commit before pushing');
+    assert.equal(out.pushed, false, 'a non-fast-forward push is rejected');
+    assert.ok(out.pushError, 'the push failure is captured');
+    assert.ok(
+      warnings.some((m) => /ahead of local HEAD/.test(m) && /non-fast-forward/.test(m) && /\[job 7 eik 8 pik 9\]/.test(m)),
+      'warns that the remote is ahead of local HEAD (correlated) and the push will be non-fast-forward',
+    );
+    // The error-level push-failure line is the primary observability behavior:
+    // assert it carries the correlation and the unpushed/lost-commit signal (this
+    // envelope has a `branch.create` feature branch, so it is "unpushed on branch",
+    // not "LOST (no PR)").
+    assert.ok(
+      errors.some((m) => /push of branch 'feat\/work' FAILED/.test(m) && /unpushed on branch 'feat\/work'/.test(m) && /will be LOST when the run workspace is reaped/.test(m) && /--keep-runs/.test(m) && /\[job 7 eik 8 pik 9\]/.test(m)),
+      'emits a correlated error line naming the unpushed commits on the feature branch, warning they are LOST on reap without --keep-runs',
+    );
+  } finally {
+    rmSync(root, { recursive: true, force: true });
+  }
+});
+
+test('finalizeGit with --keep-runs reports the feature-branch commits as retained, not LOST (#229)', { skip: !gitOk }, () => {
+  const { root, origin } = makeOriginRepo();
+  const runDir = mkdtempSync(join(root, 'run-'));
+  try {
+    const envelope = {
+      schemaVersion: 1,
+      repository: { provider: 'github', url: origin, submodules: false },
+      branch: { base: 'main', create: 'feat/keep', push: true },
+      setup: { commands: [], env: {}, secretRefs: [] },
+      task: { allowPr: false },
+    };
+    const prov = provisionRepo({ envelope, token: null, runDir });
+    writeFileSync(join(prov.workspaceDir, 'AGENT.txt'), 'agent change\n');
+    g(['add', '-A'], prov.workspaceDir);
+    g(['commit', '-q', '-m', 'agent: add AGENT.txt'], prov.workspaceDir);
+
+    // Advance origin/feat/keep so the push is non-fast-forward.
+    const rival = mkdtempSync(join(root, 'rival-'));
+    g(['clone', '-q', origin, rival], undefined);
+    g(['checkout', '-q', '-B', 'feat/keep', 'origin/main'], rival);
+    writeFileSync(join(rival, 'RIVAL.txt'), 'rival change\n');
+    g(['add', '-A'], rival);
+    g(['-c', 'user.name=rival', '-c', 'user.email=rival@example.com', 'commit', '-q', '-m', 'rival'], rival);
+    g(['push', '-q', 'origin', 'feat/keep'], rival);
+
+    const errors = [];
+    const out = finalizeGit({
+      workspaceDir: prov.workspaceDir,
+      gitEnv: prov.gitEnv,
+      startSha: prov.startSha,
+      workingBranch: prov.workingBranch,
+      envelope,
+      token: null,
+      logger: { warn: () => {}, error: (m) => errors.push(m), info: () => {} },
+      corr: 'job 1 eik 2 pik 3',
+      keepRuns: true,
+    });
+    assert.equal(out.pushed, false, 'a non-fast-forward push is rejected');
+    assert.ok(
+      errors.some((m) => /unpushed on branch 'feat\/keep'/.test(m) && /retained in the run workspace \(--keep-runs\)/.test(m)),
+      'with --keep-runs the feature-branch commits are reported retained, not LOST',
+    );
+    assert.ok(
+      !errors.some((m) => /will be LOST/.test(m)),
+      'does not claim LOST when the run workspace is retained',
+    );
+  } finally {
+    rmSync(root, { recursive: true, force: true });
+  }
+});
+
+test('finalizeGit emits the loud LOST (no PR) signal when branch.create equals the base (#229)', { skip: !gitOk }, () => {
+  const { root, origin } = makeOriginRepo();
+  const runDir = mkdtempSync(join(root, 'run-'));
+  try {
+    // { base:'main', create:'main' }: `checkout -B main` leaves the agent on the
+    // base branch itself, so there is NO separate PR branch — a failed push LOSES
+    // the commits and must keep the loud "(no PR)" signal, not the weaker
+    // "unpushed on branch" wording.
+    const envelope = {
+      schemaVersion: 1,
+      repository: { provider: 'github', url: origin, submodules: false },
+      branch: { base: 'main', create: 'main', push: true },
+      setup: { commands: [], env: {}, secretRefs: [] },
+      task: { allowPr: true },
+    };
+    const prov = provisionRepo({ envelope, token: null, runDir });
+    assert.equal(prov.workingBranch, 'main', 'create===base leaves the agent on the base branch');
+    assert.equal(prov.hasPrBranch, false, 'create===base is NOT a distinct PR branch');
+    writeFileSync(join(prov.workspaceDir, 'AGENT.txt'), 'agent change\n');
+    g(['add', '-A'], prov.workspaceDir);
+    g(['commit', '-q', '-m', 'agent: add AGENT.txt'], prov.workspaceDir);
+
+    // Advance origin/main independently so the agent's push is non-fast-forward.
+    const rival = mkdtempSync(join(root, 'rival-'));
+    g(['clone', '-q', origin, rival], undefined);
+    writeFileSync(join(rival, 'RIVAL.txt'), 'rival change\n');
+    g(['add', '-A'], rival);
+    g(['-c', 'user.name=rival', '-c', 'user.email=rival@example.com', 'commit', '-q', '-m', 'rival: add RIVAL.txt'], rival);
+    g(['push', '-q', 'origin', 'main'], rival);
+
+    const errors = [];
+    const out = finalizeGit({
+      workspaceDir: prov.workspaceDir,
+      gitEnv: prov.gitEnv,
+      startSha: prov.startSha,
+      workingBranch: prov.workingBranch,
+      hasPrBranch: prov.hasPrBranch,
+      envelope,
+      token: null,
+      logger: { warn: () => {}, error: (m) => errors.push(m), info: () => {} },
+      corr: 'job 4 eik 5 pik 6',
+    });
+    assert.equal(out.pushed, false, 'a non-fast-forward push is rejected');
+    assert.ok(
+      errors.some((m) => /will be LOST \(no PR branch/.test(m) && /\[job 4 eik 5 pik 6\]/.test(m)),
+      'create===base keeps the loud LOST (no PR branch) signal even though branch.create is set',
+    );
+  } finally {
+    rmSync(root, { recursive: true, force: true });
+  }
+});
+
+test('finalizeGit falls through to the push attempt when the remote branch is absent (#229)', { skip: !gitOk }, () => {
+  const { root, origin } = makeOriginRepo();
+  const runDir = mkdtempSync(join(root, 'run-'));
+  try {
+    const envelope = {
+      schemaVersion: 1,
+      repository: { provider: 'github', url: origin, submodules: false },
+      branch: { base: 'main', create: 'feat/fresh', push: true },
+      setup: { commands: [], env: {}, secretRefs: [] },
+      task: { allowPr: false },
+    };
+    const prov = provisionRepo({ envelope, token: null, runDir });
+    writeFileSync(join(prov.workspaceDir, 'FRESH.txt'), 'fresh\n');
+    g(['add', '-A'], prov.workspaceDir);
+    g(['commit', '-q', '-m', 'agent: add FRESH.txt'], prov.workspaceDir);
+
+    // origin has no feat/fresh yet, so the pre-push staleness fetch fails and must
+    // fall through to a successful push (no baseAdvanced signal).
+    const out = finalizeGit({
+      workspaceDir: prov.workspaceDir,
+      gitEnv: prov.gitEnv,
+      startSha: prov.startSha,
+      workingBranch: prov.workingBranch,
+      envelope,
+      token: null,
+    });
+    assert.equal(out.baseAdvanced, undefined, 'no staleness signal when the remote branch is absent');
+    assert.equal(out.pushed, true, out.pushError || 'the push still proceeds and succeeds');
+    assert.match(g(['--git-dir', origin, 'rev-parse', 'feat/fresh'], undefined), /^[0-9a-f]{40}$/);
   } finally {
     rmSync(root, { recursive: true, force: true });
   }

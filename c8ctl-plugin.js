@@ -4326,23 +4326,28 @@ function provisionRepo({ envelope, token, runDir, runId, timeoutMs = 120_000, co
   // `run-XXXXXX` basename and collide on a repo-wide remote ref (non-ff strand);
   // the UUID is globally unique. (`basename(runDir)` remains a fallback for the
   // direct-call unit tests that do not thread a runId.)
-  // What the clone actually landed on: a branch only if rev-parse resolves a
-  // symbolic name — a tag/sha leaves detached HEAD, in which case there is NO
-  // branch to push and workingBranch stays null.
-  const head = runGit(['rev-parse', '--abbrev-ref', 'HEAD'], { cwd: workspaceDir, env: gitEnv });
-  const headName = (head.stdout || '').trim();
-  const checkedOut = (headName && headName !== 'HEAD') ? headName : null; // null ⇒ detached HEAD or unborn branch
-  // A headName of "HEAD" is ambiguous: a DETACHED checkout (tag/sha) has no branch
-  // to push, but an UNBORN branch (freshly cloned EMPTY repo — a symbolic HEAD with
-  // no commit yet) does become pushable the moment the agent makes the first
-  // commit. Distinguish them via symbolic-ref so an empty-repo job is not
-  // mis-classified as detached, which would skip the push and silently strand that
-  // first commit (issue #231 silent work-loss).
-  let unbornBranch = null;
-  if (!checkedOut) {
-    const symref = runGit(['symbolic-ref', '-q', '--short', 'HEAD'], { cwd: workspaceDir, env: gitEnv });
-    if (symref.status === 0) unbornBranch = (symref.stdout || '').trim() || null;
-  }
+  // What the clone actually landed on: a branch only if HEAD is a SYMBOLIC ref —
+  // a tag/sha leaves detached HEAD, in which case there is NO branch to push and
+  // workingBranch stays null. Read it with `git symbolic-ref -q HEAD` (the FULL
+  // ref, then strip `refs/heads/`), NOT `git rev-parse --abbrev-ref HEAD`: when a
+  // TAG shares the branch's name (e.g. refs/tags/v1 alongside refs/heads/v1),
+  // `--abbrev-ref` disambiguates by emitting the qualified 'heads/v1', which would
+  // be recorded as `checkedOut` and make the returned `baseBranch` and the pre-push
+  // staleness fetch target 'refs/heads/heads/v1' instead of the real base (thread
+  // 4344, mirroring finalizeGit's same fix). `symbolic-ref` returns the full,
+  // unambiguous ref and exits nonzero for a DETACHED HEAD → symName '' → no branch.
+  const symref = runGit(['symbolic-ref', '-q', 'HEAD'], { cwd: workspaceDir, env: gitEnv });
+  const symRef = symref.status === 0 ? ((symref.stdout || '').trim()) : '';
+  const symName = symRef.startsWith('refs/heads/') ? symRef.slice('refs/heads/'.length) : '';
+  // A symbolic HEAD can still be UNBORN (freshly cloned EMPTY repo — a branch ref
+  // pointing at no commit yet). A DETACHED checkout (tag/sha) has no symbolic ref at
+  // all, but an UNBORN branch does become pushable the moment the agent makes the
+  // first commit. Separate the committed vs unborn case by whether HEAD resolves to
+  // a commit, so an empty-repo job is not mis-classified as detached (which would
+  // skip the push and silently strand that first commit, issue #231 work-loss).
+  const headHasCommit = runGit(['rev-parse', '--verify', '--quiet', 'HEAD'], { cwd: workspaceDir, env: gitEnv }).status === 0;
+  const checkedOut = (symName && headHasCommit) ? symName : null; // null ⇒ detached HEAD or unborn branch
+  const unbornBranch = (symName && !headHasCommit) ? symName : null;
   // The base we must never commit-and-push onto. Derive it ONLY from an explicit
   // `branch.base` or a SYMBOLIC checked-out/unborn branch — never from
   // `repository.ref`, which may be a TAG: a tag clone leaves detached HEAD
@@ -4599,7 +4604,7 @@ function shouldPreserveRunDir(gitResult) {
 // branch.push), and reconcile the agent-opened PR (when task.allowPr). A push
 // failure is reported (pushError) rather than thrown — the process model decides
 // what to do next, and re-running the agent would be non-idempotent.
-function finalizeGit({ workspaceDir, gitEnv, startSha, workingBranch, baseBranch: effectiveBase, baseCloneSha = null, envelope, token, corr = '' }) {
+function finalizeGit({ workspaceDir, gitEnv, startSha, workingBranch, baseBranch: effectiveBase, baseCloneSha = null, envelope, token, corr = '', budgetMs = 0 }) {
   const out = { branch: workingBranch, baseSha: startSha || null, headSha: null, commits: [], pushed: false, remote: null, pr: null };
   const rem = runGit(['remote', 'get-url', 'origin'], { cwd: workspaceDir, env: gitEnv });
   if (rem.status === 0) out.remote = redactToken(rem.stdout.trim(), token);
@@ -4651,6 +4656,20 @@ function finalizeGit({ workspaceDir, gitEnv, startSha, workingBranch, baseBranch
   } else if (coerceBool(envelope.branch?.push, true) && (out.commits.length > 0 || offBranchStray.length > 0 || branchCommits.length > 0)) {
     const log = getLogger();
     const pushTimeoutMs = 120_000; // matches runGit's default; surfaced in a timeout reason
+    // Bound the CUMULATIVE wall-time of finalization's sequential network git ops
+    // (pre-push staleness fetch → push → ls-remote/ff verify). Each runs via
+    // spawnSync, which BLOCKS the event loop, so the worker's lock-heartbeat fiber
+    // cannot fire while any is in flight; on a stalled network four back-to-back
+    // 120s ops (480s) would outlast the default 300s activation-lock/recovery window
+    // and let the broker reactivate this same job mid-finalization — a duplicate run
+    // (thread 4754). When the worker threads its effective recovery window as
+    // `budgetMs`, cap each op at the time left before 80% of that window elapses
+    // (reserving margin for a post-finalize heartbeat + settle), with a floor so a
+    // near-exhausted budget still gives each op a usable slice. Without a budget
+    // (direct callers / unit tests) keep the full per-op timeout — behaviour-neutral.
+    const NET_OP_FLOOR_MS = 20_000;
+    const netDeadline = budgetMs > 0 ? Date.now() + Math.max(NET_OP_FLOOR_MS, Math.floor(budgetMs * 0.8)) : 0;
+    const netTimeoutMs = () => (netDeadline ? Math.min(pushTimeoutMs, Math.max(NET_OP_FLOOR_MS, netDeadline - Date.now())) : pushTimeoutMs);
     // Verify HEAD is still on the branch we intend to push (issue #231). The
     // harness runs arbitrary code; if it checked out a DIFFERENT ref (e.g. the
     // base branch) and committed there, out.commits (startSha..HEAD) enumerates
@@ -4751,7 +4770,8 @@ function finalizeGit({ workspaceDir, gitEnv, startSha, workingBranch, baseBranch
       // count unreliable. The `refs/heads/` prefix makes the leading char always
       // 'r', and `--end-of-options` terminates option parsing so the ref can never
       // be reinterpreted as a flag even for future/edge values.
-      const bf = runGit([...credArgs(), 'fetch', '--no-tags', '--end-of-options', 'origin', `refs/heads/${baseBranch}`], { cwd: workspaceDir, env: gitEnv, timeoutMs: pushTimeoutMs });
+      const bfTimeoutMs = netTimeoutMs();
+      const bf = runGit([...credArgs(), 'fetch', '--no-tags', '--end-of-options', 'origin', `refs/heads/${baseBranch}`], { cwd: workspaceDir, env: gitEnv, timeoutMs: bfTimeoutMs });
       if (bf.status === 0) {
         const fetched = runGit(['rev-parse', '--verify', '--quiet', 'FETCH_HEAD'], { cwd: workspaceDir, env: gitEnv });
         const fetchedSha = fetched.status === 0 ? ((fetched.stdout || '').trim() || null) : null;
@@ -4782,7 +4802,7 @@ function finalizeGit({ workspaceDir, gitEnv, startSha, workingBranch, baseBranch
         // indistinguishable from an unchanged base. Surface the fetch failure so
         // that lost observability is itself visible (issue #229/#231). Best-effort
         // — still never fatal.
-        out.stalenessFetchError = describeGitFailure(`git fetch origin refs/heads/${baseBranch}`, bf, { token, timeoutMs: pushTimeoutMs });
+        out.stalenessFetchError = describeGitFailure(`git fetch origin refs/heads/${baseBranch}`, bf, { token, timeoutMs: bfTimeoutMs });
         log.warn?.(`finalizeGit${corr ? ' (' + corr + ')' : ''}: pre-push staleness check could not fetch base '${baseBranch}' (${out.stalenessFetchError}) — a later non-ff or other push failure will be indistinguishable from an unchanged base`);
       }
     }
@@ -4793,7 +4813,8 @@ function finalizeGit({ workspaceDir, gitEnv, startSha, workingBranch, baseBranch
     // one" and misreports the work as unpublished (threads 4767/4777). The fully
     // qualified heads ref resolves unambiguously; --set-upstream still tracks the
     // local branch.
-    const push = runGit([...credArgs(), 'push', '--set-upstream', 'origin', `refs/heads/${workingBranch}:refs/heads/${workingBranch}`], { cwd: workspaceDir, env: gitEnv, timeoutMs: pushTimeoutMs });
+    const pushTimeout = netTimeoutMs();
+    const push = runGit([...credArgs(), 'push', '--set-upstream', 'origin', `refs/heads/${workingBranch}:refs/heads/${workingBranch}`], { cwd: workspaceDir, env: gitEnv, timeoutMs: pushTimeout });
     if (push.status === 0) out.pushed = true;
     else {
       // A nonzero `git push` does NOT prove the ref was not updated: a timeout or
@@ -4807,7 +4828,7 @@ function finalizeGit({ workspaceDir, gitEnv, startSha, workingBranch, baseBranch
         // Query the EXACT `refs/heads/<branch>` ref (with `--heads`) so a same-named
         // TAG at headSha can't spoof a "landed" head: a bare `<branch>` pattern makes
         // `ls-remote` match tags too, which would falsely suppress pushFailed.
-        const ls = runGit([...credArgs(), 'ls-remote', '--heads', '--end-of-options', 'origin', `refs/heads/${workingBranch}`], { cwd: workspaceDir, env: gitEnv, timeoutMs: pushTimeoutMs });
+        const ls = runGit([...credArgs(), 'ls-remote', '--heads', '--end-of-options', 'origin', `refs/heads/${workingBranch}`], { cwd: workspaceDir, env: gitEnv, timeoutMs: netTimeoutMs() });
         if (ls.status === 0) {
           const remoteSha = ((ls.stdout || '').trim().split(/\s+/)[0] || '');
           if (remoteSha && remoteSha === out.headSha) {
@@ -4820,7 +4841,7 @@ function finalizeGit({ workspaceDir, gitEnv, startSha, workingBranch, baseBranch
             // objects are local, then test `headSha` is an ancestor of the remote
             // tip. Best-effort: a failed fetch/ancestry check just falls through to
             // the strand path (issue #231, suppressed advisory 4689).
-            const ff = runGit([...credArgs(), 'fetch', '--no-tags', '--end-of-options', 'origin', `refs/heads/${workingBranch}`], { cwd: workspaceDir, env: gitEnv, timeoutMs: pushTimeoutMs });
+            const ff = runGit([...credArgs(), 'fetch', '--no-tags', '--end-of-options', 'origin', `refs/heads/${workingBranch}`], { cwd: workspaceDir, env: gitEnv, timeoutMs: netTimeoutMs() });
             if (ff.status === 0) {
               const anc = runGit(['merge-base', '--is-ancestor', out.headSha, remoteSha], { cwd: workspaceDir, env: gitEnv });
               if (anc.status === 0) landed = true;
@@ -4836,7 +4857,7 @@ function finalizeGit({ workspaceDir, gitEnv, startSha, workingBranch, baseBranch
         // new commit in this throwaway workspace. Surface the at-risk SHAs explicitly
         // (issue #231, defense #2) so the failure is a hard, actionable signal with
         // the commits to recover — not a soft pushError that reads as "completed".
-        out.pushError = describeGitFailure('git push', push, { token, timeoutMs: pushTimeoutMs });
+        out.pushError = describeGitFailure('git push', push, { token, timeoutMs: pushTimeout });
         out.pushFailed = true;
         // Union the work-branch commit list into the stranded set: out.commits is now
         // the promoted branchCommits, but if HEAD sat off the branch and promotion
@@ -8783,6 +8804,11 @@ async function workAgent(req, flags) {
                 envelope,
                 token: repoToken,
                 corr: jobCorr,
+                // Cap finalization's cumulative network-git wall-time below the
+                // worker's activation-lock/recovery window so its event-loop-blocking
+                // spawnSync ops cannot outlast the lease and let this job be
+                // reactivated mid-finalization (thread 4754).
+                budgetMs: effectiveRecoveryWindowMs,
               });
             } catch (err) {
               gitResult = { remote: provisioned.remote, branch: provisioned.workingBranch, baseSha: provisioned.startSha || null, commits: [], pushed: false, error: redactToken(err.message, repoToken) };
@@ -8808,7 +8834,7 @@ async function workAgent(req, flags) {
           // jobs — jobKey alone is not enough, so carry the process + element keys.
           const corr = `instance ${job.processInstanceKey ?? '-'}/elem ${job.elementInstanceKey ?? '-'}`;
           if (runDir && !keepRuns && !preserveForRecovery) { try { rmSync(runDir, { recursive: true, force: true }); } catch { /* best effort */ } }
-          else if (runDir && preserveForRecovery) logger.error(`[${jobType}] job ${job.jobKey} (${corr}): preserving workspace '${runDir}' (push failed) so the stranded commit(s) remain recoverable — copy them out before the reaper ages it away`);
+          else if (runDir && preserveForRecovery) logger.error(`[${jobType}] job ${job.jobKey} (${corr}): preserving workspace '${runDir}' (${gitResult?.branchMismatch ? 'push refused — HEAD left the work branch' : 'push failed'}) so the stranded commit(s) remain recoverable — copy them out before the reaper ages it away`);
           if (runDir) liveRunDirs.delete(runDir);
           // Emit the relay session's `phase:close` lifecycle event and drain its
           // outbound buffer before the job settles (so the live-terminal tail is

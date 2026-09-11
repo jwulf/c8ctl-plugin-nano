@@ -1921,6 +1921,75 @@ test('finalizeGit pushes a work branch whose name collides with a remote TAG via
   }
 });
 
+test('provisionRepo derives the checked-out base via symbolic-ref, unfooled by a same-named TAG (issue #231, thread 4344)', { skip: !gitOk }, () => {
+  const { root, origin } = makeOriginRepo();
+  // Publish a branch 'v1' AND a same-named tag 'v1' on the origin, then clone with
+  // `repository.ref: 'v1'` (→ `git clone --branch v1`), which lands on branch v1
+  // while ALSO fetching refs/tags/v1. `git rev-parse --abbrev-ref HEAD` then returns
+  // the qualified 'heads/v1' (disambiguating the branch from the tag), which the old
+  // code recorded as the checked-out branch — making the returned baseBranch / the
+  // pre-push staleness fetch target the bogus 'refs/heads/heads/v1'. `symbolic-ref`
+  // must yield the clean 'v1'.
+  const seed = mkdtempSync(join(root, 'seed-'));
+  g(['clone', '-q', origin, seed], undefined);
+  g(['checkout', '-q', '-B', 'v1'], seed);
+  g(['push', '-q', 'origin', 'refs/heads/v1:refs/heads/v1'], seed);
+  g(['tag', 'v1'], seed);
+  g(['push', '-q', 'origin', 'refs/tags/v1:refs/tags/v1'], seed);
+  const runDir = mkdtempSync(join(root, 'run-'));
+  try {
+    const envelope = {
+      schemaVersion: 1,
+      // repository.ref='v1' checks out the branch v1 (and --branch fetches the
+      // same-named tag). No branch.base / branch.create: the base is derived from
+      // whatever the clone checked out, which is exactly where the tag collision
+      // corrupts the abbrev-ref read.
+      repository: { provider: 'github', url: origin, ref: 'v1', submodules: false },
+      branch: { push: true },
+      setup: { commands: [], env: {}, secretRefs: [] },
+      task: { allowPr: false },
+    };
+    const prov = provisionRepo({ envelope, token: null, runDir });
+    assert.equal(g(['rev-parse', '--verify', '--quiet', 'refs/tags/v1'], prov.workspaceDir).length, 40, 'the clone fetched the same-named tag, so abbrev-ref would read heads/v1');
+    assert.equal(prov.baseBranch, 'v1', "the base is the clean 'v1', not the tag-disambiguated 'heads/v1'");
+    assert.notEqual(prov.workingBranch, 'v1', 'a fallback work branch is cut so commits never land on the base');
+    assert.match(prov.workingBranch, /^nano\/agent-work\/v1-/, "fallback is namespaced off the clean base 'v1', not 'heads/v1'");
+  } finally {
+    rmSync(root, { recursive: true, force: true });
+  }
+});
+
+test('finalizeGit pushes under a finalization budget (thread 4754 — cumulative net-op cap does not break the happy path)', { skip: !gitOk }, () => {
+  const { root, origin } = makeOriginRepo();
+  const runDir = mkdtempSync(join(root, 'run-'));
+  try {
+    const envelope = {
+      schemaVersion: 1,
+      repository: { provider: 'github', url: origin, submodules: false },
+      branch: { base: 'main', create: 'feat/budget', push: true },
+      setup: { commands: [], env: {}, secretRefs: [] },
+      task: { allowPr: false },
+    };
+    const prov = provisionRepo({ envelope, token: null, runDir });
+    writeFileSync(join(prov.workspaceDir, 'work.txt'), 'work\n');
+    g(['add', '-A'], prov.workspaceDir);
+    g(['-c', 'user.name=nano', '-c', 'user.email=nano@example.com', 'commit', '-q', '-m', 'work'], prov.workspaceDir);
+    const workSha = g(['rev-parse', 'HEAD'], prov.workspaceDir);
+    // A generous budget must not shorten the healthy push; a fresh clone→push
+    // completes in well under the derived per-op slice.
+    const out = finalizeGit({ ...prov, envelope, token: null, budgetMs: 300_000 });
+    assert.equal(out.pushed, true, 'the budgeted finalization still publishes the work branch');
+    assert.ok(!out.pushFailed, 'no false strand under the budget cap');
+    assert.equal(
+      g(['-c', 'safe.bareRepository=all', 'rev-parse', '--verify', 'refs/heads/feat/budget'], origin),
+      workSha,
+      'origin carries the pushed work commit',
+    );
+  } finally {
+    rmSync(root, { recursive: true, force: true });
+  }
+});
+
 test('provisionRepo cuts a fallback from a DETACHED HEAD when branch.create equals the base (issue #231, thread 4380)', { skip: !gitOk }, () => {
   const { root, origin } = makeOriginRepo();
   // Tag the seed so we can clone a detached-HEAD checkout (repository.ref = tag).

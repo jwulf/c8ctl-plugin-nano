@@ -4590,7 +4590,10 @@ function finalizeGit({ workspaceDir, gitEnv, startSha, workingBranch, baseBranch
       // than misreporting published work as lost (issue #231).
       let landed = false;
       if (out.headSha) {
-        const ls = runGit([...credArgs(), 'ls-remote', '--end-of-options', 'origin', workingBranch], { cwd: workspaceDir, env: gitEnv, timeoutMs: pushTimeoutMs });
+        // Query the EXACT `refs/heads/<branch>` ref (with `--heads`) so a same-named
+        // TAG at headSha can't spoof a "landed" head: a bare `<branch>` pattern makes
+        // `ls-remote` match tags too, which would falsely suppress pushFailed.
+        const ls = runGit([...credArgs(), 'ls-remote', '--heads', '--end-of-options', 'origin', `refs/heads/${workingBranch}`], { cwd: workspaceDir, env: gitEnv, timeoutMs: pushTimeoutMs });
         if (ls.status === 0) {
           const remoteSha = ((ls.stdout || '').trim().split(/\s+/)[0] || '');
           if (remoteSha && remoteSha === out.headSha) landed = true;

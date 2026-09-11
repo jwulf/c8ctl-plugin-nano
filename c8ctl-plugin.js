@@ -46,6 +46,7 @@ import {
   realpathSync,
   statfsSync,
   lstatSync,
+  utimesSync,
   mkdtempSync,
   closeSync,
   watchFile,
@@ -4375,7 +4376,28 @@ function provisionRepo({ envelope, token, runDir, runId, timeoutMs = 120_000, co
     const rb = runGit(['rev-parse', '--verify', '--quiet', `refs/remotes/origin/${branchName}`], { cwd: workspaceDir, env: gitEnv });
     if (rb.status === 0 && (rb.stdout || '').trim()) refBaseBranch = branchName;
   }
-  const effectiveBase = (envelope.branch?.base || '') || checkedOut || unbornBranch || refBaseBranch || '';
+  // A `repository.sha` clone with NO `repository.ref` (branchName empty) still lands
+  // on the remote's DEFAULT branch before detaching, so an explicit branch.create
+  // naming that default (e.g. create='main') would slip past the guard below (=== ''
+  // is false) and commit/push DIRECTLY onto the base — the #231 hazard, but with no
+  // ref to name it (thread 4378). Resolve the remote's default branch from
+  // origin/HEAD so it too counts as a base the guard must refuse to commit onto.
+  if (!refBaseBranch && !checkedOut && !unbornBranch && !branchName) {
+    const dh = runGit(['rev-parse', '--abbrev-ref', 'origin/HEAD'], { cwd: workspaceDir, env: gitEnv });
+    if (dh.status === 0) {
+      const def = (dh.stdout || '').trim().replace(/^origin\//, '');
+      if (def && def !== 'HEAD' && !def.startsWith('-')) refBaseBranch = def;
+    }
+  }
+  // Fold the CONFIGURED base ref (`repository.baseRef`, the documented base) into the
+  // effective base ahead of the checked-out ref. Real PR envelopes carry the base as
+  // `repository.baseRef` (not `branch.base`), so without this the chain fell through
+  // to `checkedOut` (the FEATURE ref) and the guard treated an explicit
+  // `branch.create` that names the real base as an ordinary work branch — committing
+  // and pushing directly onto the base (the #231 hazard) AND making the pre-push
+  // staleness check watch the feature ref instead of the base (thread/advisory 4378).
+  const configuredBaseRef = repo.baseRef && !String(repo.baseRef).startsWith('-') ? String(repo.baseRef) : '';
+  const effectiveBase = (envelope.branch?.base || '') || configuredBaseRef || checkedOut || unbornBranch || refBaseBranch || '';
   // Correlation suffix (issue #231 observability): jobKey/instance/element keys so
   // concurrent workers' branch-decision logs can be joined to the AgentInstance
   // timeline. Threaded from workAgent; empty when provisioning runs out of band.
@@ -4743,9 +4765,23 @@ function finalizeGit({ workspaceDir, gitEnv, startSha, workingBranch, baseBranch
     const strays = [...new Set([...movedStray, ...offBranchStray])];
     if (strays.length > 0) {
       out.pushFailed = true;
+      // Only the UNPUBLISHED work-branch commits are actually stranded. If the harness
+      // already pushed the work branch, `branchCommits` (startSha..refs/heads/<branch>)
+      // are reachable from origin/<workingBranch> and are safe — unioning them
+      // wholesale would falsely report published commits as UNPUSHED, preserve the run
+      // unnecessarily, suppress PR reconciliation, and inflate strandedOnBranch
+      // (suppressed advisory 4748). Re-derive the branch portion excluding
+      // remote-reachable commits, mirroring the off-branch scan; fall back to the raw
+      // list only if the rev-list itself errors.
+      let unpushedBranchCommits = branchCommits;
+      if (branchCommits.length > 0) {
+        const range = startSha ? `${startSha}..refs/heads/${workingBranch}` : `refs/heads/${workingBranch}`;
+        const ub = runGit(['rev-list', range, '--not', '--remotes'], { cwd: workspaceDir, env: gitEnv });
+        if (ub.status === 0) unpushedBranchCommits = ub.stdout.trim().split('\n').filter(Boolean);
+      }
       // Union every at-risk source so recovery finds them all: the off-branch strays
-      // AND the work-branch commits we are refusing to push (branchCommits).
-      out.strandedCommits = [...new Set([...strays, ...branchCommits])];
+      // AND the UNPUBLISHED work-branch commits we are refusing to push.
+      out.strandedCommits = [...new Set([...strays, ...unpushedBranchCommits])];
       // Distinguish "HEAD moved to another ref" (actual = that ref) from "HEAD is
       // back on the work branch but commits were left on ANOTHER local branch"
       // (actual null + offBranch flag) so the completion note labels the stranded
@@ -4754,7 +4790,7 @@ function finalizeGit({ workspaceDir, gitEnv, startSha, workingBranch, baseBranch
       // sit ON the work branch vs. elsewhere) so the completion log can attribute a
       // MIXED strand accurately instead of claiming a single ref for all of them
       // (suppressed advisory 8882).
-      const strandedOnBranch = branchCommits.filter((c) => strays.indexOf(c) === -1).length;
+      const strandedOnBranch = unpushedBranchCommits.filter((c) => strays.indexOf(c) === -1).length;
       out.branchMismatch = movedOff
         ? { expected: workingBranch, actual: currentBranch || null, strandedOnBranch }
         : { expected: workingBranch, actual: null, offBranch: true, strandedOnBranch };
@@ -4844,6 +4880,11 @@ function finalizeGit({ workspaceDir, gitEnv, startSha, workingBranch, baseBranch
             out.baseAdvanced = n;
             const shaNote = ` [base '${baseBranch}': ${beforeSha.slice(0, 12)} → ${fetchedSha ? fetchedSha.slice(0, 12) : '(unknown)'}]`;
             log.warn?.(`finalizeGit${corr ? ' (' + corr + ')' : ''}: remote base '${baseBranch}' advanced ${n} commit(s) since clone${shaNote} — pushing branch '${workingBranch}'${workingBranch === baseBranch ? ' (which IS the base — a non-ff reject would strand the commits)' : ''}`);
+          } else if (Number.isFinite(n)) {
+            // Record the CLEAN result too (n === 0), so a base that did not advance is
+            // distinguishable from a skipped or errored check in the logs rather than
+            // leaving silence that reads as "diagnostic never ran" (advisory 4847).
+            log.debug?.(`finalizeGit${corr ? ' (' + corr + ')' : ''}: remote base '${baseBranch}' unchanged since clone (0 new commit(s)) — pushing branch '${workingBranch}'`);
           }
         } else {
           log.debug?.(`finalizeGit${corr ? ' (' + corr + ')' : ''}: no clone-time snapshot for base '${baseBranch}' (origin/${baseBranch} absent at clone) — skipping the base-advanced count to avoid a false positive`);
@@ -8873,8 +8914,13 @@ async function workAgent(req, flags) {
                 // (e.g. 300s window, 100s interval ⇒ 200s left, not 300s). Budgeting
                 // against that worst-case remaining lease — not the full window —
                 // keeps the git ops inside the lock even across a stale heartbeat
-                // (thread 4678).
-                budgetMs: Math.max(0, recoveryWindowMs - lockExtendIntervalMs),
+                // (thread 4678). Pass a MINIMUM of 1 (not 0): finalizeGit treats
+                // budgetMs 0 as "no budget" and restores the full per-op 120s
+                // timeouts, so a window too small to budget (e.g. recoveryWindowMs
+                // equal to lockExtendIntervalMs ⇒ difference 0) must still enforce a
+                // near-zero deadline that fails the git ops FAST rather than defeat
+                // the lease-safety cap (suppressed advisory 8877).
+                budgetMs: Math.max(1, recoveryWindowMs - lockExtendIntervalMs),
                 // Provisioned job: a null baseCloneSha means no genuine clone-time
                 // base snapshot exists, so finalizeGit must NOT fall back to a live
                 // (post-harness) read for its staleness count (advisory 4764).
@@ -8904,7 +8950,27 @@ async function workAgent(req, flags) {
           // jobs — jobKey alone is not enough, so carry the process + element keys.
           const corr = `instance ${job.processInstanceKey ?? '-'}/elem ${job.elementInstanceKey ?? '-'}`;
           if (runDir && !keepRuns && !preserveForRecovery) { try { rmSync(runDir, { recursive: true, force: true }); } catch { /* best effort */ } }
-          else if (runDir && preserveForRecovery) logger.error(`[${jobType}] job ${job.jobKey} (${corr}): preserving workspace '${runDir}' (${gitResult?.branchMismatch ? 'push refused — HEAD left the work branch' : 'push failed'}) so the stranded commit(s) remain recoverable — copy them out before the reaper ages it away`);
+          else if (runDir && preserveForRecovery) {
+            // Refresh the run dir's mtime so the age-gated reaper grants it a FULL
+            // recovery window from NOW. The reaper deletes `run-*`/`res-*` dirs whose
+            // mtime is older than maxAgeMs (default 1h); a long-running (multi-hour)
+            // job's dir is already aged when the push fails, so without this touch the
+            // "preserved" recovery workspace would be reaped on the very next sweep,
+            // defeating the preservation (thread 8905). Best-effort — a failed touch
+            // must never mask the recovery log below.
+            try { const t = new Date(); utimesSync(runDir, t, t); } catch { /* best effort */ }
+            // Label the stranded location accurately: an `offBranch` mismatch means
+            // HEAD is BACK on the work branch but commits were left on ANOTHER local
+            // branch, so "HEAD left the work branch" would be wrong for it; a moved
+            // mismatch means HEAD itself left (advisory 8907).
+            const bm = gitResult?.branchMismatch;
+            const reason = bm
+              ? (bm.offBranch
+                  ? 'push refused — commits left on another local branch'
+                  : `push refused — HEAD left the work branch (now on '${bm.actual || 'detached HEAD'}')`)
+              : 'push failed';
+            logger.error(`[${jobType}] job ${job.jobKey} (${corr}): preserving workspace '${runDir}' (${reason}) so the stranded commit(s) remain recoverable — copy them out before the reaper ages it away`);
+          }
           if (runDir) liveRunDirs.delete(runDir);
           // Emit the relay session's `phase:close` lifecycle event and drain its
           // outbound buffer before the job settles (so the live-terminal tail is

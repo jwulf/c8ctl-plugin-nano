@@ -1516,6 +1516,44 @@ test('provisionRepo cuts a fallback when branch.create names the DEFAULT branch 
   }
 });
 
+test('provisionRepo folds repository.baseRef into effectiveBase so branch.create naming the base cuts a fallback (issue #231, thread/advisory 4378)', { skip: !gitOk }, () => {
+  const { root, origin } = makeOriginRepo();
+  // Publish a feature branch so we can clone ref=feat/x while the base ref rides in
+  // repository.baseRef (NOT branch.base) — the shape real PR envelopes use.
+  const wc = mkdtempSync(join(root, 'wc4378-'));
+  g(['clone', '-q', origin, wc], undefined);
+  g(['config', 'user.name', 'seed'], wc);
+  g(['config', 'user.email', 'seed@example.com'], wc);
+  g(['checkout', '-q', '-b', 'feat/x'], wc);
+  writeFileSync(join(wc, 'feature.txt'), 'feature\n');
+  g(['add', '-A'], wc);
+  g(['commit', '-q', '-m', 'feature commit'], wc);
+  g(['push', '-q', 'origin', 'feat/x'], wc);
+  const runDir = mkdtempSync(join(root, 'run-'));
+  try {
+    // ref=feat/x (the clone lands on feat/x), baseRef=main carries the base, and an
+    // explicit branch.create='main' names that base. Without folding repository.baseRef
+    // into effectiveBase the guard treated 'main' as an ordinary work branch and would
+    // `checkout -B main` → commit/push DIRECTLY on the base (the #231 hazard), AND the
+    // pre-push staleness check would watch the FEATURE ref instead of main.
+    const envelope = {
+      schemaVersion: 1,
+      repository: { provider: 'github', url: origin, ref: 'feat/x', baseRef: 'main', submodules: false },
+      branch: { create: 'main', push: true },
+      setup: { commands: [], env: {}, secretRefs: [] },
+      task: { allowPr: false },
+    };
+    const prov = provisionRepo({ envelope, token: null, runDir });
+    assert.equal(prov.fallbackBranch, true, 'create===repository.baseRef cuts a fallback, not a direct base checkout');
+    assert.notEqual(prov.workingBranch, 'main', 'never leaves us on the base branch when pushing');
+    assert.match(prov.workingBranch, /^nano\/agent-work\//, 'a non-base fallback work branch was cut');
+    assert.equal(prov.baseBranch, 'main', 'effectiveBase folds in repository.baseRef so the staleness check watches main, not feat/x');
+    assert.equal(g(['rev-parse', '--abbrev-ref', 'HEAD'], prov.workspaceDir), prov.workingBranch);
+  } finally {
+    rmSync(root, { recursive: true, force: true });
+  }
+});
+
 test('sanitizeBranchSegment reapplies trailing-dot/.lock checks AFTER truncation (issue #231, suppressed 3933)', () => {
   // A valid long base name with a dot at char 60 must not leave a trailing '.'
   // after .slice(0, 60), or `git checkout -B` rejects the fallback ref and the job
@@ -1900,6 +1938,45 @@ test('finalizeGit records the per-ref strand split when the harness commits on B
     assert.equal(out.branchMismatch.actual, 'main');
     assert.equal(out.branchMismatch.strandedOnBranch, 1, 'exactly the work-branch commit is attributed to the work branch');
     assert.deepEqual(new Set(out.strandedCommits), new Set([workSha, strayedSha]), 'both refs contribute to the union');
+  } finally {
+    rmSync(root, { recursive: true, force: true });
+  }
+});
+
+test('finalizeGit does NOT strand ALREADY-PUSHED work-branch commits when an off-branch stray forces preservation (issue #231, suppressed advisory 4748)', { skip: !gitOk }, () => {
+  const { root, origin } = makeOriginRepo();
+  const runDir = mkdtempSync(join(root, 'run-'));
+  try {
+    const envelope = {
+      schemaVersion: 1,
+      repository: { provider: 'github', url: origin, submodules: false },
+      branch: { base: 'main', create: 'feat/work', push: true },
+      setup: { commands: [], env: {}, secretRefs: [] },
+      task: { allowPr: false },
+    };
+    const prov = provisionRepo({ envelope, token: null, runDir });
+    assert.equal(prov.workingBranch, 'feat/work');
+    // Commit on the work branch AND PUBLISH it to origin/feat/work — so this commit
+    // is remote-reachable and NOT stranded...
+    writeFileSync(join(prov.workspaceDir, 'work.txt'), 'work\n');
+    g(['add', '-A'], prov.workspaceDir);
+    g(['-c', 'user.name=nano', '-c', 'user.email=nano@example.com', 'commit', '-q', '-m', 'published work-branch commit'], prov.workspaceDir);
+    const workSha = g(['rev-parse', 'HEAD'], prov.workspaceDir);
+    g(['push', '-q', 'origin', 'feat/work'], prov.workspaceDir); // origin/feat/work -> workSha
+    // ...then move to the base and commit an off-branch stray that IS unpublished.
+    g(['checkout', '-B', 'main', 'origin/main'], prov.workspaceDir);
+    writeFileSync(join(prov.workspaceDir, 'stray.txt'), 'stray\n');
+    g(['add', '-A'], prov.workspaceDir);
+    g(['-c', 'user.name=nano', '-c', 'user.email=nano@example.com', 'commit', '-q', '-m', 'stray on base'], prov.workspaceDir);
+    const strayedSha = g(['rev-parse', 'HEAD'], prov.workspaceDir);
+
+    const out = finalizeGit({ ...prov, envelope, token: null });
+    assert.equal(out.pushFailed, true, 'the unpublished off-branch stray still forces a preserved failure');
+    // The already-pushed work-branch commit must NOT be reported stranded (it lives on
+    // origin/feat/work): only the genuinely unpublished stray is at risk.
+    assert.deepEqual(new Set(out.strandedCommits), new Set([strayedSha]), 'only the unpublished stray is stranded — the pushed work-branch commit is filtered out');
+    assert.ok(!out.strandedCommits.includes(workSha), 'the published work-branch commit is not falsely stranded');
+    assert.equal(out.branchMismatch.strandedOnBranch, 0, 'no unpublished work-branch commits ⇒ strandedOnBranch is 0');
   } finally {
     rmSync(root, { recursive: true, force: true });
   }

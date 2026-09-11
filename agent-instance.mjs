@@ -61,6 +61,38 @@ const DEFAULT_PRE_MINT_BUFFER_MAX_BYTES = 8_000_000;
 // instance non-terminal forever (issue #230).
 const DEFAULT_TERMINAL_RETRY_MAX = 3;
 
+// Bound on complete()'s last-chance create attempt (issue #230). The harness awaits
+// complete() BEFORE it settles the job (c8ctl-plugin.js), and the final un-throttled
+// createAgentInstance attempt awaits the SDK promise, which has no timeout of its own.
+// An AgentInstance outage that hangs that request would otherwise block complete()
+// indefinitely and could expire the job lease — the opposite of the "best-effort /
+// job completion unaffected" contract. So the final attempt is awaited only up to this
+// bound; past it we stop awaiting (the idempotent request is left to settle in the
+// background) and let the job settle. `0`/non-positive disables the bound.
+const DEFAULT_FINALIZE_TIMEOUT_MS = 10_000;
+
+// Await a best-effort promise up to `timeoutMs`, then give up WITHOUT rejecting. Used
+// to keep complete()'s last-chance telemetry create from blocking job settlement on a
+// hung SDK call (issue #230): resolves either when the promise settles (success OR
+// failure — both are best-effort) or when the timeout elapses, whichever is first. The
+// underlying attempt is not cancelled (the SDK call is not cancellable) but is left to
+// settle in the background; createAgentInstance is idempotent per elementInstanceKey.
+function awaitBounded(promise, timeoutMs, setTimer = setTimeout) {
+  const safe = Promise.resolve(promise).then(
+    () => undefined,
+    () => undefined,
+  );
+  if (!(timeoutMs > 0)) return safe;
+  return new Promise((resolve) => {
+    const timer = setTimer(() => resolve(undefined), timeoutMs);
+    if (timer && typeof timer.unref === 'function') timer.unref();
+    safe.then(() => {
+      clearTimeout(timer);
+      resolve(undefined);
+    });
+  });
+}
+
 // Cap the normalized SDK error body before logging so an oversized/multiline engine
 // response can't overwhelm the per-worker log (matches supervisor-engine.mjs).
 const SDK_ERROR_BODY_MAX = 500;
@@ -256,6 +288,7 @@ export function createAgentInstanceProducer(opts = {}) {
     preMintBufferMax = DEFAULT_PRE_MINT_BUFFER_MAX,
     preMintBufferMaxBytes = DEFAULT_PRE_MINT_BUFFER_MAX_BYTES,
     terminalRetryMax = DEFAULT_TERMINAL_RETRY_MAX,
+    finalizeTimeoutMs = DEFAULT_FINALIZE_TIMEOUT_MS,
   } = opts;
 
   const classify = typeof sessionAcp?.classifyUpdate === 'function' ? sessionAcp.classifyUpdate : null;
@@ -457,7 +490,6 @@ export function createAgentInstanceProducer(opts = {}) {
   // correlation) and the producer is left retryable — NOT disabled (issue #230).
   const doCreate = async () => {
     createAttempts += 1;
-    lastCreateAttemptAt = now();
     const { def, configTurn } = buildConfigTurn();
     try {
       const res = await camunda[SDK_CREATE]({
@@ -503,6 +535,13 @@ export function createAgentInstanceProducer(opts = {}) {
           `job completion unaffected).`,
       );
       return false;
+    } finally {
+      // Anchor the backoff on when the attempt SETTLES, not when it started: a slow
+      // failure (network/timeout) must pace the NEXT attempt from the moment it failed.
+      // Recording at request start would let a failure that outlasts the current
+      // backoff window trigger another request immediately, defeating the exponential
+      // pacing and risking a retry storm during an outage (issue #230).
+      lastCreateAttemptAt = now();
     }
   };
 
@@ -729,17 +768,19 @@ export function createAgentInstanceProducer(opts = {}) {
         // first so we don't start a duplicate. If it (or the lack of one) leaves us
         // un-minted, make one explicit, un-throttled final attempt regardless of the
         // backoff window, so a transient failure right before completion doesn't lose
-        // the record.
+        // the record. Both awaits are BOUNDED (finalizeTimeoutMs): the harness awaits
+        // complete() before it settles the job, so a hung createAgentInstance must not
+        // be able to block settlement / expire the lease (issue #230).
         if (creating) {
-          try { await creating; } catch { /* best effort */ }
+          await awaitBounded(creating, finalizeTimeoutMs);
         }
-        if (!agentInstanceKey) {
+        if (!agentInstanceKey && !creating) {
           creating = doCreate()
             .catch(() => false)
             .finally(() => {
               creating = null;
             });
-          try { await creating; } catch { /* best effort */ }
+          await awaitBounded(creating, finalizeTimeoutMs);
         }
       }
       if (disabled || !agentInstanceKey) {

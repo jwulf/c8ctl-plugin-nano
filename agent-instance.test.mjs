@@ -504,6 +504,92 @@ test('complete() without a prior activate() is a no-op — it does NOT mint an i
   assert.equal(warnings.length, 0);
 });
 
+test('complete()\'s last-chance create is bounded — a hung createAgentInstance cannot block job settlement (issue #230)', async () => {
+  // The harness awaits complete() before it settles the job, so a hung final create
+  // must NOT block indefinitely (that could expire the job lease). Attempt 1 fails
+  // fast (so activate() returns); the last-chance attempt in complete() then hangs
+  // forever — complete() must still resolve, bounded by finalizeTimeoutMs.
+  const warnings = [];
+  let createCall = 0;
+  const client = {
+    calls: { create: [], update: [] },
+    createAgentInstance: (req) => {
+      client.calls.create.push(req);
+      createCall += 1;
+      if (createCall === 1) return Promise.reject(new Error('transient'));
+      return new Promise(() => {}); // the final attempt never settles
+    },
+    updateAgentInstance: async (req) => {
+      client.calls.update.push(req);
+      return { createdHistory: [] };
+    },
+  };
+  const p = makeProducer(client, {
+    finalizeTimeoutMs: 20,
+    logger: { info() {}, warn: (m) => warnings.push(m), debug() {} },
+  });
+  await p.activate();
+  assert.equal(client.calls.create.length, 1, 'activate made the first (fast-failing) attempt');
+  assert.equal(p.active, false);
+  // If complete() awaited the hung create unbounded this would never resolve and the
+  // test would time out; the bound makes it return.
+  await p.complete(true);
+  assert.equal(client.calls.create.length, 2, 'complete() made one final last-chance attempt');
+  assert.equal(p.active, false, 'still un-minted — the hung create was abandoned, not awaited');
+  assert.equal(
+    client.calls.update.filter((u) => u.status === 'COMPLETED').length,
+    0,
+    'no terminal COMPLETED update without a minted instance',
+  );
+  assert.ok(
+    warnings.some((m) => /no durable AgentInstance/.test(m)),
+    'warns that no durable instance was recorded',
+  );
+});
+
+test('create backoff is anchored on when the attempt settles, not when it starts (issue #230)', async () => {
+  // A create that FAILS SLOWLY must still pace the next attempt from the moment it
+  // settled. Anchoring on request START would let a failure that outlasts the backoff
+  // window trigger another request immediately, defeating the exponential pacing and
+  // risking a retry storm during an outage.
+  let t = Date.parse('2026-02-03T04:05:06.000Z');
+  const client = {
+    calls: { create: [], update: [] },
+    createAgentInstance: async (req) => {
+      client.calls.create.push(req);
+      t += 5000; // the failing attempt takes 5s — well past the 1s base backoff window
+      throw new Error('slow transient failure');
+    },
+    updateAgentInstance: async (req) => {
+      client.calls.update.push(req);
+      return { createdHistory: [] };
+    },
+  };
+  const p = createAgentInstanceProducer({
+    camunda: client,
+    job: EXTERNAL_JOB,
+    profile: PROFILE,
+    envelope: ENVELOPE,
+    logger: nullLogger,
+    now: () => t,
+    createRetryBaseMs: 1000,
+    createRetryMaxMs: 30000,
+  });
+  await p.activate();
+  assert.equal(client.calls.create.length, 1, 'one attempt so far');
+  // The failure advanced the clock 5s. START-anchored, now-lastCreateAttemptAt would be
+  // 5000 >= 1000 and this ingest would immediately re-attempt. SETTLE-anchored, we are
+  // back at the window start → throttled.
+  p.ingest({ sessionUpdate: 'agent_message_chunk', messageId: 'm1', content: { type: 'text', text: 'x' } });
+  await p.drain();
+  assert.equal(client.calls.create.length, 1, 'settle-anchored backoff throttles the immediate next attempt');
+  // Advance past the window measured from settle → the next ingest re-attempts.
+  t += 2000;
+  p.ingest({ sessionUpdate: 'agent_message_chunk', messageId: 'm2', content: { type: 'text', text: 'y' } });
+  await p.drain();
+  assert.equal(client.calls.create.length, 2, 'past the settle-anchored window a new attempt fires');
+});
+
 test('pre-mint ACP updates are buffered and replayed once a retried create succeeds (issue #230)', async () => {
   // The create fails on activate; turns then stream in while it is still failing.
   // They must be buffered and durably replayed against the instance once a later

@@ -4292,6 +4292,11 @@ function provisionRepo({ envelope, token, runDir, timeoutMs = 120_000, logger = 
   // which case there is NO branch to push and workingBranch stays null so
   // finalizeGit skips the push/PR reconcile instead of pushing a bogus ref.
   let workingBranch = null;
+  // Whether the agent's commits land on a branch DISTINCT from the checkout base
+  // (a real PR branch that shields them from a non-ff push / a reaped base). This
+  // is the authoritative decision — finalizeGit carries it rather than re-deriving
+  // from the envelope, which cannot see the detached/unpinned cases below.
+  let hasPrBranch = false;
   if (envelope.branch?.create) {
     // Capture the branch the clone ACTUALLY checked out BEFORE we reset it with
     // `-B`. When no ref/base was pinned (`branchName` empty) the clone lands on
@@ -4311,10 +4316,16 @@ function provisionRepo({ envelope, token, runDir, timeoutMs = 120_000, logger = 
     // place: the agent commits DIRECTLY on the base with no distinct PR branch, so a
     // non-fast-forward push (the base advanced on the remote since clone) loses every
     // commit — the same 20974 work-loss shape as the no-create path. The effective
-    // base is `branchName` (repository.ref || branch.base) when pinned, else the
-    // branch the clone checked out (`clonedBranch`) so an UNPINNED `create:'main'`
-    // over a default-`main` clone is still caught. Warn loudly in that case.
-    const effectiveBase = branchName || (clonedBranch && clonedBranch !== 'HEAD' ? clonedBranch : '');
+    // base is the branch the clone ACTUALLY checked out (`clonedBranch`): this is
+    // authoritative across all cases — a pinned branch base, an UNPINNED `create`
+    // that equals the default branch the clone landed on, AND a detached tag/sha
+    // base (`clonedBranch === 'HEAD'`) where `checkout -B` cut a REAL branch from
+    // detached HEAD, so it is a distinct PR branch even when the tag NAME equals
+    // `create` (e.g. ref:'v1', create:'v1'). `branchName` (repository.ref, which
+    // may be a TAG) must NOT be used here — a tag name would masquerade as a
+    // symbolic base and misclassify the distinct branch as direct-on-base.
+    const effectiveBase = clonedBranch && clonedBranch !== 'HEAD' ? clonedBranch : '';
+    hasPrBranch = workingBranch !== effectiveBase;
     if (effectiveBase && workingBranch === effectiveBase) {
       logger?.warn?.(`git provision: branch.create='${envelope.branch.create}' equals the checkout base → agent will commit DIRECTLY on base branch '${workingBranch}'; no distinct PR branch — a non-fast-forward push (the branch advanced on the remote since clone) would lose every commit.${cs}`);
     } else {
@@ -4345,7 +4356,7 @@ function provisionRepo({ envelope, token, runDir, timeoutMs = 120_000, logger = 
   // `git rev-parse HEAD` on an unborn branch (freshly cloned empty repo) exits
   // non-zero and echoes the literal "HEAD" on stdout — treat that as "no base
   // commit" (empty startSha) rather than a bogus revision.
-  return { workspaceDir, gitEnv, committer, startSha: sha.status === 0 ? (sha.stdout || '').trim() : '', workingBranch, detached: !workingBranch, ref: commitSha || branchName || '', base, baseFetchError, remote: redactToken(repo.url, token) };
+  return { workspaceDir, gitEnv, committer, startSha: sha.status === 0 ? (sha.stdout || '').trim() : '', workingBranch, hasPrBranch, detached: !workingBranch, ref: commitSha || branchName || '', base, baseFetchError, remote: redactToken(repo.url, token) };
 }
 
 // Look up a PR for this branch (2a does NOT open it — the harness does, driven
@@ -4463,7 +4474,7 @@ function postAgentAttribution({ workspaceDir, token, number, agentName = AGENT_A
 // branch.push), and reconcile the agent-opened PR (when task.allowPr). A push
 // failure is reported (pushError) rather than thrown — the process model decides
 // what to do next, and re-running the agent would be non-idempotent.
-function finalizeGit({ workspaceDir, gitEnv, startSha, workingBranch, envelope, token, logger = null, corr = '', keepRuns = false }) {
+function finalizeGit({ workspaceDir, gitEnv, startSha, workingBranch, hasPrBranch, envelope, token, logger = null, corr = '', keepRuns = false }) {
   const cs = corr ? ` [${corr}]` : ''; // #229 cross-channel correlation suffix
   const out = { branch: workingBranch, baseSha: startSha || null, headSha: null, commits: [], pushed: false, remote: null, pr: null };
   const rem = runGit(['remote', 'get-url', 'origin'], { cwd: workspaceDir, env: gitEnv });
@@ -4519,33 +4530,33 @@ function finalizeGit({ workspaceDir, gitEnv, startSha, workingBranch, envelope, 
     else {
       out.pushError = describeGitFailure('git push', push, { token, timeoutMs: pushTimeoutMs });
       // #229: elevate the push failure out of the terse info line — commits are
-      // unpushed and this is the loud signal that was missing. The "will be LOST
-      // (no PR)" wording only holds when there is genuinely no PR branch. A
-      // `branch.create` only shields the commits when it is a DISTINCT branch from
-      // the base: `{ base:'main', create:'main' }` does `checkout -B main` and
-      // leaves the agent committing directly on the base, so there is NO separate
-      // PR branch and a failed push still LOSES the commits. `task.allowPr` only
-      // enables PR *reconciliation* — it does NOT create a branch — so it is not
-      // part of this decision. Treat create===base (and no create) as "no PR
-      // branch" and keep the loud signal. The effective checkout base is
-      // `repository.ref || branch.base` (the same precedence provisionRepo clones
-      // with) — using `branch.base` alone would miss a normalized envelope that
-      // pins the base via `repository.ref` (e.g. ref:'main', create:'main').
-      const effectiveBase = envelope.repository?.ref || envelope.branch?.base || '';
-      const hasPrBranch = !!envelope.branch?.create && workingBranch !== effectiveBase;
-      // Even a DISTINCT `branch.create` only shields commits if they survive
-      // somewhere. With the default `keepRuns=false` the worker reaps `runDir` in
-      // its `finally`, so a failed push leaves the only copy of these commits in a
-      // throwaway workspace that is about to be deleted — they are LOST too, just
-      // via reaping rather than a missing PR branch. Only `--keep-runs` retains
-      // them. So the loud "will be LOST" signal applies to BOTH arms; the wording
-      // differs only in the cause (no PR branch vs. reaped workspace) and the
-      // `--keep-runs` escape hatch is called out when a PR branch exists.
-      const lossNote = hasPrBranch
+      // unpushed and this is the loud signal that was missing. Whether the commits
+      // sit on a DISTINCT PR branch (which shields them from a non-ff push of the
+      // base) was decided authoritatively in provisionRepo, which knows the branch
+      // the clone ACTUALLY checked out — a detached tag/sha base makes `checkout -B`
+      // cut a real branch, and an unpinned `create` may equal the default branch.
+      // Carry that `hasPrBranch` decision here rather than re-deriving it from the
+      // envelope (`repository.ref || branch.base`), which cannot see those cases and
+      // would misclassify the loss. Fall back to the envelope heuristic only for
+      // direct callers (a few tests) that don't thread the provisioned flag.
+      const prBranch = typeof hasPrBranch === 'boolean'
+        ? hasPrBranch
+        : (!!envelope.branch?.create && workingBranch !== (envelope.repository?.ref || envelope.branch?.base || ''));
+      // Even a DISTINCT PR branch only shields commits if they survive somewhere.
+      // With the default `keepRuns=false` the worker reaps `runDir` in its `finally`,
+      // so a failed push leaves the only copy of these commits in a throwaway
+      // workspace that is about to be deleted — they are LOST too, just via reaping
+      // rather than a missing PR branch. Only `--keep-runs` retains them. So the loud
+      // "will be LOST" signal applies to BOTH arms UNLESS `--keep-runs` is set, in
+      // which case the workspace (and its commits) are retained either way; the
+      // wording differs only in the cause (no PR branch vs. reaped workspace).
+      const lossNote = prBranch
         ? (keepRuns
           ? `${out.commits.length} commit(s) are unpushed on branch '${workingBranch}' and retained in the run workspace (--keep-runs)`
           : `${out.commits.length} commit(s) are unpushed on branch '${workingBranch}' and will be LOST when the run workspace is reaped (re-run with --keep-runs to retain them)`)
-        : `${out.commits.length} commit(s) are unpushed and will be LOST (no PR)`;
+        : (keepRuns
+          ? `${out.commits.length} commit(s) are unpushed (no PR branch) but retained in the run workspace (--keep-runs)`
+          : `${out.commits.length} commit(s) are unpushed and will be LOST (no PR branch, and the run workspace is reaped — re-run with --keep-runs to retain them)`);
       logger?.error?.(`git finalize: push of branch '${workingBranch}' FAILED — ${lossNote}: ${oneLineLog(out.pushError)}${cs}`);
     }
   }
@@ -8278,7 +8289,7 @@ async function workAgent(req, flags) {
             liveRunDirs.add(runDir);
             provisioned = provisionRepo({ envelope, token: repoToken, runDir, timeoutMs: cloneTimeoutMs, logger, corr: aiCorr });
             if (provisioned.baseFetchError) {
-              logger.warn(`[${jobType}] job ${job.jobKey} base fetch failed (${aiCorr}) — ${provisioned.baseFetchError}; base...head diffs may be unavailable`);
+              logger.warn(`[${jobType}] job ${job.jobKey} base fetch failed (${aiCorr}) — ${oneLineLog(provisioned.baseFetchError)}; base...head diffs may be unavailable`);
             }
             cwd = provisioned.workspaceDir;
             extraEnv = {
@@ -8308,7 +8319,10 @@ async function workAgent(req, flags) {
             // #229: include the correlation keys — a clone/checkout failure occurs
             // before provisionRepo reaches either branch-decision log, so this is the
             // ONLY git-provisioning signal and must be joinable to the other channels.
-            logger.warn(`[${jobType}] job ${job.jobKey} not provisioned (${aiCorr}) — ${msg}; retries left ${retries}`);
+            // Normalize ONLY the logged value to one line (git stderr/stdout preserved
+            // by gitErrorDetail is multiline) so continuation lines can't split this
+            // correlated record; the settlement error below keeps the full detail.
+            logger.warn(`[${jobType}] job ${job.jobKey} not provisioned (${aiCorr}) — ${oneLineLog(msg)}; retries left ${retries}`);
             return settleJob.fail({ errorMessage: msg.slice(0, 2000), retries, retryBackOff: 15_000 });
           }
         } else if (!isContainer) {
@@ -8500,6 +8514,7 @@ async function workAgent(req, flags) {
                 gitEnv: provisioned.gitEnv,
                 startSha: provisioned.startSha,
                 workingBranch: provisioned.workingBranch,
+                hasPrBranch: provisioned.hasPrBranch,
                 envelope,
                 token: repoToken,
                 logger,

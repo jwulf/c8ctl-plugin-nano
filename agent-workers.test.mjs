@@ -1336,6 +1336,7 @@ test('provisionRepo warns when branch.create equals the cloned default even with
       corr: 'job 3 eik 2 pik 1',
     });
     assert.equal(prov.workingBranch, 'main');
+    assert.equal(prov.hasPrBranch, false, 'create===cloned-default is NOT a distinct PR branch');
     assert.ok(
       warnings.some((m) => /branch\.create='main' equals the checkout base/.test(m)
         && /commit DIRECTLY on base branch 'main'/.test(m)
@@ -1345,6 +1346,102 @@ test('provisionRepo warns when branch.create equals the cloned default even with
     assert.ok(
       !infos.some((m) => /cut feat branch/.test(m)),
       'does NOT falsely claim a feat branch was cut when create equals the cloned default',
+    );
+  } finally {
+    rmSync(root, { recursive: true, force: true });
+  }
+});
+
+test('provisionRepo treats a detached TAG base as a distinct PR branch even when the tag name equals branch.create (#232)', { skip: !gitOk }, () => {
+  const { root, origin } = makeOriginRepo();
+  const runDir = mkdtempSync(join(root, 'run-'));
+  const warnings = [];
+  const infos = [];
+  try {
+    // Publish a tag 'v1' at main so the clone can pin `repository.ref: 'v1'`.
+    const tagger = mkdtempSync(join(root, 'tag-'));
+    g(['clone', '-q', origin, tagger], undefined);
+    g(['tag', 'v1'], tagger);
+    g(['push', '-q', 'origin', 'v1'], tagger);
+
+    // `repository.ref: 'v1'` (a TAG) makes the clone land on DETACHED HEAD, and
+    // `branch.create: 'v1'` then `checkout -B v1` cuts a REAL branch off that
+    // detached HEAD — a genuine distinct PR branch. The old effective-base test
+    // used `branchName` (== the tag name 'v1'), so it wrongly reported the tag as a
+    // symbolic base and classified this as direct-on-base. The cloned-branch signal
+    // ('HEAD', detached) is authoritative: this IS a PR branch.
+    const envelope = {
+      schemaVersion: 1,
+      repository: { provider: 'github', url: origin, ref: 'v1', submodules: false },
+      branch: { create: 'v1', push: true },
+      setup: { commands: [], env: {}, secretRefs: [] },
+      task: { allowPr: true },
+    };
+    const prov = provisionRepo({
+      envelope,
+      token: null,
+      runDir,
+      logger: { warn: (m) => warnings.push(m), info: (m) => infos.push(m) },
+      corr: 'job 7 eik 8 pik 9',
+    });
+    assert.equal(prov.workingBranch, 'v1', 'checkout -B v1 makes a real branch');
+    assert.equal(prov.hasPrBranch, true, 'a branch cut off a detached tag IS a distinct PR branch');
+    assert.ok(
+      !warnings.some((m) => /equals the checkout base/.test(m)),
+      'does NOT warn direct-on-base for a branch cut off a detached tag',
+    );
+    assert.ok(
+      infos.some((m) => /cut feat branch 'v1'/.test(m)),
+      'reports a feat branch was cut',
+    );
+  } finally {
+    rmSync(root, { recursive: true, force: true });
+  }
+});
+
+test('finalizeGit reports the RETAINED workspace (not LOST) for a no-PR-branch push failure under --keep-runs (#232)', { skip: !gitOk }, () => {
+  const { root, origin } = makeOriginRepo();
+  const runDir = mkdtempSync(join(root, 'run-'));
+  try {
+    // { base:'main', create:'main' } → no distinct PR branch. But with keepRuns the
+    // worker's `finally` preserves runDir, so the commits are NOT lost — the loud
+    // signal must say "retained in the run workspace (--keep-runs)", not "LOST".
+    const envelope = {
+      schemaVersion: 1,
+      repository: { provider: 'github', url: origin, submodules: false },
+      branch: { base: 'main', create: 'main', push: true },
+      setup: { commands: [], env: {}, secretRefs: [] },
+      task: { allowPr: true },
+    };
+    const prov = provisionRepo({ envelope, token: null, runDir });
+    assert.equal(prov.hasPrBranch, false, 'create===base is NOT a distinct PR branch');
+    writeFileSync(join(prov.workspaceDir, 'AGENT.txt'), 'agent change\n');
+    g(['add', '-A'], prov.workspaceDir);
+    g(['commit', '-q', '-m', 'agent: add AGENT.txt'], prov.workspaceDir);
+
+    const rival = mkdtempSync(join(root, 'rival-'));
+    g(['clone', '-q', origin, rival], undefined);
+    writeFileSync(join(rival, 'RIVAL.txt'), 'rival change\n');
+    g(['add', '-A'], rival);
+    g(['-c', 'user.name=rival', '-c', 'user.email=rival@example.com', 'commit', '-q', '-m', 'rival: add RIVAL.txt'], rival);
+    g(['push', '-q', 'origin', 'main'], rival);
+
+    const errors = [];
+    const out = finalizeGit({
+      workspaceDir: prov.workspaceDir,
+      gitEnv: prov.gitEnv,
+      startSha: prov.startSha,
+      workingBranch: prov.workingBranch,
+      hasPrBranch: prov.hasPrBranch,
+      envelope,
+      token: null,
+      logger: { warn: () => {}, error: (m) => errors.push(m), info: () => {} },
+      keepRuns: true,
+    });
+    assert.equal(out.pushed, false, 'a non-fast-forward push is rejected');
+    assert.ok(
+      errors.some((m) => /no PR branch/.test(m) && /retained in the run workspace \(--keep-runs\)/.test(m) && !/will be LOST/.test(m)),
+      'no-PR-branch + keepRuns reports the retained workspace, not LOST',
     );
   } finally {
     rmSync(root, { recursive: true, force: true });
@@ -1897,6 +1994,7 @@ test('finalizeGit emits the loud LOST (no PR) signal when branch.create equals t
     };
     const prov = provisionRepo({ envelope, token: null, runDir });
     assert.equal(prov.workingBranch, 'main', 'create===base leaves the agent on the base branch');
+    assert.equal(prov.hasPrBranch, false, 'create===base is NOT a distinct PR branch');
     writeFileSync(join(prov.workspaceDir, 'AGENT.txt'), 'agent change\n');
     g(['add', '-A'], prov.workspaceDir);
     g(['commit', '-q', '-m', 'agent: add AGENT.txt'], prov.workspaceDir);
@@ -1915,6 +2013,7 @@ test('finalizeGit emits the loud LOST (no PR) signal when branch.create equals t
       gitEnv: prov.gitEnv,
       startSha: prov.startSha,
       workingBranch: prov.workingBranch,
+      hasPrBranch: prov.hasPrBranch,
       envelope,
       token: null,
       logger: { warn: () => {}, error: (m) => errors.push(m), info: () => {} },
@@ -1922,8 +2021,8 @@ test('finalizeGit emits the loud LOST (no PR) signal when branch.create equals t
     });
     assert.equal(out.pushed, false, 'a non-fast-forward push is rejected');
     assert.ok(
-      errors.some((m) => /will be LOST \(no PR\)/.test(m) && /\[job 4 eik 5 pik 6\]/.test(m)),
-      'create===base keeps the loud LOST (no PR) signal even though branch.create is set',
+      errors.some((m) => /will be LOST \(no PR branch/.test(m) && /\[job 4 eik 5 pik 6\]/.test(m)),
+      'create===base keeps the loud LOST (no PR branch) signal even though branch.create is set',
     );
   } finally {
     rmSync(root, { recursive: true, force: true });

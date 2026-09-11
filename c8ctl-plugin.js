@@ -3928,9 +3928,10 @@ function sanitizeBranchSegment(s) {
   const cleaned = String(s == null ? '' : s)
     .replace(/[^0-9A-Za-z._-]+/g, '-') // collapse anything unusual to a dash
     .replace(/\.{2,}/g, '.')            // no doubled dots (git forbids "..")
-    .replace(/^[-.]+|[-.]+$/g, '')      // no leading/trailing dot or dash
-    .replace(/\.lock$/i, 'lock')        // a ref segment may not end in ".lock"
-    .slice(0, 60);
+    .replace(/^[-.]+/, '')              // no leading dot or dash
+    .slice(0, 60)                       // bound the segment BEFORE the trailing
+    .replace(/[-.]+$/g, '')             // checks, so truncating at char 60 can't
+    .replace(/\.lock$/i, 'lock');       // re-introduce a trailing dot/dash or ".lock"
   return cleaned || 'base';
 }
 
@@ -4136,7 +4137,7 @@ function githubCloneToken({ provider, authRef, secretResolver, ghAuthToken = ghA
 // Clone repo into <runDir>/workspace and check out / create the working branch.
 // Returns { workspaceDir, gitEnv, startSha, workingBranch, remote }. Throws a
 // ProvisionError (token-redacted) on any git failure so the caller can shed.
-function provisionRepo({ envelope, token, runDir, runId, timeoutMs = 120_000 }) {
+function provisionRepo({ envelope, token, runDir, runId, timeoutMs = 120_000, corr = '' }) {
   const repo = envelope.repository;
   if (!repo || !repo.url) throw new ProvisionError('repository.url is required to provision a workspace');
   const workspaceDir = join(runDir, 'workspace');
@@ -4323,6 +4324,10 @@ function provisionRepo({ envelope, token, runDir, runId, timeoutMs = 120_000 }) 
   // actually-checked-out ref. Otherwise an explicit branch.create='main' would
   // slip past the guard below (=== '' is false) and commit directly on default.
   const effectiveBase = baseBranchName || checkedOut || '';
+  // Correlation suffix (issue #231 observability): jobKey/instance/element keys so
+  // concurrent workers' branch-decision logs can be joined to the AgentInstance
+  // timeline. Threaded from workAgent; empty when provisioning runs out of band.
+  const cx = corr ? ` (${corr})` : '';
   const cutFallbackBranch = (landedOn) => {
     const uniq = runId || basename(runDir);
     const baseSeg = baseBranchName || landedOn || 'base';
@@ -4334,7 +4339,7 @@ function provisionRepo({ envelope, token, runDir, runId, timeoutMs = 120_000 }) 
     // Report the ACTUAL checked-out ref and the configured base separately: they
     // can differ (e.g. repository.ref is a feature branch while branch.base is
     // main), so do not assert the clone "landed on the base branch".
-    log.warn?.(`provisionRepo: work would otherwise be committed on branch '${landedOn}' (configured base '${baseBranchName || '(unknown)'}') — cut fallback work branch '${fb}' so commits are never made directly on the base branch (the app should supply branch.create=feat/<task.id>)`);
+    log.warn?.(`provisionRepo${cx}: work would otherwise be committed on branch '${landedOn}' (configured base '${baseBranchName || '(unknown)'}') — cut fallback work branch '${fb}' so commits are never made directly on the base branch (the app should supply branch.create=feat/<task.id>)`);
   };
   const explicitCreate = envelope.branch?.create ? String(envelope.branch.create) : '';
   // Defense against silent work-loss (issue #231): committing on the base branch
@@ -4349,7 +4354,7 @@ function provisionRepo({ envelope, token, runDir, runId, timeoutMs = 120_000 }) 
     const cb = runGit(['checkout', '-B', explicitCreate], { cwd: workspaceDir, env: gitEnv, timeoutMs });
     if (cb.status !== 0) throw new ProvisionError(describeGitFailure(`git checkout -B ${explicitCreate}`, cb, { token, timeoutMs }));
     workingBranch = explicitCreate;
-    log.debug?.(`provisionRepo: branch.create=${workingBranch} → cut work branch off base '${baseBranchName || '(unknown)'}'`);
+    log.debug?.(`provisionRepo${cx}: branch.create=${workingBranch} → cut work branch off base '${baseBranchName || '(unknown)'}'`);
   } else if (checkedOut && wantPush) {
     // Either no branch.create, OR an explicit create that NAMES the effective base
     // while pushing — both would otherwise commit on the base, so cut a fallback.
@@ -4358,13 +4363,13 @@ function provisionRepo({ envelope, token, runDir, runId, timeoutMs = 120_000 }) 
     // Detached HEAD (tag/sha ⇒ null, no branch to push) or a read-only clone
     // (push disabled) — safe to stay on the checked-out ref; nothing is pushed.
     workingBranch = checkedOut;
-    if (checkedOut) log.debug?.(`provisionRepo: no branch.create; push disabled → working read-only on '${checkedOut}'`);
+    if (checkedOut) log.debug?.(`provisionRepo${cx}: no branch.create; push disabled → working read-only on '${checkedOut}'`);
   }
   const sha = runGit(['rev-parse', 'HEAD'], { cwd: workspaceDir, env: gitEnv });
   // `git rev-parse HEAD` on an unborn branch (freshly cloned empty repo) exits
   // non-zero and echoes the literal "HEAD" on stdout — treat that as "no base
   // commit" (empty startSha) rather than a bogus revision.
-  return { workspaceDir, gitEnv, committer, startSha: sha.status === 0 ? (sha.stdout || '').trim() : '', workingBranch, fallbackBranch, baseBranch: baseBranchName || null, detached: !workingBranch, ref: commitSha || branchName || '', base, baseFetchError, remote: redactToken(repo.url, token) };
+  return { workspaceDir, gitEnv, committer, startSha: sha.status === 0 ? (sha.stdout || '').trim() : '', workingBranch, fallbackBranch, baseBranch: effectiveBase || null, detached: !workingBranch, ref: commitSha || branchName || '', base, baseFetchError, remote: redactToken(repo.url, token) };
 }
 
 // Look up a PR for this branch (2a does NOT open it — the harness does, driven
@@ -4482,7 +4487,7 @@ function postAgentAttribution({ workspaceDir, token, number, agentName = AGENT_A
 // branch.push), and reconcile the agent-opened PR (when task.allowPr). A push
 // failure is reported (pushError) rather than thrown — the process model decides
 // what to do next, and re-running the agent would be non-idempotent.
-function finalizeGit({ workspaceDir, gitEnv, startSha, workingBranch, baseBranch: effectiveBase, envelope, token }) {
+function finalizeGit({ workspaceDir, gitEnv, startSha, workingBranch, baseBranch: effectiveBase, envelope, token, corr = '' }) {
   const out = { branch: workingBranch, baseSha: startSha || null, headSha: null, commits: [], pushed: false, remote: null, pr: null };
   const rem = runGit(['remote', 'get-url', 'origin'], { cwd: workspaceDir, env: gitEnv });
   if (rem.status === 0) out.remote = redactToken(rem.stdout.trim(), token);
@@ -4520,7 +4525,7 @@ function finalizeGit({ workspaceDir, gitEnv, startSha, workingBranch, baseBranch
         const n = ahead.status === 0 ? parseInt((ahead.stdout || '').trim(), 10) : 0;
         if (Number.isFinite(n) && n > 0) {
           out.baseAdvanced = n;
-          log.warn?.(`finalizeGit: remote base '${baseBranch}' advanced ${n} commit(s) since clone — pushing branch '${workingBranch}'${workingBranch === baseBranch ? ' (which IS the base — a non-ff reject would strand the commits)' : ''}`);
+          log.warn?.(`finalizeGit${corr ? ' (' + corr + ')' : ''}: remote base '${baseBranch}' advanced ${n} commit(s) since clone — pushing branch '${workingBranch}'${workingBranch === baseBranch ? ' (which IS the base — a non-ff reject would strand the commits)' : ''}`);
         }
       }
     }
@@ -8097,6 +8102,10 @@ async function workAgent(req, flags) {
   const runner = {
     run: async (job, abortSignal) => {
       const jobType = job.type;
+      // Correlation string for git-provisioning diagnostics (issue #231): joins
+      // provisionRepo/finalizeGit's branch-decision + pre-push staleness logs to
+      // this job's AgentInstance/relay timeline when workers run concurrently.
+      const jobCorr = `job ${job.jobKey} instance ${job.processInstanceKey ?? '-'}/elem ${job.elementInstanceKey ?? '-'}`;
       recordJobStart(job, jobType);
       // Bind the settler to THIS activation's lease token, captured from the job
       // in closure scope. A settlement is fenced with the exact activation that
@@ -8252,7 +8261,7 @@ async function workAgent(req, flags) {
             mkdirSync(workerNsDir, { recursive: true });
             runDir = mkdtempSync(join(workerNsDir, 'run-'));
             liveRunDirs.add(runDir);
-            provisioned = provisionRepo({ envelope, token: repoToken, runDir, runId, timeoutMs: cloneTimeoutMs });
+            provisioned = provisionRepo({ envelope, token: repoToken, runDir, runId, timeoutMs: cloneTimeoutMs, corr: jobCorr });
             if (provisioned.baseFetchError) {
               logger.warn(`[${jobType}] job ${job.jobKey} base fetch failed — ${provisioned.baseFetchError}; base...head diffs may be unavailable`);
             }
@@ -8459,6 +8468,7 @@ async function workAgent(req, flags) {
                 baseBranch: provisioned.baseBranch,
                 envelope,
                 token: repoToken,
+                corr: jobCorr,
               });
             } catch (err) {
               gitResult = { remote: provisioned.remote, branch: provisioned.workingBranch, baseSha: provisioned.startSha || null, commits: [], pushed: false, error: redactToken(err.message, repoToken) };
@@ -13988,6 +13998,7 @@ export {
   ensureAcpFlag,
   provisionRepo,
   finalizeGit,
+  sanitizeBranchSegment,
   describeGitFailure,
   boundGitOutput,
   reconcileAgentPr,

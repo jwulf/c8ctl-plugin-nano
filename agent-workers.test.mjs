@@ -60,6 +60,7 @@ import {
   parsePsTime,
   provisionRepo,
   finalizeGit,
+  sanitizeBranchSegment,
   describeGitFailure,
   boundGitOutput,
   reconcileAgentPr,
@@ -1430,10 +1431,31 @@ test('provisionRepo cuts a fallback when branch.create names the DEFAULT branch 
     assert.equal(prov.fallbackBranch, true, 'create===default-branch (no configured base) still cuts a fallback');
     assert.notEqual(prov.workingBranch, 'main', 'never leaves us on the default branch when pushing');
     assert.match(prov.workingBranch, /^nano\/agent-work\/main-/, 'fallback names the branch the clone landed on');
+    // Issue #231 (thread 4367): the resolved effectiveBase — the default branch the
+    // clone landed on when branch.base/repository.ref are omitted — must propagate as
+    // baseBranch so finalizeGit's pre-push staleness check still fires for this shape.
+    assert.equal(prov.baseBranch, 'main', 'effectiveBase (checked-out default) propagates as baseBranch, not null');
     assert.equal(g(['rev-parse', '--abbrev-ref', 'HEAD'], prov.workspaceDir), prov.workingBranch);
   } finally {
     rmSync(root, { recursive: true, force: true });
   }
+});
+
+test('sanitizeBranchSegment reapplies trailing-dot/.lock checks AFTER truncation (issue #231, suppressed 3933)', () => {
+  // A valid long base name with a dot at char 60 must not leave a trailing '.'
+  // after .slice(0, 60), or `git checkout -B` rejects the fallback ref and the job
+  // sheds. The cleanup must run AFTER truncation, not before.
+  const dotAt60 = 'a'.repeat(59) + '.' + 'bbbbb'; // 65 chars; char index 59 is '.'
+  const out = sanitizeBranchSegment(dotAt60);
+  assert.ok(out.length <= 60, 'segment is bounded to 60 chars');
+  assert.doesNotMatch(out, /[.-]$/, 'no trailing dot or dash survives truncation');
+  assert.doesNotMatch(out, /\.lock$/i, 'no trailing ".lock" survives truncation');
+  // A name that truncates to end in ".lock" is also repaired post-slice.
+  const lockAt = 'c'.repeat(55) + '.lockXX'; // slices to 60 → ends '...c.lock'
+  assert.doesNotMatch(sanitizeBranchSegment(lockAt), /\.lock$/i, 'post-truncation ".lock" is neutralized');
+  // Leading junk is still stripped and empties still fall back to 'base'.
+  assert.equal(sanitizeBranchSegment('...'), 'base');
+  assert.equal(sanitizeBranchSegment('---feat/x'), 'feat-x');
 });
 
 test('provisionRepo mints the fallback branch from the run UUID, not the run-dir basename (cross-worker collision safety, issue #231)', { skip: !gitOk }, () => {

@@ -4501,22 +4501,28 @@ function finalizeGit({ workspaceDir, gitEnv, startSha, workingBranch, hasPrBranc
     // remote branch we're about to push to and count how far it advanced since the
     // clone — a non-empty HEAD..origin/<branch> means the remote moved, so the push
     // will be rejected non-ff (the 20974 work-loss cause). Best-effort: a failed
-    // fetch never blocks the push attempt below. Budget this DIAGNOSTIC fetch on a
-    // short timeout (not the full push timeout): it runs synchronously on the same
-    // event loop as the dispatch-lock extender, so a slow remote here must not eat
-    // into the lock window on top of the push's own blocking budget.
-    const staleFetchTimeoutMs = 15_000;
-    const staleFetch = runGit([...credArgs(), 'fetch', '--no-tags', 'origin', workingBranch], { cwd: workspaceDir, env: gitEnv, timeoutMs: staleFetchTimeoutMs });
-    if (staleFetch.status === 0) {
-      // Budget the local graph walks on the SAME short diagnostic timeout, not
-      // runGit's 120s default: a `rev-list --count HEAD..origin/<branch>` on a
-      // large/shallow repo can block this event loop long enough to starve the
-      // dispatch-lock extender and lapse the lease. Best-effort — a slow walk just
-      // skips the hint and still reaches the push below.
-      const behind = runGit(['rev-list', '--count', `HEAD..origin/${workingBranch}`], { cwd: workspaceDir, env: gitEnv, timeoutMs: staleFetchTimeoutMs });
+    // fetch never blocks the push attempt below.
+    // #229/#232: bound the ENTIRE synchronous diagnostic phase (fetch + the two
+    // local graph walks) with ONE shared 15s deadline, not three independent
+    // 15s timeouts. Each probe runs on the same event loop as the dispatch-lock
+    // extender, so three back-to-back per-command timeouts could block it for up
+    // to 45s and lapse a short-`--recovery-window` lease mid-finalization (the
+    // job then gets redelivered while finalization continues). A single budget
+    // caps the whole phase; once it is exhausted we stop issuing probes and fall
+    // through to the push (the hint is best-effort — a skipped walk just omits it).
+    const diagBudgetMs = 15_000;
+    const diagStart = Date.now();
+    const diagLeftMs = () => diagBudgetMs - (Date.now() - diagStart);
+    const staleFetch = runGit([...credArgs(), 'fetch', '--no-tags', 'origin', workingBranch], { cwd: workspaceDir, env: gitEnv, timeoutMs: diagBudgetMs });
+    const walkBudgetMs = diagLeftMs();
+    if (staleFetch.status === 0 && walkBudgetMs > 0) {
+      const behind = runGit(['rev-list', '--count', `HEAD..origin/${workingBranch}`], { cwd: workspaceDir, env: gitEnv, timeoutMs: walkBudgetMs });
       const n = behind.status === 0 ? Number((behind.stdout || '').trim()) : NaN;
       if (Number.isFinite(n) && n > 0) {
-        const remoteSha = runGit(['rev-parse', `origin/${workingBranch}`], { cwd: workspaceDir, env: gitEnv, timeoutMs: staleFetchTimeoutMs });
+        // The rev-parse only enriches the warning with the remote SHA; once the
+        // shared budget is spent, skip it rather than opening another full probe.
+        const revBudgetMs = diagLeftMs();
+        const remoteSha = revBudgetMs > 0 ? runGit(['rev-parse', `origin/${workingBranch}`], { cwd: workspaceDir, env: gitEnv, timeoutMs: revBudgetMs }) : { status: 1, stdout: '' };
         out.baseAdvanced = n;
         // Frame this as "remote is N ahead of local HEAD", NOT "advanced since
         // clone": for a `branch.create` branch the local ref is reset from the
@@ -8238,7 +8244,7 @@ async function workAgent(req, flags) {
               logger.info(`[${jobType}] AgentInstance producer unavailable for external agent job (${aiCorr}) — activation not attempted or rejected: the host SDK lacks createAgentInstance/updateAgentInstance, the ACP classifier is unavailable, createAgentInstance returned no key, or the SDK rejected the create; continuing without a durable transcript (job completion unaffected).`);
             }
           } catch (err) {
-            logger.warn(`[${jobType}] AgentInstance producer activate() threw (${aiCorr}) — ${err?.message || err}; continuing without a durable transcript (job completion unaffected).`);
+            logger.warn(`[${jobType}] AgentInstance producer activate() threw (${aiCorr}) — ${oneLineLog(err?.message || err)}; continuing without a durable transcript (job completion unaffected).`);
           }
         } else {
           logger.debug?.(`[${jobType}] AgentInstance producer skipped (${aiCorr}) — ${agentInstanceOff ? 'NANO_AGENT_INSTANCE=off' : 'not an external agent job (no lease token / elementInstanceKey)'}.`);
@@ -8502,7 +8508,7 @@ async function workAgent(req, flags) {
           // job end (a failed run leaves it non-terminal so a retry/reactivation
           // continues the same instance). Best-effort — never disturbs job settlement.
           if (agentInstanceProducer) {
-            try { await agentInstanceProducer.complete(result.ok); } catch (err) { logger.warn(`[${jobType}] AgentInstance producer complete() threw (${aiCorr}) — ${err?.message || err}; job settlement unaffected.`); }
+            try { await agentInstanceProducer.complete(result.ok); } catch (err) { logger.warn(`[${jobType}] AgentInstance producer complete() threw (${aiCorr}) — ${oneLineLog(err?.message || err)}; job settlement unaffected.`); }
           }
 
           // Finalize git only when the harness succeeded — never push a
@@ -8528,7 +8534,7 @@ async function workAgent(req, flags) {
               // 'normal'), and surface the redacted cause with correlation keys —
               // this catch would otherwise be the only silent git-failure path.
               gitFinalizeFailed = true;
-              logger.error(`[${jobType}] job ${job.jobKey} git finalize threw (${aiCorr}) — ${gitResult.error}`);
+              logger.error(`[${jobType}] job ${job.jobKey} git finalize threw (${aiCorr}) — ${oneLineLog(gitResult.error)}`);
             }
           } else if (provisioned) {
             gitResult = { remote: provisioned.remote, branch: provisioned.workingBranch, baseSha: provisioned.startSha || null, commits: [], pushed: false };

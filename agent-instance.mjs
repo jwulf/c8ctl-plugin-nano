@@ -39,6 +39,15 @@ const isPlainObject = (v) => v != null && typeof v === 'object' && !Array.isArra
 const DEFAULT_CREATE_RETRY_BASE_MS = 1000;
 const DEFAULT_CREATE_RETRY_MAX_MS = 30000;
 
+// Bound on the pre-mint replay buffer (issue #230). Until the create succeeds there
+// is no agentInstanceKey to append against, so ACP updates that arrive while a create
+// is still being retried are buffered and replayed once the instance mints — that is
+// what keeps a transient create failure from silently losing the agent's actual work.
+// The buffer is capped so a create that never succeeds cannot grow it without bound;
+// once full, further updates are dropped (with a one-time warning) rather than
+// evicting the earliest turns, so the replayed transcript stays a contiguous prefix.
+const DEFAULT_PRE_MINT_BUFFER_MAX = 1000;
+
 /**
  * Pull the diagnosable facts out of an SDK/transport rejection so a create/append
  * failure is LOUD and root-causable (issue #230 ask 1 / #229): the HTTP status and
@@ -217,6 +226,7 @@ export function createAgentInstanceProducer(opts = {}) {
     sessionAcp = defaultSessionAcp,
     createRetryBaseMs = DEFAULT_CREATE_RETRY_BASE_MS,
     createRetryMaxMs = DEFAULT_CREATE_RETRY_MAX_MS,
+    preMintBufferMax = DEFAULT_PRE_MINT_BUFFER_MAX,
   } = opts;
 
   const classify = typeof sessionAcp?.classifyUpdate === 'function' ? sessionAcp.classifyUpdate : null;
@@ -269,6 +279,12 @@ export function createAgentInstanceProducer(opts = {}) {
   // Elevate the FIRST per-turn append failure to `warn` (repeats stay `debug`) so a
   // 400/404 append storm is visible without flooding the log (issue #230 / #229).
   let appendFailureLogged = false;
+  // Pre-mint replay buffer (issue #230): ACP updates that arrive after an activation
+  // attempt but before the instance has minted are held here (bounded) and replayed
+  // in arrival order once `agentInstanceKey` becomes available, so a create that
+  // succeeds on a retry does not lose the turns emitted while it was still failing.
+  const preMintBuffer = [];
+  let preMintOverflowLogged = false;
 
   const iso = () => new Date(now()).toISOString();
 
@@ -435,8 +451,9 @@ export function createAgentInstanceProducer(opts = {}) {
       loopIteration = 1;
       logger?.info?.(
         `AgentInstance ${agentInstanceKey} minted for element instance ${elementInstanceKey} ` +
-          `(job ${jobKey}, attempt ${createAttempts}).`,
+          `(job ${jobKey}, attempt ${createAttempts}) ${correlation()}.`,
       );
+      replayPreMintBuffer();
       return true;
     } catch (err) {
       const d = describeSdkError(err);
@@ -465,6 +482,82 @@ export function createAgentInstanceProducer(opts = {}) {
       });
   };
 
+  // Classify one raw ACP `session/update` and append the resulting turn(s). Assumes
+  // the instance is already minted (an append needs the agentInstanceKey). Malformed
+  // or ignored updates are dropped. Never throws. Shared by the hot path (`ingest`)
+  // and the pre-mint replay so both translate a turn identically.
+  const ingestClassified = (rawUpdate) => {
+    let classified;
+    try {
+      classified = classify(rawUpdate);
+    } catch {
+      return;
+    }
+    if (!classified || typeof classified !== 'object') return;
+    try {
+      switch (classified.kind) {
+        case 'message': {
+          const role = historyRole(classified.role);
+          if (
+            pendingMessage &&
+            (pendingMessage.messageId !== classified.messageId || pendingMessage.role !== role)
+          ) {
+            flushMessage();
+          }
+          if (!pendingMessage) {
+            pendingMessage = {
+              role,
+              messageId: classified.messageId ?? null,
+              texts: [],
+              metrics: undefined,
+              loopIteration,
+              producedAt: iso(),
+            };
+          }
+          if (isNonBlank(classified.text)) pendingMessage.texts.push(String(classified.text));
+          const m = extractMetrics(rawUpdate);
+          if (m) pendingMessage.metrics = { ...(pendingMessage.metrics || {}), ...m };
+          break;
+        }
+        case 'tool-call':
+          onToolCall(classified);
+          break;
+        case 'tool-result':
+          onToolResult(classified);
+          break;
+        default:
+          break;
+      }
+    } catch (err) {
+      logger?.debug?.(`AgentInstance producer: ingest failed — ${err?.message || err}`);
+    }
+  };
+
+  // Hold a pre-mint ACP update for later replay, bounded so a create that never
+  // succeeds cannot grow the buffer without bound. Once full, drop the newest update
+  // (with a one-time warning) so the buffered prefix stays contiguous and ordered.
+  const bufferPreMint = (rawUpdate) => {
+    if (preMintBuffer.length >= preMintBufferMax) {
+      if (!preMintOverflowLogged) {
+        preMintOverflowLogged = true;
+        logger?.warn?.(
+          `AgentInstance producer: pre-mint replay buffer full (${preMintBufferMax}); ` +
+            `dropping further updates until the create succeeds ${correlation()}.`,
+        );
+      }
+      return;
+    }
+    preMintBuffer.push(rawUpdate);
+  };
+
+  // Replay every buffered pre-mint update against the freshly minted instance, in
+  // arrival order, then clear the buffer. Called from doCreate on a successful mint.
+  const replayPreMintBuffer = () => {
+    if (preMintBuffer.length === 0) return;
+    const buffered = preMintBuffer.splice(0, preMintBuffer.length);
+    for (const raw of buffered) ingestClassified(raw);
+  };
+
   return {
     /** True once the AgentInstance has been minted. */
     get active() {
@@ -485,14 +578,14 @@ export function createAgentInstanceProducer(opts = {}) {
      */
     async activate() {
       if (disabled || agentInstanceKey) return this.active;
-      if (!creating) {
-        creating = doCreate()
-          .catch(() => false)
-          .finally(() => {
-            creating = null;
-          });
-      }
-      await creating;
+      // Route through maybeStartCreate so a repeated activation (a reactivation loop)
+      // respects the SAME exponential backoff the hot path does, rather than firing a
+      // fresh doCreate on every call and hammering the engine (issue #230). The first
+      // activation (createAttempts === 0) always attempts immediately; a reactivation
+      // still inside the backoff window is throttled and simply returns the current
+      // (not-yet-active) state without a new attempt.
+      maybeStartCreate();
+      if (creating) await creating;
       return this.active;
     },
 
@@ -504,57 +597,19 @@ export function createAgentInstanceProducer(opts = {}) {
     ingest(rawUpdate) {
       if (disabled) return;
       // Not minted yet? A create may have failed at second 0 — re-attempt it on the
-      // hot path (throttled) so the transcript resumes as soon as the create takes.
-      // This update itself is dropped (no key to append against), but retrying here
-      // is what keeps a transient failure from forfeiting the rest of the run.
+      // hot path (throttled) so the transcript resumes as soon as the create takes,
+      // and BUFFER this update so it is replayed against the instance once the create
+      // succeeds (issue #230 — a pre-mint update must not be silently lost). We only
+      // do this AFTER an activation attempt (createAttempts > 0): an ingest before
+      // activate() neither mints nor buffers, preserving the lifecycle contract.
       if (!agentInstanceKey) {
-        maybeStartCreate();
-        return;
-      }
-      let classified;
-      try {
-        classified = classify(rawUpdate);
-      } catch {
-        return;
-      }
-      if (!classified || typeof classified !== 'object') return;
-      try {
-        switch (classified.kind) {
-          case 'message': {
-            const role = historyRole(classified.role);
-            if (
-              pendingMessage &&
-              (pendingMessage.messageId !== classified.messageId || pendingMessage.role !== role)
-            ) {
-              flushMessage();
-            }
-            if (!pendingMessage) {
-              pendingMessage = {
-                role,
-                messageId: classified.messageId ?? null,
-                texts: [],
-                metrics: undefined,
-                loopIteration,
-                producedAt: iso(),
-              };
-            }
-            if (isNonBlank(classified.text)) pendingMessage.texts.push(String(classified.text));
-            const m = extractMetrics(rawUpdate);
-            if (m) pendingMessage.metrics = { ...(pendingMessage.metrics || {}), ...m };
-            break;
-          }
-          case 'tool-call':
-            onToolCall(classified);
-            break;
-          case 'tool-result':
-            onToolResult(classified);
-            break;
-          default:
-            break;
+        if (createAttempts > 0) {
+          bufferPreMint(rawUpdate);
+          maybeStartCreate();
         }
-      } catch (err) {
-        logger?.debug?.(`AgentInstance producer: ingest failed — ${err?.message || err}`);
+        return;
       }
+      ingestClassified(rawUpdate);
     },
 
     /** Drain any queued appends without transitioning status. */
@@ -575,14 +630,22 @@ export function createAgentInstanceProducer(opts = {}) {
       // final, un-throttled attempt so at least the CONFIGURATION turn + terminal
       // status survive when the create finally becomes possible (issue #230).
       if (!disabled && !agentInstanceKey) {
-        if (!creating) {
+        // A throttled, ingest-triggered attempt may already be in flight — await it
+        // first so we don't start a duplicate. If it (or the lack of one) leaves us
+        // un-minted, make one explicit, un-throttled final attempt regardless of the
+        // backoff window, so a transient failure right before completion doesn't lose
+        // the record.
+        if (creating) {
+          try { await creating; } catch { /* best effort */ }
+        }
+        if (!agentInstanceKey) {
           creating = doCreate()
             .catch(() => false)
             .finally(() => {
               creating = null;
             });
+          try { await creating; } catch { /* best effort */ }
         }
-        try { await creating; } catch { /* best effort */ }
       }
       if (disabled || !agentInstanceKey) {
         // Still drain any queued appends so a caller awaiting completion settles.
@@ -595,6 +658,11 @@ export function createAgentInstanceProducer(opts = {}) {
         return;
       }
       flushMessage();
+      // Track whether the terminal COMPLETED update was actually accepted. The queue
+      // swallows SDK failures (best-effort append), so `await queue` alone cannot tell
+      // a genuine terminal transition from one the engine rejected — record it here so
+      // the completion diagnostic never claims `status→COMPLETED` for a failed update.
+      let completedOk = false;
       if (ok) {
         enqueue(async () => {
           await camunda[SDK_UPDATE]({
@@ -604,12 +672,26 @@ export function createAgentInstanceProducer(opts = {}) {
             jobLease: leaseToken,
             status: 'COMPLETED',
           });
+          completedOk = true;
         });
       }
       try { await queue; } catch { /* best effort */ }
+      const terminalOk = ok && completedOk;
+      if (ok && !completedOk) {
+        logger?.warn?.(
+          `AgentInstance ${agentInstanceKey}: terminal status update to COMPLETED failed — ` +
+            `instance left non-terminal for retry ${correlation()}.`,
+        );
+      }
       logger?.info?.(
         `AgentInstance ${agentInstanceKey}: ${appendedTurns} turn(s) appended` +
-          `${ok ? ', status→COMPLETED' : ' (left non-terminal for retry)'} ${correlation()}.`,
+          `${
+            terminalOk
+              ? ', status→COMPLETED'
+              : ok
+                ? ' (COMPLETED update failed — left non-terminal for retry)'
+                : ' (left non-terminal for retry)'
+          } ${correlation()}.`,
       );
     },
   };

@@ -388,6 +388,9 @@ test('ingest before activate mints nothing and appends nothing', async () => {
   // No activate() call.
   p.ingest({ sessionUpdate: 'agent_message_chunk', content: { type: 'text', text: 'x' } });
   await p.drain();
+  // No create (no mint) AND no append: the hot-path retry only arms after an
+  // activation attempt, so an ingest before activate() is a no-op (issue #230).
+  assert.equal(client.calls.create.length, 0);
   assert.equal(client.calls.update.length, 0);
 });
 
@@ -441,20 +444,21 @@ test('a create that fails at second 0 then succeeds mid-run resumes the durable 
   assert.equal(p.active, false);
   assert.equal(client.calls.create.length, 1);
 
-  // An ingest before the backoff window elapses does NOT re-attempt.
-  p.ingest({ sessionUpdate: 'agent_message_chunk', content: { type: 'text', text: 'early' } });
+  // An ingest before the backoff window elapses does NOT re-attempt — but the update
+  // is now buffered for replay rather than dropped (issue #230).
+  p.ingest({ sessionUpdate: 'agent_message_chunk', messageId: 'm-early', content: { type: 'text', text: 'early' } });
   await p.drain();
   assert.equal(client.calls.create.length, 1);
 
   // Advance past the backoff window; the next ingest re-attempts the create, which
   // now succeeds — the instance is minted and subsequent turns append.
   t += 2000;
-  p.ingest({ sessionUpdate: 'agent_message_chunk', content: { type: 'text', text: 'later' } });
+  p.ingest({ sessionUpdate: 'agent_message_chunk', messageId: 'm-later', content: { type: 'text', text: 'later' } });
   await p.drain();
   assert.equal(client.calls.create.length, 2);
   assert.equal(p.active, true);
 
-  p.ingest({ sessionUpdate: 'agent_message_chunk', content: { type: 'text', text: 'captured' } });
+  p.ingest({ sessionUpdate: 'agent_message_chunk', messageId: 'm-captured', content: { type: 'text', text: 'captured' } });
   await p.complete(true);
 
   const texts = client.calls.update
@@ -462,6 +466,8 @@ test('a create that fails at second 0 then succeeds mid-run resumes the durable 
     .map((u) => u.history[0].content?.[0]?.text)
     .filter(Boolean);
   assert.ok(texts.includes('captured'), 'post-recovery turn is durably appended');
+  // The turns emitted while the create was still failing are replayed, not lost.
+  assert.ok(texts.includes('early') && texts.includes('later'), 'pre-mint turns are replayed');
   assert.equal(client.calls.update.filter((u) => u.status === 'COMPLETED').length, 1);
 });
 
@@ -477,6 +483,141 @@ test('complete() makes a final un-throttled create attempt when the instance nev
   assert.equal(client.calls.create.length, 2);
   assert.equal(p.active, true);
   assert.equal(client.calls.update.filter((u) => u.status === 'COMPLETED').length, 1);
+});
+
+test('pre-mint ACP updates are buffered and replayed once a retried create succeeds (issue #230)', async () => {
+  // The create fails on activate; turns then stream in while it is still failing.
+  // They must be buffered and durably replayed against the instance once a later
+  // retry mints it — a transient create failure must not lose the agent's work.
+  const client = fakeClient({ failCreateTimes: 1 });
+  let t = Date.parse('2026-02-03T04:05:06.000Z');
+  const p = createAgentInstanceProducer({
+    camunda: client,
+    job: EXTERNAL_JOB,
+    profile: PROFILE,
+    envelope: ENVELOPE,
+    logger: nullLogger,
+    now: () => t,
+    createRetryBaseMs: 1000,
+    createRetryMaxMs: 30000,
+  });
+
+  await p.activate();
+  assert.equal(p.active, false);
+
+  // These arrive before the instance mints — throttled within the backoff window, so
+  // no re-attempt yet, but they must be retained for replay.
+  p.ingest({ sessionUpdate: 'agent_message_chunk', messageId: 'm1', content: { type: 'text', text: 'pre-one' } });
+  p.ingest({ sessionUpdate: 'agent_message_chunk', messageId: 'm2', content: { type: 'text', text: 'pre-two' } });
+  await p.drain();
+  assert.equal(client.calls.create.length, 1, 'no re-attempt inside the backoff window');
+  assert.equal(client.calls.update.length, 0, 'nothing appended before the mint');
+
+  // Advance past the backoff window; the next ingest re-attempts the create, which
+  // now succeeds and replays the buffered turns.
+  t += 2000;
+  p.ingest({ sessionUpdate: 'agent_message_chunk', messageId: 'm3', content: { type: 'text', text: 'pre-three' } });
+  await p.complete(true);
+
+  const texts = client.calls.update
+    .filter((u) => Array.isArray(u.history))
+    .map((u) => u.history[0].content?.[0]?.text)
+    .filter(Boolean);
+  assert.deepEqual(
+    texts,
+    ['pre-one', 'pre-two', 'pre-three'],
+    'every pre-mint turn is replayed in arrival order',
+  );
+  assert.equal(client.calls.update.filter((u) => u.status === 'COMPLETED').length, 1);
+});
+
+test('the pre-mint replay buffer is bounded — overflow drops the newest, keeping a contiguous prefix', async () => {
+  // A create that keeps failing must not let the buffer grow without bound.
+  const client = fakeClient({ failCreate: true });
+  const p = makeProducer(client, { preMintBufferMax: 2 });
+  await p.activate();
+  assert.equal(p.active, false);
+  for (const text of ['a', 'b', 'c', 'd']) {
+    p.ingest({ sessionUpdate: 'agent_message_chunk', messageId: `m-${text}`, content: { type: 'text', text } });
+  }
+  await p.drain();
+  // Now let the create succeed and complete; only the first two buffered turns survive.
+  const client2 = client;
+  // Swap create to succeed for the final attempt.
+  client2.createAgentInstance = async (req) => {
+    client2.calls.create.push(req);
+    return { agentInstanceKey: 'AGENT-1' };
+  };
+  await p.complete(true);
+  const texts = client2.calls.update
+    .filter((u) => Array.isArray(u.history))
+    .map((u) => u.history[0].content?.[0]?.text)
+    .filter(Boolean);
+  assert.deepEqual(texts, ['a', 'b'], 'buffer capped at 2; newest updates dropped');
+});
+
+test('a repeated activate() respects the create backoff (no engine hammering) (issue #230)', async () => {
+  // Every create fails; calling activate() repeatedly inside the backoff window must
+  // NOT fire a fresh create each time — the pacing applies to activate() too.
+  const client = fakeClient({ failCreate: true });
+  let t = Date.parse('2026-02-03T04:05:06.000Z');
+  const p = createAgentInstanceProducer({
+    camunda: client,
+    job: EXTERNAL_JOB,
+    profile: PROFILE,
+    envelope: ENVELOPE,
+    logger: nullLogger,
+    now: () => t,
+    createRetryBaseMs: 1000,
+    createRetryMaxMs: 30000,
+  });
+  await p.activate();
+  assert.equal(client.calls.create.length, 1);
+  await p.activate(); // inside the backoff window → throttled, no new attempt
+  await p.activate();
+  assert.equal(client.calls.create.length, 1, 'reactivation inside backoff makes no new create');
+  t += 2000; // past the window
+  await p.activate();
+  assert.equal(client.calls.create.length, 2, 'a reactivation past the window re-attempts');
+});
+
+test('complete() does not falsely report status→COMPLETED when the terminal update fails', async () => {
+  // The COMPLETED update is rejected; the completion diagnostic must warn and NOT
+  // claim a terminal transition (issue #230).
+  const lines = { info: [], warn: [] };
+  const logger = {
+    info: (m) => lines.info.push(m),
+    warn: (m) => lines.warn.push(m),
+    debug() {},
+  };
+  let failUpdates = true;
+  const client = {
+    calls: { create: [], update: [] },
+    createAgentInstance: async (req) => {
+      client.calls.create.push(req);
+      return { agentInstanceKey: 'AGENT-1' };
+    },
+    updateAgentInstance: async (req) => {
+      client.calls.update.push(req);
+      if (failUpdates) throw new Error('HTTP 409: non-terminal');
+      return {};
+    },
+  };
+  const p = makeProducer(client, { logger });
+  await p.activate();
+  await p.complete(true);
+  assert.ok(
+    lines.warn.some((m) => /terminal status update to COMPLETED failed/.test(m)),
+    'a rejected terminal update is warned',
+  );
+  assert.ok(
+    !lines.info.some((m) => /status→COMPLETED/.test(m)),
+    'the info line does not falsely claim status→COMPLETED',
+  );
+  assert.ok(
+    lines.info.some((m) => /left non-terminal for retry/.test(m)),
+    'the info line reports the non-terminal outcome',
+  );
 });
 
 // ---------------------------------------------------------------------------

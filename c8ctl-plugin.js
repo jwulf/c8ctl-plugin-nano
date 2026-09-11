@@ -4136,7 +4136,7 @@ function githubCloneToken({ provider, authRef, secretResolver, ghAuthToken = ghA
 // Clone repo into <runDir>/workspace and check out / create the working branch.
 // Returns { workspaceDir, gitEnv, startSha, workingBranch, remote }. Throws a
 // ProvisionError (token-redacted) on any git failure so the caller can shed.
-function provisionRepo({ envelope, token, runDir, timeoutMs = 120_000 }) {
+function provisionRepo({ envelope, token, runDir, runId, timeoutMs = 120_000 }) {
   const repo = envelope.repository;
   if (!repo || !repo.url) throw new ProvisionError('repository.url is required to provision a workspace');
   const workspaceDir = join(runDir, 'workspace');
@@ -4302,30 +4302,46 @@ function provisionRepo({ envelope, token, runDir, timeoutMs = 120_000 }) {
   const wantPush = coerceBool(envelope.branch?.push, true);
   let workingBranch = null;
   let fallbackBranch = false;
-  if (envelope.branch?.create) {
-    const cb = runGit(['checkout', '-B', envelope.branch.create], { cwd: workspaceDir, env: gitEnv, timeoutMs });
-    if (cb.status !== 0) throw new ProvisionError(describeGitFailure(`git checkout -B ${envelope.branch.create}`, cb, { token, timeoutMs }));
-    workingBranch = envelope.branch.create;
+  // Cut a fresh, uniquely-named work branch off the base so commits are NEVER made
+  // directly on the base branch (issue #231). Being new on the remote it always
+  // fast-forwards, and its name rides back in the result envelope (env.branch) so
+  // the process model can still find the work. Prefer the run's UUID (`runId`)
+  // over `basename(runDir)` for the unique suffix: the latter is only unique within
+  // this worker incarnation's namespace, so two workers could mint the same
+  // `run-XXXXXX` basename and collide on a repo-wide remote ref (non-ff strand);
+  // the UUID is globally unique. (`basename(runDir)` remains a fallback for the
+  // direct-call unit tests that do not thread a runId.)
+  const cutFallbackBranch = (checkedOut) => {
+    const uniq = runId || basename(runDir);
+    const fb = `nano/agent-work/${sanitizeBranchSegment(baseBranchName)}-${sanitizeBranchSegment(uniq)}`;
+    const cb = runGit(['checkout', '-B', fb], { cwd: workspaceDir, env: gitEnv, timeoutMs });
+    if (cb.status !== 0) throw new ProvisionError(describeGitFailure(`git checkout -B ${fb}`, cb, { token, timeoutMs }));
+    workingBranch = fb;
+    fallbackBranch = true;
+    // Report the ACTUAL checked-out ref and the configured base separately: they
+    // can differ (e.g. repository.ref is a feature branch while branch.base is
+    // main), so do not assert the clone "landed on the base branch".
+    log.warn?.(`provisionRepo: work would otherwise be committed on branch '${checkedOut}' (configured base '${baseBranchName || '(unknown)'}') — cut fallback work branch '${fb}' so commits are never made directly on the base branch (the app should supply branch.create=feat/<task.id>)`);
+  };
+  const explicitCreate = envelope.branch?.create ? String(envelope.branch.create) : '';
+  // Defense against silent work-loss (issue #231): committing on the base branch
+  // with intent to push is ALWAYS wrong for the PR flow — a push to the shared
+  // base races it and a non-ff reject strands the commits in this throwaway
+  // workspace with no PR (re-running the agent is non-idempotent, so there is no
+  // recovery). An explicit `branch.create` that NAMES the base is that same
+  // misconfiguration, so treat it like an omitted create and cut a fallback rather
+  // than honouring the checkout onto the base.
+  if (explicitCreate && !(wantPush && explicitCreate === baseBranchName)) {
+    const cb = runGit(['checkout', '-B', explicitCreate], { cwd: workspaceDir, env: gitEnv, timeoutMs });
+    if (cb.status !== 0) throw new ProvisionError(describeGitFailure(`git checkout -B ${explicitCreate}`, cb, { token, timeoutMs }));
+    workingBranch = explicitCreate;
     log.debug?.(`provisionRepo: branch.create=${workingBranch} → cut work branch off base '${baseBranchName || '(unknown)'}'`);
   } else {
     const head = runGit(['rev-parse', '--abbrev-ref', 'HEAD'], { cwd: workspaceDir, env: gitEnv });
     const name = (head.stdout || '').trim();
     const checkedOut = (name && name !== 'HEAD') ? name : null; // null ⇒ detached HEAD
     if (checkedOut && wantPush) {
-      // Defense against silent work-loss (issue #231): with no branch.create the
-      // clone left us on the BASE branch. Committing there with intent to push is
-      // ALWAYS wrong for the PR flow — a push to the shared base races it and a
-      // non-ff reject strands the commits in this throwaway workspace with no PR
-      // (re-running the agent is non-idempotent, so there is no recovery). Cut a
-      // fresh, uniquely-named work branch off the base instead: being new on the
-      // remote it always fast-forwards, and its name is reported back in the
-      // result envelope (env.branch) so the process model can still find the work.
-      const fb = `nano/agent-work/${sanitizeBranchSegment(baseBranchName)}-${sanitizeBranchSegment(basename(runDir))}`;
-      const cb = runGit(['checkout', '-B', fb], { cwd: workspaceDir, env: gitEnv, timeoutMs });
-      if (cb.status !== 0) throw new ProvisionError(describeGitFailure(`git checkout -B ${fb}`, cb, { token, timeoutMs }));
-      workingBranch = fb;
-      fallbackBranch = true;
-      log.warn?.(`provisionRepo: no branch.create supplied and the clone landed on the base branch '${checkedOut}' — cut fallback work branch '${fb}' so commits are never made directly on the base branch (the app should supply branch.create=feat/<task.id>)`);
+      cutFallbackBranch(checkedOut);
     } else {
       // Detached HEAD (tag/sha ⇒ null, no branch to push) or a read-only clone
       // (push disabled) — safe to stay on the checked-out ref; nothing is pushed.
@@ -4455,7 +4471,7 @@ function postAgentAttribution({ workspaceDir, token, number, agentName = AGENT_A
 // branch.push), and reconcile the agent-opened PR (when task.allowPr). A push
 // failure is reported (pushError) rather than thrown — the process model decides
 // what to do next, and re-running the agent would be non-idempotent.
-function finalizeGit({ workspaceDir, gitEnv, startSha, workingBranch, envelope, token }) {
+function finalizeGit({ workspaceDir, gitEnv, startSha, workingBranch, baseBranch: effectiveBase, envelope, token }) {
   const out = { branch: workingBranch, baseSha: startSha || null, headSha: null, commits: [], pushed: false, remote: null, pr: null };
   const rem = runGit(['remote', 'get-url', 'origin'], { cwd: workspaceDir, env: gitEnv });
   if (rem.status === 0) out.remote = redactToken(rem.stdout.trim(), token);
@@ -4482,7 +4498,10 @@ function finalizeGit({ workspaceDir, gitEnv, startSha, workingBranch, envelope, 
     // advanced on the remote since we cloned, a push can be rejected non-ff. Fetch
     // the base and report how far it moved so the non-ff cause is visible in the
     // log BEFORE the push, not inferred after the fact. Best-effort — never fatal.
-    const baseBranch = String(envelope.branch?.base || '');
+    // Prefer the effective base resolved during provisioning (which falls back to
+    // repository.ref when branch.base is empty) so this diagnostic still fires in
+    // that valid shape; only fall back to the raw envelope field if it was absent.
+    const baseBranch = String(effectiveBase || envelope.branch?.base || '');
     if (baseBranch) {
       const bf = runGit([...credArgs(), 'fetch', '--no-tags', 'origin', baseBranch], { cwd: workspaceDir, env: gitEnv, timeoutMs: pushTimeoutMs });
       if (bf.status === 0) {
@@ -6276,6 +6295,10 @@ function buildResultEnvelope(result, { sandbox, image, git, result: agentResult,
     env.commits = git.commits ?? [];
     env.pushed = !!git.pushed;
     if (git.pushError) env.pushError = git.pushError;
+    // Forward the explicit failure flag AND the stranded SHAs together: consumers
+    // of io.nanobpm.agentResult key off `pushFailed` for the hard "push rejected"
+    // signal, and `strandedCommits` carries the SHAs to recover (see README).
+    if (git.pushFailed) env.pushFailed = true;
     if (git.strandedCommits && git.strandedCommits.length) env.strandedCommits = git.strandedCommits;
     if (git.pr) env.pr = git.pr;
     if (git.error) env.gitError = git.error;
@@ -8212,7 +8235,7 @@ async function workAgent(req, flags) {
             mkdirSync(workerNsDir, { recursive: true });
             runDir = mkdtempSync(join(workerNsDir, 'run-'));
             liveRunDirs.add(runDir);
-            provisioned = provisionRepo({ envelope, token: repoToken, runDir, timeoutMs: cloneTimeoutMs });
+            provisioned = provisionRepo({ envelope, token: repoToken, runDir, runId, timeoutMs: cloneTimeoutMs });
             if (provisioned.baseFetchError) {
               logger.warn(`[${jobType}] job ${job.jobKey} base fetch failed — ${provisioned.baseFetchError}; base...head diffs may be unavailable`);
             }
@@ -8416,6 +8439,7 @@ async function workAgent(req, flags) {
                 gitEnv: provisioned.gitEnv,
                 startSha: provisioned.startSha,
                 workingBranch: provisioned.workingBranch,
+                baseBranch: provisioned.baseBranch,
                 envelope,
                 token: repoToken,
               });
@@ -8431,7 +8455,15 @@ async function workAgent(req, flags) {
           // owning lifecycle's finally is the authoritative "job finished" signal,
           // so this namespace no longer holds a surviving harness for this job.
           removeJobMarker(workerNsDir, job.jobKey);
-          if (runDir && !keepRuns) { try { rmSync(runDir, { recursive: true, force: true }); } catch { /* best effort */ } }
+          // Preserve the workspace when a push FAILED even under the default
+          // --keep-runs=false (issue #231): a rejected push strands the new commits
+          // in this throwaway clone's object database, so `strandedCommits` is only a
+          // recovery HANDLE if the objects still exist. Keep the run dir (still
+          // age-gated by the reaper, so it is a recovery window, not a leak) and log
+          // its path so an operator can recover the SHAs the error line named.
+          const preserveForRecovery = !!gitResult?.pushFailed;
+          if (runDir && !keepRuns && !preserveForRecovery) { try { rmSync(runDir, { recursive: true, force: true }); } catch { /* best effort */ } }
+          else if (runDir && preserveForRecovery) logger.error(`[${jobType}] job ${job.jobKey}: preserving workspace '${runDir}' (push failed) so the stranded commit(s) remain recoverable — copy them out before the reaper ages it away`);
           if (runDir) liveRunDirs.delete(runDir);
           // Emit the relay session's `phase:close` lifecycle event and drain its
           // outbound buffer before the job settles (so the live-terminal tail is

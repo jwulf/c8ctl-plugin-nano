@@ -1358,12 +1358,12 @@ test('finalizeGit pushes the fallback branch cleanly even when the base advanced
   }
 });
 
-test('finalizeGit surfaces stranded commit SHAs on a non-ff push rejection (issue #231 defense #2)', { skip: !gitOk }, () => {
+test('provisionRepo cuts a fallback when branch.create names the base branch (never commits on base, issue #231)', { skip: !gitOk }, () => {
   const { root, origin } = makeOriginRepo();
   const runDir = mkdtempSync(join(root, 'run-'));
   try {
-    // An explicit create=main puts us on the base branch — the exact misconfig that
-    // strands work when the remote base advances. finalizeGit must not swallow it.
+    // An explicit create that equals the base is the same work-loss misconfig as an
+    // omitted create: honouring it would commit on base and non-ff-lose the work.
     const envelope = {
       schemaVersion: 1,
       repository: { provider: 'github', url: origin, submodules: false },
@@ -1372,16 +1372,81 @@ test('finalizeGit surfaces stranded commit SHAs on a non-ff push rejection (issu
       task: { allowPr: false },
     };
     const prov = provisionRepo({ envelope, token: null, runDir });
-    assert.equal(prov.workingBranch, 'main');
+    assert.equal(prov.fallbackBranch, true, 'create===base is treated like an omitted create');
+    assert.match(prov.workingBranch, /^nano\/agent-work\/main-/, 'a non-base fallback branch was cut');
+    assert.notEqual(prov.workingBranch, 'main', 'never leaves us on the base branch when pushing');
+    // HEAD is on the fallback branch, not on base.
+    assert.equal(g(['rev-parse', '--abbrev-ref', 'HEAD'], prov.workspaceDir), prov.workingBranch);
+  } finally {
+    rmSync(root, { recursive: true, force: true });
+  }
+});
 
-    // Remote base advances, then the harness commits on our (now-stale) local main.
+test('provisionRepo honours branch.create equal to base when push is disabled (read-only, no fallback)', { skip: !gitOk }, () => {
+  const { root, origin } = makeOriginRepo();
+  const runDir = mkdtempSync(join(root, 'run-'));
+  try {
+    const envelope = {
+      schemaVersion: 1,
+      repository: { provider: 'github', url: origin, submodules: false },
+      branch: { base: 'main', create: 'main', push: false },
+      setup: { commands: [], env: {}, secretRefs: [] },
+      task: { allowPr: false },
+    };
+    const prov = provisionRepo({ envelope, token: null, runDir });
+    assert.equal(prov.fallbackBranch, false, 'nothing is pushed → no strand risk → honour the explicit create');
+    assert.equal(prov.workingBranch, 'main');
+  } finally {
+    rmSync(root, { recursive: true, force: true });
+  }
+});
+
+test('provisionRepo mints the fallback branch from the run UUID, not the run-dir basename (cross-worker collision safety, issue #231)', { skip: !gitOk }, () => {
+  const { root, origin } = makeOriginRepo();
+  const runDir = mkdtempSync(join(root, 'run-'));
+  try {
+    const envelope = {
+      schemaVersion: 1,
+      repository: { provider: 'github', url: origin, submodules: false },
+      branch: { base: 'main', create: '', push: true },
+      setup: { commands: [], env: {}, secretRefs: [] },
+      task: { allowPr: false },
+    };
+    const runId = '11111111-2222-3333-4444-555555555555';
+    const prov = provisionRepo({ envelope, token: null, runDir, runId });
+    assert.equal(prov.fallbackBranch, true);
+    assert.equal(prov.workingBranch, `nano/agent-work/main-${runId}`, 'the globally-unique run UUID suffixes the fallback ref');
+  } finally {
+    rmSync(root, { recursive: true, force: true });
+  }
+});
+
+test('finalizeGit surfaces stranded commit SHAs on a non-ff push rejection (issue #231 defense #2)', { skip: !gitOk }, () => {
+  const { root, origin } = makeOriginRepo();
+  const runDir = mkdtempSync(join(root, 'run-'));
+  try {
+    // provisionRepo now refuses to leave us on the base branch, so drive finalizeGit
+    // directly with workingBranch='main' to exercise its non-ff push handling: the
+    // exact misconfig that strands work when the remote base advances. finalizeGit
+    // must not swallow it.
+    const envelope = {
+      schemaVersion: 1,
+      repository: { provider: 'github', url: origin, submodules: false },
+      branch: { base: 'main', create: '', push: true },
+      setup: { commands: [], env: {}, secretRefs: [] },
+      task: { allowPr: false },
+    };
+    const prov = provisionRepo({ envelope, token: null, runDir });
+    // Land back on local main (still at the cloned base tip) to simulate work made
+    // directly on base, then let the remote base advance under us.
+    g(['checkout', '-B', 'main', 'origin/main'], prov.workspaceDir);
     advanceOrigin(root, origin, 'main');
     writeFileSync(join(prov.workspaceDir, 'work.txt'), 'work\n');
     g(['add', '-A'], prov.workspaceDir);
     g(['-c', 'user.name=nano', '-c', 'user.email=nano@example.com', 'commit', '-q', '-m', 'slice work'], prov.workspaceDir);
     const headSha = g(['rev-parse', 'HEAD'], prov.workspaceDir);
 
-    const out = finalizeGit({ ...prov, envelope, token: null });
+    const out = finalizeGit({ ...prov, workingBranch: 'main', envelope, token: null });
     assert.equal(out.pushed, false, 'the non-ff push is rejected');
     assert.ok(out.pushError, 'the push error is recorded');
     assert.equal(out.pushFailed, true, 'the failure is flagged, not soft');

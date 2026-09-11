@@ -728,7 +728,7 @@ only `latest`, so the key is the reproducibility handle).
 
 On completion the plugin writes an **output envelope** back under
 `io.nanobpm.agentResult` (`{schemaVersion, status, sandbox, image, output, truncated, stderrTruncated, exitCode, signal, error, promptResourceKey?}`). When a repository was
-provisioned (below) it also carries `{repository, branch, baseSha, headSha, commits[], pushed, pushError?, gitError?, pr?}`.
+provisioned (below) it also carries `{repository, branch, baseSha, headSha, commits[], pushed, pushError?, pushFailed?, strandedCommits?, gitError?, pr?}`. `pushFailed` is the explicit "push was rejected" flag (typically non-fast-forward) and `strandedCommits` lists the SHAs of the new commits left UNPUSHED in the throwaway workspace — together they are the recovery handle for a failed push, so consumers must not treat `pushed: false` alone as the only signal (the workspace is preserved on such a failure so those SHAs remain recoverable).
 
 **Git provisioning (host).** When `--sandbox none` (the default) and the envelope
 carries a `repository.url`, the plugin provisions a workspace on the host around

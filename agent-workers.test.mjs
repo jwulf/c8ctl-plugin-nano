@@ -1313,10 +1313,35 @@ test('provisionRepo cuts a pushable fallback for an UNBORN branch (empty repo, n
   }
 });
 
+test('provisionRepo preserves the UNBORN branch name for a read-only empty repo (push off) instead of reporting it detached (issue #231, suppressed 4406)', { skip: !gitOk }, () => {
+  const root = mkdtempSync(join(tmpdir(), 'nano-git-'));
+  const origin = join(root, 'origin.git');
+  g(['init', '-q', '--bare', origin], undefined);
+  const runDir = mkdtempSync(join(root, 'run-'));
+  try {
+    const envelope = {
+      schemaVersion: 1,
+      repository: { provider: 'github', url: origin, submodules: false },
+      branch: { base: '', create: '', push: false },
+      setup: { commands: [], env: {}, secretRefs: [] },
+      task: { allowPr: false },
+    };
+    const prov = provisionRepo({ envelope, token: null, runDir });
+    // A read-only empty clone lands on a symbolic UNBORN branch (e.g. 'main'), not a
+    // detached HEAD — preserve that name so AGENT_REPO_BRANCH is truthful and the
+    // clone follows the same branch-metadata path as any other read-only clone.
+    assert.equal(prov.detached, false, 'an unborn branch is not detached even when push is off');
+    assert.equal(prov.fallbackBranch, false, 'no fallback is cut when push is disabled');
+    assert.ok(prov.workingBranch, 'the unborn branch name is preserved');
+    assert.equal(prov.workingBranch, g(['symbolic-ref', '--short', 'HEAD'], prov.workspaceDir), 'workingBranch is the actual symbolic HEAD, not null/detached');
+  } finally {
+    rmSync(root, { recursive: true, force: true });
+  }
+});
+
 // Advance origin/<branch> by one commit from a throwaway clone, so a workspace
 // cloned earlier is now behind the remote (reproduces the non-ff push condition).
-function advanceOrigin(root, origin, branch) {
-  const bump = mkdtempSync(join(root, 'bump-'));
+function advanceOrigin(root, origin, branch) {  const bump = mkdtempSync(join(root, 'bump-'));
   g(['clone', '-q', origin, bump], undefined);
   g(['checkout', '-q', branch], bump);
   writeFileSync(join(bump, `bump-${Date.now()}.txt`), 'advance\n');
@@ -1653,6 +1678,84 @@ test('finalizeGit measures base advance against the CLONE-TIME base SHA even if 
     const out = finalizeGit({ ...prov, envelope, token: null });
     assert.equal(out.baseAdvanced, 1, 'the clone-time anchor still detects the base advance the harness would have masked');
     assert.equal(out.pushed, true, 'a fresh work branch still fast-forwards');
+  } finally {
+    rmSync(root, { recursive: true, force: true });
+  }
+});
+
+test('finalizeGit strands commits the harness made off the work branch even when HEAD is returned to it (issue #231, thread 4604)', { skip: !gitOk }, () => {
+  const { root, origin } = makeOriginRepo();
+  const runDir = mkdtempSync(join(root, 'run-'));
+  try {
+    const envelope = {
+      schemaVersion: 1,
+      repository: { provider: 'github', url: origin, submodules: false },
+      branch: { base: 'main', create: 'feat/work', push: true },
+      setup: { commands: [], env: {}, secretRefs: [] },
+      task: { allowPr: false },
+    };
+    const prov = provisionRepo({ envelope, token: null, runDir });
+    assert.equal(prov.workingBranch, 'feat/work');
+    const startSha = g(['rev-parse', 'HEAD'], prov.workspaceDir);
+    // The harness checks out the base, commits THERE, then RETURNS HEAD to the
+    // untouched work branch. `startSha..HEAD` is now empty (HEAD is back at
+    // startSha), so the old `out.commits.length > 0` gate never ran and the base
+    // commit was silently reaped with the workspace. finalizeGit must still detect
+    // the off-branch commit and preserve it.
+    g(['checkout', '-B', 'main', 'origin/main'], prov.workspaceDir);
+    writeFileSync(join(prov.workspaceDir, 'stray.txt'), 'stray\n');
+    g(['add', '-A'], prov.workspaceDir);
+    g(['-c', 'user.name=nano', '-c', 'user.email=nano@example.com', 'commit', '-q', '-m', 'stray work off the work branch'], prov.workspaceDir);
+    const strayedSha = g(['rev-parse', 'HEAD'], prov.workspaceDir);
+    g(['checkout', '-q', 'feat/work'], prov.workspaceDir);
+    assert.equal(g(['rev-parse', 'HEAD'], prov.workspaceDir), startSha, 'HEAD is back on the unmodified work branch (empty startSha..HEAD)');
+
+    const out = finalizeGit({ ...prov, envelope, token: null });
+    assert.equal(out.pushed, false, 'nothing is pushed while off-branch work is stranded');
+    assert.equal(out.pushFailed, true, 'the abandoned off-branch commit is a hard, preserved failure');
+    assert.deepEqual(out.strandedCommits, [strayedSha], 'the off-branch commit SHA is surfaced for recovery');
+    assert.equal(out.branchMismatch.expected, 'feat/work');
+    assert.equal(out.branchMismatch.actual, null, 'HEAD is back on the work branch, so there is no distinct current branch to report');
+  } finally {
+    rmSync(root, { recursive: true, force: true });
+  }
+});
+
+test('finalizeGit treats a non-ff push as landed when the remote work branch is a DESCENDANT of headSha (issue #231, suppressed 4689)', { skip: !gitOk }, () => {
+  const { root, origin } = makeOriginRepo();
+  const runDir = mkdtempSync(join(root, 'run-'));
+  try {
+    const envelope = {
+      schemaVersion: 1,
+      repository: { provider: 'github', url: origin, submodules: false },
+      branch: { base: 'main', create: 'feat/work', push: true },
+      setup: { commands: [], env: {}, secretRefs: [] },
+      task: { allowPr: false },
+    };
+    const prov = provisionRepo({ envelope, token: null, runDir });
+    writeFileSync(join(prov.workspaceDir, 'work.txt'), 'work\n');
+    g(['add', '-A'], prov.workspaceDir);
+    g(['-c', 'user.name=nano', '-c', 'user.email=nano@example.com', 'commit', '-q', '-m', 'our work'], prov.workspaceDir);
+    const headSha = g(['rev-parse', 'HEAD'], prov.workspaceDir);
+    // Publish our work, then let ANOTHER actor push a further commit on the SAME
+    // branch. At finalize our local feat/work is BEHIND origin/feat/work, so the
+    // push is rejected non-ff — but our commit already landed (it is an ancestor of
+    // the remote tip), so this must be treated as pushed, not a strand. This is the
+    // recovery-critical `landed` decision (thread 4694): a non-zero push whose work
+    // is already upstream must not be misreported as stranded.
+    g(['push', '-q', 'origin', 'feat/work'], prov.workspaceDir);
+    const other = join(root, 'other');
+    g(['clone', '-q', '--branch', 'feat/work', origin, other], undefined);
+    writeFileSync(join(other, 'more.txt'), 'more\n');
+    g(['add', '-A'], other);
+    g(['-c', 'user.name=other', '-c', 'user.email=other@example.com', 'commit', '-q', '-m', 'downstream commit'], other);
+    g(['push', '-q', 'origin', 'feat/work'], other);
+
+    const out = finalizeGit({ ...prov, envelope, token: null });
+    assert.equal(out.pushed, true, 'our commit is already upstream (ancestor of the descendant remote tip)');
+    assert.ok(!out.pushFailed, 'a landed-descendant push is not a strand');
+    assert.equal(out.strandedCommits, undefined, 'no stranded commits are reported');
+    assert.equal(out.headSha, headSha);
   } finally {
     rmSync(root, { recursive: true, force: true });
   }

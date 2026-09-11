@@ -4403,7 +4403,12 @@ function provisionRepo({ envelope, token, runDir, runId, timeoutMs = 120_000, co
   } else {
     // Detached HEAD (tag/sha ⇒ null, no branch to push) or a read-only clone
     // (push disabled) — safe to stay on the checked-out ref; nothing is pushed.
-    workingBranch = checkedOut;
+    // Prefer the UNBORN branch name for an empty-repo read-only clone (checkedOut
+    // null, push disabled): it is a real symbolic branch, so preserving it here
+    // keeps `detached: false` and exports the true `AGENT_REPO_BRANCH` (and lets
+    // finalizeGit record the first commit under that branch) rather than
+    // mis-reporting the empty repo as detached (suppressed advisory, line 4406).
+    workingBranch = checkedOut || unbornBranch;
     if (checkedOut) {
       // push=false only prevents PUBLICATION — the agent can still commit on this
       // ref before the throwaway workspace is reaped. Promote the effective-base
@@ -4576,9 +4581,24 @@ function finalizeGit({ workspaceDir, gitEnv, startSha, workingBranch, baseBranch
     if (log.status === 0) out.commits = log.stdout.trim().split('\n').filter(Boolean);
   }
 
+  // Commits made on ANY local branch that are not yet on a remote, EXCLUDING the
+  // work branch we intend to push. `startSha..HEAD` (out.commits) misses work the
+  // harness committed while HEAD was checked out on a DIFFERENT branch and then
+  // returned HEAD to the (unmodified) work branch — HEAD is back at startSha, so
+  // out.commits is empty, yet those commits are real and would be reaped with the
+  // throwaway workspace (issue #231 silent work-loss, thread 4604). Anchoring on
+  // `--branches --not --remotes refs/heads/<workingBranch>` enumerates exactly the
+  // abandoned strays: reachable from some local branch, not yet on any remote, and
+  // not carried by the branch we are about to push.
+  let offBranchStray = [];
+  if (workingBranch && coerceBool(envelope.branch?.push, true)) {
+    const stray = runGit(['rev-list', '--branches', '--not', '--remotes', `refs/heads/${workingBranch}`], { cwd: workspaceDir, env: gitEnv });
+    if (stray.status === 0) offBranchStray = stray.stdout.trim().split('\n').filter(Boolean);
+  }
+
   if (!workingBranch) {
     out.detached = true; // clone landed on a tag/sha ⇒ no branch to push
-  } else if (coerceBool(envelope.branch?.push, true) && out.commits.length > 0) {
+  } else if (coerceBool(envelope.branch?.push, true) && (out.commits.length > 0 || offBranchStray.length > 0)) {
     const log = getLogger();
     const pushTimeoutMs = 120_000; // matches runGit's default; surfaced in a timeout reason
     // Verify HEAD is still on the branch we intend to push (issue #231). The
@@ -4597,11 +4617,19 @@ function finalizeGit({ workspaceDir, gitEnv, startSha, workingBranch, baseBranch
     // would claim it "moved to a branch named HEAD" instead of identifying the
     // detached state (branchMismatch.actual: null / '(detached)').
     const currentBranch = (rawHeadBranch && rawHeadBranch !== 'HEAD') ? rawHeadBranch : '';
-    if (currentBranch !== workingBranch) {
+    const movedOff = currentBranch !== workingBranch;
+    if (movedOff || offBranchStray.length > 0) {
       out.pushFailed = true;
-      out.strandedCommits = out.commits.slice();
-      out.branchMismatch = { expected: workingBranch, actual: currentBranch || null };
-      log.warn?.(`finalizeGit${corr ? ' (' + corr + ')' : ''}: HEAD is on '${currentBranch || '(detached)'}' but the provisioned work branch is '${workingBranch}' — the harness moved HEAD off it; refusing to push '${workingBranch}' (it would publish stale work and strand the ${out.commits.length} new commit(s)). Preserving workspace for recovery.`);
+      // Union the two strand sources: `out.commits` (startSha..HEAD, populated when
+      // HEAD itself moved off) and `offBranchStray` (commits abandoned on another
+      // local branch after HEAD returned to the work branch). Either way pushing
+      // `workingBranch` would leave them behind.
+      out.strandedCommits = [...new Set([...out.commits, ...offBranchStray])];
+      out.branchMismatch = { expected: workingBranch, actual: movedOff ? (currentBranch || null) : null };
+      const where = movedOff
+        ? `HEAD is on '${currentBranch || '(detached)'}'`
+        : `HEAD is back on '${workingBranch}' but ${offBranchStray.length} commit(s) were left on another local branch`;
+      log.warn?.(`finalizeGit${corr ? ' (' + corr + ')' : ''}: ${where} — the harness moved HEAD off the provisioned work branch; refusing to push '${workingBranch}' (it would publish stale work and strand the ${out.strandedCommits.length} new commit(s)). Preserving workspace for recovery.`);
     } else {
     // advanced on the remote since we cloned, a push can be rejected non-ff. Fetch
     // the base and report how far it moved so the non-ff cause is visible in the
@@ -4686,12 +4714,27 @@ function finalizeGit({ workspaceDir, gitEnv, startSha, workingBranch, baseBranch
         const ls = runGit([...credArgs(), 'ls-remote', '--heads', '--end-of-options', 'origin', `refs/heads/${workingBranch}`], { cwd: workspaceDir, env: gitEnv, timeoutMs: pushTimeoutMs });
         if (ls.status === 0) {
           const remoteSha = ((ls.stdout || '').trim().split(/\s+/)[0] || '');
-          if (remoteSha && remoteSha === out.headSha) landed = true;
+          if (remoteSha && remoteSha === out.headSha) {
+            landed = true; // exact-match fast path
+          } else if (remoteSha) {
+            // The remote tip differs from our head but may be a DESCENDANT of it:
+            // another actor (or the harness) pushed a further commit on the SAME
+            // branch after ours landed, so `origin/<branch>` is ahead of `headSha`
+            // and our work is already published — not stranded. Fetch the ref so its
+            // objects are local, then test `headSha` is an ancestor of the remote
+            // tip. Best-effort: a failed fetch/ancestry check just falls through to
+            // the strand path (issue #231, suppressed advisory 4689).
+            const ff = runGit([...credArgs(), 'fetch', '--no-tags', '--end-of-options', 'origin', `refs/heads/${workingBranch}`], { cwd: workspaceDir, env: gitEnv, timeoutMs: pushTimeoutMs });
+            if (ff.status === 0) {
+              const anc = runGit(['merge-base', '--is-ancestor', out.headSha, remoteSha], { cwd: workspaceDir, env: gitEnv });
+              if (anc.status === 0) landed = true;
+            }
+          }
         }
       }
       if (landed) {
         out.pushed = true;
-        log.warn?.(`finalizeGit${corr ? ' (' + corr + ')' : ''}: 'git push' exited nonzero but origin/'${workingBranch}' is already at ${out.headSha.slice(0, 12)} — treating as a transport hiccup after the ref was accepted, not a strand`);
+        log.warn?.(`finalizeGit${corr ? ' (' + corr + ')' : ''}: 'git push' exited nonzero but origin/'${workingBranch}' already contains ${out.headSha.slice(0, 12)} (at or ahead of it) — treating as a transport hiccup after the ref was accepted, not a strand`);
       } else {
         // A rejected push (typically non-fast-forward) would otherwise strand every
         // new commit in this throwaway workspace. Surface the at-risk SHAs explicitly

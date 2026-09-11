@@ -728,7 +728,7 @@ only `latest`, so the key is the reproducibility handle).
 
 On completion the plugin writes an **output envelope** back under
 `io.nanobpm.agentResult` (`{schemaVersion, status, sandbox, image, output, truncated, stderrTruncated, exitCode, signal, error, promptResourceKey?}`). When a repository was
-provisioned (below) it also carries `{repository, branch, baseSha, headSha, commits[], pushed, pushError?, pushFailed?, strandedCommits?, gitError?, pr?}`. `pushFailed` is the explicit "push failed" flag — set for a non-zero `git push` **whose result could not be confirmed as landed at the remote** (a non-fast-forward rejection, or an auth, hook, or network error), not only a server rejection. As a guard against false strands, a non-zero push is re-checked with `ls-remote`: if `origin/<branch>` already points at `headSha` the push is treated as a transport hiccup that landed after the ref was accepted (`pushed: true`, no `pushFailed`/`pushError`); otherwise `pushFailed` is set and `strandedCommits` lists the SHAs of the new commits left UNPUSHED in the throwaway workspace — together they are the recovery handle for a failed push, so consumers must not treat `pushed: false` alone as the only signal. On such a failure the throwaway workspace is preserved **best-effort** (even under the default `--keep-runs=false`) so those SHAs stay recoverable, but this is a *recovery window, not a durable archive*: the run-directory reaper still ages it out by mtime and worker shutdown removes the namespace — copy the stranded commits out promptly (or run with `--keep-runs`).
+provisioned (below) it also carries `{repository, branch, baseSha, headSha, commits[], pushed, pushError?, pushFailed?, strandedCommits?, branchMismatch?, gitError?, pr?}`. `pushFailed` is the explicit "push failed" flag — set for a non-zero `git push` **whose result could not be confirmed as landed at the remote** (a non-fast-forward rejection, or an auth, hook, or network error), not only a server rejection. **`pushFailed` does not by itself prove a remote push was attempted or rejected:** `finalizeGit` also sets it (with `strandedCommits` and a `branchMismatch` `{expected, actual}`) when it *refuses to push at all* because the harness moved HEAD off the provisioned work branch — or left commits abandoned on another local branch — so pushing the work branch would publish stale work and strand those commits (no `git push` runs, so `pushError` is absent in that case). As a guard against false strands, a non-zero push is re-checked with `ls-remote`: if `origin/<branch>` already points at `headSha` — or the remote tip is a **descendant** of `headSha` (another actor pushed a further commit after ours landed) — the push is treated as a transport hiccup that landed after the ref was accepted (`pushed: true`, no `pushFailed`/`pushError`); otherwise `pushFailed` is set and `strandedCommits` lists the SHAs of the new commits left UNPUSHED in the throwaway workspace — together they are the recovery handle for a failed push, so consumers must not treat `pushed: false` alone as the only signal. On such a failure (a rejected push **or** a branch-mismatch refusal) the throwaway workspace is preserved **best-effort** (even under the default `--keep-runs=false`) so those SHAs stay recoverable, but this is a *recovery window, not a durable archive*: the run-directory reaper still ages it out by mtime and worker shutdown removes the namespace — copy the stranded commits out promptly (or run with `--keep-runs`).
 
 **Git provisioning (host).** When `--sandbox none` (the default) and the envelope
 carries a `repository.url`, the plugin provisions a workspace on the host around
@@ -770,10 +770,11 @@ the harness:
    never made directly on the base branch; the branch actually used (configured or
    generated) rides back in the result envelope (`branch`) and is exported to the
    harness as `AGENT_REPO_BRANCH`. **Exception — a detached tag/SHA checkout with
-   no `branch.create`:** with no symbolic branch (and no configured base) to name a
-   fallback from, it stays `branch: null` and its commits are **not** pushed even
-   when push is enabled — supply `branch.create` to publish work committed off a
-   tag/SHA base;
+   no `branch.create`:** with no symbolic branch to name a fallback from, it stays
+   `branch: null` and its commits are **not** pushed even when push is enabled —
+   this holds for *any* detached no-`branch.create` checkout, **including** when a
+   `branch.base` is configured (the base name is not used to synthesize a fallback
+   here). Supply `branch.create` to publish work committed off a tag/SHA base;
 4. set a **committer identity** on the workspace, preferring the operator's own
    (`GIT_AUTHOR_*` env → global `git config user.name/email` → the
    `gh`-authenticated GitHub user), and only falling back to `nano-agent` when
@@ -808,7 +809,9 @@ the merge; a clone/checkout failure sheds the job (retryable). Workspaces are
 deleted after each job (keep them with `--keep-runs`) — **except** a job whose
 `git push` **could not be confirmed as landed** (a non-fast-forward rejection, or
 an auth/hook/network error whose `ls-remote` re-check did not find `origin/<branch>`
-at `headSha`), whose workspace is preserved best-effort so its
+at or ahead of `headSha`), **or** one where `finalizeGit` refused to push because
+HEAD moved off the provisioned work branch (a `branchMismatch` strand — no `git
+push` ran), whose workspace is preserved best-effort so its
 `strandedCommits` stay recoverable; that preservation is still age-gated by the
 reaper and cleared on worker shutdown, so recover the SHAs promptly.
 

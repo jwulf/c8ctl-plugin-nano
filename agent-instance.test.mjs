@@ -827,6 +827,177 @@ test('a retired create attempt that FAILS late is reported quietly, not as a mis
   );
 });
 
+test('a create that resolves with a BLANK/whitespace agentInstanceKey stays retryable — no orphaned mint against an invalid key (issue #230)', async () => {
+  // A resolved response carrying agentInstanceKey: '' (or whitespace) is NOT a mint —
+  // updates need a usable key. It must take the keyless retry path, not latch state,
+  // log a mint, and replay the pre-mint buffer against an invalid key.
+  const warnings = [];
+  let createCall = 0;
+  let t = Date.parse('2026-02-03T04:05:06.000Z');
+  const client = {
+    calls: { create: [], update: [] },
+    createAgentInstance: async (req) => {
+      client.calls.create.push(req);
+      createCall += 1;
+      if (createCall === 1) return { agentInstanceKey: '   ' }; // blank/whitespace-only key
+      return { agentInstanceKey: 'AGENT-OK' };
+    },
+    updateAgentInstance: async (req) => { client.calls.update.push(req); return { createdHistory: [] }; },
+  };
+  const p = createAgentInstanceProducer({
+    camunda: client, job: EXTERNAL_JOB, profile: PROFILE, envelope: ENVELOPE,
+    logger: { info() {}, warn: (m) => warnings.push(m), debug() {} },
+    now: () => t, createRetryBaseMs: 1000, createRetryMaxMs: 30000,
+  });
+  await p.activate();
+  assert.equal(p.active, false, 'a blank key does not mint — it takes the keyless retry path');
+  assert.equal(client.calls.update.length, 0, 'nothing was replayed against the invalid key');
+  assert.ok(
+    warnings.some((m) => /returned no agentInstanceKey \(attempt 1\)/.test(m) && /will retry/.test(m)),
+    'the blank key is reported as a keyless (retryable) result',
+  );
+  // A later attempt returning a REAL key mints normally.
+  t += 2000;
+  p.ingest({ sessionUpdate: 'agent_message_chunk', messageId: 'm1', content: { type: 'text', text: 'x' } });
+  await p.drain();
+  assert.equal(client.calls.create.length, 2, 'a fresh attempt fired past the backoff window');
+  assert.equal(p.active, true, 'the valid key minted the instance');
+});
+
+test('a keyless create result that arrives late for a retired attempt is dropped, not logged as "will retry" (issue #230)', async () => {
+  // The no-key branch sits ABOVE the late-result/finalization guard, so a timed-out
+  // create that later resolves with {} must ALSO be recognised as retired — emitting
+  // "will retry" after a newer generation (or complete()) has moved on is misleading.
+  const warnings = [];
+  const debugs = [];
+  let createCall = 0;
+  let resolveFirst = null;
+  const firstSettled = new Promise((resolve) => { resolveFirst = () => resolve({}); }); // resolves keyless, late
+  let t = Date.parse('2026-02-03T04:05:06.000Z');
+  const client = {
+    calls: { create: [], update: [] },
+    createAgentInstance: (req) => {
+      client.calls.create.push(req);
+      createCall += 1;
+      if (createCall === 1) return firstSettled; // hangs, then resolves keyless after retirement
+      return Promise.resolve({ agentInstanceKey: 'AGENT-K' });
+    },
+    updateAgentInstance: async (req) => { client.calls.update.push(req); return { createdHistory: [] }; },
+  };
+  const p = createAgentInstanceProducer({
+    camunda: client, job: EXTERNAL_JOB, profile: PROFILE, envelope: ENVELOPE,
+    logger: { info() {}, warn: (m) => warnings.push(m), debug: (m) => debugs.push(m) },
+    now: () => t, finalizeTimeoutMs: 20, createRetryBaseMs: 1000, createRetryMaxMs: 30000,
+  });
+  await p.activate(); // attempt 1 hangs → bounded out + retired
+  assert.equal(p.active, false);
+  t += 2000;
+  p.ingest({ sessionUpdate: 'agent_message_chunk', messageId: 'm1', content: { type: 'text', text: 'x' } });
+  await p.drain();
+  assert.equal(p.active, true, 'a fresh attempt minted the instance');
+  // Now the ORIGINAL (retired) attempt resolves late with no key.
+  resolveFirst();
+  await firstSettled;
+  await new Promise((r) => setTimeout(r, 5)); // let the late .then run
+  const lateNoKeyWarn = warnings.find((m) => /returned no agentInstanceKey \(attempt 1\)/.test(m) && /will retry/.test(m));
+  assert.equal(lateNoKeyWarn, undefined, 'the retired attempt\'s late keyless result did NOT emit a misleading "will retry" warning');
+  assert.ok(
+    debugs.some((m) => /resolved without a usable key late for a retired attempt/.test(m)),
+    'the late keyless result was reported quietly at debug instead',
+  );
+});
+
+test('a retired attempt\'s late settle does not overwrite a newer attempt\'s backoff anchor (issue #230)', async () => {
+  // A retired attempt already had its retirement time recorded. If its eventual late
+  // settle overwrote the shared lastCreateAttemptAt, a NEWER (failed) attempt's backoff
+  // anchor would be pushed forward to the old request's completion time, postponing the
+  // next retry. doCreate's finally must only record while its generation is current.
+  let createCall = 0;
+  let rejectFirst = null;
+  const firstSettled = new Promise((_resolve, reject) => { rejectFirst = () => reject(new Error('late stale lease')); });
+  let t = Date.parse('2026-02-03T04:05:06.000Z');
+  const client = {
+    calls: { create: [], update: [] },
+    createAgentInstance: (req) => {
+      client.calls.create.push(req);
+      createCall += 1;
+      if (createCall === 1) return firstSettled;               // hangs → retired, rejects late
+      if (createCall === 2) return Promise.reject(new Error('fast fail')); // newer attempt fails fast
+      return Promise.resolve({ agentInstanceKey: 'AGENT-Z' });  // attempt 3 mints
+    },
+    updateAgentInstance: async (req) => { client.calls.update.push(req); return { createdHistory: [] }; },
+  };
+  const p = createAgentInstanceProducer({
+    camunda: client, job: EXTERNAL_JOB, profile: PROFILE, envelope: ENVELOPE,
+    logger: nullLogger, now: () => t, finalizeTimeoutMs: 20,
+    createRetryBaseMs: 1000, createRetryMaxMs: 30000,
+  });
+  await p.activate();                    // attempt 1 hangs
+  await new Promise((r) => setTimeout(r, 45)); // let the retirement timer fire (records anchor at T0)
+  t += 2000;                             // T0+2000
+  p.ingest({ sessionUpdate: 'agent_message_chunk', messageId: 'm1', content: { type: 'text', text: 'a' } });
+  await p.drain();
+  assert.equal(client.calls.create.length, 2, 'attempt 2 fired past the backoff window and failed fast (anchor = T0+2000)');
+  // Advance, THEN let the retired attempt 1 reject late. Its finally must NOT re-anchor
+  // the backoff to now (T0+3000); the anchor must stay attempt 2's settle (T0+2000).
+  t += 1000;                             // T0+3000
+  rejectFirst();
+  await firstSettled.catch(() => {});
+  await new Promise((r) => setTimeout(r, 5)); // let the late catch/finally run
+  // At T0+4500: anchor T0+2000 → elapsed 2500 >= backoff(2)=2000 → a fresh attempt fires.
+  // Had the late settle re-anchored to T0+3000, elapsed would be 1500 < 2000 → throttled.
+  t += 1500;                             // T0+4500
+  p.ingest({ sessionUpdate: 'agent_message_chunk', messageId: 'm2', content: { type: 'text', text: 'b' } });
+  await p.drain();
+  assert.equal(client.calls.create.length, 3, 'the retired late settle did not postpone the next retry');
+  assert.equal(p.active, true, 'attempt 3 minted the instance');
+});
+
+test('a hung history append is bounded so complete()\'s queue drain cannot stall settlement (issue #230)', async () => {
+  // Appends are serialized on the queue and complete() drains it before settling the
+  // job. A history append that HANGS (rather than rejects) must be bounded
+  // (finalizeTimeoutMs) or the drain — and job settlement — blocks until lease expiry.
+  const client = {
+    calls: { create: [], update: [] },
+    createAgentInstance: async (req) => { client.calls.create.push(req); return { agentInstanceKey: 'AGENT-A' }; },
+    updateAgentInstance: (req) => {
+      client.calls.update.push(req);
+      if (req.status === 'COMPLETED') return Promise.resolve({ createdHistory: [] });
+      return new Promise(() => {}); // history appends hang forever
+    },
+  };
+  const p = makeProducer(client, { finalizeTimeoutMs: 20 });
+  await p.activate();
+  assert.equal(p.active, true);
+  // Stream a turn whose append hangs. If the append were unbounded, complete()'s drain
+  // would never resolve and this test would time out.
+  p.ingest({ sessionUpdate: 'agent_message_chunk', messageId: 'm1', content: { type: 'text', text: 'hi' } });
+  await p.complete(true);
+  assert.ok(
+    client.calls.update.some((u) => u.status === 'COMPLETED'),
+    'the terminal COMPLETED update still ran once the hung append was bounded out',
+  );
+});
+
+test('a FINALIZED producer is inert to late ACP frames — nothing appended after COMPLETED (issue #230)', async () => {
+  // spawnCaptureAcp can invoke onAcpUpdate (timeout/abort cleanup) after finish()
+  // resolved, i.e. after complete() finalized the producer. A late frame must be
+  // dropped, not appended after the terminal update nor buffered after finalization.
+  const client = {
+    calls: { create: [], update: [] },
+    createAgentInstance: async (req) => { client.calls.create.push(req); return { agentInstanceKey: 'AGENT-F' }; },
+    updateAgentInstance: async (req) => { client.calls.update.push(req); return { createdHistory: [] }; },
+  };
+  const p = makeProducer(client, { finalizeTimeoutMs: 1000 });
+  await p.activate();
+  await p.complete(true);
+  const updatesAfterComplete = client.calls.update.length;
+  // A late frame arriving after finalization must be a no-op.
+  p.ingest({ sessionUpdate: 'agent_message_chunk', messageId: 'zz', content: { type: 'text', text: 'late' } });
+  await p.drain();
+  assert.equal(client.calls.update.length, updatesAfterComplete, 'the late frame appended nothing');
+});
+
 test('pre-mint ACP updates are buffered and replayed once a retried create succeeds (issue #230)', async () => {
   // The create fails on activate; turns then stream in while it is still failing.
   // They must be buffered and durably replayed against the instance once a later

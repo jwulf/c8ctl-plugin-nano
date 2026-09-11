@@ -429,7 +429,13 @@ export function createAgentInstanceProducer(opts = {}) {
       };
       if (status) req.status = status;
       try {
-        await camunda[SDK_UPDATE](req);
+        // BOUND the append (finalizeTimeoutMs). Appends are serialized on `queue`, and
+        // complete() awaits that queue before settling the job; an append that HANGS
+        // (rather than rejects) would otherwise stall the drain and hold the lease
+        // until it expires during an AgentInstance outage. A timeout is tagged
+        // `__nanoTimeout` and swallowed by the catch below like any other append
+        // failure — best-effort, never breaks the chain (issue #230).
+        await callWithin(camunda[SDK_UPDATE](req), finalizeTimeoutMs);
         appendedTurns += 1;
       } catch (err) {
         const d = describeSdkError(err);
@@ -564,11 +570,27 @@ export function createAgentInstanceProducer(opts = {}) {
         jobLease: leaseToken,
         history: [configTurn],
       });
-      const key =
-        res && (res.agentInstanceKey ?? res.key) != null
-          ? String(res.agentInstanceKey ?? res.key)
-          : null;
+      // Treat a blank/whitespace key as "no key". Updates need a usable
+      // agentInstanceKey, so an empty ('' or whitespace-only) value must take the
+      // keyless retry path rather than latch state, log a mint, and replay the pre-mint
+      // buffer against an invalid key (issue #230).
+      const rawKey = res && (res.agentInstanceKey ?? res.key);
+      const key = isNonBlank(rawKey) ? String(rawKey).trim() : null;
       if (!key) {
+        // A RETIRED or post-finalization attempt that resolves late without a usable
+        // key must NOT emit the ordinary "will retry" warning: maybeStartCreate() won't
+        // retry once a key/finalization is latched, so promising a retry (and reading
+        // the mutable global attempt counter) would be a misleading diagnostic after
+        // complete() already settled the job. Mirror the throw path's late guard and
+        // report it as dropped instead (issue #230).
+        if (finalized || gen !== createGen) {
+          logger?.debug?.(
+            `AgentInstance producer: createAgentInstance resolved without a usable key ` +
+              `late for a retired attempt (attempt ${attempt}) ${correlation()}; result ` +
+              `dropped (no retry — key/finalization already latched).`,
+          );
+          return false;
+        }
         // createAgentInstance resolved but carried no key — updates need the
         // agentInstanceKey, so we cannot append yet. Idempotent per
         // elementInstanceKey, so keep retrying rather than forfeiting the run. Log the
@@ -633,8 +655,12 @@ export function createAgentInstanceProducer(opts = {}) {
       // failure (network/timeout) must pace the NEXT attempt from the moment it failed.
       // Recording at request start would let a failure that outlasts the current
       // backoff window trigger another request immediately, defeating the exponential
-      // pacing and risking a retry storm during an outage (issue #230).
-      lastCreateAttemptAt = now();
+      // pacing and risking a retry storm during an outage (issue #230). Only record
+      // while THIS generation still owns the slot: a retired attempt already had its
+      // retirement time recorded (retireCreate), and a stale late settle overwriting it
+      // could push the anchor forward and postpone a live attempt's next retry based on
+      // the old request's completion rather than the current one (issue #230).
+      if (gen === createGen) lastCreateAttemptAt = now();
     }
   };
 
@@ -884,7 +910,12 @@ export function createAgentInstanceProducer(opts = {}) {
      * dropped. Never throws.
      */
     ingest(rawUpdate) {
-      if (disabled) return;
+      // Treat a FINALIZED producer as inert: once complete() has drained the queue and
+      // driven (or bounded out) the terminal COMPLETED update, a late ACP frame — e.g.
+      // spawnCaptureAcp's timeout/abort cleanup firing onAcpUpdate after finish()
+      // resolved — must not enqueue history after the terminal update or buffer updates
+      // after finalization, resurrecting an orphaned instance (issue #230).
+      if (disabled || finalized) return;
       // Not minted yet? A create may have failed at second 0 — re-attempt it on the
       // hot path (throttled) so the transcript resumes as soon as the create takes,
       // and BUFFER this update so it is replayed against the instance once the create

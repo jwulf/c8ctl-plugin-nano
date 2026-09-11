@@ -143,7 +143,7 @@ export function parseInboundRelayChunk(frame, stream) {
  * @property {string} stream the relay stream name (derived from the jobKey)
  * @property {(chunk: string|Uint8Array) => void} relay publish one framed, jobKey-tagged output chunk on the relay lane
  * @property {(write: (chunk: string) => void) => (() => void)} attachSteer wire inbound steer bytes for this stream to `write`; returns a detach fn
- * @property {(reason?: string) => Promise<{ closeEmitted: boolean, drained: boolean, timedOut: boolean, updates?: number, bytes?: number, reason?: string }>} close emit the `phase:close` lifecycle event, detach any steer subscription, then drain the outbound buffer (bounded). `reason` (normal / job-killed / error) is logged with the update/byte totals (#229). The host-connection session ({@link createHostRelaySession}) additionally resolves with the observability totals `updates`, `bytes`, and the resolved `reason`.
+ * @property {(reason?: string) => Promise<{ closeEmitted: boolean, drained: boolean, timedOut: boolean, updates?: number, bytes?: number, reason?: string }>} close emit the `phase:close` lifecycle event, detach any steer subscription, then drain the outbound buffer (bounded). The channel-backed session ({@link createRelaySession}) IGNORES `reason`, logs no reason/totals, and resolves only `{ closeEmitted, drained, timedOut }`. The host-connection session ({@link createHostRelaySession}) accepts `reason` (normal / job-killed / error), logs it with the update/byte totals (#229), and additionally resolves with the observability totals `updates`, `bytes`, and the resolved `reason`.
  */
 
 /**

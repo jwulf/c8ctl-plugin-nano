@@ -321,8 +321,15 @@ export function createAgentInstanceProducer(opts = {}) {
         history: [turn],
       };
       if (status) req.status = status;
-      await camunda[SDK_UPDATE](req);
-      turnsAppended += 1;
+      const res = await camunda[SDK_UPDATE](req);
+      // #229/#232: the engine dedups appends by historyItemId, so a retry or a
+      // reactivation can return 200 while creating ZERO new history entries. Count
+      // what the engine actually CREATED (`res.createdHistory`) — not the attempt —
+      // so the completion counter separates a real append from a deduplicated no-op
+      // and keeps the 0-turns husk diagnosis honest. Fall back to +1 only when the
+      // response omits the field (older engine), so a genuine append is never
+      // under-counted.
+      turnsAppended += Array.isArray(res?.createdHistory) ? res.createdHistory.length : 1;
     }, 'updateAgentInstance(append)');
   };
 
@@ -456,7 +463,7 @@ export function createAgentInstanceProducer(opts = {}) {
         }
         loopIteration = 1;
         activatedAt = now();
-        logger?.info?.(`AgentInstance ${agentInstanceKey} minted (${corr()}; ${leaseNote()}; model ${def.model}/${def.provider}).`);
+        logger?.info?.(`AgentInstance ${agentInstanceKey} minted (${corr()}; ${leaseNote()}; model ${oneLine(def.model)}/${oneLine(def.provider)}).`);
         return true;
       } catch (err) {
         disabled = true;
@@ -466,7 +473,7 @@ export function createAgentInstanceProducer(opts = {}) {
         // elementInstanceKey/jobKey/processInstanceKey, whether the lease was
         // present + its tail, and the model/provider. An opaque "status 400" alone
         // is useless.
-        logger?.warn?.(`AgentInstance producer: createAgentInstance REJECTED (${corr()}; ${leaseNote()}; model ${def.model}/${def.provider}) — ${formatSdkError(err)}; continuing without a durable transcript (job completion unaffected).`);
+        logger?.warn?.(`AgentInstance producer: createAgentInstance REJECTED (${corr()}; ${leaseNote()}; model ${oneLine(def.model)}/${oneLine(def.provider)}) — ${formatSdkError(err)}; continuing without a durable transcript (job completion unaffected).`);
         return false;
       }
     },

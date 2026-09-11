@@ -63,7 +63,11 @@ function fakeClient({
     },
     updateAgentInstance: async (req) => {
       calls.update.push(req);
-      return { createdHistory: [] };
+      // Mirror the engine: a successful append echoes the created history entries
+      // (the append boundary is one turn per call). A status-only update carries no
+      // history, so nothing is created. Tests that model a deduplicated append
+      // override this to return an EMPTY createdHistory.
+      return { createdHistory: Array.isArray(req.history) ? req.history : [] };
     },
   };
 }
@@ -519,7 +523,7 @@ test('complete(true) whose status→COMPLETED update is REJECTED reports the fai
   client.updateAgentInstance = async (req) => {
     client.calls.update.push(req);
     if (req.status === 'COMPLETED') throw { status: 409, message: 'lease expired' };
-    return { createdHistory: [] };
+    return { createdHistory: Array.isArray(req.history) ? req.history : [] };
   };
   const logger = recordingLogger();
   const p = makeProducer(client, { logger });
@@ -542,6 +546,42 @@ test('complete() counts appended turns (#229)', async () => {
   const p = makeProducer(client, { logger });
   await p.activate();
   p.ingest({ sessionUpdate: 'agent_message_chunk', content: { type: 'text', text: 'hello' } });
+  await p.complete(true);
+  const line = logger.lines.info.find((l) => l.includes('turn(s) appended'));
+  assert.match(line, /1 turn\(s\) appended/);
+});
+
+test('complete() counts only ENGINE-created history — a deduplicated append does not inflate the turn counter (#229/#232)', async () => {
+  // updateAgentInstance is deduplicated by historyItemId, so a retry/reactivation
+  // can return 200 with an EMPTY createdHistory. The husk/healthy counter must
+  // reflect what the engine actually appended, not the attempt — otherwise a
+  // deduplicated no-op would masquerade as a healthy turn.
+  const client = fakeClient();
+  client.updateAgentInstance = async (req) => {
+    client.calls.update.push(req);
+    return { createdHistory: [] }; // engine deduped: nothing new created
+  };
+  const logger = recordingLogger();
+  const p = makeProducer(client, { logger });
+  await p.activate();
+  p.ingest({ sessionUpdate: 'agent_message_chunk', content: { type: 'text', text: 'dup' } });
+  await p.complete(true);
+  const line = logger.lines.info.find((l) => l.includes('turn(s) appended'));
+  assert.match(line, /0 turn\(s\) appended/);
+});
+
+test('complete() falls back to +1 per append when the response omits createdHistory (#229/#232)', async () => {
+  // An older engine (or a fake) that omits createdHistory must not zero the
+  // counter — a genuine append is counted via the +1 fallback.
+  const client = fakeClient();
+  client.updateAgentInstance = async (req) => {
+    client.calls.update.push(req);
+    return {}; // no createdHistory field at all
+  };
+  const logger = recordingLogger();
+  const p = makeProducer(client, { logger });
+  await p.activate();
+  p.ingest({ sessionUpdate: 'agent_message_chunk', content: { type: 'text', text: 'x' } });
   await p.complete(true);
   const line = logger.lines.info.find((l) => l.includes('turn(s) appended'));
   assert.match(line, /1 turn\(s\) appended/);

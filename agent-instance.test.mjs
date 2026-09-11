@@ -789,6 +789,86 @@ test('the pre-mint buffer only retains updates that persist a turn — a plan/st
   );
 });
 
+test('a shaped create failure emits status/body, the redacted jobLease, model/provider, and all correlation keys (issue #230)', async () => {
+  // The create-failure warning is a core observability acceptance criterion, so assert
+  // the producer-level diagnostic (not just describeSdkError in isolation): a shaped SDK
+  // error must surface its status + body, the REDACTED lease token, the model/provider,
+  // and every correlation key — so an operator can tie the failure to the exact request.
+  const lines = { info: [], warn: [], debug: [] };
+  const logger = {
+    info: (m) => lines.info.push(m),
+    warn: (m) => lines.warn.push(m),
+    debug: (m) => lines.debug.push(m),
+  };
+  const createError = Object.assign(new Error('Bad Request'), {
+    statusCode: 400,
+    body: { detail: 'stale lease fence mismatch' },
+  });
+  const client = fakeClient({ failCreate: true, createError });
+  const p = makeProducer(client, { logger });
+
+  const ok = await p.activate();
+  assert.equal(ok, false, 'a failed create does not mint');
+  assert.equal(p.active, false);
+
+  const warn = lines.warn.find((m) => /createAgentInstance failed/.test(m));
+  assert.ok(warn, 'the shaped create failure is warned');
+  assert.match(warn, /status=400/, 'the HTTP status is surfaced');
+  assert.match(warn, /stale lease fence mismatch/, 'the response body is surfaced');
+  assert.match(warn, /message=Bad Request/, 'the error message is surfaced');
+  // The lease token (99001) is redacted to a last-4 tail — never echoed verbatim.
+  assert.match(warn, /jobLease=present\(…9001\)/, 'the lease token is redacted, not leaked');
+  assert.ok(!warn.includes('99001'), 'the raw lease token never appears verbatim');
+  assert.match(warn, /model=Opus 4\.8/, 'the model is surfaced');
+  assert.match(warn, /provider=anthropic/, 'the provider is surfaced');
+  // Every correlation key ties the failure back to the exact activated job.
+  assert.match(warn, /jobKey=13954/, 'the jobKey correlation key is surfaced');
+  assert.match(warn, /elementInstanceKey=EIK-7/, 'the elementInstanceKey correlation key is surfaced');
+  assert.match(warn, /processInstanceKey=13951/, 'the processInstanceKey correlation key is surfaced');
+});
+
+test('the first per-turn append failure is warn, and repeats are debug (issue #230)', async () => {
+  // An append storm (e.g. a 400/404 on every updateAgentInstance) must be visible without
+  // flooding the log, so ONLY the first per-turn append failure is elevated to `warn`; the
+  // rest stay `debug`. Assert that severity contract at the producer level.
+  const lines = { info: [], warn: [], debug: [] };
+  const logger = {
+    info: (m) => lines.info.push(m),
+    warn: (m) => lines.warn.push(m),
+    debug: (m) => lines.debug.push(m),
+  };
+  const appendError = Object.assign(new Error('Not Found'), { statusCode: 404, body: 'no such instance' });
+  const client = {
+    calls: { create: [], update: [] },
+    createAgentInstance: async (req) => {
+      client.calls.create.push(req);
+      return { agentInstanceKey: 'AGENT-1' };
+    },
+    updateAgentInstance: async (req) => {
+      client.calls.update.push(req);
+      throw appendError;
+    },
+  };
+  const p = makeProducer(client, { logger });
+  await p.activate();
+  assert.equal(p.active, true, 'the instance minted (create succeeded)');
+
+  // Two distinct messages → the boundary flushes the first, complete() flushes the second:
+  // at least two append attempts, each rejected by the failing updateAgentInstance.
+  p.ingest({ sessionUpdate: 'agent_message_chunk', messageId: 'm-a', content: { type: 'text', text: 'alpha' } });
+  p.ingest({ sessionUpdate: 'agent_message_chunk', messageId: 'm-b', content: { type: 'text', text: 'beta' } });
+  await p.complete(true);
+
+  const warnAppends = lines.warn.filter((m) => /append failed/.test(m));
+  const debugAppends = lines.debug.filter((m) => /append failed/.test(m));
+  assert.equal(warnAppends.length, 1, 'exactly the FIRST append failure is elevated to warn');
+  assert.ok(debugAppends.length >= 1, 'subsequent append failures stay at debug (no warn flood)');
+  // The single warn carries the same shaped diagnostics + correlation keys.
+  assert.match(warnAppends[0], /status=404/, 'the append warn surfaces the HTTP status');
+  assert.match(warnAppends[0], /no such instance/, 'the append warn surfaces the response body');
+  assert.match(warnAppends[0], /jobKey=13954/, 'the append warn carries the correlation keys');
+});
+
 test('leaseTokenLabel redacts short tokens to a fixed marker (no verbatim leak) (issue #230)', () => {
   assert.equal(leaseTokenLabel(undefined), 'ABSENT');
   assert.equal(leaseTokenLabel(''), 'ABSENT');

@@ -35,48 +35,6 @@ const isPlainObject = (v) => v != null && typeof v === 'object' && !Array.isArra
 // crafted error body spoof extra log lines. Used by the one-line #229 renderers.
 const oneLine = (v) => String(v).replace(/[\r\n\t\f\v\u0085\u2028\u2029]+/g, ' ');
 
-// Raw (uncapped/unfolded) extraction of the diagnosable facts out of an SDK/transport
-// rejection, tolerant of the shapes the `@camunda8/orchestration-cluster-api` client
-// and the underlying transport surface. Used by {@link formatSdkError} for the compact
-// one-line #229 diagnostics; the richer, capped/normalized public renderer is
-// {@link describeSdkError} below (issue #230). Kept separate because the two apply
-// different normalization (oneLine → single space here vs. an inline ⏎ marker there).
-function rawSdkFields(err) {
-  if (err == null) return { status: undefined, body: undefined, message: String(err) };
-  const status =
-    err.status ??
-    err.statusCode ??
-    err?.response?.status ??
-    err?.response?.statusCode ??
-    (typeof err.code === 'number' ? err.code : undefined);
-  let body =
-    err.body ??
-    err.responseBody ??
-    err?.response?.data ??
-    err?.response?.body ??
-    undefined;
-  if (body != null && typeof body !== 'string') {
-    try {
-      body = JSON.stringify(body);
-    } catch {
-      body = String(body);
-    }
-  }
-  const message = err.message ? String(err.message) : String(err);
-  return { status, body, message };
-}
-
-// One-line rendering of an SDK error for a #229 log line: `status N; body …; msg …`
-// with CR/LF folded to spaces and the body capped so a multiline/oversized engine
-// response can neither split the single correlatable worker-log line nor flood it.
-function formatSdkError(err) {
-  const { status, body, message } = rawSdkFields(err);
-  const parts = [`status ${status ?? 'unknown'}`];
-  if (isNonBlank(body)) parts.push(`body ${oneLine(String(body).slice(0, 600))}`);
-  parts.push(`msg ${oneLine(message)}`);
-  return parts.join('; ');
-}
-
 // Default create-retry backoff (issue #230). A transient createAgentInstance
 // rejection at second 0 (e.g. a lease fence that has not yet settled) must NOT
 // forfeit the whole run's durable transcript, so a failed/absent create is
@@ -483,12 +441,8 @@ export function createAgentInstanceProducer(opts = {}) {
   // real append (issue #230 / #229 / #232).
   let appendedTurns = 0;
   // Elevate the FIRST per-turn append failure to `warn` (repeats stay `debug`) so a
-  // 400/404 append storm is visible without flooding the log (issue #230 / #229). Two
-  // flags: `appendFailureLogged` gates the #230 key=value diagnostic line, and
-  // `appendInstrFailureLogged` gates the #229 `updateAgentInstance(append) failed`
-  // observability line — they are DISTINCT so each first-failure line elevates once.
+  // 400/404 append storm is visible without flooding the log (issue #230 / #229).
   let appendFailureLogged = false;
-  let appendInstrFailureLogged = false;
   // #229 first-failure elevation for ingest faults (classifier OR handler): the FIRST
   // per-instance ingest failure logs at `warn`, repeats stay at `debug`.
   let ingestFailureLogged = false;
@@ -548,28 +502,19 @@ export function createAgentInstanceProducer(opts = {}) {
         appendedTurns += Array.isArray(res?.createdHistory) ? res.createdHistory.length : 1;
       } catch (err) {
         const d = describeSdkError(err);
-        // #230 diagnostic: the shaped key=value line (status/message/body + the richer
-        // correlation()) — asserted by the #230 append-failure test.
+        // ONE canonical append-failure diagnostic (issue #230 / #229): the shaped
+        // key=value line (status/message/body) plus the correlation keys, so a 400/404
+        // append storm is both root-causable and joinable to the job/relay channels.
+        // The FIRST per-turn failure elevates to `warn` (with the "repeats stay debug"
+        // hint); the rest stay `debug` so the log isn't flooded.
         const line =
           `AgentInstance producer: ${SDK_UPDATE} append failed — ` +
           `status=${d.status ?? 'n/a'} message=${d.message} body=${d.body ?? 'n/a'} ${correlation()}.`;
         if (!appendFailureLogged) {
           appendFailureLogged = true;
-          logger?.warn?.(line);
+          logger?.warn?.(`${line} Further append failures for this instance stay at debug.`);
         } else {
           logger?.debug?.(line);
-        }
-        // #229 observability: the compact `updateAgentInstance(append) failed` line
-        // (labelled verb + terse corr()) — asserted by the #229 append-failure test.
-        // Independently first-failure-elevated so it too warns exactly once.
-        const instr =
-          `AgentInstance producer: updateAgentInstance(append) failed (${corr()}) — ` +
-          `status ${d.status ?? 'unknown'}: ${oneLine(d.message)}`;
-        if (!appendInstrFailureLogged) {
-          appendInstrFailureLogged = true;
-          logger?.warn?.(`${instr}; further append failures for this instance stay at debug.`);
-        } else {
-          logger?.debug?.(instr);
         }
       }
     });
@@ -782,20 +727,16 @@ export function createAgentInstanceProducer(opts = {}) {
         return false;
       }
       const d = describeSdkError(err);
+      // ONE canonical create-failure diagnostic (issue #230 / #229): the shaped
+      // key=value line carrying the HTTP status + engine body (a lease fence vs a
+      // schema error), the masked lease, model/provider, the correlation keys, and
+      // the honest retry clause. First-per-instance elevation is inherent to the
+      // retry loop (a distinct attempt number each time).
       logger?.warn?.(
         `AgentInstance producer: createAgentInstance failed (attempt ${attempt}) — ` +
           `status=${d.status ?? 'n/a'} message=${d.message} body=${d.body ?? 'n/a'} ` +
           `jobLease=${leaseTokenLabel(leaseToken)} model=${def.model} provider=${def.provider} ` +
           `${correlation()}; ${retryClause}`,
-      );
-      // #229 observability: the compact, root-causable `REJECTED` summary (HTTP
-      // status + body via formatSdkError, terse corr(), masked lease, model/provider).
-      // Layered ALONGSIDE the #230 line above — the two carry the same facts in the two
-      // frozen log formats the respective test suites assert. Honest about the retry
-      // (uses the #230 retryClause), NOT "continuing without a durable transcript".
-      logger?.warn?.(
-        `AgentInstance producer: createAgentInstance REJECTED (${corr()}; ${leaseNote()}; ` +
-          `model ${oneLine(def.model)}/${oneLine(def.provider)}) — ${formatSdkError(err)}; ${retryClause}`,
       );
       return false;
     } finally {

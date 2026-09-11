@@ -1703,15 +1703,16 @@ test('activate() rejection logs HTTP status + body + correlation + lease tail at
   const p = makeProducer(client, { logger });
   const ok = await p.activate();
   assert.equal(ok, false);
-  const line = logger.lines.warn.find((l) => l.includes('createAgentInstance REJECTED'));
-  assert.ok(line, 'expected a REJECTED warn line');
-  assert.match(line, /status 400/);
+  const line = logger.lines.warn.find((l) => l.includes('createAgentInstance failed'));
+  assert.ok(line, 'expected a create-failure warn line');
+  assert.match(line, /status=400/);
   assert.match(line, /jobLease fenced/);
-  assert.match(line, /job 13954/);
-  assert.match(line, /eik EIK-7/);
-  assert.match(line, /pik 13951/);
-  assert.match(line, /lease present \(len 5\)/); // short token masked — not printed whole
-  assert.match(line, /Opus 4\.8\/anthropic/);
+  assert.match(line, /jobKey=13954/);
+  assert.match(line, /elementInstanceKey=EIK-7/);
+  assert.match(line, /processInstanceKey=13951/);
+  assert.match(line, /jobLease=present\(…/); // short token masked — not printed whole
+  assert.match(line, /model=Opus 4\.8/);
+  assert.match(line, /provider=anthropic/);
 });
 
 test('activate() rejection collapses a multiline error body/message to one log line (#229)', async () => {
@@ -1726,11 +1727,11 @@ test('activate() rejection collapses a multiline error body/message to one log l
   const p = makeProducer(client, { logger });
   const ok = await p.activate();
   assert.equal(ok, false);
-  const line = logger.lines.warn.find((l) => l.includes('createAgentInstance REJECTED'));
-  assert.ok(line, 'expected a REJECTED warn line');
+  const line = logger.lines.warn.find((l) => l.includes('createAgentInstance failed'));
+  assert.ok(line, 'expected a create-failure warn line');
   assert.ok(!/[\r\n]/.test(line), 'the rendered SDK error must not contain CR/LF');
-  assert.match(line, /body line1 line2 line3/);
-  assert.match(line, /msg boom injected: fake log line/);
+  assert.match(line, /body=line1 ⏎ line2 ⏎ line3/);
+  assert.match(line, /message=boom ⏎ injected: fake log line/);
 });
 
 test('complete() logs a turn counter separating the 0-turns husk from a healthy run (#229)', async () => {
@@ -1836,10 +1837,10 @@ test('first per-turn append failure is elevated to warn, repeats stay debug (#22
   p.ingest({ sessionUpdate: 'agent_message_chunk', messageId: 'm2', content: { type: 'text', text: 'b' } });
   // force flush of both messages
   await p.complete(true);
-  const appendWarns = logger.lines.warn.filter((l) => l.includes('updateAgentInstance(append) failed'));
+  const appendWarns = logger.lines.warn.filter((l) => l.includes('updateAgentInstance append failed'));
   assert.equal(appendWarns.length, 1, 'exactly one append failure elevated to warn');
-  assert.match(appendWarns[0], /status 404/);
+  assert.match(appendWarns[0], /status=404/);
   assert.ok(calls >= 2, 'multiple append attempts were made');
-  const appendDebugs = logger.lines.debug.filter((l) => l.includes('updateAgentInstance(append) failed'));
+  const appendDebugs = logger.lines.debug.filter((l) => l.includes('updateAgentInstance append failed'));
   assert.ok(appendDebugs.length >= 1, 'subsequent append failures stay at debug');
 });

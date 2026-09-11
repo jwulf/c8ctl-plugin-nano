@@ -9400,6 +9400,18 @@ function runningSupervisor() {
   return state && isPidAlive(state.pid) ? state : null;
 }
 
+/**
+ * The canonical daemon-descriptor field set — the single source of truth for the
+ * daemon object embedded in the persisted state (`persist()`), the socket
+ * `status` frame (`statusFrame()`), and the socket-unreachable fallback
+ * (`statusFromState()`). Routing all three through here guarantees no field
+ * (e.g. `version`, `logFile`) can be added to one builder but silently dropped by
+ * another, which is exactly how earlier rounds lost `version` and then `logFile`.
+ */
+function supervisorDaemonDescriptor({ pid, startedAt, version, socket, logFile }) {
+  return { pid, startedAt, version, socket, logFile };
+}
+
 /** Synthesize a state-file-shaped object from a live `status` response. */
 function stateFromStatus(res, socketPath) {
   return {
@@ -9421,12 +9433,7 @@ function stateFromStatus(res, socketPath) {
  */
 function statusFromState(running) {
   return {
-    daemon: {
-      pid: running.pid,
-      startedAt: running.startedAt,
-      version: running.version,
-      socket: running.socket,
-    },
+    daemon: supervisorDaemonDescriptor(running),
     workers: (running.workers || []).map((w) => summarizeSupervisorWorker(w)),
   };
 }
@@ -9596,11 +9603,9 @@ async function runSupervisorDaemon() {
   const persist = () => {
     try {
       writeSupervisorState({
-        pid: process.pid,
-        startedAt,
-        version: daemonVersion,
-        socket: socketPath,
-        logFile: daemonLogFile,
+        ...supervisorDaemonDescriptor({
+          pid: process.pid, startedAt, version: daemonVersion, socket: socketPath, logFile: daemonLogFile,
+        }),
         workers: [...workers.values()].map((w) => ({
           id: w.id, profile: w.profile, args: w.args, pid: isPidAlive(w.pid) ? w.pid : null,
           startedAt: w.startedAt || null, restarts: w.restarts, lastExit: w.lastExit ?? null,
@@ -9842,7 +9847,7 @@ async function runSupervisorDaemon() {
   const statusFrame = (final, pub) => ({
     ok: true,
     type: 'status',
-    daemon: { pid: process.pid, startedAt, version: daemonVersion, socket: socketPath, logFile: daemonLogFile },
+    daemon: supervisorDaemonDescriptor({ pid: process.pid, startedAt, version: daemonVersion, socket: socketPath, logFile: daemonLogFile }),
     workers: pub || [...workers.values()].map(workerPublic),
     ...(final ? { final: true } : {}),
   });
@@ -13964,6 +13969,7 @@ export {
   summarizeSupervisorWorker,
   formatSupervisorStatus,
   statusFromState,
+  supervisorDaemonDescriptor,
   formatSupervisorLogsLines,
   reageSupervisorStatus,
   clampToWidth,

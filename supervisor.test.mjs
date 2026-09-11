@@ -25,6 +25,7 @@ import {
   summarizeSupervisorWorker,
   formatSupervisorStatus,
   statusFromState,
+  supervisorDaemonDescriptor,
   formatSupervisorLogsLines,
   reageSupervisorStatus,
   clampToWidth,
@@ -508,6 +509,7 @@ test('statusFromState threads the persisted daemon version through the socket-un
     startedAt: '2026-09-11T00:00:00.000Z',
     version: '7.7.7-fallback',
     socket: '/tmp/y.sock',
+    logFile: '/tmp/supervisor-daemon.log',
     workers: [],
   };
   const status = statusFromState(running);
@@ -515,8 +517,36 @@ test('statusFromState threads the persisted daemon version through the socket-un
   assert.equal(status.daemon.pid, running.pid);
   assert.equal(status.daemon.startedAt, running.startedAt);
   assert.equal(status.daemon.socket, running.socket);
+  // The fallback must also carry the daemon log location, or `supervisor logs`
+  // loses it during a control-socket outage. See PR #228.
+  assert.equal(status.daemon.logFile, running.logFile);
   // And the rendered table must actually show the version to the operator.
   assert.match(formatSupervisorStatus(status), /version:\s+7\.7\.7-fallback/);
+});
+
+// The daemon object embedded in the persisted state (`persist()`), the socket
+// `status` frame (`statusFrame()`), and the socket-unreachable fallback
+// (`statusFromState()`) all build their `daemon` descriptor from the SAME
+// `supervisorDaemonDescriptor` helper, so a field added to one path (e.g.
+// `version`, then `logFile`) can never be silently dropped by another. This
+// pins the descriptor's field set — a regression that drops `version` or
+// `logFile` from the daemon build path reddens here instead of leaving the
+// fabricated-status tests green. See PR #228.
+test('supervisorDaemonDescriptor carries every persisted daemon field (single source of truth)', () => {
+  const d = supervisorDaemonDescriptor({
+    pid: 4321,
+    startedAt: '2026-09-11T01:02:03.000Z',
+    version: '8.8.8-daemon',
+    socket: '/tmp/z.sock',
+    logFile: '/tmp/z-daemon.log',
+  });
+  assert.deepEqual(d, {
+    pid: 4321,
+    startedAt: '2026-09-11T01:02:03.000Z',
+    version: '8.8.8-daemon',
+    socket: '/tmp/z.sock',
+    logFile: '/tmp/z-daemon.log',
+  });
 });
 
 // --- printSupervisorStatus (output-channel regression guard) ----------------

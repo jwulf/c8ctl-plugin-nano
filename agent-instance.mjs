@@ -682,7 +682,7 @@ export function createAgentInstanceProducer(opts = {}) {
         logger?.warn?.(
           `AgentInstance producer: createAgentInstance returned no agentInstanceKey ` +
             `(attempt ${attempt}) — status=n/a body=n/a ` +
-            `jobLease=${leaseTokenLabel(leaseToken)} model=${def.model} provider=${def.provider} ` +
+            `jobLease=${leaseTokenLabel(leaseToken)} model=${oneLine(def.model)} provider=${oneLine(def.provider)} ` +
             `${correlation()}; ${retryClause}`,
         );
         return false;
@@ -735,7 +735,7 @@ export function createAgentInstanceProducer(opts = {}) {
       logger?.warn?.(
         `AgentInstance producer: createAgentInstance failed (attempt ${attempt}) — ` +
           `status=${d.status ?? 'n/a'} message=${d.message} body=${d.body ?? 'n/a'} ` +
-          `jobLease=${leaseTokenLabel(leaseToken)} model=${def.model} provider=${def.provider} ` +
+          `jobLease=${leaseTokenLabel(leaseToken)} model=${oneLine(def.model)} provider=${oneLine(def.provider)} ` +
           `${correlation()}; ${retryClause}`,
       );
       return false;
@@ -955,7 +955,12 @@ export function createAgentInstanceProducer(opts = {}) {
     let classified;
     try {
       classified = classify(rawUpdate);
-    } catch {
+    } catch (err) {
+      // A classifier fault on the pre-mint path would otherwise be swallowed here, so
+      // the FIRST per-instance ingest failure during a create outage would never reach
+      // noteIngestFailure() and the warn-once diagnostic would be absent exactly when
+      // it matters (issue #230). Report it before dropping the update.
+      noteIngestFailure(err);
       return false;
     }
     return !!classified && typeof classified === 'object' && PERSISTED_KINDS.has(classified.kind);

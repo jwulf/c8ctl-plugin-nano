@@ -487,6 +487,14 @@ test('formatSupervisorStatus guides the operator when there are no workers', () 
   assert.match(text, /supervisor add/);
 });
 
+test('formatSupervisorStatus surfaces the daemon version for version-based debugging', () => {
+  const text = formatSupervisorStatus({
+    daemon: { pid: process.pid, version: '9.9.9-test', socket: '/tmp/x.sock' },
+    workers: [],
+  });
+  assert.match(text, /version:\s+9\.9\.9-test/);
+});
+
 // --- printSupervisorStatus (output-channel regression guard) ----------------
 //
 // Regression guard for the "literal \n, no line-wrapping" defect: the aligned

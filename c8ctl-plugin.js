@@ -9310,6 +9310,7 @@ function formatSupervisorStatus(status) {
   const alive = d.pid ? isPidAlive(d.pid) : false;
   lines.push('Supervisor:');
   lines.push(`  daemon pid: ${d.pid ?? '-'} ${alive ? '(alive)' : '(dead — stale state)'}`);
+  if (d.version) lines.push(`  version:    ${d.version}`);
   if (d.startedAt) lines.push(`  started:    ${d.startedAt}`);
   if (d.socket) lines.push(`  control:    ${d.socket}`);
   const workers = Array.isArray(status.workers) ? status.workers : [];
@@ -9404,6 +9405,7 @@ function stateFromStatus(res, socketPath) {
   return {
     pid: res.daemon?.pid,
     startedAt: res.daemon?.startedAt,
+    version: res.daemon?.version,
     socket: res.daemon?.socket || socketPath,
     logFile: res.daemon?.logFile,
     workers: res.workers || [],
@@ -9524,6 +9526,11 @@ function installParentDeathWatchdog({ intervalMs = 2000, parentPid, onOrphan, re
  */
 async function runSupervisorDaemon() {
   const startedAt = new Date().toISOString();
+  // The plugin version of THIS daemon process (read from its own pluginDir), so
+  // `supervisor status` reports the version actually running — which may lag the
+  // querying CLI after an upgrade-without-restart. Surfaced for version-based
+  // debugging.
+  const daemonVersion = pluginPackage().version;
   const { exec, entry } = c8ctlInvocation();
   const socketPath = getSupervisorSocketPath();
   const daemonLogFile = supervisorDaemonLogFile();
@@ -9572,6 +9579,7 @@ async function runSupervisorDaemon() {
       writeSupervisorState({
         pid: process.pid,
         startedAt,
+        version: daemonVersion,
         socket: socketPath,
         logFile: daemonLogFile,
         workers: [...workers.values()].map((w) => ({
@@ -9815,7 +9823,7 @@ async function runSupervisorDaemon() {
   const statusFrame = (final, pub) => ({
     ok: true,
     type: 'status',
-    daemon: { pid: process.pid, startedAt, socket: socketPath, logFile: daemonLogFile },
+    daemon: { pid: process.pid, startedAt, version: daemonVersion, socket: socketPath, logFile: daemonLogFile },
     workers: pub || [...workers.values()].map(workerPublic),
     ...(final ? { final: true } : {}),
   });

@@ -88,13 +88,42 @@ function settleWithin(promise, timeoutMs, setTimer = setTimeout) {
   );
   if (!(timeoutMs > 0)) return settled;
   return new Promise((resolve) => {
+    // This is a REQUIRED deadline timer, not a hygiene timer: it is the guarantee
+    // that lets activate()/complete() return when the SDK promise is hung, so it must
+    // keep the event loop alive until it fires (or is cleared on settle). unref()'ing
+    // it would let a client-side hang with no other active handle exit the worker
+    // before the bound resolves, defeating the guarantee (issue #230). It is always
+    // cleared the instant the promise settles, so it never outlives its purpose.
     const timer = setTimer(() => resolve(false), timeoutMs);
-    if (timer && typeof timer.unref === 'function') timer.unref();
     settled.then((won) => {
       clearTimeout(timer);
       resolve(won);
     });
   });
+}
+
+// Await an SDK call up to `timeoutMs`, resolving to its value on success, RE-THROWING
+// its rejection, or throwing a synthetic timeout error (tagged `__nanoTimeout`) when
+// the deadline wins — the underlying call is left to settle in the background. Unlike
+// `settleWithin` (which only reports WHO won) this preserves the call's outcome, so a
+// bounded terminal update can still observe success/failure while never blocking job
+// settlement on a hung request past its lease (issue #230). `timeoutMs<=0` is unbounded.
+async function callWithin(promise, timeoutMs, setTimer = setTimeout) {
+  if (!(timeoutMs > 0)) return promise;
+  let timer;
+  const deadline = new Promise((_resolve, reject) => {
+    // Required deadline timer (see settleWithin) — deliberately NOT unref()'d.
+    timer = setTimer(() => {
+      const err = new Error(`SDK call timed out after ${timeoutMs}ms`);
+      err.__nanoTimeout = true;
+      reject(err);
+    }, timeoutMs);
+  });
+  try {
+    return await Promise.race([Promise.resolve(promise), deadline]);
+  } finally {
+    clearTimeout(timer);
+  }
 }
 
 // Cap the normalized SDK error body before logging so an oversized/multiline engine
@@ -515,7 +544,11 @@ export function createAgentInstanceProducer(opts = {}) {
   // — NOT disabled (issue #230). `final` marks complete()'s one last-chance attempt,
   // after which NO further retry happens, so the diagnostic must not promise one.
   const doCreate = async ({ gen = 0, final = false } = {}) => {
-    createAttempts += 1;
+    // Capture THIS attempt's number locally. `createAttempts` is a shared mutable
+    // counter and timed-out attempts overlap later retries, so reading the global at
+    // log time could report a late result from attempt 1 as attempt 2 (with the wrong
+    // retry context). All of this attempt's diagnostics use the local `attempt`.
+    const attempt = (createAttempts += 1);
     // A failure on the FINAL attempt won't be retried (the producer is about to be
     // discarded), so don't tell operators to wait for a recovery that can't happen.
     const retryClause = final
@@ -544,7 +577,7 @@ export function createAgentInstanceProducer(opts = {}) {
         // against the request that produced it (issue #230).
         logger?.warn?.(
           `AgentInstance producer: createAgentInstance returned no agentInstanceKey ` +
-            `(attempt ${createAttempts}) — status=n/a body=n/a ` +
+            `(attempt ${attempt}) — status=n/a body=n/a ` +
             `jobLease=${leaseTokenLabel(leaseToken)} model=${def.model} provider=${def.provider} ` +
             `${correlation()}; ${retryClause}`,
         );
@@ -560,7 +593,7 @@ export function createAgentInstanceProducer(opts = {}) {
       if (finalized || gen !== createGen) {
         logger?.debug?.(
           `AgentInstance producer: createAgentInstance succeeded late for a retired ` +
-            `attempt (attempt ${createAttempts}) ${correlation()}; result dropped ` +
+            `attempt (attempt ${attempt}) ${correlation()}; result dropped ` +
             `(idempotent per element instance).`,
         );
         return false;
@@ -569,14 +602,27 @@ export function createAgentInstanceProducer(opts = {}) {
       loopIteration = 1;
       logger?.info?.(
         `AgentInstance ${agentInstanceKey} minted for element instance ${elementInstanceKey} ` +
-          `(job ${jobKey}, attempt ${createAttempts}) ${correlation()}.`,
+          `(job ${jobKey}, attempt ${attempt}) ${correlation()}.`,
       );
       replayPreMintBuffer();
       return true;
     } catch (err) {
+      // A RETIRED or post-finalization attempt that rejects late must not emit the
+      // ordinary "will retry" warning: maybeStartCreate() will not retry once a key or
+      // finalization is latched, so promising a retry (and reading the mutable global
+      // attempt counter) would be misleading. Report it quietly instead (issue #230).
+      if (finalized || gen !== createGen) {
+        const d = describeSdkError(err);
+        logger?.debug?.(
+          `AgentInstance producer: createAgentInstance failed late for a retired ` +
+            `attempt (attempt ${attempt}) — status=${d.status ?? 'n/a'} message=${d.message} ` +
+            `${correlation()}; result dropped (no retry — key/finalization already latched).`,
+        );
+        return false;
+      }
       const d = describeSdkError(err);
       logger?.warn?.(
-        `AgentInstance producer: createAgentInstance failed (attempt ${createAttempts}) — ` +
+        `AgentInstance producer: createAgentInstance failed (attempt ${attempt}) — ` +
           `status=${d.status ?? 'n/a'} message=${d.message} body=${d.body ?? 'n/a'} ` +
           `jobLease=${leaseTokenLabel(leaseToken)} model=${def.model} provider=${def.provider} ` +
           `${correlation()}; ${retryClause}`,
@@ -592,9 +638,30 @@ export function createAgentInstanceProducer(opts = {}) {
     }
   };
 
+  // Retire the create attempt that owns the slot at identity `gen`: bump `createGen`
+  // past it (so its eventual late result is dropped by doCreate's guard), free the
+  // `creating` slot for a fresh retry, and RECORD the retirement as the latest attempt
+  // time. Recording the timestamp is essential: a hung attempt's own `finally` won't
+  // run until the SDK promise finally settles (maybe never), so without this the next
+  // ACP update would see the stale `lastCreateAttemptAt` and fire immediately, letting
+  // repeated hung attempts pile up concurrently and defeat the backoff (issue #230).
+  // No-op unless `gen` still owns the slot (it may have already settled/been retired).
+  const retireCreate = (gen) => {
+    if (creatingGen !== gen || creating == null) return false;
+    createGen += 1; // > creatingGen ⇒ the hung attempt's late result is dropped
+    creating = null;
+    creatingGen = 0;
+    lastCreateAttemptAt = now();
+    return true;
+  };
+
   // Start ONE create attempt, own the `creating` slot, and track its identity so a
   // retired (timed-out) attempt's late settle can neither clear a newer attempt's slot
-  // nor latch orphaned state. Returns the (wrapped, never-rejecting) attempt promise.
+  // nor latch orphaned state. EVERY attempt is self-supervised: if it hasn't settled
+  // within `finalizeTimeoutMs` it is retired, so a hung createAgentInstance started off
+  // the non-awaited ACP hot path (ingest → maybeStartCreate) can't leave `creating`
+  // non-null forever — which would buffer every later ingest and refuse all retries
+  // until complete() (issue #230). Returns the (wrapped, never-rejecting) promise.
   const startCreate = (opts = {}) => {
     const gen = (createGen += 1);
     creatingGen = gen;
@@ -609,6 +676,11 @@ export function createAgentInstanceProducer(opts = {}) {
         }
       });
     creating = p;
+    // Fire-and-forget retirement supervision (bounds even non-awaited hot-path
+    // attempts). Never rejects; a no-op if the attempt settled or was already retired.
+    void settleWithin(p, finalizeTimeoutMs).then((settled) => {
+      if (!settled) retireCreate(gen);
+    });
     return p;
   };
 
@@ -617,19 +689,18 @@ export function createAgentInstanceProducer(opts = {}) {
   // activate() (which gates whether the harness runs) or complete() (which gates job
   // settlement / lease expiry). Retiring bumps the identity past the hung attempt (so
   // its late result is dropped in doCreate) and frees the slot so a later retry isn't
-  // wedged behind the stuck request forever (issue #230).
+  // wedged behind the stuck request forever (issue #230). Callers that must observe the
+  // retirement synchronously on return use this; startCreate's supervision is the
+  // backstop for attempts nobody awaits.
   const awaitCreateBounded = async () => {
     const pending = creating;
+    const gen = creatingGen;
     if (!pending) return;
     const settled = await settleWithin(pending, finalizeTimeoutMs);
     // Only retire if it genuinely timed out AND still owns the slot (it may have
     // settled in the same tick the timer fired, in which case its finally already
     // freed the slot / started nothing new).
-    if (!settled && creating === pending) {
-      createGen += 1; // > creatingGen ⇒ the hung attempt's late success is dropped
-      creating = null;
-      creatingGen = 0;
-    }
+    if (!settled && creating === pending) retireCreate(gen);
   };
 
   // Kick off a create attempt if one is warranted and the backoff window has
@@ -900,33 +971,52 @@ export function createAgentInstanceProducer(opts = {}) {
       try { await queue; } catch { /* best effort */ }
       let completedOk = false;
       let terminalErr = null;
+      let terminalTimedOut = false;
       const terminalAttempts = Math.max(1, terminalRetryMax);
       if (ok) {
         for (let attempt = 1; attempt <= terminalAttempts; attempt += 1) {
           try {
-            await camunda[SDK_UPDATE]({
-              agentInstanceKey,
-              elementInstanceKey,
-              jobKey,
-              jobLease: leaseToken,
-              status: 'COMPLETED',
-            });
+            // BOUND each terminal update (finalizeTimeoutMs). Like the create calls,
+            // the harness awaits complete() before it settles the job, so a hung
+            // updateAgentInstance would otherwise hold the lease until it expires and
+            // stall settlement during an engine outage (issue #230).
+            await callWithin(
+              camunda[SDK_UPDATE]({
+                agentInstanceKey,
+                elementInstanceKey,
+                jobKey,
+                jobLease: leaseToken,
+                status: 'COMPLETED',
+              }),
+              finalizeTimeoutMs,
+            );
             completedOk = true;
             terminalErr = null;
+            terminalTimedOut = false;
             break;
           } catch (err) {
             terminalErr = describeSdkError(err);
+            // A hung endpoint won't recover within the next attempt and each retry
+            // burns another finalizeTimeoutMs against the lease, so STOP retrying on a
+            // timeout (the underlying call is left to settle in the background). A
+            // plain rejection is potentially transient, so those still retry.
+            if (err && err.__nanoTimeout) {
+              terminalTimedOut = true;
+              break;
+            }
           }
         }
       }
       const terminalOk = ok && completedOk;
       if (ok && !completedOk) {
-        // Every retry of the terminal transition was rejected. The job settles now with
-        // no reactivation to try again, so this is NOT self-healing — surface the SDK
-        // error details and flag that manual reconciliation is required (issue #230).
+        // The terminal transition never confirmed (every retry rejected, or a hung
+        // request was bounded out). The job settles now with no reactivation to try
+        // again, so this is NOT self-healing — surface the SDK error details and flag
+        // that manual reconciliation is required (issue #230).
         logger?.warn?.(
-          `AgentInstance ${agentInstanceKey}: terminal status update to COMPLETED failed after ` +
-            `${terminalAttempts} attempt(s) — status=${terminalErr?.status ?? 'n/a'} ` +
+          `AgentInstance ${agentInstanceKey}: terminal status update to COMPLETED ` +
+            `${terminalTimedOut ? `timed out (bounded at ${finalizeTimeoutMs}ms)` : `failed after ${terminalAttempts} attempt(s)`} — ` +
+            `status=${terminalErr?.status ?? 'n/a'} ` +
             `body=${terminalErr?.body ?? 'n/a'} message=${terminalErr?.message ?? 'n/a'}; ` +
             `MANUAL RECONCILIATION REQUIRED — the job settles now with no reactivation to retry ` +
             `this transition ${correlation()}.`,

@@ -15,7 +15,20 @@ import {
   deriveAgentDefinition,
   deriveLimits,
   inferProvider,
+  describeSdkError,
 } from './agent-instance.mjs';
+
+// A logger that records every line per level so observability assertions (#229)
+// can inspect exactly what the producer emitted.
+function recordingLogger() {
+  const lines = { info: [], warn: [], debug: [] };
+  return {
+    info: (m) => lines.info.push(String(m)),
+    warn: (m) => lines.warn.push(String(m)),
+    debug: (m) => lines.debug.push(String(m)),
+    lines,
+  };
+}
 
 // A fake SDK client that records calls and returns a fixed agentInstanceKey.
 //
@@ -403,4 +416,94 @@ test('appended turns preserve ACP arrival order even though ingest is non-blocki
   p.ingest({ sessionUpdate: 'agent_message_chunk', content: { type: 'text', text: 'two' } });
   await p.complete(true);
   assert.deepEqual(order, ['one', 'two']);
+});
+
+// ---------------------------------------------------------------------------
+// #229 observability — root-causable create failures, turn counters, correlation
+// ---------------------------------------------------------------------------
+
+test('describeSdkError extracts HTTP status + body from common SDK error shapes', () => {
+  const a = describeSdkError({ status: 400, body: { message: 'lease fenced' }, message: 'Bad Request' });
+  assert.equal(a.status, 400);
+  assert.equal(a.body, JSON.stringify({ message: 'lease fenced' }));
+  assert.equal(a.message, 'Bad Request');
+
+  const b = describeSdkError({ response: { status: 404, data: 'not found' }, message: 'Not Found' });
+  assert.equal(b.status, 404);
+  assert.equal(b.body, 'not found');
+
+  const c = describeSdkError(new Error('plain'));
+  assert.equal(c.status, undefined);
+  assert.equal(c.message, 'plain');
+
+  assert.equal(describeSdkError(null).message, 'null');
+});
+
+test('activate() rejection logs HTTP status + body + correlation + lease tail at warn (#229)', async () => {
+  const client = fakeClient();
+  client.createAgentInstance = async (req) => {
+    client.calls.create.push(req);
+    throw { status: 400, body: { detail: 'jobLease fenced' }, message: 'Bad Request' };
+  };
+  const logger = recordingLogger();
+  const p = makeProducer(client, { logger });
+  const ok = await p.activate();
+  assert.equal(ok, false);
+  const line = logger.lines.warn.find((l) => l.includes('createAgentInstance REJECTED'));
+  assert.ok(line, 'expected a REJECTED warn line');
+  assert.match(line, /status 400/);
+  assert.match(line, /jobLease fenced/);
+  assert.match(line, /job 13954/);
+  assert.match(line, /eik EIK-7/);
+  assert.match(line, /pik 13951/);
+  assert.match(line, /lease …99001/); // lease present, tail only
+  assert.match(line, /Opus 4\.8\/anthropic/);
+});
+
+test('complete() logs a turn counter separating the 0-turns husk from a healthy run (#229)', async () => {
+  const client = fakeClient();
+  const logger = recordingLogger();
+  const p = makeProducer(client, { logger });
+  await p.activate();
+  await p.complete(true);
+  const line = logger.lines.info.find((l) => l.includes('turn(s) appended'));
+  assert.ok(line, 'expected a turn-counter info line');
+  assert.match(line, /0 turn\(s\) appended/);
+  assert.match(line, /status→COMPLETED/);
+  assert.match(line, /job 13954 eik EIK-7 pik 13951/);
+});
+
+test('complete() counts appended turns (#229)', async () => {
+  const client = fakeClient();
+  const logger = recordingLogger();
+  const p = makeProducer(client, { logger });
+  await p.activate();
+  p.ingest({ sessionUpdate: 'agent_message_chunk', content: { type: 'text', text: 'hello' } });
+  await p.complete(true);
+  const line = logger.lines.info.find((l) => l.includes('turn(s) appended'));
+  assert.match(line, /1 turn\(s\) appended/);
+});
+
+test('first per-turn append failure is elevated to warn, repeats stay debug (#229)', async () => {
+  const client = fakeClient();
+  await (async () => {})();
+  let calls = 0;
+  client.updateAgentInstance = async (req) => {
+    client.calls.update.push(req);
+    calls += 1;
+    throw { status: 404, message: 'gone' };
+  };
+  const logger = recordingLogger();
+  const p = makeProducer(client, { logger });
+  await p.activate();
+  p.ingest({ sessionUpdate: 'agent_message_chunk', content: { type: 'text', text: 'a' } });
+  p.ingest({ sessionUpdate: 'agent_message_chunk', messageId: 'm2', content: { type: 'text', text: 'b' } });
+  // force flush of both messages
+  await p.complete(true);
+  const appendWarns = logger.lines.warn.filter((l) => l.includes('updateAgentInstance(append) failed'));
+  assert.equal(appendWarns.length, 1, 'exactly one append failure elevated to warn');
+  assert.match(appendWarns[0], /status 404/);
+  assert.ok(calls >= 2, 'multiple append attempts were made');
+  const appendDebugs = logger.lines.debug.filter((l) => l.includes('updateAgentInstance(append) failed'));
+  assert.ok(appendDebugs.length >= 1, 'subsequent append failures stay at debug');
 });

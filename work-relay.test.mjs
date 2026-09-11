@@ -520,3 +520,72 @@ test('createHostRelaySession.close is idempotent (emits the close marker once)',
   session.close();
   assert.equal(published.filter((t) => t === RELAY_CLOSE_CHUNK).length, 1);
 });
+
+// ---- createHostRelaySession observability (#229) ----------------------------
+
+function recordingLogger() {
+  const lines = { info: [], warn: [], debug: [] };
+  return {
+    info: (m) => lines.info.push(String(m)),
+    warn: (m) => lines.warn.push(String(m)),
+    debug: (m) => lines.debug.push(String(m)),
+    lines,
+  };
+}
+
+test('createHostRelaySession logs open with the correlation join keys (#229)', () => {
+  const logger = recordingLogger();
+  createHostRelaySession({
+    instance: 'senior-1',
+    jobKey: '42',
+    publish: () => {},
+    logger,
+    elementInstanceKey: 'EIK-9',
+    processInstanceKey: 'PIK-3',
+    agentInstanceKey: () => 'AGENT-7',
+  });
+  const open = logger.lines.debug.find((l) => l.includes('relay opened'));
+  assert.ok(open, 'expected a relay opened line');
+  assert.match(open, /aik AGENT-7/);
+  assert.match(open, /eik EIK-9/);
+  assert.match(open, /pik PIK-3/);
+  assert.match(open, /job 42/);
+});
+
+test('createHostRelaySession logs the first update, then the close summary + reason (#229)', () => {
+  const logger = recordingLogger();
+  const session = createHostRelaySession({
+    instance: 'senior-1',
+    jobKey: '42',
+    publish: () => {},
+    logger,
+    agentInstanceKey: 'AGENT-7',
+  });
+  session.relay('abc');
+  session.relay('de');
+  assert.ok(logger.lines.debug.some((l) => l.includes('relay received first update')));
+  session.close('error');
+  const close = logger.lines.debug.find((l) => l.includes('relay closed'));
+  assert.ok(close, 'expected a relay closed line');
+  assert.match(close, /2 update\(s\)/);
+  assert.match(close, /5 byte\(s\)/);
+  assert.match(close, /reason error/);
+});
+
+test('createHostRelaySession logs zero updates for the husk case (opened, never fed) (#229)', () => {
+  const logger = recordingLogger();
+  const session = createHostRelaySession({ instance: 'i', jobKey: '9', publish: () => {}, logger });
+  session.close();
+  assert.ok(!logger.lines.debug.some((l) => l.includes('relay received first update')));
+  const close = logger.lines.debug.find((l) => l.includes('relay closed'));
+  assert.match(close, /0 update\(s\), 0 byte\(s\), reason normal/);
+});
+
+test('createHostRelaySession close() result carries the update/byte counts + reason (#229)', async () => {
+  const session = createHostRelaySession({ instance: 'i', jobKey: '9', publish: () => {} });
+  session.relay('xy');
+  const res = await session.close('job-killed');
+  assert.equal(res.updates, 1);
+  assert.equal(res.bytes, 2);
+  assert.equal(res.reason, 'job-killed');
+});

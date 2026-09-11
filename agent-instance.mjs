@@ -30,6 +30,52 @@ const isNonBlank = (v) => v != null && String(v).trim() !== '';
 const isPlainObject = (v) => v != null && typeof v === 'object' && !Array.isArray(v);
 
 /**
+ * Extract the HTTP status + response body from an SDK rejection (#229).
+ *
+ * A create/append failure logged as an opaque `status 400` is useless — the body
+ * is what distinguishes a lease-fence rejection from a schema error from a 404.
+ * The host `@camunda8/orchestration-cluster-api` client surfaces these on a few
+ * shapes depending on the transport, so probe the common ones defensively and
+ * never throw (this runs on the best-effort logging path).
+ *
+ * @param {*} err
+ * @returns {{ status: (number|string|undefined), body: (string|undefined), message: string }}
+ */
+export function describeSdkError(err) {
+  if (err == null) return { status: undefined, body: undefined, message: String(err) };
+  const status =
+    err.status ??
+    err.statusCode ??
+    err?.response?.status ??
+    err?.response?.statusCode ??
+    (typeof err.code === 'number' ? err.code : undefined);
+  let body =
+    err.body ??
+    err.responseBody ??
+    err?.response?.data ??
+    err?.response?.body ??
+    undefined;
+  if (body != null && typeof body !== 'string') {
+    try {
+      body = JSON.stringify(body);
+    } catch {
+      body = String(body);
+    }
+  }
+  const message = err.message ? String(err.message) : String(err);
+  return { status, body, message };
+}
+
+/** One-line rendering of {@link describeSdkError} for a log line (body capped). */
+function formatSdkError(err) {
+  const { status, body, message } = describeSdkError(err);
+  const parts = [`status ${status ?? 'unknown'}`];
+  if (isNonBlank(body)) parts.push(`body ${String(body).slice(0, 600)}`);
+  parts.push(`msg ${message}`);
+  return parts.join('; ');
+}
+
+/**
  * Is this activated job an `external` (job-backed) agent job — i.e. one whose
  * element carries `zeebe:agentDefinition agentType="external"`?
  *
@@ -175,6 +221,16 @@ export function createAgentInstanceProducer(opts = {}) {
   const leaseToken = job?.leaseToken != null ? String(job.leaseToken) : '';
   const elementInstanceKey = job?.elementInstanceKey != null ? String(job.elementInstanceKey) : '';
   const elementId = job?.elementId != null ? String(job.elementId) : null;
+  // #229: cross-channel correlation. Stamp jobKey + elementInstanceKey +
+  // processInstanceKey on every producer log so the AgentInstance channel can be
+  // joined to the job / relay / git channels (today AgentInstance logs carry no
+  // processInstanceKey, so the four channels can't be reconciled).
+  const processInstanceKey = job?.processInstanceKey != null ? String(job.processInstanceKey) : '';
+  const corr = () =>
+    `job ${jobKey || '?'} eik ${elementInstanceKey || '?'} pik ${processInstanceKey || '?'}`;
+  // The lease token is a secret-ish fence token — never log it whole; a short tail
+  // is enough to tell "present" from "absent" and to correlate the activation.
+  const leaseNote = () => (leaseToken ? `lease …${leaseToken.slice(-6)}` : 'lease absent');
 
   // The producer is a no-op unless every precondition holds: a usable SDK client,
   // an external agent job, and the ACP classifier. Any missing piece leaves the
@@ -191,6 +247,16 @@ export function createAgentInstanceProducer(opts = {}) {
   let activated = false;
   let loopIteration = 0;
   let queue = Promise.resolve();
+  // #229 turn accounting: how many AgentHistory turns were actually appended, and
+  // when the instance was minted — so `complete()` can log "N turns over Xm" and
+  // separate "created but nothing ingested" (the 0-turns husk) from "create failed".
+  let turnsAppended = 0;
+  let activatedAt = 0;
+  // #229 first-failure elevation: the FIRST per-turn append failure (400/404) for
+  // this instance is logged at `warn` (with the SDK verb + status); repeats stay at
+  // `debug` so a persistently-rejecting instance doesn't flood the log.
+  let appendFailureLogged = false;
+  let ingestFailureLogged = false;
   // Coalesce streamed message chunks (same messageId + role) into one turn, flushed
   // on a role/message boundary, a tool event, or completion — the engine dedups on
   // historyItemId (it does NOT merge), so a turn must be appended exactly once, whole.
@@ -201,10 +267,22 @@ export function createAgentInstanceProducer(opts = {}) {
   const iso = () => new Date(now()).toISOString();
 
   // Serialize an SDK call onto the queue so appends preserve order and `complete`
-  // can drain them. A rejection is swallowed (best-effort) but never breaks the chain.
-  const enqueue = (fn) => {
+  // can drain them. A rejection is best-effort (never breaks the chain), but the
+  // first append failure per instance is elevated to `warn` with the SDK verb +
+  // HTTP status (#229) — per-turn append failures were invisible at `debug`.
+  const enqueue = (fn, label = 'updateAgentInstance') => {
     queue = queue.then(fn).catch((err) => {
-      logger?.debug?.(`AgentInstance producer: SDK call failed — ${err?.message || err}`);
+      const { status, message } = describeSdkError(err);
+      if (!appendFailureLogged) {
+        appendFailureLogged = true;
+        logger?.warn?.(
+          `AgentInstance producer: ${label} failed (${corr()}) — status ${status ?? 'unknown'}: ${message}; further append failures for this instance stay at debug.`,
+        );
+      } else {
+        logger?.debug?.(
+          `AgentInstance producer: ${label} failed (${corr()}) — status ${status ?? 'unknown'}: ${message}`,
+        );
+      }
     });
     return queue;
   };
@@ -223,7 +301,8 @@ export function createAgentInstanceProducer(opts = {}) {
       };
       if (status) req.status = status;
       await camunda[SDK_UPDATE](req);
-    });
+      turnsAppended += 1;
+    }, 'updateAgentInstance(append)');
   };
 
   const flushMessage = () => {
@@ -339,15 +418,22 @@ export function createAgentInstanceProducer(opts = {}) {
           // result carries no key, fall back to the elementInstanceKey correlation is
           // not possible for updates (they need the agentInstanceKey), so disable.
           disabled = true;
-          logger?.warn?.('AgentInstance producer: create returned no agentInstanceKey; disabling durable transcript for this job.');
+          logger?.warn?.(`AgentInstance producer: create returned no agentInstanceKey (${corr()}); disabling durable transcript for this job.`);
           return false;
         }
         loopIteration = 1;
-        logger?.info?.(`AgentInstance ${agentInstanceKey} minted for element instance ${elementInstanceKey} (job ${jobKey}).`);
+        activatedAt = now();
+        logger?.info?.(`AgentInstance ${agentInstanceKey} minted (${corr()}; ${leaseNote()}; model ${def.model}/${def.provider}).`);
         return true;
       } catch (err) {
         disabled = true;
-        logger?.warn?.(`AgentInstance producer: createAgentInstance failed — ${err?.message || err}; continuing without a durable transcript (job completion unaffected).`);
+        // #229: the single line that would have root-caused the 20974 work-loss.
+        // Log the engine's HTTP status + response body (a lease-fence 400 vs a
+        // schema 400 vs a 404) plus the request correlation actually sent —
+        // elementInstanceKey/jobKey/processInstanceKey, whether the lease was
+        // present + its tail, and the model/provider. An opaque "status 400" alone
+        // is useless.
+        logger?.warn?.(`AgentInstance producer: createAgentInstance REJECTED (${corr()}; ${leaseNote()}; model ${def.model}/${def.provider}) — ${formatSdkError(err)}; continuing without a durable transcript (job completion unaffected).`);
         return false;
       }
     },
@@ -401,7 +487,15 @@ export function createAgentInstanceProducer(opts = {}) {
             break;
         }
       } catch (err) {
-        logger?.debug?.(`AgentInstance producer: ingest failed — ${err?.message || err}`);
+        // #229: elevate the FIRST ingest failure per instance to `warn` (repeats
+        // stay `debug`) so a translation/append fault that silently drops every
+        // turn is visible at normal verbosity.
+        if (!ingestFailureLogged) {
+          ingestFailureLogged = true;
+          logger?.warn?.(`AgentInstance producer: ingest failed (${corr()}) — ${err?.message || err}; further ingest failures for this instance stay at debug.`);
+        } else {
+          logger?.debug?.(`AgentInstance producer: ingest failed (${corr()}) — ${err?.message || err}`);
+        }
       }
     },
 
@@ -434,9 +528,15 @@ export function createAgentInstanceProducer(opts = {}) {
             jobLease: leaseToken,
             status: 'COMPLETED',
           });
-        });
+        }, 'updateAgentInstance(status→COMPLETED)');
       }
       try { await queue; } catch { /* best effort */ }
+      // #229: log a turn counter — "N turns appended over Xm, status→…" — so the
+      // 0-turns husk ("created but nothing ingested") is distinguishable from a
+      // healthy run at a glance, separate from the "create failed" line above.
+      const elapsedMs = activatedAt ? Math.max(0, now() - activatedAt) : 0;
+      const mins = (elapsedMs / 60000).toFixed(1);
+      logger?.info?.(`AgentInstance ${agentInstanceKey} (${corr()}): ${turnsAppended} turn(s) appended over ${mins}m, status→${ok ? 'COMPLETED' : 'left non-terminal (retry/reactivation continues it)'}.`);
     },
   };
 }

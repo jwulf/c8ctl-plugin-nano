@@ -143,7 +143,7 @@ export function parseInboundRelayChunk(frame, stream) {
  * @property {string} stream the relay stream name (derived from the jobKey)
  * @property {(chunk: string|Uint8Array) => void} relay publish one framed, jobKey-tagged output chunk on the relay lane
  * @property {(write: (chunk: string) => void) => (() => void)} attachSteer wire inbound steer bytes for this stream to `write`; returns a detach fn
- * @property {() => Promise<{ closeEmitted: boolean, drained: boolean, timedOut: boolean }>} close emit the `phase:close` lifecycle event, detach any steer subscription, then drain the outbound buffer (bounded)
+ * @property {(reason?: string) => Promise<{ closeEmitted: boolean, drained: boolean, timedOut: boolean }>} close emit the `phase:close` lifecycle event, detach any steer subscription, then drain the outbound buffer (bounded). `reason` (normal / job-killed / error) is logged with the update/byte totals (#229).
  */
 
 /**
@@ -339,10 +339,13 @@ export function createRelaySession({
  * @param {(text: string) => void} opts.publish stream one transcript chunk over the host connection
  * @param {(onChunk: (chunk: string|Uint8Array) => void) => (() => void)} [opts.subscribeSteer]
  *   register a steer-in sink for this instance; returns an unsubscribe fn
+ * @param {string} [opts.elementInstanceKey] correlation join key stamped on open/close logs (#229)
+ * @param {string} [opts.processInstanceKey] correlation join key stamped on open/close logs (#229)
+ * @param {string|(() => string)} [opts.agentInstanceKey] the AgentInstance key (or a lazy getter, since it is minted after the session opens) — joins the relay and engine channels (#229)
  * @param {{ warn?: Function, debug?: Function }} [opts.logger]
  * @returns {RelaySession}
  */
-export function createHostRelaySession({ instance, jobKey, publish, subscribeSteer, logger } = {}) {
+export function createHostRelaySession({ instance, jobKey, publish, subscribeSteer, logger, elementInstanceKey, processInstanceKey, agentInstanceKey } = {}) {
   if (instance === undefined || instance === null || String(instance) === '') {
     throw new Error('createHostRelaySession requires an instance');
   }
@@ -360,6 +363,29 @@ export function createHostRelaySession({ instance, jobKey, publish, subscribeSte
   // the actual wire id is composed by the emit client at emit time.
   const stream = composeStreamId(String(instance), String(jobKey));
   const log = logger || {};
+  // #229: the AgentInstance key is only known AFTER the producer's activate()
+  // resolves — which can be after this session is created — so accept it as a
+  // getter (or a value) and resolve it lazily when logging open/close.
+  const resolveAik = () => {
+    try {
+      const v = typeof agentInstanceKey === 'function' ? agentInstanceKey() : agentInstanceKey;
+      return v != null && String(v) !== '' ? String(v) : '?';
+    } catch {
+      return '?';
+    }
+  };
+  // #229 cross-channel correlation for the relay lane: join the relay to the
+  // AgentInstance + engine channels (today the relay and engine channels can't be
+  // reconciled) and to the job/git channels via jobKey/eik/pik.
+  const eik = elementInstanceKey != null ? String(elementInstanceKey) : '?';
+  const pik = processInstanceKey != null ? String(processInstanceKey) : '?';
+  const corr = () => `stream ${stream} aik ${resolveAik()} eik ${eik} pik ${pik} job ${String(jobKey)}`;
+  // #229 relay activity accounting: number of agent-output chunks relayed and their
+  // total bytes, plus a one-shot "received first update" marker. A relay that opens
+  // but never receives an update (the 59-byte husk signature) is now visible.
+  let updateCount = 0;
+  let byteCount = 0;
+  let firstUpdateLogged = false;
 
   const relay = (chunk) => {
     if (chunk == null) return;
@@ -378,6 +404,25 @@ export function createHostRelaySession({ instance, jobKey, publish, subscribeSte
         /* never let a logging failure escape the relay path */
       }
     }
+  };
+
+  // Count + log agent-output activity (never the open/close lifecycle markers,
+  // which go through relay() directly). The first update proves the relay is live.
+  const relayUpdate = (chunk) => {
+    if (chunk == null) return;
+    const text = typeof chunk === 'string'
+      ? chunk
+      : Buffer.isBuffer(chunk)
+        ? chunk.toString('utf8')
+        : Buffer.from(chunk).toString('utf8');
+    if (text === '') return;
+    updateCount += 1;
+    byteCount += Buffer.byteLength(text, 'utf8');
+    if (!firstUpdateLogged) {
+      firstUpdateLogged = true;
+      try { log.debug?.(`relay received first update (${corr()})`); } catch { /* swallow */ }
+    }
+    relay(text);
   };
 
   // Each attachSteer call owns its own subscription + detach fn (mirrors
@@ -429,19 +474,36 @@ export function createHostRelaySession({ instance, jobKey, publish, subscribeSte
   // steer subscription is torn down.
   let closed = false;
   let closedPromise = Promise.resolve({ closeEmitted: false, drained: true, timedOut: false });
-  const close = () => {
+  const close = (reason = 'normal') => {
     if (closed) return closedPromise;
     closed = true;
     // Emit the closing lifecycle twin of RELAY_OPEN_CHUNK so the app can flush the
     // durable transcript deterministically at completion (nano-workforce#710).
     relay(RELAY_CLOSE_CHUNK);
     for (const detach of [...activeDetaches]) detach();
-    closedPromise = Promise.resolve({ closeEmitted: true, drained: true, timedOut: false });
+    // #229: log the close with total updates, total bytes, and the close reason
+    // (normal / job-killed / error) so a relay that opened but never received an
+    // update (the 59-byte husk) is unambiguous in the worker log.
+    try {
+      log.debug?.(`relay closed (${corr()}) — ${updateCount} update(s), ${byteCount} byte(s), reason ${reason || 'normal'}`);
+    } catch {
+      /* swallow */
+    }
+    closedPromise = Promise.resolve({ closeEmitted: true, drained: true, timedOut: false, updates: updateCount, bytes: byteCount, reason: reason || 'normal' });
     return closedPromise;
   };
 
   // Open the stream the instant the session exists (parity with createRelaySession).
   relay(RELAY_OPEN_CHUNK);
+  // #229: log the open with the correlation join keys (stream + AgentInstance key +
+  // elementInstanceKey/processInstanceKey) so the relay, engine, job and git
+  // channels can finally be reconciled — the AgentInstance key is resolved lazily
+  // so a producer that mints slightly later is still captured on close.
+  try {
+    log.debug?.(`relay opened (${corr()})`);
+  } catch {
+    /* swallow */
+  }
 
-  return { stream, relay, attachSteer, close };
+  return { stream, relay: relayUpdate, attachSteer, close };
 }

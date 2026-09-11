@@ -4229,6 +4229,20 @@ function provisionRepo({ envelope, token, runDir, runId, timeoutMs = 120_000, co
   // sha is supplied, fetch it (respecting depth/filter) into a remote-tracking
   // ref so the harness can compute `git diff origin/<base>...HEAD`. Best-effort:
   // a failed base fetch is recorded, not fatal (the head clone still succeeded).
+  //
+  // Snapshot the SHA of the ref that base fetch is ABOUT to update, BEFORE it runs
+  // (suppressed advisory 4433): a baseRef fetch maps refs/heads/<baseRef> onto
+  // refs/remotes/origin/<baseRef> and fast-forwards it if the base advanced since
+  // clone, so reading that remote-tracking ref AFTER the fetch (where `baseCloneSha`
+  // is captured below) would record the already-advanced tip and make finalizeGit's
+  // pre-push staleness check under-count a real base advance. Best-effort — null
+  // when the ref is absent (a single-branch clone of a different ref the fetch will
+  // CREATE, which has no genuine clone-time value anyway).
+  let baseRefCloneSha = null;
+  if (repo.baseRef && !String(repo.baseRef).startsWith('-')) {
+    const br0 = runGit(['rev-parse', '--verify', '--quiet', `refs/remotes/origin/${repo.baseRef}`], { cwd: workspaceDir, env: gitEnv });
+    baseRefCloneSha = br0.status === 0 ? ((br0.stdout || '').trim() || null) : null;
+  }
   let base = '';
   let baseFetchError;
   // `baseRef` (branch/tag) and `baseSha` (raw commit) are mutually exclusive — a
@@ -4341,7 +4355,22 @@ function provisionRepo({ envelope, token, runDir, runId, timeoutMs = 120_000, co
   // directly on default — and to the UNBORN branch name for an empty-repo clone
   // (checkedOut null) so branch.create equal to the symbolic default ('master')
   // is likewise treated as the base and cut a fallback instead of committing on it.
-  const effectiveBase = (envelope.branch?.base || '') || checkedOut || unbornBranch || '';
+  //
+  // When `repository.sha` DETACHES HEAD (checkedOut AND unbornBranch both null) the
+  // clone still landed on `repository.ref` (`branchName`) first. If that ref names a
+  // REAL remote branch (e.g. ref=main + sha=<main commit> + branch.create=main), the
+  // create equals a base branch and honouring the `checkout -B main` path would
+  // commit and push DIRECTLY onto the base — the #231 hazard (thread 4344). Resolve
+  // whether the detached ref is a remote branch and, if so, fold it into the base so
+  // the guard cuts a fallback. A TAG leaves no `refs/remotes/origin/<ref>` (tags land
+  // under refs/tags and are excluded by `--no-tags`), so the detached-tag case is
+  // unaffected — it is exactly the branch case that must not be treated the same.
+  let refBaseBranch = '';
+  if (!checkedOut && !unbornBranch && branchName && !branchName.startsWith('-')) {
+    const rb = runGit(['rev-parse', '--verify', '--quiet', `refs/remotes/origin/${branchName}`], { cwd: workspaceDir, env: gitEnv });
+    if (rb.status === 0 && (rb.stdout || '').trim()) refBaseBranch = branchName;
+  }
+  const effectiveBase = (envelope.branch?.base || '') || checkedOut || unbornBranch || refBaseBranch || '';
   // Correlation suffix (issue #231 observability): jobKey/instance/element keys so
   // concurrent workers' branch-decision logs can be joined to the AgentInstance
   // timeline. Threaded from workAgent; empty when provisioning runs out of band.
@@ -4429,8 +4458,15 @@ function provisionRepo({ envelope, token, runDir, runId, timeoutMs = 120_000, co
   // the clone-time HEAD instead.
   let baseCloneSha = null;
   if (effectiveBase && !effectiveBase.startsWith('-')) {
-    const br = runGit(['rev-parse', '--verify', '--quiet', `refs/remotes/origin/${effectiveBase}`], { cwd: workspaceDir, env: gitEnv });
-    baseCloneSha = br.status === 0 ? ((br.stdout || '').trim() || null) : null;
+    // Prefer the pre-fetch snapshot when the optional base fetch above targeted
+    // THIS ref: re-reading refs/remotes/origin/<effectiveBase> now would return the
+    // tip that fetch fast-forwarded to, not the clone-time value (suppressed 4433).
+    if (baseRefCloneSha !== null && String(repo.baseRef || '') === effectiveBase) {
+      baseCloneSha = baseRefCloneSha;
+    } else {
+      const br = runGit(['rev-parse', '--verify', '--quiet', `refs/remotes/origin/${effectiveBase}`], { cwd: workspaceDir, env: gitEnv });
+      baseCloneSha = br.status === 0 ? ((br.stdout || '').trim() || null) : null;
+    }
   }
   // `git rev-parse HEAD` on an unborn branch (freshly cloned empty repo) exits
   // non-zero and echoes the literal "HEAD" on stdout — treat that as "no base
@@ -4596,9 +4632,23 @@ function finalizeGit({ workspaceDir, gitEnv, startSha, workingBranch, baseBranch
     if (stray.status === 0) offBranchStray = stray.stdout.trim().split('\n').filter(Boolean);
   }
 
+  // Commits the work branch ITSELF carries, anchored on refs/heads/<workingBranch>
+  // rather than the final HEAD. The harness may commit on the work branch and then
+  // move HEAD back to the base (or detach), leaving `startSha..HEAD` (out.commits)
+  // empty even though the work branch legitimately carries pushable commits. Without
+  // counting them the push gate below (out.commits || offBranchStray) would be false
+  // and finalizeGit would skip BOTH the push and the preservation path, letting the
+  // finally-cleanup reap the only copy of the work (thread 4601).
+  let branchCommits = [];
+  if (workingBranch) {
+    const range = startSha ? `${startSha}..refs/heads/${workingBranch}` : `refs/heads/${workingBranch}`;
+    const bl = runGit(['rev-list', range], { cwd: workspaceDir, env: gitEnv });
+    if (bl.status === 0) branchCommits = bl.stdout.trim().split('\n').filter(Boolean);
+  }
+
   if (!workingBranch) {
     out.detached = true; // clone landed on a tag/sha ⇒ no branch to push
-  } else if (coerceBool(envelope.branch?.push, true) && (out.commits.length > 0 || offBranchStray.length > 0)) {
+  } else if (coerceBool(envelope.branch?.push, true) && (out.commits.length > 0 || offBranchStray.length > 0 || branchCommits.length > 0)) {
     const log = getLogger();
     const pushTimeoutMs = 120_000; // matches runGit's default; surfaced in a timeout reason
     // Verify HEAD is still on the branch we intend to push (issue #231). The
@@ -4618,14 +4668,28 @@ function finalizeGit({ workspaceDir, gitEnv, startSha, workingBranch, baseBranch
     // detached state (branchMismatch.actual: null / '(detached)').
     const currentBranch = (rawHeadBranch && rawHeadBranch !== 'HEAD') ? rawHeadBranch : '';
     const movedOff = currentBranch !== workingBranch;
-    if (movedOff || offBranchStray.length > 0) {
+    // Commits pushing `workingBranch` would NOT publish — the harness made them off
+    // the work branch: either HEAD moved away and committed there (out.commits =
+    // startSha..HEAD, meaningful ONLY when movedOff) or they were left on another
+    // local branch (offBranchStray). If ANY exist, pushing the work branch would
+    // publish stale work and abandon them, so refuse + preserve. But when HEAD merely
+    // moved off while ALL new commits are on the work branch itself (branchCommits,
+    // no strays), `git push origin <workingBranch>` publishes exactly those commits
+    // regardless of where HEAD points — that is the intended output, so push it.
+    const strays = [...new Set([...(movedOff ? out.commits : []), ...offBranchStray])];
+    if (strays.length > 0) {
       out.pushFailed = true;
-      // Union the two strand sources: `out.commits` (startSha..HEAD, populated when
-      // HEAD itself moved off) and `offBranchStray` (commits abandoned on another
-      // local branch after HEAD returned to the work branch). Either way pushing
-      // `workingBranch` would leave them behind.
-      out.strandedCommits = [...new Set([...out.commits, ...offBranchStray])];
-      out.branchMismatch = { expected: workingBranch, actual: movedOff ? (currentBranch || null) : null };
+      // Union every at-risk source so recovery finds them all: the off-branch strays
+      // AND the work-branch commits we are refusing to push (branchCommits).
+      out.strandedCommits = [...new Set([...strays, ...branchCommits])];
+      // Distinguish "HEAD moved to another ref" (actual = that ref) from "HEAD is
+      // back on the work branch but commits were left on ANOTHER local branch"
+      // (actual null + offBranch flag) so the completion note labels the stranded
+      // ref correctly instead of rendering the null as '(detached)' (suppressed
+      // advisory 8746).
+      out.branchMismatch = movedOff
+        ? { expected: workingBranch, actual: currentBranch || null }
+        : { expected: workingBranch, actual: null, offBranch: true };
       const where = movedOff
         ? `HEAD is on '${currentBranch || '(detached)'}'`
         : `HEAD is back on '${workingBranch}' but ${offBranchStray.length} commit(s) were left on another local branch`;
@@ -4672,20 +4736,23 @@ function finalizeGit({ workspaceDir, gitEnv, startSha, workingBranch, baseBranch
         // Measure how far the BASE advanced since we cloned, not how far our post-
         // work HEAD sits behind the new base tip: `beforeSha` is the base ref as of
         // clone, so `beforeSha..FETCH_HEAD` counts exactly the commits the base
-        // gained. `HEAD..FETCH_HEAD` would misreport this — a work branch rebased
-        // onto the new base counts 0, while one that merely diverged counts
-        // unrelated commits. When there is no clone-time base ref to anchor on (a
-        // single-branch clone of a different ref ⇒ beforeSha null), fall back to the
-        // clone-time HEAD `startSha` — still a clone-time snapshot — rather than the
-        // POST-work HEAD, which would count harness divergence as base advance.
-        const staleAnchor = beforeSha || startSha || null;
-        const staleRange = staleAnchor ? `${staleAnchor}..FETCH_HEAD` : 'HEAD..FETCH_HEAD';
-        const ahead = runGit(['rev-list', '--count', staleRange], { cwd: workspaceDir, env: gitEnv });
-        const n = ahead.status === 0 ? parseInt((ahead.stdout || '').trim(), 10) : 0;
-        if (Number.isFinite(n) && n > 0) {
-          out.baseAdvanced = n;
-          const shaNote = ` [base '${baseBranch}': ${beforeSha ? beforeSha.slice(0, 12) : '(unknown)'} → ${fetchedSha ? fetchedSha.slice(0, 12) : '(unknown)'}]`;
-          log.warn?.(`finalizeGit${corr ? ' (' + corr + ')' : ''}: remote base '${baseBranch}' advanced ${n} commit(s) since clone${shaNote} — pushing branch '${workingBranch}'${workingBranch === baseBranch ? ' (which IS the base — a non-ff reject would strand the commits)' : ''}`);
+        // gained. Anchor ONLY on a genuine clone-time base tip. When there is none
+        // (baseCloneSha null AND no live refs/remotes/origin/<base> — e.g. a single-
+        // branch clone of a DIFFERENT ref, so origin/<base> never existed at clone),
+        // do NOT fall back to `startSha`: startSha is the FEATURE-branch tip, so
+        // `startSha..FETCH_HEAD` would count pre-existing feature/base divergence as
+        // "base advanced" — a false positive. Omit the count instead (suppressed
+        // advisory 4682).
+        if (beforeSha) {
+          const ahead = runGit(['rev-list', '--count', `${beforeSha}..FETCH_HEAD`], { cwd: workspaceDir, env: gitEnv });
+          const n = ahead.status === 0 ? parseInt((ahead.stdout || '').trim(), 10) : 0;
+          if (Number.isFinite(n) && n > 0) {
+            out.baseAdvanced = n;
+            const shaNote = ` [base '${baseBranch}': ${beforeSha.slice(0, 12)} → ${fetchedSha ? fetchedSha.slice(0, 12) : '(unknown)'}]`;
+            log.warn?.(`finalizeGit${corr ? ' (' + corr + ')' : ''}: remote base '${baseBranch}' advanced ${n} commit(s) since clone${shaNote} — pushing branch '${workingBranch}'${workingBranch === baseBranch ? ' (which IS the base — a non-ff reject would strand the commits)' : ''}`);
+          }
+        } else {
+          log.debug?.(`finalizeGit${corr ? ' (' + corr + ')' : ''}: no clone-time snapshot for base '${baseBranch}' (origin/${baseBranch} absent at clone) — skipping the base-advanced count to avoid a false positive`);
         }
       } else {
         // The pre-push staleness diagnostic disappears exactly when the best-effort
@@ -6528,6 +6595,12 @@ function buildResultEnvelope(result, { sandbox, image, git, result: agentResult,
     // signal, and `strandedCommits` carries the SHAs to recover (see README).
     if (git.pushFailed) env.pushFailed = true;
     if (git.strandedCommits && git.strandedCommits.length) env.strandedCommits = git.strandedCommits;
+    // Forward the branch-mismatch detail too (thread 6530): for a branch-mismatch
+    // refusal the README/finalizeGit contract lists `branchMismatch` as part of the
+    // envelope, and it is the only field carrying the expected-vs-actual ref a
+    // consumer needs to route recovery — the SHAs alone don't say which ref they sit
+    // on. Without this the mismatch reason is dropped from io.nanobpm.agentResult.
+    if (git.branchMismatch) env.branchMismatch = git.branchMismatch;
     if (git.pr) env.pr = git.pr;
     if (git.error) env.gitError = git.error;
   }
@@ -8736,19 +8809,23 @@ async function workAgent(req, flags) {
             // as the failure detail when there is no push error string.
             const stranded = gitResult.strandedCommits && gitResult.strandedCommits.length ? gitResult.strandedCommits : (gitResult.commits || []);
             // Label the stranded commits with the ref they ACTUALLY sit on. For a
-            // branch mismatch that is `branchMismatch.actual` (the ref the harness
-            // moved HEAD to, or '(detached)'), NOT the expected work branch — the
-            // commits were made off `actual`, so naming the expected branch would
-            // send recovery to the wrong ref. Fall back to the work branch for a
-            // plain (non-mismatch) push failure.
+            // branch mismatch where HEAD moved that is `branchMismatch.actual` (the
+            // ref the harness moved HEAD to, or '(detached)'); for the off-branch
+            // case (HEAD returned to the work branch, `offBranch` set, actual null)
+            // the commits sit on ANOTHER local branch — render neutral wording, NOT
+            // '(detached)', which would misdescribe them (suppressed advisory 8746).
+            // Fall back to the work branch for a plain (non-mismatch) push failure.
             const strandedRef = gitResult.branchMismatch
-              ? (gitResult.branchMismatch.actual || '(detached)')
+              ? (gitResult.branchMismatch.actual
+                  || (gitResult.branchMismatch.offBranch ? '(another local branch)' : '(detached)'))
               : gitResult.branch;
             const shaNote = stranded.length ? ` — ${stranded.length} commit(s) on branch '${strandedRef}' are UNPUSHED and will be lost, no PR [stranded: ${stranded.join(', ')}]` : '';
             const corr = `instance ${job.processInstanceKey ?? '-'}/elem ${job.elementInstanceKey ?? '-'}`;
             const failDetail = gitResult.pushError
               || (gitResult.branchMismatch
-                ? `HEAD moved to '${gitResult.branchMismatch.actual || '(detached)'}' off work branch '${gitResult.branchMismatch.expected}' — refused to push stale work`
+                ? (gitResult.branchMismatch.offBranch
+                    ? `commits were left on another local branch (HEAD returned to work branch '${gitResult.branchMismatch.expected}') — refused to push stale work`
+                    : `HEAD moved to '${gitResult.branchMismatch.actual || '(detached)'}' off work branch '${gitResult.branchMismatch.expected}' — refused to push stale work`)
                 : 'push not attempted');
             logger.error(`[${jobType}] job ${job.jobKey} (${corr}): branch push FAILED${shaNote} — ${failDetail}`);
           }

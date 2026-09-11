@@ -1071,6 +1071,23 @@ test('buildResultEnvelope merges the git block when a repo was provisioned', () 
   assert.equal(rejected.pushed, false);
   assert.equal(rejected.pushFailed, true, 'pushFailed survives into the envelope');
   assert.deepEqual(rejected.strandedCommits, ['ccc', 'ddd'], 'strandedCommits survive into the envelope');
+
+  // A branch-mismatch refusal carries a branchMismatch detail; it must ride into
+  // the envelope too so a consumer can route recovery on the WHERE, not just the
+  // WHAT, of the stranded work (#231, thread 6530).
+  const mismatched = buildResultEnvelope(
+    { ok: true, stdout: 'done', exitCode: 0 },
+    { sandbox: 'none', git: { remote: 'https://github.com/o/r.git', branch: 'feat/x', baseSha: 'aaa', headSha: 'aaa', commits: [], pushed: false, pushFailed: true, strandedCommits: ['bbb'], branchMismatch: { expected: 'feat/x', actual: 'main' } } },
+  );
+  assert.equal(mismatched.pushFailed, true);
+  assert.deepEqual(mismatched.strandedCommits, ['bbb']);
+  assert.deepEqual(mismatched.branchMismatch, { expected: 'feat/x', actual: 'main' }, 'branchMismatch survives into the envelope');
+
+  const noMismatch = buildResultEnvelope(
+    { ok: true, stdout: 'done', exitCode: 0 },
+    { sandbox: 'none', git: { remote: 'https://github.com/o/r.git', branch: 'feat/x', baseSha: 'aaa', headSha: 'bbb', commits: ['bbb'], pushed: true } },
+  );
+  assert.equal('branchMismatch' in noMismatch, false, 'no branchMismatch key on a clean push');
 });
 
 // --- Structured agent result channel ($AGENT_RESULT_FILE + fallback) ---------
@@ -1716,6 +1733,76 @@ test('finalizeGit strands commits the harness made off the work branch even when
     assert.deepEqual(out.strandedCommits, [strayedSha], 'the off-branch commit SHA is surfaced for recovery');
     assert.equal(out.branchMismatch.expected, 'feat/work');
     assert.equal(out.branchMismatch.actual, null, 'HEAD is back on the work branch, so there is no distinct current branch to report');
+  } finally {
+    rmSync(root, { recursive: true, force: true });
+  }
+});
+
+test('finalizeGit PUSHES the work branch when the harness committed on it but left HEAD on the base (issue #231, thread 4601)', { skip: !gitOk }, () => {
+  const { root, origin } = makeOriginRepo();
+  const runDir = mkdtempSync(join(root, 'run-'));
+  try {
+    const envelope = {
+      schemaVersion: 1,
+      repository: { provider: 'github', url: origin, submodules: false },
+      branch: { base: 'main', create: 'feat/work', push: true },
+      setup: { commands: [], env: {}, secretRefs: [] },
+      task: { allowPr: false },
+    };
+    const prov = provisionRepo({ envelope, token: null, runDir });
+    assert.equal(prov.workingBranch, 'feat/work');
+    const startSha = g(['rev-parse', 'HEAD'], prov.workspaceDir);
+    // The harness commits ON the work branch (the intended output)...
+    writeFileSync(join(prov.workspaceDir, 'work.txt'), 'work\n');
+    g(['add', '-A'], prov.workspaceDir);
+    g(['-c', 'user.name=nano', '-c', 'user.email=nano@example.com', 'commit', '-q', '-m', 'real work on the work branch'], prov.workspaceDir);
+    const workSha = g(['rev-parse', 'HEAD'], prov.workspaceDir);
+    // ...then leaves HEAD back on the untouched base. `startSha..HEAD` is empty and
+    // the work branch is excluded from offBranchStray, so the OLD gate skipped BOTH
+    // the push AND the preservation path — the only copy of the work was reaped with
+    // the workspace. finalizeGit must instead push the work branch by name: it holds
+    // exactly the intended commits, so publishing it loses nothing and strands nothing.
+    g(['checkout', '-B', 'main', 'origin/main'], prov.workspaceDir);
+    assert.equal(g(['rev-parse', 'HEAD'], prov.workspaceDir), startSha, 'HEAD is back at the base tip (empty startSha..HEAD)');
+
+    const out = finalizeGit({ ...prov, envelope, token: null });
+    assert.equal(out.pushed, true, 'the work branch is published even though HEAD moved off it');
+    assert.ok(!out.pushFailed, 'no strand — all new work is on the pushable work branch');
+    assert.equal(out.strandedCommits, undefined, 'nothing is stranded');
+    assert.equal(
+      g(['-c', 'safe.bareRepository=all', 'rev-parse', '--verify', 'refs/heads/feat/work'], origin),
+      workSha,
+      'origin/feat/work now carries the work commit',
+    );
+  } finally {
+    rmSync(root, { recursive: true, force: true });
+  }
+});
+
+test('provisionRepo cuts a fallback when a DETACHED repository.sha names a real remote branch via ref + branch.create (issue #231, thread 4344)', { skip: !gitOk }, () => {
+  const { root, origin } = makeOriginRepo();
+  const peek = mkdtempSync(join(root, 'peek-'));
+  g(['clone', '-q', origin, peek], undefined);
+  const mainSha = g(['rev-parse', 'HEAD'], peek);
+  const runDir = mkdtempSync(join(root, 'run-'));
+  try {
+    const envelope = {
+      schemaVersion: 1,
+      // repository.sha pins the tip → HEAD is DETACHED (checkedOut/unbornBranch both
+      // null) and there is NO branch.base. ref='main' + branch.create='main' means
+      // the create NAMES a real remote branch (refs/remotes/origin/main resolves), so
+      // honouring `checkout -B main` would commit + push directly onto the base. The
+      // detached-tag path must NOT justify this: fold the remote-branch ref into the
+      // effective base and cut a fallback instead.
+      repository: { provider: 'github', url: origin, ref: 'main', sha: mainSha, submodules: false },
+      branch: { create: 'main', push: true },
+      setup: { commands: [], env: {}, secretRefs: [] },
+      task: { allowPr: false },
+    };
+    const prov = provisionRepo({ envelope, token: null, runDir });
+    assert.equal(prov.fallbackBranch, true, 'a detached ref that names a remote branch is treated as the base');
+    assert.notEqual(prov.workingBranch, 'main', 'never commits directly on the base');
+    assert.match(prov.workingBranch, /^nano\/agent-work\/main-/, 'fallback is namespaced off the base branch');
   } finally {
     rmSync(root, { recursive: true, force: true });
   }

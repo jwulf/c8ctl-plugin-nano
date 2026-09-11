@@ -1234,6 +1234,41 @@ test('provisionRepo reports detached HEAD (tag ref, no create) and finalizeGit s
   }
 });
 
+test('provisionRepo warns (correlated) that the agent commits DIRECTLY on a symbolic checkout with no branch.create (#229)', { skip: !gitOk }, () => {
+  const { root, origin } = makeOriginRepo();
+  const runDir = mkdtempSync(join(root, 'run-'));
+  const warnings = [];
+  try {
+    // A branch ref (not a tag/sha) with NO branch.create: the clone lands on a
+    // real symbolic branch, so workingBranch is that branch and the agent would
+    // commit directly onto it — the acceptance-critical 20974 direct-branch case.
+    const envelope = {
+      schemaVersion: 1,
+      repository: { provider: 'github', url: origin, ref: 'main', submodules: false },
+      branch: { base: 'main', create: '', push: true },
+      setup: { commands: [], env: {}, secretRefs: [] },
+      task: { allowPr: true },
+    };
+    const prov = provisionRepo({
+      envelope,
+      token: null,
+      runDir,
+      logger: { warn: (m) => warnings.push(m), info: () => {} },
+      corr: 'job 1 eik 2 pik 3',
+    });
+    assert.equal(prov.workingBranch, 'main', 'a symbolic branch checkout keeps its branch');
+    assert.notEqual(prov.detached, true, 'not detached — it is a real branch');
+    assert.ok(
+      warnings.some((m) => /commit DIRECTLY on the checked-out branch 'main'/.test(m)
+        && /no PR branch/.test(m)
+        && /\[job 1 eik 2 pik 3\]/.test(m)),
+      'warns (with correlation) that commits land directly on the checked-out branch with no PR branch',
+    );
+  } finally {
+    rmSync(root, { recursive: true, force: true });
+  }
+});
+
 test('finalizeGit pushes the first commit into an empty repo (no base sha)', { skip: !gitOk }, () => {
   const root = mkdtempSync(join(tmpdir(), 'nano-git-'));
   const origin = join(root, 'origin.git');
@@ -1706,6 +1741,56 @@ test('finalizeGit reports baseAdvanced + push failure when the remote branch mov
     assert.ok(
       errors.some((m) => /push of branch 'feat\/work' FAILED/.test(m) && /unpushed on branch 'feat\/work'/.test(m) && /\[job 7 eik 8 pik 9\]/.test(m)),
       'emits a correlated error line naming the unpushed commits on the feature branch',
+    );
+  } finally {
+    rmSync(root, { recursive: true, force: true });
+  }
+});
+
+test('finalizeGit emits the loud LOST (no PR) signal when branch.create equals the base (#229)', { skip: !gitOk }, () => {
+  const { root, origin } = makeOriginRepo();
+  const runDir = mkdtempSync(join(root, 'run-'));
+  try {
+    // { base:'main', create:'main' }: `checkout -B main` leaves the agent on the
+    // base branch itself, so there is NO separate PR branch — a failed push LOSES
+    // the commits and must keep the loud "(no PR)" signal, not the weaker
+    // "unpushed on branch" wording.
+    const envelope = {
+      schemaVersion: 1,
+      repository: { provider: 'github', url: origin, submodules: false },
+      branch: { base: 'main', create: 'main', push: true },
+      setup: { commands: [], env: {}, secretRefs: [] },
+      task: { allowPr: true },
+    };
+    const prov = provisionRepo({ envelope, token: null, runDir });
+    assert.equal(prov.workingBranch, 'main', 'create===base leaves the agent on the base branch');
+    writeFileSync(join(prov.workspaceDir, 'AGENT.txt'), 'agent change\n');
+    g(['add', '-A'], prov.workspaceDir);
+    g(['commit', '-q', '-m', 'agent: add AGENT.txt'], prov.workspaceDir);
+
+    // Advance origin/main independently so the agent's push is non-fast-forward.
+    const rival = mkdtempSync(join(root, 'rival-'));
+    g(['clone', '-q', origin, rival], undefined);
+    writeFileSync(join(rival, 'RIVAL.txt'), 'rival change\n');
+    g(['add', '-A'], rival);
+    g(['-c', 'user.name=rival', '-c', 'user.email=rival@example.com', 'commit', '-q', '-m', 'rival: add RIVAL.txt'], rival);
+    g(['push', '-q', 'origin', 'main'], rival);
+
+    const errors = [];
+    const out = finalizeGit({
+      workspaceDir: prov.workspaceDir,
+      gitEnv: prov.gitEnv,
+      startSha: prov.startSha,
+      workingBranch: prov.workingBranch,
+      envelope,
+      token: null,
+      logger: { warn: () => {}, error: (m) => errors.push(m), info: () => {} },
+      corr: 'job 4 eik 5 pik 6',
+    });
+    assert.equal(out.pushed, false, 'a non-fast-forward push is rejected');
+    assert.ok(
+      errors.some((m) => /will be LOST \(no PR\)/.test(m) && /\[job 4 eik 5 pik 6\]/.test(m)),
+      'create===base keeps the loud LOST (no PR) signal even though branch.create is set',
     );
   } finally {
     rmSync(root, { recursive: true, force: true });

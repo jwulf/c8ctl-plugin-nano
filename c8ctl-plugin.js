@@ -4488,13 +4488,16 @@ function finalizeGit({ workspaceDir, gitEnv, startSha, workingBranch, envelope, 
       out.pushError = describeGitFailure('git push', push, { token, timeoutMs: pushTimeoutMs });
       // #229: elevate the push failure out of the terse info line — commits are
       // unpushed and this is the loud signal that was missing. The "will be LOST
-      // (no PR)" wording only holds when there is genuinely no PR branch. Base that
-      // solely on `branch.create` (an explicit feature branch that holds the
-      // commits): `task.allowPr` only enables PR *reconciliation* — it does NOT
-      // create a branch, so an allowPr job that is on the base branch with no
-      // `branch.create` still loses its commits on a failed push and must keep the
-      // loud "(no PR)" signal.
-      const hasPrBranch = !!envelope.branch?.create;
+      // (no PR)" wording only holds when there is genuinely no PR branch. A
+      // `branch.create` only shields the commits when it is a DISTINCT branch from
+      // the base: `{ base:'main', create:'main' }` does `checkout -B main` and
+      // leaves the agent committing directly on the base, so there is NO separate
+      // PR branch and a failed push still LOSES the commits. `task.allowPr` only
+      // enables PR *reconciliation* — it does NOT create a branch — so it is not
+      // part of this decision. Treat create===base (and no create) as "no PR
+      // branch" and keep the loud signal.
+      const effectiveBase = envelope.branch?.base || '';
+      const hasPrBranch = !!envelope.branch?.create && workingBranch !== effectiveBase;
       const lossNote = hasPrBranch
         ? `${out.commits.length} commit(s) are unpushed on branch '${workingBranch}'`
         : `${out.commits.length} commit(s) are unpushed and will be LOST (no PR)`;
@@ -7832,7 +7835,7 @@ async function workAgent(req, flags) {
   // connection instead of a per-process channel.
   /** @type {import('./supervisor.dist.js').AgenticEndpoint | null} */
   let agenticEndpoint = null;
-  /** @type {{ register: () => void, deregister: (reason?: string) => void, relaySessionFor: (jobKey: string|number) => (object|null) } | null} */
+  /** @type {{ register: () => void, deregister: (reason?: string) => void, relaySessionFor: (jobKey: string|number, extra?: { elementInstanceKey?: string|number, processInstanceKey?: string|number, agentInstanceKey?: string|number }) => (object|null) } | null} */
   let agenticPlane = null;
   // The presence attributes this worker announces on `register` (ENROLMENT
   // attributes, not routing tokens — jobKeys are carried by the explicit
@@ -8257,7 +8260,10 @@ async function workAgent(req, flags) {
             if (isContainer) liveRunIds.delete(runId);
             const retries = Math.max(0, (Number(job.retries) || 1) - 1);
             const msg = err instanceof ProvisionError ? err.message : `provisioning error: ${err.message}`;
-            logger.warn(`[${jobType}] job ${job.jobKey} not provisioned — ${msg}; retries left ${retries}`);
+            // #229: include the correlation keys — a clone/checkout failure occurs
+            // before provisionRepo reaches either branch-decision log, so this is the
+            // ONLY git-provisioning signal and must be joinable to the other channels.
+            logger.warn(`[${jobType}] job ${job.jobKey} not provisioned (${aiCorr}) — ${msg}; retries left ${retries}`);
             return settleJob.fail({ errorMessage: msg.slice(0, 2000), retries, retryBackOff: 15_000 });
           }
         } else if (!isContainer) {
@@ -8290,6 +8296,9 @@ async function workAgent(req, flags) {
 
         let result;
         let gitResult = null;
+        // #229: a finalizeGit throw is an ERROR outcome even though `result.ok` was
+        // true — track it so the relay close reason below is 'error', not 'normal'.
+        let gitFinalizeFailed = false;
         // #229: track whether the run + finalization actually ran to completion. The
         // relay close reason must NOT be inferred from `result` alone: if
         // runAgentJob (or any later step) throws before `result` is assigned, the
@@ -8453,12 +8462,19 @@ async function workAgent(req, flags) {
               });
             } catch (err) {
               gitResult = { remote: provisioned.remote, branch: provisioned.workingBranch, baseSha: provisioned.startSha || null, commits: [], pushed: false, error: redactToken(err.message, repoToken) };
+              // #229: a finalizeGit throw is an ERROR outcome, not a clean end.
+              // Keep runCompleted false so the relay close reason is 'error' (not
+              // 'normal'), and surface the redacted cause with correlation keys —
+              // this catch would otherwise be the only silent git-failure path.
+              gitFinalizeFailed = true;
+              logger.error(`[${jobType}] job ${job.jobKey} git finalize threw (${aiCorr}) — ${gitResult.error}`);
             }
           } else if (provisioned) {
             gitResult = { remote: provisioned.remote, branch: provisioned.workingBranch, baseSha: provisioned.startSha || null, commits: [], pushed: false };
           }
-          // Reached the end of the run + finalization without throwing.
-          runCompleted = true;
+          // Reached the end of the run + finalization without throwing. A git
+          // finalization error keeps this false so the relay close is 'error'.
+          runCompleted = !gitFinalizeFailed;
         } finally {
           if (isContainer) liveRunIds.delete(runId);
           // #205: clear the in-flight job marker now the harness has stopped — the

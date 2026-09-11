@@ -410,6 +410,12 @@ export function createHostRelaySession({ instance, jobKey, publish, subscribeSte
   // which go through relay() directly). The first update proves the relay is live.
   const relayUpdate = (chunk) => {
     if (chunk == null) return;
+    // #229: once close() has emitted RELAY_CLOSE_CHUNK, the close marker must stay
+    // terminal and the logged totals stable. A one-shot/ACP capture can resolve on
+    // timeout/abort before the child's final close event, after which workAgent
+    // closes the relay; a late data event arriving here would otherwise publish
+    // after the close marker and bump updateCount/byteCount past the close summary.
+    if (closed) return;
     const text = typeof chunk === 'string'
       ? chunk
       : Buffer.isBuffer(chunk)

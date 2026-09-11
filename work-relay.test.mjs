@@ -464,6 +464,24 @@ test('createHostRelaySession publishes transcript text and brackets it with life
   assert.equal(published[published.length - 1], RELAY_CLOSE_CHUNK);
 });
 
+test('createHostRelaySession: a late update after close is a no-op (close marker stays terminal, counts stable)', async () => {
+  const published = [];
+  const session = createHostRelaySession({
+    instance: 'senior-1',
+    jobKey: '42',
+    publish: (text) => published.push(text),
+  });
+  session.relay('early');
+  const res = await session.close();
+  assert.equal(res.updates, 1, 'one update counted before close');
+  // A late data event (one-shot/ACP capture resolved on timeout/abort before the
+  // child's final close) must NOT publish after the close marker or bump counts.
+  session.relay('late-after-close');
+  assert.equal(published[published.length - 1], RELAY_CLOSE_CHUNK, 'close marker remains the terminal frame');
+  assert.ok(!published.includes('late-after-close'), 'a post-close update never publishes');
+  assert.equal((await session.close()).updates, 1, 'the logged update total is unchanged by the late event');
+});
+
 test('createHostRelaySession normalizes Buffer/Uint8Array chunks to utf8 text', () => {
   const published = [];
   const session = createHostRelaySession({

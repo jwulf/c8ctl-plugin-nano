@@ -1592,6 +1592,72 @@ test('finalizeGit refuses to push when the harness moved HEAD off the work branc
   }
 });
 
+test('finalizeGit reports a detached-HEAD harness move as detached, not a branch literally named HEAD (issue #231, thread 4574)', { skip: !gitOk }, () => {
+  const { root, origin } = makeOriginRepo();
+  const runDir = mkdtempSync(join(root, 'run-'));
+  try {
+    const envelope = {
+      schemaVersion: 1,
+      repository: { provider: 'github', url: origin, submodules: false },
+      branch: { base: 'main', create: 'feat/work', push: true },
+      setup: { commands: [], env: {}, secretRefs: [] },
+      task: { allowPr: false },
+    };
+    const prov = provisionRepo({ envelope, token: null, runDir });
+    assert.equal(prov.workingBranch, 'feat/work');
+    // The harness DETACHES HEAD (e.g. `git checkout <sha>`) and commits there —
+    // `git rev-parse --abbrev-ref HEAD` then echoes the literal 'HEAD'. That must
+    // be normalized to the detached state, not recorded as a branch named 'HEAD'.
+    g(['checkout', '-q', '--detach', 'HEAD'], prov.workspaceDir);
+    writeFileSync(join(prov.workspaceDir, 'stray.txt'), 'stray\n');
+    g(['add', '-A'], prov.workspaceDir);
+    g(['-c', 'user.name=nano', '-c', 'user.email=nano@example.com', 'commit', '-q', '-m', 'stray work on detached HEAD'], prov.workspaceDir);
+    const strayedSha = g(['rev-parse', 'HEAD'], prov.workspaceDir);
+
+    const out = finalizeGit({ ...prov, envelope, token: null });
+    assert.equal(out.pushFailed, true, 'a HEAD move off the work branch is a preserved failure');
+    assert.deepEqual(out.branchMismatch, { expected: 'feat/work', actual: null }, "the detached sentinel is normalized to null, not the string 'HEAD'");
+    assert.deepEqual(out.strandedCommits, [strayedSha], 'the at-risk commit is surfaced for recovery');
+  } finally {
+    rmSync(root, { recursive: true, force: true });
+  }
+});
+
+test('finalizeGit measures base advance against the CLONE-TIME base SHA even if the harness re-fetched the base (issue #231/#229, thread 4600)', { skip: !gitOk }, () => {
+  const { root, origin } = makeOriginRepo();
+  const runDir = mkdtempSync(join(root, 'run-'));
+  try {
+    const envelope = {
+      schemaVersion: 1,
+      repository: { provider: 'github', url: origin, submodules: false },
+      branch: { base: 'main', create: '', push: true },
+      setup: { commands: [], env: {}, secretRefs: [] },
+      task: { allowPr: false },
+    };
+    const prov = provisionRepo({ envelope, token: null, runDir });
+    assert.equal(prov.fallbackBranch, true);
+    assert.equal(g(['rev-parse', '--verify', 'refs/remotes/origin/main'], prov.workspaceDir), prov.baseCloneSha, 'provisionRepo snapshots the clone-time base SHA');
+
+    // The base advances on the remote AND the harness itself fetches it, moving the
+    // clone's own `refs/remotes/origin/main` forward. A finalize that re-read that
+    // remote-tracking ref now would see the advanced tip and report a ZERO advance;
+    // anchoring on the captured clone-time SHA must still see the real advance.
+    advanceOrigin(root, origin, 'main');
+    g([...['fetch', '-q', 'origin', 'main']], prov.workspaceDir);
+    assert.notEqual(g(['rev-parse', '--verify', 'refs/remotes/origin/main'], prov.workspaceDir), prov.baseCloneSha, 'the harness advanced the clone-local base ref');
+
+    writeFileSync(join(prov.workspaceDir, 'work.txt'), 'work\n');
+    g(['add', '-A'], prov.workspaceDir);
+    g(['-c', 'user.name=nano', '-c', 'user.email=nano@example.com', 'commit', '-q', '-m', 'slice work'], prov.workspaceDir);
+
+    const out = finalizeGit({ ...prov, envelope, token: null });
+    assert.equal(out.baseAdvanced, 1, 'the clone-time anchor still detects the base advance the harness would have masked');
+    assert.equal(out.pushed, true, 'a fresh work branch still fast-forwards');
+  } finally {
+    rmSync(root, { recursive: true, force: true });
+  }
+});
+
 test('provisionRepo honours branch.create equal to a TAG ref instead of silently skipping the push (issue #231, suppressed 4337)', { skip: !gitOk }, () => {
   const { root, origin } = makeOriginRepo();
   const tagClone = mkdtempSync(join(root, 'tag-'));

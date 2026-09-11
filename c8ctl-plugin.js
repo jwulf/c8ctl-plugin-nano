@@ -4372,7 +4372,13 @@ function provisionRepo({ envelope, token, runDir, runId, timeoutMs = 120_000, co
     const cb = runGit(['checkout', '-B', explicitCreate], { cwd: workspaceDir, env: gitEnv, timeoutMs });
     if (cb.status !== 0) throw new ProvisionError(describeGitFailure(`git checkout -B ${explicitCreate}`, cb, { token, timeoutMs }));
     workingBranch = explicitCreate;
-    log.debug?.(`provisionRepo${cx}: branch.create=${workingBranch} → cut work branch off base '${baseBranchName || '(unknown)'}'`);
+    // An explicit branch.create that NAMES the effective base reaches here only
+    // with push DISABLED (the push-enabled base-equal case is routed to a fallback
+    // by the guard above). The agent still commits DIRECTLY on the base, so emit
+    // the same base-branch warning the omitted-create read-only path does — a
+    // debug-only line would leave this misconfiguration silent at normal verbosity.
+    if (workingBranch === effectiveBase) log.warn?.(`provisionRepo${cx}: branch.create='${workingBranch}' IS the effective base and push is disabled → any commits land directly on the base branch (not pushed, but this throwaway workspace is reaped)`);
+    else log.debug?.(`provisionRepo${cx}: branch.create=${workingBranch} → cut work branch off base '${baseBranchName || '(unknown)'}'`);
   } else if (checkedOut && wantPush) {
     // Either no branch.create, OR an explicit create that NAMES the effective base
     // while pushing — both would otherwise commit on the base, so cut a fallback.
@@ -4408,10 +4414,23 @@ function provisionRepo({ envelope, token, runDir, runId, timeoutMs = 120_000, co
     }
   }
   const sha = runGit(['rev-parse', 'HEAD'], { cwd: workspaceDir, env: gitEnv });
+  // Capture the base ref's SHA AT CLONE TIME (issue #229/#231 observability): the
+  // harness runs arbitrary code between here and finalizeGit and can itself advance
+  // `refs/remotes/origin/<base>` (e.g. its own `git fetch`), so finalizeGit's
+  // staleness check must compare the post-run base tip against THIS snapshot, not a
+  // value re-read after the harness ran (which would misreport a real base advance
+  // as zero). Best-effort — null when there is no remote-tracking base (a
+  // single-branch clone of a different ref), in which case finalizeGit anchors on
+  // the clone-time HEAD instead.
+  let baseCloneSha = null;
+  if (effectiveBase && !effectiveBase.startsWith('-')) {
+    const br = runGit(['rev-parse', '--verify', '--quiet', `refs/remotes/origin/${effectiveBase}`], { cwd: workspaceDir, env: gitEnv });
+    baseCloneSha = br.status === 0 ? ((br.stdout || '').trim() || null) : null;
+  }
   // `git rev-parse HEAD` on an unborn branch (freshly cloned empty repo) exits
   // non-zero and echoes the literal "HEAD" on stdout — treat that as "no base
   // commit" (empty startSha) rather than a bogus revision.
-  return { workspaceDir, gitEnv, committer, startSha: sha.status === 0 ? (sha.stdout || '').trim() : '', workingBranch, fallbackBranch, baseBranch: effectiveBase || null, detached: !workingBranch, ref: commitSha || branchName || '', base, baseFetchError, remote: redactToken(repo.url, token) };
+  return { workspaceDir, gitEnv, committer, startSha: sha.status === 0 ? (sha.stdout || '').trim() : '', workingBranch, fallbackBranch, baseBranch: effectiveBase || null, baseCloneSha, detached: !workingBranch, ref: commitSha || branchName || '', base, baseFetchError, remote: redactToken(repo.url, token) };
 }
 
 // Look up a PR for this branch (2a does NOT open it — the harness does, driven
@@ -4539,7 +4558,7 @@ function shouldPreserveRunDir(gitResult) {
 // branch.push), and reconcile the agent-opened PR (when task.allowPr). A push
 // failure is reported (pushError) rather than thrown — the process model decides
 // what to do next, and re-running the agent would be non-idempotent.
-function finalizeGit({ workspaceDir, gitEnv, startSha, workingBranch, baseBranch: effectiveBase, envelope, token, corr = '' }) {
+function finalizeGit({ workspaceDir, gitEnv, startSha, workingBranch, baseBranch: effectiveBase, baseCloneSha = null, envelope, token, corr = '' }) {
   const out = { branch: workingBranch, baseSha: startSha || null, headSha: null, commits: [], pushed: false, remote: null, pr: null };
   const rem = runGit(['remote', 'get-url', 'origin'], { cwd: workspaceDir, env: gitEnv });
   if (rem.status === 0) out.remote = redactToken(rem.stdout.trim(), token);
@@ -4571,7 +4590,13 @@ function finalizeGit({ workspaceDir, gitEnv, startSha, workingBranch, baseBranch
     // preserved result: surface the stranded SHAs, skip the misdirected push (and,
     // via pushFailed, the PR reconcile) so the recovery handle survives.
     const headBranchNow = runGit(['rev-parse', '--abbrev-ref', 'HEAD'], { cwd: workspaceDir, env: gitEnv });
-    const currentBranch = headBranchNow.status === 0 ? ((headBranchNow.stdout || '').trim()) : '';
+    const rawHeadBranch = headBranchNow.status === 0 ? ((headBranchNow.stdout || '').trim()) : '';
+    // `git rev-parse --abbrev-ref HEAD` echoes the literal 'HEAD' for a DETACHED
+    // checkout, so normalize that sentinel to '' — otherwise the harness detaching
+    // HEAD would record `branchMismatch.actual: 'HEAD'` and the completion error
+    // would claim it "moved to a branch named HEAD" instead of identifying the
+    // detached state (branchMismatch.actual: null / '(detached)').
+    const currentBranch = (rawHeadBranch && rawHeadBranch !== 'HEAD') ? rawHeadBranch : '';
     if (currentBranch !== workingBranch) {
       out.pushFailed = true;
       out.strandedCommits = out.commits.slice();
@@ -4593,11 +4618,19 @@ function finalizeGit({ workspaceDir, gitEnv, startSha, workingBranch, baseBranch
       // begins with '-' is not a valid branch name anyway, so refuse it outright.
       log.debug?.(`finalizeGit${corr ? ' (' + corr + ')' : ''}: skipping pre-push staleness check — base ref '${baseBranch}' is not a valid branch name (begins with '-')`);
     } else if (baseBranch) {
-      // Capture the base SHA transition (issue #229 observability): where the base
-      // pointed before the fetch and where it points after, so a concurrent remote
-      // advance can be tied to an exact ref movement, not just a bare count.
-      const beforeRef = runGit(['rev-parse', '--verify', '--quiet', `refs/remotes/origin/${baseBranch}`], { cwd: workspaceDir, env: gitEnv });
-      const beforeSha = beforeRef.status === 0 ? ((beforeRef.stdout || '').trim() || null) : null;
+      // Anchor the staleness range at a CLONE-TIME snapshot of the base. Prefer
+      // the SHA captured during provisioning (`baseCloneSha`): the harness runs
+      // between provision and finalize and can itself advance
+      // `refs/remotes/origin/<base>` (e.g. its own `git fetch`), so re-reading that
+      // remote-tracking ref HERE would no longer be the clone-time value and a real
+      // base advance during the run would misreport as zero. Fall back to reading
+      // the remote-tracking ref only for direct callers that do not thread the
+      // captured SHA.
+      let beforeSha = baseCloneSha;
+      if (!beforeSha) {
+        const beforeRef = runGit(['rev-parse', '--verify', '--quiet', `refs/remotes/origin/${baseBranch}`], { cwd: workspaceDir, env: gitEnv });
+        beforeSha = beforeRef.status === 0 ? ((beforeRef.stdout || '').trim() || null) : null;
+      }
       // Fetch the EXACT `refs/heads/<branch>` ref, not the bare name: git treats a
       // bare refspec beginning with '+' as the force-update prefix, so a valid
       // branch like '+release' would fetch the wrong ref and make the staleness
@@ -4613,9 +4646,12 @@ function finalizeGit({ workspaceDir, gitEnv, startSha, workingBranch, baseBranch
         // clone, so `beforeSha..FETCH_HEAD` counts exactly the commits the base
         // gained. `HEAD..FETCH_HEAD` would misreport this — a work branch rebased
         // onto the new base counts 0, while one that merely diverged counts
-        // unrelated commits. Fall back to `HEAD..FETCH_HEAD` only when there was no
-        // prior remote-tracking ref to anchor the range (beforeSha null).
-        const staleRange = beforeSha ? `${beforeSha}..FETCH_HEAD` : 'HEAD..FETCH_HEAD';
+        // unrelated commits. When there is no clone-time base ref to anchor on (a
+        // single-branch clone of a different ref ⇒ beforeSha null), fall back to the
+        // clone-time HEAD `startSha` — still a clone-time snapshot — rather than the
+        // POST-work HEAD, which would count harness divergence as base advance.
+        const staleAnchor = beforeSha || startSha || null;
+        const staleRange = staleAnchor ? `${staleAnchor}..FETCH_HEAD` : 'HEAD..FETCH_HEAD';
         const ahead = runGit(['rev-list', '--count', staleRange], { cwd: workspaceDir, env: gitEnv });
         const n = ahead.status === 0 ? parseInt((ahead.stdout || '').trim(), 10) : 0;
         if (Number.isFinite(n) && n > 0) {
@@ -8593,6 +8629,7 @@ async function workAgent(req, flags) {
                 startSha: provisioned.startSha,
                 workingBranch: provisioned.workingBranch,
                 baseBranch: provisioned.baseBranch,
+                baseCloneSha: provisioned.baseCloneSha,
                 envelope,
                 token: repoToken,
                 corr: jobCorr,
@@ -8655,7 +8692,16 @@ async function workAgent(req, flags) {
             // attempted, so no pushError) is reported too; use its `branchMismatch`
             // as the failure detail when there is no push error string.
             const stranded = gitResult.strandedCommits && gitResult.strandedCommits.length ? gitResult.strandedCommits : (gitResult.commits || []);
-            const shaNote = stranded.length ? ` — ${stranded.length} commit(s) on branch '${gitResult.branch}' are UNPUSHED and will be lost, no PR [stranded: ${stranded.join(', ')}]` : '';
+            // Label the stranded commits with the ref they ACTUALLY sit on. For a
+            // branch mismatch that is `branchMismatch.actual` (the ref the harness
+            // moved HEAD to, or '(detached)'), NOT the expected work branch — the
+            // commits were made off `actual`, so naming the expected branch would
+            // send recovery to the wrong ref. Fall back to the work branch for a
+            // plain (non-mismatch) push failure.
+            const strandedRef = gitResult.branchMismatch
+              ? (gitResult.branchMismatch.actual || '(detached)')
+              : gitResult.branch;
+            const shaNote = stranded.length ? ` — ${stranded.length} commit(s) on branch '${strandedRef}' are UNPUSHED and will be lost, no PR [stranded: ${stranded.join(', ')}]` : '';
             const corr = `instance ${job.processInstanceKey ?? '-'}/elem ${job.elementInstanceKey ?? '-'}`;
             const failDetail = gitResult.pushError
               || (gitResult.branchMismatch

@@ -769,7 +769,11 @@ the harness:
    generated fallback work branch `nano/agent-work/<base>-<runId>` so commits are
    never made directly on the base branch; the branch actually used (configured or
    generated) rides back in the result envelope (`branch`) and is exported to the
-   harness as `AGENT_REPO_BRANCH`;
+   harness as `AGENT_REPO_BRANCH`. **Exception — a detached tag/SHA checkout with
+   no `branch.create`:** with no symbolic branch (and no configured base) to name a
+   fallback from, it stays `branch: null` and its commits are **not** pushed even
+   when push is enabled — supply `branch.create` to publish work committed off a
+   tag/SHA base;
 4. set a **committer identity** on the workspace, preferring the operator's own
    (`GIT_AUTHOR_*` env → global `git config user.name/email` → the
    `gh`-authenticated GitHub user), and only falling back to `nano-agent` when

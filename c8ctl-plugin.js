@@ -3850,6 +3850,12 @@ function boundGitOutput(text, max = 500) {
   return `${s.slice(0, head)}${marker}${s.slice(s.length - tail)}`;
 }
 
+// Collapse every line-break / vertical-whitespace run into a single space so an
+// error string (git stderr/stdout, an SDK message) that carries CR/LF can never
+// split one correlated worker-log record into uncorrelated continuation lines
+// (remote git output is repository-controlled — a log-spoofing/dilution vector).
+const oneLineLog = (v) => String(v ?? '').replace(/[\r\n\t\f\v\u0085\u2028\u2029]+/g, ' ');
+
 // Build an informative, token-redacted failure reason from a runGit result.
 // Two things the old `stderr || stdout`.slice(0,500) message threw away:
 //   1. On a timeout Node SIGTERM-kills git (status→128, signal='SIGTERM') — say
@@ -4287,22 +4293,32 @@ function provisionRepo({ envelope, token, runDir, timeoutMs = 120_000, logger = 
   // finalizeGit skips the push/PR reconcile instead of pushing a bogus ref.
   let workingBranch = null;
   if (envelope.branch?.create) {
+    // Capture the branch the clone ACTUALLY checked out BEFORE we reset it with
+    // `-B`. When no ref/base was pinned (`branchName` empty) the clone lands on
+    // the remote's default branch (e.g. `main`); without this we could not tell
+    // that `branch.create` EQUALS that default, so the direct-on-base warning
+    // below would silently not fire. A tag/sha checkout is detached HEAD → 'HEAD',
+    // which never equals a real create target.
+    const preHead = runGit(['rev-parse', '--abbrev-ref', 'HEAD'], { cwd: workspaceDir, env: gitEnv });
+    const clonedBranch = (preHead.stdout || '').trim();
     const cb = runGit(['checkout', '-B', envelope.branch.create], { cwd: workspaceDir, env: gitEnv, timeoutMs });
     if (cb.status !== 0) throw new ProvisionError(describeGitFailure(`git checkout -B ${envelope.branch.create}`, cb, { token, timeoutMs }));
     workingBranch = envelope.branch.create;
     // #229: make the working-branch decision explicit. A `checkout -B` whose target
-    // is DISTINCT from the effective checkout base (`branchName` = repository.ref ||
-    // branch.base) genuinely cuts a feat branch — the agent's commits land on their
-    // own branch and a PR can be opened. But when `branch.create` EQUALS that base
-    // (e.g. `{ base:'main', create:'main' }`, or `repository.ref:'main'` +
-    // `create:'main'`) the `-B` just resets the base branch in place: the agent
-    // commits DIRECTLY on the base with no distinct PR branch, so a non-fast-forward
-    // push (the base advanced on the remote since clone) loses every commit — the
-    // same 20974 work-loss shape as the no-create path. Warn loudly in that case.
-    if (branchName && workingBranch === branchName) {
+    // is DISTINCT from the effective checkout base genuinely cuts a feat branch —
+    // the agent's commits land on their own branch and a PR can be opened. But when
+    // `branch.create` EQUALS that base the `-B` just resets the base branch in
+    // place: the agent commits DIRECTLY on the base with no distinct PR branch, so a
+    // non-fast-forward push (the base advanced on the remote since clone) loses every
+    // commit — the same 20974 work-loss shape as the no-create path. The effective
+    // base is `branchName` (repository.ref || branch.base) when pinned, else the
+    // branch the clone checked out (`clonedBranch`) so an UNPINNED `create:'main'`
+    // over a default-`main` clone is still caught. Warn loudly in that case.
+    const effectiveBase = branchName || (clonedBranch && clonedBranch !== 'HEAD' ? clonedBranch : '');
+    if (effectiveBase && workingBranch === effectiveBase) {
       logger?.warn?.(`git provision: branch.create='${envelope.branch.create}' equals the checkout base → agent will commit DIRECTLY on base branch '${workingBranch}'; no distinct PR branch — a non-fast-forward push (the branch advanced on the remote since clone) would lose every commit.${cs}`);
     } else {
-      logger?.info?.(`git provision: branch.create=${envelope.branch.create} → cut feat branch '${workingBranch}' off '${branchName || 'HEAD'}'.${cs}`);
+      logger?.info?.(`git provision: branch.create=${envelope.branch.create} → cut feat branch '${workingBranch}' off '${effectiveBase || 'HEAD'}'.${cs}`);
     }
   } else {
     const head = runGit(['rev-parse', '--abbrev-ref', 'HEAD'], { cwd: workspaceDir, env: gitEnv });
@@ -4447,7 +4463,7 @@ function postAgentAttribution({ workspaceDir, token, number, agentName = AGENT_A
 // branch.push), and reconcile the agent-opened PR (when task.allowPr). A push
 // failure is reported (pushError) rather than thrown — the process model decides
 // what to do next, and re-running the agent would be non-idempotent.
-function finalizeGit({ workspaceDir, gitEnv, startSha, workingBranch, envelope, token, logger = null, corr = '' }) {
+function finalizeGit({ workspaceDir, gitEnv, startSha, workingBranch, envelope, token, logger = null, corr = '', keepRuns = false }) {
   const cs = corr ? ` [${corr}]` : ''; // #229 cross-channel correlation suffix
   const out = { branch: workingBranch, baseSha: startSha || null, headSha: null, commits: [], pushed: false, remote: null, pr: null };
   const rem = runGit(['remote', 'get-url', 'origin'], { cwd: workspaceDir, env: gitEnv });
@@ -4517,10 +4533,20 @@ function finalizeGit({ workspaceDir, gitEnv, startSha, workingBranch, envelope, 
       // pins the base via `repository.ref` (e.g. ref:'main', create:'main').
       const effectiveBase = envelope.repository?.ref || envelope.branch?.base || '';
       const hasPrBranch = !!envelope.branch?.create && workingBranch !== effectiveBase;
+      // Even a DISTINCT `branch.create` only shields commits if they survive
+      // somewhere. With the default `keepRuns=false` the worker reaps `runDir` in
+      // its `finally`, so a failed push leaves the only copy of these commits in a
+      // throwaway workspace that is about to be deleted — they are LOST too, just
+      // via reaping rather than a missing PR branch. Only `--keep-runs` retains
+      // them. So the loud "will be LOST" signal applies to BOTH arms; the wording
+      // differs only in the cause (no PR branch vs. reaped workspace) and the
+      // `--keep-runs` escape hatch is called out when a PR branch exists.
       const lossNote = hasPrBranch
-        ? `${out.commits.length} commit(s) are unpushed on branch '${workingBranch}'`
+        ? (keepRuns
+          ? `${out.commits.length} commit(s) are unpushed on branch '${workingBranch}' and retained in the run workspace (--keep-runs)`
+          : `${out.commits.length} commit(s) are unpushed on branch '${workingBranch}' and will be LOST when the run workspace is reaped (re-run with --keep-runs to retain them)`)
         : `${out.commits.length} commit(s) are unpushed and will be LOST (no PR)`;
-      logger?.error?.(`git finalize: push of branch '${workingBranch}' FAILED — ${lossNote}: ${out.pushError}${cs}`);
+      logger?.error?.(`git finalize: push of branch '${workingBranch}' FAILED — ${lossNote}: ${oneLineLog(out.pushError)}${cs}`);
     }
   }
 
@@ -8198,7 +8224,7 @@ async function workAgent(req, flags) {
             if (active) {
               logger.info(`[${jobType}] AgentInstance producer active for external agent job (${aiCorr}).`);
             } else {
-              logger.info(`[${jobType}] AgentInstance producer unavailable for external agent job (${aiCorr}) — host SDK lacks createAgentInstance/updateAgentInstance or activation was rejected; continuing without a durable transcript (job completion unaffected).`);
+              logger.info(`[${jobType}] AgentInstance producer unavailable for external agent job (${aiCorr}) — activation not attempted or rejected: the host SDK lacks createAgentInstance/updateAgentInstance, the ACP classifier is unavailable, createAgentInstance returned no key, or the SDK rejected the create; continuing without a durable transcript (job completion unaffected).`);
             }
           } catch (err) {
             logger.warn(`[${jobType}] AgentInstance producer activate() threw (${aiCorr}) — ${err?.message || err}; continuing without a durable transcript (job completion unaffected).`);
@@ -8478,6 +8504,7 @@ async function workAgent(req, flags) {
                 token: repoToken,
                 logger,
                 corr: aiCorr,
+                keepRuns,
               });
             } catch (err) {
               gitResult = { remote: provisioned.remote, branch: provisioned.workingBranch, baseSha: provisioned.startSha || null, commits: [], pushed: false, error: redactToken(err.message, repoToken) };
@@ -8512,7 +8539,7 @@ async function workAgent(req, flags) {
           if (relaySession) {
             const relayCloseReason = result?.aborted
               ? 'job-killed'
-              : (!runCompleted || (result && result.ok === false) ? 'error' : 'normal');
+              : (!runCompleted || (result && result.ok === false) || gitResult?.pushError ? 'error' : 'normal');
             try { await relaySession.close(relayCloseReason); } catch { /* best effort */ }
           }
         }
@@ -8532,7 +8559,7 @@ async function workAgent(req, flags) {
             ? ` [${gitResult.branch ? `branch ${gitResult.branch}` : 'detached HEAD'}: ${gitResult.commits.length} commit(s), ${gitResult.branch ? (gitResult.pushed ? 'pushed' : (gitResult.pushError ? 'push FAILED' : 'not pushed')) : 'no branch to push'}${gitResult.pr?.found ? `, PR #${gitResult.pr.number}` : ''}]`
             : '';
           logger.info(`[${jobType}] job ${job.jobKey} complete (exit 0)${result.truncated ? ' [output truncated]' : ''}${gitNote}`);
-          if (gitResult?.pushError) logger.warn(`[${jobType}] job ${job.jobKey}: branch push failed (${aiCorr}) — ${gitResult.pushError}`);
+          if (gitResult?.pushError) logger.warn(`[${jobType}] job ${job.jobKey}: branch push failed (${aiCorr}) — ${oneLineLog(gitResult.pushError)}`);
           // Guard the operator against silent empty escalations: a success that
           // yields no *effective* result vars (no file/sentinel at all, an empty
           // `{}`, or only reserved keys that were sanitized away) means the

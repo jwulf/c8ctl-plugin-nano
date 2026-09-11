@@ -297,11 +297,11 @@ export function createAgentInstanceProducer(opts = {}) {
       if (isAppend && !appendFailureLogged) {
         appendFailureLogged = true;
         logger?.warn?.(
-          `AgentInstance producer: ${label} failed (${corr()}) — status ${status ?? 'unknown'}: ${message}; further append failures for this instance stay at debug.`,
+          `AgentInstance producer: ${label} failed (${corr()}) — status ${status ?? 'unknown'}: ${oneLine(message)}; further append failures for this instance stay at debug.`,
         );
       } else {
         logger?.debug?.(
-          `AgentInstance producer: ${label} failed (${corr()}) — status ${status ?? 'unknown'}: ${message}`,
+          `AgentInstance producer: ${label} failed (${corr()}) — status ${status ?? 'unknown'}: ${oneLine(message)}`,
         );
       }
     });
@@ -395,9 +395,9 @@ export function createAgentInstanceProducer(opts = {}) {
   const noteIngestFailure = (err) => {
     if (!ingestFailureLogged) {
       ingestFailureLogged = true;
-      logger?.warn?.(`AgentInstance producer: ingest failed (${corr()}) — ${err?.message || err}; further ingest failures for this instance stay at debug.`);
+      logger?.warn?.(`AgentInstance producer: ingest failed (${corr()}) — ${oneLine(err?.message || err)}; further ingest failures for this instance stay at debug.`);
     } else {
-      logger?.debug?.(`AgentInstance producer: ingest failed (${corr()}) — ${err?.message || err}`);
+      logger?.debug?.(`AgentInstance producer: ingest failed (${corr()}) — ${oneLine(err?.message || err)}`);
     }
   };
 

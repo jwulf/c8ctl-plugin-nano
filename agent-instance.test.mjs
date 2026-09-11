@@ -509,6 +509,33 @@ test('complete() logs a turn counter separating the 0-turns husk from a healthy 
   assert.match(line, /job 13954 eik EIK-7 pik 13951/);
 });
 
+test('complete(true) whose status→COMPLETED update is REJECTED reports the failed transition, not COMPLETED (#229)', async () => {
+  // The status update rides the best-effort queue whose catch swallows the
+  // rejection. Reject ONLY the terminal status update (not per-turn appends) so a
+  // 400/404 there can't masquerade as a healthy COMPLETED while the instance stays
+  // non-terminal — the exact husk-diagnosis regression the statusResolved gate
+  // guards against.
+  const client = fakeClient();
+  client.updateAgentInstance = async (req) => {
+    client.calls.update.push(req);
+    if (req.status === 'COMPLETED') throw { status: 409, message: 'lease expired' };
+    return { createdHistory: [] };
+  };
+  const logger = recordingLogger();
+  const p = makeProducer(client, { logger });
+  await p.activate();
+  p.ingest({ sessionUpdate: 'agent_message_chunk', content: { type: 'text', text: 'hi' } });
+  await p.complete(true);
+  const line = logger.lines.info.find((l) => l.includes('turn(s) appended'));
+  assert.ok(line, 'expected a turn-counter info line');
+  assert.match(line, /COMPLETED update FAILED — left non-terminal/);
+  assert.doesNotMatch(line, /status→COMPLETED\./);
+  assert.ok(
+    client.calls.update.some((r) => r.status === 'COMPLETED'),
+    'the status→COMPLETED update was attempted',
+  );
+});
+
 test('complete() counts appended turns (#229)', async () => {
   const client = fakeClient();
   const logger = recordingLogger();

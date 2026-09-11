@@ -61,6 +61,7 @@ import {
   provisionRepo,
   finalizeGit,
   sanitizeBranchSegment,
+  shouldPreserveRunDir,
   describeGitFailure,
   boundGitOutput,
   reconcileAgentPr,
@@ -1280,6 +1281,38 @@ test('finalizeGit pushes the first commit into an empty repo (no base sha)', { s
 
 // --- issue #231: never commit-on-base then non-ff-lose the work ---------------
 
+test('provisionRepo cuts a pushable fallback for an UNBORN branch (empty repo, no create, push on)', { skip: !gitOk }, () => {
+  const root = mkdtempSync(join(tmpdir(), 'nano-git-'));
+  const origin = join(root, 'origin.git');
+  g(['init', '-q', '--bare', origin], undefined);
+  const runDir = mkdtempSync(join(root, 'run-'));
+  try {
+    const envelope = {
+      schemaVersion: 1,
+      repository: { provider: 'github', url: origin, submodules: false },
+      branch: { base: '', create: '', push: true },
+      setup: { commands: [], env: {}, secretRefs: [] },
+      task: { allowPr: false },
+    };
+    const prov = provisionRepo({ envelope, token: null, runDir });
+    // An unborn branch must NOT be mis-classified as detached — that would skip
+    // the push and strand the agent's first commit (issue #231 silent work-loss).
+    assert.equal(prov.detached, false, 'an unborn branch is not detached');
+    assert.equal(prov.fallbackBranch, true, 'a pushable fallback was cut off the unborn branch');
+    assert.match(prov.workingBranch, /^nano\/agent-work\//, 'fallback branch is namespaced');
+
+    // Simulate the harness making the repo's first commit, then push.
+    writeFileSync(join(prov.workspaceDir, 'hello.txt'), 'hi\n');
+    g(['add', '-A'], prov.workspaceDir);
+    g(['-c', 'user.name=nano', '-c', 'user.email=nano@example.com', 'commit', '-q', '-m', 'first'], prov.workspaceDir);
+    const out = finalizeGit({ ...prov, envelope, token: null });
+    assert.equal(out.pushed, true, 'the unborn first commit is pushed on the fallback branch');
+    assert.equal(g(['-c', 'safe.bareRepository=all', 'rev-parse', '--verify', `refs/heads/${prov.workingBranch}`], origin).length, 40);
+  } finally {
+    rmSync(root, { recursive: true, force: true });
+  }
+});
+
 // Advance origin/<branch> by one commit from a throwaway clone, so a workspace
 // cloned earlier is now behind the remote (reproduces the non-ff push condition).
 function advanceOrigin(root, origin, branch) {
@@ -1456,6 +1489,17 @@ test('sanitizeBranchSegment reapplies trailing-dot/.lock checks AFTER truncation
   // Leading junk is still stripped and empties still fall back to 'base'.
   assert.equal(sanitizeBranchSegment('...'), 'base');
   assert.equal(sanitizeBranchSegment('---feat/x'), 'feat-x');
+});
+
+test('shouldPreserveRunDir preserves the run dir only when a push FAILED (issue #231, suppressed 8491)', () => {
+  // The recovery guarantee: a failed push strands the new commits in the throwaway
+  // clone, so the run dir must survive even under --keep-runs=false. This is the
+  // extracted, testable cleanup seam for that decision.
+  assert.equal(shouldPreserveRunDir({ pushFailed: true, strandedCommits: ['abc'] }), true, 'preserve on push failure');
+  assert.equal(shouldPreserveRunDir({ pushFailed: false, pushed: true }), false, 'do not preserve a clean push');
+  assert.equal(shouldPreserveRunDir({ pushed: false }), false, 'no pushFailed flag ⇒ not a strand ⇒ no preserve');
+  assert.equal(shouldPreserveRunDir(null), false, 'no git result ⇒ no preserve');
+  assert.equal(shouldPreserveRunDir(undefined), false, 'undefined git result ⇒ no preserve');
 });
 
 test('provisionRepo mints the fallback branch from the run UUID, not the run-dir basename (cross-worker collision safety, issue #231)', { skip: !gitOk }, () => {

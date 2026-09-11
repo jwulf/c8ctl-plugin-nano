@@ -728,7 +728,7 @@ only `latest`, so the key is the reproducibility handle).
 
 On completion the plugin writes an **output envelope** back under
 `io.nanobpm.agentResult` (`{schemaVersion, status, sandbox, image, output, truncated, stderrTruncated, exitCode, signal, error, promptResourceKey?}`). When a repository was
-provisioned (below) it also carries `{repository, branch, baseSha, headSha, commits[], pushed, pushError?, pushFailed?, strandedCommits?, gitError?, pr?}`. `pushFailed` is the explicit "push was rejected" flag (typically non-fast-forward) and `strandedCommits` lists the SHAs of the new commits left UNPUSHED in the throwaway workspace — together they are the recovery handle for a failed push, so consumers must not treat `pushed: false` alone as the only signal. On such a failure the throwaway workspace is preserved **best-effort** (even under the default `--keep-runs=false`) so those SHAs stay recoverable, but this is a *recovery window, not a durable archive*: the run-directory reaper still ages it out by mtime and worker shutdown removes the namespace — copy the stranded commits out promptly (or run with `--keep-runs`).
+provisioned (below) it also carries `{repository, branch, baseSha, headSha, commits[], pushed, pushError?, pushFailed?, strandedCommits?, gitError?, pr?}`. `pushFailed` is the explicit "push failed" flag — set for **any** non-zero `git push` (a non-fast-forward rejection, but also auth, hook, or network errors), not only a server rejection — and `strandedCommits` lists the SHAs of the new commits left UNPUSHED in the throwaway workspace — together they are the recovery handle for a failed push, so consumers must not treat `pushed: false` alone as the only signal. On such a failure the throwaway workspace is preserved **best-effort** (even under the default `--keep-runs=false`) so those SHAs stay recoverable, but this is a *recovery window, not a durable archive*: the run-directory reaper still ages it out by mtime and worker shutdown removes the namespace — copy the stranded commits out promptly (or run with `--keep-runs`).
 
 **Git provisioning (host).** When `--sandbox none` (the default) and the envelope
 carries a `repository.url`, the plugin provisions a workspace on the host around
@@ -764,7 +764,12 @@ the harness:
    per envelope (default 120s, or the `--clone-timeout` worker flag) as a backstop
    for repos big enough to approach the cap even when shallow; a timeout is now
    reported *as a timeout* rather than an opaque `exit 128`;
-3. create `branch.create` (if set) off that target;
+3. create `branch.create` (if set) off that target — or, when `branch.create` is
+   **absent** (or names the effective base itself) **and push is enabled**, cut a
+   generated fallback work branch `nano/agent-work/<base>-<runId>` so commits are
+   never made directly on the base branch; the branch actually used (configured or
+   generated) rides back in the result envelope (`branch`) and is exported to the
+   harness as `AGENT_REPO_BRANCH`;
 4. set a **committer identity** on the workspace, preferring the operator's own
    (`GIT_AUTHOR_*` env → global `git config user.name/email` → the
    `gh`-authenticated GitHub user), and only falling back to `nano-agent` when

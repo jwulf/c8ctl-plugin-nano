@@ -973,6 +973,14 @@ test('a hung history append is bounded so complete()\'s queue drain cannot stall
   // would never resolve and this test would time out.
   p.ingest({ sessionUpdate: 'agent_message_chunk', messageId: 'm1', content: { type: 'text', text: 'hi' } });
   await p.complete(true);
+  // complete() returned promptly (the hung append was bounded out) rather than stalling
+  // settlement until lease expiry. Because the drain timed out with the append still in
+  // flight, the terminal COMPLETED is SERIALIZED behind it (not raced), landing in the
+  // background once the bounded append settles.
+  const deadline = Date.now() + 2000;
+  while (!client.calls.update.some((u) => u.status === 'COMPLETED') && Date.now() < deadline) {
+    await new Promise((r) => setTimeout(r, 10));
+  }
   assert.ok(
     client.calls.update.some((u) => u.status === 'COMPLETED'),
     'the terminal COMPLETED update still ran once the hung append was bounded out',
@@ -1035,19 +1043,78 @@ test('retiring a hung create emits a loud (warn-once) timeout diagnostic and cap
   assert.equal(p.active, true, 'the fresh attempt minted the instance');
 });
 
-test('complete() bounds the AGGREGATE append drain — it does not wait for every hung append serially before the terminal update (issue #230)', async () => {
+test('a hung FINAL last-chance create is retired with the no-further-retry diagnostic, not a promise of a hot-path retry that cannot happen (issue #230)', async () => {
+  // retireCreate() is reached for both hot-path attempts (which a later ingest WILL
+  // retry) and complete()'s one FINAL last-chance attempt (after which `finalized`
+  // latches, so NO retry can follow). The retirement diagnostic must match: the hot-path
+  // retirement promises a later mint; the final-attempt retirement must say no further
+  // create will be attempted (mirroring doCreate's `final` failure clause).
+  const msgs = [];
+  const logger = { info() {}, warn: (m) => msgs.push(m), debug: (m) => msgs.push(m) };
+  const client = {
+    calls: { create: [], update: [] },
+    createAgentInstance: (req) => { client.calls.create.push(req); return new Promise(() => {}); }, // every create hangs
+    updateAgentInstance: async (req) => { client.calls.update.push(req); return { createdHistory: [] }; },
+  };
+  // Default maxInFlightCreates (3) leaves room for the final attempt to start.
+  const p = makeProducer(client, { logger, finalizeTimeoutMs: 20 });
+  await p.activate();               // hot-path attempt 1 hangs → retired (promises a retry)
+  await p.complete(true);           // final attempt 2 hangs → retired (no further retry)
+  const hotRetire = msgs.find((m) => /did not settle within 20ms \(attempt 1\)/.test(m));
+  const finalRetire = msgs.find((m) => /did not settle within 20ms \(attempt 2\)/.test(m));
+  assert.ok(hotRetire && /a later hot-path retry will attempt to mint/.test(hotRetire),
+    'the hot-path retirement still promises a later retry');
+  assert.ok(finalRetire, 'the final-attempt retirement was logged');
+  assert.ok(/no further create will be attempted \(final attempt/.test(finalRetire),
+    'the final-attempt retirement uses the no-further-retry diagnostic');
+  assert.ok(!/a later hot-path retry will attempt to mint/.test(finalRetire),
+    'the final-attempt retirement does not promise a hot-path retry that cannot happen');
+});
+
+test('complete()\'s FINAL last-chance create honors the maxInFlightCreates cap — it does not launch a request beyond the cap when retired POSTs are still in flight (issue #230)', async () => {
+  // The circuit breaker in maybeStartCreate() bounds retirement-driven retries, but the
+  // final last-chance attempt calls startCreate() directly. With the cap saturated by a
+  // retired-but-hung POST, that direct call would launch one request beyond the cap —
+  // the exact outage the cap contains. complete() must honor the cap here too: skip the
+  // final attempt (the engine is hung; a final POST would only hang too) and fall through
+  // to the un-minted drain/warn path.
+  const warnings = [];
+  const logger = { info() {}, warn: (m) => warnings.push(m), debug() {} };
+  const client = {
+    calls: { create: [], update: [] },
+    createAgentInstance: (req) => { client.calls.create.push(req); return new Promise(() => {}); }, // hangs, stays in flight
+    updateAgentInstance: async (req) => { client.calls.update.push(req); return { createdHistory: [] }; },
+  };
+  const p = makeProducer(client, { logger, finalizeTimeoutMs: 20, maxInFlightCreates: 1 });
+  await p.activate();               // attempt 1 hangs → retired, but its POST is still in flight (count = 1 = cap)
+  assert.equal(client.calls.create.length, 1, 'one (hung, still in-flight) attempt after activate');
+  await p.complete(true);
+  // The cap was saturated (1 in-flight == cap), so the final attempt was NOT started —
+  // otherwise create.length would be 2, one beyond the cap.
+  assert.equal(client.calls.create.length, 1, 'the saturated cap blocked the final last-chance attempt');
+  assert.equal(p.active, false, 'the instance never minted');
+  assert.ok(
+    warnings.some((m) => /no durable AgentInstance for this job/.test(m)),
+    'complete() fell through to the un-minted drain/warn path',
+  );
+});
+
+test('complete() bounds the AGGREGATE append drain and SERIALIZES the terminal COMPLETED behind pending appends — it neither waits for every hung append serially nor races the terminal update ahead of them (issue #230)', async () => {
   // Each append is individually bounded, but the queue is serialized: N hung appends
   // would take up to N×finalizeTimeoutMs to drain, holding the lease that whole span
   // before the terminal COMPLETED update even begins. complete() bounds the TOTAL drain
-  // at finalizeTimeoutMs, so only a bounded slice of the queue runs before it proceeds
-  // to COMPLETED (the rest drain in the background, best-effort).
+  // at finalizeTimeoutMs. When that bound wins the appends are STILL in flight, so the
+  // terminal COMPLETED must NOT be driven directly (a concurrent request could
+  // terminalize the instance before a delayed append lands, reordering/losing it).
+  // Instead it is ENQUEUED behind the pending appends: bounded, never raced, always
+  // ordered last.
   const client = {
     calls: { create: [], update: [] },
     createAgentInstance: async (req) => { client.calls.create.push(req); return { agentInstanceKey: 'AGENT-DR' }; },
     updateAgentInstance: (req) => {
       client.calls.update.push(req);
       if (req.status === 'COMPLETED') return Promise.resolve({ createdHistory: [] });
-      return new Promise(() => {}); // every history append hangs forever
+      return new Promise(() => {}); // every history append hangs forever (bounded per-call)
     },
   };
   const p = makeProducer(client, { finalizeTimeoutMs: 20 });
@@ -1059,14 +1126,33 @@ test('complete() bounds the AGGREGATE append drain — it does not wait for ever
     p.ingest({ sessionUpdate: 'agent_message_chunk', messageId: `m${i}`, content: { type: 'text', text: `t${i}` } });
   }
   await p.complete(true);
-  const historyCalls = client.calls.update.filter((u) => u.status !== 'COMPLETED').length;
+  // The aggregate drain was bounded: only a slice of the six hung appends ran before
+  // complete() returned (an unbounded drain would have issued all six first).
+  const historyAtReturn = client.calls.update.filter((u) => u.status !== 'COMPLETED').length;
   assert.ok(
-    client.calls.update.some((u) => u.status === 'COMPLETED'),
-    'the terminal COMPLETED update ran after the bounded drain',
+    historyAtReturn < 6,
+    `the aggregate drain was bounded — only ${historyAtReturn} of 6 hung appends were issued before complete() returned`,
   );
+  // The terminal COMPLETED was NOT raced ahead of the still-pending appends: at the
+  // moment complete() returns it is enqueued behind them, so it has not been issued yet.
   assert.ok(
-    historyCalls < 6,
-    `the aggregate drain was bounded — only ${historyCalls} of 6 hung appends were issued before COMPLETED (an unbounded drain would issue all six)`,
+    !client.calls.update.some((u) => u.status === 'COMPLETED'),
+    'the terminal COMPLETED update was serialized behind the pending appends, not raced ahead of them',
+  );
+  // Let the background queue drain (each hung append is bounded at finalizeTimeoutMs).
+  const deadline = Date.now() + 2000;
+  while (!client.calls.update.some((u) => u.status === 'COMPLETED') && Date.now() < deadline) {
+    await new Promise((r) => setTimeout(r, 10));
+  }
+  // The terminal COMPLETED eventually lands, and ORDERING is preserved: it is the final
+  // update, after all six history appends were issued (never reordered/lost).
+  const completedIdx = client.calls.update.findIndex((u) => u.status === 'COMPLETED');
+  assert.ok(completedIdx !== -1, 'the terminal COMPLETED update eventually ran in the background');
+  assert.equal(completedIdx, client.calls.update.length - 1, 'COMPLETED is the last update issued');
+  assert.equal(
+    client.calls.update.slice(0, completedIdx).filter((u) => u.status !== 'COMPLETED').length,
+    6,
+    'all six history appends were issued before COMPLETED (ordering preserved)',
   );
 });
 

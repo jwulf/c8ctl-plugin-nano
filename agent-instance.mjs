@@ -387,6 +387,11 @@ export function createAgentInstanceProducer(opts = {}) {
   // path, hard-stopping any late create from minting an orphaned instance (issue #230).
   let creating = null;
   let creatingGen = 0;
+  // True while the attempt owning the `creating` slot is complete()'s one last-chance
+  // FINAL attempt. Tracked so retireCreate can emit the correct diagnostic: after the
+  // final attempt complete() latches `finalized`, so NO hot-path retry can follow and
+  // the timeout message must not promise one (issue #230).
+  let creatingFinal = false;
   let createGen = 0;
   // Count of createAgentInstance POSTs currently in flight (started but not yet
   // settled), including RETIRED attempts whose hung request is still outstanding. Caps
@@ -695,9 +700,11 @@ export function createAgentInstanceProducer(opts = {}) {
   // No-op unless `gen` still owns the slot (it may have already settled/been retired).
   const retireCreate = (gen) => {
     if (creatingGen !== gen || creating == null) return false;
+    const wasFinal = creatingFinal;
     createGen += 1; // > creatingGen ⇒ the hung attempt's late result is dropped
     creating = null;
     creatingGen = 0;
+    creatingFinal = false;
     lastCreateAttemptAt = now();
     // A hung create that is bounded out and retired here would otherwise vanish
     // silently: retireCreate only updates state, and if a later retry succeeds the
@@ -706,11 +713,17 @@ export function createAgentInstanceProducer(opts = {}) {
     // diagnostic (attempt + correlation) so the timeout is visible. This attempt owns
     // the slot, so `createAttempts` is its number (no newer attempt has started). First
     // retirement is `warn`; the rest are `debug` to avoid a warn storm (issue #230).
+    // The FINAL last-chance attempt is followed by `finalized` in complete(), so NO
+    // hot-path retry can mint the instance afterwards — its diagnostic must not promise
+    // one (matching doCreate's `final` retry clause), or operators would wait for a
+    // recovery that can't happen (issue #230).
+    const retryClause = wasFinal
+      ? `no further create will be attempted (final attempt; job completion unaffected).`
+      : `a later hot-path retry will attempt to mint the instance (job completion unaffected).`;
     const line =
       `AgentInstance producer: createAgentInstance did not settle within ` +
       `${finalizeTimeoutMs}ms (attempt ${createAttempts}) — request RETIRED and left to ` +
-      `settle in the background ${correlation()}; a later hot-path retry will attempt to ` +
-      `mint the instance (job completion unaffected).`;
+      `settle in the background ${correlation()}; ${retryClause}`;
     if (!createTimeoutLogged) {
       createTimeoutLogged = true;
       logger?.warn?.(line);
@@ -730,6 +743,7 @@ export function createAgentInstanceProducer(opts = {}) {
   const startCreate = (opts = {}) => {
     const gen = (createGen += 1);
     creatingGen = gen;
+    creatingFinal = opts.final === true;
     createInFlight += 1;
     const p = doCreate({ ...opts, gen })
       .catch(() => false)
@@ -743,6 +757,7 @@ export function createAgentInstanceProducer(opts = {}) {
         if (creatingGen === gen) {
           creating = null;
           creatingGen = 0;
+          creatingFinal = false;
         }
       });
     creating = p;
@@ -1019,7 +1034,17 @@ export function createAgentInstanceProducer(opts = {}) {
         if (creating) {
           await awaitCreateBounded();
         }
-        if (!agentInstanceKey && !creating) {
+        // Honor the `maxInFlightCreates` circuit breaker here too (issue #230): this
+        // last-chance attempt calls startCreate() directly (bypassing maybeStartCreate's
+        // guard), so without this check it could launch one request beyond the cap when
+        // retired-but-hung POSTs are still outstanding — the exact outage the cap is
+        // meant to contain. When the cap is already saturated the engine is hung and a
+        // final POST would only hang and be retired too, so we skip it and fall through
+        // to the un-minted drain/warn path rather than pile on. When there is spare
+        // capacity (the common case: earlier attempts settled, so createInFlight is 0)
+        // the final attempt proceeds normally.
+        const capSaturated = maxInFlightCreates > 0 && createInFlight >= maxInFlightCreates;
+        if (!agentInstanceKey && !creating && !capSaturated) {
           startCreate({ final: true });
           await awaitCreateBounded();
         }
@@ -1060,10 +1085,40 @@ export function createAgentInstanceProducer(opts = {}) {
       // finalizeTimeoutMs: each append is individually bounded, but the queue is
       // serialized, so during an outage N queued appends could take up to
       // N×finalizeTimeoutMs and hold the lease that whole span before the terminal
-      // update even begins. Past the deadline the remaining appends drain in the
-      // background (best-effort) and we proceed to the durable COMPLETED transition,
-      // preserving the job-settlement / lease-liveness contract (issue #230).
-      await settleWithin(queue, finalizeTimeoutMs);
+      // update even begins (issue #230).
+      const drained = await settleWithin(queue, finalizeTimeoutMs);
+      if (ok && !drained) {
+        // The aggregate drain timed out: appends are STILL in flight on `queue`.
+        // Driving the terminal COMPLETED update directly here would race those pending
+        // appends — a concurrent request that could terminalize the instance BEFORE a
+        // delayed append lands, reordering or losing that turn (issue #230). Instead,
+        // SERIALIZE the terminal transition behind the queue: enqueue it so it runs
+        // only after every pending append settles (each is individually bounded, so the
+        // queue keeps making progress even under an outage). We can no longer observe /
+        // retry its outcome from here, so surface that reconciliation may be needed, and
+        // return without blocking job settlement — the terminal update lands in the
+        // background once the drain catches up (best-effort, correctly ordered).
+        enqueue(async () => {
+          await callWithin(
+            camunda[SDK_UPDATE]({
+              agentInstanceKey,
+              elementInstanceKey,
+              jobKey,
+              jobLease: leaseToken,
+              status: 'COMPLETED',
+            }),
+            finalizeTimeoutMs,
+          );
+        });
+        logger?.warn?.(
+          `AgentInstance ${agentInstanceKey}: history drain did not settle within ` +
+            `${finalizeTimeoutMs}ms — terminal COMPLETED update SERIALIZED behind the ` +
+            `pending appends (best-effort, ordered) rather than racing them; its outcome ` +
+            `is not observed here, so MANUAL RECONCILIATION may be required if the drain ` +
+            `never catches up ${correlation()}.`,
+        );
+        return;
+      }
       let completedOk = false;
       let terminalErr = null;
       let terminalTimedOut = false;

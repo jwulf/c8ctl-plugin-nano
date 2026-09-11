@@ -97,11 +97,14 @@ export function describeSdkError(err) {
 }
 
 // Redact a lease token down to a presence + short tail so it can be logged for
-// correlation without leaking the opaque fence value.
-function leaseTokenLabel(leaseToken) {
+// correlation without leaking the opaque fence value. For a short token (≤ 4 chars)
+// a last-4 tail would reveal the ENTIRE token, so emit a fixed redacted marker
+// instead — `isExternalAgentJob` accepts any non-blank token, so a short/custom
+// value must never be logged verbatim. The presence signal is preserved either way.
+export function leaseTokenLabel(leaseToken) {
   if (!isNonBlank(leaseToken)) return 'ABSENT';
   const s = String(leaseToken);
-  return `present(…${s.length > 4 ? s.slice(-4) : s})`;
+  return s.length > 4 ? `present(…${s.slice(-4)})` : 'present(short)';
 }
 
 /**
@@ -572,7 +575,28 @@ export function createAgentInstanceProducer(opts = {}) {
       return 0;
     }
   };
+  // Would this raw update classify to a persisted history turn (message/tool-call/
+  // tool-result)? The replay path (ingestClassified) IGNORES everything else — e.g.
+  // `plan`/status notifications — so buffering them would let a plan/status burst
+  // consume the count/byte caps during a create outage and starve later message/tool
+  // updates. Filter them out before buffering; arrival order is preserved because an
+  // ignored update contributes no turn on replay anyway (issue #230).
+  const PERSISTED_KINDS = new Set(['message', 'tool-call', 'tool-result']);
+  const classifiesToPersistedTurn = (rawUpdate) => {
+    if (!classify) return false;
+    let classified;
+    try {
+      classified = classify(rawUpdate);
+    } catch {
+      return false;
+    }
+    return !!classified && typeof classified === 'object' && PERSISTED_KINDS.has(classified.kind);
+  };
   const bufferPreMint = (rawUpdate) => {
+    // Skip updates that will not persist a turn on replay so they cannot exhaust the
+    // caps (issue #230). Not counted as a drop — dropping an ignored update loses no
+    // transcript content.
+    if (!classifiesToPersistedTurn(rawUpdate)) return;
     const size = sizeOfUpdate(rawUpdate);
     if (
       preMintBuffer.length >= preMintBufferMax ||

@@ -16,6 +16,7 @@ import {
   deriveLimits,
   inferProvider,
   describeSdkError,
+  leaseTokenLabel,
 } from './agent-instance.mjs';
 
 // A fake SDK client that records calls and returns a fixed agentInstanceKey.
@@ -740,6 +741,65 @@ test('the pre-mint replay buffer is bounded by an approximate byte budget, and t
     lines.warn.some((m) => /pre-mint update\(s\) were dropped .* truncated/.test(m)),
     'the dropped count is reported on replay so the truncation is visible',
   );
+});
+
+test('the pre-mint buffer only retains updates that persist a turn — a plan/status burst cannot starve it (issue #230)', async () => {
+  // Non-history notifications (e.g. `plan`) are ignored on replay, so buffering them
+  // would let a plan burst consume the caps during a create outage and drop later
+  // message updates. They must be filtered out before buffering.
+  const client = fakeClient({ failCreateTimes: 1 });
+  let t = Date.parse('2026-02-03T04:05:06.000Z');
+  const p = createAgentInstanceProducer({
+    camunda: client,
+    job: EXTERNAL_JOB,
+    profile: PROFILE,
+    envelope: ENVELOPE,
+    logger: nullLogger,
+    now: () => t,
+    createRetryBaseMs: 1000,
+    createRetryMaxMs: 30000,
+    // Only 2 slots: a naive buffer would fill them with the plan burst and drop the
+    // real message updates.
+    preMintBufferMax: 2,
+  });
+
+  await p.activate();
+  assert.equal(p.active, false);
+
+  // A burst of ignored plan notifications, then two real message chunks.
+  for (let i = 0; i < 5; i += 1) p.ingest({ sessionUpdate: 'plan', entries: [{ content: `step ${i}` }] });
+  p.ingest({ sessionUpdate: 'agent_message_chunk', messageId: 'm-a', content: { type: 'text', text: 'msg-a' } });
+  p.ingest({ sessionUpdate: 'agent_message_chunk', messageId: 'm-b', content: { type: 'text', text: 'msg-b' } });
+  await p.drain();
+
+  // Past the window, the next attempt succeeds → mint + replay.
+  t += 2000;
+  await p.activate();
+  assert.equal(p.active, true);
+  await p.complete(true);
+
+  const texts = client.calls.update
+    .filter((u) => Array.isArray(u.history))
+    .map((u) => u.history[0].content?.[0]?.text)
+    .filter(Boolean);
+  assert.deepEqual(
+    texts,
+    ['msg-a', 'msg-b'],
+    'the plan burst was filtered out; both real message turns survived the 2-slot buffer',
+  );
+});
+
+test('leaseTokenLabel redacts short tokens to a fixed marker (no verbatim leak) (issue #230)', () => {
+  assert.equal(leaseTokenLabel(undefined), 'ABSENT');
+  assert.equal(leaseTokenLabel(''), 'ABSENT');
+  assert.equal(leaseTokenLabel('   '), 'ABSENT');
+  // A short (≤4 char) token must NOT be echoed verbatim — its last-4 tail would be
+  // the whole value — so a fixed marker is used instead.
+  assert.equal(leaseTokenLabel('ab'), 'present(short)');
+  assert.equal(leaseTokenLabel('abcd'), 'present(short)');
+  assert.ok(!leaseTokenLabel('abcd').includes('abcd'), 'the short token is not leaked verbatim');
+  // A longer token keeps only a redacted last-4 tail for correlation.
+  assert.equal(leaseTokenLabel('abcdefgh'), 'present(…efgh)');
 });
 
 // ---------------------------------------------------------------------------

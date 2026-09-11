@@ -1826,6 +1826,48 @@ test('finalizeGit PUSHES the work branch when the harness committed on it then D
   }
 });
 
+test('finalizeGit does NOT strand a moved HEAD left at an already-PUBLISHED (remote-reachable) commit (issue #231, suppressed advisory 4714)', { skip: !gitOk }, () => {
+  const { root, origin } = makeOriginRepo();
+  const runDir = mkdtempSync(join(root, 'run-'));
+  try {
+    const envelope = {
+      schemaVersion: 1,
+      repository: { provider: 'github', url: origin, submodules: false },
+      branch: { base: 'main', create: 'feat/work', push: true },
+      setup: { commands: [], env: {}, secretRefs: [] },
+      task: { allowPr: false },
+    };
+    const prov = provisionRepo({ envelope, token: null, runDir });
+    assert.equal(prov.workingBranch, 'feat/work');
+    const startSha = prov.startSha;
+    // Simulate the harness advancing origin/main and leaving HEAD detached at that
+    // fetched tip WITHOUT doing any local work of its own: make a commit, PUBLISH it
+    // to origin's main, then rewind the work branch and detach HEAD at the fetched
+    // (already-published) tip.
+    writeFileSync(join(prov.workspaceDir, 'upstream.txt'), 'upstream\n');
+    g(['add', '-A'], prov.workspaceDir);
+    g(['-c', 'user.name=nano', '-c', 'user.email=nano@example.com', 'commit', '-q', '-m', 'a commit that is published on origin/main'], prov.workspaceDir);
+    const publishedSha = g(['rev-parse', 'HEAD'], prov.workspaceDir);
+    g(['push', '-q', 'origin', 'HEAD:main'], prov.workspaceDir); // origin/main advances
+    g(['reset', '--hard', '-q', startSha], prov.workspaceDir);   // feat/work back to start
+    g(['fetch', '-q', 'origin', 'main'], prov.workspaceDir);     // refs/remotes/origin/main -> publishedSha
+    g(['checkout', '-q', '--detach', publishedSha], prov.workspaceDir);
+    assert.equal(g(['rev-parse', 'HEAD'], prov.workspaceDir), publishedSha, 'HEAD is detached at the already-published commit');
+    // `startSha..HEAD` (out.commits) = [publishedSha] and HEAD moved off the work
+    // branch, so the OLD moved-HEAD set = out.commits = [publishedSha] and the push
+    // was FALSELY marked stranded (pushFailed → PR reconciliation suppressed) even
+    // though that commit is already on origin/main and no local work is at risk.
+    // Excluding remote-reachable commits from the moved-HEAD strays (as the
+    // off-branch scan already does) fixes the false strand.
+    const out = finalizeGit({ ...prov, envelope, token: null });
+    assert.ok(!out.pushFailed, 'an already-published moved-HEAD commit is not a strand');
+    assert.equal(out.strandedCommits, undefined, 'nothing is stranded — the commit is on origin/main');
+    assert.equal(out.pushed, true, 'the (unchanged) work branch is still published, PR reconciliation not suppressed');
+  } finally {
+    rmSync(root, { recursive: true, force: true });
+  }
+});
+
 test('finalizeGit records the per-ref strand split when the harness commits on BOTH the work branch and the base (issue #231, suppressed advisory 8882)', { skip: !gitOk }, () => {
   const { root, origin } = makeOriginRepo();
   const runDir = mkdtempSync(join(root, 'run-'));
@@ -2265,6 +2307,45 @@ test('provisionRepo honors singleBranch + filter and fetches the base for a base
     assert.match(g(['rev-parse', 'origin/main'], prov.workspaceDir), /^[0-9a-f]{40}$/, 'origin/main resolves after the base fetch');
     const diff = g(['diff', '--name-only', 'origin/main...HEAD'], prov.workspaceDir);
     assert.equal(diff, 'feature.txt', 'base...head diff computes the feature change');
+  } finally {
+    rmSync(root, { recursive: true, force: true });
+  }
+});
+
+test('provisionRepo keeps baseCloneSha NULL when the base ref was absent at clone and only the base fetch created it (issue #231, suppressed advisory 4473)', { skip: !gitOk }, () => {
+  const { root, origin } = makeOriginRepo();
+  // Publish a feature branch so we can single-branch clone it (leaving origin/main
+  // ABSENT at clone time).
+  const wc = mkdtempSync(join(root, 'wc4473-'));
+  g(['clone', '-q', origin, wc], undefined);
+  g(['config', 'user.name', 'seed'], wc);
+  g(['config', 'user.email', 'seed@example.com'], wc);
+  g(['checkout', '-q', '-b', 'feat/x'], wc);
+  writeFileSync(join(wc, 'feature.txt'), 'feature\n');
+  g(['add', '-A'], wc);
+  g(['commit', '-q', '-m', 'feature commit'], wc);
+  g(['push', '-q', 'origin', 'feat/x'], wc);
+  const runDir = mkdtempSync(join(root, 'run-'));
+  try {
+    const envelope = {
+      schemaVersion: 1,
+      // single-branch clone of feat/x ⇒ refs/remotes/origin/main does NOT exist at
+      // clone; baseRef='main' + branch.base='main' make effectiveBase='main', so the
+      // optional base fetch is what CREATES origin/main.
+      repository: { provider: 'github', url: origin, ref: 'feat/x', singleBranch: true, baseRef: 'main', submodules: false },
+      branch: { base: 'main', create: '', push: false },
+      setup: { commands: [], env: {}, secretRefs: [] },
+      task: { allowPr: false },
+    };
+    const prov = provisionRepo({ envelope, token: null, runDir });
+    // The base fetch DID create origin/main (so the OLD code would have re-read its
+    // post-fetch tip and recorded it as the clone-time snapshot)...
+    assert.match(g(['rev-parse', '--verify', 'refs/remotes/origin/main'], prov.workspaceDir), /^[0-9a-f]{40}$/, 'the base fetch created origin/main');
+    // ...but there is NO genuine clone-time snapshot for a ref that did not exist at
+    // clone, so baseCloneSha must stay NULL rather than mis-record the post-fetch tip
+    // (which would silently drop base commits landed during the clone/fetch window
+    // from finalizeGit's baseAdvanced count).
+    assert.equal(prov.baseCloneSha, null, 'absent-at-clone base ⇒ baseCloneSha is null, not the post-fetch tip');
   } finally {
     rmSync(root, { recursive: true, force: true });
   }

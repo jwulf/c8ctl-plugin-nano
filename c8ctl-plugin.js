@@ -4468,6 +4468,17 @@ function provisionRepo({ envelope, token, runDir, runId, timeoutMs = 120_000, co
     // tip that fetch fast-forwarded to, not the clone-time value (suppressed 4433).
     if (baseRefCloneSha !== null && String(repo.baseRef || '') === effectiveBase) {
       baseCloneSha = baseRefCloneSha;
+    } else if (baseRefCloneSha === null && String(repo.baseRef || '') === effectiveBase) {
+      // The optional base fetch above TARGETED effectiveBase, but the remote-tracking
+      // ref was ABSENT at clone time (baseRefCloneSha null) — e.g. a single-branch
+      // clone of a DIFFERENT ref that the fetch then CREATED. Re-reading
+      // origin/<effectiveBase> now would record the POST-fetch tip as if it were the
+      // clone-time snapshot, silently dropping any base commits that landed during
+      // the clone/base-fetch window from finalizeGit's baseAdvanced count. There is
+      // no genuine clone-time value here, so keep the snapshot NULL — a provisioned
+      // finalizeGit then honestly skips the staleness count instead of anchoring on a
+      // misleading post-fetch tip (suppressed advisory 4473).
+      baseCloneSha = null;
     } else {
       const br = runGit(['rev-parse', '--verify', '--quiet', `refs/remotes/origin/${effectiveBase}`], { cwd: workspaceDir, env: gitEnv });
       baseCloneSha = br.status === 0 ? ((br.stdout || '').trim() || null) : null;
@@ -4710,7 +4721,25 @@ function finalizeGit({ workspaceDir, gitEnv, startSha, workingBranch, baseBranch
     // exactly those commits regardless of where HEAD points — that is the intended
     // output, so push it.
     const branchCommitSet = new Set(branchCommits);
-    const movedStray = movedOff ? out.commits.filter((c) => !branchCommitSet.has(c)) : [];
+    // Moved-HEAD strays: commits reachable from the current (moved-off) HEAD that
+    // `git push origin <workingBranch>` would NOT publish. Exclude commits the work
+    // branch already carries (branchCommitSet) AND commits already reachable from a
+    // remote: if the harness fetched e.g. `origin/main` and left HEAD at that fetched
+    // tip (or pushed the work branch before moving HEAD), `startSha..HEAD` holds
+    // already-PUBLISHED commits that are NOT at risk — counting them would set a
+    // false `pushFailed` and suppress PR reconciliation even though no local work is
+    // stranded. Anchor on `--not --remotes refs/heads/<workingBranch>` exactly as the
+    // off-branch scan above does, so only genuinely unpublished, off-work-branch
+    // commits count (suppressed advisory 4714). Fall back to the plain filter only if
+    // the rev-list itself errors.
+    let movedStray = [];
+    if (movedOff) {
+      const range = startSha ? `${startSha}..HEAD` : 'HEAD';
+      const ms = runGit(['rev-list', range, '--not', '--remotes', `refs/heads/${workingBranch}`], { cwd: workspaceDir, env: gitEnv });
+      movedStray = ms.status === 0
+        ? ms.stdout.trim().split('\n').filter(Boolean)
+        : out.commits.filter((c) => !branchCommitSet.has(c));
+    }
     const strays = [...new Set([...movedStray, ...offBranchStray])];
     if (strays.length > 0) {
       out.pushFailed = true;
@@ -8835,8 +8864,17 @@ async function workAgent(req, flags) {
                 // task override widens only the harness liveness window, not the
                 // broker lock (see #172 note above + dispatch config below), so
                 // budgeting against the widened value could still let the git ops run
-                // past the real lease (thread 8811).
-                budgetMs: recoveryWindowMs,
+                // past the real lease (thread 8811). SUBTRACT `lockExtendIntervalMs`:
+                // the lock is renewed to a full `recoveryWindowMs` only at each
+                // heartbeat, and the heartbeat fiber cannot fire while finalization's
+                // spawnSync ops block the event loop. At finalization start the last
+                // beat could have fired up to `lockExtendIntervalMs` ago, so the lease
+                // GUARANTEED to remain is `recoveryWindowMs - lockExtendIntervalMs`
+                // (e.g. 300s window, 100s interval ⇒ 200s left, not 300s). Budgeting
+                // against that worst-case remaining lease — not the full window —
+                // keeps the git ops inside the lock even across a stale heartbeat
+                // (thread 4678).
+                budgetMs: Math.max(0, recoveryWindowMs - lockExtendIntervalMs),
                 // Provisioned job: a null baseCloneSha means no genuine clone-time
                 // base snapshot exists, so finalizeGit must NOT fall back to a live
                 // (post-harness) read for its staleness count (advisory 4764).

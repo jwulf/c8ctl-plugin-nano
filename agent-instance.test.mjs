@@ -285,6 +285,23 @@ test('an ignored update (a plan) produces no history append', async () => {
   assert.equal(appends.length, 0);
 });
 
+test('a classifier exception elevates the FIRST ingest failure to warn (repeats stay debug) (#229)', async () => {
+  // A translation/classification fault must NOT vanish silently: the first ingest
+  // failure per instance is elevated to `warn`, later ones stay at `debug`.
+  const log = recordingLogger();
+  const throwingAcp = { classifyUpdate: () => { throw new Error('boom classify'); } };
+  const p = makeProducer(fakeClient(), { logger: log, sessionAcp: throwingAcp });
+  await p.activate();
+  p.ingest({ sessionUpdate: 'agent_message_chunk', content: { type: 'text', text: 'a' } });
+  p.ingest({ sessionUpdate: 'agent_message_chunk', content: { type: 'text', text: 'b' } });
+  await p.drain();
+  const warns = log.lines.warn.filter((m) => /ingest failed/.test(m));
+  const debugs = log.lines.debug.filter((m) => /ingest failed/.test(m));
+  assert.equal(warns.length, 1, 'only the first classifier fault is elevated to warn');
+  assert.ok(/boom classify/.test(warns[0]), 'the warn carries the classifier error');
+  assert.equal(debugs.length, 1, 'the second classifier fault stays at debug');
+});
+
 // ---------------------------------------------------------------------------
 // historyItemId stability (retry dedup)
 // ---------------------------------------------------------------------------

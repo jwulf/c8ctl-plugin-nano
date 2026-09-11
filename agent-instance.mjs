@@ -376,6 +376,18 @@ export function createAgentInstanceProducer(opts = {}) {
     appendTurn(turn);
   };
 
+  // #229: first-failure elevation for ingest faults (classifier OR handler). The
+  // FIRST ingest failure per instance logs at `warn`; repeats stay at `debug` so a
+  // persistently-faulting instance doesn't flood the log.
+  const noteIngestFailure = (err) => {
+    if (!ingestFailureLogged) {
+      ingestFailureLogged = true;
+      logger?.warn?.(`AgentInstance producer: ingest failed (${corr()}) — ${err?.message || err}; further ingest failures for this instance stay at debug.`);
+    } else {
+      logger?.debug?.(`AgentInstance producer: ingest failed (${corr()}) — ${err?.message || err}`);
+    }
+  };
+
   return {
     /** True once the AgentInstance has been minted (or is being minted). */
     get active() {
@@ -456,7 +468,11 @@ export function createAgentInstanceProducer(opts = {}) {
       let classified;
       try {
         classified = classify(rawUpdate);
-      } catch {
+      } catch (err) {
+        // A classifier/translation fault is an ingest failure too — route it
+        // through the same first-failure elevation (#229) instead of returning
+        // silently, or the ingest path can still drop every turn with no warning.
+        noteIngestFailure(err);
         return;
       }
       if (!classified || typeof classified !== 'object') return;
@@ -498,12 +514,7 @@ export function createAgentInstanceProducer(opts = {}) {
         // #229: elevate the FIRST ingest failure per instance to `warn` (repeats
         // stay `debug`) so a translation/append fault that silently drops every
         // turn is visible at normal verbosity.
-        if (!ingestFailureLogged) {
-          ingestFailureLogged = true;
-          logger?.warn?.(`AgentInstance producer: ingest failed (${corr()}) — ${err?.message || err}; further ingest failures for this instance stay at debug.`);
-        } else {
-          logger?.debug?.(`AgentInstance producer: ingest failed (${corr()}) — ${err?.message || err}`);
-        }
+        noteIngestFailure(err);
       }
     },
 

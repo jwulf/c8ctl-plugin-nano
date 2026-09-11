@@ -4463,15 +4463,23 @@ function finalizeGit({ workspaceDir, gitEnv, startSha, workingBranch, envelope, 
     // remote branch we're about to push to and count how far it advanced since the
     // clone — a non-empty HEAD..origin/<branch> means the remote moved, so the push
     // will be rejected non-ff (the 20974 work-loss cause). Best-effort: a failed
-    // fetch never blocks the push attempt below.
-    const staleFetch = runGit([...credArgs(), 'fetch', '--no-tags', 'origin', workingBranch], { cwd: workspaceDir, env: gitEnv, timeoutMs: pushTimeoutMs });
+    // fetch never blocks the push attempt below. Budget this DIAGNOSTIC fetch on a
+    // short timeout (not the full push timeout): it runs synchronously on the same
+    // event loop as the dispatch-lock extender, so a slow remote here must not eat
+    // into the lock window on top of the push's own blocking budget.
+    const staleFetchTimeoutMs = 15_000;
+    const staleFetch = runGit([...credArgs(), 'fetch', '--no-tags', 'origin', workingBranch], { cwd: workspaceDir, env: gitEnv, timeoutMs: staleFetchTimeoutMs });
     if (staleFetch.status === 0) {
       const behind = runGit(['rev-list', '--count', `HEAD..origin/${workingBranch}`], { cwd: workspaceDir, env: gitEnv });
       const n = behind.status === 0 ? Number((behind.stdout || '').trim()) : NaN;
       if (Number.isFinite(n) && n > 0) {
         const remoteSha = runGit(['rev-parse', `origin/${workingBranch}`], { cwd: workspaceDir, env: gitEnv });
         out.baseAdvanced = n;
-        logger?.warn?.(`git finalize: remote branch '${workingBranch}' advanced ${n} commit(s) since clone (base ${String(startSha || '?').slice(0, 12)} → ${String((remoteSha.stdout || '').trim() || '?').slice(0, 12)}); push will be non-fast-forward.${cs}`);
+        // Frame this as "remote is N ahead of local HEAD", NOT "advanced since
+        // clone": for a `branch.create` branch the local ref is reset from the
+        // checked-out base while `origin/<branch>` may already have carried commits
+        // from BEFORE the clone, so a "since clone" timeline would be false.
+        logger?.warn?.(`git finalize: remote branch '${workingBranch}' is ${n} commit(s) ahead of local HEAD (local ${String(out.headSha || '?').slice(0, 12)} vs origin ${String((remoteSha.stdout || '').trim() || '?').slice(0, 12)}); push will be non-fast-forward.${cs}`);
       }
     }
     const push = runGit([...credArgs(), 'push', '--set-upstream', 'origin', workingBranch], { cwd: workspaceDir, env: gitEnv, timeoutMs: pushTimeoutMs });
@@ -4480,11 +4488,13 @@ function finalizeGit({ workspaceDir, gitEnv, startSha, workingBranch, envelope, 
       out.pushError = describeGitFailure('git push', push, { token, timeoutMs: pushTimeoutMs });
       // #229: elevate the push failure out of the terse info line — commits are
       // unpushed and this is the loud signal that was missing. The "will be LOST
-      // (no PR)" wording only holds when there is genuinely no PR branch: a
-      // `branch.create` feature branch (or an `allowPr` job) keeps its commits on
-      // its own branch and may already have a PR, so asserting "no PR" there would
-      // mislead the incident investigation. Make that clause conditional.
-      const hasPrBranch = !!envelope.branch?.create || !!envelope.task?.allowPr;
+      // (no PR)" wording only holds when there is genuinely no PR branch. Base that
+      // solely on `branch.create` (an explicit feature branch that holds the
+      // commits): `task.allowPr` only enables PR *reconciliation* — it does NOT
+      // create a branch, so an allowPr job that is on the base branch with no
+      // `branch.create` still loses its commits on a failed push and must keep the
+      // loud "(no PR)" signal.
+      const hasPrBranch = !!envelope.branch?.create;
       const lossNote = hasPrBranch
         ? `${out.commits.length} commit(s) are unpushed on branch '${workingBranch}'`
         : `${out.commits.length} commit(s) are unpushed and will be LOST (no PR)`;
@@ -8155,9 +8165,19 @@ async function workAgent(req, flags) {
         const aiCorr = `job ${job.jobKey} eik ${job.elementInstanceKey ?? '?'} pik ${job.processInstanceKey ?? '?'}`;
         if (!agentInstanceOff && isExternalAgentJob(job)) {
           agentInstanceProducer = createAgentInstanceProducer({ camunda, job, profile, envelope, logger });
-          logger.info(`[${jobType}] AgentInstance producer created for external agent job (${aiCorr}).`);
           try {
-            await agentInstanceProducer.activate();
+            // `createAgentInstanceProducer` always returns an object — including a
+            // DISABLED facade when the host SDK lacks createAgentInstance/
+            // updateAgentInstance. Report based on the ACTUAL activation outcome
+            // (`active`), not the mere fact a producer object exists, so an
+            // unavailable/rejected producer doesn't masquerade as a usable one and
+            // leave the no-transcript cause silent.
+            const active = await agentInstanceProducer.activate();
+            if (active) {
+              logger.info(`[${jobType}] AgentInstance producer active for external agent job (${aiCorr}).`);
+            } else {
+              logger.info(`[${jobType}] AgentInstance producer unavailable for external agent job (${aiCorr}) — host SDK lacks createAgentInstance/updateAgentInstance or activation was rejected; continuing without a durable transcript (job completion unaffected).`);
+            }
           } catch (err) {
             logger.warn(`[${jobType}] AgentInstance producer activate() threw (${aiCorr}) — ${err?.message || err}; continuing without a durable transcript (job completion unaffected).`);
           }
@@ -8477,7 +8497,7 @@ async function workAgent(req, flags) {
             ? ` [${gitResult.branch ? `branch ${gitResult.branch}` : 'detached HEAD'}: ${gitResult.commits.length} commit(s), ${gitResult.branch ? (gitResult.pushed ? 'pushed' : (gitResult.pushError ? 'push FAILED' : 'not pushed')) : 'no branch to push'}${gitResult.pr?.found ? `, PR #${gitResult.pr.number}` : ''}]`
             : '';
           logger.info(`[${jobType}] job ${job.jobKey} complete (exit 0)${result.truncated ? ' [output truncated]' : ''}${gitNote}`);
-          if (gitResult?.pushError) logger.warn(`[${jobType}] job ${job.jobKey}: branch push failed — ${gitResult.pushError}`);
+          if (gitResult?.pushError) logger.warn(`[${jobType}] job ${job.jobKey}: branch push failed (${aiCorr}) — ${gitResult.pushError}`);
           // Guard the operator against silent empty escalations: a success that
           // yields no *effective* result vars (no file/sentinel at all, an empty
           // `{}`, or only reserved keys that were sanitized away) means the

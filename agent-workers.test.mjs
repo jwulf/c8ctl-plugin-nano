@@ -1680,6 +1680,7 @@ test('finalizeGit reports baseAdvanced + push failure when the remote branch mov
     g(['push', '-q', 'origin', 'feat/work'], rival);
 
     const warnings = [];
+    const errors = [];
     const out = finalizeGit({
       workspaceDir: prov.workspaceDir,
       gitEnv: prov.gitEnv,
@@ -1687,15 +1688,24 @@ test('finalizeGit reports baseAdvanced + push failure when the remote branch mov
       workingBranch: prov.workingBranch,
       envelope,
       token: null,
-      logger: { warn: (m) => warnings.push(m), error: () => {}, info: () => {} },
+      logger: { warn: (m) => warnings.push(m), error: (m) => errors.push(m), info: () => {} },
+      corr: 'job 7 eik 8 pik 9',
     });
     assert.equal(out.commits.length, 1, 'one new local commit since start');
     assert.equal(out.baseAdvanced, 1, 'detects the remote branch advanced by one commit before pushing');
     assert.equal(out.pushed, false, 'a non-fast-forward push is rejected');
     assert.ok(out.pushError, 'the push failure is captured');
     assert.ok(
-      warnings.some((m) => /advanced 1 commit\(s\) since clone/.test(m) && /non-fast-forward/.test(m)),
-      'warns that the remote advanced and the push will be non-fast-forward',
+      warnings.some((m) => /ahead of local HEAD/.test(m) && /non-fast-forward/.test(m) && /\[job 7 eik 8 pik 9\]/.test(m)),
+      'warns that the remote is ahead of local HEAD (correlated) and the push will be non-fast-forward',
+    );
+    // The error-level push-failure line is the primary observability behavior:
+    // assert it carries the correlation and the unpushed/lost-commit signal (this
+    // envelope has a `branch.create` feature branch, so it is "unpushed on branch",
+    // not "LOST (no PR)").
+    assert.ok(
+      errors.some((m) => /push of branch 'feat\/work' FAILED/.test(m) && /unpushed on branch 'feat\/work'/.test(m) && /\[job 7 eik 8 pik 9\]/.test(m)),
+      'emits a correlated error line naming the unpushed commits on the feature branch',
     );
   } finally {
     rmSync(root, { recursive: true, force: true });

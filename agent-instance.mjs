@@ -46,7 +46,20 @@ const DEFAULT_CREATE_RETRY_MAX_MS = 30000;
 // The buffer is capped so a create that never succeeds cannot grow it without bound;
 // once full, further updates are dropped (with a one-time warning) rather than
 // evicting the earliest turns, so the replayed transcript stays a contiguous prefix.
+// The cap is applied on BOTH a slot count and an approximate byte budget: a streamed
+// response can emit many token-chunk notifications, so a raw-count cap alone would let
+// a chunk storm exhaust the buffer and silently truncate the transcript — the byte
+// budget bounds the actual payload, and dropped updates are COUNTED and reported on
+// replay so any truncation is visible rather than silent (issue #230).
 const DEFAULT_PRE_MINT_BUFFER_MAX = 1000;
+const DEFAULT_PRE_MINT_BUFFER_MAX_BYTES = 8_000_000;
+
+// A terminal COMPLETED update is driven directly (not via the best-effort append
+// queue) and RETRIED a bounded number of times: on a successful job end the caller
+// settles the job the instant complete() returns, so there is no reactivation to
+// retry a rejected terminal transition — a single swallowed failure would strand the
+// instance non-terminal forever (issue #230).
+const DEFAULT_TERMINAL_RETRY_MAX = 3;
 
 /**
  * Pull the diagnosable facts out of an SDK/transport rejection so a create/append
@@ -227,6 +240,8 @@ export function createAgentInstanceProducer(opts = {}) {
     createRetryBaseMs = DEFAULT_CREATE_RETRY_BASE_MS,
     createRetryMaxMs = DEFAULT_CREATE_RETRY_MAX_MS,
     preMintBufferMax = DEFAULT_PRE_MINT_BUFFER_MAX,
+    preMintBufferMaxBytes = DEFAULT_PRE_MINT_BUFFER_MAX_BYTES,
+    terminalRetryMax = DEFAULT_TERMINAL_RETRY_MAX,
   } = opts;
 
   const classify = typeof sessionAcp?.classifyUpdate === 'function' ? sessionAcp.classifyUpdate : null;
@@ -285,6 +300,10 @@ export function createAgentInstanceProducer(opts = {}) {
   // succeeds on a retry does not lose the turns emitted while it was still failing.
   const preMintBuffer = [];
   let preMintOverflowLogged = false;
+  // Approximate byte weight of the buffered updates + a count of updates dropped on
+  // overflow, so a truncated pre-mint replay is reported (not silent) at replay time.
+  let preMintBufferBytes = 0;
+  let preMintDropped = 0;
 
   const iso = () => new Date(now()).toISOString();
 
@@ -440,10 +459,15 @@ export function createAgentInstanceProducer(opts = {}) {
       if (!key) {
         // createAgentInstance resolved but carried no key — updates need the
         // agentInstanceKey, so we cannot append yet. Idempotent per
-        // elementInstanceKey, so keep retrying rather than forfeiting the run.
+        // elementInstanceKey, so keep retrying rather than forfeiting the run. Log the
+        // SAME request-context fields the throw path does (with explicit status/body
+        // n/a, since the call resolved) so an unexpected success shape is diagnosable
+        // against the request that produced it (issue #230).
         logger?.warn?.(
           `AgentInstance producer: createAgentInstance returned no agentInstanceKey ` +
-            `(attempt ${createAttempts}) ${correlation()}; will retry.`,
+            `(attempt ${createAttempts}) — status=n/a body=n/a ` +
+            `jobLease=${leaseTokenLabel(leaseToken)} model=${def.model} provider=${def.provider} ` +
+            `${correlation()}; will retry.`,
         );
         return false;
       }
@@ -534,25 +558,57 @@ export function createAgentInstanceProducer(opts = {}) {
   };
 
   // Hold a pre-mint ACP update for later replay, bounded so a create that never
-  // succeeds cannot grow the buffer without bound. Once full, drop the newest update
-  // (with a one-time warning) so the buffered prefix stays contiguous and ordered.
+  // succeeds cannot grow the buffer without bound. Bounded by BOTH a slot count and an
+  // approximate byte budget — a streamed response can emit many token-chunk
+  // notifications, so a raw-count cap alone would let a chunk storm exhaust the buffer.
+  // Once either cap is hit, drop the newest update (keeping the buffered prefix
+  // contiguous) and COUNT the drop so the truncation is reported (not silent) on
+  // replay. A single oversized update is still buffered (the byte cap only bites once
+  // something is already buffered) so at least one turn always survives.
+  const sizeOfUpdate = (u) => {
+    try {
+      return JSON.stringify(u)?.length ?? 0;
+    } catch {
+      return 0;
+    }
+  };
   const bufferPreMint = (rawUpdate) => {
-    if (preMintBuffer.length >= preMintBufferMax) {
+    const size = sizeOfUpdate(rawUpdate);
+    if (
+      preMintBuffer.length >= preMintBufferMax ||
+      (preMintBuffer.length > 0 && preMintBufferBytes + size > preMintBufferMaxBytes)
+    ) {
+      preMintDropped += 1;
       if (!preMintOverflowLogged) {
         preMintOverflowLogged = true;
         logger?.warn?.(
-          `AgentInstance producer: pre-mint replay buffer full (${preMintBufferMax}); ` +
-            `dropping further updates until the create succeeds ${correlation()}.`,
+          `AgentInstance producer: pre-mint replay buffer full ` +
+            `(${preMintBuffer.length} update(s), ~${preMintBufferBytes} bytes; caps ` +
+            `${preMintBufferMax} updates / ${preMintBufferMaxBytes} bytes); dropping further ` +
+            `updates until the create succeeds ${correlation()}.`,
         );
       }
       return;
     }
     preMintBuffer.push(rawUpdate);
+    preMintBufferBytes += size;
   };
 
   // Replay every buffered pre-mint update against the freshly minted instance, in
   // arrival order, then clear the buffer. Called from doCreate on a successful mint.
+  // If any updates were dropped on overflow, report the count so a truncated replay is
+  // visible rather than silent (issue #230).
   const replayPreMintBuffer = () => {
+    const dropped = preMintDropped;
+    preMintDropped = 0;
+    preMintBufferBytes = 0;
+    if (dropped > 0) {
+      logger?.warn?.(
+        `AgentInstance producer: ${dropped} pre-mint update(s) were dropped before the instance ` +
+          `minted (replay buffer overflow) — the replayed transcript is truncated by that many ` +
+          `updates ${correlation()}.`,
+      );
+    }
     if (preMintBuffer.length === 0) return;
     const buffered = preMintBuffer.splice(0, preMintBuffer.length);
     for (const raw of buffered) ingestClassified(raw);
@@ -658,29 +714,45 @@ export function createAgentInstanceProducer(opts = {}) {
         return;
       }
       flushMessage();
-      // Track whether the terminal COMPLETED update was actually accepted. The queue
-      // swallows SDK failures (best-effort append), so `await queue` alone cannot tell
-      // a genuine terminal transition from one the engine rejected — record it here so
-      // the completion diagnostic never claims `status→COMPLETED` for a failed update.
-      let completedOk = false;
-      if (ok) {
-        enqueue(async () => {
-          await camunda[SDK_UPDATE]({
-            agentInstanceKey,
-            elementInstanceKey,
-            jobKey,
-            jobLease: leaseToken,
-            status: 'COMPLETED',
-          });
-          completedOk = true;
-        });
-      }
+      // Drain any queued appends first so ordering is preserved, THEN drive the
+      // terminal COMPLETED update directly (not via the best-effort append queue) so
+      // we can observe its outcome and RETRY it. On a successful job end the caller
+      // settles the job the instant complete() returns, so there is no reactivation to
+      // retry a rejected terminal transition — a single swallowed failure would strand
+      // the instance non-terminal forever (issue #230).
       try { await queue; } catch { /* best effort */ }
+      let completedOk = false;
+      let terminalErr = null;
+      const terminalAttempts = Math.max(1, terminalRetryMax);
+      if (ok) {
+        for (let attempt = 1; attempt <= terminalAttempts; attempt += 1) {
+          try {
+            await camunda[SDK_UPDATE]({
+              agentInstanceKey,
+              elementInstanceKey,
+              jobKey,
+              jobLease: leaseToken,
+              status: 'COMPLETED',
+            });
+            completedOk = true;
+            terminalErr = null;
+            break;
+          } catch (err) {
+            terminalErr = describeSdkError(err);
+          }
+        }
+      }
       const terminalOk = ok && completedOk;
       if (ok && !completedOk) {
+        // Every retry of the terminal transition was rejected. The job settles now with
+        // no reactivation to try again, so this is NOT self-healing — surface the SDK
+        // error details and flag that manual reconciliation is required (issue #230).
         logger?.warn?.(
-          `AgentInstance ${agentInstanceKey}: terminal status update to COMPLETED failed — ` +
-            `instance left non-terminal for retry ${correlation()}.`,
+          `AgentInstance ${agentInstanceKey}: terminal status update to COMPLETED failed after ` +
+            `${terminalAttempts} attempt(s) — status=${terminalErr?.status ?? 'n/a'} ` +
+            `body=${terminalErr?.body ?? 'n/a'} message=${terminalErr?.message ?? 'n/a'}; ` +
+            `MANUAL RECONCILIATION REQUIRED — the job settles now with no reactivation to retry ` +
+            `this transition ${correlation()}.`,
         );
       }
       logger?.info?.(
@@ -689,7 +761,7 @@ export function createAgentInstanceProducer(opts = {}) {
             terminalOk
               ? ', status→COMPLETED'
               : ok
-                ? ' (COMPLETED update failed — left non-terminal for retry)'
+                ? ' (COMPLETED update rejected — manual reconciliation required)'
                 : ' (left non-terminal for retry)'
           } ${correlation()}.`,
       );

@@ -29,6 +29,7 @@ function fakeClient({
   createResult = { agentInstanceKey: 'AGENT-1' },
   failCreate = false,
   failCreateTimes = 0,
+  noKeyTimes = 0,
   createError = null,
   enforceContract = false,
 } = {}) {
@@ -49,6 +50,9 @@ function fakeClient({
       calls.create.push(req);
       if (failCreate) throw createError || new Error('stale lease');
       if (calls.create.length <= failCreateTimes) throw createError || new Error('stale lease');
+      // A resolved-but-keyless response for the next `noKeyTimes` attempts: the create
+      // succeeds at the transport layer but carries no agentInstanceKey.
+      if (calls.create.length <= failCreateTimes + noKeyTimes) return {};
       validate(req);
       return createResult;
     },
@@ -611,19 +615,136 @@ test('complete() does not falsely report status→COMPLETED when the terminal up
     'a rejected terminal update is warned',
   );
   assert.ok(
+    lines.warn.some((m) => /MANUAL RECONCILIATION REQUIRED/.test(m)),
+    'a permanently-rejected terminal update flags manual reconciliation (no reactivation retries it)',
+  );
+  assert.ok(
     !lines.info.some((m) => /status→COMPLETED/.test(m)),
     'the info line does not falsely claim status→COMPLETED',
   );
   assert.ok(
-    lines.info.some((m) => /left non-terminal for retry/.test(m)),
-    'the info line reports the non-terminal outcome',
+    lines.info.some((m) => /manual reconciliation required/.test(m)),
+    'the info line reports the non-terminal, manual-reconciliation outcome',
+  );
+  // The terminal update is retried (not swallowed once) before giving up.
+  assert.ok(
+    client.calls.update.filter((u) => u.status === 'COMPLETED').length >= 2,
+    'the terminal update is retried before reporting manual reconciliation',
+  );
+});
+
+test('a create that resolves without an agentInstanceKey stays retryable and mints + replays on a later attempt (issue #230)', async () => {
+  // The no-key success path: createAgentInstance resolves but carries no key. The
+  // producer must NOT disable or drop the run — it stays retryable, buffers the
+  // pre-mint updates, and a later attempt that returns a key mints and replays them.
+  const client = fakeClient({ noKeyTimes: 1 });
+  let t = Date.parse('2026-02-03T04:05:06.000Z');
+  const p = createAgentInstanceProducer({
+    camunda: client,
+    job: EXTERNAL_JOB,
+    profile: PROFILE,
+    envelope: ENVELOPE,
+    logger: nullLogger,
+    now: () => t,
+    createRetryBaseMs: 1000,
+    createRetryMaxMs: 30000,
+  });
+
+  // First attempt resolves without a key → not minted, not disabled, still retryable.
+  const ok = await p.activate();
+  assert.equal(ok, false);
+  assert.equal(p.active, false);
+  assert.equal(client.calls.create.length, 1);
+
+  // A turn streams in while un-minted — buffered (not dropped), no append yet.
+  p.ingest({ sessionUpdate: 'agent_message_chunk', messageId: 'nk-1', content: { type: 'text', text: 'buffered' } });
+  await p.drain();
+  assert.equal(client.calls.update.length, 0, 'nothing appended before the mint');
+
+  // Past the backoff window, the next attempt returns a key → mint + replay.
+  t += 2000;
+  p.ingest({ sessionUpdate: 'agent_message_chunk', messageId: 'nk-2', content: { type: 'text', text: 'after-mint' } });
+  await p.complete(true);
+  assert.equal(p.active, true, 'a later keyed attempt mints the instance');
+  assert.ok(client.calls.create.length >= 2, 'the keyless attempt was retried');
+
+  const texts = client.calls.update
+    .filter((u) => Array.isArray(u.history))
+    .map((u) => u.history[0].content?.[0]?.text)
+    .filter(Boolean);
+  assert.ok(
+    texts.includes('buffered') && texts.includes('after-mint'),
+    'the update buffered during the keyless window replays once a later attempt mints',
+  );
+  assert.equal(client.calls.update.filter((u) => u.status === 'COMPLETED').length, 1);
+});
+
+test('the pre-mint replay buffer is bounded by an approximate byte budget, and the dropped count is reported (issue #230)', async () => {
+  // A raw-count cap alone lets a token-chunk storm exhaust the buffer, so the buffer
+  // is ALSO bounded by bytes. Once the byte budget is exceeded, further updates are
+  // dropped (keeping a contiguous prefix) and the dropped count is surfaced on replay
+  // so the truncation is visible rather than silent.
+  const lines = { info: [], warn: [] };
+  const logger = { info: (m) => lines.info.push(m), warn: (m) => lines.warn.push(m), debug() {} };
+  const client = fakeClient({ failCreateTimes: 1 });
+  let t = Date.parse('2026-02-03T04:05:06.000Z');
+  const p = createAgentInstanceProducer({
+    camunda: client,
+    job: EXTERNAL_JOB,
+    profile: PROFILE,
+    envelope: ENVELOPE,
+    logger,
+    now: () => t,
+    createRetryBaseMs: 1000,
+    createRetryMaxMs: 30000,
+    // A tiny byte budget so a couple of small updates already overflow it, and a large
+    // slot count so it is the BYTE cap (not the count cap) doing the bounding here.
+    preMintBufferMax: 1000,
+    preMintBufferMaxBytes: 120,
+  });
+
+  await p.activate();
+  assert.equal(p.active, false);
+
+  // Stream several updates while the create is still failing (inside the backoff
+  // window → no re-attempt). The byte budget bounds how many are retained.
+  for (const text of ['first', 'second', 'third', 'fourth', 'fifth']) {
+    p.ingest({ sessionUpdate: 'agent_message_chunk', messageId: `m-${text}`, content: { type: 'text', text } });
+  }
+  await p.drain();
+  assert.equal(client.calls.create.length, 1, 'no re-attempt inside the backoff window');
+
+  // Past the window, the next attempt succeeds → mint + replay of the retained prefix.
+  t += 2000;
+  await p.activate();
+  assert.equal(p.active, true);
+  // A post-mint turn now appends directly (the instance exists).
+  p.ingest({ sessionUpdate: 'agent_message_chunk', messageId: 'm-live', content: { type: 'text', text: 'live' } });
+  await p.complete(true);
+
+  const texts = client.calls.update
+    .filter((u) => Array.isArray(u.history))
+    .map((u) => u.history[0].content?.[0]?.text)
+    .filter(Boolean);
+  // Some early updates are retained (a contiguous prefix), some are dropped by the
+  // byte cap — the buffer neither kept everything nor lost everything.
+  assert.ok(texts.includes('first'), 'the earliest pre-mint update is retained');
+  assert.ok(texts.length < 6, 'the byte budget dropped at least one buffered update');
+  assert.ok(texts.includes('live'), 'the post-mint update is appended');
+  // The overflow is reported (once at buffering, once with the dropped count on replay).
+  assert.ok(
+    lines.warn.some((m) => /pre-mint replay buffer full/.test(m)),
+    'the buffer-full overflow is warned',
+  );
+  assert.ok(
+    lines.warn.some((m) => /pre-mint update\(s\) were dropped .* truncated/.test(m)),
+    'the dropped count is reported on replay so the truncation is visible',
   );
 });
 
 // ---------------------------------------------------------------------------
 // Lease plumbing (issue #230 ask 3): the job's leaseToken is submitted as jobLease
 // ---------------------------------------------------------------------------
-
 test('the activation leaseToken is submitted as jobLease on create AND every append', async () => {
   const client = fakeClient();
   const p = makeProducer(client);

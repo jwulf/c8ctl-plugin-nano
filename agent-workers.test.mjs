@@ -1059,6 +1059,16 @@ test('buildResultEnvelope merges the git block when a repo was provisioned', () 
   assert.equal(failed.repository, 'https://github.com/o/r.git', 'repository preserved on failure');
   assert.equal(failed.branch, 'feat/x');
   assert.equal(failed.gitError, 'finalize failed');
+
+  // A rejected (non-ff) push must forward BOTH recovery-contract fields into the
+  // envelope so io.nanobpm.agentResult stays the durable recovery handle (#231).
+  const rejected = buildResultEnvelope(
+    { ok: true, stdout: 'done', exitCode: 0 },
+    { sandbox: 'none', git: { remote: 'https://github.com/o/r.git', branch: 'feat/x', baseSha: 'aaa', headSha: 'ccc', commits: ['ccc', 'ddd'], pushed: false, pushFailed: true, pushError: '! [rejected] feat/x -> feat/x (non-fast-forward)', strandedCommits: ['ccc', 'ddd'] } },
+  );
+  assert.equal(rejected.pushed, false);
+  assert.equal(rejected.pushFailed, true, 'pushFailed survives into the envelope');
+  assert.deepEqual(rejected.strandedCommits, ['ccc', 'ddd'], 'strandedCommits survive into the envelope');
 });
 
 // --- Structured agent result channel ($AGENT_RESULT_FILE + fallback) ---------
@@ -1396,6 +1406,31 @@ test('provisionRepo honours branch.create equal to base when push is disabled (r
     const prov = provisionRepo({ envelope, token: null, runDir });
     assert.equal(prov.fallbackBranch, false, 'nothing is pushed → no strand risk → honour the explicit create');
     assert.equal(prov.workingBranch, 'main');
+  } finally {
+    rmSync(root, { recursive: true, force: true });
+  }
+});
+
+test('provisionRepo cuts a fallback when branch.create names the DEFAULT branch and no base is configured (issue #231)', { skip: !gitOk }, () => {
+  const { root, origin } = makeOriginRepo();
+  const runDir = mkdtempSync(join(root, 'run-'));
+  try {
+    // With BOTH branch.base and repository.ref omitted, baseBranchName is empty even
+    // though the clone lands on the remote default branch (main). An explicit
+    // create='main' must still be recognized as the base and cut a fallback, not
+    // commit directly on main and non-ff-lose the work.
+    const envelope = {
+      schemaVersion: 1,
+      repository: { provider: 'github', url: origin, submodules: false },
+      branch: { create: 'main', push: true },
+      setup: { commands: [], env: {}, secretRefs: [] },
+      task: { allowPr: false },
+    };
+    const prov = provisionRepo({ envelope, token: null, runDir });
+    assert.equal(prov.fallbackBranch, true, 'create===default-branch (no configured base) still cuts a fallback');
+    assert.notEqual(prov.workingBranch, 'main', 'never leaves us on the default branch when pushing');
+    assert.match(prov.workingBranch, /^nano\/agent-work\/main-/, 'fallback names the branch the clone landed on');
+    assert.equal(g(['rev-parse', '--abbrev-ref', 'HEAD'], prov.workspaceDir), prov.workingBranch);
   } finally {
     rmSync(root, { recursive: true, force: true });
   }

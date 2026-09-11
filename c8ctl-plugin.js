@@ -4311,9 +4311,22 @@ function provisionRepo({ envelope, token, runDir, runId, timeoutMs = 120_000 }) 
   // `run-XXXXXX` basename and collide on a repo-wide remote ref (non-ff strand);
   // the UUID is globally unique. (`basename(runDir)` remains a fallback for the
   // direct-call unit tests that do not thread a runId.)
-  const cutFallbackBranch = (checkedOut) => {
+  // What the clone actually landed on: a branch only if rev-parse resolves a
+  // symbolic name — a tag/sha leaves detached HEAD, in which case there is NO
+  // branch to push and workingBranch stays null.
+  const head = runGit(['rev-parse', '--abbrev-ref', 'HEAD'], { cwd: workspaceDir, env: gitEnv });
+  const headName = (head.stdout || '').trim();
+  const checkedOut = (headName && headName !== 'HEAD') ? headName : null; // null ⇒ detached HEAD
+  // The base we must never commit-and-push onto. When BOTH branch.base and
+  // repository.ref are omitted, baseBranchName is empty even though the clone may
+  // have landed on the remote default branch (e.g. 'main') — so fall back to the
+  // actually-checked-out ref. Otherwise an explicit branch.create='main' would
+  // slip past the guard below (=== '' is false) and commit directly on default.
+  const effectiveBase = baseBranchName || checkedOut || '';
+  const cutFallbackBranch = (landedOn) => {
     const uniq = runId || basename(runDir);
-    const fb = `nano/agent-work/${sanitizeBranchSegment(baseBranchName)}-${sanitizeBranchSegment(uniq)}`;
+    const baseSeg = baseBranchName || landedOn || 'base';
+    const fb = `nano/agent-work/${sanitizeBranchSegment(baseSeg)}-${sanitizeBranchSegment(uniq)}`;
     const cb = runGit(['checkout', '-B', fb], { cwd: workspaceDir, env: gitEnv, timeoutMs });
     if (cb.status !== 0) throw new ProvisionError(describeGitFailure(`git checkout -B ${fb}`, cb, { token, timeoutMs }));
     workingBranch = fb;
@@ -4321,33 +4334,31 @@ function provisionRepo({ envelope, token, runDir, runId, timeoutMs = 120_000 }) 
     // Report the ACTUAL checked-out ref and the configured base separately: they
     // can differ (e.g. repository.ref is a feature branch while branch.base is
     // main), so do not assert the clone "landed on the base branch".
-    log.warn?.(`provisionRepo: work would otherwise be committed on branch '${checkedOut}' (configured base '${baseBranchName || '(unknown)'}') — cut fallback work branch '${fb}' so commits are never made directly on the base branch (the app should supply branch.create=feat/<task.id>)`);
+    log.warn?.(`provisionRepo: work would otherwise be committed on branch '${landedOn}' (configured base '${baseBranchName || '(unknown)'}') — cut fallback work branch '${fb}' so commits are never made directly on the base branch (the app should supply branch.create=feat/<task.id>)`);
   };
   const explicitCreate = envelope.branch?.create ? String(envelope.branch.create) : '';
   // Defense against silent work-loss (issue #231): committing on the base branch
   // with intent to push is ALWAYS wrong for the PR flow — a push to the shared
   // base races it and a non-ff reject strands the commits in this throwaway
   // workspace with no PR (re-running the agent is non-idempotent, so there is no
-  // recovery). An explicit `branch.create` that NAMES the base is that same
-  // misconfiguration, so treat it like an omitted create and cut a fallback rather
-  // than honouring the checkout onto the base.
-  if (explicitCreate && !(wantPush && explicitCreate === baseBranchName)) {
+  // recovery). An explicit `branch.create` that NAMES the effective base (the
+  // configured base, or the default branch the clone landed on when no base was
+  // given) is that same misconfiguration, so treat it like an omitted create and
+  // cut a fallback rather than honouring the checkout onto the base.
+  if (explicitCreate && !(wantPush && explicitCreate === effectiveBase)) {
     const cb = runGit(['checkout', '-B', explicitCreate], { cwd: workspaceDir, env: gitEnv, timeoutMs });
     if (cb.status !== 0) throw new ProvisionError(describeGitFailure(`git checkout -B ${explicitCreate}`, cb, { token, timeoutMs }));
     workingBranch = explicitCreate;
     log.debug?.(`provisionRepo: branch.create=${workingBranch} → cut work branch off base '${baseBranchName || '(unknown)'}'`);
+  } else if (checkedOut && wantPush) {
+    // Either no branch.create, OR an explicit create that NAMES the effective base
+    // while pushing — both would otherwise commit on the base, so cut a fallback.
+    cutFallbackBranch(checkedOut);
   } else {
-    const head = runGit(['rev-parse', '--abbrev-ref', 'HEAD'], { cwd: workspaceDir, env: gitEnv });
-    const name = (head.stdout || '').trim();
-    const checkedOut = (name && name !== 'HEAD') ? name : null; // null ⇒ detached HEAD
-    if (checkedOut && wantPush) {
-      cutFallbackBranch(checkedOut);
-    } else {
-      // Detached HEAD (tag/sha ⇒ null, no branch to push) or a read-only clone
-      // (push disabled) — safe to stay on the checked-out ref; nothing is pushed.
-      workingBranch = checkedOut;
-      if (checkedOut) log.debug?.(`provisionRepo: no branch.create; push disabled → working read-only on '${checkedOut}'`);
-    }
+    // Detached HEAD (tag/sha ⇒ null, no branch to push) or a read-only clone
+    // (push disabled) — safe to stay on the checked-out ref; nothing is pushed.
+    workingBranch = checkedOut;
+    if (checkedOut) log.debug?.(`provisionRepo: no branch.create; push disabled → working read-only on '${checkedOut}'`);
   }
   const sha = runGit(['rev-parse', 'HEAD'], { cwd: workspaceDir, env: gitEnv });
   // `git rev-parse HEAD` on an unborn branch (freshly cloned empty repo) exits
@@ -4526,7 +4537,13 @@ function finalizeGit({ workspaceDir, gitEnv, startSha, workingBranch, baseBranch
     }
   }
 
-  if (workingBranch && envelope.task?.allowPr) {
+  // Skip PR reconciliation when the push FAILED (issue #231): a non-fast-forward
+  // reject leaves this run's commits stranded, but an explicit work branch may
+  // still have an OLDER remote PR — reporting `pr.found` for it would falsely
+  // claim this run's stranded commits are in a PR. Leave `out.pr` unset so the
+  // envelope + completion note carry only the `pushFailed`/`strandedCommits`
+  // recovery signal, not a misleading PR reference.
+  if (workingBranch && envelope.task?.allowPr && !out.pushFailed) {
     out.pr = reconcileAgentPr({ workspaceDir, token, branch: workingBranch, provider: envelope.repository?.provider || 'github' });
     // Record the agent's authorship on the PR (commits carry the operator's
     // identity now, so this preserves the machine-generated provenance).
@@ -8462,8 +8479,12 @@ async function workAgent(req, flags) {
           // age-gated by the reaper, so it is a recovery window, not a leak) and log
           // its path so an operator can recover the SHAs the error line named.
           const preserveForRecovery = !!gitResult?.pushFailed;
+          // Correlation handle (issue #231 observability): join these push-failure
+          // diagnostics to the AgentInstance / relay timelines even with concurrent
+          // jobs — jobKey alone is not enough, so carry the process + element keys.
+          const corr = `instance ${job.processInstanceKey ?? '-'}/elem ${job.elementInstanceKey ?? '-'}`;
           if (runDir && !keepRuns && !preserveForRecovery) { try { rmSync(runDir, { recursive: true, force: true }); } catch { /* best effort */ } }
-          else if (runDir && preserveForRecovery) logger.error(`[${jobType}] job ${job.jobKey}: preserving workspace '${runDir}' (push failed) so the stranded commit(s) remain recoverable — copy them out before the reaper ages it away`);
+          else if (runDir && preserveForRecovery) logger.error(`[${jobType}] job ${job.jobKey} (${corr}): preserving workspace '${runDir}' (push failed) so the stranded commit(s) remain recoverable — copy them out before the reaper ages it away`);
           if (runDir) liveRunDirs.delete(runDir);
           // Emit the relay session's `phase:close` lifecycle event and drain its
           // outbound buffer before the job settles (so the live-terminal tail is
@@ -8495,7 +8516,8 @@ async function workAgent(req, flags) {
             // recovered from these SHAs.
             const stranded = gitResult.strandedCommits && gitResult.strandedCommits.length ? gitResult.strandedCommits : (gitResult.commits || []);
             const shaNote = stranded.length ? ` — ${stranded.length} commit(s) on branch '${gitResult.branch}' are UNPUSHED and will be lost, no PR [stranded: ${stranded.join(', ')}]` : '';
-            logger.error(`[${jobType}] job ${job.jobKey}: branch push FAILED${shaNote} — ${gitResult.pushError}`);
+            const corr = `instance ${job.processInstanceKey ?? '-'}/elem ${job.elementInstanceKey ?? '-'}`;
+            logger.error(`[${jobType}] job ${job.jobKey} (${corr}): branch push FAILED${shaNote} — ${gitResult.pushError}`);
           }
           // Guard the operator against silent empty escalations: a success that
           // yields no *effective* result vars (no file/sentinel at all, an empty

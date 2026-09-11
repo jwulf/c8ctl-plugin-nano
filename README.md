@@ -728,7 +728,7 @@ only `latest`, so the key is the reproducibility handle).
 
 On completion the plugin writes an **output envelope** back under
 `io.nanobpm.agentResult` (`{schemaVersion, status, sandbox, image, output, truncated, stderrTruncated, exitCode, signal, error, promptResourceKey?}`). When a repository was
-provisioned (below) it also carries `{repository, branch, baseSha, headSha, commits[], pushed, pushError?, pushFailed?, strandedCommits?, gitError?, pr?}`. `pushFailed` is the explicit "push was rejected" flag (typically non-fast-forward) and `strandedCommits` lists the SHAs of the new commits left UNPUSHED in the throwaway workspace — together they are the recovery handle for a failed push, so consumers must not treat `pushed: false` alone as the only signal (the workspace is preserved on such a failure so those SHAs remain recoverable).
+provisioned (below) it also carries `{repository, branch, baseSha, headSha, commits[], pushed, pushError?, pushFailed?, strandedCommits?, gitError?, pr?}`. `pushFailed` is the explicit "push was rejected" flag (typically non-fast-forward) and `strandedCommits` lists the SHAs of the new commits left UNPUSHED in the throwaway workspace — together they are the recovery handle for a failed push, so consumers must not treat `pushed: false` alone as the only signal. On such a failure the throwaway workspace is preserved **best-effort** (even under the default `--keep-runs=false`) so those SHAs stay recoverable, but this is a *recovery window, not a durable archive*: the run-directory reaper still ages it out by mtime and worker shutdown removes the namespace — copy the stranded commits out promptly (or run with `--keep-runs`).
 
 **Git provisioning (host).** When `--sandbox none` (the default) and the envelope
 carries a `repository.url`, the plugin provisions a workspace on the host around
@@ -796,7 +796,10 @@ agent/config; use HTTPS URLs if you need a guaranteed-anonymous clone.)
 Token-backed jobs keep global config (e.g. `http.proxy`). A push failure is
 reported as `pushError` (the job still completes) so a later BPMN step can drive
 the merge; a clone/checkout failure sheds the job (retryable). Workspaces are
-deleted after each job (keep them with `--keep-runs`).
+deleted after each job (keep them with `--keep-runs`) — **except** a rejected
+(non-fast-forward) push, whose workspace is preserved best-effort so its
+`strandedCommits` stay recoverable; that preservation is still age-gated by the
+reaper and cleared on worker shutdown, so recover the SHAs promptly.
 
 ```bash
 # The harness sees a cloned repo at $AGENT_WORKSPACE; branch/push/PR are handled for it.

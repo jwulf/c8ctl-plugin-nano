@@ -3340,6 +3340,20 @@ function bindJobSettle(settle, job) {
   };
 }
 
+async function yieldJobForRetry(settle, { jobKey, retries, leaseToken }, signal, logger) {
+  try {
+    await settle.fail(jobKey, {
+      errorMessage: `worker force-stopped (${signal}); job yielded for retry`,
+      retries: Number.isFinite(retries) && retries > 0 ? retries : 1,
+      retryBackOff: 0,
+      leaseToken,
+    });
+    logger.info(`  yielded job ${jobKey} for immediate retry.`);
+  } catch (err) {
+    logger.warn(`  could not yield job ${jobKey} (${err?.message || err}); its lock will lapse and the broker will reclaim it.`);
+  }
+}
+
 async function createSupervisorDeps(opts = {}) {
   const {
     runner,
@@ -8910,17 +8924,7 @@ async function workAgent(req, flags) {
       // preserved — a force-stop doesn't consume an attempt). Best-effort: a
       // failed yield just lets the lock lapse (the honest fallback).
       for (const { jobKey, retries, leaseToken } of inflight) {
-        try {
-          await SupervisorEffect.runPromise(settle.fail(jobKey, {
-            errorMessage: `worker force-stopped (${signal}); job yielded for retry`,
-            retries: Number.isFinite(retries) && retries > 0 ? retries : 1,
-            retryBackOff: 0,
-            leaseToken,
-          }));
-          logger.info(`  yielded job ${jobKey} for immediate retry.`);
-        } catch (err) {
-          logger.warn(`  could not yield job ${jobKey} (${err?.message || err}); its lock will lapse and the broker will reclaim it.`);
-        }
+        await yieldJobForRetry(settle, { jobKey, retries, leaseToken }, signal, logger);
       }
       finished = true; // teardown already interrupted the fiber; just resolve.
       logger.info('Worker stopped.');
@@ -14156,6 +14160,7 @@ export {
   createAgenticEndpoint,
   createSupervisorDeps,
   bindJobSettle,
+  yieldJobForRetry,
   enableEngineHappyEyeballs,
   preferIpv4Resolution,
   isLikelyLocalNetworkTccBlock,

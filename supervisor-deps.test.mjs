@@ -19,9 +19,40 @@ import {
   recoverPendingSettlement,
   settlementJournalPath,
   settleWithRecovery,
+  yieldJobForRetry,
 } from "./c8ctl-plugin.js";
 
 const sleep = (ms) => new Promise((r) => setTimeout(r, ms));
+
+test("force-stop yield awaits the promise-returning settlement seam", async () => {
+  const calls = [];
+  const info = [];
+  const warn = [];
+  await yieldJobForRetry(
+    {
+      fail: async (jobKey, options) => {
+        calls.push({ jobKey, options });
+      },
+    },
+    { jobKey: "job-yield", retries: 3, leaseToken: "lease-yield" },
+    "SIGTERM",
+    { info: (message) => info.push(message), warn: (message) => warn.push(message) },
+  );
+
+  assert.deepEqual(calls, [
+    {
+      jobKey: "job-yield",
+      options: {
+        errorMessage: "worker force-stopped (SIGTERM); job yielded for retry",
+        retries: 3,
+        retryBackOff: 0,
+        leaseToken: "lease-yield",
+      },
+    },
+  ]);
+  assert.equal(info.length, 1);
+  assert.equal(warn.length, 0);
+});
 
 /** A fake `fetch`: serves ONE job on the first activation, then empty; records timeout PATCHes. */
 function makeEngineFetch() {

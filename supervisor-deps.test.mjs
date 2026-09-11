@@ -9,16 +9,19 @@
  */
 import assert from "node:assert/strict";
 import { test } from "node:test";
-import { mkdtempSync, readFileSync, rmSync } from "node:fs";
+import { existsSync, mkdirSync, mkdtempSync, readFileSync, rmSync, writeFileSync } from "node:fs";
 import { tmpdir } from "node:os";
 import { join } from "node:path";
 import {
   bindJobSettle,
   createSupervisorDeps,
+  hasPendingSettlement,
   readPendingSettlement,
   recoverPendingSettlement,
+  selectYieldableInflight,
   settlementJournalPath,
   settleWithRecovery,
+  writePendingSettlement,
   yieldJobForRetry,
 } from "./c8ctl-plugin.js";
 
@@ -454,6 +457,105 @@ test("settlement recovery: a lost failure is replayed with the original retry de
     { jobKey: oldJob.jobKey, opts: { retries: 2, errorMessage: "agent failed", retryBackOff: 15_000, leaseToken: "lease-new" } },
   ]);
   assert.equal(readPendingSettlement(root, oldJob.jobKey), null);
+});
+
+test("settlement recovery: an unpersistable intent fails closed — flagged and the broker is never called", async (t) => {
+  const base = mkdtempSync(join(tmpdir(), "c8ctl-settlement-persist-"));
+  t.after(() => rmSync(base, { recursive: true, force: true }));
+  // An ancestor of the journal root is a FILE, so mkdir of the root (ENOSPC/EACCES
+  // in production) fails and the intent cannot be persisted.
+  const blocker = join(base, "blocker");
+  writeFileSync(blocker, "not a directory");
+  const unwritableRoot = join(blocker, "settlements");
+
+  let completeCalls = 0;
+  let reclaimCalls = 0;
+  const job = { jobKey: "job-nospace", type: "senior:feature", leaseToken: "lease-x" };
+  const err = await settleWithRecovery({
+    root: unwritableRoot,
+    job,
+    operation: "complete",
+    payload: { status: "opened" },
+    settle: { complete: async () => { completeCalls++; }, fail: async () => {} },
+    reclaim: async () => { reclaimCalls++; },
+  }).then(() => null, (e) => e);
+
+  assert.ok(err, "an unpersistable intent must reject");
+  assert.equal(err.settlementPersistFailed, true, "the caller can detect the failure and fail closed");
+  assert.equal(completeCalls, 0, "the broker settlement must NOT be attempted with no durable record");
+  assert.equal(reclaimCalls, 0, "no reclaim is attempted when nothing was settled");
+});
+
+test("settlement recovery: a journal cleanup failure never turns a settled job into a failure", async (t) => {
+  const root = mkdtempSync(join(tmpdir(), "c8ctl-settlement-cleanup-"));
+  t.after(() => rmSync(root, { recursive: true, force: true }));
+
+  const reclaims = [];
+  const warnings = [];
+  const job = { jobKey: "job-cleanup", type: "senior:feature", leaseToken: "lease-c" };
+  const journalPath = settlementJournalPath(root, job.jobKey);
+  const result = await settleWithRecovery({
+    root,
+    job,
+    operation: "complete",
+    payload: { status: "done" },
+    settle: {
+      // Broker accepts the settlement, then the journal file is swapped for a
+      // directory so the best-effort unlink (no `recursive`) cannot remove it.
+      complete: async () => {
+        rmSync(journalPath, { force: true });
+        mkdirSync(journalPath, { recursive: true });
+      },
+      fail: async () => {},
+    },
+    reclaim: async (jobKey, leaseToken) => { reclaims.push({ jobKey, leaseToken }); },
+    logger: { warn: (m) => warnings.push(m) },
+  });
+
+  assert.equal(result.settled, true, "a cleanup failure must not fail the settlement");
+  assert.deepEqual(reclaims, [], "a settled job must NOT be reclaimed over a cleanup error");
+  assert.ok(warnings.some((m) => /orphan/.test(m)), "the orphaned journal is surfaced as a warning");
+});
+
+test("hasPendingSettlement: absent → false, present → true, unreadable → conservatively true", async (t) => {
+  const root = mkdtempSync(join(tmpdir(), "c8ctl-has-pending-"));
+  t.after(() => rmSync(root, { recursive: true, force: true }));
+
+  assert.equal(hasPendingSettlement(root, "job-absent"), false);
+
+  writePendingSettlement(root, { jobKey: "job-present", operation: "complete", payload: { status: "opened" } });
+  assert.equal(hasPendingSettlement(root, "job-present"), true);
+
+  // A corrupt/garbage journal must count as pending — never deleted or rerun.
+  writeFileSync(settlementJournalPath(root, "job-corrupt"), "{ not json");
+  const errors = [];
+  assert.equal(hasPendingSettlement(root, "job-corrupt", { error: (m) => errors.push(m) }), true);
+  assert.equal(errors.length, 1, "an unreadable journal is logged for operator recovery");
+});
+
+test("selectYieldableInflight: force-stop yields ONLY jobs with no pending settlement intent", async (t) => {
+  const root = mkdtempSync(join(tmpdir(), "c8ctl-yieldable-"));
+  t.after(() => rmSync(root, { recursive: true, force: true }));
+
+  // A durable journal models a job mid-settlement whose map entry is not yet
+  // marked `settlement-pending`; a corrupt journal models an unreadable one.
+  writePendingSettlement(root, { jobKey: "job-journal", operation: "complete", payload: { status: "opened" } });
+  writeFileSync(settlementJournalPath(root, "job-corrupt"), "{ broken");
+
+  const entries = [
+    ["job-normal", { retries: 3, leaseToken: "lease-n" }],
+    ["job-marked", { retries: 3, leaseToken: "lease-m", state: "settlement-pending" }],
+    ["job-journal", { retries: 2, leaseToken: "lease-j" }],
+    ["job-corrupt", { retries: 2, leaseToken: "lease-r" }],
+    ["job-unrecoverable", { retries: 1, leaseToken: "lease-u" }],
+  ];
+  const yieldable = selectYieldableInflight(entries, root, { unrecoverable: new Set(["job-unrecoverable"]) });
+
+  assert.deepEqual(
+    yieldable,
+    [{ jobKey: "job-normal", retries: 3, leaseToken: "lease-n" }],
+    "only a job with a clean absence of any pending intent is yielded",
+  );
 });
 
 test("createSupervisorDeps: derives engine authHeaders from camunda.getAuthHeaders() when no explicit headers/token", async () => {

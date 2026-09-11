@@ -3794,6 +3794,13 @@ function agentRunsRoot() {
   return join(getStateHome(), 'agent-runs');
 }
 
+// The single durable home for settlement handoffs. Shared by the settle wrappers,
+// the run-end recorder, and the force-stop yield filter so they can never disagree
+// about where a job's pending intent lives.
+function settlementsRoot() {
+  return join(agentRunsRoot(), 'settlements');
+}
+
 // A settlement handoff is the durable boundary between an agent's external
 // side effect and the broker's job settlement. It lives outside any one
 // worker-incarnation namespace so a same-host reactivation can be recovered by
@@ -3879,6 +3886,39 @@ function removePendingSettlement(root, jobKey) {
   rmSync(settlementJournalPath(root, jobKey), { force: true });
 }
 
+// True when a job still carries a durable pending settlement intent — i.e. a
+// readable journal exists, OR its journal is present but UNREADABLE (a broker
+// settlement may already be recorded there, so we conservatively treat it as
+// pending rather than risk deleting/rerunning). A clean absence returns false.
+function hasPendingSettlement(root, jobKey, logger = null) {
+  try {
+    return Boolean(readPendingSettlement(root, jobKey));
+  } catch (err) {
+    logger?.error?.(
+      `job ${jobKey}: settlement journal could not be read — treating as settlement-pending; ` +
+      `operator recovery required (${err?.message || err})`,
+    );
+    return true;
+  }
+}
+
+// Choose which in-flight jobs a force-stop may yield (fail-for-immediate-retry).
+// A job that carries a pending settlement intent — already marked
+// `settlement-pending`, a readable/unreadable journal, or flagged unrecoverable
+// because its journal write failed — is DELIBERATELY excluded: yielding it would
+// race or overwrite the durable settlement path (e.g. clobber a pending
+// completion with a fail) and defeat recovery. Such jobs settle only via the
+// journal, never the yield.
+function selectYieldableInflight(entries, root, { logger = null, unrecoverable = null } = {}) {
+  return entries
+    .filter(([jobKey, info]) => {
+      if (info?.state === 'settlement-pending') return false;
+      if (unrecoverable && unrecoverable.has(String(jobKey))) return false;
+      return !hasPendingSettlement(root, jobKey, logger);
+    })
+    .map(([jobKey, info]) => ({ jobKey, retries: info?.retries, leaseToken: info?.leaseToken }));
+}
+
 function settlementCall(settle, operation, payload) {
   return operation === 'complete' ? settle.complete(payload) : settle.fail(payload);
 }
@@ -3909,6 +3949,12 @@ async function settleWithRecovery({ root, job, operation, payload, settle, recla
       payload,
     });
   } catch (err) {
+    // The intent could NOT be persisted, so this settlement is not durably
+    // recoverable: if broker ownership is lost, the reactivation finds no record
+    // and reruns the agent's side effect. Flag the error so the caller can fail
+    // closed (hold the job non-rerunnable + quiesce) instead of allowing ordinary
+    // reactivation.
+    if (err && typeof err === 'object') err.settlementPersistFailed = true;
     logger?.error?.(
       `[${job.type}] job ${job.jobKey}: CRITICAL settlement journal write failed; ` +
       `the agent result cannot be recovered safely and operator intervention is required (${err?.message ?? err})`,
@@ -3917,8 +3963,6 @@ async function settleWithRecovery({ root, job, operation, payload, settle, recla
   }
   try {
     await settlementCall(settle, operation, payload);
-    removePendingSettlement(root, job.jobKey);
-    return { settled: true, recovered: false, path };
   } catch (err) {
     if (isSettlementOwnershipLostError(err) && typeof reclaim === 'function') {
       try {
@@ -3936,11 +3980,25 @@ async function settleWithRecovery({ root, job, operation, payload, settle, recla
       }
     }
     logger?.warn?.(
-      `[${job.type}] job ${job.jobKey}: settlement lost or failed after agent exit; ` +
-      `recovery journal retained at ${path}; future activations will replay ${operation} without rerunning the agent (${err?.message ?? err})`,
+      `[${job.type}] job ${job.jobKey}: ${operation} settlement could not be confirmed with the broker; ` +
+      `recovery journal retained at ${path}; a future activation will replay it without rerunning any agent work (${err?.message ?? err})`,
     );
     throw err;
   }
+  // The broker accepted the settlement. Removing the journal is best-effort
+  // cleanup and is NEVER treated as a settlement failure: the job is settled, so
+  // there is no activation to replay, and reporting a cleanup error as failure
+  // would (a) trigger a pointless reclaim of a settled job and (b) leave the
+  // worker wedged `settlement-pending` with nothing left to clear it.
+  try {
+    removePendingSettlement(root, job.jobKey);
+  } catch (cleanupErr) {
+    logger?.warn?.(
+      `[${job.type}] job ${job.jobKey}: ${operation} settled with the broker, but the recovery journal at ${path} ` +
+      `could not be removed; it is now an orphan and safe to delete (${cleanupErr?.message ?? cleanupErr})`,
+    );
+  }
+  return { settled: true, recovered: false, path };
 }
 
 /**
@@ -3968,11 +4026,6 @@ async function recoverPendingSettlement({ root, job, settle, logger = null }) {
   const path = settlementJournalPath(root, job.jobKey);
   try {
     await settlementCall(settle, record.operation, record.payload);
-    removePendingSettlement(root, job.jobKey);
-    logger?.info?.(
-      `[${job.type}] job ${job.jobKey}: replayed pending ${record.operation} settlement from ${path}; agent was not rerun`,
-    );
-    return true;
   } catch (err) {
     logger?.warn?.(
       `[${job.type}] job ${job.jobKey}: pending ${record.operation} settlement still cannot be applied; ` +
@@ -3980,6 +4033,21 @@ async function recoverPendingSettlement({ root, job, settle, logger = null }) {
     );
     throw err;
   }
+  // Replay accepted by the broker. As in settleWithRecovery, journal removal is
+  // best-effort cleanup: a failed unlink must not turn a successful replay into a
+  // failure (which would re-throw, wedge the worker, and replay again forever).
+  try {
+    removePendingSettlement(root, job.jobKey);
+  } catch (cleanupErr) {
+    logger?.warn?.(
+      `[${job.type}] job ${job.jobKey}: replayed ${record.operation} settlement, but the recovery journal at ${path} ` +
+      `could not be removed; it is now an orphan and safe to delete (${cleanupErr?.message ?? cleanupErr})`,
+    );
+  }
+  logger?.info?.(
+    `[${job.type}] job ${job.jobKey}: replayed pending ${record.operation} settlement from ${path}; agent was not rerun`,
+  );
+  return true;
 }
 
 // Redact a token that may have been embedded in a URL or surfaced in git output,
@@ -7929,6 +7997,11 @@ async function workAgent(req, flags) {
     installParentDeathWatchdog({ parentPid: Number.isInteger(daemonPid) ? daemonPid : undefined });
   }
   const activeJobs = new Map(); // jobKey -> { type, since (ms epoch) }
+  // Jobs whose settlement intent could NOT be durably persisted (journal write
+  // failed). They are held non-rerunnable (`settlement-pending`) and the worker is
+  // quiesced, because ordinary reactivation would rerun an agent that may already
+  // have caused an external side effect. Cleared only by operator recovery/restart.
+  const unrecoverableSettlements = new Set();
   // Which engine this worker polls jobs from, surfaced to `supervisor status` via
   // the activity marker (#99). Derived from resolveWorkerPollEngineBase — the SDK
   // client's OWN profile restAddress (the base createJobWorker actually activates
@@ -8013,13 +8086,12 @@ async function workAgent(req, flags) {
     // before.
     const cur = activeJobs.get(String(job.jobKey));
     if (cur && cur.leaseToken !== job.leaseToken) return;
-    let pending = false;
-    try {
-      pending = Boolean(readPendingSettlement(join(agentRunsRoot(), 'settlements'), job.jobKey));
-    } catch (err) {
-      pending = true;
-      logger.error?.(`[${job.type}] job ${job.jobKey}: settlement journal could not be read after run exit — operator recovery required (${err?.message || err})`);
-    }
+    // A job is held (not deleted) when it still carries a durable pending intent
+    // (readable/unreadable journal) OR its journal write failed (unrecoverable):
+    // deleting it would let the slot free for an ordinary reactivation that reruns
+    // the agent's side effect.
+    const pending = hasPendingSettlement(settlementsRoot(), job.jobKey, logger)
+      || unrecoverableSettlements.has(String(job.jobKey));
     if (pending) {
       activeJobs.set(String(job.jobKey), {
         type: job.type,
@@ -8033,6 +8105,21 @@ async function workAgent(req, flags) {
     }
     activeJobs.delete(String(job.jobKey));
     writeActivity();
+  };
+  // Fail closed when a settlement intent cannot be durably persisted (journal
+  // write failed). Hold the job non-rerunnable (`settlement-pending`) and quiesce
+  // the worker: with the settlement store unwritable, this worker can no longer
+  // guarantee ANY job's result is recoverable, so it must stop leasing new work
+  // until an operator restores the store and restarts it. (`workerRegistry` /
+  // `SupervisorEffect` are bound below from the composed runtime; this only runs
+  // once a job is in flight, i.e. after that binding.)
+  const failClosedUnrecoverable = (job) => {
+    unrecoverableSettlements.add(String(job.jobKey));
+    try { SupervisorEffect.runSync(workerRegistry.quiesce()); } catch { /* best effort */ }
+    logger.error?.(
+      `[${job.type}] job ${job.jobKey}: settlement store is unwritable — worker QUIESCED (leasing no new jobs) and this job is ` +
+      `held settlement-pending so it is not rerun. Restore ${settlementsRoot()} and restart the worker.`,
+    );
   };
   // Seed an initial idle marker so status reports 'idle' immediately after spawn.
   writeActivity();
@@ -8230,27 +8317,27 @@ async function workAgent(req, flags) {
       // WRONG (newer) token and clobber the new activation — the very lease bypass
       // this fence exists to prevent. `job.leaseToken` in the closure cannot drift.
       const settleJob = bindJobSettle(settle, job);
-      const settlementRoot = join(agentRunsRoot(), 'settlements');
-      const settleComplete = (variables) =>
-        settleWithRecovery({
-          root: settlementRoot,
-          job,
-          operation: 'complete',
-          payload: variables,
-          settle: settleJob,
-          reclaim: settle.reclaim,
-          logger,
-        });
-      const settleFail = (opts2) =>
-        settleWithRecovery({
-          root: settlementRoot,
-          job,
-          operation: 'fail',
-          payload: opts2 || {},
-          settle: settleJob,
-          reclaim: settle.reclaim,
-          logger,
-        });
+      const settlementRoot = settlementsRoot();
+      // Persist the intent, settle, and — if the intent could not be persisted —
+      // fail closed rather than let the job be reactivated and rerun.
+      const settleVia = async (operation, payload) => {
+        try {
+          return await settleWithRecovery({
+            root: settlementRoot,
+            job,
+            operation,
+            payload,
+            settle: settleJob,
+            reclaim: settle.reclaim,
+            logger,
+          });
+        } catch (err) {
+          if (err?.settlementPersistFailed) failClosedUnrecoverable(job);
+          throw err;
+        }
+      };
+      const settleComplete = (variables) => settleVia('complete', variables);
+      const settleFail = (opts2) => settleVia('fail', opts2 || {});
       try {
         // A previous activation may have completed the agent's external work
         // but lost ownership before settlement. Replay that exact intent before
@@ -8896,7 +8983,11 @@ async function workAgent(req, flags) {
 
     const inFlightCount = () => {
       try { return SupervisorEffect.runSync(workerRegistry.activeCount); }
-      catch { return activeJobs.size; }
+      // Fallback only on a registry read error: count genuinely in-flight jobs,
+      // NOT the settlement-pending markers that linger in activeJobs (those hold a
+      // durable handoff, not a running slot) — otherwise a drain could never reach
+      // zero and would wedge.
+      catch { return [...activeJobs.values()].filter((v) => v?.state !== 'settlement-pending').length; }
     };
 
     const forceAbort = async (signal) => {
@@ -8906,10 +8997,17 @@ async function workAgent(req, flags) {
       if (!autoMode) { try { unwatchFile(configFile); } catch { /* best effort */ } }
       logger.info(`Received ${signal} — aborting in-flight work and stopping worker...`);
       // Snapshot in-flight jobs (with their retry budget) BEFORE the interrupt
-      // clears the ownership registry, so we can yield each one afterwards.
-      const inflight = [...activeJobs.entries()]
-        .filter(([, info]) => info?.state !== 'settlement-pending')
-        .map(([jobKey, info]) => ({ jobKey, retries: info?.retries, leaseToken: info?.leaseToken }));
+      // clears the ownership registry, so we can yield each one afterwards. Jobs
+      // that already carry a pending settlement intent (marked settlement-pending,
+      // a readable OR unreadable journal, or flagged unrecoverable) are excluded:
+      // the durable path owns them, and yielding would race/overwrite it. The
+      // journal is written BEFORE the settle call, so a job can be mid-settlement
+      // here without its map entry being marked yet — reading the journal closes
+      // that window; an unreadable journal is excluded conservatively.
+      const inflight = selectYieldableInflight([...activeJobs.entries()], settlementsRoot(), {
+        logger,
+        unrecoverable: unrecoverableSettlements,
+      });
       // Interrupt the runtime: this aborts each running job's AbortSignal (the
       // makeJobRunner seam) so runAgentJob killTree's the harness process group,
       // and runs dispatch's bracketed teardown (release ownership + slot). The
@@ -14139,9 +14237,12 @@ export {
   redactToken,
   agentRunsRoot,
   settlementJournalPath,
+  settlementsRoot,
   readPendingSettlement,
   writePendingSettlement,
   removePendingSettlement,
+  hasPendingSettlement,
+  selectYieldableInflight,
   settleWithRecovery,
   recoverPendingSettlement,
   ProvisionError,

@@ -4604,7 +4604,7 @@ function shouldPreserveRunDir(gitResult) {
 // branch.push), and reconcile the agent-opened PR (when task.allowPr). A push
 // failure is reported (pushError) rather than thrown — the process model decides
 // what to do next, and re-running the agent would be non-idempotent.
-function finalizeGit({ workspaceDir, gitEnv, startSha, workingBranch, baseBranch: effectiveBase, baseCloneSha = null, envelope, token, corr = '', budgetMs = 0 }) {
+function finalizeGit({ workspaceDir, gitEnv, startSha, workingBranch, baseBranch: effectiveBase, baseCloneSha = null, envelope, token, corr = '', budgetMs = 0, provisioned = false }) {
   const out = { branch: workingBranch, baseSha: startSha || null, headSha: null, commits: [], pushed: false, remote: null, pr: null };
   const rem = runGit(['remote', 'get-url', 'origin'], { cwd: workspaceDir, env: gitEnv });
   if (rem.status === 0) out.remote = redactToken(rem.stdout.trim(), token);
@@ -4664,12 +4664,18 @@ function finalizeGit({ workspaceDir, gitEnv, startSha, workingBranch, baseBranch
     // and let the broker reactivate this same job mid-finalization — a duplicate run
     // (thread 4754). When the worker threads its effective recovery window as
     // `budgetMs`, cap each op at the time left before 80% of that window elapses
-    // (reserving margin for a post-finalize heartbeat + settle), with a floor so a
-    // near-exhausted budget still gives each op a usable slice. Without a budget
-    // (direct callers / unit tests) keep the full per-op timeout — behaviour-neutral.
-    const NET_OP_FLOOR_MS = 20_000;
-    const netDeadline = budgetMs > 0 ? Date.now() + Math.max(NET_OP_FLOOR_MS, Math.floor(budgetMs * 0.8)) : 0;
-    const netTimeoutMs = () => (netDeadline ? Math.min(pushTimeoutMs, Math.max(NET_OP_FLOOR_MS, netDeadline - Date.now())) : pushTimeoutMs);
+    // (reserving margin for a post-finalize heartbeat + settle). Enforce the budget
+    // STRICTLY, with NO per-op floor: a floor let each of the N sequential ops claim
+    // its own minimum slice even AFTER the deadline had passed, so their cumulative
+    // wall-time could still outlast the lease (e.g. a 96s deadline followed by four
+    // 20s floors = 156s, past a 120s window — thread 4672). Instead every op sees the
+    // time REMAINING to the shared deadline, so the ops together can never run past
+    // it; clamp only to a 1ms minimum so a near/over-exhausted budget makes the op
+    // fail-fast (spawnSync treats a 0/absent timeout as "no timeout", which would
+    // block indefinitely) rather than block past the window. Without a budget (direct
+    // callers / unit tests) keep the full per-op timeout — behaviour-neutral.
+    const netDeadline = budgetMs > 0 ? Date.now() + Math.floor(budgetMs * 0.8) : 0;
+    const netTimeoutMs = () => (netDeadline ? Math.min(pushTimeoutMs, Math.max(1, netDeadline - Date.now())) : pushTimeoutMs);
     // Verify HEAD is still on the branch we intend to push (issue #231). The
     // harness runs arbitrary code; if it checked out a DIFFERENT ref (e.g. the
     // base branch) and committed there, out.commits (startSha..HEAD) enumerates
@@ -4694,11 +4700,18 @@ function finalizeGit({ workspaceDir, gitEnv, startSha, workingBranch, baseBranch
     // the work branch: either HEAD moved away and committed there (out.commits =
     // startSha..HEAD, meaningful ONLY when movedOff) or they were left on another
     // local branch (offBranchStray). If ANY exist, pushing the work branch would
-    // publish stale work and abandon them, so refuse + preserve. But when HEAD merely
-    // moved off while ALL new commits are on the work branch itself (branchCommits,
-    // no strays), `git push origin <workingBranch>` publishes exactly those commits
-    // regardless of where HEAD points — that is the intended output, so push it.
-    const strays = [...new Set([...(movedOff ? out.commits : []), ...offBranchStray])];
+    // publish stale work and abandon them, so refuse + preserve. But a moved/detached
+    // HEAD sitting at a commit that is ALREADY on the work branch is NOT stranded:
+    // `git push origin <workingBranch>` publishes it. Excluding `branchCommits` from
+    // the moved-HEAD set keeps a `git checkout --detach HEAD` (after committing on
+    // the work branch) from falsely refusing an otherwise-pushable branch
+    // (thread 4701). When HEAD merely moved off while ALL new commits are on the
+    // work branch itself (no strays), `git push origin <workingBranch>` publishes
+    // exactly those commits regardless of where HEAD points — that is the intended
+    // output, so push it.
+    const branchCommitSet = new Set(branchCommits);
+    const movedStray = movedOff ? out.commits.filter((c) => !branchCommitSet.has(c)) : [];
+    const strays = [...new Set([...movedStray, ...offBranchStray])];
     if (strays.length > 0) {
       out.pushFailed = true;
       // Union every at-risk source so recovery finds them all: the off-branch strays
@@ -4708,10 +4721,14 @@ function finalizeGit({ workspaceDir, gitEnv, startSha, workingBranch, baseBranch
       // back on the work branch but commits were left on ANOTHER local branch"
       // (actual null + offBranch flag) so the completion note labels the stranded
       // ref correctly instead of rendering the null as '(detached)' (suppressed
-      // advisory 8746).
+      // advisory 8746). Carry the per-ref strand split (how many stranded commits
+      // sit ON the work branch vs. elsewhere) so the completion log can attribute a
+      // MIXED strand accurately instead of claiming a single ref for all of them
+      // (suppressed advisory 8882).
+      const strandedOnBranch = branchCommits.filter((c) => strays.indexOf(c) === -1).length;
       out.branchMismatch = movedOff
-        ? { expected: workingBranch, actual: currentBranch || null }
-        : { expected: workingBranch, actual: null, offBranch: true };
+        ? { expected: workingBranch, actual: currentBranch || null, strandedOnBranch }
+        : { expected: workingBranch, actual: null, offBranch: true, strandedOnBranch };
       const where = movedOff
         ? `HEAD is on '${currentBranch || '(detached)'}'`
         : `HEAD is back on '${workingBranch}' but ${offBranchStray.length} commit(s) were left on another local branch`;
@@ -4757,10 +4774,16 @@ function finalizeGit({ workspaceDir, gitEnv, startSha, workingBranch, baseBranch
       // `refs/remotes/origin/<base>` (e.g. its own `git fetch`), so re-reading that
       // remote-tracking ref HERE would no longer be the clone-time value and a real
       // base advance during the run would misreport as zero. Fall back to reading
-      // the remote-tracking ref only for direct callers that do not thread the
-      // captured SHA.
+      // the remote-tracking ref only for direct/legacy callers that do NOT thread a
+      // provisioning snapshot (`provisioned` false). For a PROVISIONED job a null
+      // `baseCloneSha` means provisioning genuinely captured no clone-time snapshot
+      // (no origin/<base>, or the base fetch failed), so a live read here would be a
+      // POST-harness tip — if the harness fetched the base mid-run it would read at
+      // or ahead of the real tip and silently zero the staleness count, hiding a
+      // non-ff cause. Skip the fallback and let the count be omitted instead
+      // (suppressed advisory 4764).
       let beforeSha = baseCloneSha;
-      if (!beforeSha) {
+      if (!beforeSha && !provisioned) {
         const beforeRef = runGit(['rev-parse', '--verify', '--quiet', `refs/remotes/origin/${baseBranch}`], { cwd: workspaceDir, env: gitEnv });
         beforeSha = beforeRef.status === 0 ? ((beforeRef.stdout || '').trim() || null) : null;
       }
@@ -8807,8 +8830,17 @@ async function workAgent(req, flags) {
                 // Cap finalization's cumulative network-git wall-time below the
                 // worker's activation-lock/recovery window so its event-loop-blocking
                 // spawnSync ops cannot outlast the lease and let this job be
-                // reactivated mid-finalization (thread 4754).
-                budgetMs: effectiveRecoveryWindowMs,
+                // reactivated mid-finalization (thread 4754). Use the WORKER-level
+                // `recoveryWindowMs`, NOT the per-task `effectiveRecoveryWindowMs`: a
+                // task override widens only the harness liveness window, not the
+                // broker lock (see #172 note above + dispatch config below), so
+                // budgeting against the widened value could still let the git ops run
+                // past the real lease (thread 8811).
+                budgetMs: recoveryWindowMs,
+                // Provisioned job: a null baseCloneSha means no genuine clone-time
+                // base snapshot exists, so finalizeGit must NOT fall back to a live
+                // (post-harness) read for its staleness count (advisory 4764).
+                provisioned: true,
               });
             } catch (err) {
               gitResult = { remote: provisioned.remote, branch: provisioned.workingBranch, baseSha: provisioned.startSha || null, commits: [], pushed: false, error: redactToken(err.message, repoToken) };
@@ -8879,7 +8911,28 @@ async function workAgent(req, flags) {
               ? (gitResult.branchMismatch.actual
                   || (gitResult.branchMismatch.offBranch ? '(another local branch)' : '(detached)'))
               : gitResult.branch;
-            const shaNote = stranded.length ? ` — ${stranded.length} commit(s) on branch '${strandedRef}' are UNPUSHED and will be lost, no PR [stranded: ${stranded.join(', ')}]` : '';
+            // A branch-mismatch strand is a UNION of commits on two different refs:
+            // the ones the harness left off the work branch (on `strandedRef`) AND
+            // the work-branch commits we refused to push (`strandedOnBranch`). Naming
+            // a single ref for the whole set would misdescribe the work-branch
+            // portion, so when the strand is genuinely MIXED attribute each group to
+            // its own ref; otherwise keep the precise single-ref wording (suppressed
+            // advisory 8882).
+            const onBranchCount = gitResult.branchMismatch?.strandedOnBranch || 0;
+            let shaNote = '';
+            if (stranded.length) {
+              if (gitResult.branchMismatch && onBranchCount > 0 && onBranchCount < stranded.length) {
+                const elsewhereCount = stranded.length - onBranchCount;
+                shaNote = ` — ${stranded.length} commit(s) are UNPUSHED and will be lost, no PR (${onBranchCount} on work branch '${gitResult.branchMismatch.expected}', ${elsewhereCount} on '${strandedRef}') [stranded: ${stranded.join(', ')}]`;
+              } else {
+                // Whole strand sits on one ref: the work branch itself when every
+                // stranded commit is a work-branch commit, else `strandedRef`.
+                const soleRef = (gitResult.branchMismatch && onBranchCount >= stranded.length)
+                  ? gitResult.branchMismatch.expected
+                  : strandedRef;
+                shaNote = ` — ${stranded.length} commit(s) on branch '${soleRef}' are UNPUSHED and will be lost, no PR [stranded: ${stranded.join(', ')}]`;
+              }
+            }
             const corr = `instance ${job.processInstanceKey ?? '-'}/elem ${job.elementInstanceKey ?? '-'}`;
             const failDetail = gitResult.pushError
               || (gitResult.branchMismatch

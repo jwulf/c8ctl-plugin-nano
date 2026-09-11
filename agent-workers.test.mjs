@@ -1625,7 +1625,7 @@ test('finalizeGit refuses to push when the harness moved HEAD off the work branc
     const out = finalizeGit({ ...prov, envelope, token: null });
     assert.equal(out.pushed, false, 'the misdirected push is refused');
     assert.equal(out.pushFailed, true, 'a branch mismatch is a hard, preserved failure');
-    assert.deepEqual(out.branchMismatch, { expected: 'feat/work', actual: 'main' }, 'the mismatch is reported');
+    assert.deepEqual(out.branchMismatch, { expected: 'feat/work', actual: 'main', strandedOnBranch: 0 }, 'the mismatch is reported');
     assert.deepEqual(out.strandedCommits, [strayedSha], 'the at-risk commit is surfaced for recovery');
     // Nothing was published: the provisioned work branch never reached the remote.
     assert.throws(() => g(['-c', 'safe.bareRepository=all', 'rev-parse', '--verify', 'refs/heads/feat/work'], origin), 'no stale ref was published');
@@ -1658,7 +1658,7 @@ test('finalizeGit reports a detached-HEAD harness move as detached, not a branch
 
     const out = finalizeGit({ ...prov, envelope, token: null });
     assert.equal(out.pushFailed, true, 'a HEAD move off the work branch is a preserved failure');
-    assert.deepEqual(out.branchMismatch, { expected: 'feat/work', actual: null }, "the detached sentinel is normalized to null, not the string 'HEAD'");
+    assert.deepEqual(out.branchMismatch, { expected: 'feat/work', actual: null, strandedOnBranch: 0 }, "the detached sentinel is normalized to null, not the string 'HEAD'");
     assert.deepEqual(out.strandedCommits, [strayedSha], 'the at-risk commit is surfaced for recovery');
   } finally {
     rmSync(root, { recursive: true, force: true });
@@ -1779,6 +1779,85 @@ test('finalizeGit PUSHES the work branch when the harness committed on it but le
       workSha,
       'origin/feat/work now carries the work commit',
     );
+  } finally {
+    rmSync(root, { recursive: true, force: true });
+  }
+});
+
+test('finalizeGit PUSHES the work branch when the harness committed on it then DETACHED HEAD at that same tip (issue #231, thread 4701)', { skip: !gitOk }, () => {
+  const { root, origin } = makeOriginRepo();
+  const runDir = mkdtempSync(join(root, 'run-'));
+  try {
+    const envelope = {
+      schemaVersion: 1,
+      repository: { provider: 'github', url: origin, submodules: false },
+      branch: { base: 'main', create: 'feat/work', push: true },
+      setup: { commands: [], env: {}, secretRefs: [] },
+      task: { allowPr: false },
+    };
+    const prov = provisionRepo({ envelope, token: null, runDir });
+    assert.equal(prov.workingBranch, 'feat/work');
+    // The harness commits ON the work branch (the intended output)...
+    writeFileSync(join(prov.workspaceDir, 'work.txt'), 'work\n');
+    g(['add', '-A'], prov.workspaceDir);
+    g(['-c', 'user.name=nano', '-c', 'user.email=nano@example.com', 'commit', '-q', '-m', 'real work on the work branch'], prov.workspaceDir);
+    const workSha = g(['rev-parse', 'HEAD'], prov.workspaceDir);
+    // ...then DETACHES HEAD at that exact commit (e.g. `git checkout --detach HEAD`).
+    // `startSha..HEAD` (out.commits) now enumerates [workSha] and HEAD is off any
+    // branch (movedOff), so the OLD stray set = out.commits = [workSha] and the push
+    // was FALSELY refused — even though workSha is already on the work branch and
+    // `git push origin feat/work` would publish exactly it. Excluding branchCommits
+    // from the moved-HEAD strays fixes the false strand.
+    g(['checkout', '-q', '--detach', 'HEAD'], prov.workspaceDir);
+    assert.equal(g(['rev-parse', 'HEAD'], prov.workspaceDir), workSha, 'HEAD is detached at the work-branch tip');
+
+    const out = finalizeGit({ ...prov, envelope, token: null });
+    assert.equal(out.pushed, true, 'the work branch is published even though HEAD is detached at its tip');
+    assert.ok(!out.pushFailed, 'no strand — the detached commit is already on the pushable work branch');
+    assert.equal(out.strandedCommits, undefined, 'nothing is stranded');
+    assert.equal(out.headSha, workSha, 'headSha is the pushed work-branch tip');
+    assert.equal(
+      g(['-c', 'safe.bareRepository=all', 'rev-parse', '--verify', 'refs/heads/feat/work'], origin),
+      workSha,
+      'origin/feat/work now carries the work commit',
+    );
+  } finally {
+    rmSync(root, { recursive: true, force: true });
+  }
+});
+
+test('finalizeGit records the per-ref strand split when the harness commits on BOTH the work branch and the base (issue #231, suppressed advisory 8882)', { skip: !gitOk }, () => {
+  const { root, origin } = makeOriginRepo();
+  const runDir = mkdtempSync(join(root, 'run-'));
+  try {
+    const envelope = {
+      schemaVersion: 1,
+      repository: { provider: 'github', url: origin, submodules: false },
+      branch: { base: 'main', create: 'feat/work', push: true },
+      setup: { commands: [], env: {}, secretRefs: [] },
+      task: { allowPr: false },
+    };
+    const prov = provisionRepo({ envelope, token: null, runDir });
+    assert.equal(prov.workingBranch, 'feat/work');
+    // Commit ON the work branch (a legitimately-pushable commit)...
+    writeFileSync(join(prov.workspaceDir, 'work.txt'), 'work\n');
+    g(['add', '-A'], prov.workspaceDir);
+    g(['-c', 'user.name=nano', '-c', 'user.email=nano@example.com', 'commit', '-q', '-m', 'work-branch commit'], prov.workspaceDir);
+    const workSha = g(['rev-parse', 'HEAD'], prov.workspaceDir);
+    // ...then move to the base and commit THERE too (an off-branch stray). The
+    // strand is now MIXED: workSha sits on the work branch, strayedSha on 'main'.
+    g(['checkout', '-B', 'main', 'origin/main'], prov.workspaceDir);
+    writeFileSync(join(prov.workspaceDir, 'stray.txt'), 'stray\n');
+    g(['add', '-A'], prov.workspaceDir);
+    g(['-c', 'user.name=nano', '-c', 'user.email=nano@example.com', 'commit', '-q', '-m', 'stray on base'], prov.workspaceDir);
+    const strayedSha = g(['rev-parse', 'HEAD'], prov.workspaceDir);
+
+    const out = finalizeGit({ ...prov, envelope, token: null });
+    assert.equal(out.pushFailed, true, 'a mixed strand is refused + preserved');
+    assert.equal(out.branchMismatch.expected, 'feat/work');
+    assert.equal(out.branchMismatch.actual, 'main');
+    assert.equal(out.branchMismatch.strandedOnBranch, 1, 'exactly the work-branch commit is attributed to the work branch');
+    assert.deepEqual(new Set(out.strandedCommits), new Set([workSha, strayedSha]), 'both refs contribute to the union');
   } finally {
     rmSync(root, { recursive: true, force: true });
   }

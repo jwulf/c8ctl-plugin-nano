@@ -9310,6 +9310,7 @@ function formatSupervisorStatus(status) {
   const alive = d.pid ? isPidAlive(d.pid) : false;
   lines.push('Supervisor:');
   lines.push(`  daemon pid: ${d.pid ?? '-'} ${alive ? '(alive)' : '(dead — stale state)'}`);
+  if (d.version) lines.push(`  version:    ${d.version}`);
   if (d.startedAt) lines.push(`  started:    ${d.startedAt}`);
   if (d.socket) lines.push(`  control:    ${d.socket}`);
   const workers = Array.isArray(status.workers) ? status.workers : [];
@@ -9399,14 +9400,41 @@ function runningSupervisor() {
   return state && isPidAlive(state.pid) ? state : null;
 }
 
+/**
+ * The canonical daemon-descriptor field set — the single source of truth for the
+ * daemon object embedded in the persisted state (`persist()`), the socket
+ * `status` frame (`statusFrame()`), and the socket-unreachable fallback
+ * (`statusFromState()`). Routing all three through here guarantees no field
+ * (e.g. `version`, `logFile`) can be added to one builder but silently dropped by
+ * another, which is exactly how earlier rounds lost `version` and then `logFile`.
+ */
+function supervisorDaemonDescriptor({ pid, startedAt, version, socket, logFile }) {
+  return { pid, startedAt, version, socket, logFile };
+}
+
 /** Synthesize a state-file-shaped object from a live `status` response. */
 function stateFromStatus(res, socketPath) {
   return {
     pid: res.daemon?.pid,
     startedAt: res.daemon?.startedAt,
+    version: res.daemon?.version,
     socket: res.daemon?.socket || socketPath,
     logFile: res.daemon?.logFile,
     workers: res.workers || [],
+  };
+}
+
+/**
+ * Synthesize a `status`-shaped object from a persisted state file — the inverse
+ * of `stateFromStatus`. Used by `supervisor status` when the daemon pid is alive
+ * but its control socket is temporarily unreachable, so the fallback render must
+ * carry every persisted daemon field (including `version`) to meet the feature's
+ * visibility guarantee.
+ */
+function statusFromState(running) {
+  return {
+    daemon: supervisorDaemonDescriptor(running),
+    workers: (running.workers || []).map((w) => summarizeSupervisorWorker(w)),
   };
 }
 
@@ -9524,6 +9552,11 @@ function installParentDeathWatchdog({ intervalMs = 2000, parentPid, onOrphan, re
  */
 async function runSupervisorDaemon() {
   const startedAt = new Date().toISOString();
+  // The plugin version of THIS daemon process (read from its own pluginDir), so
+  // `supervisor status` reports the version actually running — which may lag the
+  // querying CLI after an upgrade-without-restart. Surfaced for version-based
+  // debugging.
+  const daemonVersion = pluginPackage().version;
   const { exec, entry } = c8ctlInvocation();
   const socketPath = getSupervisorSocketPath();
   const daemonLogFile = supervisorDaemonLogFile();
@@ -9570,10 +9603,9 @@ async function runSupervisorDaemon() {
   const persist = () => {
     try {
       writeSupervisorState({
-        pid: process.pid,
-        startedAt,
-        socket: socketPath,
-        logFile: daemonLogFile,
+        ...supervisorDaemonDescriptor({
+          pid: process.pid, startedAt, version: daemonVersion, socket: socketPath, logFile: daemonLogFile,
+        }),
         workers: [...workers.values()].map((w) => ({
           id: w.id, profile: w.profile, args: w.args, pid: isPidAlive(w.pid) ? w.pid : null,
           startedAt: w.startedAt || null, restarts: w.restarts, lastExit: w.lastExit ?? null,
@@ -9815,7 +9847,7 @@ async function runSupervisorDaemon() {
   const statusFrame = (final, pub) => ({
     ok: true,
     type: 'status',
-    daemon: { pid: process.pid, startedAt, socket: socketPath, logFile: daemonLogFile },
+    daemon: supervisorDaemonDescriptor({ pid: process.pid, startedAt, version: daemonVersion, socket: socketPath, logFile: daemonLogFile }),
     workers: pub || [...workers.values()].map(workerPublic),
     ...(final ? { final: true } : {}),
   });
@@ -10266,10 +10298,7 @@ async function supervisorStatusCmd() {
     if (res.ok) { printSupervisorStatus(logger, res); return; }
   } catch { /* fall back to state file below */ }
   // Socket unreachable but pid alive — render from the last persisted state.
-  printSupervisorStatus(logger, {
-    daemon: { pid: running.pid, startedAt: running.startedAt, socket: running.socket },
-    workers: (running.workers || []).map((w) => summarizeSupervisorWorker(w)),
-  });
+  printSupervisorStatus(logger, statusFromState(running));
 }
 
 async function supervisorAddCmd(req, flags) {
@@ -13939,6 +13968,8 @@ export {
   formatDuration,
   summarizeSupervisorWorker,
   formatSupervisorStatus,
+  statusFromState,
+  supervisorDaemonDescriptor,
   formatSupervisorLogsLines,
   reageSupervisorStatus,
   clampToWidth,

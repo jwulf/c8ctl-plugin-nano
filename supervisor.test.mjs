@@ -24,6 +24,8 @@ import {
   formatDuration,
   summarizeSupervisorWorker,
   formatSupervisorStatus,
+  statusFromState,
+  supervisorDaemonDescriptor,
   formatSupervisorLogsLines,
   reageSupervisorStatus,
   clampToWidth,
@@ -485,6 +487,66 @@ test('formatSupervisorStatus guides the operator when there are no workers', () 
   const text = formatSupervisorStatus({ daemon: { pid: process.pid }, workers: [] });
   assert.match(text, /No workers/);
   assert.match(text, /supervisor add/);
+});
+
+test('formatSupervisorStatus surfaces the daemon version for version-based debugging', () => {
+  const text = formatSupervisorStatus({
+    daemon: { pid: process.pid, version: '9.9.9-test', socket: '/tmp/x.sock' },
+    workers: [],
+  });
+  assert.match(text, /version:\s+9\.9\.9-test/);
+});
+
+// Regression for the socket-unreachable fallback in `supervisor status`: when
+// the daemon pid is alive but its control socket is temporarily down, status is
+// rendered from the persisted state via `statusFromState`. That object must
+// carry the persisted `version` (and other daemon fields) through, or the
+// fallback silently drops the version and misses the feature's visibility
+// guarantee. See PR #228.
+test('statusFromState threads the persisted daemon version through the socket-unreachable fallback', () => {
+  const running = {
+    pid: process.pid,
+    startedAt: '2026-09-11T00:00:00.000Z',
+    version: '7.7.7-fallback',
+    socket: '/tmp/y.sock',
+    logFile: '/tmp/supervisor-daemon.log',
+    workers: [],
+  };
+  const status = statusFromState(running);
+  assert.equal(status.daemon.version, '7.7.7-fallback');
+  assert.equal(status.daemon.pid, running.pid);
+  assert.equal(status.daemon.startedAt, running.startedAt);
+  assert.equal(status.daemon.socket, running.socket);
+  // The fallback must also carry the daemon log location, or `supervisor logs`
+  // loses it during a control-socket outage. See PR #228.
+  assert.equal(status.daemon.logFile, running.logFile);
+  // And the rendered table must actually show the version to the operator.
+  assert.match(formatSupervisorStatus(status), /version:\s+7\.7\.7-fallback/);
+});
+
+// The daemon object embedded in the persisted state (`persist()`), the socket
+// `status` frame (`statusFrame()`), and the socket-unreachable fallback
+// (`statusFromState()`) all build their `daemon` descriptor from the SAME
+// `supervisorDaemonDescriptor` helper, so a field added to one path (e.g.
+// `version`, then `logFile`) can never be silently dropped by another. This
+// pins the descriptor's field set — a regression that drops `version` or
+// `logFile` from the daemon build path reddens here instead of leaving the
+// fabricated-status tests green. See PR #228.
+test('supervisorDaemonDescriptor carries every persisted daemon field (single source of truth)', () => {
+  const d = supervisorDaemonDescriptor({
+    pid: 4321,
+    startedAt: '2026-09-11T01:02:03.000Z',
+    version: '8.8.8-daemon',
+    socket: '/tmp/z.sock',
+    logFile: '/tmp/z-daemon.log',
+  });
+  assert.deepEqual(d, {
+    pid: 4321,
+    startedAt: '2026-09-11T01:02:03.000Z',
+    version: '8.8.8-daemon',
+    socket: '/tmp/z.sock',
+    logFile: '/tmp/z-daemon.log',
+  });
 });
 
 // --- printSupervisorStatus (output-channel regression guard) ----------------

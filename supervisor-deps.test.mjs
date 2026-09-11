@@ -240,6 +240,32 @@ test("createSupervisorDeps: the settle seam FENCES complete/fail — the activat
   assert.deepEqual(failures, [{ retries: 1, errorMessage: "boom", leaseToken: "lease-f" }]);
 });
 
+test("createSupervisorDeps: reclaim uses the activation lease fence and timeout zero", async () => {
+  const patches = [];
+  const fetchImpl = async (url, init) => {
+    if (init?.method === "PATCH") {
+      patches.push({ url: String(url), body: JSON.parse(init.body) });
+      return { ok: true, status: 204, json: async () => ({}), text: async () => "" };
+    }
+    if (String(url).endsWith("/jobs/activation")) {
+      return { ok: true, status: 200, json: async () => ({ jobs: [] }), text: async () => "" };
+    }
+    return { ok: false, status: 404, json: async () => ({}), text: async () => "" };
+  };
+  const { settle } = await createSupervisorDeps({
+    runner: { run: async () => {} },
+    restConfig: { baseUrl: "http://engine:8080", token: "T" },
+    worker: "host-under-test",
+    fetchImpl,
+  });
+
+  await settle.reclaim("job-requeue", "lease-old");
+  assert.deepEqual(patches, [{
+    url: "http://engine:8080/v2/jobs/job-requeue",
+    body: { changeset: { timeout: 0 }, leaseToken: "lease-old" },
+  }]);
+});
+
 test("bindJobSettle: each bound settler fences with ITS OWN activation's leaseToken — two same-jobKey activations never cross tokens", async () => {
   // Regression guard for the TOCTOU the runner's closure-capture prevents: the
   // token that fences a settlement must come from the activation that ran, not a
@@ -273,6 +299,7 @@ test("settlement recovery: a lost completion is replayed on reactivation without
   t.after(() => rmSync(root, { recursive: true, force: true }));
 
   const completions = [];
+  const reclaims = [];
   let sideEffects = 0;
   const rawSettle = {
     complete: async (jobKey, variables, leaseToken) => {
@@ -280,6 +307,9 @@ test("settlement recovery: a lost completion is replayed on reactivation without
       if (leaseToken === "lease-old") throw new Error("HTTP 409 — Job not activated");
     },
     fail: async () => {},
+  };
+  const reclaim = async (jobKey, leaseToken) => {
+    reclaims.push({ jobKey, leaseToken });
   };
   const oldJob = { jobKey: "job-recovered", type: "senior:feature", processInstanceKey: "pi-1", leaseToken: "lease-old" };
 
@@ -293,6 +323,7 @@ test("settlement recovery: a lost completion is replayed on reactivation without
         operation: "complete",
         payload: { status: "opened", summary: "side effect already applied" },
         settle: bindJobSettle(rawSettle, oldJob),
+        reclaim,
       }),
     /409.*not activated/i,
   );
@@ -300,6 +331,7 @@ test("settlement recovery: a lost completion is replayed on reactivation without
   const pendingPath = settlementJournalPath(root, oldJob.jobKey);
   assert.equal(readFileSync(pendingPath, "utf8").includes("side effect already applied"), true);
   assert.deepEqual(readPendingSettlement(root, oldJob.jobKey)?.operation, "complete");
+  assert.deepEqual(reclaims, [{ jobKey: oldJob.jobKey, leaseToken: "lease-old" }]);
 
   // Model the engine's stale CREATED row: the old worker is gone, but the job
   // remains visible with a future deadline and is later activated again.
@@ -319,6 +351,37 @@ test("settlement recovery: a lost completion is replayed on reactivation without
     { jobKey: oldJob.jobKey, variables: { status: "opened", summary: "side effect already applied" }, leaseToken: "lease-new" },
   ]);
   assert.equal(readPendingSettlement(root, oldJob.jobKey), null, "successful replay clears the durable handoff");
+});
+
+test("settlement recovery: a superseded lease rejects reclaim without an unfenced timeout update", async (t) => {
+  const root = mkdtempSync(join(tmpdir(), "c8ctl-settlement-fence-"));
+  t.after(() => rmSync(root, { recursive: true, force: true }));
+
+  const reclaimCalls = [];
+  const job = { jobKey: "job-superseded", type: "senior:feature", leaseToken: "lease-old" };
+  await assert.rejects(
+    () =>
+      settleWithRecovery({
+        root,
+        job,
+        operation: "complete",
+        payload: { status: "done" },
+        settle: {
+          complete: async () => {
+            throw new Error("HTTP 409 — Job not activated");
+          },
+          fail: async () => {},
+        },
+        reclaim: async (jobKey, leaseToken) => {
+          reclaimCalls.push({ jobKey, leaseToken });
+          throw new Error("HTTP 409 — JobLeaseMismatch");
+        },
+      }),
+    /409.*not activated/i,
+  );
+
+  assert.deepEqual(reclaimCalls, [{ jobKey: job.jobKey, leaseToken: "lease-old" }]);
+  assert.notEqual(readPendingSettlement(root, job.jobKey), null, "the handoff remains until a newer activation can replay it");
 });
 
 test("settlement recovery: a lost failure is replayed with the original retry decision", async (t) => {

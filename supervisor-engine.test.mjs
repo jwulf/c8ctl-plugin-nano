@@ -175,6 +175,13 @@ test("extendLock: threads the leaseToken as a TOP-LEVEL field in the raw PATCH b
   assert.deepEqual(JSON.parse(fetchImpl.calls[0].init.body), { changeset: { timeout: 300_000 }, leaseToken: "lease-xyz" });
 });
 
+test("extendLock: timeout 0 is sent with the lease fence for immediate reclaim", async () => {
+  const fetchImpl = makeFakeFetch([{ status: 204 }]);
+  const engine = createRawEngineClient({ baseUrl: "http://engine:8080/v2", fetchImpl });
+  await engine.extendLock("job-key-9", 0, "lease-xyz");
+  assert.deepEqual(JSON.parse(fetchImpl.calls[0].init.body), { changeset: { timeout: 0 }, leaseToken: "lease-xyz" });
+});
+
 test("extendLock: a blank/absent leaseToken is OMITTED (preserves the unfenced operator/bulk extend path)", async () => {
   const calls = [];
   const camunda = { updateJob: async (arg) => { calls.push(arg); } };

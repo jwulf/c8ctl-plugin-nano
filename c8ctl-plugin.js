@@ -3443,6 +3443,11 @@ async function createSupervisorDeps(opts = {}) {
   const settle = {
     complete: (jobKey, variables, leaseToken) => rt.Effect.runPromise(engine.complete(jobKey, variables, leaseToken)),
     fail: (jobKey, opts2) => rt.Effect.runPromise(engine.fail(jobKey, opts2)),
+    // A failed fenced settlement can leave the old engine activation visible
+    // until its deadline. Set that activation's timeout to zero using the same
+    // lease token; a superseded activation rejects this call, and we never fall
+    // back to an unfenced update that could shorten a newer worker's lease.
+    reclaim: (jobKey, leaseToken) => rt.Effect.runPromise(engine.extendLock(jobKey, 0, leaseToken)),
   };
 
   return { deps, registry, settle, makeSupervisor: rt.makeSupervisor, Effect: rt.Effect, Fiber: rt.Fiber };
@@ -3864,12 +3869,22 @@ function settlementCall(settle, operation, payload) {
   return operation === 'complete' ? settle.complete(payload) : settle.fail(payload);
 }
 
+const SETTLEMENT_OWNERSHIP_LOST_RE =
+  /HTTP 4(?:09|04)\b|status\s*code\s*4(?:09|04)\b|\bnot activated\b|joblease\s*mismatch|lease\s*mismatch|\breclaim/i;
+
+function isSettlementOwnershipLostError(err) {
+  const text = [err?.message, err?.cause?.message].filter(Boolean).join(' ');
+  return SETTLEMENT_OWNERSHIP_LOST_RE.test(text);
+}
+
 /**
  * Persist the exact settle intent before calling the engine. If activation
- * ownership is lost, the record remains and the next activation replays this
- * intent instead of running the agent again.
+ * ownership is lost, the record remains and the old activation is asked to
+ * become immediately reclaimable using its lease token. A token mismatch is
+ * deliberately not retried without a fence: that would clobber a newer
+ * activation.
  */
-async function settleWithRecovery({ root, job, operation, payload, settle, logger = null }) {
+async function settleWithRecovery({ root, job, operation, payload, settle, reclaim, logger = null }) {
   let path;
   try {
     path = writePendingSettlement(root, {
@@ -3891,6 +3906,21 @@ async function settleWithRecovery({ root, job, operation, payload, settle, logge
     removePendingSettlement(root, job.jobKey);
     return { settled: true, recovered: false, path };
   } catch (err) {
+    if (isSettlementOwnershipLostError(err) && typeof reclaim === 'function') {
+      try {
+        await reclaim(job.jobKey, job.leaseToken);
+        logger?.info?.(
+          `[${job.type}] job ${job.jobKey}: old activation released for immediate reclaim; ` +
+          `pending ${operation} settlement will replay on the next activation`,
+        );
+      } catch (reclaimErr) {
+        logger?.warn?.(
+          `[${job.type}] job ${job.jobKey}: lease-fenced reclaim request was rejected; ` +
+          `no unfenced timeout update was attempted, so a newer activation cannot be clobbered ` +
+          `(${reclaimErr?.message ?? reclaimErr})`,
+        );
+      }
+    }
     logger?.warn?.(
       `[${job.type}] job ${job.jobKey}: settlement lost or failed after agent exit; ` +
       `recovery journal retained at ${path}; future activations will replay ${operation} without rerunning the agent (${err?.message ?? err})`,
@@ -8194,6 +8224,7 @@ async function workAgent(req, flags) {
           operation: 'complete',
           payload: variables,
           settle: settleJob,
+          reclaim: settle.reclaim,
           logger,
         });
       const settleFail = (opts2) =>
@@ -8203,6 +8234,7 @@ async function workAgent(req, flags) {
           operation: 'fail',
           payload: opts2 || {},
           settle: settleJob,
+          reclaim: settle.reclaim,
           logger,
         });
       try {

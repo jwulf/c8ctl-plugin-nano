@@ -29,6 +29,59 @@ const SDK_UPDATE = 'updateAgentInstance';
 const isNonBlank = (v) => v != null && String(v).trim() !== '';
 const isPlainObject = (v) => v != null && typeof v === 'object' && !Array.isArray(v);
 
+// Default create-retry backoff (issue #230). A transient createAgentInstance
+// rejection at second 0 (e.g. a lease fence that has not yet settled) must NOT
+// forfeit the whole run's durable transcript, so a failed/absent create is
+// retried — idempotently, correlated on the elementInstanceKey — rather than
+// disabling the producer. Retries are paced by exponential backoff (capped) and
+// driven lazily by the ACP hot path, so a create that becomes possible mid-run
+// is picked up without hammering the engine.
+const DEFAULT_CREATE_RETRY_BASE_MS = 1000;
+const DEFAULT_CREATE_RETRY_MAX_MS = 30000;
+
+/**
+ * Pull the diagnosable facts out of an SDK/transport rejection so a create/append
+ * failure is LOUD and root-causable (issue #230 ask 1 / #229): the HTTP status and
+ * the engine's response body distinguish a lease-fence rejection from a schema
+ * error — an "SDK status 400" message alone is useless. Tolerant of the various
+ * error shapes the `@camunda8/orchestration-cluster-api` client and the underlying
+ * transport surface (statusCode / status / nested response / body / data).
+ */
+export function describeSdkError(err) {
+  if (err == null) return { status: null, body: null, message: String(err) };
+  const status =
+    err.statusCode ??
+    err.status ??
+    err.response?.status ??
+    err.response?.statusCode ??
+    (typeof err.code === 'number' ? err.code : null) ??
+    null;
+  let body =
+    err.body ??
+    err.responseBody ??
+    err.response?.body ??
+    err.response?.data ??
+    err.data ??
+    null;
+  if (body != null && typeof body !== 'string') {
+    try {
+      body = JSON.stringify(body);
+    } catch {
+      body = String(body);
+    }
+  }
+  const message = isNonBlank(err.message) ? String(err.message) : String(err);
+  return { status: status ?? null, body: body ?? null, message };
+}
+
+// Redact a lease token down to a presence + short tail so it can be logged for
+// correlation without leaking the opaque fence value.
+function leaseTokenLabel(leaseToken) {
+  if (!isNonBlank(leaseToken)) return 'ABSENT';
+  const s = String(leaseToken);
+  return `present(…${s.length > 4 ? s.slice(-4) : s})`;
+}
+
 /**
  * Is this activated job an `external` (job-backed) agent job — i.e. one whose
  * element carries `zeebe:agentDefinition agentType="external"`?
@@ -162,6 +215,8 @@ export function createAgentInstanceProducer(opts = {}) {
     logger = console,
     now = () => Date.now(),
     sessionAcp = defaultSessionAcp,
+    createRetryBaseMs = DEFAULT_CREATE_RETRY_BASE_MS,
+    createRetryMaxMs = DEFAULT_CREATE_RETRY_MAX_MS,
   } = opts;
 
   const classify = typeof sessionAcp?.classifyUpdate === 'function' ? sessionAcp.classifyUpdate : null;
@@ -175,6 +230,7 @@ export function createAgentInstanceProducer(opts = {}) {
   const leaseToken = job?.leaseToken != null ? String(job.leaseToken) : '';
   const elementInstanceKey = job?.elementInstanceKey != null ? String(job.elementInstanceKey) : '';
   const elementId = job?.elementId != null ? String(job.elementId) : null;
+  const processInstanceKey = job?.processInstanceKey != null ? String(job.processInstanceKey) : '';
 
   // The producer is a no-op unless every precondition holds: a usable SDK client,
   // an external agent job, and the ACP classifier. Any missing piece leaves the
@@ -186,9 +242,19 @@ export function createAgentInstanceProducer(opts = {}) {
     !!classify &&
     isExternalAgentJob(job);
 
+  // Permanent kill-switch: the producer is inert (no behaviour change for the
+  // harness path) unless every precondition holds. This is distinct from a
+  // transient create failure — the latter is RETRIED, never permanently disabled
+  // (issue #230).
   let disabled = !usable;
   let agentInstanceKey = null;
-  let activated = false;
+  // Create-retry bookkeeping. `creating` dedups a concurrent in-flight attempt;
+  // `createAttempts` / `lastCreateAttemptAt` pace the exponential backoff so a
+  // failing create is re-attempted (idempotently, on the ACP hot path) without
+  // hammering the engine.
+  let creating = null;
+  let createAttempts = 0;
+  let lastCreateAttemptAt = 0;
   let loopIteration = 0;
   let queue = Promise.resolve();
   // Coalesce streamed message chunks (same messageId + role) into one turn, flushed
@@ -197,6 +263,12 @@ export function createAgentInstanceProducer(opts = {}) {
   let pendingMessage = null;
   // callId → toolName, so a TOOL_RESULT turn can reference the originating call name.
   const toolNames = new Map();
+  // Count of AgentHistory turns successfully appended, for the completion diagnostic
+  // (separates "create failed" from "created but nothing ingested over a long run").
+  let appendedTurns = 0;
+  // Elevate the FIRST per-turn append failure to `warn` (repeats stay `debug`) so a
+  // 400/404 append storm is visible without flooding the log (issue #230 / #229).
+  let appendFailureLogged = false;
 
   const iso = () => new Date(now()).toISOString();
 
@@ -222,7 +294,21 @@ export function createAgentInstanceProducer(opts = {}) {
         history: [turn],
       };
       if (status) req.status = status;
-      await camunda[SDK_UPDATE](req);
+      try {
+        await camunda[SDK_UPDATE](req);
+        appendedTurns += 1;
+      } catch (err) {
+        const d = describeSdkError(err);
+        const line =
+          `AgentInstance producer: ${SDK_UPDATE} append failed — ` +
+          `status=${d.status ?? 'n/a'} message=${d.message} body=${d.body ?? 'n/a'} ${correlation()}.`;
+        if (!appendFailureLogged) {
+          appendFailureLogged = true;
+          logger?.warn?.(line);
+        } else {
+          logger?.debug?.(line);
+        }
+      }
     });
   };
 
@@ -289,10 +375,100 @@ export function createAgentInstanceProducer(opts = {}) {
     appendTurn(turn);
   };
 
+  const correlation = () =>
+    `[jobKey=${jobKey || 'n/a'} elementInstanceKey=${elementInstanceKey || 'n/a'} ` +
+    `processInstanceKey=${processInstanceKey || 'n/a'}]`;
+
+  // Build the opening CONFIGURATION turn from the concrete runtime definition.
+  const buildConfigTurn = () => {
+    const def = deriveAgentDefinition({ profile, envelope });
+    const configTurn = {
+      historyItemId: `configuration:${elementInstanceKey}`,
+      loopIteration: 1,
+      role: 'CONFIGURATION',
+      content: [],
+      producedAt: iso(),
+      model: def.model,
+      provider: def.provider,
+    };
+    if (isNonBlank(def.systemPrompt)) {
+      configTurn.systemPrompt = [{ contentType: 'TEXT', text: def.systemPrompt }];
+    }
+    const limits = deriveLimits(envelope);
+    if (limits) configTurn.limits = limits;
+    return { def, configTurn };
+  };
+
+  // Exponential backoff (capped) for the Nth create attempt (1-based).
+  const backoffForAttempt = (attempt) =>
+    Math.min(createRetryMaxMs, createRetryBaseMs * Math.pow(2, Math.max(0, attempt - 1)));
+
+  // Perform ONE createAgentInstance attempt. On success the instance key is
+  // latched; on failure it is logged LOUDLY (status + body + lease presence +
+  // correlation) and the producer is left retryable — NOT disabled (issue #230).
+  const doCreate = async () => {
+    createAttempts += 1;
+    lastCreateAttemptAt = now();
+    const { def, configTurn } = buildConfigTurn();
+    try {
+      const res = await camunda[SDK_CREATE]({
+        elementInstanceKey,
+        jobKey,
+        jobLease: leaseToken,
+        history: [configTurn],
+      });
+      const key =
+        res && (res.agentInstanceKey ?? res.key) != null
+          ? String(res.agentInstanceKey ?? res.key)
+          : null;
+      if (!key) {
+        // createAgentInstance resolved but carried no key — updates need the
+        // agentInstanceKey, so we cannot append yet. Idempotent per
+        // elementInstanceKey, so keep retrying rather than forfeiting the run.
+        logger?.warn?.(
+          `AgentInstance producer: createAgentInstance returned no agentInstanceKey ` +
+            `(attempt ${createAttempts}) ${correlation()}; will retry.`,
+        );
+        return false;
+      }
+      agentInstanceKey = key;
+      loopIteration = 1;
+      logger?.info?.(
+        `AgentInstance ${agentInstanceKey} minted for element instance ${elementInstanceKey} ` +
+          `(job ${jobKey}, attempt ${createAttempts}).`,
+      );
+      return true;
+    } catch (err) {
+      const d = describeSdkError(err);
+      logger?.warn?.(
+        `AgentInstance producer: createAgentInstance failed (attempt ${createAttempts}) — ` +
+          `status=${d.status ?? 'n/a'} message=${d.message} body=${d.body ?? 'n/a'} ` +
+          `jobLease=${leaseTokenLabel(leaseToken)} model=${def.model} provider=${def.provider} ` +
+          `${correlation()}; will retry (durable transcript resumes once the create succeeds; ` +
+          `job completion unaffected).`,
+      );
+      return false;
+    }
+  };
+
+  // Kick off a create attempt if one is warranted and the backoff window has
+  // elapsed. Non-blocking: dedups a concurrent attempt and never throws. Called
+  // from the ACP hot path (`ingest`) so a create that becomes possible mid-run is
+  // retried without a dedicated timer.
+  const maybeStartCreate = () => {
+    if (disabled || agentInstanceKey || creating) return;
+    if (createAttempts > 0 && now() - lastCreateAttemptAt < backoffForAttempt(createAttempts)) return;
+    creating = doCreate()
+      .catch(() => false)
+      .finally(() => {
+        creating = null;
+      });
+  };
+
   return {
-    /** True once the AgentInstance has been minted (or is being minted). */
+    /** True once the AgentInstance has been minted. */
     get active() {
-      return activated && !disabled;
+      return !!agentInstanceKey && !disabled;
     },
     get agentInstanceKey() {
       return agentInstanceKey;
@@ -303,53 +479,21 @@ export function createAgentInstanceProducer(opts = {}) {
      * establishes model/provider/systemPrompt/limits. Idempotent per element
      * instance — safe to call once per activation; a reactivation reconciles onto
      * the same instance rather than creating a second one. Best-effort: a rejected
-     * create (e.g. a stale lease) disables the producer and returns false.
+     * create (e.g. a stale lease fence at second 0) does NOT disable the producer —
+     * it is retried on the ACP hot path (issue #230), so a transient failure never
+     * forfeits the whole run's durable transcript.
      */
     async activate() {
-      if (disabled || activated) return this.active;
-      activated = true;
-      const def = deriveAgentDefinition({ profile, envelope });
-      const configTurn = {
-        historyItemId: `configuration:${elementInstanceKey}`,
-        loopIteration: 1,
-        role: 'CONFIGURATION',
-        content: [],
-        producedAt: iso(),
-        model: def.model,
-        provider: def.provider,
-      };
-      if (isNonBlank(def.systemPrompt)) {
-        configTurn.systemPrompt = [{ contentType: 'TEXT', text: def.systemPrompt }];
+      if (disabled || agentInstanceKey) return this.active;
+      if (!creating) {
+        creating = doCreate()
+          .catch(() => false)
+          .finally(() => {
+            creating = null;
+          });
       }
-      const limits = deriveLimits(envelope);
-      if (limits) configTurn.limits = limits;
-      try {
-        const res = await camunda[SDK_CREATE]({
-          elementInstanceKey,
-          jobKey,
-          jobLease: leaseToken,
-          history: [configTurn],
-        });
-        agentInstanceKey =
-          (res && (res.agentInstanceKey ?? res.key)) != null
-            ? String(res.agentInstanceKey ?? res.key)
-            : null;
-        if (!agentInstanceKey) {
-          // A reactivation reconciles the auto-minted/existing record; if the create
-          // result carries no key, fall back to the elementInstanceKey correlation is
-          // not possible for updates (they need the agentInstanceKey), so disable.
-          disabled = true;
-          logger?.warn?.('AgentInstance producer: create returned no agentInstanceKey; disabling durable transcript for this job.');
-          return false;
-        }
-        loopIteration = 1;
-        logger?.info?.(`AgentInstance ${agentInstanceKey} minted for element instance ${elementInstanceKey} (job ${jobKey}).`);
-        return true;
-      } catch (err) {
-        disabled = true;
-        logger?.warn?.(`AgentInstance producer: createAgentInstance failed — ${err?.message || err}; continuing without a durable transcript (job completion unaffected).`);
-        return false;
-      }
+      await creating;
+      return this.active;
     },
 
     /**
@@ -358,7 +502,15 @@ export function createAgentInstanceProducer(opts = {}) {
      * dropped. Never throws.
      */
     ingest(rawUpdate) {
-      if (disabled || !agentInstanceKey) return;
+      if (disabled) return;
+      // Not minted yet? A create may have failed at second 0 — re-attempt it on the
+      // hot path (throttled) so the transcript resumes as soon as the create takes.
+      // This update itself is dropped (no key to append against), but retrying here
+      // is what keeps a transient failure from forfeiting the rest of the run.
+      if (!agentInstanceKey) {
+        maybeStartCreate();
+        return;
+      }
       let classified;
       try {
         classified = classify(rawUpdate);
@@ -419,9 +571,27 @@ export function createAgentInstanceProducer(opts = {}) {
      * the same instance. Best-effort; never throws; `job.complete` is unaffected.
      */
     async complete(ok = true) {
+      // Last chance: if the instance never minted (create kept failing) make one
+      // final, un-throttled attempt so at least the CONFIGURATION turn + terminal
+      // status survive when the create finally becomes possible (issue #230).
+      if (!disabled && !agentInstanceKey) {
+        if (!creating) {
+          creating = doCreate()
+            .catch(() => false)
+            .finally(() => {
+              creating = null;
+            });
+        }
+        try { await creating; } catch { /* best effort */ }
+      }
       if (disabled || !agentInstanceKey) {
         // Still drain any queued appends so a caller awaiting completion settles.
         try { await this.drain(); } catch { /* best effort */ }
+        logger?.warn?.(
+          `AgentInstance producer: no durable AgentInstance for this job after ` +
+            `${createAttempts} create attempt(s) ${correlation()}; ` +
+            `no engine transcript was recorded (job completion unaffected).`,
+        );
         return;
       }
       flushMessage();
@@ -437,6 +607,10 @@ export function createAgentInstanceProducer(opts = {}) {
         });
       }
       try { await queue; } catch { /* best effort */ }
+      logger?.info?.(
+        `AgentInstance ${agentInstanceKey}: ${appendedTurns} turn(s) appended` +
+          `${ok ? ', status→COMPLETED' : ' (left non-terminal for retry)'} ${correlation()}.`,
+      );
     },
   };
 }

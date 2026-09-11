@@ -15,6 +15,7 @@ import {
   deriveAgentDefinition,
   deriveLimits,
   inferProvider,
+  describeSdkError,
 } from './agent-instance.mjs';
 
 // A fake SDK client that records calls and returns a fixed agentInstanceKey.
@@ -27,6 +28,8 @@ import {
 function fakeClient({
   createResult = { agentInstanceKey: 'AGENT-1' },
   failCreate = false,
+  failCreateTimes = 0,
+  createError = null,
   enforceContract = false,
 } = {}) {
   const calls = { create: [], update: [] };
@@ -44,7 +47,8 @@ function fakeClient({
     calls,
     createAgentInstance: async (req) => {
       calls.create.push(req);
-      if (failCreate) throw new Error('stale lease');
+      if (failCreate) throw createError || new Error('stale lease');
+      if (calls.create.length <= failCreateTimes) throw createError || new Error('stale lease');
       validate(req);
       return createResult;
     },
@@ -332,16 +336,20 @@ test('complete(false) does NOT complete the instance (a retry continues it)', as
 // Best-effort: nothing here may throw or mint when preconditions fail
 // ---------------------------------------------------------------------------
 
-test('a failed create disables the producer; ingest/complete become no-ops and never throw', async () => {
+test('a failed create does NOT permanently disable — it is retried, and never throws (issue #230)', async () => {
+  // Every create attempt throws, so no key is ever obtained and no append lands,
+  // but the producer must stay retryable (not disabled) and never throw.
   const client = fakeClient({ failCreate: true });
   const p = makeProducer(client);
   const ok = await p.activate();
   assert.equal(ok, false);
   assert.equal(p.active, false);
-  // No throw, no updates.
+  // No throw, no updates (there is no instance key to append against).
   p.ingest({ sessionUpdate: 'agent_message_chunk', content: { type: 'text', text: 'x' } });
   await p.complete(true);
   assert.equal(client.calls.update.length, 0);
+  // At least the activate() attempt (and complete()'s final attempt) were made.
+  assert.ok(client.calls.create.length >= 1);
 });
 
 test('the producer is inert for a non-external job (no SDK calls)', async () => {
@@ -403,4 +411,107 @@ test('appended turns preserve ACP arrival order even though ingest is non-blocki
   p.ingest({ sessionUpdate: 'agent_message_chunk', content: { type: 'text', text: 'two' } });
   await p.complete(true);
   assert.deepEqual(order, ['one', 'two']);
+});
+
+// ---------------------------------------------------------------------------
+// Create retry — a transient failure must not forfeit the run (issue #230)
+// ---------------------------------------------------------------------------
+
+test('a create that fails at second 0 then succeeds mid-run resumes the durable transcript', async () => {
+  // The first create attempt (from activate) throws; a second attempt — driven by a
+  // later ingest once the backoff window has elapsed — succeeds, and from then on
+  // turns append to the same instance.
+  const client = fakeClient({ failCreateTimes: 1 });
+  let t = Date.parse('2026-02-03T04:05:06.000Z');
+  const clock = () => t;
+  const p = createAgentInstanceProducer({
+    camunda: client,
+    job: EXTERNAL_JOB,
+    profile: PROFILE,
+    envelope: ENVELOPE,
+    logger: nullLogger,
+    now: clock,
+    createRetryBaseMs: 1000,
+    createRetryMaxMs: 30000,
+  });
+
+  // First attempt fails → no key yet, producer not disabled.
+  const ok = await p.activate();
+  assert.equal(ok, false);
+  assert.equal(p.active, false);
+  assert.equal(client.calls.create.length, 1);
+
+  // An ingest before the backoff window elapses does NOT re-attempt.
+  p.ingest({ sessionUpdate: 'agent_message_chunk', content: { type: 'text', text: 'early' } });
+  await p.drain();
+  assert.equal(client.calls.create.length, 1);
+
+  // Advance past the backoff window; the next ingest re-attempts the create, which
+  // now succeeds — the instance is minted and subsequent turns append.
+  t += 2000;
+  p.ingest({ sessionUpdate: 'agent_message_chunk', content: { type: 'text', text: 'later' } });
+  await p.drain();
+  assert.equal(client.calls.create.length, 2);
+  assert.equal(p.active, true);
+
+  p.ingest({ sessionUpdate: 'agent_message_chunk', content: { type: 'text', text: 'captured' } });
+  await p.complete(true);
+
+  const texts = client.calls.update
+    .filter((u) => Array.isArray(u.history))
+    .map((u) => u.history[0].content?.[0]?.text)
+    .filter(Boolean);
+  assert.ok(texts.includes('captured'), 'post-recovery turn is durably appended');
+  assert.equal(client.calls.update.filter((u) => u.status === 'COMPLETED').length, 1);
+});
+
+test('complete() makes a final un-throttled create attempt when the instance never minted', async () => {
+  // fail once (activate), then complete()'s final attempt succeeds even inside the
+  // backoff window, so at least the config turn + COMPLETED status survive.
+  const client = fakeClient({ failCreateTimes: 1 });
+  const p = makeProducer(client); // fixed clock
+  await p.activate();
+  assert.equal(client.calls.create.length, 1);
+  assert.equal(p.active, false);
+  await p.complete(true);
+  assert.equal(client.calls.create.length, 2);
+  assert.equal(p.active, true);
+  assert.equal(client.calls.update.filter((u) => u.status === 'COMPLETED').length, 1);
+});
+
+// ---------------------------------------------------------------------------
+// Lease plumbing (issue #230 ask 3): the job's leaseToken is submitted as jobLease
+// ---------------------------------------------------------------------------
+
+test('the activation leaseToken is submitted as jobLease on create AND every append', async () => {
+  const client = fakeClient();
+  const p = makeProducer(client);
+  await p.activate();
+  p.ingest({ sessionUpdate: 'agent_message_chunk', content: { type: 'text', text: 'x' } });
+  await p.complete(true);
+  assert.ok(client.calls.create.length >= 1);
+  for (const c of client.calls.create) assert.equal(c.jobLease, EXTERNAL_JOB.leaseToken);
+  assert.ok(client.calls.update.length >= 1);
+  for (const u of client.calls.update) assert.equal(u.jobLease, EXTERNAL_JOB.leaseToken);
+});
+
+// ---------------------------------------------------------------------------
+// describeSdkError — status + body extraction for loud, diagnosable failures
+// ---------------------------------------------------------------------------
+
+test('describeSdkError pulls HTTP status and body from common SDK error shapes', () => {
+  const a = describeSdkError({ statusCode: 400, body: { detail: 'lease fence mismatch' }, message: 'Bad Request' });
+  assert.equal(a.status, 400);
+  assert.match(a.body, /lease fence mismatch/);
+  assert.equal(a.message, 'Bad Request');
+
+  const b = describeSdkError({ response: { status: 404, data: 'not found' } });
+  assert.equal(b.status, 404);
+  assert.equal(b.body, 'not found');
+
+  const c = describeSdkError(new Error('network down'));
+  assert.equal(c.status, null);
+  assert.equal(c.message, 'network down');
+
+  assert.equal(describeSdkError(null).message, 'null');
 });

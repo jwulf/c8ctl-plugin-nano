@@ -24,6 +24,7 @@ import {
   formatDuration,
   summarizeSupervisorWorker,
   formatSupervisorStatus,
+  statusFromState,
   formatSupervisorLogsLines,
   reageSupervisorStatus,
   clampToWidth,
@@ -493,6 +494,29 @@ test('formatSupervisorStatus surfaces the daemon version for version-based debug
     workers: [],
   });
   assert.match(text, /version:\s+9\.9\.9-test/);
+});
+
+// Regression for the socket-unreachable fallback in `supervisor status`: when
+// the daemon pid is alive but its control socket is temporarily down, status is
+// rendered from the persisted state via `statusFromState`. That object must
+// carry the persisted `version` (and other daemon fields) through, or the
+// fallback silently drops the version and misses the feature's visibility
+// guarantee. See PR #228.
+test('statusFromState threads the persisted daemon version through the socket-unreachable fallback', () => {
+  const running = {
+    pid: process.pid,
+    startedAt: '2026-09-11T00:00:00.000Z',
+    version: '7.7.7-fallback',
+    socket: '/tmp/y.sock',
+    workers: [],
+  };
+  const status = statusFromState(running);
+  assert.equal(status.daemon.version, '7.7.7-fallback');
+  assert.equal(status.daemon.pid, running.pid);
+  assert.equal(status.daemon.startedAt, running.startedAt);
+  assert.equal(status.daemon.socket, running.socket);
+  // And the rendered table must actually show the version to the operator.
+  assert.match(formatSupervisorStatus(status), /version:\s+7\.7\.7-fallback/);
 });
 
 // --- printSupervisorStatus (output-channel regression guard) ----------------

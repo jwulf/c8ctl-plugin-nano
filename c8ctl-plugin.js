@@ -9413,6 +9413,25 @@ function stateFromStatus(res, socketPath) {
 }
 
 /**
+ * Synthesize a `status`-shaped object from a persisted state file — the inverse
+ * of `stateFromStatus`. Used by `supervisor status` when the daemon pid is alive
+ * but its control socket is temporarily unreachable, so the fallback render must
+ * carry every persisted daemon field (including `version`) to meet the feature's
+ * visibility guarantee.
+ */
+function statusFromState(running) {
+  return {
+    daemon: {
+      pid: running.pid,
+      startedAt: running.startedAt,
+      version: running.version,
+      socket: running.socket,
+    },
+    workers: (running.workers || []).map((w) => summarizeSupervisorWorker(w)),
+  };
+}
+
+/**
  * Resolve a live supervisor, healing a missing/stale state file. Returns the
  * running state (pid alive) if present; otherwise probes the deterministic
  * control socket and, if a daemon answers, re-persists and returns its state so
@@ -10274,10 +10293,7 @@ async function supervisorStatusCmd() {
     if (res.ok) { printSupervisorStatus(logger, res); return; }
   } catch { /* fall back to state file below */ }
   // Socket unreachable but pid alive — render from the last persisted state.
-  printSupervisorStatus(logger, {
-    daemon: { pid: running.pid, startedAt: running.startedAt, socket: running.socket },
-    workers: (running.workers || []).map((w) => summarizeSupervisorWorker(w)),
-  });
+  printSupervisorStatus(logger, statusFromState(running));
 }
 
 async function supervisorAddCmd(req, flags) {
@@ -13947,6 +13963,7 @@ export {
   formatDuration,
   summarizeSupervisorWorker,
   formatSupervisorStatus,
+  statusFromState,
   formatSupervisorLogsLines,
   reageSupervisorStatus,
   clampToWidth,

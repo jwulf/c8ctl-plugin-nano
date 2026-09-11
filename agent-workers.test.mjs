@@ -1267,6 +1267,131 @@ test('finalizeGit pushes the first commit into an empty repo (no base sha)', { s
   }
 });
 
+// --- issue #231: never commit-on-base then non-ff-lose the work ---------------
+
+// Advance origin/<branch> by one commit from a throwaway clone, so a workspace
+// cloned earlier is now behind the remote (reproduces the non-ff push condition).
+function advanceOrigin(root, origin, branch) {
+  const bump = mkdtempSync(join(root, 'bump-'));
+  g(['clone', '-q', origin, bump], undefined);
+  g(['checkout', '-q', branch], bump);
+  writeFileSync(join(bump, `bump-${Date.now()}.txt`), 'advance\n');
+  g(['add', '-A'], bump);
+  g(['-c', 'user.name=bump', '-c', 'user.email=bump@example.com', 'commit', '-q', '-m', 'advance base'], bump);
+  g(['push', '-q', 'origin', branch], bump);
+}
+
+test('provisionRepo cuts a fallback work branch when branch.create is absent (never commits on base)', { skip: !gitOk }, () => {
+  const { root, origin } = makeOriginRepo();
+  const runDir = mkdtempSync(join(root, 'run-'));
+  try {
+    const envelope = {
+      schemaVersion: 1,
+      repository: { provider: 'github', url: origin, submodules: false },
+      branch: { base: 'main', create: '', push: true },
+      setup: { commands: [], env: {}, secretRefs: [] },
+      task: { allowPr: false },
+    };
+    const prov = provisionRepo({ envelope, token: null, runDir });
+    assert.equal(prov.fallbackBranch, true, 'a fallback branch was cut');
+    assert.notEqual(prov.workingBranch, 'main', 'the working branch is NOT the base branch');
+    assert.match(prov.workingBranch, /^nano\/agent-work\/main-/, 'fallback branch is namespaced off the base');
+    assert.equal(prov.baseBranch, 'main');
+    // HEAD is on the fallback branch, not on base.
+    assert.equal(g(['rev-parse', '--abbrev-ref', 'HEAD'], prov.workspaceDir), prov.workingBranch);
+  } finally {
+    rmSync(root, { recursive: true, force: true });
+  }
+});
+
+test('provisionRepo stays read-only on the base branch when push is disabled (no fallback)', { skip: !gitOk }, () => {
+  const { root, origin } = makeOriginRepo();
+  const runDir = mkdtempSync(join(root, 'run-'));
+  try {
+    const envelope = {
+      schemaVersion: 1,
+      repository: { provider: 'github', url: origin, submodules: false },
+      branch: { base: 'main', create: '', push: false },
+      setup: { commands: [], env: {}, secretRefs: [] },
+      task: { allowPr: false },
+    };
+    const prov = provisionRepo({ envelope, token: null, runDir });
+    assert.equal(prov.fallbackBranch, false, 'no fallback when nothing will be pushed');
+    assert.equal(prov.workingBranch, 'main', 'a read-only clone may stay on the base branch');
+  } finally {
+    rmSync(root, { recursive: true, force: true });
+  }
+});
+
+test('finalizeGit pushes the fallback branch cleanly even when the base advanced (issue #231 defense #1)', { skip: !gitOk }, () => {
+  const { root, origin } = makeOriginRepo();
+  const runDir = mkdtempSync(join(root, 'run-'));
+  try {
+    const envelope = {
+      schemaVersion: 1,
+      repository: { provider: 'github', url: origin, submodules: false },
+      branch: { base: 'main', create: '', push: true },
+      setup: { commands: [], env: {}, secretRefs: [] },
+      task: { allowPr: false },
+    };
+    const prov = provisionRepo({ envelope, token: null, runDir });
+    assert.equal(prov.fallbackBranch, true);
+
+    // The remote base advances AFTER we cloned — this is exactly what non-ff'd the
+    // real repro when the agent had committed on base.
+    advanceOrigin(root, origin, 'main');
+
+    // The harness makes a commit on the fallback branch.
+    writeFileSync(join(prov.workspaceDir, 'work.txt'), 'work\n');
+    g(['add', '-A'], prov.workspaceDir);
+    g(['-c', 'user.name=nano', '-c', 'user.email=nano@example.com', 'commit', '-q', '-m', 'slice work'], prov.workspaceDir);
+
+    const out = finalizeGit({ ...prov, envelope, token: null });
+    assert.equal(out.baseAdvanced, 1, 'the pre-push staleness check saw the base advance');
+    assert.equal(out.pushed, true, 'a fresh work branch always fast-forwards, base advance notwithstanding');
+    assert.equal(out.pushError, undefined, 'no work is stranded');
+    assert.equal(out.strandedCommits, undefined);
+    // the fallback branch now exists on the origin
+    assert.equal(g(['-c', 'safe.bareRepository=all', 'rev-parse', '--verify', `refs/heads/${out.branch}`], origin).length, 40);
+  } finally {
+    rmSync(root, { recursive: true, force: true });
+  }
+});
+
+test('finalizeGit surfaces stranded commit SHAs on a non-ff push rejection (issue #231 defense #2)', { skip: !gitOk }, () => {
+  const { root, origin } = makeOriginRepo();
+  const runDir = mkdtempSync(join(root, 'run-'));
+  try {
+    // An explicit create=main puts us on the base branch — the exact misconfig that
+    // strands work when the remote base advances. finalizeGit must not swallow it.
+    const envelope = {
+      schemaVersion: 1,
+      repository: { provider: 'github', url: origin, submodules: false },
+      branch: { base: 'main', create: 'main', push: true },
+      setup: { commands: [], env: {}, secretRefs: [] },
+      task: { allowPr: false },
+    };
+    const prov = provisionRepo({ envelope, token: null, runDir });
+    assert.equal(prov.workingBranch, 'main');
+
+    // Remote base advances, then the harness commits on our (now-stale) local main.
+    advanceOrigin(root, origin, 'main');
+    writeFileSync(join(prov.workspaceDir, 'work.txt'), 'work\n');
+    g(['add', '-A'], prov.workspaceDir);
+    g(['-c', 'user.name=nano', '-c', 'user.email=nano@example.com', 'commit', '-q', '-m', 'slice work'], prov.workspaceDir);
+    const headSha = g(['rev-parse', 'HEAD'], prov.workspaceDir);
+
+    const out = finalizeGit({ ...prov, envelope, token: null });
+    assert.equal(out.pushed, false, 'the non-ff push is rejected');
+    assert.ok(out.pushError, 'the push error is recorded');
+    assert.equal(out.pushFailed, true, 'the failure is flagged, not soft');
+    assert.deepEqual(out.strandedCommits, [headSha], 'the at-risk commit SHAs are surfaced for recovery');
+    assert.equal(out.baseAdvanced, 1, 'the staleness check attributed the cause');
+  } finally {
+    rmSync(root, { recursive: true, force: true });
+  }
+});
+
 test('provisionRepo checks out a commit SHA via repository.sha (detached, not via --branch)', { skip: !gitOk }, () => {
   const { root, origin } = makeOriginRepo();
   // add a second commit so we can pin the FIRST one by SHA

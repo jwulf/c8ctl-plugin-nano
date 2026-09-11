@@ -3919,6 +3919,21 @@ function authUrl(url, provider, hasToken) {
 
 class ProvisionError extends Error {}
 
+// Reduce an arbitrary string to a single git-ref-safe path segment: git refname
+// rules forbid spaces and ~^:?*[\, leading/trailing/doubled dots, a trailing
+// ".lock", etc. Used to build the deterministic fallback work branch (issue #231)
+// off the base branch name + run id, so a run with no branch.create still commits
+// on a fresh, always-fast-forwardable branch instead of on the base.
+function sanitizeBranchSegment(s) {
+  const cleaned = String(s == null ? '' : s)
+    .replace(/[^0-9A-Za-z._-]+/g, '-') // collapse anything unusual to a dash
+    .replace(/\.{2,}/g, '.')            // no doubled dots (git forbids "..")
+    .replace(/^[-.]+|[-.]+$/g, '')      // no leading/trailing dot or dash
+    .replace(/\.lock$/i, 'lock')        // a ref segment may not end in ".lock"
+    .slice(0, 60);
+  return cleaned || 'base';
+}
+
 // Never let git invoke the host's configured credential helper for our clone/
 // push. Reset the helper list ("") so no helper runs — even when we DO have a
 // token, because helpers like `store`/keychain would persist the job's repo
@@ -4282,21 +4297,47 @@ function provisionRepo({ envelope, token, runDir, timeoutMs = 120_000 }) {
   // rev-parse resolves a symbolic name — a tag/sha leaves detached HEAD, in
   // which case there is NO branch to push and workingBranch stays null so
   // finalizeGit skips the push/PR reconcile instead of pushing a bogus ref.
+  const log = getLogger();
+  const baseBranchName = envelope.branch?.base || branchName || '';
+  const wantPush = coerceBool(envelope.branch?.push, true);
   let workingBranch = null;
+  let fallbackBranch = false;
   if (envelope.branch?.create) {
     const cb = runGit(['checkout', '-B', envelope.branch.create], { cwd: workspaceDir, env: gitEnv, timeoutMs });
     if (cb.status !== 0) throw new ProvisionError(describeGitFailure(`git checkout -B ${envelope.branch.create}`, cb, { token, timeoutMs }));
     workingBranch = envelope.branch.create;
+    log.debug?.(`provisionRepo: branch.create=${workingBranch} → cut work branch off base '${baseBranchName || '(unknown)'}'`);
   } else {
     const head = runGit(['rev-parse', '--abbrev-ref', 'HEAD'], { cwd: workspaceDir, env: gitEnv });
     const name = (head.stdout || '').trim();
-    workingBranch = (name && name !== 'HEAD') ? name : null; // null ⇒ detached HEAD
+    const checkedOut = (name && name !== 'HEAD') ? name : null; // null ⇒ detached HEAD
+    if (checkedOut && wantPush) {
+      // Defense against silent work-loss (issue #231): with no branch.create the
+      // clone left us on the BASE branch. Committing there with intent to push is
+      // ALWAYS wrong for the PR flow — a push to the shared base races it and a
+      // non-ff reject strands the commits in this throwaway workspace with no PR
+      // (re-running the agent is non-idempotent, so there is no recovery). Cut a
+      // fresh, uniquely-named work branch off the base instead: being new on the
+      // remote it always fast-forwards, and its name is reported back in the
+      // result envelope (env.branch) so the process model can still find the work.
+      const fb = `nano/agent-work/${sanitizeBranchSegment(baseBranchName)}-${sanitizeBranchSegment(basename(runDir))}`;
+      const cb = runGit(['checkout', '-B', fb], { cwd: workspaceDir, env: gitEnv, timeoutMs });
+      if (cb.status !== 0) throw new ProvisionError(describeGitFailure(`git checkout -B ${fb}`, cb, { token, timeoutMs }));
+      workingBranch = fb;
+      fallbackBranch = true;
+      log.warn?.(`provisionRepo: no branch.create supplied and the clone landed on the base branch '${checkedOut}' — cut fallback work branch '${fb}' so commits are never made directly on the base branch (the app should supply branch.create=feat/<task.id>)`);
+    } else {
+      // Detached HEAD (tag/sha ⇒ null, no branch to push) or a read-only clone
+      // (push disabled) — safe to stay on the checked-out ref; nothing is pushed.
+      workingBranch = checkedOut;
+      if (checkedOut) log.debug?.(`provisionRepo: no branch.create; push disabled → working read-only on '${checkedOut}'`);
+    }
   }
   const sha = runGit(['rev-parse', 'HEAD'], { cwd: workspaceDir, env: gitEnv });
   // `git rev-parse HEAD` on an unborn branch (freshly cloned empty repo) exits
   // non-zero and echoes the literal "HEAD" on stdout — treat that as "no base
   // commit" (empty startSha) rather than a bogus revision.
-  return { workspaceDir, gitEnv, committer, startSha: sha.status === 0 ? (sha.stdout || '').trim() : '', workingBranch, detached: !workingBranch, ref: commitSha || branchName || '', base, baseFetchError, remote: redactToken(repo.url, token) };
+  return { workspaceDir, gitEnv, committer, startSha: sha.status === 0 ? (sha.stdout || '').trim() : '', workingBranch, fallbackBranch, baseBranch: baseBranchName || null, detached: !workingBranch, ref: commitSha || branchName || '', base, baseFetchError, remote: redactToken(repo.url, token) };
 }
 
 // Look up a PR for this branch (2a does NOT open it — the harness does, driven
@@ -4435,10 +4476,35 @@ function finalizeGit({ workspaceDir, gitEnv, startSha, workingBranch, envelope, 
   if (!workingBranch) {
     out.detached = true; // clone landed on a tag/sha ⇒ no branch to push
   } else if (coerceBool(envelope.branch?.push, true) && out.commits.length > 0) {
+    const log = getLogger();
     const pushTimeoutMs = 120_000; // matches runGit's default; surfaced in a timeout reason
+    // Pre-push staleness check (issue #229/#231 observability): if the base branch
+    // advanced on the remote since we cloned, a push can be rejected non-ff. Fetch
+    // the base and report how far it moved so the non-ff cause is visible in the
+    // log BEFORE the push, not inferred after the fact. Best-effort — never fatal.
+    const baseBranch = String(envelope.branch?.base || '');
+    if (baseBranch) {
+      const bf = runGit([...credArgs(), 'fetch', '--no-tags', 'origin', baseBranch], { cwd: workspaceDir, env: gitEnv, timeoutMs: pushTimeoutMs });
+      if (bf.status === 0) {
+        const ahead = runGit(['rev-list', '--count', 'HEAD..FETCH_HEAD'], { cwd: workspaceDir, env: gitEnv });
+        const n = ahead.status === 0 ? parseInt((ahead.stdout || '').trim(), 10) : 0;
+        if (Number.isFinite(n) && n > 0) {
+          out.baseAdvanced = n;
+          log.warn?.(`finalizeGit: remote base '${baseBranch}' advanced ${n} commit(s) since clone — pushing branch '${workingBranch}'${workingBranch === baseBranch ? ' (which IS the base — a non-ff reject would strand the commits)' : ''}`);
+        }
+      }
+    }
     const push = runGit([...credArgs(), 'push', '--set-upstream', 'origin', workingBranch], { cwd: workspaceDir, env: gitEnv, timeoutMs: pushTimeoutMs });
     if (push.status === 0) out.pushed = true;
-    else out.pushError = describeGitFailure('git push', push, { token, timeoutMs: pushTimeoutMs });
+    else {
+      // A rejected push (typically non-fast-forward) would otherwise strand every
+      // new commit in this throwaway workspace. Surface the at-risk SHAs explicitly
+      // (issue #231, defense #2) so the failure is a hard, actionable signal with
+      // the commits to recover — not a soft pushError that reads as "completed".
+      out.pushError = describeGitFailure('git push', push, { token, timeoutMs: pushTimeoutMs });
+      out.pushFailed = true;
+      out.strandedCommits = out.commits.slice();
+    }
   }
 
   if (workingBranch && envelope.task?.allowPr) {
@@ -6210,6 +6276,7 @@ function buildResultEnvelope(result, { sandbox, image, git, result: agentResult,
     env.commits = git.commits ?? [];
     env.pushed = !!git.pushed;
     if (git.pushError) env.pushError = git.pushError;
+    if (git.strandedCommits && git.strandedCommits.length) env.strandedCommits = git.strandedCommits;
     if (git.pr) env.pr = git.pr;
     if (git.error) env.gitError = git.error;
   }
@@ -8389,7 +8456,15 @@ async function workAgent(req, flags) {
             ? ` [${gitResult.branch ? `branch ${gitResult.branch}` : 'detached HEAD'}: ${gitResult.commits.length} commit(s), ${gitResult.branch ? (gitResult.pushed ? 'pushed' : (gitResult.pushError ? 'push FAILED' : 'not pushed')) : 'no branch to push'}${gitResult.pr?.found ? `, PR #${gitResult.pr.number}` : ''}]`
             : '';
           logger.info(`[${jobType}] job ${job.jobKey} complete (exit 0)${result.truncated ? ' [output truncated]' : ''}${gitNote}`);
-          if (gitResult?.pushError) logger.warn(`[${jobType}] job ${job.jobKey}: branch push failed — ${gitResult.pushError}`);
+          if (gitResult?.pushError) {
+            // Elevate a push failure from a terse info tail to a loud, actionable
+            // error naming the stranded commit SHAs (issue #231): these commits are
+            // unpushed in a throwaway workspace and will be lost with no PR unless
+            // recovered from these SHAs.
+            const stranded = gitResult.strandedCommits && gitResult.strandedCommits.length ? gitResult.strandedCommits : (gitResult.commits || []);
+            const shaNote = stranded.length ? ` — ${stranded.length} commit(s) on branch '${gitResult.branch}' are UNPUSHED and will be lost, no PR [stranded: ${stranded.join(', ')}]` : '';
+            logger.error(`[${jobType}] job ${job.jobKey}: branch push FAILED${shaNote} — ${gitResult.pushError}`);
+          }
           // Guard the operator against silent empty escalations: a success that
           // yields no *effective* result vars (no file/sentinel at all, an empty
           // `{}`, or only reserved keys that were sanitized away) means the

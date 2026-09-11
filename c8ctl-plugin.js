@@ -4314,7 +4314,16 @@ function provisionRepo({ envelope, token, runDir, runId, timeoutMs = 120_000, co
   // which case there is NO branch to push and workingBranch stays null so
   // finalizeGit skips the push/PR reconcile instead of pushing a bogus ref.
   const log = getLogger();
-  const baseBranchName = envelope.branch?.base || branchName || '';
+  // Fold the CONFIGURED base ref (`repository.baseRef`) in ahead of the checked-out
+  // ref so the fallback branch NAME and the "configured base" log identify the ACTUAL
+  // base. Real PR envelopes carry the base as `repository.baseRef` (not branch.base),
+  // so without this the split shape (ref='feat/x' + baseRef='main', no branch.create)
+  // named the fallback after the FEATURE ref (`nano/agent-work/feat-x-…`) and logged
+  // 'feat/x' as the configured base even though `effectiveBase` (below) is 'main'
+  // (suppressed advisory 4317). This is observability only — the #231 guard already
+  // compares against `effectiveBase`, which folds the same value.
+  const configuredBaseRef = repo.baseRef && !String(repo.baseRef).startsWith('-') ? String(repo.baseRef) : '';
+  const baseBranchName = envelope.branch?.base || configuredBaseRef || branchName || '';
   const wantPush = coerceBool(envelope.branch?.push, true);
   let workingBranch = null;
   let fallbackBranch = false;
@@ -4396,7 +4405,6 @@ function provisionRepo({ envelope, token, runDir, runId, timeoutMs = 120_000, co
   // `branch.create` that names the real base as an ordinary work branch — committing
   // and pushing directly onto the base (the #231 hazard) AND making the pre-push
   // staleness check watch the feature ref instead of the base (thread/advisory 4378).
-  const configuredBaseRef = repo.baseRef && !String(repo.baseRef).startsWith('-') ? String(repo.baseRef) : '';
   const effectiveBase = (envelope.branch?.base || '') || configuredBaseRef || checkedOut || unbornBranch || refBaseBranch || '';
   // Correlation suffix (issue #231 observability): jobKey/instance/element keys so
   // concurrent workers' branch-decision logs can be joined to the AgentInstance
@@ -4655,6 +4663,24 @@ function finalizeGit({ workspaceDir, gitEnv, startSha, workingBranch, baseBranch
     if (log.status === 0) out.commits = log.stdout.trim().split('\n').filter(Boolean);
   }
 
+  // Bound EVERY finalize git op against ONE shared deadline derived from the recovery
+  // window (budgetMs) — the LOCAL graph scans below AND the sequential NETWORK ops
+  // later. Each runs via spawnSync, which BLOCKS the event loop so the worker's
+  // lock-heartbeat fiber cannot fire while it is in flight; on a very large repository
+  // an unbounded local rev-list could itself burn up to the full 120s per scan before
+  // the network phase even starts, letting the recovery window lapse and the broker
+  // reactivate this same job mid-finalization (suppressed advisory 4670). Starting the
+  // deadline HERE and drawing each op's remaining slice from it keeps their CUMULATIVE
+  // wall-time inside the lease. Enforce it STRICTLY with NO per-op floor (a floor let
+  // N sequential ops each claim a minimum slice past the deadline — thread 4672);
+  // clamp only to the per-op default and a 1ms minimum so a near/over-exhausted budget
+  // makes the op fail-fast (spawnSync treats 0/absent as "no timeout") rather than
+  // block past the window. Without a budget (direct callers / unit tests) keep the
+  // full per-op timeout — behaviour-neutral (thread 4754).
+  const opTimeoutMs = 120_000; // matches runGit's default; surfaced in a timeout reason
+  const netDeadline = budgetMs > 0 ? Date.now() + Math.floor(budgetMs * 0.8) : 0;
+  const netTimeoutMs = () => (netDeadline ? Math.min(opTimeoutMs, Math.max(1, netDeadline - Date.now())) : opTimeoutMs);
+
   // Commits made on ANY local branch that are not yet on a remote, EXCLUDING the
   // work branch we intend to push. `startSha..HEAD` (out.commits) misses work the
   // harness committed while HEAD was checked out on a DIFFERENT branch and then
@@ -4666,7 +4692,7 @@ function finalizeGit({ workspaceDir, gitEnv, startSha, workingBranch, baseBranch
   // not carried by the branch we are about to push.
   let offBranchStray = [];
   if (workingBranch && coerceBool(envelope.branch?.push, true)) {
-    const stray = runGit(['rev-list', '--branches', '--not', '--remotes', `refs/heads/${workingBranch}`], { cwd: workspaceDir, env: gitEnv });
+    const stray = runGit(['rev-list', '--branches', '--not', '--remotes', `refs/heads/${workingBranch}`], { cwd: workspaceDir, env: gitEnv, timeoutMs: netTimeoutMs() });
     if (stray.status === 0) offBranchStray = stray.stdout.trim().split('\n').filter(Boolean);
   }
 
@@ -4680,7 +4706,7 @@ function finalizeGit({ workspaceDir, gitEnv, startSha, workingBranch, baseBranch
   let branchCommits = [];
   if (workingBranch) {
     const range = startSha ? `${startSha}..refs/heads/${workingBranch}` : `refs/heads/${workingBranch}`;
-    const bl = runGit(['rev-list', range], { cwd: workspaceDir, env: gitEnv });
+    const bl = runGit(['rev-list', range], { cwd: workspaceDir, env: gitEnv, timeoutMs: netTimeoutMs() });
     if (bl.status === 0) branchCommits = bl.stdout.trim().split('\n').filter(Boolean);
   }
 
@@ -4688,27 +4714,11 @@ function finalizeGit({ workspaceDir, gitEnv, startSha, workingBranch, baseBranch
     out.detached = true; // clone landed on a tag/sha ⇒ no branch to push
   } else if (coerceBool(envelope.branch?.push, true) && (out.commits.length > 0 || offBranchStray.length > 0 || branchCommits.length > 0)) {
     const log = getLogger();
-    const pushTimeoutMs = 120_000; // matches runGit's default; surfaced in a timeout reason
-    // Bound the CUMULATIVE wall-time of finalization's sequential network git ops
-    // (pre-push staleness fetch → push → ls-remote/ff verify). Each runs via
-    // spawnSync, which BLOCKS the event loop, so the worker's lock-heartbeat fiber
-    // cannot fire while any is in flight; on a stalled network four back-to-back
-    // 120s ops (480s) would outlast the default 300s activation-lock/recovery window
-    // and let the broker reactivate this same job mid-finalization — a duplicate run
-    // (thread 4754). When the worker threads its effective recovery window as
-    // `budgetMs`, cap each op at the time left before 80% of that window elapses
-    // (reserving margin for a post-finalize heartbeat + settle). Enforce the budget
-    // STRICTLY, with NO per-op floor: a floor let each of the N sequential ops claim
-    // its own minimum slice even AFTER the deadline had passed, so their cumulative
-    // wall-time could still outlast the lease (e.g. a 96s deadline followed by four
-    // 20s floors = 156s, past a 120s window — thread 4672). Instead every op sees the
-    // time REMAINING to the shared deadline, so the ops together can never run past
-    // it; clamp only to a 1ms minimum so a near/over-exhausted budget makes the op
-    // fail-fast (spawnSync treats a 0/absent timeout as "no timeout", which would
-    // block indefinitely) rather than block past the window. Without a budget (direct
-    // callers / unit tests) keep the full per-op timeout — behaviour-neutral.
-    const netDeadline = budgetMs > 0 ? Date.now() + Math.floor(budgetMs * 0.8) : 0;
-    const netTimeoutMs = () => (netDeadline ? Math.min(pushTimeoutMs, Math.max(1, netDeadline - Date.now())) : pushTimeoutMs);
+    const pushTimeoutMs = opTimeoutMs; // the shared per-op cap, surfaced in a timeout reason
+    // The finalization deadline (netDeadline / netTimeoutMs) was established at the top
+    // of finalizeGit so it also bounded the local graph scans above; the sequential
+    // NETWORK ops below (pre-push staleness fetch → push → ls-remote/ff verify) simply
+    // keep drawing their remaining slice from that same shared deadline.
     // Verify HEAD is still on the branch we intend to push (issue #231). The
     // harness runs arbitrary code; if it checked out a DIFFERENT ref (e.g. the
     // base branch) and committed there, out.commits (startSha..HEAD) enumerates
@@ -4757,7 +4767,7 @@ function finalizeGit({ workspaceDir, gitEnv, startSha, workingBranch, baseBranch
     let movedStray = [];
     if (movedOff) {
       const range = startSha ? `${startSha}..HEAD` : 'HEAD';
-      const ms = runGit(['rev-list', range, '--not', '--remotes', `refs/heads/${workingBranch}`], { cwd: workspaceDir, env: gitEnv });
+      const ms = runGit(['rev-list', range, '--not', '--remotes', `refs/heads/${workingBranch}`], { cwd: workspaceDir, env: gitEnv, timeoutMs: netTimeoutMs() });
       movedStray = ms.status === 0
         ? ms.stdout.trim().split('\n').filter(Boolean)
         : out.commits.filter((c) => !branchCommitSet.has(c));
@@ -4776,7 +4786,7 @@ function finalizeGit({ workspaceDir, gitEnv, startSha, workingBranch, baseBranch
       let unpushedBranchCommits = branchCommits;
       if (branchCommits.length > 0) {
         const range = startSha ? `${startSha}..refs/heads/${workingBranch}` : `refs/heads/${workingBranch}`;
-        const ub = runGit(['rev-list', range, '--not', '--remotes'], { cwd: workspaceDir, env: gitEnv });
+        const ub = runGit(['rev-list', range, '--not', '--remotes'], { cwd: workspaceDir, env: gitEnv, timeoutMs: netTimeoutMs() });
         if (ub.status === 0) unpushedBranchCommits = ub.stdout.trim().split('\n').filter(Boolean);
       }
       // Union every at-risk source so recovery finds them all: the off-branch strays
@@ -4852,6 +4862,18 @@ function finalizeGit({ workspaceDir, gitEnv, startSha, workingBranch, baseBranch
         const beforeRef = runGit(['rev-parse', '--verify', '--quiet', `refs/remotes/origin/${baseBranch}`], { cwd: workspaceDir, env: gitEnv });
         beforeSha = beforeRef.status === 0 ? ((beforeRef.stdout || '').trim() || null) : null;
       }
+      if (!beforeSha) {
+        // No clone-time base snapshot to measure against, so the base-advanced count
+        // cannot be computed regardless — do NOT fetch. A null `beforeSha` here also
+        // means there was no `refs/remotes/origin/<base>` at clone, which is exactly
+        // the TAG-base case: `repository.baseRef` may be a tag, and tags land under
+        // refs/tags (never a remote-tracking branch), so a `refs/heads/<base>` fetch
+        // would always fail and log a misleading `stalenessFetchError` for a perfectly
+        // valid tag base (suppressed advisory 4862). A tag is immutable and cannot
+        // "advance" anyway, so skipping the check is the correct outcome; emit a debug
+        // note so the skip is distinguishable from a diagnostic that never ran.
+        log.debug?.(`finalizeGit${corr ? ' (' + corr + ')' : ''}: no clone-time snapshot for base '${baseBranch}' (origin/${baseBranch} absent at clone — e.g. a tag base or a single-branch clone of a different ref) — skipping the base-advanced staleness check`);
+      } else {
       // Fetch the EXACT `refs/heads/<branch>` ref, not the bare name: git treats a
       // bare refspec beginning with '+' as the force-update prefix, so a valid
       // branch like '+release' would fetch the wrong ref and make the staleness
@@ -4866,15 +4888,9 @@ function finalizeGit({ workspaceDir, gitEnv, startSha, workingBranch, baseBranch
         // Measure how far the BASE advanced since we cloned, not how far our post-
         // work HEAD sits behind the new base tip: `beforeSha` is the base ref as of
         // clone, so `beforeSha..FETCH_HEAD` counts exactly the commits the base
-        // gained. Anchor ONLY on a genuine clone-time base tip. When there is none
-        // (baseCloneSha null AND no live refs/remotes/origin/<base> — e.g. a single-
-        // branch clone of a DIFFERENT ref, so origin/<base> never existed at clone),
-        // do NOT fall back to `startSha`: startSha is the FEATURE-branch tip, so
-        // `startSha..FETCH_HEAD` would count pre-existing feature/base divergence as
-        // "base advanced" — a false positive. Omit the count instead (suppressed
-        // advisory 4682).
-        if (beforeSha) {
-          const ahead = runGit(['rev-list', '--count', `${beforeSha}..FETCH_HEAD`], { cwd: workspaceDir, env: gitEnv });
+        // gained.
+        {
+          const ahead = runGit(['rev-list', '--count', `${beforeSha}..FETCH_HEAD`], { cwd: workspaceDir, env: gitEnv, timeoutMs: netTimeoutMs() });
           const n = ahead.status === 0 ? parseInt((ahead.stdout || '').trim(), 10) : 0;
           if (Number.isFinite(n) && n > 0) {
             out.baseAdvanced = n;
@@ -4886,8 +4902,6 @@ function finalizeGit({ workspaceDir, gitEnv, startSha, workingBranch, baseBranch
             // leaving silence that reads as "diagnostic never ran" (advisory 4847).
             log.debug?.(`finalizeGit${corr ? ' (' + corr + ')' : ''}: remote base '${baseBranch}' unchanged since clone (0 new commit(s)) — pushing branch '${workingBranch}'`);
           }
-        } else {
-          log.debug?.(`finalizeGit${corr ? ' (' + corr + ')' : ''}: no clone-time snapshot for base '${baseBranch}' (origin/${baseBranch} absent at clone) — skipping the base-advanced count to avoid a false positive`);
         }
       } else {
         // The pre-push staleness diagnostic disappears exactly when the best-effort
@@ -4897,6 +4911,7 @@ function finalizeGit({ workspaceDir, gitEnv, startSha, workingBranch, baseBranch
         // — still never fatal.
         out.stalenessFetchError = describeGitFailure(`git fetch origin refs/heads/${baseBranch}`, bf, { token, timeoutMs: bfTimeoutMs });
         log.warn?.(`finalizeGit${corr ? ' (' + corr + ')' : ''}: pre-push staleness check could not fetch base '${baseBranch}' (${out.stalenessFetchError}) — a later non-ff or other push failure will be indistinguishable from an unchanged base`);
+      }
       }
     }
     // Push the EXPLICIT refs/heads/<branch>:refs/heads/<branch> refspec, not the bare
@@ -4956,8 +4971,20 @@ function finalizeGit({ workspaceDir, gitEnv, startSha, workingBranch, baseBranch
         // the promoted branchCommits, but if HEAD sat off the branch and promotion
         // found no tip, out.commits could still be the (empty) final-HEAD range —
         // branchCommits carries the commits the rejected push actually strands, so
-        // include them explicitly (suppressed advisory 4812).
-        out.strandedCommits = [...new Set([...out.commits, ...branchCommits])];
+        // include them explicitly (suppressed advisory 4812). But a NON-FF reject does
+        // NOT mean the whole branch is unpushed: an earlier prefix may already be on
+        // the remote (e.g. C1 landed, local C2 followed, another actor advanced the
+        // remote from C1, so pushing C2 is rejected — yet C1 is already recoverable).
+        // Reporting C1 as stranded is a false alarm, so filter the union against every
+        // remote-tracking ref (`--not --remotes`) exactly as the branch-mismatch path
+        // does, leaving only the genuinely unpublished commits; fall back to the raw
+        // union only if the rev-list itself errors (suppressed advisory 4960).
+        let stranded = [...new Set([...out.commits, ...branchCommits])];
+        if (stranded.length > 0) {
+          const sr = runGit(['rev-list', ...stranded, '--not', '--remotes'], { cwd: workspaceDir, env: gitEnv, timeoutMs: netTimeoutMs() });
+          if (sr.status === 0) stranded = sr.stdout.trim().split('\n').filter(Boolean);
+        }
+        out.strandedCommits = stranded;
       }
     }
     } // end HEAD-on-workingBranch else

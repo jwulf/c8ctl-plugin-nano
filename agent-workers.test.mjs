@@ -1554,6 +1554,42 @@ test('provisionRepo folds repository.baseRef into effectiveBase so branch.create
   }
 });
 
+test('provisionRepo names the fallback + logs the base from repository.baseRef when branch.create is absent (issue #231, suppressed advisory 4317)', { skip: !gitOk }, () => {
+  const { root, origin } = makeOriginRepo();
+  // Publish a feature branch so we can clone ref=feat/x while the base rides in
+  // repository.baseRef (NOT branch.base) with NO branch.create — the split shape.
+  const wc = mkdtempSync(join(root, 'wc4317-'));
+  g(['clone', '-q', origin, wc], undefined);
+  g(['config', 'user.name', 'seed'], wc);
+  g(['config', 'user.email', 'seed@example.com'], wc);
+  g(['checkout', '-q', '-b', 'feat/x'], wc);
+  writeFileSync(join(wc, 'feature.txt'), 'feature\n');
+  g(['add', '-A'], wc);
+  g(['commit', '-q', '-m', 'feature commit'], wc);
+  g(['push', '-q', 'origin', 'feat/x'], wc);
+  const runDir = mkdtempSync(join(root, 'run-'));
+  try {
+    // ref=feat/x lands the clone on feat/x, baseRef=main carries the real base, and
+    // there is NO branch.create — so the guard cuts a fallback off the checked-out
+    // feat/x. Before folding repository.baseRef into `baseBranchName` the fallback was
+    // named `nano/agent-work/feat-x-…` and the "configured base" log claimed 'feat/x'
+    // even though effectiveBase is 'main'. The name + base must identify the ACTUAL base.
+    const envelope = {
+      schemaVersion: 1,
+      repository: { provider: 'github', url: origin, ref: 'feat/x', baseRef: 'main', submodules: false },
+      branch: { push: true },
+      setup: { commands: [], env: {}, secretRefs: [] },
+      task: { allowPr: false },
+    };
+    const prov = provisionRepo({ envelope, token: null, runDir });
+    assert.equal(prov.fallbackBranch, true, 'a fallback is cut so commits never land on the checked-out ref');
+    assert.equal(prov.baseBranch, 'main', 'effectiveBase resolves the configured base ref');
+    assert.match(prov.workingBranch, /^nano\/agent-work\/main-/, 'the fallback name identifies the real base (main), not the feature ref');
+  } finally {
+    rmSync(root, { recursive: true, force: true });
+  }
+});
+
 test('sanitizeBranchSegment reapplies trailing-dot/.lock checks AFTER truncation (issue #231, suppressed 3933)', () => {
   // A valid long base name with a dot at char 60 must not leave a trailing '.'
   // after .slice(0, 60), or `git checkout -B` rejects the fallback ref and the job
@@ -1633,6 +1669,51 @@ test('finalizeGit surfaces stranded commit SHAs on a non-ff push rejection (issu
     assert.equal(out.pushFailed, true, 'the failure is flagged, not soft');
     assert.deepEqual(out.strandedCommits, [headSha], 'the at-risk commit SHAs are surfaced for recovery');
     assert.equal(out.baseAdvanced, 1, 'the staleness check attributed the cause');
+  } finally {
+    rmSync(root, { recursive: true, force: true });
+  }
+});
+
+test('finalizeGit does NOT report an already-PUSHED prefix as stranded on a non-ff reject (issue #231, suppressed advisory 4960)', { skip: !gitOk }, () => {
+  const { root, origin } = makeOriginRepo();
+  const runDir = mkdtempSync(join(root, 'run-'));
+  try {
+    // Drive finalizeGit directly with workingBranch='main' (provisionRepo refuses to
+    // leave us on the base) to exercise the non-ff push-reject strand path with a
+    // previously-landed prefix. The reviewer's scenario: C1 is ALREADY pushed, a later
+    // local C2 follows, and another actor advances the remote FROM C1 — so pushing C2
+    // is rejected non-ff, yet C1 is already recoverable on the remote and must NOT be
+    // reported as stranded.
+    const envelope = {
+      schemaVersion: 1,
+      repository: { provider: 'github', url: origin, submodules: false },
+      branch: { base: 'main', create: '', push: true },
+      setup: { commands: [], env: {}, secretRefs: [] },
+      task: { allowPr: false },
+    };
+    const prov = provisionRepo({ envelope, token: null, runDir });
+    g(['checkout', '-B', 'main', 'origin/main'], prov.workspaceDir);
+    // C1: commit and PUSH so origin/main (and the local remote-tracking ref) carries
+    // it — the already-published prefix.
+    writeFileSync(join(prov.workspaceDir, 'c1.txt'), 'c1\n');
+    g(['add', '-A'], prov.workspaceDir);
+    g(['-c', 'user.name=nano', '-c', 'user.email=nano@example.com', 'commit', '-q', '-m', 'C1'], prov.workspaceDir);
+    const c1 = g(['rev-parse', 'HEAD'], prov.workspaceDir);
+    g(['push', '-q', 'origin', 'main'], prov.workspaceDir);
+    // Another actor advances the remote FROM C1 (C1 stays an ancestor) → a later push
+    // is non-ff.
+    advanceOrigin(root, origin, 'main');
+    // C2: the further local commit the rejected push would strand.
+    writeFileSync(join(prov.workspaceDir, 'c2.txt'), 'c2\n');
+    g(['add', '-A'], prov.workspaceDir);
+    g(['-c', 'user.name=nano', '-c', 'user.email=nano@example.com', 'commit', '-q', '-m', 'C2'], prov.workspaceDir);
+    const c2 = g(['rev-parse', 'HEAD'], prov.workspaceDir);
+
+    const out = finalizeGit({ ...prov, workingBranch: 'main', envelope, token: null });
+    assert.equal(out.pushed, false, 'the non-ff push is rejected');
+    assert.equal(out.pushFailed, true, 'the failure is flagged');
+    assert.deepEqual(out.strandedCommits, [c2], 'only the unpublished C2 is stranded');
+    assert.ok(!out.strandedCommits.includes(c1), 'the already-published prefix C1 is filtered out of the recovery list');
   } finally {
     rmSync(root, { recursive: true, force: true });
   }

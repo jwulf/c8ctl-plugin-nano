@@ -979,6 +979,97 @@ test('a hung history append is bounded so complete()\'s queue drain cannot stall
   );
 });
 
+test('retiring a hung create emits a loud (warn-once) timeout diagnostic and caps concurrent in-flight creates so retries cannot overlap (issue #230)', async () => {
+  // A hung createAgentInstance is bounded out and RETIRED, freeing the `creating` slot
+  // for a retry — but its SDK POST is uncancellable and stays in flight. Two guarantees:
+  // (1) retirement is logged at warn (once) so a timed-out create is visible even when a
+  // later retry succeeds; (2) maybeStartCreate() will NOT launch a fresh attempt while
+  // `maxInFlightCreates` POSTs are still outstanding, so retirement-driven retries can't
+  // accumulate overlapping requests against a hung engine. Once an in-flight request
+  // settles, the retry path re-opens.
+  const warnings = [];
+  const logger = { info() {}, warn: (m) => warnings.push(m), debug() {} };
+  let createCall = 0;
+  let rejectFirst = null;
+  const firstHung = new Promise((_resolve, reject) => { rejectFirst = () => reject(new Error('late transport error')); });
+  let t = Date.parse('2026-02-03T04:05:06.000Z');
+  const client = {
+    calls: { create: [], update: [] },
+    createAgentInstance: (req) => {
+      client.calls.create.push(req);
+      createCall += 1;
+      if (createCall === 1) return firstHung;                    // hangs → bounded → retired, still in flight
+      return Promise.resolve({ agentInstanceKey: 'AGENT-CAP' }); // a later retry mints
+    },
+    updateAgentInstance: async (req) => { client.calls.update.push(req); return { createdHistory: [] }; },
+  };
+  const p = createAgentInstanceProducer({
+    camunda: client, job: EXTERNAL_JOB, profile: PROFILE, envelope: ENVELOPE,
+    logger, now: () => t, finalizeTimeoutMs: 20, maxInFlightCreates: 1,
+    createRetryBaseMs: 1000, createRetryMaxMs: 30000,
+  });
+  // activate() awaits the bounded create; the hung attempt is retired on the deadline.
+  await p.activate();
+  assert.equal(p.active, false, 'the hung create was retired, not minted');
+  assert.equal(client.calls.create.length, 1, 'one (hung, still in-flight) attempt so far');
+  assert.equal(
+    warnings.filter((m) => /did not settle within 20ms/.test(m)).length,
+    1,
+    'retirement emitted exactly one warn-level timeout diagnostic',
+  );
+  // The retired attempt's POST is still in flight (count = 1 = cap), so even well past
+  // the backoff window a fresh retry must NOT start — that would overlap the hung POST.
+  t += 5000;
+  p.ingest({ sessionUpdate: 'agent_message_chunk', messageId: 'm1', content: { type: 'text', text: 'a' } });
+  await p.drain();
+  assert.equal(client.calls.create.length, 1, 'the in-flight cap blocked an overlapping retry while the hung POST is outstanding');
+  // Let the hung POST finally settle (transport error): the in-flight slot frees, so a
+  // later ingest can start a fresh attempt, which mints the instance.
+  rejectFirst();
+  await firstHung.catch(() => {});
+  await new Promise((r) => setImmediate(r)); // flush the late catch/finally (in-flight decrement)
+  t += 5000;
+  p.ingest({ sessionUpdate: 'agent_message_chunk', messageId: 'm2', content: { type: 'text', text: 'b' } });
+  await p.drain();
+  assert.equal(client.calls.create.length, 2, 'once the in-flight POST settled, the retry path re-opened');
+  assert.equal(p.active, true, 'the fresh attempt minted the instance');
+});
+
+test('complete() bounds the AGGREGATE append drain — it does not wait for every hung append serially before the terminal update (issue #230)', async () => {
+  // Each append is individually bounded, but the queue is serialized: N hung appends
+  // would take up to N×finalizeTimeoutMs to drain, holding the lease that whole span
+  // before the terminal COMPLETED update even begins. complete() bounds the TOTAL drain
+  // at finalizeTimeoutMs, so only a bounded slice of the queue runs before it proceeds
+  // to COMPLETED (the rest drain in the background, best-effort).
+  const client = {
+    calls: { create: [], update: [] },
+    createAgentInstance: async (req) => { client.calls.create.push(req); return { agentInstanceKey: 'AGENT-DR' }; },
+    updateAgentInstance: (req) => {
+      client.calls.update.push(req);
+      if (req.status === 'COMPLETED') return Promise.resolve({ createdHistory: [] });
+      return new Promise(() => {}); // every history append hangs forever
+    },
+  };
+  const p = makeProducer(client, { finalizeTimeoutMs: 20 });
+  await p.activate();
+  // Queue six independent turns (distinct messageIds each flush the previous). Their
+  // appends all hang; serialized, an UNBOUNDED drain would issue all six SDK calls (one
+  // per finalizeTimeoutMs window) before COMPLETED. The bounded drain issues far fewer.
+  for (let i = 0; i < 6; i += 1) {
+    p.ingest({ sessionUpdate: 'agent_message_chunk', messageId: `m${i}`, content: { type: 'text', text: `t${i}` } });
+  }
+  await p.complete(true);
+  const historyCalls = client.calls.update.filter((u) => u.status !== 'COMPLETED').length;
+  assert.ok(
+    client.calls.update.some((u) => u.status === 'COMPLETED'),
+    'the terminal COMPLETED update ran after the bounded drain',
+  );
+  assert.ok(
+    historyCalls < 6,
+    `the aggregate drain was bounded — only ${historyCalls} of 6 hung appends were issued before COMPLETED (an unbounded drain would issue all six)`,
+  );
+});
+
 test('a FINALIZED producer is inert to late ACP frames — nothing appended after COMPLETED (issue #230)', async () => {
   // spawnCaptureAcp can invoke onAcpUpdate (timeout/abort cleanup) after finish()
   // resolved, i.e. after complete() finalized the producer. A late frame must be

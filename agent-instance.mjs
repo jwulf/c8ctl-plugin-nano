@@ -71,6 +71,17 @@ const DEFAULT_TERMINAL_RETRY_MAX = 3;
 // background) and let the job settle. `0`/non-positive disables the bound.
 const DEFAULT_FINALIZE_TIMEOUT_MS = 10_000;
 
+// Circuit-breaker cap on the number of concurrent, still-in-flight createAgentInstance
+// requests (issue #230). Retiring a hung create frees the `creating` slot for a fresh
+// retry, but the underlying SDK POST is NOT cancellable — it stays outstanding until it
+// finally settles (maybe never, during an engine outage). Because the retry backoff
+// starts at ~1s while a hung request isn't retired until finalizeTimeoutMs (~10s),
+// frequent ACP updates could otherwise launch a new POST every backoff window while the
+// earlier retired-but-hung POSTs are all still in flight, accumulating overlapping
+// requests and hammering the engine. This bounds the outstanding POSTs: once this many
+// are in flight, maybeStartCreate() pauses new attempts until one settles.
+const DEFAULT_MAX_INFLIGHT_CREATES = 3;
+
 // Race a best-effort promise against `timeoutMs`, reporting WHICH won, without ever
 // rejecting. Used to bound every create attempt so a hung createAgentInstance can
 // neither block activate() (which gates whether the harness runs at all) nor
@@ -332,6 +343,7 @@ export function createAgentInstanceProducer(opts = {}) {
     preMintBufferMaxBytes = DEFAULT_PRE_MINT_BUFFER_MAX_BYTES,
     terminalRetryMax = DEFAULT_TERMINAL_RETRY_MAX,
     finalizeTimeoutMs = DEFAULT_FINALIZE_TIMEOUT_MS,
+    maxInFlightCreates = DEFAULT_MAX_INFLIGHT_CREATES,
   } = opts;
 
   const classify = typeof sessionAcp?.classifyUpdate === 'function' ? sessionAcp.classifyUpdate : null;
@@ -376,6 +388,15 @@ export function createAgentInstanceProducer(opts = {}) {
   let creating = null;
   let creatingGen = 0;
   let createGen = 0;
+  // Count of createAgentInstance POSTs currently in flight (started but not yet
+  // settled), including RETIRED attempts whose hung request is still outstanding. Caps
+  // concurrent uncancellable creates (see `maxInFlightCreates`) so retirement-driven
+  // retries can't accumulate against a hung engine (issue #230).
+  let createInFlight = 0;
+  // Elevate the FIRST create-retirement (bounded-out hung request) to `warn` so a
+  // timed-out AgentInstance create is visible even when a later retry succeeds;
+  // subsequent retirements stay `debug` to avoid a warn storm during an outage.
+  let createTimeoutLogged = false;
   let finalized = false;
   let createAttempts = 0;
   let lastCreateAttemptAt = 0;
@@ -558,7 +579,7 @@ export function createAgentInstanceProducer(opts = {}) {
     // A failure on the FINAL attempt won't be retried (the producer is about to be
     // discarded), so don't tell operators to wait for a recovery that can't happen.
     const retryClause = final
-      ? `no further create will be attempted (final finalization attempt; ` +
+      ? `no further create will be attempted (final attempt; ` +
         `job completion unaffected).`
       : `will retry (durable transcript resumes once the create succeeds; ` +
         `job completion unaffected).`;
@@ -678,6 +699,24 @@ export function createAgentInstanceProducer(opts = {}) {
     creating = null;
     creatingGen = 0;
     lastCreateAttemptAt = now();
+    // A hung create that is bounded out and retired here would otherwise vanish
+    // silently: retireCreate only updates state, and if a later retry succeeds the
+    // original timeout leaves no trace — making a stuck AgentInstance request
+    // indistinguishable from a run with no ACP traffic. Emit a bounded timeout
+    // diagnostic (attempt + correlation) so the timeout is visible. This attempt owns
+    // the slot, so `createAttempts` is its number (no newer attempt has started). First
+    // retirement is `warn`; the rest are `debug` to avoid a warn storm (issue #230).
+    const line =
+      `AgentInstance producer: createAgentInstance did not settle within ` +
+      `${finalizeTimeoutMs}ms (attempt ${createAttempts}) — request RETIRED and left to ` +
+      `settle in the background ${correlation()}; a later hot-path retry will attempt to ` +
+      `mint the instance (job completion unaffected).`;
+    if (!createTimeoutLogged) {
+      createTimeoutLogged = true;
+      logger?.warn?.(line);
+    } else {
+      logger?.debug?.(line);
+    }
     return true;
   };
 
@@ -691,9 +730,14 @@ export function createAgentInstanceProducer(opts = {}) {
   const startCreate = (opts = {}) => {
     const gen = (createGen += 1);
     creatingGen = gen;
+    createInFlight += 1;
     const p = doCreate({ ...opts, gen })
       .catch(() => false)
       .finally(() => {
+        // The POST has finally settled — free its in-flight slot in the concurrency
+        // cap regardless of whether this attempt still owns the `creating` slot (a
+        // retired attempt no longer owns it but was still counted while hung).
+        createInFlight -= 1;
         // Only free the shared slot if THIS attempt still owns it — a retired attempt
         // that settles late must not null a newer attempt's `creating` promise.
         if (creatingGen === gen) {
@@ -735,6 +779,15 @@ export function createAgentInstanceProducer(opts = {}) {
   // retried without a dedicated timer.
   const maybeStartCreate = () => {
     if (disabled || agentInstanceKey || creating || finalized) return;
+    // Circuit-breaker: don't launch a fresh retry while `maxInFlightCreates` create
+    // POSTs are still outstanding. Retiring a hung attempt frees the `creating` slot,
+    // but its uncancellable SDK call stays in flight until it settles; without this
+    // cap, frequent ACP updates would keep starting new retries (backoff base ~1s)
+    // while earlier retired-but-hung POSTs (bounded at finalizeTimeoutMs) remain in
+    // flight, accumulating overlapping requests and hammering the engine during an
+    // outage. Pausing here until an in-flight create settles bounds the overlap; a
+    // recovered engine settles those requests and re-opens the retry path (issue #230).
+    if (maxInFlightCreates > 0 && createInFlight >= maxInFlightCreates) return;
     if (createAttempts > 0 && now() - lastCreateAttemptAt < backoffForAttempt(createAttempts)) return;
     startCreate();
   };
@@ -978,8 +1031,13 @@ export function createAgentInstanceProducer(opts = {}) {
       // COMPLETED update (issue #230). doCreate's guard drops any such late success.
       finalized = true;
       if (disabled || !agentInstanceKey) {
-        // Still drain any queued appends so a caller awaiting completion settles.
-        try { await this.drain(); } catch { /* best effort */ }
+        // Still drain any queued appends so a caller awaiting completion settles — but
+        // bound the TOTAL drain at finalizeTimeoutMs (settleWithin never rejects). Each
+        // append is individually bounded, yet the queue is serialized, so during an
+        // AgentInstance outage N queued appends could take up to N×finalizeTimeoutMs and
+        // hold the lease for that whole span; the remaining appends drain in the
+        // background past the deadline (best-effort) so job settlement isn't blocked.
+        await settleWithin(this.drain(), finalizeTimeoutMs);
         // Only warn when we actually attempted to mint (createAttempts > 0). A
         // producer that was never activated is a clean no-op — there is no missing
         // transcript to report.
@@ -998,8 +1056,14 @@ export function createAgentInstanceProducer(opts = {}) {
       // we can observe its outcome and RETRY it. On a successful job end the caller
       // settles the job the instant complete() returns, so there is no reactivation to
       // retry a rejected terminal transition — a single swallowed failure would strand
-      // the instance non-terminal forever (issue #230).
-      try { await queue; } catch { /* best effort */ }
+      // the instance non-terminal forever (issue #230). BOUND the aggregate drain at
+      // finalizeTimeoutMs: each append is individually bounded, but the queue is
+      // serialized, so during an outage N queued appends could take up to
+      // N×finalizeTimeoutMs and hold the lease that whole span before the terminal
+      // update even begins. Past the deadline the remaining appends drain in the
+      // background (best-effort) and we proceed to the durable COMPLETED transition,
+      // preserving the job-settlement / lease-liveness contract (issue #230).
+      await settleWithin(queue, finalizeTimeoutMs);
       let completedOk = false;
       let terminalErr = null;
       let terminalTimedOut = false;

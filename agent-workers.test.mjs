@@ -1652,6 +1652,90 @@ test('finalizeGit enumerates new commits and pushes the branch', { skip: !gitOk 
   }
 });
 
+test('finalizeGit reports baseAdvanced + push failure when the remote branch moved ahead (#229)', { skip: !gitOk }, () => {
+  const { root, origin } = makeOriginRepo();
+  const runDir = mkdtempSync(join(root, 'run-'));
+  try {
+    const envelope = {
+      schemaVersion: 1,
+      repository: { provider: 'github', url: origin, submodules: false },
+      branch: { base: 'main', create: 'feat/work', push: true },
+      setup: { commands: [], env: {}, secretRefs: [] },
+      task: { allowPr: false },
+    };
+    const prov = provisionRepo({ envelope, token: null, runDir });
+    // The agent commits locally on feat/work (off main).
+    writeFileSync(join(prov.workspaceDir, 'AGENT.txt'), 'agent change\n');
+    g(['add', '-A'], prov.workspaceDir);
+    g(['commit', '-q', '-m', 'agent: add AGENT.txt'], prov.workspaceDir);
+
+    // Meanwhile the remote feat/work branch advances independently (a divergent
+    // commit off main), so the branch we're about to push to has moved ahead.
+    const rival = mkdtempSync(join(root, 'rival-'));
+    g(['clone', '-q', origin, rival], undefined);
+    g(['checkout', '-q', '-B', 'feat/work', 'origin/main'], rival);
+    writeFileSync(join(rival, 'RIVAL.txt'), 'rival change\n');
+    g(['add', '-A'], rival);
+    g(['-c', 'user.name=rival', '-c', 'user.email=rival@example.com', 'commit', '-q', '-m', 'rival: add RIVAL.txt'], rival);
+    g(['push', '-q', 'origin', 'feat/work'], rival);
+
+    const warnings = [];
+    const out = finalizeGit({
+      workspaceDir: prov.workspaceDir,
+      gitEnv: prov.gitEnv,
+      startSha: prov.startSha,
+      workingBranch: prov.workingBranch,
+      envelope,
+      token: null,
+      logger: { warn: (m) => warnings.push(m), error: () => {}, info: () => {} },
+    });
+    assert.equal(out.commits.length, 1, 'one new local commit since start');
+    assert.equal(out.baseAdvanced, 1, 'detects the remote branch advanced by one commit before pushing');
+    assert.equal(out.pushed, false, 'a non-fast-forward push is rejected');
+    assert.ok(out.pushError, 'the push failure is captured');
+    assert.ok(
+      warnings.some((m) => /advanced 1 commit\(s\) since clone/.test(m) && /non-fast-forward/.test(m)),
+      'warns that the remote advanced and the push will be non-fast-forward',
+    );
+  } finally {
+    rmSync(root, { recursive: true, force: true });
+  }
+});
+
+test('finalizeGit falls through to the push attempt when the remote branch is absent (#229)', { skip: !gitOk }, () => {
+  const { root, origin } = makeOriginRepo();
+  const runDir = mkdtempSync(join(root, 'run-'));
+  try {
+    const envelope = {
+      schemaVersion: 1,
+      repository: { provider: 'github', url: origin, submodules: false },
+      branch: { base: 'main', create: 'feat/fresh', push: true },
+      setup: { commands: [], env: {}, secretRefs: [] },
+      task: { allowPr: false },
+    };
+    const prov = provisionRepo({ envelope, token: null, runDir });
+    writeFileSync(join(prov.workspaceDir, 'FRESH.txt'), 'fresh\n');
+    g(['add', '-A'], prov.workspaceDir);
+    g(['commit', '-q', '-m', 'agent: add FRESH.txt'], prov.workspaceDir);
+
+    // origin has no feat/fresh yet, so the pre-push staleness fetch fails and must
+    // fall through to a successful push (no baseAdvanced signal).
+    const out = finalizeGit({
+      workspaceDir: prov.workspaceDir,
+      gitEnv: prov.gitEnv,
+      startSha: prov.startSha,
+      workingBranch: prov.workingBranch,
+      envelope,
+      token: null,
+    });
+    assert.equal(out.baseAdvanced, undefined, 'no staleness signal when the remote branch is absent');
+    assert.equal(out.pushed, true, out.pushError || 'the push still proceeds and succeeds');
+    assert.match(g(['--git-dir', origin, 'rev-parse', 'feat/fresh'], undefined), /^[0-9a-f]{40}$/);
+  } finally {
+    rmSync(root, { recursive: true, force: true });
+  }
+});
+
 test('resolveCommitterIdentity: prefers operator identity over the nano-agent fallback', () => {
   const savedName = process.env.GIT_AUTHOR_NAME;
   const savedEmail = process.env.GIT_AUTHOR_EMAIL;

@@ -4305,7 +4305,13 @@ function provisionRepo({ envelope, token, runDir, timeoutMs = 120_000, logger = 
     if (!workingBranch) {
       logger?.info?.(`git provision: no branch.create and detached HEAD (tag/sha checkout) → no branch to push.${cs}`);
     } else {
-      logger?.warn?.(`git provision: no branch.create → agent will commit DIRECTLY on the base branch '${workingBranch}'; no PR branch — a non-fast-forward push (base advanced since clone) would lose every commit.${cs}`);
+      // We can't reliably assert this IS the base branch: `branchName` is taken
+      // from `repository.ref` before `branch.base`, so a job may deliberately run
+      // on a non-base ref and this else-branch simply reflects the checked-out
+      // branch. Warn about committing directly onto THAT branch — the work-loss
+      // risk (a non-ff push after the branch advances on the remote, with no PR
+      // branch to fall back to) applies to any pushed-to branch, not just base.
+      logger?.warn?.(`git provision: no branch.create → agent will commit DIRECTLY on the checked-out branch '${workingBranch}'; no PR branch — a non-fast-forward push (the branch advanced on the remote since clone) would lose every commit.${cs}`);
     }
   }
   const sha = runGit(['rev-parse', 'HEAD'], { cwd: workspaceDir, env: gitEnv });
@@ -4472,9 +4478,17 @@ function finalizeGit({ workspaceDir, gitEnv, startSha, workingBranch, envelope, 
     if (push.status === 0) out.pushed = true;
     else {
       out.pushError = describeGitFailure('git push', push, { token, timeoutMs: pushTimeoutMs });
-      // #229: elevate the push failure out of the terse info line — N commits are
-      // about to be lost with no PR branch. This is the loud signal that was missing.
-      logger?.error?.(`git finalize: push of branch '${workingBranch}' FAILED — ${out.commits.length} commit(s) are unpushed and will be LOST (no PR): ${out.pushError}${cs}`);
+      // #229: elevate the push failure out of the terse info line — commits are
+      // unpushed and this is the loud signal that was missing. The "will be LOST
+      // (no PR)" wording only holds when there is genuinely no PR branch: a
+      // `branch.create` feature branch (or an `allowPr` job) keeps its commits on
+      // its own branch and may already have a PR, so asserting "no PR" there would
+      // mislead the incident investigation. Make that clause conditional.
+      const hasPrBranch = !!envelope.branch?.create || !!envelope.task?.allowPr;
+      const lossNote = hasPrBranch
+        ? `${out.commits.length} commit(s) are unpushed on branch '${workingBranch}'`
+        : `${out.commits.length} commit(s) are unpushed and will be LOST (no PR)`;
+      logger?.error?.(`git finalize: push of branch '${workingBranch}' FAILED — ${lossNote}: ${out.pushError}${cs}`);
     }
   }
 
@@ -8196,7 +8210,7 @@ async function workAgent(req, flags) {
             liveRunDirs.add(runDir);
             provisioned = provisionRepo({ envelope, token: repoToken, runDir, timeoutMs: cloneTimeoutMs, logger, corr: aiCorr });
             if (provisioned.baseFetchError) {
-              logger.warn(`[${jobType}] job ${job.jobKey} base fetch failed — ${provisioned.baseFetchError}; base...head diffs may be unavailable`);
+              logger.warn(`[${jobType}] job ${job.jobKey} base fetch failed (${aiCorr}) — ${provisioned.baseFetchError}; base...head diffs may be unavailable`);
             }
             cwd = provisioned.workspaceDir;
             extraEnv = {
@@ -8256,6 +8270,13 @@ async function workAgent(req, flags) {
 
         let result;
         let gitResult = null;
+        // #229: track whether the run + finalization actually ran to completion. The
+        // relay close reason must NOT be inferred from `result` alone: if
+        // runAgentJob (or any later step) throws before `result` is assigned, the
+        // finally runs with `result === undefined` and would mislabel an ERRORED run
+        // as a `normal` close. This flag flips true only once we reach the end of the
+        // try body, so an early throw is correctly reported as `error`.
+        let runCompleted = false;
         // The per-job live-terminal relay session (issue #173): streams this job's
         // harness terminal over the single-owner supervisor's ONE multiplexed host
         // connection, keyed by this worker's instance + the jobKey, and accepts
@@ -8416,6 +8437,8 @@ async function workAgent(req, flags) {
           } else if (provisioned) {
             gitResult = { remote: provisioned.remote, branch: provisioned.workingBranch, baseSha: provisioned.startSha || null, commits: [], pushed: false };
           }
+          // Reached the end of the run + finalization without throwing.
+          runCompleted = true;
         } finally {
           if (isContainer) liveRunIds.delete(runId);
           // #205: clear the in-flight job marker now the harness has stopped — the
@@ -8434,7 +8457,7 @@ async function workAgent(req, flags) {
           if (relaySession) {
             const relayCloseReason = result?.aborted
               ? 'job-killed'
-              : (result && result.ok === false ? 'error' : 'normal');
+              : (!runCompleted || (result && result.ok === false) ? 'error' : 'normal');
             try { await relaySession.close(relayCloseReason); } catch { /* best effort */ }
           }
         }

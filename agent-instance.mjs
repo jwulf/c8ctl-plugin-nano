@@ -273,7 +273,15 @@ export function createAgentInstanceProducer(opts = {}) {
   const enqueue = (fn, label = 'updateAgentInstance') => {
     queue = queue.then(fn).catch((err) => {
       const { status, message } = describeSdkError(err);
-      if (!appendFailureLogged) {
+      // The first-failure elevation is for per-turn APPEND failures ONLY. A
+      // completion status update (status→COMPLETED) rides this same queue, so if
+      // it were allowed to consume the one-shot flag it would suppress the FIRST
+      // real per-turn append failure down to `debug` — the exact regression the
+      // #229 warning exists to prevent. Gate the elevation on the append label;
+      // completion failures are diagnosed separately in `complete()` (they render
+      // a failed/unknown terminal transition), so here they only ever log at debug.
+      const isAppend = label.includes('append');
+      if (isAppend && !appendFailureLogged) {
         appendFailureLogged = true;
         logger?.warn?.(
           `AgentInstance producer: ${label} failed (${corr()}) — status ${status ?? 'unknown'}: ${message}; further append failures for this instance stay at debug.`,
@@ -519,6 +527,12 @@ export function createAgentInstanceProducer(opts = {}) {
         return;
       }
       flushMessage();
+      // Track whether the COMPLETED status request actually resolved. The update
+      // rides the best-effort queue (whose catch swallows SDK rejections), so we
+      // must NOT infer the terminal transition from `ok` alone — a 400/404 on the
+      // status update would otherwise be logged as a successful COMPLETED (#229),
+      // defeating the husk diagnosis. `null` ⇒ no status update attempted.
+      let statusResolved = ok ? false : null;
       if (ok) {
         enqueue(async () => {
           await camunda[SDK_UPDATE]({
@@ -528,6 +542,7 @@ export function createAgentInstanceProducer(opts = {}) {
             jobLease: leaseToken,
             status: 'COMPLETED',
           });
+          statusResolved = true;
         }, 'updateAgentInstance(status→COMPLETED)');
       }
       try { await queue; } catch { /* best effort */ }
@@ -536,7 +551,16 @@ export function createAgentInstanceProducer(opts = {}) {
       // healthy run at a glance, separate from the "create failed" line above.
       const elapsedMs = activatedAt ? Math.max(0, now() - activatedAt) : 0;
       const mins = (elapsedMs / 60000).toFixed(1);
-      logger?.info?.(`AgentInstance ${agentInstanceKey} (${corr()}): ${turnsAppended} turn(s) appended over ${mins}m, status→${ok ? 'COMPLETED' : 'left non-terminal (retry/reactivation continues it)'}.`);
+      // Render the ACTUAL terminal transition: COMPLETED only when the status
+      // update resolved; on a rejected update say so (the instance stays
+      // non-terminal, so a retry/reactivation still continues it); on a failed run
+      // no update was attempted at all.
+      const transition = ok
+        ? (statusResolved
+          ? 'COMPLETED'
+          : 'COMPLETED update FAILED — left non-terminal (retry/reactivation continues it)')
+        : 'left non-terminal (retry/reactivation continues it)';
+      logger?.info?.(`AgentInstance ${agentInstanceKey} (${corr()}): ${turnsAppended} turn(s) appended over ${mins}m, status→${transition}.`);
     },
   };
 }

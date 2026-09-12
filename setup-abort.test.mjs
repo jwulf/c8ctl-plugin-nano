@@ -40,8 +40,32 @@ test('checkSetupAbort returns true and logs once when the signal is already abor
   assert.equal(checkSetupAbort(ac.signal, { jobType: 'senior:feature', jobKey: '42', stage: 'prompt', logger }), true);
   assert.equal(warns.length, 1, 'a single stage abort logs exactly once');
   assert.match(warns[0], /job 42 aborted during setup \(prompt\)/);
-  assert.match(warns[0], /no transcript husk/i);
+  // The prompt stage runs before any side effect, so it may honestly say so…
+  assert.match(warns[0], /no repo work/i);
   assert.match(warns[0], /no settle/i);
+  assert.match(warns[0], /yielded for retry/i);
+});
+
+test('checkSetupAbort message is stage-aware — it does NOT falsely claim "no repo side effects" at provisioning stages (#222)', () => {
+  const ac = new AbortController();
+  ac.abort();
+  // At prompt: no work has happened, so the "before any side effect" wording is honest.
+  {
+    const { logger, warns } = collectingLogger();
+    checkSetupAbort(ac.signal, { jobType: 't', jobKey: '1', stage: 'prompt', logger });
+    assert.match(warns[0], /before any side effect/i);
+  }
+  // At repo-provisioning / relay-open the clone/config/branch may already exist, so the
+  // message must NOT promise "before any side effect" — it only promises no settle and
+  // that any partial workspace is left for reaping.
+  for (const stage of ['repo-provisioning', 'relay-open']) {
+    const { logger, warns } = collectingLogger();
+    checkSetupAbort(ac.signal, { jobType: 't', jobKey: '1', stage, logger });
+    assert.doesNotMatch(warns[0], /before any side effect/i, `'${stage}' must not claim it stopped before any side effect`);
+    assert.doesNotMatch(warns[0], /no repo side effects/i, `'${stage}' must not claim no repo side effects`);
+    assert.match(warns[0], /left for reaping/i, `'${stage}' should note the partial workspace is reaped`);
+    assert.match(warns[0], /without a settle/i);
+  }
 });
 
 test('checkSetupAbort names the stage it gated so each setup boundary is distinguishable', () => {
@@ -152,6 +176,46 @@ test('#222 provisionRepo does NOT bail for a live (un-aborted) signal — the ga
     );
     assert.ok(calls.some((a) => a.includes('clone')), 'the clone ran');
     assert.ok(calls.some((a) => a.includes('fetch')), 'the base fetch was reached — the abort gate stayed inert for a live signal');
+  } finally {
+    rmSync(runDir, { recursive: true, force: true });
+  }
+});
+
+// A SHA-pinned checkout runs TWO extra blocking git ops after the clone: `git
+// fetch origin <sha>` then `git checkout --detach <sha>`. The post-clone recheck
+// alone does not cover them, so an abort that wins while the fetch is blocking
+// would still mutate the working tree with the checkout. #222: recheck BETWEEN the
+// fetch and the checkout so a mid-fetch abort stops before the checkout.
+function shaEnvelope(sha, origin = 'https://example.com/o/r.git') {
+  return {
+    schemaVersion: 1,
+    repository: { provider: 'github', url: origin, sha, singleBranch: true },
+    branch: { push: true },
+    setup: { commands: [], env: {}, secretRefs: [] },
+    task: { allowPr: false },
+  };
+}
+
+test('#222 provisionRepo (SHA pin) bails when the abort wins DURING the sha fetch — throws before the checkout mutates the tree', () => {
+  const runDir = mkdtempSync(join(tmpdir(), 'nano-sha-abort-'));
+  const sha = 'a'.repeat(40);
+  const ac = new AbortController(); // live at entry and through the clone…
+  const calls = [];
+  const fakeGit = (args) => {
+    calls.push(args);
+    // …the lock-loss race wins WHILE `git fetch origin <sha>` is blocking; the
+    // between-fetch-and-checkout recheck must observe it.
+    if (args.includes('fetch') && args.includes(sha)) ac.abort();
+    return gitOk();
+  };
+  try {
+    assert.throws(
+      () => provisionRepo({ envelope: shaEnvelope(sha), token: null, runDir, abortSignal: ac.signal, _runGit: fakeGit }),
+      /provisioning aborted/,
+      'an abort during the sha fetch is caught by the post-sha-fetch recheck',
+    );
+    assert.ok(calls.some((a) => a.includes('fetch') && a.includes(sha)), 'the sha fetch ran');
+    assert.ok(!calls.some((a) => a.includes('checkout')), 'the detached checkout never ran — provisioning stopped before mutating the tree');
   } finally {
     rmSync(runDir, { recursive: true, force: true });
   }

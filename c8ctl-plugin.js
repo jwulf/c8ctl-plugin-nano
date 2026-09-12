@@ -4273,6 +4273,12 @@ function provisionRepo({ envelope, token, runDir, runId, timeoutMs = 120_000, lo
     // The SHA may not be present under a shallow clone of the branch — fetch it
     // explicitly (best effort), then check it out (detached HEAD).
     const fetch = runGitFn([...credArgs(), 'fetch', '--no-tags', 'origin', commitSha], { cwd: workspaceDir, env: gitEnv, timeoutMs: provTimeoutMs() });
+    // #222: the fetch above is its own blocking network op — recheck the abort signal
+    // BEFORE the checkout mutates the working tree, so a lock-loss race that won while
+    // `git fetch origin <sha>` was blocking stops here (cleanup/no-settle path) rather
+    // than running `git checkout --detach` and continuing to mutate the throwaway repo
+    // after cancellation.
+    throwIfAborted('post-sha-fetch');
     const co = runGitFn(['checkout', '--detach', commitSha], { cwd: workspaceDir, env: gitEnv, timeoutMs: provTimeoutMs() });
     if (co.status !== 0) {
       // Combine the fetch + checkout output (the real reason often lives in the
@@ -8378,7 +8384,22 @@ function localNetworkTccHint() {
  */
 function checkSetupAbort(abortSignal, { jobType, jobKey, stage, logger } = {}) {
   if (!abortSignal || abortSignal.aborted !== true) return false;
-  logger?.warn?.(`[${jobType}] job ${jobKey} aborted during setup (${stage}) — lease loss/force-stop won the race; stopping before any side effect (no transcript husk, no repo side effects, no settle).`);
+  // The invariant that holds at EVERY stage is the same: we stop and DO NOT settle,
+  // so the job is yielded for retry. What has already happened by this point is NOT
+  // the same across stages, though — the earlier "no repo side effects / no transcript
+  // husk" wording was inaccurate at `agent-instance` (an instance may have minted, then
+  // discarded here) and especially at `repo-provisioning`/`relay-open` (the throwaway
+  // clone + config + branch setup may already exist). Describe only what is TRUE for
+  // this stage so operators investigating a cleaned-up but partially-provisioned run
+  // are not misled (issue #222).
+  const sideEffectNote = stage === 'prompt'
+    ? 'stopping before any side effect (no transcript, no repo work, no settle)'
+    : stage === 'agent-instance'
+      ? 'any AgentInstance minted this run is discarded (no COMPLETED update); stopping without a settle'
+      : stage === 'repo-provisioning' || stage === 'relay-open'
+        ? 'any partially-provisioned throwaway workspace is left for reaping and no transcript is completed; stopping without a settle'
+        : 'stopping without a settle';
+  logger?.warn?.(`[${jobType}] job ${jobKey} aborted during setup (${stage}) — lease loss/force-stop won the race; ${sideEffectNote} (the job is being yielded for retry).`);
   return true;
 }
 
@@ -9179,13 +9200,16 @@ async function workAgent(req, flags) {
         // DURING it (and a pending create may still mint a durable instance). Recheck
         // BEFORE the later setup-failure settlements (the malformed-repository refusal
         // below and the repo-provisioning path) so an aborted run returns WITHOUT
-        // settling. There is no delete verb for a minted instance, so best-effort
-        // DRAIN a producer that did mint (flush queued appends, release its timers)
-        // rather than leave it dangling — we deliberately do NOT complete() it (that
-        // would try to mint one for an abandoned run).
+        // settling. There is no delete verb for a minted instance, so `discard()` the
+        // producer: it makes it permanently inert (dropping any late create so an
+        // abandoned run can't mint an orphaned instance after we return) and drains
+        // already-queued appends — WITHOUT driving a COMPLETED update (that would try
+        // to mint/complete an instance for a run being yielded for retry). This covers
+        // BOTH an active producer AND a retry-pending one whose in-flight/armed create
+        // could otherwise settle late and mint after the abort path returned.
         if (checkSetupAbort(abortSignal, { jobType, jobKey: job.jobKey, stage: 'agent-instance', logger })) {
-          if (agentInstanceProducer?.active) {
-            try { await agentInstanceProducer.drain(); } catch { /* best effort */ }
+          if (agentInstanceProducer?.active || agentInstanceProducer?.retryPending) {
+            try { await agentInstanceProducer.discard(); } catch { /* best effort */ }
           }
           if (isContainer) liveRunIds.delete(runId);
           return;

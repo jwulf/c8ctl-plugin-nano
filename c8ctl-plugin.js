@@ -4446,13 +4446,16 @@ function provisionRepo({ envelope, token, runDir, runId, timeoutMs = 120_000, co
   // When default resolution was NEEDED (an explicit create we would otherwise honor)
   // but BOTH the local origin/HEAD read AND the ls-remote --symref network fallback
   // came back empty, we cannot PROVE the create is not the remote default. Fail CLOSED
-  // — but ONLY when the create names an ALREADY-EXISTING remote branch and no base was
+  // — when the create names an ALREADY-EXISTING remote branch and no base was
   // configured: an existing remote branch could BE the default, and a push onto it
   // fast-forwards silently (the reviewer's bypass — "if that base has not advanced, the
   // push succeeds, so the new defense is bypassed"), so treat it as base-like and cut a
   // fallback. A create that does NOT exist on the remote is a genuine NEW branch: the
   // push creates it, can never non-ff a shared base, and must be honored (e.g. an empty
   // repo with an explicit `branch.create=feat/x`), so it is left alone (thread 4444).
+  // Also fail CLOSED when the existence probe ITSELF fails (a transient network/auth
+  // timeout): an indeterminate probe cannot prove the create is not the default, so
+  // honoring it would re-open the fail-OPEN this guard exists to close (thread 4477).
   let defaultUnverified = false;
   if (explicitCreate && wantPush && explicitCreate !== effectiveBase) {
     const dh = runGit(['rev-parse', '--abbrev-ref', 'origin/HEAD'], { cwd: workspaceDir, env: gitEnv, timeoutMs });
@@ -4475,6 +4478,15 @@ function provisionRepo({ envelope, token, runDir, runId, timeoutMs = 120_000, co
         const wantRef = `refs/heads/${explicitCreate}`;
         const exists = (ec.stdout || '').split('\n').some((ln) => ln.split('\t')[1] === wantRef);
         if (exists) defaultUnverified = true;
+      } else {
+        // The existence probe ITSELF failed (a transient network/auth timeout, the same
+        // condition that emptied origin/HEAD and the --symref fallback above). We cannot
+        // PROVE the create is a genuinely-new branch, so honoring it risks a silent
+        // fast-forward push directly onto the unverified default — the exact fail-OPEN
+        // the two successful-probe branches guard against. Treat the indeterminate probe
+        // as base-like and fail CLOSED: cut the fallback (work is preserved on the
+        // fallback branch, never lost) rather than committing on a possibly-shared base.
+        defaultUnverified = true;
       }
     }
   }
@@ -4756,6 +4768,14 @@ function finalizeGit({ workspaceDir, gitEnv, startSha, workingBranch, baseBranch
     else noteScanFail('rev-list HEAD', log);
   }
 
+  // No commit exists anywhere yet: provisionRepo recorded no base (`startSha` empty)
+  // AND HEAD does not resolve (an unborn work branch on an empty clone). The work-ref
+  // `refs/heads/<workingBranch>` therefore has no object, so the branch-anchored scans
+  // below must NOT reference it (doing so is a hard rev-list error that would falsely
+  // trip `scanFailed` → a spurious `pushFailed` + leaked workspace for a no-op agent,
+  // thread 4787).
+  const noCommitYet = !startSha && !out.headSha;
+
   // Commits made on ANY local branch that are not yet on a remote, EXCLUDING the
   // work branch we intend to push. `startSha..HEAD` (out.commits) misses work the
   // harness committed while HEAD was checked out on a DIFFERENT branch and then
@@ -4767,7 +4787,17 @@ function finalizeGit({ workspaceDir, gitEnv, startSha, workingBranch, baseBranch
   // not carried by the branch we are about to push.
   let offBranchStray = [];
   if (workingBranch && coerceBool(envelope.branch?.push, true)) {
-    const stray = runGit(['rev-list', '--branches', '--not', '--remotes', `refs/heads/${workingBranch}`], { cwd: workspaceDir, env: gitEnv, timeoutMs: netTimeoutMs() });
+    // An unborn work branch (an empty clone where the harness made NO first commit)
+    // has no `refs/heads/<workingBranch>` object, so feeding it to rev-list is a hard
+    // error (exit 128) that spuriously trips `scanFailed` → a false `pushFailed` and a
+    // leaked workspace for a genuine no-op agent (thread 4787). When there is no commit
+    // anywhere (no `startSha` AND no resolvable HEAD), omit the unresolvable work-ref
+    // exclusion — `--branches --not --remotes` alone exits 0/empty on an empty repo, so
+    // a real off-branch stray is still detected while the no-op case stays clean.
+    const strayArgs = noCommitYet
+      ? ['rev-list', '--branches', '--not', '--remotes']
+      : ['rev-list', '--branches', '--not', '--remotes', `refs/heads/${workingBranch}`];
+    const stray = runGit(strayArgs, { cwd: workspaceDir, env: gitEnv, timeoutMs: netTimeoutMs() });
     if (stray.status === 0) offBranchStray = stray.stdout.trim().split('\n').filter(Boolean);
     else noteScanFail('rev-list --branches --not --remotes', stray);
   }
@@ -4780,7 +4810,7 @@ function finalizeGit({ workspaceDir, gitEnv, startSha, workingBranch, baseBranch
   // and finalizeGit would skip BOTH the push and the preservation path, letting the
   // finally-cleanup reap the only copy of the work (thread 4601).
   let branchCommits = [];
-  if (workingBranch) {
+  if (workingBranch && !noCommitYet) {
     const range = startSha ? `${startSha}..refs/heads/${workingBranch}` : `refs/heads/${workingBranch}`;
     const bl = runGit(['rev-list', range], { cwd: workspaceDir, env: gitEnv, timeoutMs: netTimeoutMs() });
     if (bl.status === 0) branchCommits = bl.stdout.trim().split('\n').filter(Boolean);

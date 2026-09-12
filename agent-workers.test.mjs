@@ -1338,6 +1338,38 @@ test('provisionRepo cuts a pushable fallback for an UNBORN branch (empty repo, n
   }
 });
 
+test('finalizeGit does NOT report pushFailed for a NO-OP agent on an UNBORN work branch (empty repo, no first commit — issue #231, thread 4787)', { skip: !gitOk }, () => {
+  const root = mkdtempSync(join(tmpdir(), 'nano-git-'));
+  const origin = join(root, 'origin.git');
+  g(['init', '-q', '--bare', origin], undefined);
+  const runDir = mkdtempSync(join(root, 'run-'));
+  try {
+    const envelope = {
+      schemaVersion: 1,
+      repository: { provider: 'github', url: origin, submodules: false },
+      branch: { base: '', create: '', push: true },
+      setup: { commands: [], env: {}, secretRefs: [] },
+      task: { allowPr: false },
+    };
+    const prov = provisionRepo({ envelope, token: null, runDir });
+    // provisionRepo cut a pushable fallback off the unborn branch, but the harness
+    // made NO commit — refs/heads/<workingBranch> is still unborn (no object). The
+    // branch-anchored rev-list scans must NOT feed that unresolvable ref to git: doing
+    // so is a hard error (exit 128) that would falsely trip scanFailed → a spurious
+    // pushFailed that PRESERVES the workspace for a genuine no-op.
+    assert.equal(prov.fallbackBranch, true, 'a fallback was cut off the unborn branch');
+    assert.equal(prov.startSha, '', 'no base commit on an empty clone');
+    const out = finalizeGit({ ...prov, envelope, token: null });
+    assert.ok(!out.pushFailed, 'a no-op agent on an unborn branch is NOT a push failure');
+    assert.equal(out.scanError, undefined, 'no scan error is surfaced for the no-commit case');
+    assert.equal(out.pushed, false, 'nothing was pushed — there were no commits');
+    assert.equal(out.strandedCommits, undefined, 'no stranded commits to preserve');
+    assert.deepEqual(out.commits, [], 'no commits enumerated');
+  } finally {
+    rmSync(root, { recursive: true, force: true });
+  }
+});
+
 test('provisionRepo preserves the UNBORN branch name for a read-only empty repo (push off) instead of reporting it detached (issue #231, suppressed 4406)', { skip: !gitOk }, () => {
   const root = mkdtempSync(join(tmpdir(), 'nano-git-'));
   const origin = join(root, 'origin.git');

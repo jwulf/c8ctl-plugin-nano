@@ -1179,16 +1179,34 @@ export function createAgentInstanceProducer(opts = {}) {
         // return without blocking job settlement — the terminal update lands in the
         // background once the drain catches up (best-effort, correctly ordered).
         enqueue(async () => {
-          await callWithin(
-            camunda[SDK_UPDATE]({
-              agentInstanceKey,
-              elementInstanceKey,
-              jobKey,
-              jobLease: leaseToken,
-              status: 'COMPLETED',
-            }),
-            finalizeTimeoutMs,
-          );
+          try {
+            await callWithin(
+              camunda[SDK_UPDATE]({
+                agentInstanceKey,
+                elementInstanceKey,
+                jobKey,
+                jobLease: leaseToken,
+                status: 'COMPLETED',
+              }),
+              finalizeTimeoutMs,
+            );
+          } catch (err) {
+            // This serialized enqueue IS the terminal transition on the drain-timeout
+            // path — the only actor that can still terminalize the instance here. The
+            // generic enqueue() catch would swallow it at debug with just err.message,
+            // losing the HTTP status/body/correlation on the very path that already
+            // warned reconciliation may be needed (issue #230). Emit the SAME shaped
+            // status/body/correlation warning the direct terminal-retry path uses
+            // (with its manual-reconciliation outcome) before it is swallowed.
+            const d = describeSdkError(err);
+            logger?.warn?.(
+              `AgentInstance ${agentInstanceKey}: serialized terminal COMPLETED update ` +
+                `${err?.__nanoTimeout ? `timed out (bounded at ${finalizeTimeoutMs}ms)` : 'failed'} — ` +
+                `status=${d.status ?? 'n/a'} body=${d.body ?? 'n/a'} message=${d.message ?? 'n/a'}; ` +
+                `MANUAL RECONCILIATION REQUIRED — the drain did not catch up and the job has ` +
+                `settled with no reactivation to retry this transition ${correlation()}.`,
+            );
+          }
         });
         logger?.warn?.(
           `AgentInstance ${agentInstanceKey}: history drain did not settle within ` +

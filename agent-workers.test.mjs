@@ -69,6 +69,8 @@ import {
   isPlaceholderEmail,
   reapAgentRunDirs,
   agentRunsRoot,
+  reclaimOrphanNamespaces,
+  allocateWorkerNamespace,
   authUrl,
   githubCloneToken,
   primeGhAuthToken,
@@ -1667,6 +1669,46 @@ test('provisionRepo cuts a fallback when branch.create names the remote DEFAULT 
     const prov = provisionRepo({ envelope, token: null, runDir });
     assert.equal(prov.fallbackBranch, true, 'create names the remote default → treated like an omitted create, a fallback is cut');
     assert.notEqual(prov.workingBranch, 'main', 'never leaves us on the remote default branch when pushing');
+    assert.notEqual(prov.workingBranch, 'feat/x', 'a fresh fallback work branch is cut, not the checked-out ref');
+    assert.match(prov.workingBranch, /^nano\/agent-work\//, 'a non-base fallback work branch was cut');
+    assert.equal(g(['rev-parse', '--abbrev-ref', 'HEAD'], prov.workspaceDir), prov.workingBranch);
+  } finally {
+    rmSync(root, { recursive: true, force: true });
+  }
+});
+
+test('provisionRepo FAILS CLOSED (cuts a fallback) when the remote default is UNVERIFIABLE and no base is configured (issue #231, thread 4444)', { skip: !gitOk }, () => {
+  const { root, origin } = makeOriginRepo();
+  const wc = mkdtempSync(join(root, 'wc4444-'));
+  g(['clone', '-q', origin, wc], undefined);
+  g(['config', 'user.name', 'seed'], wc);
+  g(['config', 'user.email', 'seed@example.com'], wc);
+  g(['checkout', '-q', '-b', 'feat/x'], wc);
+  writeFileSync(join(wc, 'feature.txt'), 'feature\n');
+  g(['add', '-A'], wc);
+  g(['commit', '-q', '-m', 'feature commit'], wc);
+  g(['push', '-q', 'origin', 'feat/x'], wc);
+  // DETACH the origin's HEAD to a raw SHA so `ls-remote --symref origin HEAD`
+  // advertises no `ref: refs/heads/... HEAD` line — the remote default becomes
+  // UNVERIFIABLE. Combined with singleBranch:true (no local origin/HEAD) and NO
+  // configured base, an explicit branch.create='main' cannot be confirmed to be
+  // (or not be) the default branch. The guard must fail CLOSED — cut a throwaway
+  // fallback rather than honor `checkout -B main` and risk pushing straight onto
+  // a possibly-default branch (the #231 non-ff work-loss hazard).
+  const sha = g(['rev-parse', 'HEAD'], wc);
+  g(['-c', 'safe.bareRepository=all', 'update-ref', '--no-deref', 'HEAD', sha], origin);
+  const runDir = mkdtempSync(join(root, 'run-'));
+  try {
+    const envelope = {
+      schemaVersion: 1,
+      repository: { provider: 'github', url: origin, ref: 'feat/x', singleBranch: true, submodules: false },
+      branch: { create: 'main', push: true },
+      setup: { commands: [], env: {}, secretRefs: [] },
+      task: { allowPr: false },
+    };
+    const prov = provisionRepo({ envelope, token: null, runDir });
+    assert.equal(prov.fallbackBranch, true, 'unverifiable default + no base → fail closed, a fallback is cut');
+    assert.notEqual(prov.workingBranch, 'main', 'never push straight onto an unverified create when the default is unknown');
     assert.notEqual(prov.workingBranch, 'feat/x', 'a fresh fallback work branch is cut, not the checked-out ref');
     assert.match(prov.workingBranch, /^nano\/agent-work\//, 'a non-base fallback work branch was cut');
     assert.equal(g(['rev-parse', '--abbrev-ref', 'HEAD'], prov.workspaceDir), prov.workingBranch);
@@ -3355,6 +3397,42 @@ test('reapAgentRunDirs age-gates and skips in-flight dirs', () => {
   } finally {
     if (prev === undefined) delete process.env.C8CTL_NANO_HOME; else process.env.C8CTL_NANO_HOME = prev;
     rmSync(home, { recursive: true, force: true });
+  }
+});
+
+test('reclaimOrphanNamespaces retains a dead-owner namespace whose mtime was just refreshed (issue #231, thread 9056)', () => {
+  // A worker that preserves a recovery workspace (failed push) refreshes NOT ONLY
+  // the child run dir but also the ENCLOSING worker namespace dir's mtime, because
+  // the cross-process reclaimer age-gates on the NAMESPACE dir's mtime. Without the
+  // namespace touch, once this worker exits (owner proven dead) a sibling reclaimer
+  // would see the already-aged namespace as old and delete it WHOLE — taking the
+  // just-preserved recovery workspace with it. This proves the namespace-mtime
+  // refresh grants a full reclaim-window reprieve even for a dead owner.
+  const root = mkdtempSync(join(tmpdir(), 'nano-runs-'));
+  try {
+    const minAgeMs = 60 * 60_000; // 1h reclaim grace
+    // A DEAD owner (an implausibly-high, non-alive pid ⇒ liveness 'dead') with an
+    // OLD namespace mtime is normally reclaimed.
+    const aged = allocateWorkerNamespace({ incarnation: 'dead-aged', pid: 0x7fffffff, root });
+    const old = Date.now() / 1000 - 7200; // 2h ago (older than the grace)
+    utimesSync(aged.nsDir, old, old);
+    const before = reclaimOrphanNamespaces({ root, now: Date.now(), minAgeMs });
+    assert.equal(existsSync(aged.nsDir), false, 'baseline: an aged dead-owner namespace IS reclaimed');
+    assert.ok(before.reclaimed.some((r) => r.name.includes('dead-aged')), 'reclaimed list names it');
+
+    // Same dead owner, but the preserve-branch just REFRESHED the namespace mtime.
+    const kept = allocateWorkerNamespace({ incarnation: 'dead-refreshed', pid: 0x7fffffff, root });
+    utimesSync(kept.nsDir, old, old);           // start aged…
+    const now = new Date();
+    utimesSync(kept.nsDir, now, now);           // …then the fix's touch bumps it to NOW
+    const after = reclaimOrphanNamespaces({ root, now: Date.now(), minAgeMs });
+    assert.equal(existsSync(kept.nsDir), true, 'a freshly-touched namespace survives despite a dead owner');
+    assert.ok(
+      after.retained.some((r) => r.name.includes('dead-refreshed') && /younger than min reclaim age/.test(r.reason)),
+      'retained BECAUSE it is younger than the reclaim age, not for any other reason',
+    );
+  } finally {
+    rmSync(root, { recursive: true, force: true });
   }
 });
 

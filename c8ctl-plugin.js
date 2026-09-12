@@ -4443,6 +4443,17 @@ function provisionRepo({ envelope, token, runDir, runId, timeoutMs = 120_000, co
   // non-ff strand/preserve path is the backstop, so this stays best-effort, never a
   // hard failure that could wrongly reject a legitimate new work branch.
   let remoteDefaultBranch = '';
+  // When default resolution was NEEDED (an explicit create we would otherwise honor)
+  // but BOTH the local origin/HEAD read AND the ls-remote --symref network fallback
+  // came back empty, we cannot PROVE the create is not the remote default. Fail CLOSED
+  // — but ONLY when the create names an ALREADY-EXISTING remote branch and no base was
+  // configured: an existing remote branch could BE the default, and a push onto it
+  // fast-forwards silently (the reviewer's bypass — "if that base has not advanced, the
+  // push succeeds, so the new defense is bypassed"), so treat it as base-like and cut a
+  // fallback. A create that does NOT exist on the remote is a genuine NEW branch: the
+  // push creates it, can never non-ff a shared base, and must be honored (e.g. an empty
+  // repo with an explicit `branch.create=feat/x`), so it is left alone (thread 4444).
+  let defaultUnverified = false;
   if (explicitCreate && wantPush && explicitCreate !== effectiveBase) {
     const dh = runGit(['rev-parse', '--abbrev-ref', 'origin/HEAD'], { cwd: workspaceDir, env: gitEnv, timeoutMs });
     if (dh.status === 0) {
@@ -4456,10 +4467,22 @@ function provisionRepo({ envelope, token, runDir, runId, timeoutMs = 120_000, co
         if (m && m[1] && !m[1].startsWith('-')) remoteDefaultBranch = m[1];
       }
     }
+    if (!remoteDefaultBranch && !configuredBaseRef && !envelope.branch?.base) {
+      // The create could still be the unverified default — but only if it already
+      // exists remotely. Probe for it; a genuinely-new branch stays honored.
+      const ec = runGit([...credArgs(), 'ls-remote', '--heads', '--end-of-options', 'origin', explicitCreate], { cwd: workspaceDir, env: gitEnv, timeoutMs });
+      if (ec.status === 0) {
+        const wantRef = `refs/heads/${explicitCreate}`;
+        const exists = (ec.stdout || '').split('\n').some((ln) => ln.split('\t')[1] === wantRef);
+        if (exists) defaultUnverified = true;
+      }
+    }
   }
   // An explicit create NAMES the base when it equals the effective base OR the remote's
-  // resolved default branch — both mean "commit directly on a shared base".
-  const createNamesBase = (name) => name === effectiveBase || (!!remoteDefaultBranch && name === remoteDefaultBranch);
+  // resolved default branch — both mean "commit directly on a shared base". When the
+  // default could NOT be verified and no base was configured, fail closed (treat every
+  // such create as base-like) so an unverified default can never slip the guard (4444).
+  const createNamesBase = (name) => name === effectiveBase || (!!remoteDefaultBranch && name === remoteDefaultBranch) || defaultUnverified;
   // Defense against silent work-loss (issue #231): committing on the base branch
   // with intent to push is ALWAYS wrong for the PR flow — a push to the shared
   // base races it and a non-ff reject strands the commits in this throwaway
@@ -9051,9 +9074,14 @@ async function workAgent(req, flags) {
             // mtime is older than maxAgeMs (default 1h); a long-running (multi-hour)
             // job's dir is already aged when the push fails, so without this touch the
             // "preserved" recovery workspace would be reaped on the very next sweep,
-            // defeating the preservation (thread 8905). Best-effort — a failed touch
+            // defeating the preservation (thread 8905). Also refresh the ENCLOSING
+            // worker namespace dir: the cross-process reclaimer (`reclaimOrphanNamespaces`)
+            // age-gates on the NAMESPACE dir's mtime, NOT the child run dir's, so once
+            // this worker exits (owner proven dead) a sibling would otherwise see the
+            // already-aged namespace as old and delete it WHOLE — taking the just-preserved
+            // recovery workspace with it (thread 9056). Best-effort — a failed touch
             // must never mask the recovery log below.
-            try { const t = new Date(); utimesSync(runDir, t, t); } catch { /* best effort */ }
+            try { const t = new Date(); utimesSync(runDir, t, t); if (workerNsDir) utimesSync(workerNsDir, t, t); } catch { /* best effort */ }
             // Label the stranded location accurately: an `offBranch` mismatch means
             // HEAD is BACK on the work branch but commits were left on ANOTHER local
             // branch, so "HEAD left the work branch" would be wrong for it; a moved

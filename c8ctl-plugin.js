@@ -85,6 +85,11 @@ import { acpUpdateToDisplayChunk } from './acp-transcript-producer.mjs';
 // #194): mints an AgentInstance for an `external` agent job and appends each ACP
 // turn to the engine's append-only AgentHistory via the host SDK client.
 import { createAgentInstanceProducer, isExternalAgentJob } from './agent-instance.mjs';
+// Engine-transcript resume (issue #239): on a re-activation, fetch the prior
+// AgentInstance transcript for this elementInstanceKey and seed the harness with it
+// so the new agent CONTINUES rather than cold-reruns — at-least-once delivery becomes
+// a continuation, not a duplicate. Best-effort; degrades to the legacy cold rerun.
+import { resolveEffectiveEnvelope } from './agent-resume.mjs';
 
 const requireFromHere = createRequire(import.meta.url);
 const pluginDir = dirname(fileURLToPath(import.meta.url));
@@ -9094,6 +9099,41 @@ async function workAgent(req, flags) {
           logger.debug?.(`[${jobType}] AgentInstance producer skipped (${aiCorr}) — ${agentInstanceOff ? 'NANO_AGENT_INSTANCE=off' : 'not an external agent job (no lease token / elementInstanceKey)'}.`);
         }
 
+        // #239: engine-transcript resume. On a re-activation the durable
+        // AgentInstance transcript (minted above, #194) already holds the prior
+        // instance's work, so instead of cold-rerunning we fetch it and SEED the
+        // harness prompt with a rendered continuation — turning an at-least-once
+        // re-delivery into a continuation, not a duplicate. The transcript carries the
+        // reasoning/steps so the resumed agent doesn't repeat completed work.
+        //
+        // COMMITTED work is recovered from the pushed branch only when this activation
+        // provisions the SAME branch the prior one pushed. That holds when the envelope
+        // carries a STABLE branch identity: an explicit `branch.create`, or a
+        // `repository.ref` that names a NON-base branch (which `provisionRepo` checks out
+        // and commits on directly). It does NOT hold for a plain push-enabled job whose
+        // ref is base-like and sets no `branch.create`: `provisionRepo` then cuts a fresh
+        // per-activation `nano/agent-work/<base>-<runId>` fallback, so the prior commits
+        // are on a DIFFERENT branch and are not checked out — that case (and any repo-less
+        // / `branch.push=false` job) degrades to a transcript-only continuation, which the
+        // seeded prompt states honestly (`seedResumeEnvelope` gates the recovery text on a
+        // declared pushed branch). Carrying the prior `workingBranch` across reactivations
+        // (or a full prior-branch resolve+checkout) is the later isolated-context
+        // increment; uncommitted deltas from the prior run are not recovered in any case.
+        //
+        // The gating + best-effort read/seed live in `resolveEffectiveEnvelope`
+        // (unit-tested) so this wiring stays a thin call; a read failure /
+        // no-prior-work / an SDK without a read surface / the NANO_AGENT_RESUME=off
+        // kill switch all fall through to the legacy cold rerun with
+        // `effectiveEnvelope === envelope`.
+        let effectiveEnvelope = envelope;
+        {
+          const resumed = await resolveEffectiveEnvelope({ envelope, job, camunda, agentInstanceOff, logger });
+          effectiveEnvelope = resumed.envelope;
+          if (resumed.resumed) {
+            logger.info(`[${jobType}] resuming from prior engine transcript (${aiCorr}) — ${resumed.historyCount} history turn(s) seeded into the harness prompt; continuing from the last pushed commit when the branch identity is stable (uncommitted deltas from the prior run are not recovered).`);
+          }
+        }
+
         // Fail-closed on a half-specified repository envelope (issue #129,
         // hardening 2): a `repository` block that declares intent (any field set)
         // but whose `url` is absent or not a usable clone target almost always
@@ -9267,7 +9307,10 @@ async function workAgent(req, flags) {
             // detached agent grandchild to init. Absent (undefined) on the normal
             // and graceful-drain paths, where the harness runs to completion.
             abortSignal,
-            envelope,
+            // #239: the resume-seeded envelope when this is a re-activation with a
+            // prior transcript (else the original envelope). Only the task prompt is
+            // reframed as a continuation; repository/setup are unchanged.
+            envelope: effectiveEnvelope,
             sandbox,
             image,
             runId,

@@ -354,6 +354,78 @@ test('supervisor start forwards c8ctl --profile <conn> to spawned workers', asyn
   assert.equal(childArgv[pIdx + 1], 'nano-validate', 'the forwarded --profile must be the ctx override');
 });
 
+test('supervisor add forwards c8ctl --profile <conn> to spawned workers', async (t) => {
+  const HOME = mkdtempSync(join(tmpdir(), 'c8ctl-sup-addprof-'));
+  const prevHome = process.env.C8CTL_NANO_HOME;
+  const prevEntry = process.env.C8CTL_NANO_ENTRY;
+  const prevC8ctl = globalThis.c8ctl;
+  process.env.C8CTL_NANO_HOME = HOME;
+
+  writeFileSync(join(HOME, 'config.json'), JSON.stringify({
+    hires: { faker: { name: 'faker', rank: 'senior', command: 'true', model: '', capabilities: [] } },
+  }));
+
+  // The `work` stand-in records its own argv so we can prove `supervisor add`
+  // threads the ctx `--profile` override all the way into the spawned child.
+  const workArgvDir = join(HOME, 'work-argv');
+  const shim = join(HOME, 'fake-entry.mjs');
+  writeShim(shim, { recordArgv: true, workArgvDir });
+  process.env.C8CTL_NANO_ENTRY = shim;
+
+  // Drive the REAL `supervisor add` handler (not just `withConnectionProfileArg`
+  // in isolation): `supervisorAddCmd` is a SEPARATE public path from
+  // `supervisorStartCmd`, so it must independently thread the handler ctx's
+  // global `--profile <conn>` override (distinct from the active session
+  // profile) through `reconstructWorkArgs`/`withConnectionProfileArg` into the
+  // child argv the daemon spawns (jwulf/c8ctl-plugin-nano#189). The active
+  // profile is set to something the override DIFFERS from, so the forward is a
+  // genuine per-invocation pin — not a spurious echo.
+  const quiet = { info() {}, warn() {}, error() {}, debug() {}, output() {} };
+  globalThis.c8ctl = { activeProfile: 'local', getLogger: () => quiet };
+
+  const mod = await import(pluginUrl);
+
+  t.after(async () => {
+    try { await mod.supervisorRequest({ op: 'stop' }); } catch { /* ignore */ }
+    const st = mod.runningSupervisor();
+    if (st) { try { process.kill(st.pid, 'SIGKILL'); } catch { /* ignore */ } }
+    mod.clearSupervisorState();
+    if (prevC8ctl === undefined) delete globalThis.c8ctl; else globalThis.c8ctl = prevC8ctl;
+    restoreEnv('C8CTL_NANO_ENTRY', prevEntry);
+    restoreEnv('C8CTL_NANO_HOME', prevHome);
+    try { rmSync(HOME, { recursive: true, force: true }); } catch { /* ignore */ }
+  });
+
+  // Pre-start the daemon so the handler's service policy adopts it (Linux path).
+  const state = await mod.startSupervisorDaemon();
+  assert.ok(state && state.pid, 'daemon should report a pid');
+
+  // `req.positional[1]` is the profile that runs; `flags.name` names this
+  // worker; `ctx.profile` carries the global connection-profile override.
+  await mod.supervisorAddCmd(
+    { subcommand: 'supervisor', positional: ['add', 'faker'] },
+    { name: 'faker-pin' },
+    { profile: 'nano-validate' },
+  );
+
+  // The named worker should come up running.
+  let worker = null;
+  for (let i = 0; i < 30 && !worker; i++) {
+    const s = await mod.supervisorRequest({ op: 'status' });
+    worker = (s.workers || []).find((w) => w.id === 'faker-pin' && w.state === 'running' && w.pid) || null;
+    if (!worker) await sleep(100);
+  }
+  assert.ok(worker, 'supervisor add should launch the named worker');
+
+  // The child the daemon spawned must carry the forwarded `--profile <conn>`.
+  const childArgv = await readChildArgv(workArgvDir, worker.pid, 'faker-pin');
+  assert.ok(childArgv, 'the child should have recorded its argv');
+  assert.deepEqual(childArgv.slice(0, 3), ['nano', 'work', 'faker'], 'child runs the positional profile');
+  const pIdx = childArgv.indexOf('--profile');
+  assert.ok(pIdx !== -1, `child argv should forward --profile: ${JSON.stringify(childArgv)}`);
+  assert.equal(childArgv[pIdx + 1], 'nano-validate', 'the forwarded --profile must be the ctx override');
+});
+
 test('supervisor daemon: restarts a crashing worker', async (t) => {
   const HOME = mkdtempSync(join(tmpdir(), 'c8ctl-sup-rt-'));
   const prevHome = process.env.C8CTL_NANO_HOME;

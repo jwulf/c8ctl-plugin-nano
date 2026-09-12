@@ -14,6 +14,20 @@ import { join } from 'node:path';
 
 import { checkSetupAbort, provisionRepo } from './c8ctl-plugin.js';
 
+// Hermeticity guard for this whole file. `provisionRepo`'s `_runGit` seam only
+// intercepts the git ops `provisionRepo` runs DIRECTLY; it does NOT cover the
+// git/gh spawns inside `resolveCommitterIdentity()` (which is not injectable
+// here). With `GIT_AUTHOR_*` unset, that resolver falls back to real
+// `spawnSync('git', …)` / `spawnSync('gh', …)` probes, making any test that
+// reaches it non-hermetic (needs a git binary / hits the network / reads global
+// git config). Pinning a real identity in `GIT_AUTHOR_*` short-circuits the
+// resolver entirely (it returns the env identity verbatim — no spawns), so every
+// test below stays offline and deterministic regardless of which git op it aborts
+// on. Set at module load, before any test runs; node's test runner gives each
+// file its own process, so this does not leak into other test files.
+process.env.GIT_AUTHOR_NAME = process.env.GIT_AUTHOR_NAME || 'Nano Test Author';
+process.env.GIT_AUTHOR_EMAIL = process.env.GIT_AUTHOR_EMAIL || 'nano-test@example.com';
+
 function collectingLogger() {
   const warns = [];
   return { logger: { warn: (m) => warns.push(m) }, warns };
@@ -101,7 +115,9 @@ test('checkSetupAbort tolerates a logger without warn (best-effort) and a missin
 // AbortSignal to prove: (a) an abort that landed before/during the clone stops
 // BEFORE the next side effect (the base fetch) and throws so the caller returns
 // without settling, and (b) a live signal is a no-op — provisioning proceeds.
-// The fake never invokes real git, so these run without a git binary/network.
+// The fake covers every git op `provisionRepo` runs directly, and the file-scoped
+// `GIT_AUTHOR_*` guard above short-circuits `resolveCommitterIdentity()`, so these
+// run without a git binary/network.
 // ---------------------------------------------------------------------------
 
 const gitOk = () => ({ status: 0, stdout: '', stderr: '', timedOut: false });

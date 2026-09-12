@@ -3089,84 +3089,126 @@ function resolveAutoRestConfig(camunda, env = process.env) {
 // exist" is answerable from that engine alone.
 //
 // `@nanobpm/agentic/demand` already reads deployed `taskDefinition` leaves over
-// C8 REST (`process-definitions/search` → `/{key}/xml`). As of
-// `@nanobpm/agentic@0.4.0` its `scanTaskDefinitions(xml)` tags every leaf with a
-// canonical `agentic: boolean` — true iff the service task declares a
-// `<zeebe:linkedResource … linkName="prompt">` base-prompt side-car (its internal
-// `hasPromptLink`). That flag is the SINGLE SOURCE OF TRUTH for agentic-ness (see
-// the package's `demand/taskdef.d.ts` and nano-workforce SPEC "Agent job
-// contract"): every external agent task delivers its base prompt through a
-// `linkName="prompt"` linked resource, and no in-process worker task does. Not
-// every service task is an agent task — plain connectors and record-keepers
-// (e.g. `pr.record-plan`) are ordinary workers, and they carry no prompt link.
+// C8 REST (`process-definitions/search` → `/{key}/xml`): `scanTaskDefinitions(xml)`
+// yields every service-task leaf with its `taskType`/`process`/`elementId`. Since
+// issue #235 the SINGLE auto-discovery convention is the external-agent marker
+// `<zeebe:agentDefinition agentType="external">` (see below), not the earlier
+// linked-prompt `agentic` flag or the legacy `io.nanobpm.agentTask` header. Not
+// every service task is an agent task — plain connectors and record-keepers (e.g.
+// `pr.record-plan`) carry no marker and are ordinary workers.
 //
-// Per AGENTS.md "Derivation Over Duplication: No Drift Surfaces", this plugin
-// CONSUMES that flag rather than re-implementing the scan, so the detector can
-// never drift out of lock-step with the package again (as it did in #95, when a
-// local copy keyed on the legacy `io.nanobpm.agentTask` header missed the current
-// linked-prompt marker). Advertise the raw job-type string the engine matches
-// (`senior:plan`) verbatim — colon-named types are NOT forced through the agentic
-// dot-grammar.
+// Per AGENTS.md "Derivation Over Duplication: No Drift Surfaces", the authoritative
+// task-type / process derivation still comes from `scanTaskDefinitions`; the plugin
+// only supplements the "is this an external agent task?" answer locally until the
+// package exposes an `external` leaf flag (`scanAgentTaskLeaves` prefers it when
+// present). Advertise the raw job-type string the engine matches (`senior:plan`)
+// verbatim — colon-named types are NOT forced through the agentic dot-grammar.
 // ---------------------------------------------------------------------------
 
-// Legacy (pre-nano-workforce#203) agent-task marker: a service task carried the
-// agent's prompt in an `io.nanobpm.agentTask.*` `<zeebe:header>` rather than a
-// `linkName="prompt"` linked resource. The current package detector
-// (`scanTaskDefinitions`, whose `agentic` flag keys SOLELY off the linked-prompt
-// side-car) therefore reports `agentic:false` for such tasks. We keep a narrow,
-// self-contained fallback so `--auto` still discovers agent job types against an
-// engine still holding a pre-#203 deployment (issue #120 acceptance criterion:
-// "Legacy header-based BPMN still discovers correctly"). This is a supplement to
-// — never a replacement for — the package flag: the authoritative task-type /
-// process derivation still comes from `scanTaskDefinitions`; this only answers
-// "is this leaf an agent task?" for the legacy shape.
+// Single-convention agent-task marker (issue #235): every external agent task
+// carries the ONE canonical eligibility flag
 //
-// True when `body` (a service task's inner XML) declares any
-// `io.nanobpm.agentTask*` `<zeebe:header>` key — the sole such header on a
-// pre-#203 agent service task. The regex is compiled once (it is called once
-// per matched `<serviceTask>` during `--auto` scans, so recompiling per call
-// would allocate needlessly across many deployed definitions).
-const AGENT_TASK_HEADER_RE = new RegExp(
-  `<(?:\\w+:)?header\\b[^>]*\\bkey\\s*=\\s*(["'])${AGENT_TASK_NS.replace(/[.]/g, '\\.')}(?:\\.[^"']*)?\\1`,
+//     <zeebe:agentDefinition agentType="external" />
+//
+// inside its `extensionElements` (nano-workforce enforces it via
+// `agent-marker.test.ts`; registered in its `app/contracts.ts`). This replaces the
+// former dual `--auto` detection — the `@nanobpm/agentic` linked-prompt `agentic`
+// flag OR the pre-#203 `io.nanobpm.agentTask` `<zeebe:header>` fallback — with the
+// single marker every external agent task already declares. Behaviour change: a
+// prompt-bearing task WITHOUT the external marker is no longer auto-discovered
+// (safe for nano-workforce, where every `senior:*` task carries the marker).
+//
+// Preferred long-term derivation is a package-supplied `external` flag on each
+// `scanTaskDefinitions` leaf ("derivation over duplication"); until the package
+// exposes it, this self-contained supplement scan answers "is this leaf an
+// external agent task?" and `scanAgentTaskLeaves` prefers `leaf.external` when
+// present, falling back to it. The authoritative task-type / process derivation
+// still comes from `scanTaskDefinitions`.
+//
+// True when `body` (a service task's inner XML) declares a
+// `<zeebe:agentDefinition agentType="external">` element (attribute order and
+// quote style tolerated). Compiled once — called per matched `<serviceTask>`
+// during `--auto` scans, so recompiling per call would allocate needlessly.
+const AGENT_DEFINITION_EXTERNAL_RE = new RegExp(
+  `<(?:\\w+:)?agentDefinition\\b[^>]*\\bagentType\\s*=\\s*(["'])external\\1`,
   'i'
 );
-function serviceTaskHasAgentHeader(body) {
-  return AGENT_TASK_HEADER_RE.test(String(body || ''));
+function serviceTaskIsExternalAgent(body) {
+  return AGENT_DEFINITION_EXTERNAL_RE.test(String(body || ''));
 }
 
-// The set of service-task element ids in `xml` bearing the legacy agent-task
-// header. Correlates back to `scanTaskDefinitions` leaves by `elementId`, so a
-// leaf is treated as legacy-agentic only when it ALSO has a `taskDefinition type`
-// (the package only yields leaves that do) — matching the issue rule "prompt link
-// OR legacy header, AND a non-empty task type".
-function legacyAgentHeaderElementIds(xml) {
+// Opt-out namespace (issue #235): an external agent task authored with
+//
+//     <zeebe:property name="io.nanobpm.agentTask.autoSubscribe" value="false" />
+//
+// is EXCLUDED from the `--auto` set — served only by explicit subscription
+// (`--job-type`/profile, unioned unchanged with `autoTypes`). Only the exact
+// `value="false"` opts out (fail-safe: any other value, or absence, auto-subscribes).
+const AGENT_TASK_AUTO_SUBSCRIBE_PROP = `${AGENT_TASK_NS}.autoSubscribe`;
+
+// Read a named attribute's value from a raw element's attribute string
+// (`name="…"`/`name='…'`), quote-style and order tolerant; undefined when absent.
+function readXmlAttr(attrs, key) {
+  const m = new RegExp(`\\b${key}\\s*=\\s*(["'])(.*?)\\1`, 'i').exec(String(attrs || ''));
+  return m ? m[2] : undefined;
+}
+
+// True when `body` (a service task's inner XML) declares a
+// `<zeebe:property name="io.nanobpm.agentTask.autoSubscribe" value="false">` —
+// attribute order tolerated (name/value read independently). Fail-safe: only the
+// literal `false` opts out.
+function serviceTaskOptsOutOfAutoSubscribe(body) {
+  const src = String(body || '');
+  if (!src.includes(AGENT_TASK_AUTO_SUBSCRIBE_PROP)) return false;
+  const propRe = /<(?:\w+:)?property\b([^>]*?)\/?>/gi;
+  let m;
+  while ((m = propRe.exec(src)) !== null) {
+    if (readXmlAttr(m[1], 'name') !== AGENT_TASK_AUTO_SUBSCRIBE_PROP) continue;
+    if (readXmlAttr(m[1], 'value') === 'false') return true;
+  }
+  return false;
+}
+
+// Walk `xml` collecting the service-task element ids whose inner body satisfies
+// `predicate(body)`, correlating back to `scanTaskDefinitions` leaves by
+// `elementId`. Shared by the external-marker and auto-subscribe-opt-out scans.
+function serviceTaskElementIds(xml, guardSubstring, predicate) {
   const ids = new Set();
   const src = String(xml || '');
-  // Cheap guard: a legacy agent-task header always contains the literal
-  // `io.nanobpm.agentTask` namespace, so a document lacking that substring
-  // cannot match — skip the full `<serviceTask>` walk entirely. This avoids
-  // parsing every deployed definition in `--auto` enrolment loops when none
-  // carry the legacy marker.
-  if (!src.includes(AGENT_TASK_NS)) return ids;
+  // Cheap guard: skip the full `<serviceTask>` walk when the document cannot
+  // possibly match, so `--auto` enrolment loops don't parse every deployed
+  // definition needlessly.
+  if (guardSubstring && !src.includes(guardSubstring)) return ids;
   const taskRe =
     /<(?:\w+:)?serviceTask\b[^>]*?\bid\s*=\s*(["'])(.*?)\1[^>]*?>([\s\S]*?)<\/(?:\w+:)?serviceTask>/g;
   let m;
   while ((m = taskRe.exec(src)) !== null) {
-    if (serviceTaskHasAgentHeader(m[3])) ids.add(m[2]);
+    if (predicate(m[3])) ids.add(m[2]);
   }
   return ids;
 }
 
-// Scan one deployed BPMN document for its *agent* task-definition leaves: the
-// subset of `@nanobpm/agentic` `demand.scanTaskDefinitions(xml)` leaves whose
-// canonical `agentic` flag is set (i.e. the service task declares a
-// `linkName="prompt"` linked resource) OR — for backward compatibility with
-// pre-#203 deployments — which carry the legacy `io.nanobpm.agentTask` header.
-// Returns `{ taskType, process }` leaves in first-occurrence order; a task
-// matched by both signals is the same leaf, so it is emitted once. The published
-// `scanTaskDefinitions` is INJECTED so this stays a pure, synchronous function;
-// `readDeployedAgentJobTypes` supplies the real one from the lazily-imported
-// demand surface (`agentic.mjs`).
+// The set of service-task element ids in `xml` carrying the external-agent
+// marker (`<zeebe:agentDefinition agentType="external">`).
+function externalAgentElementIds(xml) {
+  return serviceTaskElementIds(xml, 'agentDefinition', serviceTaskIsExternalAgent);
+}
+
+// The set of service-task element ids in `xml` opted out of `--auto`
+// (`io.nanobpm.agentTask.autoSubscribe = "false"`).
+function autoSubscribeOptOutElementIds(xml) {
+  return serviceTaskElementIds(xml, AGENT_TASK_AUTO_SUBSCRIBE_PROP, serviceTaskOptsOutOfAutoSubscribe);
+}
+
+// Scan one deployed BPMN document for its `--auto`-eligible *agent* task-definition
+// leaves: the subset of `@nanobpm/agentic` `demand.scanTaskDefinitions(xml)` leaves
+// that carry the single-convention external-agent marker (issue #235) — preferring
+// a package-supplied `leaf.external` flag, falling back to the local
+// `externalAgentElementIds` scan — MINUS any leaf that opts out via
+// `io.nanobpm.agentTask.autoSubscribe="false"`. Returns `{ taskType, process }`
+// leaves in first-occurrence order. The published `scanTaskDefinitions` is INJECTED
+// so this stays a pure, synchronous function; `readDeployedAgentJobTypes` supplies
+// the real one from the lazily-imported demand surface (`agentic.mjs`).
 function scanAgentTaskLeaves(xml, scanTaskDefinitions) {
   if (typeof scanTaskDefinitions !== 'function') {
     throw new TypeError(
@@ -3175,9 +3217,11 @@ function scanAgentTaskLeaves(xml, scanTaskDefinitions) {
     );
   }
   const src = String(xml || '');
-  const legacyIds = legacyAgentHeaderElementIds(src);
+  const externalIds = externalAgentElementIds(src);
+  const optedOutIds = autoSubscribeOptOutElementIds(src);
   return scanTaskDefinitions(src)
-    .filter((leaf) => leaf.agentic || legacyIds.has(leaf.elementId))
+    .filter((leaf) => leaf.external === true || externalIds.has(leaf.elementId))
+    .filter((leaf) => !optedOutIds.has(leaf.elementId))
     .map((leaf) => ({ taskType: leaf.taskType, process: leaf.process }));
 }
 
@@ -15086,7 +15130,10 @@ export {
   diffJobTypes,
   parseJobTypeFlags,
   scanAgentTaskLeaves,
-  serviceTaskHasAgentHeader,
+  serviceTaskIsExternalAgent,
+  externalAgentElementIds,
+  serviceTaskOptsOutOfAutoSubscribe,
+  autoSubscribeOptOutElementIds,
   readDeployedAgentJobTypes,
   resolveAutoJobTypes,
   loadSupervisorRuntime,

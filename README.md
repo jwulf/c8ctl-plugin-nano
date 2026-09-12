@@ -236,11 +236,14 @@ How it works and why it needs no wiring:
   agent jobs at all, it and the app are already on the same engine, so *what
   agent job types exist* is answerable from that engine alone — **no cross-machine
   app discovery, no app enrol endpoint, no channel connection**.
-- **Agent-task header filter.** Not every service task is an agent task —
+- **Agent-task marker filter.** Not every service task is an agent task —
   connectors and record-keepers (e.g. `pr.record-plan`) are plain workers.
-  `--auto` keeps only leaves whose service task carries an
-  **`io.nanobpm.agentTask.`** task header (e.g. `senior:plan` carries
-  `io.nanobpm.agentTask.task.prompt`; a record-keeper does not).
+  `--auto` keeps only leaves whose service task carries the single-convention
+  external-agent marker **`<zeebe:agentDefinition agentType="external" />`** (the
+  same marker every external agent task already declares). A task can **opt out**
+  of `--auto` with `<zeebe:property name="io.nanobpm.agentTask.autoSubscribe"
+  value="false" />` — it is then served only by explicit `--job-type`/profile
+  subscription.
 - **One poller per agent job type, reconciled on change.** It opens one poller
   per agent job type and re-reads the engine periodically, adding pollers for
   newly deployed agent processes and draining pollers for undeployed ones — the

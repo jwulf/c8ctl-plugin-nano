@@ -21,6 +21,7 @@ import {
   buildResumePrompt,
   seedResumeEnvelope,
   isResumeDisabled,
+  resolveEffectiveEnvelope,
 } from './agent-resume.mjs';
 
 // A minimal AgentHistory turn factory mirroring agent-instance.mjs's wire shape.
@@ -89,8 +90,8 @@ test('readPriorTranscript: null when no prior work, no eik, or read throws', asy
 test('readPriorTranscript: default SDK seam probes searchAgentInstances + embedded history', async () => {
   const camunda = {
     searchAgentInstances: async ({ filter }) => {
-      assert.equal(filter.elementInstanceKey, '42');
-      return { items: [{ elementInstanceKey: '42', agentInstanceKey: 'ai-1', history: [textTurn('ASSISTANT', 'prior work here')] }] };
+      assert.deepEqual(filter.elementInstanceKeys, ['42'], 'sends the PLURAL elementInstanceKeys array filter');
+      return { items: [{ elementInstanceKeys: ['42'], agentInstanceKey: 'ai-1', history: [textTurn('ASSISTANT', 'prior work here')] }] };
     },
   };
   const got = await readPriorTranscript({ camunda, job: { elementInstanceKey: '42' } });
@@ -115,30 +116,65 @@ test('readPriorTranscript: an SDK with no read surface → null (legacy cold rer
   assert.equal(got, null);
 });
 
-test('readPriorTranscript: resumes off the direct searchAgentInstanceHistory surface (issue #194)', async () => {
-  // A client exposing ONLY the documented element-instance history search (no
-  // instance search/get) must still resume, not silently cold-run.
+test('readPriorTranscript: resolves the instance then reads history via searchAgentInstanceHistory (issue #194)', async () => {
+  // `searchAgentInstanceHistory` is keyed by `agentInstanceKey` (NOT an element
+  // filter) per the real @camunda8/orchestration-cluster-api surface: the element
+  // correlation happens via searchAgentInstances first, then history is read by the
+  // resolved agentInstanceKey.
+  const calls = [];
   const camunda = {
-    searchAgentInstanceHistory: async ({ filter }) => {
-      assert.equal(filter.elementInstanceKey, '99');
-      return { history: [textTurn('ASSISTANT', 'history-search work')] };
+    searchAgentInstances: async ({ filter }) => {
+      calls.push('search');
+      assert.deepEqual(filter.elementInstanceKeys, ['99']);
+      return { items: [{ elementInstanceKeys: ['99'], agentInstanceKey: 'ai-99' }] };
+    },
+    searchAgentInstanceHistory: async ({ agentInstanceKey }) => {
+      calls.push('history');
+      assert.equal(agentInstanceKey, 'ai-99', 'history read is keyed by the resolved agentInstanceKey');
+      return { items: [textTurn('ASSISTANT', 'history-search work')] };
     },
   };
   const got = await readPriorTranscript({ camunda, job: { elementInstanceKey: '99' } });
-  assert.ok(got, 'resumes from the direct history-search surface');
+  assert.ok(got, 'resumes via instance-resolve → history-by-key');
   assert.ok(got.text.includes('history-search work'));
+  assert.deepEqual(calls, ['search', 'history']);
+});
+
+test('readPriorTranscript: a client exposing ONLY searchAgentInstanceHistory cannot resume (needs an instance key)', async () => {
+  // Without an instance-resolution surface there is no agentInstanceKey to key the
+  // history search on, so resume degrades to a cold rerun rather than mis-calling the
+  // API with a bare element key.
+  const camunda = {
+    searchAgentInstanceHistory: async () => ({ items: [textTurn('ASSISTANT', 'unreachable')] }),
+  };
+  const got = await readPriorTranscript({ camunda, job: { elementInstanceKey: '99' } });
+  assert.equal(got, null);
 });
 
 test('readPriorTranscript: broad search with no exact element match → null (no cross-job transcript)', async () => {
   // A broader/unfiltered search result must NOT seed this job with another
-  // element's transcript — an exact elementInstanceKey match is required.
+  // element's transcript — an exact elementInstanceKey match is required. The real
+  // result carries the PLURAL elementInstanceKeys array.
   const camunda = {
     searchAgentInstances: async () => ({
-      items: [{ elementInstanceKey: 'other-1', agentInstanceKey: 'ai-x', history: [textTurn('ASSISTANT', 'someone else work')] }],
+      items: [{ elementInstanceKeys: ['other-1'], agentInstanceKey: 'ai-x', history: [textTurn('ASSISTANT', 'someone else work')] }],
     }),
   };
   const got = await readPriorTranscript({ camunda, job: { elementInstanceKey: 'mine-2' } });
   assert.equal(got, null, 'no exact match → resume from nothing');
+});
+
+test('readPriorTranscript: matches an element within the PLURAL elementInstanceKeys array', async () => {
+  // An AgentInstance can span several element instances; the exact match must look
+  // inside the returned `elementInstanceKeys` array, not a singular scalar.
+  const camunda = {
+    searchAgentInstances: async () => ({
+      items: [{ elementInstanceKeys: ['sib-1', 'mine-2', 'sib-3'], agentInstanceKey: 'ai-m', history: [textTurn('ASSISTANT', 'my prior work')] }],
+    }),
+  };
+  const got = await readPriorTranscript({ camunda, job: { elementInstanceKey: 'mine-2' } });
+  assert.ok(got, 'matched via the plural array');
+  assert.ok(got.text.includes('my prior work'));
 });
 
 test('readPriorTranscript: a non-settling read is bounded by the deadline → null', async () => {
@@ -177,6 +213,78 @@ test('seedResumeEnvelope: replaces only task.prompt, never mutates the original'
 test('seedResumeEnvelope: returns the original when there is no task prompt to seed', () => {
   const noTask = { repository: { url: 'x' } };
   assert.equal(seedResumeEnvelope(noTask, 'transcript'), noTask);
+  // A task object with no string prompt (e.g. `task: {}` or a blank prompt) has
+  // nothing to continue — must be returned UNCHANGED, not wrapped in a RESUMING
+  // preamble around an empty task (which would divert the job from its cold run).
+  const emptyTask = { task: {}, repository: { url: 'x' } };
+  assert.equal(seedResumeEnvelope(emptyTask, 'transcript'), emptyTask, 'task:{} → unchanged');
+  const blankPrompt = { task: { prompt: '   ' } };
+  assert.equal(seedResumeEnvelope(blankPrompt, 'transcript'), blankPrompt, 'blank prompt → unchanged');
+  const nonStringPrompt = { task: { prompt: 42 } };
+  assert.equal(seedResumeEnvelope(nonStringPrompt, 'transcript'), nonStringPrompt, 'non-string prompt → unchanged');
+});
+
+test('renderHistoryTurns: an empty TOOL_RESULT renders an explicit result, never a re-invocation', () => {
+  // A side-effecting tool that returned nothing yields a TOOL_RESULT with empty
+  // content but retained toolCalls. It must NOT render as a `[tool-call: ...]` line
+  // (which a resumed agent could read as "run it again").
+  const emptyResult = { role: 'TOOL_RESULT', content: [], toolCalls: [{ toolCallId: 'c1', toolName: 'deploy' }] };
+  const out = renderHistoryTurns([textTurn('USER', 'go'), emptyResult]);
+  assert.ok(out.includes('[tool-result: deploy] (no output)'), 'empty tool result is explicit');
+  assert.ok(!out.includes('[tool-call: deploy]'), 'never rendered as a fresh invocation');
+});
+
+test('resolveEffectiveEnvelope: external job with prior transcript → resume-seeded envelope', async () => {
+  const envelope = { task: { prompt: 'original task' } };
+  const job = { leaseToken: 'lease-1', elementInstanceKey: 'eik-1' };
+  const readPrior = async () => ({ text: '[ASSISTANT] partial', historyCount: 3 });
+  const got = await resolveEffectiveEnvelope({ envelope, job, readPrior });
+  assert.equal(got.resumed, true);
+  assert.equal(got.historyCount, 3);
+  assert.notEqual(got.envelope, envelope, 'a new, seeded envelope is returned');
+  assert.ok(got.envelope.task.prompt.includes('RESUMING'));
+  assert.ok(got.envelope.task.prompt.includes('original task'));
+});
+
+test('resolveEffectiveEnvelope: ineligible / disabled / no-prior → original envelope (cold run)', async () => {
+  const envelope = { task: { prompt: 'original task' } };
+  const externalJob = { leaseToken: 'lease-1', elementInstanceKey: 'eik-1' };
+  const withPrior = async () => ({ text: '[ASSISTANT] x', historyCount: 1 });
+
+  // Not an external agent job (no lease / eik) — never reads, returns original.
+  let called = false;
+  const nonExternal = await resolveEffectiveEnvelope({
+    envelope, job: { elementInstanceKey: 'eik-1' }, readPrior: async () => { called = true; return withPrior(); },
+  });
+  assert.equal(nonExternal.envelope, envelope);
+  assert.equal(nonExternal.resumed, false);
+  assert.equal(called, false, 'ineligible job short-circuits before reading');
+
+  // Kill switch off.
+  const disabled = await resolveEffectiveEnvelope({ envelope, job: externalJob, env: { NANO_AGENT_RESUME: 'off' }, readPrior: withPrior });
+  assert.equal(disabled.envelope, envelope);
+  assert.equal(disabled.resumed, false);
+
+  // AgentInstance producer off.
+  const aiOff = await resolveEffectiveEnvelope({ envelope, job: externalJob, agentInstanceOff: true, readPrior: withPrior });
+  assert.equal(aiOff.envelope, envelope);
+  assert.equal(aiOff.resumed, false);
+
+  // No prior work.
+  const noPrior = await resolveEffectiveEnvelope({ envelope, job: externalJob, readPrior: async () => null });
+  assert.equal(noPrior.envelope, envelope);
+  assert.equal(noPrior.resumed, false);
+
+  // Read throws — best-effort degrade to cold run.
+  const threw = await resolveEffectiveEnvelope({ envelope, job: externalJob, readPrior: async () => { throw new Error('engine down'); } });
+  assert.equal(threw.envelope, envelope);
+  assert.equal(threw.resumed, false);
+
+  // Prior exists but the envelope has no seedable prompt → not resumed, original returned.
+  const noPrompt = { task: {} };
+  const unseedable = await resolveEffectiveEnvelope({ envelope: noPrompt, job: externalJob, readPrior: withPrior });
+  assert.equal(unseedable.envelope, noPrompt);
+  assert.equal(unseedable.resumed, false);
 });
 
 test('isResumeDisabled: honours the NANO_AGENT_RESUME=off kill switch', () => {

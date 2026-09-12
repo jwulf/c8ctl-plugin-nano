@@ -89,7 +89,7 @@ import { createAgentInstanceProducer, isExternalAgentJob } from './agent-instanc
 // AgentInstance transcript for this elementInstanceKey and seed the harness with it
 // so the new agent CONTINUES rather than cold-reruns — at-least-once delivery becomes
 // a continuation, not a duplicate. Best-effort; degrades to the legacy cold rerun.
-import { readPriorTranscript, seedResumeEnvelope, isResumeDisabled } from './agent-resume.mjs';
+import { resolveEffectiveEnvelope } from './agent-resume.mjs';
 
 const requireFromHere = createRequire(import.meta.url);
 const pluginDir = dirname(fileURLToPath(import.meta.url));
@@ -9103,23 +9103,29 @@ async function workAgent(req, flags) {
         // AgentInstance transcript (minted above, #194) already holds the prior
         // instance's work, so instead of cold-rerunning we fetch it and SEED the
         // harness prompt with a rendered continuation — turning an at-least-once
-        // re-delivery into a continuation, not a duplicate. Committed work is
-        // recovered from the pushed branch (git provisioning checks it out); the
-        // transcript carries the reasoning/steps so the resumed agent doesn't repeat
-        // completed work. Best-effort and gated to external agent jobs (the only
-        // ones with a durable transcript): a read failure / no-prior-work / an SDK
-        // without a read surface / the NANO_AGENT_RESUME=off kill switch all fall
-        // through to the legacy cold rerun with `effectiveEnvelope === envelope`.
+        // re-delivery into a continuation, not a duplicate. The transcript carries the
+        // reasoning/steps so the resumed agent doesn't repeat completed work.
+        //
+        // COMMITTED work is recovered from the pushed branch when this activation
+        // provisions the SAME branch the prior one pushed — which holds for envelopes
+        // carrying a stable branch identity (`repository.ref` / `branch.create`, the
+        // real agent-work path). When neither is set the provisioning layer cuts an
+        // ephemeral `nano/agent-work/<base>-<runId>` fallback that differs per
+        // activation, so that case degrades to a transcript-only continuation (a full
+        // prior-branch resolve+checkout is the later isolated-context increment);
+        // uncommitted deltas from the prior run are not recovered in either case.
+        //
+        // The gating + best-effort read/seed live in `resolveEffectiveEnvelope`
+        // (unit-tested) so this wiring stays a thin call; a read failure /
+        // no-prior-work / an SDK without a read surface / the NANO_AGENT_RESUME=off
+        // kill switch all fall through to the legacy cold rerun with
+        // `effectiveEnvelope === envelope`.
         let effectiveEnvelope = envelope;
-        if (!agentInstanceOff && !isResumeDisabled() && isExternalAgentJob(job)) {
-          try {
-            const prior = await readPriorTranscript({ camunda, job, logger });
-            if (prior) {
-              effectiveEnvelope = seedResumeEnvelope(envelope, prior.text);
-              logger.info(`[${jobType}] resuming from prior engine transcript (${aiCorr}) — ${prior.historyCount} history turn(s) seeded into the harness prompt; continuing from the last pushed commit (uncommitted deltas from the prior run are not recovered).`);
-            }
-          } catch (err) {
-            logger.debug?.(`[${jobType}] engine-transcript resume skipped (${aiCorr}) — ${oneLineLog(err?.message || err)}; cold-running.`);
+        {
+          const resumed = await resolveEffectiveEnvelope({ envelope, job, camunda, agentInstanceOff, logger });
+          effectiveEnvelope = resumed.envelope;
+          if (resumed.resumed) {
+            logger.info(`[${jobType}] resuming from prior engine transcript (${aiCorr}) — ${resumed.historyCount} history turn(s) seeded into the harness prompt; continuing from the last pushed commit when the branch identity is stable (uncommitted deltas from the prior run are not recovered).`);
           }
         }
 

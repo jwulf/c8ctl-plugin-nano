@@ -110,6 +110,30 @@ function makeProducer(client, overrides = {}) {
   });
 }
 
+// A deterministic replacement for setTimeout for the producer's bounded-call / create
+// retirement timers (issue #230): instead of arming a real wall-clock timer, it records
+// the pending deadline callbacks so a test can FIRE them on demand — no scheduler-timing
+// sleeps. `clearTimeout(id)` on the returned object is a harmless no-op, and firing a
+// deadline whose promise already settled resolves/rejects an already-settled promise (a
+// no-op), so `fire()` may safely flush every pending deadline.
+function makeManualTimer() {
+  let pending = [];
+  const setTimer = (fn) => {
+    const entry = { fn };
+    pending.push(entry);
+    return entry;
+  };
+  // Fire every currently-pending deadline, then let the resulting microtasks (the
+  // settleWithin/callWithin `.then` that drives retirement) run to completion.
+  setTimer.fire = async () => {
+    const batch = pending;
+    pending = [];
+    for (const e of batch) e.fn();
+    await new Promise((r) => setImmediate(r));
+  };
+  return setTimer;
+}
+
 // ---------------------------------------------------------------------------
 // Detection + definition derivation
 // ---------------------------------------------------------------------------
@@ -754,10 +778,11 @@ test('a hung HOT-PATH create is bounded and retired so it cannot wedge every lat
     },
     updateAgentInstance: async (req) => { client.calls.update.push(req); return { createdHistory: [] }; },
   };
+  const timer = makeManualTimer();
   const p = createAgentInstanceProducer({
     camunda: client, job: EXTERNAL_JOB, profile: PROFILE, envelope: ENVELOPE,
     logger: nullLogger, now: () => t, finalizeTimeoutMs: 20,
-    createRetryBaseMs: 1000, createRetryMaxMs: 30000,
+    createRetryBaseMs: 1000, createRetryMaxMs: 30000, setTimer: timer,
   });
   await p.activate(); // attempt 1 fails fast
   assert.equal(client.calls.create.length, 1);
@@ -771,8 +796,9 @@ test('a hung HOT-PATH create is bounded and retired so it cannot wedge every lat
   p.ingest({ sessionUpdate: 'agent_message_chunk', messageId: 'm2', content: { type: 'text', text: 'b' } });
   await p.drain();
   assert.equal(client.calls.create.length, 2, 'no new attempt while the hung one still owns the slot');
-  // Let the real-time retirement timer (finalizeTimeoutMs=20) fire.
-  await new Promise((r) => setTimeout(r, 45));
+  // Deterministically fire the create-retirement deadline (finalizeTimeoutMs=20) instead
+  // of sleeping on wall-clock time: retirement records lastCreateAttemptAt=now().
+  await timer.fire();
   // Retirement recorded lastCreateAttemptAt=now(): an ingest at the SAME clock is still
   // throttled by the backoff, proving the timeout paced the next attempt (issue #230).
   p.ingest({ sessionUpdate: 'agent_message_chunk', messageId: 'm3', content: { type: 'text', text: 'c' } });
@@ -960,13 +986,15 @@ test('a retired attempt\'s late settle does not overwrite a newer attempt\'s bac
     },
     updateAgentInstance: async (req) => { client.calls.update.push(req); return { createdHistory: [] }; },
   };
+  const timer = makeManualTimer();
   const p = createAgentInstanceProducer({
     camunda: client, job: EXTERNAL_JOB, profile: PROFILE, envelope: ENVELOPE,
     logger: nullLogger, now: () => t, finalizeTimeoutMs: 20,
-    createRetryBaseMs: 1000, createRetryMaxMs: 30000,
+    createRetryBaseMs: 1000, createRetryMaxMs: 30000, setTimer: timer,
   });
-  await p.activate();                    // attempt 1 hangs
-  await new Promise((r) => setTimeout(r, 45)); // let the retirement timer fire (records anchor at T0)
+  const activated = p.activate();        // attempt 1 hangs; activate awaits the bounded create
+  await timer.fire();                    // fire the retirement deadline WHILE activate awaits it (anchor at T0)
+  await activated;
   t += 2000;                             // T0+2000
   p.ingest({ sessionUpdate: 'agent_message_chunk', messageId: 'm1', content: { type: 'text', text: 'a' } });
   await p.drain();
@@ -976,7 +1004,7 @@ test('a retired attempt\'s late settle does not overwrite a newer attempt\'s bac
   t += 1000;                             // T0+3000
   rejectFirst();
   await firstSettled.catch(() => {});
-  await new Promise((r) => setTimeout(r, 5)); // let the late catch/finally run
+  await new Promise((r) => setImmediate(r)); // let the late catch/finally run (deterministic)
   // At T0+4500: anchor T0+2000 → elapsed 2500 >= backoff(2)=2000 → a fresh attempt fires.
   // Had the late settle re-anchored to T0+3000, elapsed would be 1500 < 2000 → throttled.
   t += 1500;                             // T0+4500
@@ -1630,7 +1658,7 @@ test('the post-mint append backlog is bounded — overflow drops the newest turn
 
   const backlogWarns = lines.warn.filter((m) => /append backlog full/.test(m));
   assert.equal(backlogWarns.length, 1, 'the overflow is warned exactly once');
-  assert.match(backlogWarns[0], /cap 2/, 'the diagnostic reports the cap');
+  assert.match(backlogWarns[0], /caps 2 turns/, 'the diagnostic reports the count cap');
 
   // Release the hang so the queue drains and the test does not leak a pending append.
   openGate();
@@ -1639,6 +1667,57 @@ test('the post-mint append backlog is bounded — overflow drops the newest turn
   // Only the two accepted appends ever reached the SDK; the two overflow turns were
   // dropped and never enqueued.
   assert.equal(client.calls.update.length, 2, 'the two overflow turns were dropped; only two appends hit the SDK');
+});
+
+test('the post-mint append backlog is bounded by BYTES too — a large turn overflows the byte cap under the count cap (issue #230)', async () => {
+  // The count cap alone can't bound memory: a handful of huge turns (e.g. a large tool
+  // result) stay under maxPendingAppends yet retain unbounded bytes. The companion byte
+  // cap drops the newest turn once the pending bytes would exceed it — even with plenty
+  // of count headroom — and the byte cap applies to the FIRST pending append too.
+  const lines = { info: [], warn: [], debug: [] };
+  const logger = {
+    info: (m) => lines.info.push(m),
+    warn: (m) => lines.warn.push(m),
+    debug: (m) => lines.debug.push(m),
+  };
+  let openGate;
+  const gate = new Promise((resolve) => {
+    openGate = resolve;
+  });
+  const client = {
+    calls: { create: [], update: [] },
+    createAgentInstance: async (req) => {
+      client.calls.create.push(req);
+      return { agentInstanceKey: 'AGENT-BYTES' };
+    },
+    updateAgentInstance: async (req) => {
+      client.calls.update.push(req);
+      await gate; // hang so the backlog cannot drain
+      return { createdHistory: Array.isArray(req.history) ? req.history : [] };
+    },
+  };
+  // Roomy count cap (100) but a tiny byte cap (2 KB): the byte cap must be the binding
+  // constraint. Each tool_call carries a ~1.5 KB title payload.
+  const big = 'x'.repeat(1500);
+  const p = makeProducer(client, { logger, maxPendingAppends: 100, maxPendingAppendBytes: 2000 });
+  await p.activate();
+  assert.equal(p.active, true);
+
+  // First large turn is accepted (in flight on the hung update). The second would push
+  // pending bytes past 2 KB, so it is dropped despite ample count headroom.
+  for (let i = 0; i < 3; i += 1) {
+    p.ingest({ sessionUpdate: 'tool_call', toolCallId: `tc-${i}`, title: `${big}-${i}`, status: 'pending' });
+  }
+
+  const backlogWarns = lines.warn.filter((m) => /append backlog full/.test(m));
+  assert.equal(backlogWarns.length, 1, 'the byte overflow is warned exactly once');
+  assert.match(backlogWarns[0], /bytes; caps 100 turns \/ 2000 bytes/, 'the diagnostic reports the byte cap');
+
+  openGate();
+  await p.drain();
+
+  // Only the first turn ever reached the SDK; the byte cap dropped the rest.
+  assert.equal(client.calls.update.length, 1, 'the byte cap dropped the over-size turns; only one append hit the SDK');
 });
 
 test('a shaped create failure emits status/body, the redacted jobLease, model/provider, and all correlation keys (issue #230)', async () => {

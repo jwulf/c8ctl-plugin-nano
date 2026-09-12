@@ -98,6 +98,15 @@ const DEFAULT_MAX_INFLIGHT_CREATES = 3;
 // so the truncation is visible rather than a silent unbounded backlog.
 const DEFAULT_MAX_PENDING_APPENDS = 1000;
 
+// Companion BYTE cap on the post-mint append backlog (issue #230). The count cap above
+// bounds only the NUMBER of pending appends, but each retained turn closure holds the
+// full `turn` payload — and a single tool result/argument can be arbitrarily large — so
+// a backlog well under `maxPendingAppends` can still consume unbounded memory during an
+// AgentInstance outage. Mirror the pre-mint buffer's byte cap: once the pending appends'
+// approximate serialized size would exceed this, DROP the newest turn (counted, warn-once)
+// like the count cap, so the memory bound holds regardless of per-turn size.
+const DEFAULT_MAX_PENDING_APPEND_BYTES = 8_000_000;
+
 // Race a best-effort promise against `timeoutMs`, reporting WHICH won, without ever
 // rejecting. Used to bound every create attempt so a hung createAgentInstance can
 // neither block activate() (which gates whether the harness runs at all) nor
@@ -366,6 +375,12 @@ export function createAgentInstanceProducer(opts = {}) {
     finalizeTimeoutMs = DEFAULT_FINALIZE_TIMEOUT_MS,
     maxInFlightCreates = DEFAULT_MAX_INFLIGHT_CREATES,
     maxPendingAppends = DEFAULT_MAX_PENDING_APPENDS,
+    maxPendingAppendBytes = DEFAULT_MAX_PENDING_APPEND_BYTES,
+    // Injected deadline-timer factory (defaults to setTimeout) — the seam that lets a
+    // test drive the create-retirement / bounded-call timers deterministically instead
+    // of sleeping on wall-clock time (issue #230). Only the timer is injected; the
+    // clock is `now`.
+    setTimer = setTimeout,
   } = opts;
 
   const classify = typeof sessionAcp?.classifyUpdate === 'function' ? sessionAcp.classifyUpdate : null;
@@ -470,6 +485,10 @@ export function createAgentInstanceProducer(opts = {}) {
   // elevated to `warn` exactly once so a bounded-out backlog is visible without a storm.
   let pendingAppends = 0;
   let appendsDropped = 0;
+  // Approximate serialized size of the currently-pending appends, for the companion
+  // byte cap (issue #230): a small number of huge turns can breach the memory bound the
+  // count cap alone can't — so track bytes alongside count and drop on either.
+  let pendingAppendBytes = 0;
   let appendBacklogLogged = false;
   // #229 first-failure elevation for ingest faults (classifier OR handler): the FIRST
   // per-instance ingest failure logs at `warn`, repeats stay at `debug`.
@@ -506,21 +525,31 @@ export function createAgentInstanceProducer(opts = {}) {
     // Backpressure (issue #230): during an AgentInstance outage each serialized append
     // can take up to finalizeTimeoutMs to settle, so an unbounded enqueue would let the
     // backlog (and its retained turn payloads) grow without limit and drain for hours
-    // past complete(). Once the backlog hits the cap, DROP the newest turn — counting it
-    // and warning once — rather than retain it, mirroring the pre-mint buffer's explicit
-    // drop policy so the truncation is visible, not a silent runaway queue.
-    if (maxPendingAppends > 0 && pendingAppends >= maxPendingAppends) {
+    // past complete(). Once the backlog hits EITHER the count cap OR the byte cap, DROP
+    // the newest turn — counting it and warning once — rather than retain it, mirroring
+    // the pre-mint buffer's explicit drop policy so the truncation is visible, not a
+    // silent runaway queue. The byte cap applies even to the first pending append: a
+    // single arbitrarily large turn (e.g. a huge tool result) would otherwise be
+    // retained in full during a prolonged outage, defeating the memory bound.
+    const size = sizeOfUpdate(turn);
+    if (
+      (maxPendingAppends > 0 && pendingAppends >= maxPendingAppends) ||
+      (maxPendingAppendBytes > 0 && pendingAppendBytes + size > maxPendingAppendBytes)
+    ) {
       appendsDropped += 1;
       if (!appendBacklogLogged) {
         appendBacklogLogged = true;
         logger?.warn?.(
-          `AgentInstance producer: append backlog full (${pendingAppends} pending; cap ` +
-            `${maxPendingAppends}); dropping further turns until it drains ${correlation()}.`,
+          `AgentInstance producer: append backlog full (${pendingAppends} pending, ` +
+            `~${pendingAppendBytes} bytes; caps ${maxPendingAppends} turns / ` +
+            `${maxPendingAppendBytes} bytes); dropping further turns until it drains ` +
+            `${correlation()}.`,
         );
       }
       return;
     }
     pendingAppends += 1;
+    pendingAppendBytes += size;
     const appended = enqueue(async () => {
       const req = {
         agentInstanceKey,
@@ -537,7 +566,7 @@ export function createAgentInstanceProducer(opts = {}) {
         // until it expires during an AgentInstance outage. A timeout is tagged
         // `__nanoTimeout` and swallowed by the catch below like any other append
         // failure — best-effort, never breaks the chain (issue #230).
-        const res = await callWithin(camunda[SDK_UPDATE](req), finalizeTimeoutMs);
+        const res = await callWithin(camunda[SDK_UPDATE](req), finalizeTimeoutMs, setTimer);
         // #229/#232: the engine dedups appends by historyItemId, so a retry or a
         // reactivation can return 200 while creating ZERO new history entries. Count
         // what the engine actually CREATED (`res.createdHistory`) — not the attempt —
@@ -565,9 +594,11 @@ export function createAgentInstanceProducer(opts = {}) {
       }
     });
     // Decrement the backlog when THIS append settles (enqueue's chain never rejects),
-    // freeing a slot for a later turn without affecting the serialized `queue`.
+    // freeing a slot (and its bytes) for a later turn without affecting the serialized
+    // `queue`.
     appended.finally(() => {
       pendingAppends -= 1;
+      pendingAppendBytes -= size;
     });
   };
 
@@ -886,7 +917,7 @@ export function createAgentInstanceProducer(opts = {}) {
     creating = p;
     // Fire-and-forget retirement supervision (bounds even non-awaited hot-path
     // attempts). Never rejects; a no-op if the attempt settled or was already retired.
-    void settleWithin(p, finalizeTimeoutMs).then((settled) => {
+    void settleWithin(p, finalizeTimeoutMs, setTimer).then((settled) => {
       if (!settled) retireCreate(gen);
     });
     return p;
@@ -904,7 +935,7 @@ export function createAgentInstanceProducer(opts = {}) {
     const pending = creating;
     const gen = creatingGen;
     if (!pending) return;
-    const settled = await settleWithin(pending, finalizeTimeoutMs);
+    const settled = await settleWithin(pending, finalizeTimeoutMs, setTimer);
     // Only retire if it genuinely timed out AND still owns the slot (it may have
     // settled in the same tick the timer fired, in which case its finally already
     // freed the slot / started nothing new).
@@ -1240,7 +1271,7 @@ export function createAgentInstanceProducer(opts = {}) {
         // AgentInstance outage N queued appends could take up to N×finalizeTimeoutMs and
         // hold the lease for that whole span; the remaining appends drain in the
         // background past the deadline (best-effort) so job settlement isn't blocked.
-        await settleWithin(this.drain(), finalizeTimeoutMs);
+        await settleWithin(this.drain(), finalizeTimeoutMs, setTimer);
         // The instance never minted, and `finalized` now guarantees the pre-mint buffer
         // can NEVER be replayed. Release it (and its byte/drop counters) so an
         // uncancellable create promise still hung during a prolonged outage cannot
@@ -1272,7 +1303,7 @@ export function createAgentInstanceProducer(opts = {}) {
       // serialized, so during an outage N queued appends could take up to
       // N×finalizeTimeoutMs and hold the lease that whole span before the terminal
       // update even begins (issue #230).
-      const drained = await settleWithin(queue, finalizeTimeoutMs);
+      const drained = await settleWithin(queue, finalizeTimeoutMs, setTimer);
       if (ok && !drained) {
         // The aggregate drain timed out: appends are STILL in flight on `queue`.
         // Driving the terminal COMPLETED update directly here would race those pending
@@ -1295,6 +1326,7 @@ export function createAgentInstanceProducer(opts = {}) {
                 status: 'COMPLETED',
               }),
               finalizeTimeoutMs,
+              setTimer,
             );
           } catch (err) {
             // This serialized enqueue IS the terminal transition on the drain-timeout
@@ -1330,7 +1362,8 @@ export function createAgentInstanceProducer(opts = {}) {
           const mins = (elapsedMs / 60000).toFixed(1);
           logger?.info?.(
             `AgentInstance ${agentInstanceKey} (${corr()}): ${appendedTurns} turn(s) appended ` +
-              `so far over ${mins}m (drain still pending — count unobserved), ` +
+              `so far over ${mins}m (drain still pending — count unobserved)` +
+              `${appendsDropped > 0 ? `, ${appendsDropped} turn(s) DROPPED (append backlog cap — transcript truncated)` : ''}, ` +
               `terminal COMPLETED update serialized behind pending appends.`,
           );
         }
@@ -1356,6 +1389,7 @@ export function createAgentInstanceProducer(opts = {}) {
                 status: 'COMPLETED',
               }),
               finalizeTimeoutMs,
+              setTimer,
             );
             completedOk = true;
             terminalErr = null;
@@ -1403,8 +1437,16 @@ export function createAgentInstanceProducer(opts = {}) {
         : terminalOk
           ? 'status→COMPLETED'
           : 'COMPLETED update FAILED — left non-terminal (retry/reactivation continues it); manual reconciliation required';
+      // Surface the aggregate append backlog DROP count (issue #230): the warn-once
+      // backlog log only says drops STARTED — the operator can't quantify the loss or
+      // tell it apart from an engine append failure without the final tally. Fold it
+      // into the completion counter so a truncated transcript is quantified, not silent.
+      const droppedNote =
+        appendsDropped > 0
+          ? ` (${appendsDropped} turn(s) DROPPED — append backlog cap; transcript truncated)`
+          : '';
       logger?.info?.(
-        `AgentInstance ${agentInstanceKey} (${corr()}): ${appendedTurns} turn(s) appended over ${mins}m, ${transition}.`,
+        `AgentInstance ${agentInstanceKey} (${corr()}): ${appendedTurns} turn(s) appended over ${mins}m${droppedNote}, ${transition}.`,
       );
     },
   };

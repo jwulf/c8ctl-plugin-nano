@@ -8568,7 +8568,7 @@ function checkSetupAbort(abortSignal, { jobType, jobKey, stage, logger } = {}) {
  * the rank×capability matrix) and poll for work in the foreground until Ctrl-C.
  * Uses the c8ctl-provided SDK client (globalThis.c8ctl.createClient()).
  */
-async function workAgent(req, flags) {
+async function workAgent(req, flags, ctx) {
   const logger = getLogger();
   // The hire to run always comes from the positional profile. `--name` no longer
   // selects the hire (that was a footgun: `work reviewer --name coder` silently
@@ -8850,7 +8850,14 @@ async function workAgent(req, flags) {
   // bad DNS answer is corrected, without a supervisor restart. Set before the
   // client is created so every outbound inherits it.
   preferIpv4Resolution();
-  const camunda = globalThis.c8ctl.createClient();
+  // Honour c8ctl's global `--profile <name>` for this invocation: the handler
+  // ctx carries `profile` (the `--profile` override, else the active session
+  // profile). Passing it to createClient(profile) connects the worker to the
+  // profile named on the command line, not just the active session — closing the
+  // silently-ignored-`--profile` gap (jwulf/c8ctl-plugin-nano#189). ctx-less
+  // callers (undefined) fall back to createClient(undefined), which resolves the
+  // active profile itself — identical to the old no-arg behaviour.
+  const camunda = globalThis.c8ctl.createClient(resolveConnectionProfile(ctx));
 
   // Broker REST endpoint for live linked-resource prompts (issue #63) and the
   // C8 REST source for `--auto`'s engine-read enrolment. Derived from the SAME
@@ -10315,6 +10322,55 @@ function reconstructWorkArgs(flags) {
   return out;
 }
 
+// The c8ctl connection profile (its global `--profile` flag) resolved for THIS
+// invocation, for handing to `createClient(profile)`. c8ctl core builds the
+// plugin handler's third `ctx` argument with `ctx.profile = --profile override
+// ?? activeProfile` (index.js), then exposes a lazy `createClient(pluginProfile)`
+// — but this plugin creates its own client via `globalThis.c8ctl.createClient()`
+// and, before this, called it with NO profile, so `work`/`supervisor` always
+// connected to the ACTIVE session profile and silently ignored a per-invocation
+// `--profile <name>` (jwulf/c8ctl-plugin-nano#189). Threading this value into
+// `createClient(profile)` makes them honour `--profile` the way core c8ctl
+// commands do. Returns undefined when ctx carries no profile, so
+// `createClient(undefined)` resolves the active session profile itself (its own
+// documented default) — byte-identical to the old no-arg call. Pure.
+function resolveConnectionProfile(ctx) {
+  const p = ctx && typeof ctx.profile === 'string' ? ctx.profile.trim() : '';
+  return p || undefined;
+}
+
+// The EXPLICIT `--profile <name>` override only (distinct from the active
+// session profile), for FORWARDING to spawned `nano work` children. When an
+// operator runs `supervisor start --worker <p> --profile <conn>` (or
+// `supervisor add … --profile <conn>`), each supervised worker is a fresh
+// `c8ctl nano work` process that must connect to <conn>, not the daemon's/
+// session's active profile. c8ctl strips the global `--profile` before the
+// plugin parser sees it, so it never lands in `flags`; we recover it from
+// `ctx.profile` and re-emit it as a `--profile` token in the child argv (c8ctl
+// core parses it position-independently as a global). Returns undefined when no
+// override was given — i.e. `ctx.profile` is absent or merely equals the active
+// session profile — so the child inherits the active profile exactly as before
+// (no spurious pin). Pure.
+function explicitConnectionProfile(ctx) {
+  const p = resolveConnectionProfile(ctx);
+  if (!p) return undefined;
+  const active = globalThis.c8ctl && typeof globalThis.c8ctl.activeProfile === 'string'
+    ? globalThis.c8ctl.activeProfile
+    : undefined;
+  return p === active ? undefined : p;
+}
+
+// Append the explicit connection-profile override (if any) to a reconstructed
+// `work` argv tail as a c8ctl global `--profile <conn>` token, so a supervised
+// worker connects to the profile named on the `supervisor start`/`add` command
+// line rather than the active session profile (jwulf/c8ctl-plugin-nano#189).
+// A no-op when no `--profile` override was passed. Pure.
+function withConnectionProfileArg(workArgs, ctx) {
+  const conn = explicitConnectionProfile(ctx);
+  const base = Array.isArray(workArgs) ? workArgs : [];
+  return conn ? [...base, '--profile', conn] : base;
+}
+
 /**
  * Sanitize one token for use inside a worker name: keep `[A-Za-z0-9._-]`,
  * collapse every other run to a single `-`, and trim leading/trailing
@@ -11737,13 +11793,17 @@ async function startSupervisorWithServicePolicy(logger = getLogger()) {
   return startSupervisorDaemon({ adoptOnly: serviceOwned });
 }
 
-async function supervisorStartCmd(req, flags) {
+async function supervisorStartCmd(req, flags, ctx) {
   const logger = getLogger();
   const state = await startSupervisorWithServicePolicy(logger);
   logger.info(`Supervisor daemon running (pid ${state.pid}).`);
 
   const specs = normalizeArgList(flags?.worker);
-  const workArgs = reconstructWorkArgs(flags);
+  // Forward c8ctl's global `--profile <conn>` (when it overrides the active
+  // session profile) to every spawned worker, so `supervisor start --worker <p>
+  // --profile <conn>` pins the fleet to <conn> instead of silently connecting to
+  // the active session engine (jwulf/c8ctl-plugin-nano#189).
+  const workArgs = withConnectionProfileArg(reconstructWorkArgs(flags), ctx);
   // `--name` names a single launched worker. With several `--worker` specs a lone
   // name can't apply to all of them, so honour it only for a single spec and let
   // the rest auto-name; warn so the intent isn't silently dropped.
@@ -11803,7 +11863,7 @@ async function supervisorStatusCmd() {
   printSupervisorStatus(logger, statusFromState(running));
 }
 
-async function supervisorAddCmd(req, flags) {
+async function supervisorAddCmd(req, flags, ctx) {
   const logger = getLogger();
   // The positional profile is what runs; `--name` names this worker instance
   // (forwarded to the child as `nano work … --name`, and used as its supervisor
@@ -11822,7 +11882,10 @@ async function supervisorAddCmd(req, flags) {
     process.exit(1);
   }
   await startSupervisorWithServicePolicy(logger);
-  const workArgs = reconstructWorkArgs(flags);
+  // Forward the global `--profile <conn>` override to the spawned worker(s) so
+  // `supervisor add … --profile <conn>` connects them to <conn>, matching
+  // `supervisor start` (jwulf/c8ctl-plugin-nano#189).
+  const workArgs = withConnectionProfileArg(reconstructWorkArgs(flags), ctx);
   let added = 0;
   let failed = 0;
   for (let i = 0; i < count; i++) {
@@ -12617,7 +12680,7 @@ async function maybeReparentOrWarnOnStart(logger) {
 }
 
 /** Dispatch the `supervisor` subcommand's action. */
-async function supervisorCommand(req, flags) {
+async function supervisorCommand(req, flags, ctx) {
   const action = (req.positional[0] || '').toLowerCase();
   switch (action) {
     case '__daemon':
@@ -12632,7 +12695,7 @@ async function supervisorCommand(req, flags) {
       return;
     }
     case 'start':
-      await supervisorStartCmd(req, flags);
+      await supervisorStartCmd(req, flags, ctx);
       return;
     case 'install':
       await supervisorInstallCmd();
@@ -12646,7 +12709,7 @@ async function supervisorCommand(req, flags) {
       await supervisorStatusCmd();
       return;
     case 'add':
-      await supervisorAddCmd(req, flags);
+      await supervisorAddCmd(req, flags, ctx);
       return;
     case 'remove':
     case 'rm':
@@ -15463,6 +15526,9 @@ export {
 };
 export {
   reconstructWorkArgs,
+  resolveConnectionProfile,
+  explicitConnectionProfile,
+  withConnectionProfileArg,
   supervisorWorkerId,
   autoWorkerName,
   sanitizeNameToken,
@@ -15498,6 +15564,7 @@ export {
   runSupervisorDaemon,
   startSupervisorDaemon,
   supervisorRequest,
+  supervisorStartCmd,
   supervisorAddCmd,
   runningSupervisor,
   readSupervisorState,
@@ -15687,7 +15754,7 @@ export const commands = {
       manifest: { type: 'string', description: `workforce: manifest name to operate on (default ${DEFAULT_WORKFORCE_MANIFEST}); each subcommand reads/writes <stateHome>/workforce/<name>.json. Renamed from --profile (which now collides with c8ctl's global connection-profile flag).` },
       roles: { type: 'string', description: 'workforce add: comma-separated role list for the entry (→ --job-type <rank>:<role> at start); mutually exclusive with --auto' },
     },
-    handler: async (args, flags) => {
+    handler: async (args, flags, ctx) => {
       const logger = getLogger();
       const req = parseRequest(args, flags);
 
@@ -15744,10 +15811,10 @@ export const commands = {
             await assignCapabilities(req, flags);
             break;
           case 'work':
-            await workAgent(req, flags);
+            await workAgent(req, flags, ctx);
             break;
           case 'supervisor':
-            await supervisorCommand(req, flags);
+            await supervisorCommand(req, flags, ctx);
             break;
           case 'workforce':
             await workforceCommand(req, flags);

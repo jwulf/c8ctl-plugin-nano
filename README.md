@@ -197,6 +197,21 @@ capabilities `code-review, testing` the matrix is:
 so a BPMN service task can target a worker at any granularity by setting its job
 type to the matching token.
 
+**Choosing which engine a worker connects to.** By default `work` (and
+`supervisor start --worker`) connects to your **active** c8ctl session profile
+(`c8ctl use profile <name>`). To point a single invocation at a different
+cluster without switching the active session, pass c8ctl's global
+`--profile <name>` — it is honoured the same way it is for core c8ctl commands:
+
+```bash
+c8ctl nano work fleet --profile nano-validate            # this worker only → nano-validate's engine
+c8ctl nano supervisor start --worker fleet --profile nano-validate   # the whole fleet → nano-validate
+```
+
+The named profile wins over the active session for that run only; a supervised
+fleet is pinned to it (the daemon forwards it to every worker it spawns), and
+`supervisor status` reports the matching `ENGINE`.
+
 To also service a job type the matrix can't express — for example a code-first
 [`@nanobpm/workflow`](https://www.npmjs.com/package/@nanobpm/workflow) flow whose
 external task type is `<flowId>:<taskName>`, or any bespoke token — add one or

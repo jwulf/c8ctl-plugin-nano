@@ -16,6 +16,7 @@ import {
   deriveLimits,
   inferProvider,
   describeSdkError,
+  leaseTokenLabel,
 } from './agent-instance.mjs';
 
 // A logger that records every line per level so observability assertions (#229)
@@ -40,6 +41,9 @@ function recordingLogger() {
 function fakeClient({
   createResult = { agentInstanceKey: 'AGENT-1' },
   failCreate = false,
+  failCreateTimes = 0,
+  noKeyTimes = 0,
+  createError = null,
   enforceContract = false,
 } = {}) {
   const calls = { create: [], update: [] };
@@ -57,7 +61,11 @@ function fakeClient({
     calls,
     createAgentInstance: async (req) => {
       calls.create.push(req);
-      if (failCreate) throw new Error('stale lease');
+      if (failCreate) throw createError || new Error('stale lease');
+      if (calls.create.length <= failCreateTimes) throw createError || new Error('stale lease');
+      // A resolved-but-keyless response for the next `noKeyTimes` attempts: the create
+      // succeeds at the transport layer but carries no agentInstanceKey.
+      if (calls.create.length <= failCreateTimes + noKeyTimes) return {};
       validate(req);
       return createResult;
     },
@@ -75,7 +83,7 @@ function fakeClient({
 const EXTERNAL_JOB = {
   jobKey: '13954',
   type: 'senior:feature',
-  leaseToken: '99001',
+  leaseToken: 'FENCE99001',
   elementInstanceKey: 'EIK-7',
   elementId: 'agent-task',
   processInstanceKey: '13951',
@@ -100,6 +108,30 @@ function makeProducer(client, overrides = {}) {
     now,
     ...overrides,
   });
+}
+
+// A deterministic replacement for setTimeout for the producer's bounded-call / create
+// retirement timers (issue #230): instead of arming a real wall-clock timer, it records
+// the pending deadline callbacks so a test can FIRE them on demand — no scheduler-timing
+// sleeps. `clearTimeout(id)` on the returned object is a harmless no-op, and firing a
+// deadline whose promise already settled resolves/rejects an already-settled promise (a
+// no-op), so `fire()` may safely flush every pending deadline.
+function makeManualTimer() {
+  let pending = [];
+  const setTimer = (fn) => {
+    const entry = { fn };
+    pending.push(entry);
+    return entry;
+  };
+  // Fire every currently-pending deadline, then let the resulting microtasks (the
+  // settleWithin/callWithin `.then` that drives retirement) run to completion.
+  setTimer.fire = async () => {
+    const batch = pending;
+    pending = [];
+    for (const e of batch) e.fn();
+    await new Promise((r) => setImmediate(r));
+  };
+  return setTimer;
 }
 
 // ---------------------------------------------------------------------------
@@ -150,7 +182,7 @@ test('activate mints exactly one AgentInstance, lease-gated, with an opening CON
   // Lease-gated on the activated job.
   assert.equal(req.elementInstanceKey, 'EIK-7');
   assert.equal(req.jobKey, '13954');
-  assert.equal(req.jobLease, '99001');
+  assert.equal(req.jobLease, 'FENCE99001');
   // Opening CONFIGURATION turn carries the concrete runtime definition.
   assert.equal(req.history.length, 1);
   const cfg = req.history[0];
@@ -228,7 +260,7 @@ test('assistant message chunks coalesce into ONE ASSISTANT turn on flush', async
   assert.equal(turn.role, 'ASSISTANT');
   assert.deepEqual(turn.content, [{ contentType: 'TEXT', text: 'Hello world' }]);
   assert.equal(appends[0].jobKey, '13954');
-  assert.equal(appends[0].jobLease, '99001');
+  assert.equal(appends[0].jobLease, 'FENCE99001');
   assert.equal(appends[0].elementInstanceKey, 'EIK-7');
   assert.equal(appends[0].agentInstanceKey, 'AGENT-1');
 });
@@ -351,7 +383,7 @@ test('complete(true) drives the instance status to COMPLETED', async () => {
   assert.equal(statusUpdates.length, 1);
   assert.equal(statusUpdates[0].agentInstanceKey, 'AGENT-1');
   assert.equal(statusUpdates[0].jobKey, '13954');
-  assert.equal(statusUpdates[0].jobLease, '99001');
+  assert.equal(statusUpdates[0].jobLease, 'FENCE99001');
 });
 
 test('complete(false) does NOT complete the instance (a retry continues it)', async () => {
@@ -366,16 +398,20 @@ test('complete(false) does NOT complete the instance (a retry continues it)', as
 // Best-effort: nothing here may throw or mint when preconditions fail
 // ---------------------------------------------------------------------------
 
-test('a failed create disables the producer; ingest/complete become no-ops and never throw', async () => {
+test('a failed create does NOT permanently disable — it is retried, and never throws (issue #230)', async () => {
+  // Every create attempt throws, so no key is ever obtained and no append lands,
+  // but the producer must stay retryable (not disabled) and never throw.
   const client = fakeClient({ failCreate: true });
   const p = makeProducer(client);
   const ok = await p.activate();
   assert.equal(ok, false);
   assert.equal(p.active, false);
-  // No throw, no updates.
+  // No throw, no updates (there is no instance key to append against).
   p.ingest({ sessionUpdate: 'agent_message_chunk', content: { type: 'text', text: 'x' } });
   await p.complete(true);
   assert.equal(client.calls.update.length, 0);
+  // At least the activate() attempt (and complete()'s final attempt) were made.
+  assert.ok(client.calls.create.length >= 1);
 });
 
 test('the producer is inert for a non-external job (no SDK calls)', async () => {
@@ -414,6 +450,9 @@ test('ingest before activate mints nothing and appends nothing', async () => {
   // No activate() call.
   p.ingest({ sessionUpdate: 'agent_message_chunk', content: { type: 'text', text: 'x' } });
   await p.drain();
+  // No create (no mint) AND no append: the hot-path retry only arms after an
+  // activation attempt, so an ingest before activate() is a no-op (issue #230).
+  assert.equal(client.calls.create.length, 0);
   assert.equal(client.calls.update.length, 0);
 });
 
@@ -440,6 +479,1435 @@ test('appended turns preserve ACP arrival order even though ingest is non-blocki
 });
 
 // ---------------------------------------------------------------------------
+// Create retry — a transient failure must not forfeit the run (issue #230)
+// ---------------------------------------------------------------------------
+
+test('a create that fails at second 0 then succeeds mid-run resumes the durable transcript', async () => {
+  // The first create attempt (from activate) throws; a second attempt — driven by a
+  // later ingest once the backoff window has elapsed — succeeds, and from then on
+  // turns append to the same instance.
+  const client = fakeClient({ failCreateTimes: 1 });
+  let t = Date.parse('2026-02-03T04:05:06.000Z');
+  const clock = () => t;
+  const p = createAgentInstanceProducer({
+    camunda: client,
+    job: EXTERNAL_JOB,
+    profile: PROFILE,
+    envelope: ENVELOPE,
+    logger: nullLogger,
+    now: clock,
+    createRetryBaseMs: 1000,
+    createRetryMaxMs: 30000,
+  });
+
+  // First attempt fails → no key yet, producer not disabled.
+  const ok = await p.activate();
+  assert.equal(ok, false);
+  assert.equal(p.active, false);
+  assert.equal(client.calls.create.length, 1);
+
+  // An ingest before the backoff window elapses does NOT re-attempt — but the update
+  // is now buffered for replay rather than dropped (issue #230).
+  p.ingest({ sessionUpdate: 'agent_message_chunk', messageId: 'm-early', content: { type: 'text', text: 'early' } });
+  await p.drain();
+  assert.equal(client.calls.create.length, 1);
+
+  // Advance past the backoff window; the next ingest re-attempts the create, which
+  // now succeeds — the instance is minted and subsequent turns append.
+  t += 2000;
+  p.ingest({ sessionUpdate: 'agent_message_chunk', messageId: 'm-later', content: { type: 'text', text: 'later' } });
+  await p.drain();
+  assert.equal(client.calls.create.length, 2);
+  assert.equal(p.active, true);
+
+  p.ingest({ sessionUpdate: 'agent_message_chunk', messageId: 'm-captured', content: { type: 'text', text: 'captured' } });
+  await p.complete(true);
+
+  const texts = client.calls.update
+    .filter((u) => Array.isArray(u.history))
+    .map((u) => u.history[0].content?.[0]?.text)
+    .filter(Boolean);
+  assert.ok(texts.includes('captured'), 'post-recovery turn is durably appended');
+  // The turns emitted while the create was still failing are replayed, not lost.
+  assert.ok(texts.includes('early') && texts.includes('later'), 'pre-mint turns are replayed');
+  assert.equal(client.calls.update.filter((u) => u.status === 'COMPLETED').length, 1);
+});
+
+test('complete() makes a final un-throttled create attempt when the instance never minted', async () => {
+  // fail once (activate), then complete()'s final attempt succeeds even inside the
+  // backoff window, so at least the config turn + COMPLETED status survive.
+  const client = fakeClient({ failCreateTimes: 1 });
+  const p = makeProducer(client); // fixed clock
+  await p.activate();
+  assert.equal(client.calls.create.length, 1);
+  assert.equal(p.active, false);
+  await p.complete(true);
+  assert.equal(client.calls.create.length, 2);
+  assert.equal(p.active, true);
+  assert.equal(client.calls.update.filter((u) => u.status === 'COMPLETED').length, 1);
+});
+
+test('complete() without a prior activate() is a no-op — it does NOT mint an instance (issue #230)', async () => {
+  // A producer that was never activated (createAttempts === 0) must not mint — and
+  // therefore not complete — an AgentInstance for a run that never activated. The
+  // last-chance create is gated on an activation attempt, matching ingest()'s
+  // lifecycle contract, and no misleading "no durable AgentInstance" warning fires.
+  const warnings = [];
+  const client = fakeClient();
+  const p = makeProducer(client, { logger: { info() {}, warn: (m) => warnings.push(m), debug() {} } });
+  await p.complete(true);
+  assert.equal(client.calls.create.length, 0);
+  assert.equal(client.calls.update.length, 0);
+  assert.equal(warnings.length, 0);
+});
+
+test('complete()\'s last-chance create is bounded — a hung createAgentInstance cannot block job settlement (issue #230)', async () => {
+  // The harness awaits complete() before it settles the job, so a hung final create
+  // must NOT block indefinitely (that could expire the job lease). Attempt 1 fails
+  // fast (so activate() returns); the last-chance attempt in complete() then hangs
+  // forever — complete() must still resolve, bounded by finalizeTimeoutMs.
+  const warnings = [];
+  let createCall = 0;
+  const client = {
+    calls: { create: [], update: [] },
+    createAgentInstance: (req) => {
+      client.calls.create.push(req);
+      createCall += 1;
+      if (createCall === 1) return Promise.reject(new Error('transient'));
+      return new Promise(() => {}); // the final attempt never settles
+    },
+    updateAgentInstance: async (req) => {
+      client.calls.update.push(req);
+      return { createdHistory: [] };
+    },
+  };
+  const p = makeProducer(client, {
+    finalizeTimeoutMs: 20,
+    logger: { info() {}, warn: (m) => warnings.push(m), debug() {} },
+  });
+  await p.activate();
+  assert.equal(client.calls.create.length, 1, 'activate made the first (fast-failing) attempt');
+  assert.equal(p.active, false);
+  // If complete() awaited the hung create unbounded this would never resolve and the
+  // test would time out; the bound makes it return.
+  await p.complete(true);
+  assert.equal(client.calls.create.length, 2, 'complete() made one final last-chance attempt');
+  assert.equal(p.active, false, 'still un-minted — the hung create was abandoned, not awaited');
+  assert.equal(
+    client.calls.update.filter((u) => u.status === 'COMPLETED').length,
+    0,
+    'no terminal COMPLETED update without a minted instance',
+  );
+  assert.ok(
+    warnings.some((m) => /no durable AgentInstance/.test(m)),
+    'warns that no durable instance was recorded',
+  );
+});
+
+test('activate() is bounded — a hung create cannot block the harness, and the attempt is retired so a later retry proceeds (issue #230)', async () => {
+  // c8ctl-plugin.js awaits activate() before it starts runAgentJob, so a hung
+  // createAgentInstance must NOT block activate() forever. The FIRST attempt hangs;
+  // activate() must still return (bounded by finalizeTimeoutMs), and the hung attempt
+  // must be RETIRED so a later ingest can start a fresh attempt rather than being
+  // wedged behind the stuck request. A subsequent attempt that succeeds mints normally.
+  let createCall = 0;
+  let t = Date.parse('2026-02-03T04:05:06.000Z');
+  const client = {
+    calls: { create: [], update: [] },
+    createAgentInstance: (req) => {
+      client.calls.create.push(req);
+      createCall += 1;
+      if (createCall === 1) return new Promise(() => {}); // first attempt hangs forever
+      return Promise.resolve({ agentInstanceKey: 'AGENT-9' });
+    },
+    updateAgentInstance: async (req) => {
+      client.calls.update.push(req);
+      return { createdHistory: [] };
+    },
+  };
+  const p = createAgentInstanceProducer({
+    camunda: client,
+    job: EXTERNAL_JOB,
+    profile: PROFILE,
+    envelope: ENVELOPE,
+    logger: nullLogger,
+    now: () => t,
+    finalizeTimeoutMs: 20,
+    createRetryBaseMs: 1000,
+    createRetryMaxMs: 30000,
+  });
+  // If activate() awaited the hung create unbounded this would never resolve.
+  await p.activate();
+  assert.equal(p.active, false, 'activate() returned without minting — the hung create was retired, not awaited');
+  assert.equal(client.calls.create.length, 1, 'one (hung) attempt so far');
+  // Past the backoff window, an ingest must be able to start a FRESH attempt — the
+  // retired hung attempt must not leave `creating` set and wedge every later retry.
+  t += 2000;
+  p.ingest({ sessionUpdate: 'agent_message_chunk', messageId: 'm1', content: { type: 'text', text: 'hello' } });
+  await p.drain();
+  assert.equal(client.calls.create.length, 2, 'a later ingest started a fresh attempt despite the hung first one');
+  assert.equal(p.active, true, 'the fresh attempt minted the instance');
+});
+
+test('a create that succeeds late for a RETIRED/finalized attempt is dropped — no orphaned mint or replay after complete() (issue #230)', async () => {
+  // If a bounded wait times out, the underlying create is left running. Should it
+  // succeed AFTER complete() has returned (job settled without a COMPLETED update),
+  // it must NOT set agentInstanceKey or replay buffered turns — that would resurrect
+  // an orphaned, non-terminal AgentInstance receiving late history. Here the final
+  // last-chance create is deferred past complete()'s bound, then released.
+  const warnings = [];
+  let createCall = 0;
+  let releaseSecond = null;
+  const secondSettled = new Promise((resolve) => { releaseSecond = resolve; });
+  const client = {
+    calls: { create: [], update: [] },
+    createAgentInstance: (req) => {
+      client.calls.create.push(req);
+      createCall += 1;
+      if (createCall === 1) return Promise.reject(new Error('transient')); // activate fails fast
+      // The final attempt resolves only when the test releases it — AFTER complete().
+      return secondSettled.then(() => ({ agentInstanceKey: 'AGENT-LATE' }));
+    },
+    updateAgentInstance: async (req) => {
+      client.calls.update.push(req);
+      return { createdHistory: [] };
+    },
+  };
+  const p = makeProducer(client, {
+    finalizeTimeoutMs: 20,
+    logger: { info() {}, warn: (m) => warnings.push(m), debug() {} },
+  });
+  await p.activate();
+  assert.equal(p.active, false);
+  await p.complete(true); // final attempt is still pending → bounded out + retired/finalized
+  assert.equal(p.active, false, 'complete() returned un-minted (the final create had not settled)');
+  assert.equal(
+    client.calls.update.filter((u) => u.status === 'COMPLETED').length,
+    0,
+    'no COMPLETED update was sent',
+  );
+  // Now let the retired create succeed. Its late result MUST be dropped.
+  releaseSecond();
+  await secondSettled;
+  await new Promise((r) => setImmediate(r)); // let the late .then run (deterministic)
+  assert.equal(p.active, false, 'the late create did NOT mint an orphaned instance');
+  assert.equal(
+    client.calls.update.length,
+    0,
+    'no buffered turns were replayed to a late-minted instance',
+  );
+});
+
+test('the FINAL last-chance create failure does not promise a retry that cannot happen (issue #230)', async () => {
+  // doCreate() is shared by the hot path (which WILL retry) and complete()'s one final
+  // attempt (which will NOT — the producer is about to be discarded). The finalization
+  // failure diagnostic must not tell operators to wait for a recovery that can't come.
+  const warnings = [];
+  const client = fakeClient({ failCreate: true }); // every create fails
+  const p = makeProducer(client, { logger: { info() {}, warn: (m) => warnings.push(m), debug() {} } });
+  await p.activate();
+  await p.complete(true);
+  const hotPathFailure = warnings.find((m) => /createAgentInstance failed \(attempt 1\)/.test(m));
+  const finalFailure = warnings.find((m) => /createAgentInstance failed \(attempt 2\)/.test(m));
+  assert.ok(hotPathFailure && /will retry/.test(hotPathFailure), 'the hot-path failure still promises a retry');
+  assert.ok(finalFailure, 'the final attempt failure was logged');
+  assert.ok(/no further create will be attempted/.test(finalFailure), 'the final failure does not promise a retry');
+  assert.ok(!/will retry/.test(finalFailure), 'the final failure does not say "will retry"');
+});
+
+test('create backoff is anchored on when the attempt settles, not when it starts (issue #230)', async () => {
+  // A create that FAILS SLOWLY must still pace the next attempt from the moment it
+  // settled. Anchoring on request START would let a failure that outlasts the backoff
+  // window trigger another request immediately, defeating the exponential pacing and
+  // risking a retry storm during an outage.
+  let t = Date.parse('2026-02-03T04:05:06.000Z');
+  const client = {
+    calls: { create: [], update: [] },
+    createAgentInstance: async (req) => {
+      client.calls.create.push(req);
+      t += 5000; // the failing attempt takes 5s — well past the 1s base backoff window
+      throw new Error('slow transient failure');
+    },
+    updateAgentInstance: async (req) => {
+      client.calls.update.push(req);
+      return { createdHistory: [] };
+    },
+  };
+  const p = createAgentInstanceProducer({
+    camunda: client,
+    job: EXTERNAL_JOB,
+    profile: PROFILE,
+    envelope: ENVELOPE,
+    logger: nullLogger,
+    now: () => t,
+    createRetryBaseMs: 1000,
+    createRetryMaxMs: 30000,
+  });
+  await p.activate();
+  assert.equal(client.calls.create.length, 1, 'one attempt so far');
+  // The failure advanced the clock 5s. START-anchored, now-lastCreateAttemptAt would be
+  // 5000 >= 1000 and this ingest would immediately re-attempt. SETTLE-anchored, we are
+  // back at the window start → throttled.
+  p.ingest({ sessionUpdate: 'agent_message_chunk', messageId: 'm1', content: { type: 'text', text: 'x' } });
+  await p.drain();
+  assert.equal(client.calls.create.length, 1, 'settle-anchored backoff throttles the immediate next attempt');
+  // Advance past the window measured from settle → the next ingest re-attempts.
+  t += 2000;
+  p.ingest({ sessionUpdate: 'agent_message_chunk', messageId: 'm2', content: { type: 'text', text: 'y' } });
+  await p.drain();
+  assert.equal(client.calls.create.length, 2, 'past the settle-anchored window a new attempt fires');
+});
+
+test('a hung HOT-PATH create is bounded and retired so it cannot wedge every later retry, and its timeout paces the backoff (issue #230)', async () => {
+  // ingest() → maybeStartCreate() starts a create that NOBODY awaits. If it hangs,
+  // `creating` must not stay set forever — that would buffer every later ingest while
+  // maybeStartCreate() refuses to launch another retry, deferring recovery to
+  // complete(). startCreate self-supervises: after finalizeTimeoutMs the hung attempt
+  // is RETIRED, freeing the slot. Retirement also records the attempt time so the next
+  // ingest respects the backoff instead of firing a fresh request immediately.
+  let createCall = 0;
+  let t = Date.parse('2026-02-03T04:05:06.000Z');
+  const client = {
+    calls: { create: [], update: [] },
+    createAgentInstance: (req) => {
+      client.calls.create.push(req);
+      createCall += 1;
+      if (createCall === 1) return Promise.reject(new Error('transient')); // activate fails fast
+      if (createCall === 2) return new Promise(() => {}); // hot-path attempt hangs forever
+      return Promise.resolve({ agentInstanceKey: 'AGENT-HOT' });
+    },
+    updateAgentInstance: async (req) => { client.calls.update.push(req); return { createdHistory: [] }; },
+  };
+  const timer = makeManualTimer();
+  const p = createAgentInstanceProducer({
+    camunda: client, job: EXTERNAL_JOB, profile: PROFILE, envelope: ENVELOPE,
+    logger: nullLogger, now: () => t, finalizeTimeoutMs: 20,
+    createRetryBaseMs: 1000, createRetryMaxMs: 30000, setTimer: timer,
+  });
+  await p.activate(); // attempt 1 fails fast
+  assert.equal(client.calls.create.length, 1);
+  // Past the backoff window, a hot-path ingest starts attempt 2 (which hangs). Nobody awaits it.
+  t += 2000;
+  p.ingest({ sessionUpdate: 'agent_message_chunk', messageId: 'm1', content: { type: 'text', text: 'a' } });
+  await p.drain();
+  assert.equal(client.calls.create.length, 2, 'the hot path started a second (hung) attempt');
+  // While it is still hung and un-retired, a later ingest cannot start a fresh attempt.
+  t += 5000;
+  p.ingest({ sessionUpdate: 'agent_message_chunk', messageId: 'm2', content: { type: 'text', text: 'b' } });
+  await p.drain();
+  assert.equal(client.calls.create.length, 2, 'no new attempt while the hung one still owns the slot');
+  // Deterministically fire the create-retirement deadline (finalizeTimeoutMs=20) instead
+  // of sleeping on wall-clock time: retirement records lastCreateAttemptAt=now().
+  await timer.fire();
+  // Retirement recorded lastCreateAttemptAt=now(): an ingest at the SAME clock is still
+  // throttled by the backoff, proving the timeout paced the next attempt (issue #230).
+  p.ingest({ sessionUpdate: 'agent_message_chunk', messageId: 'm3', content: { type: 'text', text: 'c' } });
+  await p.drain();
+  assert.equal(client.calls.create.length, 2, 'retirement anchored the backoff — the immediate next ingest is throttled');
+  // Past the backoff window (measured from retirement), the freed slot lets a fresh attempt mint.
+  t += 5000;
+  p.ingest({ sessionUpdate: 'agent_message_chunk', messageId: 'm4', content: { type: 'text', text: 'd' } });
+  await p.drain();
+  assert.equal(client.calls.create.length, 3, 'a fresh attempt fired after the hung one was retired');
+  assert.equal(p.active, true, 'the fresh attempt minted the instance');
+});
+
+test('a hung terminal COMPLETED update is bounded so it cannot hold the lease and block job settlement (issue #230)', async () => {
+  // The harness awaits complete() before it settles the job. The terminal update is
+  // awaited directly (so its outcome can be observed + retried), so a hung
+  // updateAgentInstance must be BOUNDED (finalizeTimeoutMs) — otherwise it holds the
+  // lease until expiry and stalls settlement during an AgentInstance outage.
+  const warnings = [];
+  const client = {
+    calls: { create: [], update: [] },
+    createAgentInstance: async (req) => { client.calls.create.push(req); return { agentInstanceKey: 'AGENT-T' }; },
+    updateAgentInstance: (req) => {
+      client.calls.update.push(req);
+      if (req.status === 'COMPLETED') return new Promise(() => {}); // the terminal update hangs forever
+      return Promise.resolve({ createdHistory: [] });
+    },
+  };
+  const p = makeProducer(client, {
+    finalizeTimeoutMs: 20,
+    logger: { info() {}, warn: (m) => warnings.push(m), debug() {} },
+  });
+  await p.activate();
+  assert.equal(p.active, true, 'the instance minted');
+  // If complete() awaited the hung terminal update unbounded, this would never resolve.
+  await p.complete(true);
+  assert.ok(
+    warnings.some((m) => /terminal status update to COMPLETED timed out/.test(m) && /MANUAL RECONCILIATION REQUIRED/.test(m)),
+    'the hung terminal update was bounded out and flagged for manual reconciliation',
+  );
+});
+
+test('a retired create attempt that FAILS late is reported quietly, not as a misleading "will retry" (issue #230)', async () => {
+  // A timed-out attempt keeps running and may reject AFTER it was retired and a newer
+  // attempt has minted the instance. That late rejection must not emit the ordinary
+  // "will retry" warning (maybeStartCreate won't retry once a key/finalization is
+  // latched) — reading the shared attempt counter and promising a retry would mislead.
+  const warnings = [];
+  const debugs = [];
+  let createCall = 0;
+  let rejectFirst = null;
+  const firstSettled = new Promise((_resolve, reject) => { rejectFirst = () => reject(new Error('late stale lease')); });
+  let t = Date.parse('2026-02-03T04:05:06.000Z');
+  const client = {
+    calls: { create: [], update: [] },
+    createAgentInstance: (req) => {
+      client.calls.create.push(req);
+      createCall += 1;
+      if (createCall === 1) return firstSettled; // hangs, then rejects late (after retirement)
+      return Promise.resolve({ agentInstanceKey: 'AGENT-R' });
+    },
+    updateAgentInstance: async (req) => { client.calls.update.push(req); return { createdHistory: [] }; },
+  };
+  const p = createAgentInstanceProducer({
+    camunda: client, job: EXTERNAL_JOB, profile: PROFILE, envelope: ENVELOPE,
+    logger: { info() {}, warn: (m) => warnings.push(m), debug: (m) => debugs.push(m) },
+    now: () => t, finalizeTimeoutMs: 20, createRetryBaseMs: 1000, createRetryMaxMs: 30000,
+  });
+  await p.activate(); // attempt 1 hangs → bounded out + retired
+  assert.equal(p.active, false);
+  // A later ingest mints via a fresh attempt.
+  t += 2000;
+  p.ingest({ sessionUpdate: 'agent_message_chunk', messageId: 'm1', content: { type: 'text', text: 'x' } });
+  await p.drain();
+  assert.equal(p.active, true, 'a fresh attempt minted the instance');
+  // Now the ORIGINAL (retired) attempt rejects late.
+  rejectFirst();
+  await firstSettled.catch(() => {});
+  await new Promise((r) => setImmediate(r)); // let the late catch run (deterministic)
+  const lateWarn = warnings.find((m) => /createAgentInstance failed \(attempt 1\)/.test(m) && /will retry/.test(m));
+  assert.equal(lateWarn, undefined, "the retired attempt's late failure did NOT emit a misleading \"will retry\" warning");
+  assert.ok(
+    debugs.some((m) => /failed late for a retired attempt/.test(m)),
+    'the late failure was reported quietly at debug instead',
+  );
+});
+
+test('a create that resolves with a BLANK/whitespace agentInstanceKey stays retryable — no orphaned mint against an invalid key (issue #230)', async () => {
+  // A resolved response carrying agentInstanceKey: '' (or whitespace) is NOT a mint —
+  // updates need a usable key. It must take the keyless retry path, not latch state,
+  // log a mint, and replay the pre-mint buffer against an invalid key.
+  const warnings = [];
+  let createCall = 0;
+  let t = Date.parse('2026-02-03T04:05:06.000Z');
+  const client = {
+    calls: { create: [], update: [] },
+    createAgentInstance: async (req) => {
+      client.calls.create.push(req);
+      createCall += 1;
+      if (createCall === 1) return { agentInstanceKey: '   ' }; // blank/whitespace-only key
+      return { agentInstanceKey: 'AGENT-OK' };
+    },
+    updateAgentInstance: async (req) => { client.calls.update.push(req); return { createdHistory: [] }; },
+  };
+  const p = createAgentInstanceProducer({
+    camunda: client, job: EXTERNAL_JOB, profile: PROFILE, envelope: ENVELOPE,
+    logger: { info() {}, warn: (m) => warnings.push(m), debug() {} },
+    now: () => t, createRetryBaseMs: 1000, createRetryMaxMs: 30000,
+  });
+  await p.activate();
+  assert.equal(p.active, false, 'a blank key does not mint — it takes the keyless retry path');
+  assert.equal(client.calls.update.length, 0, 'nothing was replayed against the invalid key');
+  assert.ok(
+    warnings.some((m) => /returned no agentInstanceKey \(attempt 1\)/.test(m) && /will retry/.test(m)),
+    'the blank key is reported as a keyless (retryable) result',
+  );
+  // A later attempt returning a REAL key mints normally.
+  t += 2000;
+  p.ingest({ sessionUpdate: 'agent_message_chunk', messageId: 'm1', content: { type: 'text', text: 'x' } });
+  await p.drain();
+  assert.equal(client.calls.create.length, 2, 'a fresh attempt fired past the backoff window');
+  assert.equal(p.active, true, 'the valid key minted the instance');
+});
+
+test('a keyless create result that arrives late for a retired attempt is dropped, not logged as "will retry" (issue #230)', async () => {
+  // The no-key branch sits ABOVE the late-result/finalization guard, so a timed-out
+  // create that later resolves with {} must ALSO be recognised as retired — emitting
+  // "will retry" after a newer generation (or complete()) has moved on is misleading.
+  const warnings = [];
+  const debugs = [];
+  let createCall = 0;
+  let resolveFirst = null;
+  const firstSettled = new Promise((resolve) => { resolveFirst = () => resolve({}); }); // resolves keyless, late
+  let t = Date.parse('2026-02-03T04:05:06.000Z');
+  const client = {
+    calls: { create: [], update: [] },
+    createAgentInstance: (req) => {
+      client.calls.create.push(req);
+      createCall += 1;
+      if (createCall === 1) return firstSettled; // hangs, then resolves keyless after retirement
+      return Promise.resolve({ agentInstanceKey: 'AGENT-K' });
+    },
+    updateAgentInstance: async (req) => { client.calls.update.push(req); return { createdHistory: [] }; },
+  };
+  const p = createAgentInstanceProducer({
+    camunda: client, job: EXTERNAL_JOB, profile: PROFILE, envelope: ENVELOPE,
+    logger: { info() {}, warn: (m) => warnings.push(m), debug: (m) => debugs.push(m) },
+    now: () => t, finalizeTimeoutMs: 20, createRetryBaseMs: 1000, createRetryMaxMs: 30000,
+  });
+  await p.activate(); // attempt 1 hangs → bounded out + retired
+  assert.equal(p.active, false);
+  t += 2000;
+  p.ingest({ sessionUpdate: 'agent_message_chunk', messageId: 'm1', content: { type: 'text', text: 'x' } });
+  await p.drain();
+  assert.equal(p.active, true, 'a fresh attempt minted the instance');
+  // Now the ORIGINAL (retired) attempt resolves late with no key.
+  resolveFirst();
+  await firstSettled;
+  await new Promise((r) => setImmediate(r)); // let the late .then run (deterministic)
+  const lateNoKeyWarn = warnings.find((m) => /returned no agentInstanceKey \(attempt 1\)/.test(m) && /will retry/.test(m));
+  assert.equal(lateNoKeyWarn, undefined, 'the retired attempt\'s late keyless result did NOT emit a misleading "will retry" warning');
+  assert.ok(
+    debugs.some((m) => /resolved without a usable key late for a retired attempt/.test(m)),
+    'the late keyless result was reported quietly at debug instead',
+  );
+});
+
+test('a retired attempt\'s late settle does not overwrite a newer attempt\'s backoff anchor (issue #230)', async () => {
+  // A retired attempt already had its retirement time recorded. If its eventual late
+  // settle overwrote the shared lastCreateAttemptAt, a NEWER (failed) attempt's backoff
+  // anchor would be pushed forward to the old request's completion time, postponing the
+  // next retry. doCreate's finally must only record while its generation is current.
+  let createCall = 0;
+  let rejectFirst = null;
+  const firstSettled = new Promise((_resolve, reject) => { rejectFirst = () => reject(new Error('late stale lease')); });
+  let t = Date.parse('2026-02-03T04:05:06.000Z');
+  const client = {
+    calls: { create: [], update: [] },
+    createAgentInstance: (req) => {
+      client.calls.create.push(req);
+      createCall += 1;
+      if (createCall === 1) return firstSettled;               // hangs → retired, rejects late
+      if (createCall === 2) return Promise.reject(new Error('fast fail')); // newer attempt fails fast
+      return Promise.resolve({ agentInstanceKey: 'AGENT-Z' });  // attempt 3 mints
+    },
+    updateAgentInstance: async (req) => { client.calls.update.push(req); return { createdHistory: [] }; },
+  };
+  const timer = makeManualTimer();
+  const p = createAgentInstanceProducer({
+    camunda: client, job: EXTERNAL_JOB, profile: PROFILE, envelope: ENVELOPE,
+    logger: nullLogger, now: () => t, finalizeTimeoutMs: 20,
+    createRetryBaseMs: 1000, createRetryMaxMs: 30000, setTimer: timer,
+  });
+  const activated = p.activate();        // attempt 1 hangs; activate awaits the bounded create
+  await timer.fire();                    // fire the retirement deadline WHILE activate awaits it (anchor at T0)
+  await activated;
+  t += 2000;                             // T0+2000
+  p.ingest({ sessionUpdate: 'agent_message_chunk', messageId: 'm1', content: { type: 'text', text: 'a' } });
+  await p.drain();
+  assert.equal(client.calls.create.length, 2, 'attempt 2 fired past the backoff window and failed fast (anchor = T0+2000)');
+  // Advance, THEN let the retired attempt 1 reject late. Its finally must NOT re-anchor
+  // the backoff to now (T0+3000); the anchor must stay attempt 2's settle (T0+2000).
+  t += 1000;                             // T0+3000
+  rejectFirst();
+  await firstSettled.catch(() => {});
+  await new Promise((r) => setImmediate(r)); // let the late catch/finally run (deterministic)
+  // At T0+4500: anchor T0+2000 → elapsed 2500 >= backoff(2)=2000 → a fresh attempt fires.
+  // Had the late settle re-anchored to T0+3000, elapsed would be 1500 < 2000 → throttled.
+  t += 1500;                             // T0+4500
+  p.ingest({ sessionUpdate: 'agent_message_chunk', messageId: 'm2', content: { type: 'text', text: 'b' } });
+  await p.drain();
+  assert.equal(client.calls.create.length, 3, 'the retired late settle did not postpone the next retry');
+  assert.equal(p.active, true, 'attempt 3 minted the instance');
+});
+
+test('a hung history append is bounded so complete()\'s queue drain cannot stall settlement (issue #230)', async () => {
+  // Appends are serialized on the queue and complete() drains it before settling the
+  // job. A history append that HANGS (rather than rejects) must be bounded
+  // (finalizeTimeoutMs) or the drain — and job settlement — blocks until lease expiry.
+  let signalCompletedA;
+  const completedSeenA = new Promise((r) => { signalCompletedA = r; });
+  const client = {
+    calls: { create: [], update: [] },
+    createAgentInstance: async (req) => { client.calls.create.push(req); return { agentInstanceKey: 'AGENT-A' }; },
+    updateAgentInstance: (req) => {
+      client.calls.update.push(req);
+      if (req.status === 'COMPLETED') { signalCompletedA(); return Promise.resolve({ createdHistory: [] }); }
+      return new Promise(() => {}); // history appends hang forever
+    },
+  };
+  const p = makeProducer(client, { finalizeTimeoutMs: 20 });
+  await p.activate();
+  assert.equal(p.active, true);
+  // Stream a turn whose append hangs. If the append were unbounded, complete()'s drain
+  // would never resolve and this test would time out.
+  p.ingest({ sessionUpdate: 'agent_message_chunk', messageId: 'm1', content: { type: 'text', text: 'hi' } });
+  await p.complete(true);
+  // complete() returned promptly (the hung append was bounded out) rather than stalling
+  // settlement until lease expiry. Because the drain timed out with the append still in
+  // flight, the terminal COMPLETED is SERIALIZED behind it (not raced), landing in the
+  // background once the bounded append settles.
+  // Await a deterministic completion signal from the fake (resolved the instant the
+  // terminal COMPLETED update is issued), not a wall-clock deadline, so pass/fail does
+  // not depend on scheduler load (issue #230).
+  await completedSeenA;
+  assert.ok(
+    client.calls.update.some((u) => u.status === 'COMPLETED'),
+    'the terminal COMPLETED update still ran once the hung append was bounded out',
+  );
+});
+
+test('retiring a hung create emits a loud (warn-once) timeout diagnostic and caps concurrent in-flight creates so retries cannot overlap (issue #230)', async () => {
+  // A hung createAgentInstance is bounded out and RETIRED, freeing the `creating` slot
+  // for a retry — but its SDK POST is uncancellable and stays in flight. Two guarantees:
+  // (1) retirement is logged at warn (once) so a timed-out create is visible even when a
+  // later retry succeeds; (2) maybeStartCreate() will NOT launch a fresh attempt while
+  // `maxInFlightCreates` POSTs are still outstanding, so retirement-driven retries can't
+  // accumulate overlapping requests against a hung engine. Once an in-flight request
+  // settles, the retry path re-opens.
+  const warnings = [];
+  const logger = { info() {}, warn: (m) => warnings.push(m), debug() {} };
+  let createCall = 0;
+  let rejectFirst = null;
+  const firstHung = new Promise((_resolve, reject) => { rejectFirst = () => reject(new Error('late transport error')); });
+  let t = Date.parse('2026-02-03T04:05:06.000Z');
+  const client = {
+    calls: { create: [], update: [] },
+    createAgentInstance: (req) => {
+      client.calls.create.push(req);
+      createCall += 1;
+      if (createCall === 1) return firstHung;                    // hangs → bounded → retired, still in flight
+      return Promise.resolve({ agentInstanceKey: 'AGENT-CAP' }); // a later retry mints
+    },
+    updateAgentInstance: async (req) => { client.calls.update.push(req); return { createdHistory: [] }; },
+  };
+  const p = createAgentInstanceProducer({
+    camunda: client, job: EXTERNAL_JOB, profile: PROFILE, envelope: ENVELOPE,
+    logger, now: () => t, finalizeTimeoutMs: 20, maxInFlightCreates: 1,
+    createRetryBaseMs: 1000, createRetryMaxMs: 30000,
+  });
+  // activate() awaits the bounded create; the hung attempt is retired on the deadline.
+  await p.activate();
+  assert.equal(p.active, false, 'the hung create was retired, not minted');
+  assert.equal(client.calls.create.length, 1, 'one (hung, still in-flight) attempt so far');
+  assert.equal(
+    warnings.filter((m) => /did not settle within 20ms/.test(m)).length,
+    1,
+    'retirement emitted exactly one warn-level timeout diagnostic',
+  );
+  // The retired attempt's POST is still in flight (count = 1 = cap), so even well past
+  // the backoff window a fresh retry must NOT start — that would overlap the hung POST.
+  t += 5000;
+  p.ingest({ sessionUpdate: 'agent_message_chunk', messageId: 'm1', content: { type: 'text', text: 'a' } });
+  await p.drain();
+  assert.equal(client.calls.create.length, 1, 'the in-flight cap blocked an overlapping retry while the hung POST is outstanding');
+  // Let the hung POST finally settle (transport error): the in-flight slot frees, so a
+  // later ingest can start a fresh attempt, which mints the instance.
+  rejectFirst();
+  await firstHung.catch(() => {});
+  await new Promise((r) => setImmediate(r)); // flush the late catch/finally (in-flight decrement)
+  t += 5000;
+  p.ingest({ sessionUpdate: 'agent_message_chunk', messageId: 'm2', content: { type: 'text', text: 'b' } });
+  await p.drain();
+  assert.equal(client.calls.create.length, 2, 'once the in-flight POST settled, the retry path re-opened');
+  assert.equal(p.active, true, 'the fresh attempt minted the instance');
+});
+
+test('a hung FINAL last-chance create is retired with the no-further-retry diagnostic, not a promise of a hot-path retry that cannot happen (issue #230)', async () => {
+  // retireCreate() is reached for both hot-path attempts (which a later ingest WILL
+  // retry) and complete()'s one FINAL last-chance attempt (after which `finalized`
+  // latches, so NO retry can follow). The retirement diagnostic must match: the hot-path
+  // retirement promises a later mint; the final-attempt retirement must say no further
+  // create will be attempted (mirroring doCreate's `final` failure clause).
+  const msgs = [];
+  const logger = { info() {}, warn: (m) => msgs.push(m), debug: (m) => msgs.push(m) };
+  const client = {
+    calls: { create: [], update: [] },
+    createAgentInstance: (req) => { client.calls.create.push(req); return new Promise(() => {}); }, // every create hangs
+    updateAgentInstance: async (req) => { client.calls.update.push(req); return { createdHistory: [] }; },
+  };
+  // Default maxInFlightCreates (3) leaves room for the final attempt to start.
+  const p = makeProducer(client, { logger, finalizeTimeoutMs: 20 });
+  await p.activate();               // hot-path attempt 1 hangs → retired (promises a retry)
+  await p.complete(true);           // final attempt 2 hangs → retired (no further retry)
+  const hotRetire = msgs.find((m) => /did not settle within 20ms \(attempt 1\)/.test(m));
+  const finalRetire = msgs.find((m) => /did not settle within 20ms \(attempt 2\)/.test(m));
+  assert.ok(hotRetire && /a later hot-path retry will attempt to mint/.test(hotRetire),
+    'the hot-path retirement still promises a later retry');
+  assert.ok(finalRetire, 'the final-attempt retirement was logged');
+  assert.ok(/no further create will be attempted \(final attempt/.test(finalRetire),
+    'the final-attempt retirement uses the no-further-retry diagnostic');
+  assert.ok(!/a later hot-path retry will attempt to mint/.test(finalRetire),
+    'the final-attempt retirement does not promise a hot-path retry that cannot happen');
+});
+
+test('complete()\'s FINAL last-chance create BYPASSES the maxInFlightCreates cap — the terminal durability attempt is always made once, even when retired POSTs still saturate the cap (issue #230)', async () => {
+  // The circuit breaker in maybeStartCreate() bounds HOT-PATH retirement-driven retries
+  // so overlapping create POSTs can't storm during an outage. But complete()'s ONE final
+  // last-chance attempt is the durability backstop, and it runs at most once per job — it
+  // is NOT a storm. A retired-but-hung POST that keeps the cap "saturated" is uncancellable
+  // and may never settle, so the stale count does NOT prove the engine is still hung: if
+  // the engine has recovered, the final POST would SUCCEED. Skipping it on a stale count
+  // would strand a recoverable run with no durable record (the "cap permanently stops
+  // recovery" case). So the final attempt bypasses the cap: a bounded, one-time +1
+  // overshoot, always attempted once.
+  const warnings = [];
+  const logger = { info() {}, warn: (m) => warnings.push(m), debug() {} };
+  let createCall = 0;
+  const client = {
+    calls: { create: [], update: [] },
+    createAgentInstance: (req) => {
+      client.calls.create.push(req);
+      createCall += 1;
+      if (createCall === 1) return new Promise(() => {}); // attempt 1 hangs, stays in flight (saturates cap)
+      return Promise.resolve({ agentInstanceKey: 'AGENT-FINAL' }); // recovered engine: final attempt mints
+    },
+    updateAgentInstance: async (req) => { client.calls.update.push(req); return { createdHistory: [] }; },
+  };
+  const p = makeProducer(client, { logger, finalizeTimeoutMs: 20, maxInFlightCreates: 1 });
+  await p.activate();               // attempt 1 hangs → retired, but its POST is still in flight (count = 1 = cap)
+  assert.equal(client.calls.create.length, 1, 'one (hung, still in-flight) attempt after activate');
+  await p.complete(true);
+  // Despite the cap being saturated by the hung attempt-1 POST, complete() still made its
+  // single terminal attempt (create.length === 2) — and here the engine had recovered, so
+  // it minted the instance and drove the terminal COMPLETED, exactly the recovery the old
+  // cap-honoring behavior would have wrongly skipped.
+  assert.equal(client.calls.create.length, 2, 'the final last-chance attempt was made once, bypassing the saturated cap');
+  assert.equal(p.active, true, 'the final attempt minted the instance on the recovered engine');
+  assert.ok(
+    client.calls.update.some((u) => u.status === 'COMPLETED'),
+    'the terminal COMPLETED update ran after the final attempt minted the instance',
+  );
+});
+
+
+test('complete() bounds the AGGREGATE append drain and SERIALIZES the terminal COMPLETED behind pending appends — it neither waits for every hung append serially nor races the terminal update ahead of them (issue #230)', async () => {
+  // Each append is individually bounded, but the queue is serialized: N hung appends
+  // would take up to N×finalizeTimeoutMs to drain, holding the lease that whole span
+  // before the terminal COMPLETED update even begins. complete() bounds the TOTAL drain
+  // at finalizeTimeoutMs. When that bound wins the appends are STILL in flight, so the
+  // terminal COMPLETED must NOT be driven directly (a concurrent request could
+  // terminalize the instance before a delayed append lands, reordering/losing it).
+  // Instead it is ENQUEUED behind the pending appends: bounded, never raced, always
+  // ordered last.
+  let signalCompletedDR;
+  const completedSeenDR = new Promise((r) => { signalCompletedDR = r; });
+  const client = {
+    calls: { create: [], update: [] },
+    createAgentInstance: async (req) => { client.calls.create.push(req); return { agentInstanceKey: 'AGENT-DR' }; },
+    updateAgentInstance: (req) => {
+      client.calls.update.push(req);
+      if (req.status === 'COMPLETED') { signalCompletedDR(); return Promise.resolve({ createdHistory: [] }); }
+      return new Promise(() => {}); // every history append hangs forever (bounded per-call)
+    },
+  };
+  const p = makeProducer(client, { finalizeTimeoutMs: 20 });
+  await p.activate();
+  // Queue six independent turns (distinct messageIds each flush the previous). Their
+  // appends all hang; serialized, an UNBOUNDED drain would issue all six SDK calls (one
+  // per finalizeTimeoutMs window) before COMPLETED. The bounded drain issues far fewer.
+  for (let i = 0; i < 6; i += 1) {
+    p.ingest({ sessionUpdate: 'agent_message_chunk', messageId: `m${i}`, content: { type: 'text', text: `t${i}` } });
+  }
+  await p.complete(true);
+  // The aggregate drain was bounded: only a slice of the six hung appends ran before
+  // complete() returned (an unbounded drain would have issued all six first).
+  const historyAtReturn = client.calls.update.filter((u) => u.status !== 'COMPLETED').length;
+  assert.ok(
+    historyAtReturn < 6,
+    `the aggregate drain was bounded — only ${historyAtReturn} of 6 hung appends were issued before complete() returned`,
+  );
+  // The terminal COMPLETED was NOT raced ahead of the still-pending appends: at the
+  // moment complete() returns it is enqueued behind them, so it has not been issued yet.
+  assert.ok(
+    !client.calls.update.some((u) => u.status === 'COMPLETED'),
+    'the terminal COMPLETED update was serialized behind the pending appends, not raced ahead of them',
+  );
+  // Let the background queue drain (each hung append is bounded at finalizeTimeoutMs).
+  // Await a deterministic completion signal from the fake instead of a wall-clock
+  // deadline, so ordering assertions do not depend on scheduler load (issue #230).
+  await completedSeenDR;
+  // The terminal COMPLETED eventually lands, and ORDERING is preserved: it is the final
+  // update, after all six history appends were issued (never reordered/lost).
+  const completedIdx = client.calls.update.findIndex((u) => u.status === 'COMPLETED');
+  assert.ok(completedIdx !== -1, 'the terminal COMPLETED update eventually ran in the background');
+  assert.equal(completedIdx, client.calls.update.length - 1, 'COMPLETED is the last update issued');
+  assert.equal(
+    client.calls.update.slice(0, completedIdx).filter((u) => u.status !== 'COMPLETED').length,
+    6,
+    'all six history appends were issued before COMPLETED (ordering preserved)',
+  );
+});
+
+test('a FINALIZED producer is inert to late ACP frames — nothing appended after COMPLETED (issue #230)', async () => {
+  // spawnCaptureAcp can invoke onAcpUpdate (timeout/abort cleanup) after finish()
+  // resolved, i.e. after complete() finalized the producer. A late frame must be
+  // dropped, not appended after the terminal update nor buffered after finalization.
+  const client = {
+    calls: { create: [], update: [] },
+    createAgentInstance: async (req) => { client.calls.create.push(req); return { agentInstanceKey: 'AGENT-F' }; },
+    updateAgentInstance: async (req) => { client.calls.update.push(req); return { createdHistory: [] }; },
+  };
+  const p = makeProducer(client, { finalizeTimeoutMs: 1000 });
+  await p.activate();
+  await p.complete(true);
+  const updatesAfterComplete = client.calls.update.length;
+  // A late frame arriving after finalization must be a no-op.
+  p.ingest({ sessionUpdate: 'agent_message_chunk', messageId: 'zz', content: { type: 'text', text: 'late' } });
+  await p.drain();
+  assert.equal(client.calls.update.length, updatesAfterComplete, 'the late frame appended nothing');
+});
+
+test('pre-mint ACP updates are buffered and replayed once a retried create succeeds (issue #230)', async () => {
+  // The create fails on activate; turns then stream in while it is still failing.
+  // They must be buffered and durably replayed against the instance once a later
+  // retry mints it — a transient create failure must not lose the agent's work.
+  const client = fakeClient({ failCreateTimes: 1 });
+  let t = Date.parse('2026-02-03T04:05:06.000Z');
+  const p = createAgentInstanceProducer({
+    camunda: client,
+    job: EXTERNAL_JOB,
+    profile: PROFILE,
+    envelope: ENVELOPE,
+    logger: nullLogger,
+    now: () => t,
+    createRetryBaseMs: 1000,
+    createRetryMaxMs: 30000,
+  });
+
+  await p.activate();
+  assert.equal(p.active, false);
+
+  // These arrive before the instance mints — throttled within the backoff window, so
+  // no re-attempt yet, but they must be retained for replay.
+  p.ingest({ sessionUpdate: 'agent_message_chunk', messageId: 'm1', content: { type: 'text', text: 'pre-one' } });
+  p.ingest({ sessionUpdate: 'agent_message_chunk', messageId: 'm2', content: { type: 'text', text: 'pre-two' } });
+  await p.drain();
+  assert.equal(client.calls.create.length, 1, 'no re-attempt inside the backoff window');
+  assert.equal(client.calls.update.length, 0, 'nothing appended before the mint');
+
+  // Advance past the backoff window; the next ingest re-attempts the create, which
+  // now succeeds and replays the buffered turns.
+  t += 2000;
+  p.ingest({ sessionUpdate: 'agent_message_chunk', messageId: 'm3', content: { type: 'text', text: 'pre-three' } });
+  await p.complete(true);
+
+  const texts = client.calls.update
+    .filter((u) => Array.isArray(u.history))
+    .map((u) => u.history[0].content?.[0]?.text)
+    .filter(Boolean);
+  assert.deepEqual(
+    texts,
+    ['pre-one', 'pre-two', 'pre-three'],
+    'every pre-mint turn is replayed in arrival order',
+  );
+  assert.equal(client.calls.update.filter((u) => u.status === 'COMPLETED').length, 1);
+});
+
+test('the pre-mint replay buffer is bounded — overflow drops the newest, keeping a contiguous prefix', async () => {
+  // A create that keeps failing must not let the buffer grow without bound.
+  const client = fakeClient({ failCreate: true });
+  const p = makeProducer(client, { preMintBufferMax: 2 });
+  await p.activate();
+  assert.equal(p.active, false);
+  for (const text of ['a', 'b', 'c', 'd']) {
+    p.ingest({ sessionUpdate: 'agent_message_chunk', messageId: `m-${text}`, content: { type: 'text', text } });
+  }
+  await p.drain();
+  // Now let the create succeed and complete; only the first two buffered turns survive.
+  const client2 = client;
+  // Swap create to succeed for the final attempt.
+  client2.createAgentInstance = async (req) => {
+    client2.calls.create.push(req);
+    return { agentInstanceKey: 'AGENT-1' };
+  };
+  await p.complete(true);
+  const texts = client2.calls.update
+    .filter((u) => Array.isArray(u.history))
+    .map((u) => u.history[0].content?.[0]?.text)
+    .filter(Boolean);
+  assert.deepEqual(texts, ['a', 'b'], 'buffer capped at 2; newest updates dropped');
+});
+
+test('a repeated activate() respects the create backoff (no engine hammering) (issue #230)', async () => {
+  // Every create fails; calling activate() repeatedly inside the backoff window must
+  // NOT fire a fresh create each time — the pacing applies to activate() too.
+  const client = fakeClient({ failCreate: true });
+  let t = Date.parse('2026-02-03T04:05:06.000Z');
+  const p = createAgentInstanceProducer({
+    camunda: client,
+    job: EXTERNAL_JOB,
+    profile: PROFILE,
+    envelope: ENVELOPE,
+    logger: nullLogger,
+    now: () => t,
+    createRetryBaseMs: 1000,
+    createRetryMaxMs: 30000,
+  });
+  await p.activate();
+  assert.equal(client.calls.create.length, 1);
+  await p.activate(); // inside the backoff window → throttled, no new attempt
+  await p.activate();
+  assert.equal(client.calls.create.length, 1, 'reactivation inside backoff makes no new create');
+  t += 2000; // past the window
+  await p.activate();
+  assert.equal(client.calls.create.length, 2, 'a reactivation past the window re-attempts');
+});
+
+test('complete() does not falsely report status→COMPLETED when the terminal update fails', async () => {
+  // The COMPLETED update is rejected; the completion diagnostic must warn and NOT
+  // claim a terminal transition (issue #230).
+  const lines = { info: [], warn: [] };
+  const logger = {
+    info: (m) => lines.info.push(m),
+    warn: (m) => lines.warn.push(m),
+    debug() {},
+  };
+  let failUpdates = true;
+  const client = {
+    calls: { create: [], update: [] },
+    createAgentInstance: async (req) => {
+      client.calls.create.push(req);
+      return { agentInstanceKey: 'AGENT-1' };
+    },
+    updateAgentInstance: async (req) => {
+      client.calls.update.push(req);
+      if (failUpdates) throw new Error('HTTP 409: non-terminal');
+      return {};
+    },
+  };
+  const p = makeProducer(client, { logger });
+  await p.activate();
+  await p.complete(true);
+  assert.ok(
+    lines.warn.some((m) => /terminal status update to COMPLETED failed/.test(m)),
+    'a rejected terminal update is warned',
+  );
+  assert.ok(
+    lines.warn.some((m) => /MANUAL RECONCILIATION REQUIRED/.test(m)),
+    'a permanently-rejected terminal update flags manual reconciliation (no reactivation retries it)',
+  );
+  assert.ok(
+    !lines.info.some((m) => /status→COMPLETED/.test(m)),
+    'the info line does not falsely claim status→COMPLETED',
+  );
+  assert.ok(
+    lines.info.some((m) => /manual reconciliation required/.test(m)),
+    'the info line reports the non-terminal, manual-reconciliation outcome',
+  );
+  // The terminal update is retried (not swallowed once) before giving up.
+  assert.ok(
+    client.calls.update.filter((u) => u.status === 'COMPLETED').length >= 2,
+    'the terminal update is retried before reporting manual reconciliation',
+  );
+});
+
+test('a create that resolves without an agentInstanceKey stays retryable and mints + replays on a later attempt (issue #230)', async () => {
+  // The no-key success path: createAgentInstance resolves but carries no key. The
+  // producer must NOT disable or drop the run — it stays retryable, buffers the
+  // pre-mint updates, and a later attempt that returns a key mints and replays them.
+  const client = fakeClient({ noKeyTimes: 1 });
+  let t = Date.parse('2026-02-03T04:05:06.000Z');
+  const p = createAgentInstanceProducer({
+    camunda: client,
+    job: EXTERNAL_JOB,
+    profile: PROFILE,
+    envelope: ENVELOPE,
+    logger: nullLogger,
+    now: () => t,
+    createRetryBaseMs: 1000,
+    createRetryMaxMs: 30000,
+  });
+
+  // First attempt resolves without a key → not minted, not disabled, still retryable.
+  const ok = await p.activate();
+  assert.equal(ok, false);
+  assert.equal(p.active, false);
+  assert.equal(client.calls.create.length, 1);
+
+  // A turn streams in while un-minted — buffered (not dropped), no append yet.
+  p.ingest({ sessionUpdate: 'agent_message_chunk', messageId: 'nk-1', content: { type: 'text', text: 'buffered' } });
+  await p.drain();
+  assert.equal(client.calls.update.length, 0, 'nothing appended before the mint');
+
+  // Past the backoff window, the next attempt returns a key → mint + replay.
+  t += 2000;
+  p.ingest({ sessionUpdate: 'agent_message_chunk', messageId: 'nk-2', content: { type: 'text', text: 'after-mint' } });
+  await p.complete(true);
+  assert.equal(p.active, true, 'a later keyed attempt mints the instance');
+  assert.ok(client.calls.create.length >= 2, 'the keyless attempt was retried');
+
+  const texts = client.calls.update
+    .filter((u) => Array.isArray(u.history))
+    .map((u) => u.history[0].content?.[0]?.text)
+    .filter(Boolean);
+  assert.ok(
+    texts.includes('buffered') && texts.includes('after-mint'),
+    'the update buffered during the keyless window replays once a later attempt mints',
+  );
+  assert.equal(client.calls.update.filter((u) => u.status === 'COMPLETED').length, 1);
+});
+
+test('the pre-mint replay buffer is bounded by an approximate byte budget, and the dropped count is reported (issue #230)', async () => {
+  // A raw-count cap alone lets a token-chunk storm exhaust the buffer, so the buffer
+  // is ALSO bounded by bytes. Once the byte budget is exceeded, further updates are
+  // dropped (keeping a contiguous prefix) and the dropped count is surfaced on replay
+  // so the truncation is visible rather than silent.
+  const lines = { info: [], warn: [] };
+  const logger = { info: (m) => lines.info.push(m), warn: (m) => lines.warn.push(m), debug() {} };
+  const client = fakeClient({ failCreateTimes: 1 });
+  let t = Date.parse('2026-02-03T04:05:06.000Z');
+  const p = createAgentInstanceProducer({
+    camunda: client,
+    job: EXTERNAL_JOB,
+    profile: PROFILE,
+    envelope: ENVELOPE,
+    logger,
+    now: () => t,
+    createRetryBaseMs: 1000,
+    createRetryMaxMs: 30000,
+    // A tiny byte budget so a couple of small updates already overflow it, and a large
+    // slot count so it is the BYTE cap (not the count cap) doing the bounding here.
+    preMintBufferMax: 1000,
+    preMintBufferMaxBytes: 120,
+  });
+
+  await p.activate();
+  assert.equal(p.active, false);
+
+  // Stream several updates while the create is still failing (inside the backoff
+  // window → no re-attempt). The byte budget bounds how many are retained.
+  for (const text of ['first', 'second', 'third', 'fourth', 'fifth']) {
+    p.ingest({ sessionUpdate: 'agent_message_chunk', messageId: `m-${text}`, content: { type: 'text', text } });
+  }
+  await p.drain();
+  assert.equal(client.calls.create.length, 1, 'no re-attempt inside the backoff window');
+
+  // Past the window, the next attempt succeeds → mint + replay of the retained prefix.
+  t += 2000;
+  await p.activate();
+  assert.equal(p.active, true);
+  // A post-mint turn now appends directly (the instance exists).
+  p.ingest({ sessionUpdate: 'agent_message_chunk', messageId: 'm-live', content: { type: 'text', text: 'live' } });
+  await p.complete(true);
+
+  const texts = client.calls.update
+    .filter((u) => Array.isArray(u.history))
+    .map((u) => u.history[0].content?.[0]?.text)
+    .filter(Boolean);
+  // Some early updates are retained (a contiguous prefix), some are dropped by the
+  // byte cap — the buffer neither kept everything nor lost everything.
+  assert.ok(texts.includes('first'), 'the earliest pre-mint update is retained');
+  assert.ok(texts.length < 6, 'the byte budget dropped at least one buffered update');
+  assert.ok(texts.includes('live'), 'the post-mint update is appended');
+  // The overflow is reported (once at buffering, once with the dropped count on replay).
+  assert.ok(
+    lines.warn.some((m) => /pre-mint replay buffer full/.test(m)),
+    'the buffer-full overflow is warned',
+  );
+  assert.ok(
+    lines.warn.some((m) => /pre-mint update\(s\) were dropped .* truncated/.test(m)),
+    'the dropped count is reported on replay so the truncation is visible',
+  );
+});
+
+test('the pre-mint buffer only retains updates that persist a turn — a plan/status burst cannot starve it (issue #230)', async () => {
+  // Non-history notifications (e.g. `plan`) are ignored on replay, so buffering them
+  // would let a plan burst consume the caps during a create outage and drop later
+  // message updates. They must be filtered out before buffering.
+  const client = fakeClient({ failCreateTimes: 1 });
+  let t = Date.parse('2026-02-03T04:05:06.000Z');
+  const p = createAgentInstanceProducer({
+    camunda: client,
+    job: EXTERNAL_JOB,
+    profile: PROFILE,
+    envelope: ENVELOPE,
+    logger: nullLogger,
+    now: () => t,
+    createRetryBaseMs: 1000,
+    createRetryMaxMs: 30000,
+    // Only 2 slots: a naive buffer would fill them with the plan burst and drop the
+    // real message updates.
+    preMintBufferMax: 2,
+  });
+
+  await p.activate();
+  assert.equal(p.active, false);
+
+  // A burst of ignored plan notifications, then two real message chunks.
+  for (let i = 0; i < 5; i += 1) p.ingest({ sessionUpdate: 'plan', entries: [{ content: `step ${i}` }] });
+  p.ingest({ sessionUpdate: 'agent_message_chunk', messageId: 'm-a', content: { type: 'text', text: 'msg-a' } });
+  p.ingest({ sessionUpdate: 'agent_message_chunk', messageId: 'm-b', content: { type: 'text', text: 'msg-b' } });
+  await p.drain();
+
+  // Past the window, the next attempt succeeds → mint + replay.
+  t += 2000;
+  await p.activate();
+  assert.equal(p.active, true);
+  await p.complete(true);
+
+  const texts = client.calls.update
+    .filter((u) => Array.isArray(u.history))
+    .map((u) => u.history[0].content?.[0]?.text)
+    .filter(Boolean);
+  assert.deepEqual(
+    texts,
+    ['msg-a', 'msg-b'],
+    'the plan burst was filtered out; both real message turns survived the 2-slot buffer',
+  );
+});
+
+test('the pre-mint buffer skips metadata-only message chunks (no text/metrics) so they cannot starve it (issue #230)', async () => {
+  // A message chunk with blank text and no metrics classifies to kind:'message' but
+  // persists NO turn on replay (flushMessage discards it). Buffering it would let a
+  // burst of such chunks consume the caps during a create outage and drop later real
+  // turns. They must be filtered out before buffering, mirroring flushMessage.
+  const client = fakeClient({ failCreateTimes: 1 });
+  let t = Date.parse('2026-02-03T04:05:06.000Z');
+  const p = createAgentInstanceProducer({
+    camunda: client,
+    job: EXTERNAL_JOB,
+    profile: PROFILE,
+    envelope: ENVELOPE,
+    logger: nullLogger,
+    now: () => t,
+    createRetryBaseMs: 1000,
+    createRetryMaxMs: 30000,
+    // Only 2 slots: a naive buffer would fill them with the blank chunks.
+    preMintBufferMax: 2,
+  });
+
+  await p.activate();
+  assert.equal(p.active, false);
+
+  // A burst of blank-text (whitespace-only) message chunks, then two real ones.
+  for (let i = 0; i < 5; i += 1) {
+    p.ingest({ sessionUpdate: 'agent_message_chunk', messageId: `blank-${i}`, content: { type: 'text', text: '   ' } });
+  }
+  p.ingest({ sessionUpdate: 'agent_message_chunk', messageId: 'r-a', content: { type: 'text', text: 'real-a' } });
+  p.ingest({ sessionUpdate: 'agent_message_chunk', messageId: 'r-b', content: { type: 'text', text: 'real-b' } });
+  await p.drain();
+
+  t += 2000;
+  await p.activate();
+  assert.equal(p.active, true);
+  await p.complete(true);
+
+  const texts = client.calls.update
+    .filter((u) => Array.isArray(u.history))
+    .map((u) => u.history[0].content?.[0]?.text)
+    .filter(Boolean);
+  assert.deepEqual(
+    texts,
+    ['real-a', 'real-b'],
+    'the blank message chunks were filtered; both real message turns survived the 2-slot buffer',
+  );
+});
+
+test('retryPending distinguishes a transient un-minted create from a permanently disabled producer (issue #230)', async () => {
+  // After the create-retry change, `active === false` no longer means "permanently
+  // unavailable": a transient create rejection leaves the producer armed to retry on
+  // the ACP hot path. `retryPending` exposes that transient state so the caller does
+  // not misreport a recoverable run as a lost transcript.
+  const client = fakeClient({ failCreate: true });
+  const p = makeProducer(client);
+  const ok = await p.activate();
+  assert.equal(ok, false, 'a failed create does not mint');
+  assert.equal(p.active, false);
+  assert.equal(p.retryPending, true, 'an armed create is retry-pending, not permanently unavailable');
+
+  // A producer with no classifier is DISABLED — it will never record a transcript, so
+  // it is not retry-pending.
+  const disabled = createAgentInstanceProducer({
+    camunda: client,
+    job: EXTERNAL_JOB,
+    profile: PROFILE,
+    envelope: ENVELOPE,
+    logger: nullLogger,
+    now,
+    sessionAcp: {},
+  });
+  await disabled.activate();
+  assert.equal(disabled.active, false);
+  assert.equal(disabled.retryPending, false, 'a disabled producer is not retry-pending');
+
+  // Once complete() has run its terminal path, no further retry can follow.
+  await p.complete(true);
+  assert.equal(p.retryPending, false, 'after finalization the producer is no longer retry-pending');
+});
+
+test('the post-mint append backlog is bounded — overflow drops the newest turn and warns once (issue #230)', async () => {
+  // During an AgentInstance outage each serialized append can hang up to
+  // finalizeTimeoutMs. Without a cap, ingest() could enqueue an unbounded backlog of
+  // turn payloads. Once the cap is hit the newest turn is dropped (warn-once), mirroring
+  // the pre-mint buffer's explicit drop policy.
+  const lines = { info: [], warn: [], debug: [] };
+  const logger = {
+    info: (m) => lines.info.push(m),
+    warn: (m) => lines.warn.push(m),
+    debug: (m) => lines.debug.push(m),
+  };
+  let openGate;
+  const gate = new Promise((resolve) => {
+    openGate = resolve;
+  });
+  const client = {
+    calls: { create: [], update: [] },
+    createAgentInstance: async (req) => {
+      client.calls.create.push(req);
+      return { agentInstanceKey: 'AGENT-1' };
+    },
+    updateAgentInstance: async (req) => {
+      client.calls.update.push(req);
+      // Hang until released so the append backlog cannot drain during the test.
+      await gate;
+      return { createdHistory: Array.isArray(req.history) ? req.history : [] };
+    },
+  };
+  const p = makeProducer(client, { logger, maxPendingAppends: 2 });
+  await p.activate();
+  assert.equal(p.active, true);
+
+  // Four tool-call updates → four appendTurn calls. The first two fill the backlog
+  // (one in flight on the hung update, one queued); the last two overflow and are
+  // dropped.
+  for (let i = 0; i < 4; i += 1) {
+    p.ingest({ sessionUpdate: 'tool_call', toolCallId: `tc-${i}`, title: `t-${i}`, status: 'pending' });
+  }
+
+  const backlogWarns = lines.warn.filter((m) => /append backlog full/.test(m));
+  assert.equal(backlogWarns.length, 1, 'the overflow is warned exactly once');
+  assert.match(backlogWarns[0], /caps 2 turns/, 'the diagnostic reports the count cap');
+
+  // Release the hang so the queue drains and the test does not leak a pending append.
+  openGate();
+  await p.drain();
+
+  // Only the two accepted appends ever reached the SDK; the two overflow turns were
+  // dropped and never enqueued.
+  assert.equal(client.calls.update.length, 2, 'the two overflow turns were dropped; only two appends hit the SDK');
+});
+
+test('the post-mint append backlog is bounded by BYTES too — a large turn overflows the byte cap under the count cap (issue #230)', async () => {
+  // The count cap alone can't bound memory: a handful of huge turns (e.g. a large tool
+  // result) stay under maxPendingAppends yet retain unbounded bytes. The companion byte
+  // cap drops the newest turn once the pending bytes would exceed it — even with plenty
+  // of count headroom — and the byte cap applies to the FIRST pending append too.
+  const lines = { info: [], warn: [], debug: [] };
+  const logger = {
+    info: (m) => lines.info.push(m),
+    warn: (m) => lines.warn.push(m),
+    debug: (m) => lines.debug.push(m),
+  };
+  let openGate;
+  const gate = new Promise((resolve) => {
+    openGate = resolve;
+  });
+  const client = {
+    calls: { create: [], update: [] },
+    createAgentInstance: async (req) => {
+      client.calls.create.push(req);
+      return { agentInstanceKey: 'AGENT-BYTES' };
+    },
+    updateAgentInstance: async (req) => {
+      client.calls.update.push(req);
+      await gate; // hang so the backlog cannot drain
+      return { createdHistory: Array.isArray(req.history) ? req.history : [] };
+    },
+  };
+  // Roomy count cap (100) but a tiny byte cap (2 KB): the byte cap must be the binding
+  // constraint. Each tool_call carries a ~1.5 KB title payload.
+  const big = 'x'.repeat(1500);
+  const p = makeProducer(client, { logger, maxPendingAppends: 100, maxPendingAppendBytes: 2000 });
+  await p.activate();
+  assert.equal(p.active, true);
+
+  // First large turn is accepted (in flight on the hung update). The second would push
+  // pending bytes past 2 KB, so it is dropped despite ample count headroom.
+  for (let i = 0; i < 3; i += 1) {
+    p.ingest({ sessionUpdate: 'tool_call', toolCallId: `tc-${i}`, title: `${big}-${i}`, status: 'pending' });
+  }
+
+  const backlogWarns = lines.warn.filter((m) => /append backlog full/.test(m));
+  assert.equal(backlogWarns.length, 1, 'the byte overflow is warned exactly once');
+  assert.match(backlogWarns[0], /bytes; caps 100 turns \/ 2000 bytes/, 'the diagnostic reports the byte cap');
+
+  openGate();
+  await p.drain();
+
+  // Only the first turn ever reached the SDK; the byte cap dropped the rest.
+  assert.equal(client.calls.update.length, 1, 'the byte cap dropped the over-size turns; only one append hit the SDK');
+});
+
+test('the streaming message coalescing buffer is bounded by BYTES — a long response drops later chunks, warns once, and surfaces a truncation marker (issue #230)', async () => {
+  // A single assistant message streams as many chunks coalesced in pendingMessage.texts
+  // until a boundary flush. Without a cap that buffer grows unbounded before the turn is
+  // ever appended (bypassing the append/pre-mint byte caps). The buffer cap drops later
+  // chunks once the retained bytes would exceed it, warns once, and the flushed turn
+  // carries a visible truncation marker so the dropped content is not silent.
+  const lines = { info: [], warn: [], debug: [] };
+  const logger = {
+    info: (m) => lines.info.push(m),
+    warn: (m) => lines.warn.push(m),
+    debug: (m) => lines.debug.push(m),
+  };
+  const client = fakeClient();
+  // Tiny 2 KB buffer cap; each chunk ~1.5 KB, so only the first is retained.
+  const p = makeProducer(client, { logger, maxPendingMessageBytes: 2000 });
+  await p.activate();
+  const big = 'x'.repeat(1500);
+  for (let i = 0; i < 4; i += 1) {
+    p.ingest({ sessionUpdate: 'agent_message_chunk', messageId: 'm-stream', content: { type: 'text', text: `${big}-${i}` } });
+  }
+
+  const bufWarns = lines.warn.filter((m) => /streaming message buffer full/.test(m));
+  assert.equal(bufWarns.length, 1, 'the streaming-buffer overflow is warned exactly once');
+  assert.match(bufWarns[0], /cap 2000 bytes/, 'the diagnostic reports the byte cap');
+
+  await p.complete(true);
+
+  // The coalesced ASSISTANT turn retains the first chunk plus a visible truncation marker.
+  const appends = client.calls.update.filter((u) => Array.isArray(u.history) && u.history[0]?.role === 'ASSISTANT');
+  assert.equal(appends.length, 1, 'the truncated response still flushes to exactly one ASSISTANT turn');
+  const text = appends[0].history[0].content[0].text;
+  assert.match(text, /^x{1500}-0/, 'the retained prefix (first chunk) is kept contiguous');
+  assert.match(text, /assistant response truncated — exceeded the 2000-byte streaming buffer cap/, 'a truncation marker surfaces the drop');
+
+  // The completion diagnostic quantifies the dropped streaming chunks.
+  const completionLog = lines.info.find((m) => /streaming chunk\(s\) DROPPED/.test(m));
+  assert.ok(completionLog, 'the completion diagnostic reports the dropped streaming chunk count');
+  assert.match(completionLog, /3 streaming chunk\(s\) DROPPED/, 'all three over-cap chunks are counted');
+});
+
+test('a shaped create failure emits status/body, the redacted jobLease, model/provider, and all correlation keys (issue #230)', async () => {
+  // The create-failure warning is a core observability acceptance criterion, so assert
+  // the producer-level diagnostic (not just describeSdkError in isolation): a shaped SDK
+  // error must surface its status + body, the REDACTED lease token, the model/provider,
+  // and every correlation key — so an operator can tie the failure to the exact request.
+  const lines = { info: [], warn: [], debug: [] };
+  const logger = {
+    info: (m) => lines.info.push(m),
+    warn: (m) => lines.warn.push(m),
+    debug: (m) => lines.debug.push(m),
+  };
+  const createError = Object.assign(new Error('Bad Request'), {
+    statusCode: 400,
+    body: { detail: 'stale lease fence mismatch' },
+  });
+  const client = fakeClient({ failCreate: true, createError });
+  const p = makeProducer(client, { logger });
+
+  const ok = await p.activate();
+  assert.equal(ok, false, 'a failed create does not mint');
+  assert.equal(p.active, false);
+
+  const warn = lines.warn.find((m) => /createAgentInstance failed/.test(m));
+  assert.ok(warn, 'the shaped create failure is warned');
+  assert.match(warn, /status=400/, 'the HTTP status is surfaced');
+  assert.match(warn, /stale lease fence mismatch/, 'the response body is surfaced');
+  assert.match(warn, /message=Bad Request/, 'the error message is surfaced');
+  // The lease token (FENCE99001) is redacted to a last-4 tail — never echoed verbatim.
+  assert.match(warn, /jobLease=present\(…9001\)/, 'the lease token is redacted, not leaked');
+  assert.ok(!warn.includes('FENCE99001'), 'the raw lease token never appears verbatim');
+  assert.match(warn, /model=Opus 4\.8/, 'the model is surfaced');
+  assert.match(warn, /provider=anthropic/, 'the provider is surfaced');
+  // Every correlation key ties the failure back to the exact activated job.
+  assert.match(warn, /jobKey=13954/, 'the jobKey correlation key is surfaced');
+  assert.match(warn, /elementInstanceKey=EIK-7/, 'the elementInstanceKey correlation key is surfaced');
+  assert.match(warn, /processInstanceKey=13951/, 'the processInstanceKey correlation key is surfaced');
+});
+
+test('the first per-turn append failure is warn, and repeats are debug (issue #230)', async () => {
+  // An append storm (e.g. a 400/404 on every updateAgentInstance) must be visible without
+  // flooding the log, so ONLY the first per-turn append failure is elevated to `warn`; the
+  // rest stay `debug`. Assert that severity contract at the producer level.
+  const lines = { info: [], warn: [], debug: [] };
+  const logger = {
+    info: (m) => lines.info.push(m),
+    warn: (m) => lines.warn.push(m),
+    debug: (m) => lines.debug.push(m),
+  };
+  const appendError = Object.assign(new Error('Not Found'), { statusCode: 404, body: 'no such instance' });
+  const client = {
+    calls: { create: [], update: [] },
+    createAgentInstance: async (req) => {
+      client.calls.create.push(req);
+      return { agentInstanceKey: 'AGENT-1' };
+    },
+    updateAgentInstance: async (req) => {
+      client.calls.update.push(req);
+      throw appendError;
+    },
+  };
+  const p = makeProducer(client, { logger });
+  await p.activate();
+  assert.equal(p.active, true, 'the instance minted (create succeeded)');
+
+  // Two distinct messages → the boundary flushes the first, complete() flushes the second:
+  // at least two append attempts, each rejected by the failing updateAgentInstance.
+  p.ingest({ sessionUpdate: 'agent_message_chunk', messageId: 'm-a', content: { type: 'text', text: 'alpha' } });
+  p.ingest({ sessionUpdate: 'agent_message_chunk', messageId: 'm-b', content: { type: 'text', text: 'beta' } });
+  await p.complete(true);
+
+  const warnAppends = lines.warn.filter((m) => /append failed/.test(m));
+  const debugAppends = lines.debug.filter((m) => /append failed/.test(m));
+  assert.equal(warnAppends.length, 1, 'exactly the FIRST append failure is elevated to warn');
+  assert.ok(debugAppends.length >= 1, 'subsequent append failures stay at debug (no warn flood)');
+  // The single warn carries the same shaped diagnostics + correlation keys.
+  assert.match(warnAppends[0], /status=404/, 'the append warn surfaces the HTTP status');
+  assert.match(warnAppends[0], /no such instance/, 'the append warn surfaces the response body');
+  assert.match(warnAppends[0], /jobKey=13954/, 'the append warn carries the correlation keys');
+});
+
+test('leaseTokenLabel redacts short tokens to a fixed marker (no verbatim leak) (issue #230)', () => {
+  assert.equal(leaseTokenLabel(undefined), 'ABSENT');
+  assert.equal(leaseTokenLabel(''), 'ABSENT');
+  assert.equal(leaseTokenLabel('   '), 'ABSENT');
+  // A short (≤8 char) token must NOT be echoed verbatim — its last-4 tail would be
+  // most or all of the value — so a fixed marker is used instead, matching the
+  // producer's leaseNote() >8 threshold.
+  assert.equal(leaseTokenLabel('ab'), 'present(short)');
+  assert.equal(leaseTokenLabel('abcd'), 'present(short)');
+  assert.ok(!leaseTokenLabel('abcd').includes('abcd'), 'the short token is not leaked verbatim');
+  assert.equal(leaseTokenLabel('abcdefgh'), 'present(short)');
+  assert.ok(
+    !leaseTokenLabel('abcdefgh').includes('efgh'),
+    'an 8-char token keeps no tail (matches leaseNote threshold)',
+  );
+  // A longer (>8 char) token keeps only a redacted last-4 tail for correlation.
+  assert.equal(leaseTokenLabel('abcdefghi'), 'present(…fghi)');
+});
+
+// ---------------------------------------------------------------------------
+// Lease plumbing (issue #230 ask 3): the job's leaseToken is submitted as jobLease
+// ---------------------------------------------------------------------------
+test('the activation leaseToken is submitted as jobLease on create AND every append', async () => {
+  const client = fakeClient();
+  const p = makeProducer(client);
+  await p.activate();
+  p.ingest({ sessionUpdate: 'agent_message_chunk', content: { type: 'text', text: 'x' } });
+  await p.complete(true);
+  assert.ok(client.calls.create.length >= 1);
+  for (const c of client.calls.create) assert.equal(c.jobLease, EXTERNAL_JOB.leaseToken);
+  assert.ok(client.calls.update.length >= 1);
+  for (const u of client.calls.update) assert.equal(u.jobLease, EXTERNAL_JOB.leaseToken);
+});
+
+// ---------------------------------------------------------------------------
+// describeSdkError — status + body extraction for loud, diagnosable failures
+// ---------------------------------------------------------------------------
+
+test('describeSdkError reads the statusCode alias and coerces a missing/nullish status to null', () => {
+  const a = describeSdkError({ statusCode: 400, body: { detail: 'lease fence mismatch' }, message: 'Bad Request' });
+  assert.equal(a.status, 400);
+  assert.match(a.body, /lease fence mismatch/);
+  assert.equal(a.message, 'Bad Request');
+
+  const b = describeSdkError({ response: { status: 404, data: 'not found' } });
+  assert.equal(b.status, 404);
+  assert.equal(b.body, 'not found');
+
+  const c = describeSdkError(new Error('network down'));
+  assert.equal(c.status, null);
+  assert.equal(c.message, 'network down');
+
+  assert.equal(describeSdkError(null).message, 'null');
+});
+
+// ---------------------------------------------------------------------------
 // #229 observability — root-causable create failures, turn counters, correlation
 // ---------------------------------------------------------------------------
 
@@ -454,10 +1922,46 @@ test('describeSdkError extracts HTTP status + body from common SDK error shapes'
   assert.equal(b.body, 'not found');
 
   const c = describeSdkError(new Error('plain'));
-  assert.equal(c.status, undefined);
+  // Merge reconciliation (#230 × #232): the unified describeSdkError returns `null`
+  // (not undefined) for a missing status — both are nullish and render identically.
+  // Under node:assert/strict the two branches' expectations are irreconcilable, so
+  // the single kept implementation (issue #230, which also caps/folds the body) wins.
+  assert.equal(c.status, null);
   assert.equal(c.message, 'plain');
 
   assert.equal(describeSdkError(null).message, 'null');
+});
+
+test('describeSdkError caps an oversized response body so it cannot flood the log (issue #230)', () => {
+  const huge = 'x'.repeat(5000);
+  const capped = describeSdkError({ statusCode: 500, body: huge });
+  assert.equal(capped.status, 500);
+  assert.ok(capped.body.length < huge.length, 'the body is truncated');
+  assert.ok(capped.body.startsWith('x'.repeat(500)), 'the first 500 chars are preserved');
+  assert.match(capped.body, /\(5000 chars\)/, 'the original length is noted');
+
+  // A serialized (non-string) oversized body is capped too.
+  const bigObj = describeSdkError({ status: 400, body: { detail: 'y'.repeat(5000) } });
+  assert.ok(bigObj.body.length <= 540, 'a serialized oversized body is bounded');
+
+  // A short body is left intact.
+  const small = describeSdkError({ statusCode: 400, body: 'short body' });
+  assert.equal(small.body, 'short body');
+});
+
+test('describeSdkError folds newlines and caps the message so a multiline error stays one bounded log line (issue #230)', () => {
+  // A multiline body/message would split the single correlatable worker-log line, and a
+  // message that embeds a large body would bypass the body cap and flood the log.
+  const multiline = describeSdkError({ statusCode: 502, body: 'line1\nline2\r\nline3', message: 'oops\nsecond line' });
+  assert.ok(!/\n|\r/.test(multiline.body), 'the body has no raw newlines');
+  assert.ok(!/\n|\r/.test(multiline.message), 'the message has no raw newlines');
+  assert.match(multiline.body, /line1.*line2.*line3/, 'the body content is preserved inline');
+
+  // A message that embeds a huge body must be capped too — it cannot bypass the cap.
+  const huge = 'z'.repeat(5000);
+  const bigMessage = describeSdkError(new Error(`create failed: ${huge}`));
+  assert.ok(bigMessage.message.length < huge.length, 'the message is bounded');
+  assert.match(bigMessage.message, /chars\)/, 'the message notes its length when capped');
 });
 
 test('activate() rejection logs HTTP status + body + correlation + lease tail at warn (#229)', async () => {
@@ -470,15 +1974,16 @@ test('activate() rejection logs HTTP status + body + correlation + lease tail at
   const p = makeProducer(client, { logger });
   const ok = await p.activate();
   assert.equal(ok, false);
-  const line = logger.lines.warn.find((l) => l.includes('createAgentInstance REJECTED'));
-  assert.ok(line, 'expected a REJECTED warn line');
-  assert.match(line, /status 400/);
+  const line = logger.lines.warn.find((l) => l.includes('createAgentInstance failed'));
+  assert.ok(line, 'expected a create-failure warn line');
+  assert.match(line, /status=400/);
   assert.match(line, /jobLease fenced/);
-  assert.match(line, /job 13954/);
-  assert.match(line, /eik EIK-7/);
-  assert.match(line, /pik 13951/);
-  assert.match(line, /lease present \(len 5\)/); // short token masked — not printed whole
-  assert.match(line, /Opus 4\.8\/anthropic/);
+  assert.match(line, /jobKey=13954/);
+  assert.match(line, /elementInstanceKey=EIK-7/);
+  assert.match(line, /processInstanceKey=13951/);
+  assert.match(line, /jobLease=present\(…/); // short token masked — not printed whole
+  assert.match(line, /model=Opus 4\.8/);
+  assert.match(line, /provider=anthropic/);
 });
 
 test('activate() rejection collapses a multiline error body/message to one log line (#229)', async () => {
@@ -493,11 +1998,11 @@ test('activate() rejection collapses a multiline error body/message to one log l
   const p = makeProducer(client, { logger });
   const ok = await p.activate();
   assert.equal(ok, false);
-  const line = logger.lines.warn.find((l) => l.includes('createAgentInstance REJECTED'));
-  assert.ok(line, 'expected a REJECTED warn line');
+  const line = logger.lines.warn.find((l) => l.includes('createAgentInstance failed'));
+  assert.ok(line, 'expected a create-failure warn line');
   assert.ok(!/[\r\n]/.test(line), 'the rendered SDK error must not contain CR/LF');
-  assert.match(line, /body line1 line2 line3/);
-  assert.match(line, /msg boom injected: fake log line/);
+  assert.match(line, /body=line1 ⏎ line2 ⏎ line3/);
+  assert.match(line, /message=boom ⏎ injected: fake log line/);
 });
 
 test('complete() logs a turn counter separating the 0-turns husk from a healthy run (#229)', async () => {
@@ -603,10 +2108,10 @@ test('first per-turn append failure is elevated to warn, repeats stay debug (#22
   p.ingest({ sessionUpdate: 'agent_message_chunk', messageId: 'm2', content: { type: 'text', text: 'b' } });
   // force flush of both messages
   await p.complete(true);
-  const appendWarns = logger.lines.warn.filter((l) => l.includes('updateAgentInstance(append) failed'));
+  const appendWarns = logger.lines.warn.filter((l) => l.includes('updateAgentInstance append failed'));
   assert.equal(appendWarns.length, 1, 'exactly one append failure elevated to warn');
-  assert.match(appendWarns[0], /status 404/);
+  assert.match(appendWarns[0], /status=404/);
   assert.ok(calls >= 2, 'multiple append attempts were made');
-  const appendDebugs = logger.lines.debug.filter((l) => l.includes('updateAgentInstance(append) failed'));
+  const appendDebugs = logger.lines.debug.filter((l) => l.includes('updateAgentInstance append failed'));
   assert.ok(appendDebugs.length >= 1, 'subsequent append failures stay at debug');
 });

@@ -79,6 +79,37 @@ test("reconcile wiring: an --auto worker's serviceable types are published from 
   );
 });
 
+test("reconcile wiring: explicit --job-type extras survive the auto reconcile rewrite", async () => {
+  await Effect.runPromise(
+    Effect.gen(function* () {
+      const engine = makeEngine({ activate: () => Effect.never as never });
+      const runner = makeRunner(0);
+      const reg = yield* makeRegistry();
+      // Seeded with the extra explicit type; reconcile must NOT drop it.
+      yield* reg.add("auto", ["explicit:extra"], 1);
+      const reader = makeReader([["k1", "k2"]], { k1: "alpha", k2: "beta" });
+
+      const sup = yield* makeSupervisor({
+        engine,
+        runner,
+        registry: reg,
+        reconcileReader: reader,
+        scan,
+        autoWorkerId: "auto",
+        autoExtraTypes: ["explicit:extra"],
+        logger: noopLogger,
+      });
+
+      yield* sup.reconcileOnce;
+      assert.deepEqual(
+        [...(yield* reg.pollTypes)].sort(),
+        ["alpha", "beta", "explicit:extra"],
+        "the engine-read set is unioned with the explicit extra, not replaced",
+      );
+    }).pipe(Effect.provide(TestClock.layer())),
+  );
+});
+
 test("homogeneous fan-out: N idle workers on one type fill in a SINGLE activation round", async () => {
   await Effect.runPromise(
     Effect.gen(function* () {

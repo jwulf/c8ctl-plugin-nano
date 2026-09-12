@@ -170,6 +170,22 @@ test('serviceTaskIsExternalAgent matches only agentType="external"', () => {
   assert.equal(serviceTaskIsExternalAgent(null), false);
 });
 
+test('serviceTaskIsExternalAgent is case-sensitive on the literal "external" value', () => {
+  // XML attribute values are case-sensitive and the convention specifies the
+  // literal `external`; a noncanonical spelling must NOT auto-enrol.
+  assert.equal(serviceTaskIsExternalAgent('<zeebe:agentDefinition agentType="External" />'), false);
+  assert.equal(serviceTaskIsExternalAgent('<zeebe:agentDefinition agentType="EXTERNAL" />'), false);
+});
+
+test('serviceTaskIsExternalAgent ignores a marker inside an XML comment or CDATA', () => {
+  const commented = '<!-- <zeebe:agentDefinition agentType="external" /> -->';
+  const cdata = '<![CDATA[ <zeebe:agentDefinition agentType="external" /> ]]>';
+  // Raw predicate still matches inert text (it is comment-agnostic); the id scan
+  // strips comments/CDATA first, so a commented-out marker never auto-enrols.
+  assert.equal(externalAgentElementIds(`<bpmn:serviceTask id="t">${commented}</bpmn:serviceTask>`).size, 0);
+  assert.equal(externalAgentElementIds(`<bpmn:serviceTask id="t">${cdata}</bpmn:serviceTask>`).size, 0);
+});
+
 test('externalAgentElementIds collects the marked service-task ids only', () => {
   const xml = model('feature', [
     { id: 'plan', type: 'senior:plan', external: true },
@@ -187,6 +203,14 @@ test('serviceTaskOptsOutOfAutoSubscribe only fires on the exact false value', ()
   assert.equal(serviceTaskOptsOutOfAutoSubscribe(prop('')), false);
   assert.equal(serviceTaskOptsOutOfAutoSubscribe('<zeebe:property name="other" value="false" />'), false);
   assert.equal(serviceTaskOptsOutOfAutoSubscribe(''), false);
+});
+
+test('serviceTaskOptsOutOfAutoSubscribe is not fooled by hyphen-suffixed attributes', () => {
+  // `readXmlAttr` must anchor the key at a start/whitespace boundary, NOT a `\b`
+  // boundary: `-` is non-word, so a `\b`-based read would treat `other-name`/
+  // `other-value` as the canonical `name`/`value` and misclassify the property.
+  const decoy = '<zeebe:property other-name="io.nanobpm.agentTask.autoSubscribe" other-value="false" />';
+  assert.equal(serviceTaskOptsOutOfAutoSubscribe(decoy), false);
 });
 
 test('autoSubscribeOptOutElementIds collects opted-out service-task ids only', () => {

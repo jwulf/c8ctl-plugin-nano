@@ -3129,9 +3129,11 @@ function resolveAutoRestConfig(camunda, env = process.env) {
 // `<zeebe:agentDefinition agentType="external">` element (attribute order and
 // quote style tolerated). Compiled once — called per matched `<serviceTask>`
 // during `--auto` scans, so recompiling per call would allocate needlessly.
+// CASE-SENSITIVE by design: XML attribute values are case-sensitive and the
+// convention specifies the literal `external`, so `agentType="External"`/`"EXTERNAL"`
+// is NOT the canonical marker and must not auto-enrol a non-conforming task.
 const AGENT_DEFINITION_EXTERNAL_RE = new RegExp(
-  `<(?:\\w+:)?agentDefinition\\b[^>]*\\bagentType\\s*=\\s*(["'])external\\1`,
-  'i'
+  `<(?:\\w+:)?agentDefinition\\b[^>]*\\bagentType\\s*=\\s*(["'])external\\1`
 );
 function serviceTaskIsExternalAgent(body) {
   return AGENT_DEFINITION_EXTERNAL_RE.test(String(body || ''));
@@ -3148,8 +3150,12 @@ const AGENT_TASK_AUTO_SUBSCRIBE_PROP = `${AGENT_TASK_NS}.autoSubscribe`;
 
 // Read a named attribute's value from a raw element's attribute string
 // (`name="…"`/`name='…'`), quote-style and order tolerant; undefined when absent.
+// The key must sit at the START of the attribute string or after XML whitespace —
+// NOT a `\b` boundary, which (because `-` is a non-word char) would let
+// `other-name`/`other-value` masquerade as the canonical `name`/`value`.
+// Case-sensitive: XML attribute names are case-sensitive and the convention is literal.
 function readXmlAttr(attrs, key) {
-  const m = new RegExp(`\\b${key}\\s*=\\s*(["'])(.*?)\\1`, 'i').exec(String(attrs || ''));
+  const m = new RegExp(`(?:^|\\s)${key}\\s*=\\s*(["'])(.*?)\\1`).exec(String(attrs || ''));
   return m ? m[2] : undefined;
 }
 
@@ -3169,6 +3175,16 @@ function serviceTaskOptsOutOfAutoSubscribe(body) {
   return false;
 }
 
+// Strip XML comments (`<!-- … -->`) and CDATA sections (`<![CDATA[ … ]]>`) from a
+// fragment so marker/property detection never fires on INERT text: a commented-out
+// or CDATA-wrapped `agentDefinition`/`autoSubscribe` is not a live declaration and
+// must not auto-enrol (or silently suppress) a task.
+function stripXmlCommentsAndCdata(s) {
+  return String(s || '')
+    .replace(/<!--[\s\S]*?-->/g, '')
+    .replace(/<!\[CDATA\[[\s\S]*?\]\]>/g, '');
+}
+
 // Walk `xml` collecting the service-task element ids whose inner body satisfies
 // `predicate(body)`, correlating back to `scanTaskDefinitions` leaves by
 // `elementId`. Shared by the external-marker and auto-subscribe-opt-out scans.
@@ -3183,7 +3199,9 @@ function serviceTaskElementIds(xml, guardSubstring, predicate) {
     /<(?:\w+:)?serviceTask\b[^>]*?\bid\s*=\s*(["'])(.*?)\1[^>]*?>([\s\S]*?)<\/(?:\w+:)?serviceTask>/g;
   let m;
   while ((m = taskRe.exec(src)) !== null) {
-    if (predicate(m[3])) ids.add(m[2]);
+    // Strip comments/CDATA before matching: a marker/property inside a comment or
+    // CDATA is inert and must not drive enrolment or opt-out.
+    if (predicate(stripXmlCommentsAndCdata(m[3]))) ids.add(m[2]);
   }
   return ids;
 }
@@ -3379,6 +3397,7 @@ async function createAgenticEndpoint(opts) {
 // @param {string} [opts.worker]         worker id stamped on activations
 // @param {Array<{id: string, types?: Iterable<string>, capacity?: number}>} [opts.workers]  registry seed
 // @param {string} [opts.autoWorkerId]   worker whose types the reconcile loop rewrites
+// @param {Iterable<string>} [opts.autoExtraTypes]  explicit `--job-type` extras unioned into every reconcile write (survive the auto rewrite)
 // @param {import('./supervisor.dist.js').AgenticEndpoint} [opts.agenticEndpoint]  the ownership wire
 // @param {object} [opts.agenticConfig]  reconnect backoff config
 // @param {string} [opts.scope]          reconcile process-id scope narrowing
@@ -3413,6 +3432,7 @@ async function createSupervisorDeps(opts = {}) {
     worker,
     workers = [],
     autoWorkerId,
+    autoExtraTypes,
     agenticEndpoint,
     agenticConfig,
     scope = '',
@@ -3487,6 +3507,7 @@ async function createSupervisorDeps(opts = {}) {
     scan,
     logger,
     autoWorkerId,
+    autoExtraTypes,
     agenticEndpoint,
     agenticConfig,
     config: scope ? { ...config, scope } : config,
@@ -9644,6 +9665,11 @@ async function workAgent(req, flags) {
     worker: workerName,
     workers: [{ id: workerName, types: jobTypes, capacity: 1 }],
     autoWorkerId: autoMode ? workerName : undefined,
+    // Explicit `--job-type` extras must outlive the first reconcile: the runtime's
+    // reconcile rewrites the --auto worker's set from the engine scan, so pass the
+    // extras through to be unioned into every reconcile write (else an explicit
+    // subscription stops being served once reconcile succeeds).
+    autoExtraTypes: autoMode && extraJobTypes.length > 0 ? extraJobTypes : undefined,
     scope: autoScope,
     // The ONE multiplexed host connection (issue #173): the runtime owns its
     // connect/reconnect/resync + teardown lifecycle. Omitted (undefined) when the

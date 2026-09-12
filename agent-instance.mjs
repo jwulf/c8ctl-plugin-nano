@@ -107,6 +107,18 @@ const DEFAULT_MAX_PENDING_APPENDS = 1000;
 // like the count cap, so the memory bound holds regardless of per-turn size.
 const DEFAULT_MAX_PENDING_APPEND_BYTES = 8_000_000;
 
+// Byte cap on the streaming coalescing buffer for a SINGLE in-flight assistant message
+// (issue #230). A `message` update streams as many token-chunk notifications that are
+// coalesced in `pendingMessage.texts` until a boundary (role/messageId change, tool
+// call/result, drain, or completion) flushes them into ONE turn. Until that flush the
+// chunks are held in memory and are NOT yet subject to the post-mint append/pre-mint
+// buffer byte caps — so a single very long (or never-terminated) response could grow
+// the coalescing buffer without bound. Once the buffered chunks' approximate size would
+// exceed this, DROP further chunks (counted, warn-once) and mark the message truncated,
+// so the flushed turn carries a visible truncation marker rather than the buffer growing
+// unbounded — the same explicit "bound + surface the drop" policy as the other buffers.
+const DEFAULT_MAX_PENDING_MESSAGE_BYTES = 8_000_000;
+
 // Race a best-effort promise against `timeoutMs`, reporting WHICH won, without ever
 // rejecting. Used to bound every create attempt so a hung createAgentInstance can
 // neither block activate() (which gates whether the harness runs at all) nor
@@ -376,6 +388,7 @@ export function createAgentInstanceProducer(opts = {}) {
     maxInFlightCreates = DEFAULT_MAX_INFLIGHT_CREATES,
     maxPendingAppends = DEFAULT_MAX_PENDING_APPENDS,
     maxPendingAppendBytes = DEFAULT_MAX_PENDING_APPEND_BYTES,
+    maxPendingMessageBytes = DEFAULT_MAX_PENDING_MESSAGE_BYTES,
     // Injected deadline-timer factory (defaults to setTimeout) — the seam that lets a
     // test drive the create-retirement / bounded-call timers deterministically instead
     // of sleeping on wall-clock time (issue #230). Only the timer is injected; the
@@ -485,6 +498,12 @@ export function createAgentInstanceProducer(opts = {}) {
   // elevated to `warn` exactly once so a bounded-out backlog is visible without a storm.
   let pendingAppends = 0;
   let appendsDropped = 0;
+  // Streaming coalescing-buffer bookkeeping (issue #230): `messageChunksDropped` counts
+  // token chunks dropped once an in-flight assistant message's coalescing buffer hits
+  // `maxPendingMessageBytes`; the drop is elevated to `warn` exactly once so a truncated
+  // streaming response is visible without a per-chunk storm.
+  let messageChunksDropped = 0;
+  let messageBufferLogged = false;
   // Approximate serialized size of the currently-pending appends, for the companion
   // byte cap (issue #230): a small number of huge turns can breach the memory bound the
   // count cap alone can't — so track bytes alongside count and drop on either.
@@ -604,11 +623,17 @@ export function createAgentInstanceProducer(opts = {}) {
 
   const flushMessage = () => {
     if (!pendingMessage) return;
-    const text = pendingMessage.texts.join('');
-    const hasText = text.trim() !== '';
-    const hasMetrics = pendingMessage.metrics !== undefined;
     const msg = pendingMessage;
     pendingMessage = null;
+    let text = msg.texts.join('');
+    if (msg.truncated) {
+      // Surface the streaming-buffer truncation in the persisted turn so the dropped
+      // content is visible rather than silently lost (issue #230 review).
+      text += `${text ? '\n' : ''}[nano: assistant response truncated — exceeded the ` +
+        `${maxPendingMessageBytes}-byte streaming buffer cap; later chunk(s) dropped]`;
+    }
+    const hasText = text.trim() !== '';
+    const hasMetrics = msg.metrics !== undefined;
     if (!hasText && !hasMetrics) return;
     const idBasis = isNonBlank(msg.messageId) ? String(msg.messageId) : `h:${shortHash(text)}`;
     const turn = {
@@ -1000,12 +1025,39 @@ export function createAgentInstanceProducer(opts = {}) {
               role,
               messageId: classified.messageId ?? null,
               texts: [],
+              bytes: 0,
+              truncated: false,
               metrics: undefined,
               loopIteration,
               producedAt: iso(),
             };
           }
-          if (isNonBlank(classified.text)) pendingMessage.texts.push(String(classified.text));
+          if (isNonBlank(classified.text)) {
+            const chunk = String(classified.text);
+            // Bound the streaming coalescing buffer (issue #230): a long/never-terminated
+            // response could otherwise grow `texts` without limit before a boundary flush,
+            // bypassing the post-mint append/pre-mint byte caps. Once the buffered chunks'
+            // approximate size would exceed the cap, DROP further chunks (counted, warn-once)
+            // and mark the message truncated so the flushed turn carries a visible marker.
+            if (
+              maxPendingMessageBytes > 0 &&
+              pendingMessage.bytes + chunk.length > maxPendingMessageBytes
+            ) {
+              pendingMessage.truncated = true;
+              messageChunksDropped += 1;
+              if (!messageBufferLogged) {
+                messageBufferLogged = true;
+                logger?.warn?.(
+                  `AgentInstance producer: streaming message buffer full ` +
+                    `(~${pendingMessage.bytes} bytes; cap ${maxPendingMessageBytes} bytes); ` +
+                    `dropping further chunks of this response until it flushes ${correlation()}.`,
+                );
+              }
+            } else {
+              pendingMessage.texts.push(chunk);
+              pendingMessage.bytes += chunk.length;
+            }
+          }
           const m = extractMetrics(rawUpdate);
           if (m) pendingMessage.metrics = { ...(pendingMessage.metrics || {}), ...m };
           break;
@@ -1364,6 +1416,7 @@ export function createAgentInstanceProducer(opts = {}) {
             `AgentInstance ${agentInstanceKey} (${corr()}): ${appendedTurns} turn(s) appended ` +
               `so far over ${mins}m (drain still pending — count unobserved)` +
               `${appendsDropped > 0 ? `, ${appendsDropped} turn(s) DROPPED (append backlog cap — transcript truncated)` : ''}, ` +
+              `${messageChunksDropped > 0 ? `${messageChunksDropped} streaming chunk(s) DROPPED (message buffer cap), ` : ''}` +
               `terminal COMPLETED update serialized behind pending appends.`,
           );
         }
@@ -1426,17 +1479,19 @@ export function createAgentInstanceProducer(opts = {}) {
       // #229/#232 turn counter — "N turn(s) appended over Xm, <transition>" — so the
       // 0-turns husk ("created but nothing ingested") is distinguishable from a healthy
       // run at a glance. Render the HONEST terminal transition: only claim
-      // `status→COMPLETED` when the terminal update actually confirmed (terminalOk);
-      // on a rejected/timed-out update say so (the instance stays non-terminal, so a
-      // retry/reactivation still continues it) and flag manual reconciliation; on a
-      // failed job end no COMPLETED update was attempted at all.
+      // `status→COMPLETED` when the terminal update actually confirmed (terminalOk).
+      // The `!ok` (failed job end) path IS reactivatable, so it says so; but the
+      // terminalOk-false path is a SUCCESSFUL job end whose COMPLETED update failed —
+      // the caller settles the job the instant complete() returns, so there is NO
+      // reactivation to continue it (that would contradict the manual-reconciliation
+      // warning). State only that it was left non-terminal and needs reconciliation.
       const elapsedMs = activatedAt ? Math.max(0, now() - activatedAt) : 0;
       const mins = (elapsedMs / 60000).toFixed(1);
       const transition = !ok
         ? 'left non-terminal (retry/reactivation continues it)'
         : terminalOk
           ? 'status→COMPLETED'
-          : 'COMPLETED update FAILED — left non-terminal (retry/reactivation continues it); manual reconciliation required';
+          : 'COMPLETED update FAILED — left non-terminal; manual reconciliation required (no reactivation on a settled job)';
       // Surface the aggregate append backlog DROP count (issue #230): the warn-once
       // backlog log only says drops STARTED — the operator can't quantify the loss or
       // tell it apart from an engine append failure without the final tally. Fold it
@@ -1445,8 +1500,12 @@ export function createAgentInstanceProducer(opts = {}) {
         appendsDropped > 0
           ? ` (${appendsDropped} turn(s) DROPPED — append backlog cap; transcript truncated)`
           : '';
+      const chunkNote =
+        messageChunksDropped > 0
+          ? ` (${messageChunksDropped} streaming chunk(s) DROPPED — message buffer cap; response truncated)`
+          : '';
       logger?.info?.(
-        `AgentInstance ${agentInstanceKey} (${corr()}): ${appendedTurns} turn(s) appended over ${mins}m${droppedNote}, ${transition}.`,
+        `AgentInstance ${agentInstanceKey} (${corr()}): ${appendedTurns} turn(s) appended over ${mins}m${droppedNote}${chunkNote}, ${transition}.`,
       );
     },
   };

@@ -689,7 +689,7 @@ test('a create that succeeds late for a RETIRED/finalized attempt is dropped —
   // Now let the retired create succeed. Its late result MUST be dropped.
   releaseSecond();
   await secondSettled;
-  await new Promise((r) => setTimeout(r, 5)); // let the late .then run
+  await new Promise((r) => setImmediate(r)); // let the late .then run (deterministic)
   assert.equal(p.active, false, 'the late create did NOT mint an orphaned instance');
   assert.equal(
     client.calls.update.length,
@@ -877,7 +877,7 @@ test('a retired create attempt that FAILS late is reported quietly, not as a mis
   // Now the ORIGINAL (retired) attempt rejects late.
   rejectFirst();
   await firstSettled.catch(() => {});
-  await new Promise((r) => setTimeout(r, 5)); // let the late catch run
+  await new Promise((r) => setImmediate(r)); // let the late catch run (deterministic)
   const lateWarn = warnings.find((m) => /createAgentInstance failed \(attempt 1\)/.test(m) && /will retry/.test(m));
   assert.equal(lateWarn, undefined, "the retired attempt's late failure did NOT emit a misleading \"will retry\" warning");
   assert.ok(
@@ -957,7 +957,7 @@ test('a keyless create result that arrives late for a retired attempt is dropped
   // Now the ORIGINAL (retired) attempt resolves late with no key.
   resolveFirst();
   await firstSettled;
-  await new Promise((r) => setTimeout(r, 5)); // let the late .then run
+  await new Promise((r) => setImmediate(r)); // let the late .then run (deterministic)
   const lateNoKeyWarn = warnings.find((m) => /returned no agentInstanceKey \(attempt 1\)/.test(m) && /will retry/.test(m));
   assert.equal(lateNoKeyWarn, undefined, 'the retired attempt\'s late keyless result did NOT emit a misleading "will retry" warning');
   assert.ok(
@@ -1718,6 +1718,46 @@ test('the post-mint append backlog is bounded by BYTES too — a large turn over
 
   // Only the first turn ever reached the SDK; the byte cap dropped the rest.
   assert.equal(client.calls.update.length, 1, 'the byte cap dropped the over-size turns; only one append hit the SDK');
+});
+
+test('the streaming message coalescing buffer is bounded by BYTES — a long response drops later chunks, warns once, and surfaces a truncation marker (issue #230)', async () => {
+  // A single assistant message streams as many chunks coalesced in pendingMessage.texts
+  // until a boundary flush. Without a cap that buffer grows unbounded before the turn is
+  // ever appended (bypassing the append/pre-mint byte caps). The buffer cap drops later
+  // chunks once the retained bytes would exceed it, warns once, and the flushed turn
+  // carries a visible truncation marker so the dropped content is not silent.
+  const lines = { info: [], warn: [], debug: [] };
+  const logger = {
+    info: (m) => lines.info.push(m),
+    warn: (m) => lines.warn.push(m),
+    debug: (m) => lines.debug.push(m),
+  };
+  const client = fakeClient();
+  // Tiny 2 KB buffer cap; each chunk ~1.5 KB, so only the first is retained.
+  const p = makeProducer(client, { logger, maxPendingMessageBytes: 2000 });
+  await p.activate();
+  const big = 'x'.repeat(1500);
+  for (let i = 0; i < 4; i += 1) {
+    p.ingest({ sessionUpdate: 'agent_message_chunk', messageId: 'm-stream', content: { type: 'text', text: `${big}-${i}` } });
+  }
+
+  const bufWarns = lines.warn.filter((m) => /streaming message buffer full/.test(m));
+  assert.equal(bufWarns.length, 1, 'the streaming-buffer overflow is warned exactly once');
+  assert.match(bufWarns[0], /cap 2000 bytes/, 'the diagnostic reports the byte cap');
+
+  await p.complete(true);
+
+  // The coalesced ASSISTANT turn retains the first chunk plus a visible truncation marker.
+  const appends = client.calls.update.filter((u) => Array.isArray(u.history) && u.history[0]?.role === 'ASSISTANT');
+  assert.equal(appends.length, 1, 'the truncated response still flushes to exactly one ASSISTANT turn');
+  const text = appends[0].history[0].content[0].text;
+  assert.match(text, /^x{1500}-0/, 'the retained prefix (first chunk) is kept contiguous');
+  assert.match(text, /assistant response truncated — exceeded the 2000-byte streaming buffer cap/, 'a truncation marker surfaces the drop');
+
+  // The completion diagnostic quantifies the dropped streaming chunks.
+  const completionLog = lines.info.find((m) => /streaming chunk\(s\) DROPPED/.test(m));
+  assert.ok(completionLog, 'the completion diagnostic reports the dropped streaming chunk count');
+  assert.match(completionLog, /3 streaming chunk\(s\) DROPPED/, 'all three over-cap chunks are counted');
 });
 
 test('a shaped create failure emits status/body, the redacted jobLease, model/provider, and all correlation keys (issue #230)', async () => {

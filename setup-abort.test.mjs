@@ -57,13 +57,17 @@ test('checkSetupAbort message is stage-aware — it does NOT falsely claim "no r
   }
   // At repo-provisioning / relay-open the clone/config/branch may already exist, so the
   // message must NOT promise "before any side effect" — it only promises no settle and
-  // that any partial workspace is left for reaping.
+  // that any partial workspace is removed best-effort (a failed removal → the reaper).
   for (const stage of ['repo-provisioning', 'relay-open']) {
     const { logger, warns } = collectingLogger();
     checkSetupAbort(ac.signal, { jobType: 't', jobKey: '1', stage, logger });
     assert.doesNotMatch(warns[0], /before any side effect/i, `'${stage}' must not claim it stopped before any side effect`);
     assert.doesNotMatch(warns[0], /no repo side effects/i, `'${stage}' must not claim no repo side effects`);
-    assert.match(warns[0], /left for reaping/i, `'${stage}' should note the partial workspace is reaped`);
+    // The abort paths call rmSync(runDir) directly, so the workspace is REMOVED, not
+    // merely "left for reaping"; only a FAILED removal falls to the age-gated reaper.
+    assert.doesNotMatch(warns[0], /left for reaping/i, `'${stage}' must not claim the workspace is left for reaping — it is removed best-effort`);
+    assert.match(warns[0], /removed best-effort/i, `'${stage}' should note the partial workspace is removed best-effort`);
+    assert.match(warns[0], /reaper/i, `'${stage}' should note a failed removal falls to the reaper`);
     assert.match(warns[0], /without a settle/i);
   }
 });
@@ -248,5 +252,75 @@ test('#222 provisionRepo bails when the abort wins DURING the base fetch — thr
     assert.ok(!calls.some((a) => a.includes('checkout')), 'no branch checkout — stopped before mutating the tree');
   } finally {
     rmSync(runDir, { recursive: true, force: true });
+  }
+});
+
+// #222 (thread 4389, inline): the pre-base-fetch SNAPSHOT probe can itself block on
+// the network — when there is no local `origin/<base>` it falls back to
+// `ls-remote --heads origin refs/heads/<base>` to pin the clone-time baseline. The
+// `pre-base-fetch` recheck sits BEFORE that probe, so an abort that wins WHILE the
+// snapshot ls-remote is blocking would still reach the base fetch (a repo mutation).
+// The `pre-base-fetch-op` recheck (after the snapshot, before the base fetch) closes it.
+test('#222 provisionRepo bails when the abort wins DURING the base snapshot ls-remote — throws before the base fetch mutates the repo', () => {
+  const runDir = mkdtempSync(join(tmpdir(), 'nano-snap-abort-'));
+  const ac = new AbortController(); // live through entry + clone…
+  const calls = [];
+  const fakeGit = (args) => {
+    calls.push(args);
+    // rev-parse of the local origin/main returns empty (status 0, no sha) so the
+    // snapshot falls back to the network ls-remote; the lock-loss race wins WHILE
+    // that ls-remote is blocking. The pre-base-fetch-op recheck must observe it.
+    if (args.includes('ls-remote') && args.some((a) => a.includes('refs/heads/main'))) ac.abort();
+    return gitOk();
+  };
+  try {
+    assert.throws(
+      () => provisionRepo({ envelope: baseFetchEnvelope(), token: null, runDir, abortSignal: ac.signal, _runGit: fakeGit }),
+      /provisioning aborted during pre-base-fetch-op/,
+      'an abort during the snapshot ls-remote is caught by the pre-base-fetch-op recheck',
+    );
+    assert.ok(calls.some((a) => a.includes('ls-remote') && a.some((x) => x.includes('refs/heads/main'))), 'the snapshot ls-remote ran');
+    assert.ok(!calls.some((a) => a.includes('fetch') && a.some((x) => x.includes('refs/remotes/origin/main'))), 'the base fetch never ran — stopped before mutating the repo');
+    assert.ok(!calls.some((a) => a.includes('config')), 'the committer-config writes never ran');
+  } finally {
+    rmSync(runDir, { recursive: true, force: true });
+  }
+});
+
+// #222 (suppressed advisory 4389): `post-base-fetch` is not the last gate either —
+// `resolveCommitterIdentity()` runs blocking git/gh probes and the two `git config`
+// writes MUTATE .git/config. An abort that wins during/after the first config write
+// must stop before starting the next one. The post-committer-{identity,name,config}
+// rechecks close it. Here the abort wins DURING the `user.name` write.
+test('#222 provisionRepo bails when the abort wins DURING the committer-config writes — throws before the next config/branch op', () => {
+  const runDir = mkdtempSync(join(tmpdir(), 'nano-committer-abort-'));
+  // Short-circuit resolveCommitterIdentity's own git/gh spawns to keep the test
+  // hermetic — a real identity in GIT_AUTHOR_* is returned verbatim (no spawns).
+  const prevName = process.env.GIT_AUTHOR_NAME;
+  const prevEmail = process.env.GIT_AUTHOR_EMAIL;
+  process.env.GIT_AUTHOR_NAME = 'Test User';
+  process.env.GIT_AUTHOR_EMAIL = 'test@example.com';
+  const ac = new AbortController(); // live through entry + clone + base fetch…
+  const calls = [];
+  const fakeGit = (args) => {
+    calls.push(args);
+    // …the lock-loss race wins WHILE `git config user.name` is blocking; the
+    // post-committer-name recheck must observe it before the user.email write.
+    if (args.includes('config') && args.includes('user.name')) ac.abort();
+    return gitOk();
+  };
+  try {
+    assert.throws(
+      () => provisionRepo({ envelope: baseFetchEnvelope(), token: null, runDir, abortSignal: ac.signal, _runGit: fakeGit }),
+      /provisioning aborted during post-committer-name/,
+      'an abort during the user.name config write is caught by the post-committer-name recheck',
+    );
+    assert.ok(calls.some((a) => a.includes('config') && a.includes('user.name')), 'the user.name config write ran');
+    assert.ok(!calls.some((a) => a.includes('config') && a.includes('user.email')), 'the user.email config write never ran — stopped before the next mutation');
+    assert.ok(!calls.some((a) => a.includes('checkout')), 'no branch checkout — stopped before mutating the tree');
+  } finally {
+    rmSync(runDir, { recursive: true, force: true });
+    if (prevName === undefined) delete process.env.GIT_AUTHOR_NAME; else process.env.GIT_AUTHOR_NAME = prevName;
+    if (prevEmail === undefined) delete process.env.GIT_AUTHOR_EMAIL; else process.env.GIT_AUTHOR_EMAIL = prevEmail;
   }
 });

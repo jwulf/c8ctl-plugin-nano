@@ -4342,6 +4342,13 @@ function provisionRepo({ envelope, token, runDir, runId, timeoutMs = 120_000, lo
       }
     }
   }
+  // #222: the pre-base-fetch snapshot probe above can itself BLOCK on the network
+  // (the `ls-remote --heads` fallback when there is no local `origin/<base>`), so
+  // `pre-base-fetch` (before the probe) is too early to cover an abort that wins
+  // DURING it. Recheck here — after the snapshot probe, before the OPTIONAL base
+  // fetch below — so a lock-loss race that landed while the snapshot ls-remote was
+  // blocking stops before the base fetch mutates the throwaway repo (thread 4389).
+  throwIfAborted('pre-base-fetch-op');
   let base = '';
   let baseFetchError;
   // `baseRef` (branch/tag) and `baseSha` (raw commit) are mutually exclusive — a
@@ -4395,8 +4402,17 @@ function provisionRepo({ envelope, token, runDir, runId, timeoutMs = 120_000, lo
   // is instead recorded as a PR comment (postAgentAttribution). Set via repo-
   // level config, which overrides global, so the identity is deterministic.
   const committer = resolveCommitterIdentity();
+  // #222: `resolveCommitterIdentity()` runs blocking git/gh identity probes and the
+  // two `git config` writes below MUTATE .git/config, so `post-base-fetch` (before
+  // the identity resolution) is not the last gate. Recheck after identity resolution
+  // and around each config write so an abort that wins during any of them stops
+  // before starting the next blocking op rather than mutating the throwaway repo's
+  // config after cancellation (suppressed advisory 4389).
+  throwIfAborted('post-committer-identity');
   runGitFn(['config', 'user.name', committer.name], { cwd: workspaceDir, env: gitEnv, timeoutMs: provTimeoutMs() });
+  throwIfAborted('post-committer-name');
   runGitFn(['config', 'user.email', committer.email], { cwd: workspaceDir, env: gitEnv, timeoutMs: provTimeoutMs() });
+  throwIfAborted('post-committer-config');
   // Config alone is not enough: git honours GIT_AUTHOR_*/GIT_COMMITTER_* OVER
   // user.name/user.email config, so a placeholder GIT_AUTHOR_EMAIL inherited from
   // the launch environment (e.g. `trial-merge@nano.local`) would still be stamped
@@ -8417,7 +8433,7 @@ function checkSetupAbort(abortSignal, { jobType, jobKey, stage, logger } = {}) {
     : stage === 'agent-instance'
       ? 'any AgentInstance minted this run is discarded (no COMPLETED update); stopping without a settle'
       : stage === 'repo-provisioning' || stage === 'relay-open'
-        ? 'any partially-provisioned throwaway workspace is left for reaping and no transcript is completed; stopping without a settle'
+        ? 'any partially-provisioned throwaway workspace is removed best-effort on the way out (a failed removal is left for the age-gated reaper; the entry gate may have created none yet) and no transcript is completed; stopping without a settle'
         : 'stopping without a settle';
   logger?.warn?.(`[${jobType}] job ${jobKey} aborted during setup (${stage}) — lease loss/force-stop won the race; ${sideEffectNote} (the job is being yielded for retry).`);
   return true;

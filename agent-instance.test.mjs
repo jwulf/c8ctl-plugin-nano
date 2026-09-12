@@ -1619,7 +1619,7 @@ test('the activation leaseToken is submitted as jobLease on create AND every app
 // describeSdkError — status + body extraction for loud, diagnosable failures
 // ---------------------------------------------------------------------------
 
-test('describeSdkError pulls HTTP status and body from common SDK error shapes', () => {
+test('describeSdkError reads the statusCode alias and coerces a missing/nullish status to null', () => {
   const a = describeSdkError({ statusCode: 400, body: { detail: 'lease fence mismatch' }, message: 'Bad Request' });
   assert.equal(a.status, 400);
   assert.match(a.body, /lease fence mismatch/);

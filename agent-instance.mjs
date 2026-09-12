@@ -791,14 +791,16 @@ export function createAgentInstanceProducer(opts = {}) {
     // The FINAL last-chance attempt is followed by `finalized` in complete(), so NO
     // hot-path retry can mint the instance afterwards — its diagnostic must not promise
     // one (matching doCreate's `final` retry clause), or operators would wait for a
-    // recovery that can't happen (issue #230). The same holds for a NON-final attempt
-    // retired while complete() is finalizing (`finalizing`): complete() latches
-    // `finalized` right after awaiting it, so no hot-path retry follows there either.
-    const retryClause =
-      wasFinal || finalizing
-        ? `no further create will be attempted (${
-            wasFinal ? 'final attempt' : 'completion in progress'
-          }; job completion unaffected).`
+    // recovery that can't happen (issue #230). A NON-final attempt retired while
+    // complete() is finalizing (`finalizing`) is different: no HOT-PATH retry follows
+    // (maybeStartCreate gates on `finalizing`), but complete() itself may still make one
+    // explicit final attempt right after (when the in-flight cap has room), so the
+    // diagnostic must describe that as a possible final attempt — not promise "no
+    // further create" (which would be false on that path) nor a hot-path retry.
+    const retryClause = wasFinal
+      ? `no further create will be attempted (final attempt; job completion unaffected).`
+      : finalizing
+        ? `completion is in progress and may make one final attempt to mint the instance (job completion unaffected).`
         : `a later hot-path retry will attempt to mint the instance (job completion unaffected).`;
     const line =
       `AgentInstance producer: createAgentInstance did not settle within ` +
@@ -873,7 +875,15 @@ export function createAgentInstanceProducer(opts = {}) {
   // from the ACP hot path (`ingest`) so a create that becomes possible mid-run is
   // retried without a dedicated timer.
   const maybeStartCreate = () => {
-    if (disabled || agentInstanceKey || creating || finalized) return;
+    // `finalizing` is included so no hot-path retry can start once complete() has begun
+    // its terminal last-chance path (issue #230): complete() awaits an existing create
+    // (bounded) and, if still un-minted, makes ONE explicit final attempt. If a late ACP
+    // frame started a fresh non-final create while complete() was suspended on that
+    // await, complete() would see `creating` truthy, skip its explicit final attempt,
+    // then latch `finalized` — and doCreate would drop the late result, losing the
+    // terminal record during a transient create failure. Gating on `finalizing` keeps
+    // complete() the sole author of the final attempt.
+    if (disabled || agentInstanceKey || creating || finalized || finalizing) return;
     // Circuit-breaker: don't launch a fresh retry while `maxInFlightCreates` create
     // POSTs are still outstanding. Retiring a hung attempt frees the `creating` slot,
     // but its uncancellable SDK call stays in flight until it settles; without this

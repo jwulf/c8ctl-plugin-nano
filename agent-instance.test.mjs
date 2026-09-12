@@ -990,12 +990,14 @@ test('a hung history append is bounded so complete()\'s queue drain cannot stall
   // Appends are serialized on the queue and complete() drains it before settling the
   // job. A history append that HANGS (rather than rejects) must be bounded
   // (finalizeTimeoutMs) or the drain — and job settlement — blocks until lease expiry.
+  let signalCompletedA;
+  const completedSeenA = new Promise((r) => { signalCompletedA = r; });
   const client = {
     calls: { create: [], update: [] },
     createAgentInstance: async (req) => { client.calls.create.push(req); return { agentInstanceKey: 'AGENT-A' }; },
     updateAgentInstance: (req) => {
       client.calls.update.push(req);
-      if (req.status === 'COMPLETED') return Promise.resolve({ createdHistory: [] });
+      if (req.status === 'COMPLETED') { signalCompletedA(); return Promise.resolve({ createdHistory: [] }); }
       return new Promise(() => {}); // history appends hang forever
     },
   };
@@ -1010,10 +1012,10 @@ test('a hung history append is bounded so complete()\'s queue drain cannot stall
   // settlement until lease expiry. Because the drain timed out with the append still in
   // flight, the terminal COMPLETED is SERIALIZED behind it (not raced), landing in the
   // background once the bounded append settles.
-  const deadline = Date.now() + 2000;
-  while (!client.calls.update.some((u) => u.status === 'COMPLETED') && Date.now() < deadline) {
-    await new Promise((r) => setTimeout(r, 10));
-  }
+  // Await a deterministic completion signal from the fake (resolved the instant the
+  // terminal COMPLETED update is issued), not a wall-clock deadline, so pass/fail does
+  // not depend on scheduler load (issue #230).
+  await completedSeenA;
   assert.ok(
     client.calls.update.some((u) => u.status === 'COMPLETED'),
     'the terminal COMPLETED update still ran once the hung append was bounded out',
@@ -1141,12 +1143,14 @@ test('complete() bounds the AGGREGATE append drain and SERIALIZES the terminal C
   // terminalize the instance before a delayed append lands, reordering/losing it).
   // Instead it is ENQUEUED behind the pending appends: bounded, never raced, always
   // ordered last.
+  let signalCompletedDR;
+  const completedSeenDR = new Promise((r) => { signalCompletedDR = r; });
   const client = {
     calls: { create: [], update: [] },
     createAgentInstance: async (req) => { client.calls.create.push(req); return { agentInstanceKey: 'AGENT-DR' }; },
     updateAgentInstance: (req) => {
       client.calls.update.push(req);
-      if (req.status === 'COMPLETED') return Promise.resolve({ createdHistory: [] });
+      if (req.status === 'COMPLETED') { signalCompletedDR(); return Promise.resolve({ createdHistory: [] }); }
       return new Promise(() => {}); // every history append hangs forever (bounded per-call)
     },
   };
@@ -1173,10 +1177,9 @@ test('complete() bounds the AGGREGATE append drain and SERIALIZES the terminal C
     'the terminal COMPLETED update was serialized behind the pending appends, not raced ahead of them',
   );
   // Let the background queue drain (each hung append is bounded at finalizeTimeoutMs).
-  const deadline = Date.now() + 2000;
-  while (!client.calls.update.some((u) => u.status === 'COMPLETED') && Date.now() < deadline) {
-    await new Promise((r) => setTimeout(r, 10));
-  }
+  // Await a deterministic completion signal from the fake instead of a wall-clock
+  // deadline, so ordering assertions do not depend on scheduler load (issue #230).
+  await completedSeenDR;
   // The terminal COMPLETED eventually lands, and ORDERING is preserved: it is the final
   // update, after all six history appends were issued (never reordered/lost).
   const completedIdx = client.calls.update.findIndex((u) => u.status === 'COMPLETED');

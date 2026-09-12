@@ -63,10 +63,19 @@ SDK client (job workers) — do **not** add the SDK as a dependency or use raw
   run the harness with that workspace as `cwd` → push the branch (`branch.push`)
   → reconcile the **agent-opened** PR (`task.allowPr`, via `gh pr list --head`).
   The repo token is delivered via `GIT_ASKPASS` (env) and **redacted** from all
-  logs/results — never in argv or the remote URL. A push failure is a
-  non-fatal `pushError` (the process model drives the merge); a clone failure
-  sheds (retryable). Workspaces are reaped like containers (age-gated, in-flight
-  skipped) and deleted per-job unless `--keep-runs`. Container-side cloning
+  logs/results — never in argv or the remote URL. A push failure is **non-fatal**
+  and sets `pushFailed` (the authoritative "work is stranded / workspace
+  preserved" flag) so the worker still completes the job and the process model
+  drives the merge; a clone/checkout failure sheds (retryable `ProvisionError`).
+  When work is stranded the run **workspace is PRESERVED** for recovery (holding
+  the `strandedCommits` list — only usable while the clone's objects exist).
+  `pushError` accompanies only an **attempted-and-rejected** push; a
+  branch-mismatch or incomplete-scan finalize **refuses to push** and sets
+  `pushFailed` (+`branchMismatch`/`scanError`) *without* `pushError`. `scanError`
+  marks a **best-effort/partial** `strandedCommits` list (a remote-reachability
+  scan that could not complete). Otherwise workspaces are reaped like containers
+  (age-gated, in-flight skipped) and deleted per-job unless `--keep-runs`.
+  Container-side cloning
   (strong isolation) is a later increment; container jobs don't clone yet.
 
 ## Worker supervisor (`supervisor`)

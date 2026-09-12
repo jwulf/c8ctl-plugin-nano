@@ -46,6 +46,7 @@ import {
   realpathSync,
   statfsSync,
   lstatSync,
+  utimesSync,
   mkdtempSync,
   closeSync,
   watchFile,
@@ -2527,6 +2528,19 @@ const RESULT_SENTINEL = '::nano:result::';
 const RESERVED_RESULT_KEYS = new Set([
   AGENT_RESULT_KEY, 'output', 'exitCode', 'agent', 'truncated',
   'branch', 'commits', 'pushed', 'pullRequest', 'forcedReap',
+  // The host-authored Git result contract (issue #231): these carry the "push
+  // rejected" signal, the recovery SHAs, and the branch-mismatch detail into
+  // io.nanobpm.agentResult. Reserve them alongside branch/commits/pushed so
+  // untrusted agent output cannot inject/shadow them as top-level completion vars
+  // and spoof the finalize contract downstream (thread 6772). `scanError` marks an
+  // INCOMPLETE local scan (partial strandedCommits, no push attempted) distinctly
+  // from a rejected push — reserve it too so an agent can't forge it. `pushError`
+  // is the host-authored "the push was ATTEMPTED and rejected" detail — reserve it
+  // alongside `pushFailed` so an untrusted agent result cannot emit a top-level
+  // `pushError` that spreads into the completion vars and forges the git-failure
+  // signal for consumers (the nested envelope is host-built and correct, but the
+  // flat completion vars must not be spoofable).
+  'pushFailed', 'pushError', 'strandedCommits', 'branchMismatch', 'scanError',
 ]);
 
 // Parse `text` as a JSON object, returning it only when it is a plain object.
@@ -3925,6 +3939,22 @@ function authUrl(url, provider, hasToken) {
 
 class ProvisionError extends Error {}
 
+// Reduce an arbitrary string to a single git-ref-safe path segment: git refname
+// rules forbid spaces and ~^:?*[\, leading/trailing/doubled dots, a trailing
+// ".lock", etc. Used to build the deterministic fallback work branch (issue #231)
+// off the base branch name + run id, so a run with no branch.create still commits
+// on a fresh, always-fast-forwardable branch instead of on the base.
+function sanitizeBranchSegment(s) {
+  const cleaned = String(s == null ? '' : s)
+    .replace(/[^0-9A-Za-z._-]+/g, '-') // collapse anything unusual to a dash
+    .replace(/\.{2,}/g, '.')            // no doubled dots (git forbids "..")
+    .replace(/^[-.]+/, '')              // no leading dot or dash
+    .slice(0, 60)                       // bound the segment BEFORE the trailing
+    .replace(/[-.]+$/g, '')             // checks, so truncating at char 60 can't
+    .replace(/\.lock$/i, 'lock');       // re-introduce a trailing dot/dash or ".lock"
+  return cleaned || 'base';
+}
+
 // Never let git invoke the host's configured credential helper for our clone/
 // push. Reset the helper list ("") so no helper runs — even when we DO have a
 // token, because helpers like `store`/keychain would persist the job's repo
@@ -4127,7 +4157,11 @@ function githubCloneToken({ provider, authRef, secretResolver, ghAuthToken = ghA
 // Clone repo into <runDir>/workspace and check out / create the working branch.
 // Returns { workspaceDir, gitEnv, startSha, workingBranch, remote }. Throws a
 // ProvisionError (token-redacted) on any git failure so the caller can shed.
-function provisionRepo({ envelope, token, runDir, timeoutMs = 120_000, logger = null, corr = '' }) {
+function provisionRepo({ envelope, token, runDir, runId, timeoutMs = 120_000, logger = null, corr = '', _runGit = null }) {
+  // Test-only seam mirroring finalizeGit: route every git call through `runGitFn` so a
+  // deterministic test can observe the per-call timeouts drawn from the shared
+  // provisioning budget below. Defaults to the module `runGit` (production unchanged).
+  const runGitFn = _runGit || runGit;
   const repo = envelope.repository;
   if (!repo || !repo.url) throw new ProvisionError('repository.url is required to provision a workspace');
   // #229: correlation suffix so git provisioning lines can be joined to the job /
@@ -4177,6 +4211,21 @@ function provisionRepo({ envelope, token, runDir, timeoutMs = 120_000, logger = 
   // Per-envelope timeout override (backstop for giant monorepos that approach the
   // default cap even when shallow); falls back to the caller-supplied timeout.
   const effectiveTimeoutMs = (repo.cloneTimeoutMs && repo.cloneTimeoutMs > 0) ? repo.cloneTimeoutMs : timeoutMs;
+  // Cumulative provisioning lease budget (advisory: provisioning runs under a
+  // supervisor heartbeat that CANNOT fire during the blocking spawnSync git calls
+  // below). The clone PLUS the added network probes (ls-remote --symref default-branch
+  // probe, the base-snapshot ls-remote, the base fetch) each formerly claimed their OWN
+  // full `effectiveTimeoutMs`, so their SUM could exceed the recovery lease (default
+  // 300s) and get the job REDELIVERED before the harness even started. Bound them all
+  // against ONE shared deadline instead: the clone draws the full budget first (it is
+  // the dominant cost and stays a retryable ProvisionError on timeout), and each
+  // subsequent op takes only the REMAINING slice — so the cumulative provisioning
+  // wall-time is capped by a single budget, not N×120s. A near-exhausted budget makes
+  // the best-effort probes fail fast (clamped to 1ms) rather than blocking past the
+  // lease; the base-snapshot/default-branch probes already degrade safely (fail-closed
+  // / baseSnapshotUnknown) when they cannot complete.
+  const provDeadline = Date.now() + effectiveTimeoutMs;
+  const provTimeoutMs = () => Math.max(1, Math.min(effectiveTimeoutMs, provDeadline - Date.now()));
   const cloneArgs = [...credArgs(), 'clone', '--no-tags'];
   if (repo.depth && repo.depth > 0) cloneArgs.push('--depth', String(repo.depth));
   // `--single-branch` restricts the fetch to just `ref` — a plain `clone --branch`
@@ -4191,7 +4240,7 @@ function provisionRepo({ envelope, token, runDir, timeoutMs = 120_000, logger = 
   const remote = authUrl(repo.url, repo.provider || 'github', !!token);
   cloneArgs.push(remote, workspaceDir);
 
-  const clone = runGit(cloneArgs, { env: gitEnv, timeoutMs: effectiveTimeoutMs });
+  const clone = runGitFn(cloneArgs, { env: gitEnv, timeoutMs: provTimeoutMs() });
   if (clone.status !== 0) {
     if (clone.timedOut) {
       // Preserve whatever git managed to print before SIGTERM (plus exit/signal
@@ -4206,8 +4255,8 @@ function provisionRepo({ envelope, token, runDir, timeoutMs = 120_000, logger = 
   if (isSha) {
     // The SHA may not be present under a shallow clone of the branch — fetch it
     // explicitly (best effort), then check it out (detached HEAD).
-    const fetch = runGit([...credArgs(), 'fetch', '--no-tags', 'origin', commitSha], { cwd: workspaceDir, env: gitEnv, timeoutMs: effectiveTimeoutMs });
-    const co = runGit(['checkout', '--detach', commitSha], { cwd: workspaceDir, env: gitEnv });
+    const fetch = runGitFn([...credArgs(), 'fetch', '--no-tags', 'origin', commitSha], { cwd: workspaceDir, env: gitEnv, timeoutMs: provTimeoutMs() });
+    const co = runGitFn(['checkout', '--detach', commitSha], { cwd: workspaceDir, env: gitEnv, timeoutMs: provTimeoutMs() });
     if (co.status !== 0) {
       // Combine the fetch + checkout output (the real reason often lives in the
       // fetch), and annotate a fetch timeout explicitly so a slow `git fetch
@@ -4222,6 +4271,44 @@ function provisionRepo({ envelope, token, runDir, timeoutMs = 120_000, logger = 
   // sha is supplied, fetch it (respecting depth/filter) into a remote-tracking
   // ref so the harness can compute `git diff origin/<base>...HEAD`. Best-effort:
   // a failed base fetch is recorded, not fatal (the head clone still succeeded).
+  //
+  // Snapshot the CONFIGURED base's clone-time tip BEFORE the optional base fetch
+  // below, so finalizeGit's pre-push base-advanced staleness check anchors on a
+  // genuine clone-time baseline. The explicitly-configured base is `branch.base`
+  // (or `repository.baseRef`); anything else `effectiveBase` (below) resolves to is
+  // the ref the CLONE itself landed on, whose `origin/<base>` is present locally and
+  // read directly there. This pre-fetch snapshot guards two hazards:
+  //   * a baseRef fetch fast-forwards refs/remotes/origin/<baseRef>, so reading that
+  //     remote-tracking ref AFTER the fetch records the already-advanced tip and
+  //     under-counts a real base advance (suppressed advisory 4433); and
+  //   * a single-branch clone of a DIFFERENT ref has NO local origin/<base>, so the
+  //     baseline must come from the remote — and taking that `ls-remote` AFTER the
+  //     fetch lets a base advance in the fetch→query window slip into the baseline
+  //     (TOCTOU under-count). Doing it PRE-fetch pins the true clone-time tip.
+  // Capture the LOCAL remote-tracking tip when present (full clone, cheap, no
+  // network); else query the remote ONCE, pre-fetch. A BRANCH base yields a SHA (the
+  // baseline finalizeGit measures against); a TAG/absent base yields empty (tags are
+  // immutable → the staleness skip is correct); a failed remote query leaves the
+  // baseline UNKNOWN so finalizeGit reports it explicitly rather than silently
+  // skipping (covers an explicit `branch.base` single-branch clone too, not only
+  // `repository.baseRef`).
+  const configuredBase = envelope.branch?.base
+    || (repo.baseRef && !String(repo.baseRef).startsWith('-') ? String(repo.baseRef) : '');
+  let baseCloneSnapshot = null;    // pre-fetch clone-time baseline SHA (null ⇒ none)
+  let baseSnapshotUnknown = false; // remote query failed ⇒ baseline cannot be confirmed
+  if (configuredBase && !String(configuredBase).startsWith('-')) {
+    const local = runGitFn(['rev-parse', '--verify', '--quiet', `refs/remotes/origin/${configuredBase}`], { cwd: workspaceDir, env: gitEnv, timeoutMs: provTimeoutMs() });
+    if (local.status === 0 && (local.stdout || '').trim()) {
+      baseCloneSnapshot = (local.stdout || '').trim();
+    } else {
+      const ls = runGitFn([...credArgs(), 'ls-remote', '--heads', 'origin', `refs/heads/${configuredBase}`], { cwd: workspaceDir, env: gitEnv, timeoutMs: provTimeoutMs() });
+      if (ls.status === 0) {
+        baseCloneSnapshot = ((ls.stdout || '').trim().split(/\s+/)[0] || '') || null; // branch → baseline; empty → tag/absent (skip)
+      } else {
+        baseSnapshotUnknown = true; // network failure — cannot confirm branch vs tag
+      }
+    }
+  }
   let base = '';
   let baseFetchError;
   // `baseRef` (branch/tag) and `baseSha` (raw commit) are mutually exclusive — a
@@ -4248,7 +4335,7 @@ function provisionRepo({ envelope, token, runDir, timeoutMs = 120_000, logger = 
         fetchArgs.push('origin', `+${baseTarget}:refs/remotes/origin/${baseTarget}`);
         base = `origin/${baseTarget}`;
       }
-      const bf = runGit(fetchArgs, { cwd: workspaceDir, env: gitEnv, timeoutMs: effectiveTimeoutMs });
+      const bf = runGitFn(fetchArgs, { cwd: workspaceDir, env: gitEnv, timeoutMs: provTimeoutMs() });
       if (bf.status !== 0) {
         // Name the base target (branch vs sha) so the warning is actionable when
         // multiple refs are in play, and preserve git's output/context in both the
@@ -4269,8 +4356,8 @@ function provisionRepo({ envelope, token, runDir, timeoutMs = 120_000, logger = 
   // is instead recorded as a PR comment (postAgentAttribution). Set via repo-
   // level config, which overrides global, so the identity is deterministic.
   const committer = resolveCommitterIdentity();
-  runGit(['config', 'user.name', committer.name], { cwd: workspaceDir, env: gitEnv });
-  runGit(['config', 'user.email', committer.email], { cwd: workspaceDir, env: gitEnv });
+  runGitFn(['config', 'user.name', committer.name], { cwd: workspaceDir, env: gitEnv, timeoutMs: provTimeoutMs() });
+  runGitFn(['config', 'user.email', committer.email], { cwd: workspaceDir, env: gitEnv, timeoutMs: provTimeoutMs() });
   // Config alone is not enough: git honours GIT_AUTHOR_*/GIT_COMMITTER_* OVER
   // user.name/user.email config, so a placeholder GIT_AUTHOR_EMAIL inherited from
   // the launch environment (e.g. `trial-merge@nano.local`) would still be stamped
@@ -4291,72 +4378,317 @@ function provisionRepo({ envelope, token, runDir, timeoutMs = 120_000, logger = 
   // rev-parse resolves a symbolic name — a tag/sha leaves detached HEAD, in
   // which case there is NO branch to push and workingBranch stays null so
   // finalizeGit skips the push/PR reconcile instead of pushing a bogus ref.
+  const log = logger || getLogger();
+  // Fold the CONFIGURED base ref (`repository.baseRef`) in ahead of the checked-out
+  // ref so the fallback branch NAME and the "configured base" log identify the ACTUAL
+  // base. Real PR envelopes carry the base as `repository.baseRef` (not branch.base),
+  // so without this the split shape (ref='feat/x' + baseRef='main', no branch.create)
+  // named the fallback after the FEATURE ref (`nano/agent-work/feat-x-…`) and logged
+  // 'feat/x' as the configured base even though `effectiveBase` (below) is 'main'
+  // (suppressed advisory 4317). This is observability only — the #231 guard already
+  // compares against `effectiveBase`, which folds the same value.
+  const configuredBaseRef = repo.baseRef && !String(repo.baseRef).startsWith('-') ? String(repo.baseRef) : '';
+  const baseBranchName = envelope.branch?.base || configuredBaseRef || branchName || '';
+  const wantPush = coerceBool(envelope.branch?.push, true);
   let workingBranch = null;
-  // Whether the agent's commits land on a branch DISTINCT from the checkout base
-  // (a real PR branch that shields them from a non-ff push / a reaped base). This
-  // is the authoritative decision — finalizeGit carries it rather than re-deriving
-  // from the envelope, which cannot see the detached/unpinned cases below.
-  let hasPrBranch = false;
-  if (envelope.branch?.create) {
-    // Capture the branch the clone ACTUALLY checked out BEFORE we reset it with
-    // `-B`. When no ref/base was pinned (`branchName` empty) the clone lands on
-    // the remote's default branch (e.g. `main`); without this we could not tell
-    // that `branch.create` EQUALS that default, so the direct-on-base warning
-    // below would silently not fire. A tag/sha checkout is detached HEAD → 'HEAD',
-    // which never equals a real create target.
-    const preHead = runGit(['rev-parse', '--abbrev-ref', 'HEAD'], { cwd: workspaceDir, env: gitEnv });
-    const clonedBranch = (preHead.stdout || '').trim();
-    const cb = runGit(['checkout', '-B', envelope.branch.create], { cwd: workspaceDir, env: gitEnv, timeoutMs });
-    if (cb.status !== 0) throw new ProvisionError(describeGitFailure(`git checkout -B ${envelope.branch.create}`, cb, { token, timeoutMs }));
-    workingBranch = envelope.branch.create;
-    // #229: make the working-branch decision explicit. A `checkout -B` whose target
-    // is DISTINCT from the effective checkout base genuinely cuts a feat branch —
-    // the agent's commits land on their own branch and a PR can be opened. But when
-    // `branch.create` EQUALS that base the `-B` just resets the base branch in
-    // place: the agent commits DIRECTLY on the base with no distinct PR branch, so a
-    // non-fast-forward push (the base advanced on the remote since clone) loses every
-    // commit — the same 20974 work-loss shape as the no-create path. The effective
-    // base is the branch the clone ACTUALLY checked out (`clonedBranch`): this is
-    // authoritative across all cases — a pinned branch base, an UNPINNED `create`
-    // that equals the default branch the clone landed on, AND a detached tag/sha
-    // base (`clonedBranch === 'HEAD'`) where `checkout -B` cut a REAL branch from
-    // detached HEAD, so it is a distinct PR branch even when the tag NAME equals
-    // `create` (e.g. ref:'v1', create:'v1'). `branchName` (repository.ref, which
-    // may be a TAG) must NOT be used here — a tag name would masquerade as a
-    // symbolic base and misclassify the distinct branch as direct-on-base.
-    const effectiveBase = clonedBranch && clonedBranch !== 'HEAD' ? clonedBranch : '';
-    hasPrBranch = workingBranch !== effectiveBase;
-    if (effectiveBase && workingBranch === effectiveBase) {
-      logger?.warn?.(`git provision: branch.create='${envelope.branch.create}' equals the checkout base → agent will commit DIRECTLY on base branch '${workingBranch}'; no distinct PR branch — a non-fast-forward push (the branch advanced on the remote since clone) would lose every commit.${cs}`);
-    } else {
-      logger?.info?.(`git provision: branch.create=${envelope.branch.create} → cut feat branch '${workingBranch}' off '${effectiveBase || 'HEAD'}'.${cs}`);
-    }
-  } else {
-    const head = runGit(['rev-parse', '--abbrev-ref', 'HEAD'], { cwd: workspaceDir, env: gitEnv });
-    const name = (head.stdout || '').trim();
-    workingBranch = (name && name !== 'HEAD') ? name : null; // null ⇒ detached HEAD
-    // #229: the else branch silently defaulted to the checked-out branch. Make it
-    // visible, and WARN loudly when the working branch IS the base branch — the
-    // agent will commit directly onto the base branch, so a non-fast-forward push
-    // (the base advanced since clone) loses all commits with no PR branch (the
-    // exact 20974 work-loss shape).
-    if (!workingBranch) {
-      logger?.info?.(`git provision: no branch.create and detached HEAD (tag/sha checkout) → no branch to push.${cs}`);
-    } else {
-      // We can't reliably assert this IS the base branch: `branchName` is taken
-      // from `repository.ref` before `branch.base`, so a job may deliberately run
-      // on a non-base ref and this else-branch simply reflects the checked-out
-      // branch. Warn about committing directly onto THAT branch — the work-loss
-      // risk (a non-ff push after the branch advances on the remote, with no PR
-      // branch to fall back to) applies to any pushed-to branch, not just base.
-      logger?.warn?.(`git provision: no branch.create → agent will commit DIRECTLY on the checked-out branch '${workingBranch}'; no PR branch — a non-fast-forward push (the branch advanced on the remote since clone) would lose every commit.${cs}`);
+  let fallbackBranch = false;
+  // Cut a fresh, uniquely-named work branch off the base so commits are NEVER made
+  // directly on the base branch (issue #231). Being new on the remote it always
+  // fast-forwards, and its name rides back in the result envelope (env.branch) so
+  // the process model can still find the work. Prefer the run's UUID (`runId`)
+  // over `basename(runDir)` for the unique suffix: the latter is only unique within
+  // this worker incarnation's namespace, so two workers could mint the same
+  // `run-XXXXXX` basename and collide on a repo-wide remote ref (non-ff strand);
+  // the UUID is globally unique. (`basename(runDir)` remains a fallback for the
+  // direct-call unit tests that do not thread a runId.)
+  // What the clone actually landed on: a branch only if HEAD is a SYMBOLIC ref —
+  // a tag/sha leaves detached HEAD, in which case there is NO branch to push and
+  // workingBranch stays null. Read it with `git symbolic-ref -q HEAD` (the FULL
+  // ref, then strip `refs/heads/`), NOT `git rev-parse --abbrev-ref HEAD`: when a
+  // TAG shares the branch's name (e.g. refs/tags/v1 alongside refs/heads/v1),
+  // `--abbrev-ref` disambiguates by emitting the qualified 'heads/v1', which would
+  // be recorded as `checkedOut` and make the returned `baseBranch` and the pre-push
+  // staleness fetch target 'refs/heads/heads/v1' instead of the real base (thread
+  // 4344, mirroring finalizeGit's same fix). `symbolic-ref` returns the full,
+  // unambiguous ref and exits nonzero for a DETACHED HEAD → symName '' → no branch.
+  const symref = runGitFn(['symbolic-ref', '-q', 'HEAD'], { cwd: workspaceDir, env: gitEnv, timeoutMs: provTimeoutMs() });
+  // A TIMEOUT (or spawn failure) on a MANDATORY branch-state probe must NOT be
+  // misread as "detached/unborn HEAD" — under the shared provisioning budget a
+  // nearly-exhausted deadline can time this probe out, and classifying that as
+  // detached would return `workingBranch=null`, make `finalizeGit` SKIP the push, and
+  // let the harness commit directly on the real base while the workspace is reaped:
+  // silent work loss (issue #231). `runGit` surfaces a timeout as `timedOut` and a
+  // spawn failure as a null status; a GENUINE detached/unborn HEAD exits 1 (a real,
+  // completed status) and is unaffected. Throw a retryable ProvisionError so the job
+  // is REDELIVERED instead of losing work.
+  const probeFailedToRun = (r) => r.timedOut === true || r.status === null;
+  if (probeFailedToRun(symref)) throw new ProvisionError(describeGitFailure('git symbolic-ref -q HEAD', symref, { token, timeoutMs }));
+  const symRef = symref.status === 0 ? ((symref.stdout || '').trim()) : '';
+  const symName = symRef.startsWith('refs/heads/') ? symRef.slice('refs/heads/'.length) : '';
+  // A symbolic HEAD can still be UNBORN (freshly cloned EMPTY repo — a branch ref
+  // pointing at no commit yet). A DETACHED checkout (tag/sha) has no symbolic ref at
+  // all, but an UNBORN branch does become pushable the moment the agent makes the
+  // first commit. Separate the committed vs unborn case by whether HEAD resolves to
+  // a commit, so an empty-repo job is not mis-classified as detached (which would
+  // skip the push and silently strand that first commit, issue #231 work-loss).
+  const headProbe = runGitFn(['rev-parse', '--verify', '--quiet', 'HEAD'], { cwd: workspaceDir, env: gitEnv, timeoutMs: provTimeoutMs() });
+  if (probeFailedToRun(headProbe)) throw new ProvisionError(describeGitFailure('git rev-parse --verify --quiet HEAD', headProbe, { token, timeoutMs }));
+  const headHasCommit = headProbe.status === 0;
+  const checkedOut = (symName && headHasCommit) ? symName : null; // null ⇒ detached HEAD or unborn branch
+  const unbornBranch = (symName && !headHasCommit) ? symName : null;
+  // The base we must never commit-and-push onto. Derive it ONLY from an explicit
+  // `branch.base` or a SYMBOLIC checked-out/unborn branch — never from
+  // `repository.ref`, which may be a TAG: a tag clone leaves detached HEAD
+  // (checkedOut null), and if `branch.create` happened to equal that tag the old
+  // `baseBranchName`-derived compare would make the guard below skip the explicit
+  // checkout, leaving workingBranch null and silently skipping the push. When both
+  // branch.base and repository.ref are omitted, fall back to the actually
+  // checked-out ref (e.g. the remote default 'main') so an explicit
+  // branch.create='main' can't slip past the guard (=== '' is false) and commit
+  // directly on default — and to the UNBORN branch name for an empty-repo clone
+  // (checkedOut null) so branch.create equal to the symbolic default ('master')
+  // is likewise treated as the base and cut a fallback instead of committing on it.
+  //
+  // When `repository.sha` DETACHES HEAD (checkedOut AND unbornBranch both null) the
+  // clone still landed on `repository.ref` (`branchName`) first. If that ref names a
+  // REAL remote branch (e.g. ref=main + sha=<main commit> + branch.create=main), the
+  // create equals a base branch and honouring the `checkout -B main` path would
+  // commit and push DIRECTLY onto the base — the #231 hazard (thread 4344). Resolve
+  // whether the detached ref is a remote branch and, if so, fold it into the base so
+  // the guard cuts a fallback. A TAG leaves no `refs/remotes/origin/<ref>` (tags land
+  // under refs/tags and are excluded by `--no-tags`), so the detached-tag case is
+  // unaffected — it is exactly the branch case that must not be treated the same.
+  let refBaseBranch = '';
+  if (!checkedOut && !unbornBranch && branchName && !branchName.startsWith('-')) {
+    const rb = runGitFn(['rev-parse', '--verify', '--quiet', `refs/remotes/origin/${branchName}`], { cwd: workspaceDir, env: gitEnv, timeoutMs: provTimeoutMs() });
+    if (rb.status === 0 && (rb.stdout || '').trim()) refBaseBranch = branchName;
+  }
+  // A `repository.sha` clone with NO `repository.ref` (branchName empty) still lands
+  // on the remote's DEFAULT branch before detaching, so an explicit branch.create
+  // naming that default (e.g. create='main') would slip past the guard below (=== ''
+  // is false) and commit/push DIRECTLY onto the base — the #231 hazard, but with no
+  // ref to name it (thread 4378). Resolve the remote's default branch from
+  // origin/HEAD so it too counts as a base the guard must refuse to commit onto.
+  if (!refBaseBranch && !checkedOut && !unbornBranch && !branchName) {
+    const dh = runGitFn(['rev-parse', '--abbrev-ref', 'origin/HEAD'], { cwd: workspaceDir, env: gitEnv, timeoutMs: provTimeoutMs() });
+    if (dh.status === 0) {
+      const def = (dh.stdout || '').trim().replace(/^origin\//, '');
+      if (def && def !== 'HEAD' && !def.startsWith('-')) refBaseBranch = def;
     }
   }
-  const sha = runGit(['rev-parse', 'HEAD'], { cwd: workspaceDir, env: gitEnv });
+  // Fold the CONFIGURED base ref (`repository.baseRef`, the documented base) into the
+  // effective base ahead of the checked-out ref. Real PR envelopes carry the base as
+  // `repository.baseRef` (not `branch.base`), so without this the chain fell through
+  // to `checkedOut` (the FEATURE ref) and the guard treated an explicit
+  // `branch.create` that names the real base as an ordinary work branch — committing
+  // and pushing directly onto the base (the #231 hazard) AND making the pre-push
+  // staleness check watch the feature ref instead of the base (thread/advisory 4378).
+  const effectiveBase = (envelope.branch?.base || '') || configuredBaseRef || checkedOut || unbornBranch || refBaseBranch || '';
+  const cutFallbackBranch = (landedOn) => {
+    const uniq = runId || basename(runDir);
+    // Name the fallback segment for the REAL base/default the commit would have raced,
+    // NOT the ref the clone happens to sit on. When the clone is DETACHED at a tag/SHA
+    // and no base was configured, `baseBranchName` is derived from `branchName` (the
+    // TAG), so an explicit `branch.create` equal to the remote default routes here with
+    // an empty `effectiveBase` and would mislabel the recovery branch
+    // `nano/agent-work/<tag>-…` instead of `<default>-…` (advisory: tag-base mislabels
+    // fallback branch). Prefer the resolved `effectiveBase`/`remoteDefaultBranch` ahead
+    // of `baseBranchName` so the segment names the real default/base, falling back to
+    // the landed ref only when neither resolved.
+    const baseSeg = effectiveBase || remoteDefaultBranch || baseBranchName || landedOn || 'base';
+    const fb = `nano/agent-work/${sanitizeBranchSegment(baseSeg)}-${sanitizeBranchSegment(uniq)}`;
+    const cb = runGitFn(['checkout', '-B', fb], { cwd: workspaceDir, env: gitEnv, timeoutMs: provTimeoutMs() });
+    if (cb.status !== 0) throw new ProvisionError(describeGitFailure(`git checkout -B ${fb}`, cb, { token, timeoutMs }));
+    workingBranch = fb;
+    fallbackBranch = true;
+    // Name the branch the commit WOULD have landed on had the fallback not been cut.
+    // When an explicit branch.create is present (and recognized as the base/default),
+    // the unguarded path would have checked out and committed on that REQUESTED create
+    // ref, NOT the ref the clone currently sits on (`landedOn`): e.g. ref=feat/x +
+    // branch.create=main lands on 'feat/x' at clone but would have committed on 'main'.
+    // Reporting `landedOn` alone mislabels that case (advisory: fallback-branch warning
+    // names the wrong branch), so prefer `explicitCreate` when set. Also surface the
+    // resolved effective/default base so the recovery diagnostic points at the branch
+    // the commit would ACTUALLY have landed on and the base it would have raced.
+    const wouldLandOn = explicitCreate || landedOn;
+    const resolvedBase = (remoteDefaultBranch && (explicitCreate === remoteDefaultBranch || defaultUnverified))
+      ? remoteDefaultBranch
+      : (effectiveBase || baseBranchName || '(unknown)');
+    log.warn?.(`provisionRepo${cs}: work would otherwise be committed on branch '${wouldLandOn}' (resolved base '${resolvedBase}') — cut fallback work branch '${fb}' so commits are never made directly on the base branch (the app should supply branch.create=feat/<task.id>)`);
+  };
+  const explicitCreate = envelope.branch?.create ? String(envelope.branch.create) : '';
+  // Resolve the remote's DEFAULT branch (best-effort) ONLY when it can change the
+  // decision: an explicit branch.create we would otherwise HONOR (push enabled, and
+  // not already the effective base). A FEATURE-ref checkout short-circuits the
+  // `refBaseBranch` (origin/HEAD) resolution above, and a job may omit the base
+  // entirely, so without this an explicit `branch.create` naming the real default
+  // branch (e.g. 'main') slips the base guard below and the harness commits + pushes
+  // DIRECTLY onto the base — the #231 non-ff work-loss hazard (thread 4435). Try the
+  // local `origin/HEAD` first; a --single-branch clone (the PR-review shape) has no
+  // origin/HEAD, so fall back to a bounded `ls-remote --symref` network query. If it
+  // still cannot be resolved, fall through to honoring the create — finalizeGit's
+  // non-ff strand/preserve path is the backstop, so this stays best-effort, never a
+  // hard failure that could wrongly reject a legitimate new work branch.
+  let remoteDefaultBranch = '';
+  // When default resolution was NEEDED (an explicit create we would otherwise honor)
+  // but BOTH the local origin/HEAD read AND the ls-remote --symref network fallback
+  // came back empty, we cannot PROVE the create is not the remote default. Fail CLOSED
+  // — when the create names an ALREADY-EXISTING remote branch and no base was
+  // configured: an existing remote branch could BE the default, and a push onto it
+  // fast-forwards silently (the reviewer's bypass — "if that base has not advanced, the
+  // push succeeds, so the new defense is bypassed"), so treat it as base-like and cut a
+  // fallback. A create that does NOT exist on the remote is a genuine NEW branch: the
+  // push creates it, can never non-ff a shared base, and must be honored (e.g. an empty
+  // repo with an explicit `branch.create=feat/x`), so it is left alone (thread 4444).
+  // Also fail CLOSED when the existence probe ITSELF fails (a transient network/auth
+  // timeout): an indeterminate probe cannot prove the create is not the default, so
+  // honoring it would re-open the fail-OPEN this guard exists to close (thread 4477).
+  let defaultUnverified = false;
+  if (explicitCreate && wantPush && explicitCreate !== effectiveBase) {
+    const dh = runGitFn(['rev-parse', '--abbrev-ref', 'origin/HEAD'], { cwd: workspaceDir, env: gitEnv, timeoutMs: provTimeoutMs() });
+    if (dh.status === 0) {
+      const def = (dh.stdout || '').trim().replace(/^origin\//, '');
+      if (def && def !== 'HEAD' && !def.startsWith('-')) remoteDefaultBranch = def;
+    }
+    if (!remoteDefaultBranch) {
+      const sr = runGitFn([...credArgs(), 'ls-remote', '--symref', 'origin', 'HEAD'], { cwd: workspaceDir, env: gitEnv, timeoutMs: provTimeoutMs() });
+      if (sr.status === 0) {
+        const m = /^ref:\s+refs\/heads\/(\S+)\s+HEAD\b/m.exec(sr.stdout || '');
+        if (m && m[1] && !m[1].startsWith('-')) remoteDefaultBranch = m[1];
+      }
+    }
+    if (!remoteDefaultBranch && !configuredBaseRef && !envelope.branch?.base) {
+      // The create could still be the unverified default — but only if it already
+      // exists remotely. Probe for it; a genuinely-new branch stays honored.
+      // `ls-remote` does NOT reliably accept `--end-of-options` on older git (<2.24),
+      // so it is omitted here; pass the FULLY-QUALIFIED `refs/heads/<create>` pattern
+      // (always 'r'-prefixed) instead of the bare name so a create beginning with '-'
+      // can never be parsed as an option — same injection-safety without the flag.
+      const ec = runGitFn([...credArgs(), 'ls-remote', '--heads', 'origin', `refs/heads/${explicitCreate}`], { cwd: workspaceDir, env: gitEnv, timeoutMs: provTimeoutMs() });
+      if (ec.status === 0) {
+        const wantRef = `refs/heads/${explicitCreate}`;
+        const exists = (ec.stdout || '').split('\n').some((ln) => ln.split('\t')[1] === wantRef);
+        if (exists) defaultUnverified = true;
+      } else {
+        // The existence probe ITSELF failed (a transient network/auth timeout, the same
+        // condition that emptied origin/HEAD and the --symref fallback above). We cannot
+        // PROVE the create is a genuinely-new branch, so honoring it risks a silent
+        // fast-forward push directly onto the unverified default — the exact fail-OPEN
+        // the two successful-probe branches guard against. Treat the indeterminate probe
+        // as base-like and fail CLOSED: cut the fallback (work is preserved on the
+        // fallback branch, never lost) rather than committing on a possibly-shared base.
+        defaultUnverified = true;
+      }
+    }
+  }
+  // An explicit create NAMES the base when it equals the effective base OR the remote's
+  // resolved default branch — both mean "commit directly on a shared base". When the
+  // default could NOT be verified and no base was configured, fail closed (treat every
+  // such create as base-like) so an unverified default can never slip the guard (4444).
+  const createNamesBase = (name) => name === effectiveBase || (!!remoteDefaultBranch && name === remoteDefaultBranch) || defaultUnverified;
+  // Defense against silent work-loss (issue #231): committing on the base branch
+  // with intent to push is ALWAYS wrong for the PR flow — a push to the shared
+  // base races it and a non-ff reject strands the commits in this throwaway
+  // workspace with no PR (re-running the agent is non-idempotent, so there is no
+  // recovery). An explicit `branch.create` that NAMES the effective base (the
+  // configured base, the default branch the clone landed on, OR the remote's default
+  // branch when no base was given) is that same misconfiguration, so treat it like an
+  // omitted create and cut a fallback rather than honouring the checkout onto the base.
+  if (explicitCreate && !(wantPush && createNamesBase(explicitCreate))) {
+    const cb = runGitFn(['checkout', '-B', explicitCreate], { cwd: workspaceDir, env: gitEnv, timeoutMs: provTimeoutMs() });
+    if (cb.status !== 0) throw new ProvisionError(describeGitFailure(`git checkout -B ${explicitCreate}`, cb, { token, timeoutMs }));
+    workingBranch = explicitCreate;
+    // An explicit branch.create that NAMES the effective base reaches here only
+    // with push DISABLED (the push-enabled base-equal case is routed to a fallback
+    // by the guard above). The agent still commits DIRECTLY on the base, so emit
+    // the same base-branch warning the omitted-create read-only path does — a
+    // debug-only line would leave this misconfiguration silent at normal verbosity.
+    if (workingBranch === effectiveBase) log.warn?.(`provisionRepo${cs}: branch.create='${workingBranch}' IS the effective base and push is disabled → any commits land directly on the base branch (not pushed, but this throwaway workspace is reaped)`);
+    else log.debug?.(`provisionRepo${cs}: branch.create=${workingBranch} → cut work branch off base '${baseBranchName || '(unknown)'}'`);
+  } else if (checkedOut && wantPush) {
+    // Either no branch.create, OR an explicit create that NAMES the effective base
+    // while pushing — both would otherwise commit on the base, so cut a fallback.
+    cutFallbackBranch(checkedOut);
+  } else if (unbornBranch && wantPush) {
+    // Unborn branch (empty remote clone) with push enabled: the agent's FIRST
+    // commit belongs on a pushable work branch, not stranded on the unborn default.
+    // Cut a fallback off the unborn branch name so finalizeGit still pushes it
+    // once the harness makes that first commit.
+    cutFallbackBranch(unbornBranch);
+  } else if (wantPush && explicitCreate && createNamesBase(explicitCreate)) {
+    // Detached HEAD (a tag/sha checkout leaves checkedOut AND unbornBranch both
+    // null) where an explicit branch.create NAMES the effective base (or the remote's
+    // default branch): the first `if` above suppressed the explicit checkout (to avoid
+    // committing on the base), but with no symbolic branch for the arms above to fall
+    // back from, workingBranch would stay null — so finalizeGit skips BOTH the push and
+    // its failed-push preservation path, silently deleting any commits the harness
+    // makes from the detached HEAD (issue #231 silent work-loss). Cut the fallback
+    // from the CURRENT (detached) HEAD so those commits ride a pushable work
+    // branch instead of being reaped with the throwaway workspace.
+    cutFallbackBranch(effectiveBase);
+  } else {
+    // Detached HEAD (tag/sha ⇒ null, no branch to push) or a read-only clone
+    // (push disabled) — safe to stay on the checked-out ref; nothing is pushed.
+    // Prefer the UNBORN branch name for an empty-repo read-only clone (checkedOut
+    // null, push disabled): it is a real symbolic branch, so preserving it here
+    // keeps `detached: false` and exports the true `AGENT_REPO_BRANCH` (and lets
+    // finalizeGit record the first commit under that branch) rather than
+    // mis-reporting the empty repo as detached (suppressed advisory, line 4406).
+    workingBranch = checkedOut || unbornBranch;
+    if (checkedOut) {
+      // push=false only prevents PUBLICATION — the agent can still commit on this
+      // ref before the throwaway workspace is reaped. Promote the effective-base
+      // case to warn (committing on the base is the #231 hazard even unpushed);
+      // keep debug for a non-base checkout.
+      if (checkedOut === effectiveBase) log.warn?.(`provisionRepo${cs}: no branch.create; push disabled → working read-only on '${checkedOut}', which IS the effective base — any commits land on the base branch (not pushed, but this throwaway workspace is reaped)`);
+      else log.debug?.(`provisionRepo${cs}: no branch.create; push disabled → working read-only on '${checkedOut}'`);
+    }
+  }
+  const sha = runGitFn(['rev-parse', 'HEAD'], { cwd: workspaceDir, env: gitEnv, timeoutMs: provTimeoutMs() });
+  // Capture the base ref's SHA AT CLONE TIME (issue #229/#231 observability): the
+  // harness runs arbitrary code between here and finalizeGit and can itself advance
+  // `refs/remotes/origin/<base>` (e.g. its own `git fetch`), so finalizeGit's
+  // staleness check must compare the post-run base tip against THIS snapshot, not a
+  // value re-read after the harness ran (which would misreport a real base advance
+  // as zero). Best-effort — null when there is no remote-tracking base (a
+  // single-branch clone of a different ref), in which case finalizeGit anchors on
+  // the clone-time HEAD instead.
+  let baseCloneSha = null;
+  // When we could not capture a genuine pre-harness baseline for a base that MIGHT
+  // be a branch, flag it so finalizeGit emits an EXPLICIT unknown-count diagnostic
+  // instead of the (tag-base) silent skip. Stays false for a captured baseline or a
+  // confirmed tag/absent base (tags are immutable — the silent skip is correct).
+  let baseBaselineUnknown = false;
+  if (effectiveBase && !effectiveBase.startsWith('-')) {
+    if (configuredBase && effectiveBase === configuredBase) {
+      // effectiveBase is the EXPLICITLY-configured base (`branch.base`/`baseRef`).
+      // Use the PRE-FETCH snapshot captured above — NEVER a post-fetch or
+      // post-harness tip (advisories 4433 / TOCTOU / singleBranch silent skip). A
+      // branch base carries a baseline SHA; a tag/absent base carries null (correct
+      // silent skip); a failed remote query marks the baseline unknown so finalizeGit
+      // says so explicitly. This now covers an explicit `branch.base` single-branch
+      // clone too, not only `repository.baseRef`.
+      baseCloneSha = baseCloneSnapshot;
+      baseBaselineUnknown = baseSnapshotUnknown;
+    } else {
+      // effectiveBase is the ref the CLONE itself landed on (no explicit
+      // branch.base/baseRef) — its origin/<base> is present locally, so read the
+      // clone-time tip directly.
+      const br = runGitFn(['rev-parse', '--verify', '--quiet', `refs/remotes/origin/${effectiveBase}`], { cwd: workspaceDir, env: gitEnv, timeoutMs: provTimeoutMs() });
+      baseCloneSha = br.status === 0 ? ((br.stdout || '').trim() || null) : null;
+    }
+  }
   // `git rev-parse HEAD` on an unborn branch (freshly cloned empty repo) exits
   // non-zero and echoes the literal "HEAD" on stdout — treat that as "no base
   // commit" (empty startSha) rather than a bogus revision.
-  return { workspaceDir, gitEnv, committer, startSha: sha.status === 0 ? (sha.stdout || '').trim() : '', workingBranch, hasPrBranch, detached: !workingBranch, ref: commitSha || branchName || '', base, baseFetchError, remote: redactToken(repo.url, token) };
+  // #229/#232 observability compat: `hasPrBranch` — the agent's commits land on a
+  // branch DISTINCT from the effective base (a fallback/feat branch that shields
+  // them from a non-ff push of a shared base). Under issue #231 provisioning ALWAYS
+  // cuts such a branch when it would otherwise commit on the base, so this is true
+  // exactly when a real work branch was resolved that is not the base itself
+  // (false for a read-only base checkout with push disabled, or a detached HEAD).
+  const hasPrBranch = !!workingBranch && workingBranch !== effectiveBase;
+  return { workspaceDir, gitEnv, committer, startSha: sha.status === 0 ? (sha.stdout || '').trim() : '', workingBranch, fallbackBranch, hasPrBranch, baseBranch: effectiveBase || null, baseCloneSha, baseBaselineUnknown, detached: !workingBranch, ref: commitSha || branchName || '', base, baseFetchError, remote: redactToken(repo.url, token) };
 }
 
 // Look up a PR for this branch (2a does NOT open it — the harness does, driven
@@ -4470,104 +4802,593 @@ function postAgentAttribution({ workspaceDir, token, number, agentName = AGENT_A
   }
 }
 
+// Decide whether a finished job's throwaway run dir must be PRESERVED for
+// recovery even under the default `--keep-runs=false`. A FAILED push strands the
+// new commits in this clone's object database, so `strandedCommits` is only a
+// usable recovery handle while those objects still exist. Pure + exported so the
+// recovery guarantee is unit-tested without spinning a full worker job (issue
+// #231): the cleanup boundary calls this instead of inlining the predicate.
+function shouldPreserveRunDir(gitResult) {
+  return !!gitResult?.pushFailed;
+}
+
+// Decide the agentic/transcript relay's close reason (normal / job-killed / error)
+// for a finished job. Pure + exported so the close-reason contract is unit-tested
+// without spinning a full worker job. `error` must cover ANY hard finalization
+// failure: a killed run (`job-killed` takes precedence), a run that did not
+// complete, a failed harness result, OR a stranded-work finalize — the latter is
+// keyed off `pushFailed`, NOT `pushError`, because the branch-mismatch and
+// incomplete-scan paths set `pushFailed` (with `branchMismatch`/`scanError`)
+// WITHOUT attempting a push, so `pushError` is absent yet the work is preserved and
+// the loud error is logged (#229 relay close-reason).
+function computeRelayCloseReason(result, runCompleted, gitResult) {
+  if (result?.aborted) return 'job-killed';
+  if (!runCompleted || (result && result.ok === false) || gitResult?.pushFailed || gitResult?.pushError) return 'error';
+  return 'normal';
+}
+
 // After the harness runs: enumerate new commits, push the branch (when
 // branch.push), and reconcile the agent-opened PR (when task.allowPr). A push
 // failure is reported (pushError) rather than thrown — the process model decides
 // what to do next, and re-running the agent would be non-idempotent.
-function finalizeGit({ workspaceDir, gitEnv, startSha, workingBranch, hasPrBranch, envelope, token, logger = null, corr = '', keepRuns = false }) {
+function finalizeGit({ workspaceDir, gitEnv, startSha, workingBranch, baseBranch: effectiveBase, baseCloneSha = null, baseBaselineUnknown = false, hasPrBranch, envelope, token, logger = null, corr = '', budgetMs = 0, provisioned = false, keepRuns = false, _runGit = null }) {
+  const log = logger || getLogger(); // route observability through the injected logger (tests) or the host logger
+  // Test-only seam: the late remote-reachability FILTER scans (movedStray /
+  // unpushedBranchCommits / final stranded) AND the remote-tip VERIFICATION calls
+  // (ls-remote / fetch / merge-base in the pushFailed path) are routed through
+  // `lateScanGit` so a deterministic test can force ONE of them to fail (a timeout /
+  // corrupt object DB / deleted remote ref in production) while the earlier enumeration
+  // scans still succeed — otherwise these `--not --remotes` filters and the verification
+  // probes cannot be made to fail deterministically. Defaults to the module `runGit`, so
+  // production behaviour is unchanged.
+  const lateScanGit = _runGit || runGit;
   const cs = corr ? ` [${corr}]` : ''; // #229 cross-channel correlation suffix
   const out = { branch: workingBranch, baseSha: startSha || null, headSha: null, commits: [], pushed: false, remote: null, pr: null };
-  const rem = runGit(['remote', 'get-url', 'origin'], { cwd: workspaceDir, env: gitEnv });
+
+  // Bound EVERY finalize git op against ONE shared deadline derived from the recovery
+  // window (budgetMs) — the LOCAL graph scans below AND the sequential NETWORK ops
+  // later. Each runs via spawnSync, which BLOCKS the event loop so the worker's
+  // lock-heartbeat fiber cannot fire while it is in flight; on a very large repository
+  // an unbounded local rev-list could itself burn up to the full 120s per scan before
+  // the network phase even starts, letting the recovery window lapse and the broker
+  // reactivate this same job mid-finalization (suppressed advisory 4670). Establish the
+  // deadline BEFORE the very first git call (the `remote`/`HEAD`/commit-enumeration
+  // scans here, not only the branch scans below) and draw each op's remaining slice
+  // from it so their CUMULATIVE wall-time — including the later FETCH_HEAD/merge-base
+  // checks — stays inside the lease (thread 4670). Enforce it STRICTLY with NO per-op
+  // floor (a floor let N sequential ops each claim a minimum slice past the deadline —
+  // thread 4672); clamp only to the per-op default and a 1ms minimum so a
+  // near/over-exhausted budget makes the op fail-fast (spawnSync treats 0/absent as "no
+  // timeout") rather than block past the window. Without a budget (direct callers /
+  // unit tests) keep the full per-op timeout — behaviour-neutral (thread 4754).
+  const opTimeoutMs = 120_000; // matches runGit's default; surfaced in a timeout reason
+  const netDeadline = budgetMs > 0 ? Date.now() + Math.floor(budgetMs * 0.8) : 0;
+  const netTimeoutMs = () => (netDeadline ? Math.min(opTimeoutMs, Math.max(1, netDeadline - Date.now())) : opTimeoutMs);
+
+  // Track whether any CRITICAL commit-enumeration scan did NOT complete. A rev-list
+  // that fails (nonzero exit — a timeout on a huge/stuck graph, a corrupt object DB)
+  // yields an EMPTY list, which is indistinguishable from a genuine "no new commits".
+  // Trusting that empty result is unsafe: it lets the push gate skip BOTH the push and
+  // its preservation path when the harness really did commit, and lets the promotion
+  // overwrite a real recovery list with [] so a rejected push carries no stranded SHAs.
+  // Treat an incomplete scan as a hard, PRESERVED finalization failure instead (thread
+  // 4710); the check below the scans acts on this flag.
+  let scanFailed = false, scanFailedReason = '';
+  const noteScanFail = (label, r) => { if (!scanFailed) { scanFailed = true; scanFailedReason = `${label} exited ${r.status ?? 'null'}${r.signal ? ` (signal ${r.signal})` : ''}`; } };
+
+  const rem = runGit(['remote', 'get-url', 'origin'], { cwd: workspaceDir, env: gitEnv, timeoutMs: netTimeoutMs() });
   if (rem.status === 0) out.remote = redactToken(rem.stdout.trim(), token);
-  const headNow = runGit(['rev-parse', 'HEAD'], { cwd: workspaceDir, env: gitEnv });
+  const headNow = runGit(['rev-parse', 'HEAD'], { cwd: workspaceDir, env: gitEnv, timeoutMs: netTimeoutMs() });
   out.headSha = headNow.status === 0 ? ((headNow.stdout || '').trim() || null) : null;
   if (startSha) {
-    const log = runGit(['rev-list', `${startSha}..HEAD`], { cwd: workspaceDir, env: gitEnv });
+    const log = runGit(['rev-list', `${startSha}..HEAD`], { cwd: workspaceDir, env: gitEnv, timeoutMs: netTimeoutMs() });
     if (log.status === 0) out.commits = log.stdout.trim().split('\n').filter(Boolean);
+    else noteScanFail('rev-list startSha..HEAD', log);
   } else if (out.headSha) {
     // Empty-repo case: provisionRepo found no initial commit (unborn branch), so
     // there is no base to diff against — every commit now on HEAD is new. Without
     // this, a harness that makes the repo's first commit would enumerate as "0
     // commits" and the branch would never be pushed.
-    const log = runGit(['rev-list', 'HEAD'], { cwd: workspaceDir, env: gitEnv });
+    const log = runGit(['rev-list', 'HEAD'], { cwd: workspaceDir, env: gitEnv, timeoutMs: netTimeoutMs() });
     if (log.status === 0) out.commits = log.stdout.trim().split('\n').filter(Boolean);
+    else noteScanFail('rev-list HEAD', log);
+  }
+
+  // No commit exists anywhere yet: provisionRepo recorded no base (`startSha` empty)
+  // AND HEAD does not resolve (an unborn work branch on an empty clone). The work-ref
+  // `refs/heads/<workingBranch>` therefore has no object, so the branch-anchored scans
+  // below must NOT reference it (doing so is a hard rev-list error that would falsely
+  // trip `scanFailed` → a spurious `pushFailed` + leaked workspace for a no-op agent,
+  // thread 4787).
+  const noCommitYet = !startSha && !out.headSha;
+
+  // Commits made on ANY local branch that are not yet on a remote, EXCLUDING the
+  // work branch we intend to push. `startSha..HEAD` (out.commits) misses work the
+  // harness committed while HEAD was checked out on a DIFFERENT branch and then
+  // returned HEAD to the (unmodified) work branch — HEAD is back at startSha, so
+  // out.commits is empty, yet those commits are real and would be reaped with the
+  // throwaway workspace (issue #231 silent work-loss, thread 4604). Anchoring on
+  // `--branches --not --remotes refs/heads/<workingBranch>` enumerates exactly the
+  // abandoned strays: reachable from some local branch, not yet on any remote, and
+  // not carried by the branch we are about to push.
+  let offBranchStray = [];
+  if (workingBranch && coerceBool(envelope.branch?.push, true)) {
+    // An unborn work branch (an empty clone where the harness made NO first commit)
+    // has no `refs/heads/<workingBranch>` object, so feeding it to rev-list is a hard
+    // error (exit 128) that spuriously trips `scanFailed` → a false `pushFailed` and a
+    // leaked workspace for a genuine no-op agent (thread 4787). When there is no commit
+    // anywhere (no `startSha` AND no resolvable HEAD), omit the unresolvable work-ref
+    // exclusion — `--branches --not --remotes` alone exits 0/empty on an empty repo, so
+    // a real off-branch stray is still detected while the no-op case stays clean.
+    const strayArgs = noCommitYet
+      ? ['rev-list', '--branches', '--not', '--remotes']
+      : ['rev-list', '--branches', '--not', '--remotes', `refs/heads/${workingBranch}`];
+    const stray = runGit(strayArgs, { cwd: workspaceDir, env: gitEnv, timeoutMs: netTimeoutMs() });
+    if (stray.status === 0) offBranchStray = stray.stdout.trim().split('\n').filter(Boolean);
+    else noteScanFail('rev-list --branches --not --remotes', stray);
+
+    // The `--branches` walk above misses a commit that sits on NO branch at all: a
+    // harness that DETACHES HEAD, commits, then checks the work branch back out (or
+    // deletes the temp branch) leaves that commit reachable ONLY via the reflog. It
+    // is absent from BOTH out.commits (startSha..HEAD — HEAD is back on the work
+    // branch) AND offBranchStray (no branch points at it), so the push gate below
+    // would see "no strays", skip preservation, and the run-dir reaper would destroy
+    // the only copy of that commit (advisory: detached/reflog commit scan gap). Walk
+    // the reflog for reachable-but-unpushed commits that the work-branch push would
+    // NOT publish and fold them into the stray set, so they gate preservation and land
+    // in strandedCommits exactly like an off-branch stray. Fail CLOSED on a scan error
+    // (preserve) as with every other enumeration above.
+    const reflogArgs = noCommitYet
+      ? ['rev-list', '--reflog', '--not', '--remotes']
+      : ['rev-list', '--reflog', '--not', '--remotes', `refs/heads/${workingBranch}`];
+    const reflog = runGit(reflogArgs, { cwd: workspaceDir, env: gitEnv, timeoutMs: netTimeoutMs() });
+    if (reflog.status === 0) {
+      const reflogStray = reflog.stdout.trim().split('\n').filter(Boolean);
+      if (reflogStray.length) offBranchStray = [...new Set([...offBranchStray, ...reflogStray])];
+    } else noteScanFail('rev-list --reflog --not --remotes', reflog);
+  }
+
+  // Commits the work branch ITSELF carries, anchored on refs/heads/<workingBranch>
+  // rather than the final HEAD. The harness may commit on the work branch and then
+  // move HEAD back to the base (or detach), leaving `startSha..HEAD` (out.commits)
+  // empty even though the work branch legitimately carries pushable commits. Without
+  // counting them the push gate below (out.commits || offBranchStray) would be false
+  // and finalizeGit would skip BOTH the push and the preservation path, letting the
+  // finally-cleanup reap the only copy of the work (thread 4601).
+  let branchCommits = [];
+  if (workingBranch && !noCommitYet) {
+    const range = startSha ? `${startSha}..refs/heads/${workingBranch}` : `refs/heads/${workingBranch}`;
+    const bl = runGit(['rev-list', range], { cwd: workspaceDir, env: gitEnv, timeoutMs: netTimeoutMs() });
+    if (bl.status === 0) branchCommits = bl.stdout.trim().split('\n').filter(Boolean);
+    else noteScanFail('rev-list startSha..refs/heads/<branch>', bl);
   }
 
   if (!workingBranch) {
     out.detached = true; // clone landed on a tag/sha ⇒ no branch to push
-  } else if (coerceBool(envelope.branch?.push, true) && out.commits.length > 0) {
-    const pushTimeoutMs = 120_000; // matches runGit's default; surfaced in a timeout reason
-    // #229: proactively capture the non-fast-forward cause BEFORE pushing. Fetch the
-    // remote branch we're about to push to and count how far it advanced since the
-    // clone — a non-empty HEAD..origin/<branch> means the remote moved, so the push
-    // will be rejected non-ff (the 20974 work-loss cause). Best-effort: a failed
-    // fetch never blocks the push attempt below.
-    // #229/#232: bound the ENTIRE synchronous diagnostic phase (fetch + the two
-    // local graph walks) with ONE shared 15s deadline, not three independent
-    // 15s timeouts. Each probe runs on the same event loop as the dispatch-lock
-    // extender, so three back-to-back per-command timeouts could block it for up
-    // to 45s and lapse a short-`--recovery-window` lease mid-finalization (the
-    // job then gets redelivered while finalization continues). A single budget
-    // caps the whole phase; once it is exhausted we stop issuing probes and fall
-    // through to the push (the hint is best-effort — a skipped walk just omits it).
-    const diagBudgetMs = 15_000;
-    const diagStart = Date.now();
-    const diagLeftMs = () => diagBudgetMs - (Date.now() - diagStart);
-    const staleFetch = runGit([...credArgs(), 'fetch', '--no-tags', 'origin', workingBranch], { cwd: workspaceDir, env: gitEnv, timeoutMs: diagBudgetMs });
-    const walkBudgetMs = diagLeftMs();
-    if (staleFetch.status === 0 && walkBudgetMs > 0) {
-      const behind = runGit(['rev-list', '--count', `HEAD..origin/${workingBranch}`], { cwd: workspaceDir, env: gitEnv, timeoutMs: walkBudgetMs });
-      const n = behind.status === 0 ? Number((behind.stdout || '').trim()) : NaN;
-      if (Number.isFinite(n) && n > 0) {
-        // The rev-parse only enriches the warning with the remote SHA; once the
-        // shared budget is spent, skip it rather than opening another full probe.
-        const revBudgetMs = diagLeftMs();
-        const remoteSha = revBudgetMs > 0 ? runGit(['rev-parse', `origin/${workingBranch}`], { cwd: workspaceDir, env: gitEnv, timeoutMs: revBudgetMs }) : { status: 1, stdout: '' };
-        out.baseAdvanced = n;
-        // Frame this as "remote is N ahead of local HEAD", NOT "advanced since
-        // clone": for a `branch.create` branch the local ref is reset from the
-        // checked-out base while `origin/<branch>` may already have carried commits
-        // from BEFORE the clone, so a "since clone" timeline would be false.
-        logger?.warn?.(`git finalize: remote branch '${workingBranch}' is ${n} commit(s) ahead of local HEAD (local ${String(out.headSha || '?').slice(0, 12)} vs origin ${String((remoteSha.stdout || '').trim() || '?').slice(0, 12)}); push will be non-fast-forward.${cs}`);
+  } else if (coerceBool(envelope.branch?.push, true) && scanFailed) {
+    // A critical commit-enumeration scan did NOT complete (see `scanFailed` above), so
+    // the empty lists it produced cannot be trusted to mean "no commits". Refuse to
+    // push on an incomplete graph and PRESERVE the workspace for recovery rather than
+    // silently skipping the push (and reaping the only copy of the work) or promoting
+    // an empty recovery list onto a rejected push (thread 4710).
+    out.pushFailed = true;
+    out.scanError = scanFailedReason;
+    // Surface whatever SHAs the partial scans DID reveal as a best-effort recovery
+    // handle; the preserved workspace keeps the full object DB for the rest.
+    const partial = [...new Set([...out.commits, ...offBranchStray, ...branchCommits])];
+    if (partial.length > 0) out.strandedCommits = partial;
+    log.error?.(`finalizeGit${cs}: a git graph scan did not complete (${scanFailedReason}) — refusing to push '${workingBranch}' on an incomplete commit enumeration; preserving workspace for recovery (${partial.length} partial SHA(s) surfaced).`);
+  } else if (coerceBool(envelope.branch?.push, true) && (out.commits.length > 0 || offBranchStray.length > 0 || branchCommits.length > 0)) {
+    const pushTimeoutMs = opTimeoutMs; // the shared per-op cap, surfaced in a timeout reason
+    // The finalization deadline (netDeadline / netTimeoutMs) was established at the top
+    // of finalizeGit so it also bounded the local graph scans above; the sequential
+    // NETWORK ops below (pre-push staleness fetch → push → ls-remote/ff verify) simply
+    // keep drawing their remaining slice from that same shared deadline.
+    // Verify HEAD is still on the branch we intend to push (issue #231). The
+    // harness runs arbitrary code; if it checked out a DIFFERENT ref (e.g. the
+    // base branch) and committed there, out.commits (startSha..HEAD) enumerates
+    // those new commits but `git push origin <workingBranch>` would push the
+    // UNTOUCHED work branch and report success — after which the workspace is
+    // reaped and the real commits are lost. Treat a branch mismatch as a failed,
+    // preserved result: surface the stranded SHAs, skip the misdirected push (and,
+    // via pushFailed, the PR reconcile) so the recovery handle survives.
+    // Read the current branch via `git symbolic-ref -q HEAD`, NOT
+    // `git rev-parse --abbrev-ref HEAD`. When a TAG shares the work branch's name
+    // (e.g. refs/tags/v1 alongside refs/heads/v1), `--abbrev-ref` disambiguates by
+    // emitting the qualified 'heads/v1' form, so `currentBranch !== workingBranch`
+    // spuriously reads as a branch mismatch and finalizeGit REFUSES to push a branch
+    // HEAD never actually left (thread 4767). `symbolic-ref` returns the full,
+    // unambiguous `refs/heads/<name>` and exits nonzero for a DETACHED HEAD, so the
+    // detached case maps cleanly to '' (no 'HEAD' sentinel to special-case).
+    const headBranchNow = runGit(['symbolic-ref', '-q', 'HEAD'], { cwd: workspaceDir, env: gitEnv, timeoutMs: netTimeoutMs() });
+    const rawHeadRef = headBranchNow.status === 0 ? ((headBranchNow.stdout || '').trim()) : '';
+    const currentBranch = rawHeadRef.startsWith('refs/heads/') ? rawHeadRef.slice('refs/heads/'.length) : '';
+    const movedOff = currentBranch !== workingBranch;
+    // Commits pushing `workingBranch` would NOT publish — the harness made them off
+    // the work branch: either HEAD moved away and committed there (out.commits =
+    // startSha..HEAD, meaningful ONLY when movedOff) or they were left on another
+    // local branch (offBranchStray). If ANY exist, pushing the work branch would
+    // publish stale work and abandon them, so refuse + preserve. But a moved/detached
+    // HEAD sitting at a commit that is ALREADY on the work branch is NOT stranded:
+    // `git push origin <workingBranch>` publishes it. Excluding `branchCommits` from
+    // the moved-HEAD set keeps a `git checkout --detach HEAD` (after committing on
+    // the work branch) from falsely refusing an otherwise-pushable branch
+    // (thread 4701). When HEAD merely moved off while ALL new commits are on the
+    // work branch itself (no strays), `git push origin <workingBranch>` publishes
+    // exactly those commits regardless of where HEAD points — that is the intended
+    // output, so push it.
+    const branchCommitSet = new Set(branchCommits);
+    // Moved-HEAD strays: commits reachable from the current (moved-off) HEAD that
+    // `git push origin <workingBranch>` would NOT publish. Exclude commits the work
+    // branch already carries (branchCommitSet) AND commits already reachable from a
+    // remote: if the harness fetched e.g. `origin/main` and left HEAD at that fetched
+    // tip (or pushed the work branch before moving HEAD), `startSha..HEAD` holds
+    // already-PUBLISHED commits that are NOT at risk — counting them would set a
+    // false `pushFailed` and suppress PR reconciliation even though no local work is
+    // stranded. Anchor on `--not --remotes refs/heads/<workingBranch>` exactly as the
+    // off-branch scan above does, so only genuinely unpublished, off-work-branch
+    // commits count (suppressed advisory 4714). Fall back to the plain filter only if
+    // the rev-list itself errors.
+    let movedStray = [];
+    if (movedOff) {
+      const range = startSha ? `${startSha}..HEAD` : 'HEAD';
+      const ms = lateScanGit(['rev-list', range, '--not', '--remotes', `refs/heads/${workingBranch}`], { cwd: workspaceDir, env: gitEnv, timeoutMs: netTimeoutMs() });
+      if (ms.status === 0) {
+        movedStray = ms.stdout.trim().split('\n').filter(Boolean);
+      } else {
+        // The filtered walk did NOT complete, so the unfiltered fallback below cannot
+        // exclude commits already reachable from a remote — it may over-report LANDED
+        // commits as stranded. Fail CLOSED: mark the scan incomplete (scanError) so the
+        // recovery list is flagged best-effort, never presented as an EXACT strand set
+        // (advisory: fail-closed on movedStray scan failure).
+        noteScanFail('rev-list startSha..HEAD --not --remotes (movedStray)', ms);
+        movedStray = out.commits.filter((c) => !branchCommitSet.has(c));
       }
     }
-    const push = runGit([...credArgs(), 'push', '--set-upstream', 'origin', workingBranch], { cwd: workspaceDir, env: gitEnv, timeoutMs: pushTimeoutMs });
+    const strays = [...new Set([...movedStray, ...offBranchStray])];
+    if (strays.length > 0) {
+      out.pushFailed = true;
+      // Only the UNPUBLISHED work-branch commits are actually stranded. If the harness
+      // already pushed the work branch, `branchCommits` (startSha..refs/heads/<branch>)
+      // are reachable from origin/<workingBranch> and are safe — unioning them
+      // wholesale would falsely report published commits as UNPUSHED, preserve the run
+      // unnecessarily, suppress PR reconciliation, and inflate strandedOnBranch
+      // (suppressed advisory 4748). Re-derive the branch portion excluding
+      // remote-reachable commits, mirroring the off-branch scan; fall back to the raw
+      // list only if the rev-list itself errors.
+      let unpushedBranchCommits = branchCommits;
+      if (branchCommits.length > 0) {
+        const range = startSha ? `${startSha}..refs/heads/${workingBranch}` : `refs/heads/${workingBranch}`;
+        const ub = lateScanGit(['rev-list', range, '--not', '--remotes'], { cwd: workspaceDir, env: gitEnv, timeoutMs: netTimeoutMs() });
+        if (ub.status === 0) unpushedBranchCommits = ub.stdout.trim().split('\n').filter(Boolean);
+        // Fail CLOSED on a failed filter: this scan removes commits already reachable
+        // from a remote, so its unfiltered fallback (`branchCommits`) can include a
+        // PUBLISHED prefix. Mark the scan incomplete (scanError) so the resulting
+        // strand list is flagged best-effort, not exact (advisory: fail-closed on the
+        // unpushedBranchCommits scan failure).
+        else noteScanFail('rev-list startSha..refs/heads/<branch> --not --remotes (unpushedBranchCommits)', ub);
+      }
+      // Union every at-risk source so recovery finds them all: the off-branch strays
+      // AND the UNPUBLISHED work-branch commits we are refusing to push.
+      out.strandedCommits = [...new Set([...strays, ...unpushedBranchCommits])];
+      // Distinguish "HEAD moved to another ref" (actual = that ref) from "HEAD is
+      // back on the work branch but commits were left on ANOTHER local branch"
+      // (actual null + offBranch flag) so the completion note labels the stranded
+      // ref correctly instead of rendering the null as '(detached)' (suppressed
+      // advisory 8746). Carry the per-ref strand split (how many stranded commits
+      // sit ON the work branch vs. elsewhere) so the completion log can attribute a
+      // MIXED strand accurately instead of claiming a single ref for all of them
+      // (suppressed advisory 8882).
+      const strandedOnBranch = unpushedBranchCommits.filter((c) => strays.indexOf(c) === -1).length;
+      out.branchMismatch = movedOff
+        ? { expected: workingBranch, actual: currentBranch || null, strandedOnBranch }
+        : { expected: workingBranch, actual: null, offBranch: true, strandedOnBranch };
+      const where = movedOff
+        ? `HEAD is on '${currentBranch || '(detached)'}'`
+        : `HEAD is back on '${workingBranch}' but ${offBranchStray.length} commit(s) were left on another local branch or an abandoned detached HEAD`;
+      log.warn?.(`finalizeGit${cs}: ${where} — the harness moved HEAD off the provisioned work branch; refusing to push '${workingBranch}' (it would publish stale work and strand the ${out.strandedCommits.length} new commit(s)). Preserving workspace for recovery.`);
+      // If either remote-reachability FILTER above (movedStray / unpushedBranchCommits)
+      // did NOT complete, `strandedCommits` is a best-effort union that may include
+      // already-published commits — surface that via `scanError` so a consumer can tell
+      // an EXACT recovery list from a partial one (advisory: fail-closed on scan
+      // failure). No push was attempted here, so there is no pushError to confuse it.
+      if (scanFailed) out.scanError = out.scanError || scanFailedReason;
+    } else {
+    // We are pushing `workingBranch`. Promote the WORK-BRANCH tip + its commit list
+    // into the authoritative output/recovery metadata BEFORE push verification
+    // (threads 4646/4810, suppressed advisories 4781/4812). out.headSha (final HEAD)
+    // and out.commits (startSha..HEAD) describe wherever the harness left HEAD, which
+    // — in the newly supported case where it committed on the work branch then moved
+    // HEAD back to the base/detached — is the BASE, not the branch we publish. Left
+    // uncorrected: (1) a successful push reports the base SHA + zero commits; (2) the
+    // landed-check below compares origin/<branch> against the base out.headSha, so a
+    // diverged work branch can look like a descendant of the base head → false
+    // landed → pushFailed suppressed → the recovery workspace deleted though the work
+    // never landed; (3) a genuine non-ff reject copies an empty out.commits into
+    // strandedCommits, dropping the recovery SHAs. Anchoring on refs/heads/<branch>
+    // (a no-op when HEAD is already on it) makes the metadata track what we push.
+    const branchTip = runGit(['rev-parse', '--verify', '--quiet', `refs/heads/${workingBranch}`], { cwd: workspaceDir, env: gitEnv, timeoutMs: netTimeoutMs() });
+    const branchTipSha = branchTip.status === 0 ? ((branchTip.stdout || '').trim() || null) : null;
+    if (branchTipSha) {
+      out.headSha = branchTipSha;
+      out.commits = branchCommits.slice();
+    }
+    // advanced on the remote since we cloned, a push can be rejected non-ff. Fetch
+    // the base and report how far it moved so the non-ff cause is visible in the
+    // log BEFORE the push, not inferred after the fact. Best-effort — never fatal.
+    // Prefer the effective base resolved during provisioning (an explicit
+    // branch.base or the symbolic branch the clone landed on) so this diagnostic
+    // still fires in that valid shape; only fall back to the raw envelope field if
+    // it was absent.
+    const baseBranch = String(effectiveBase || envelope.branch?.base || '');
+    if (baseBranch && baseBranch.startsWith('-')) {
+      // Git permits ref names beginning with '-', and passing an untrusted base
+      // ref straight after `origin` would let a value like '--upload-pack=…' be
+      // parsed as a fetch OPTION rather than a ref (argument injection). A ref that
+      // begins with '-' is not a valid branch name anyway, so refuse it outright.
+      log.debug?.(`finalizeGit${cs}: skipping pre-push staleness check — base ref '${baseBranch}' is not a valid branch name (begins with '-')`);
+    } else if (baseBranch) {
+      // Anchor the staleness range at a CLONE-TIME snapshot of the base. Prefer
+      // the SHA captured during provisioning (`baseCloneSha`): the harness runs
+      // between provision and finalize and can itself advance
+      // `refs/remotes/origin/<base>` (e.g. its own `git fetch`), so re-reading that
+      // remote-tracking ref HERE would no longer be the clone-time value and a real
+      // base advance during the run would misreport as zero. Fall back to reading
+      // the remote-tracking ref only for direct/legacy callers that do NOT thread a
+      // provisioning snapshot (`provisioned` false). For a PROVISIONED job a null
+      // `baseCloneSha` means provisioning genuinely captured no clone-time snapshot
+      // (no origin/<base>, or the base fetch failed), so a live read here would be a
+      // POST-harness tip — if the harness fetched the base mid-run it would read at
+      // or ahead of the real tip and silently zero the staleness count, hiding a
+      // non-ff cause. Skip the fallback and let the count be omitted instead
+      // (suppressed advisory 4764).
+      let beforeSha = baseCloneSha;
+      if (!beforeSha && !provisioned) {
+        const beforeRef = runGit(['rev-parse', '--verify', '--quiet', `refs/remotes/origin/${baseBranch}`], { cwd: workspaceDir, env: gitEnv, timeoutMs: netTimeoutMs() });
+        beforeSha = beforeRef.status === 0 ? ((beforeRef.stdout || '').trim() || null) : null;
+      }
+      if (!beforeSha) {
+        // No clone-time base snapshot to measure against, so the base-advanced count
+        // cannot be computed regardless — do NOT fetch. A null `beforeSha` here also
+        // means there was no `refs/remotes/origin/<base>` at clone, which is exactly
+        // the TAG-base case: `repository.baseRef` may be a tag, and tags land under
+        // refs/tags (never a remote-tracking branch), so a `refs/heads/<base>` fetch
+        // would always fail and log a misleading `stalenessFetchError` for a perfectly
+        // valid tag base (suppressed advisory 4862). A tag is immutable and cannot
+        // "advance" anyway, so skipping the check is the correct outcome; emit a debug
+        // note so the skip is distinguishable from a diagnostic that never ran.
+        //
+        // Advisory #3: distinguish the case where provisioning tried to snapshot a
+        // BRANCH base pre-harness but the remote query FAILED (`baseBaselineUnknown`).
+        // There we cannot silently pretend the base is an immutable tag — a real base
+        // advance would go unreported. Surface it as an EXPLICIT unknown-count
+        // diagnostic (a distinct signal, `out.stalenessBaselineUnknown`) so a later
+        // non-ff push failure is not read as an unchanged base.
+        if (baseBaselineUnknown) {
+          out.stalenessBaselineUnknown = true;
+          log.warn?.(`finalizeGit${cs}: pre-push base-advanced check for base '${baseBranch}' is UNKNOWN — provisioning could not capture a clone-time baseline (remote query failed) and a post-harness read would be unsafe, so whether the base advanced since clone cannot be confirmed; pushing branch '${workingBranch}'`);
+        } else {
+          log.debug?.(`finalizeGit${cs}: no clone-time snapshot for base '${baseBranch}' (origin/${baseBranch} absent at clone — e.g. a tag base or a single-branch clone of a different ref) — skipping the base-advanced staleness check`);
+        }
+      } else {
+      // Fetch the EXACT `refs/heads/<branch>` ref, not the bare name: git treats a
+      // bare refspec beginning with '+' as the force-update prefix, so a valid
+      // branch like '+release' would fetch the wrong ref and make the staleness
+      // count unreliable. The `refs/heads/` prefix makes the leading char always
+      // 'r', and `--end-of-options` terminates option parsing so the ref can never
+      // be reinterpreted as a flag even for future/edge values.
+      const bfTimeoutMs = netTimeoutMs();
+      const bf = runGit([...credArgs(), 'fetch', '--no-tags', '--end-of-options', 'origin', `refs/heads/${baseBranch}`], { cwd: workspaceDir, env: gitEnv, timeoutMs: bfTimeoutMs });
+      if (bf.status === 0) {
+        const fetched = runGit(['rev-parse', '--verify', '--quiet', 'FETCH_HEAD'], { cwd: workspaceDir, env: gitEnv, timeoutMs: netTimeoutMs() });
+        const fetchedSha = fetched.status === 0 ? ((fetched.stdout || '').trim() || null) : null;
+        // Measure how far the BASE advanced since we cloned, not how far our post-
+        // work HEAD sits behind the new base tip: `beforeSha` is the base ref as of
+        // clone, so `beforeSha..FETCH_HEAD` counts exactly the commits the base
+        // gained.
+        {
+          const ahead = runGit(['rev-list', '--count', `${beforeSha}..FETCH_HEAD`], { cwd: workspaceDir, env: gitEnv, timeoutMs: netTimeoutMs() });
+          const n = ahead.status === 0 ? parseInt((ahead.stdout || '').trim(), 10) : NaN;
+          if (Number.isFinite(n) && n > 0) {
+            out.baseAdvanced = n;
+            const shaNote = ` [base '${baseBranch}': ${beforeSha.slice(0, 12)} → ${fetchedSha ? fetchedSha.slice(0, 12) : '(unknown)'}]`;
+            log.warn?.(`finalizeGit${cs}: remote base '${baseBranch}' advanced ${n} commit(s) since clone${shaNote} — pushing branch '${workingBranch}'${workingBranch === baseBranch ? ' (which IS the base — a non-ff reject would strand the commits)' : ''}`);
+          } else if (Number.isFinite(n)) {
+            // Record the CLEAN result too (n === 0), so a base that did not advance is
+            // distinguishable from a skipped or errored check in the logs rather than
+            // leaving silence that reads as "diagnostic never ran" (advisory 4847).
+            log.debug?.(`finalizeGit${cs}: remote base '${baseBranch}' unchanged since clone (0 new commit(s)) — pushing branch '${workingBranch}'`);
+          } else {
+            // The staleness count could NOT be computed — `rev-list --count` failed
+            // (timeout / incomplete graph) or returned a non-numeric result. Log it as
+            // UNKNOWN, NOT as an unchanged base: collapsing a failed probe to 0 would
+            // fabricate a clean "0 new commit(s)" and hide the exact base advance this
+            // diagnostic exists to expose, so a later non-ff push failure reads as an
+            // unchanged base (advisory 4985). Best-effort — still never fatal.
+            log.warn?.(`finalizeGit${cs}: pre-push staleness count for base '${baseBranch}' is UNKNOWN (git rev-list --count exited ${ahead.status ?? 'null'}) — cannot confirm whether the base advanced since clone; pushing branch '${workingBranch}'`);
+          }
+        }
+      } else {
+        // The pre-push staleness diagnostic disappears exactly when the best-effort
+        // fetch fails: a subsequent non-ff (or other) push failure is then
+        // indistinguishable from an unchanged base. Surface the fetch failure so
+        // that lost observability is itself visible (issue #229/#231). Best-effort
+        // — still never fatal.
+        out.stalenessFetchError = describeGitFailure(`git fetch origin refs/heads/${baseBranch}`, bf, { token, timeoutMs: bfTimeoutMs });
+        log.warn?.(`finalizeGit${cs}: pre-push staleness check could not fetch base '${baseBranch}' (${out.stalenessFetchError}) — a later non-ff or other push failure will be indistinguishable from an unchanged base`);
+      }
+      }
+    }
+    // Push the EXPLICIT refs/heads/<branch>:refs/heads/<branch> refspec, not the bare
+    // `workingBranch`: a bare source ref is ambiguous when a same-named TAG also
+    // exists (e.g. workingBranch 'v1' while origin — and thus the local clone — has
+    // refs/tags/v1), so `git push origin v1` fails "src refspec v1 matches more than
+    // one" and misreports the work as unpublished (threads 4767/4777). The fully
+    // qualified heads ref resolves unambiguously; --set-upstream still tracks the
+    // local branch.
+    const pushTimeout = netTimeoutMs();
+    const push = runGit([...credArgs(), 'push', '--set-upstream', 'origin', `refs/heads/${workingBranch}:refs/heads/${workingBranch}`], { cwd: workspaceDir, env: gitEnv, timeoutMs: pushTimeout });
     if (push.status === 0) out.pushed = true;
     else {
-      out.pushError = describeGitFailure('git push', push, { token, timeoutMs: pushTimeoutMs });
-      // #229: elevate the push failure out of the terse info line — commits are
-      // unpushed and this is the loud signal that was missing. Whether the commits
-      // sit on a DISTINCT PR branch (which shields them from a non-ff push of the
-      // base) was decided authoritatively in provisionRepo, which knows the branch
-      // the clone ACTUALLY checked out — a detached tag/sha base makes `checkout -B`
-      // cut a real branch, and an unpinned `create` may equal the default branch.
-      // Carry that `hasPrBranch` decision here rather than re-deriving it from the
-      // envelope (`repository.ref || branch.base`), which cannot see those cases and
-      // would misclassify the loss. Fall back to the envelope heuristic only for
-      // direct callers (a few tests) that don't thread the provisioned flag.
-      const prBranch = typeof hasPrBranch === 'boolean'
-        ? hasPrBranch
-        : (!!envelope.branch?.create && workingBranch !== (envelope.repository?.ref || envelope.branch?.base || ''));
-      // Even a DISTINCT PR branch only shields commits if they survive somewhere.
-      // With the default `keepRuns=false` the worker reaps `runDir` in its `finally`,
-      // so a failed push leaves the only copy of these commits in a throwaway
-      // workspace that is about to be deleted — they are LOST too, just via reaping
-      // rather than a missing PR branch. Only `--keep-runs` retains them. So the loud
-      // "will be LOST" signal applies to BOTH arms UNLESS `--keep-runs` is set, in
-      // which case the workspace (and its commits) are retained either way; the
-      // wording differs only in the cause (no PR branch vs. reaped workspace).
-      const lossNote = prBranch
-        ? (keepRuns
-          ? `${out.commits.length} commit(s) are unpushed on branch '${workingBranch}' and retained in the run workspace (--keep-runs)`
-          : `${out.commits.length} commit(s) are unpushed on branch '${workingBranch}' and will be LOST when the run workspace is reaped (re-run with --keep-runs to retain them)`)
-        : (keepRuns
-          ? `${out.commits.length} commit(s) are unpushed (no PR branch) but retained in the run workspace (--keep-runs)`
-          : `${out.commits.length} commit(s) are unpushed and will be LOST (no PR branch, and the run workspace is reaped — re-run with --keep-runs to retain them)`);
-      logger?.error?.(`git finalize: push of branch '${workingBranch}' FAILED — ${lossNote}: ${oneLineLog(out.pushError)}${cs}`);
+      // A nonzero `git push` does NOT prove the ref was not updated: a timeout or
+      // connection drop can occur AFTER the server accepted the ref. Before
+      // labeling the commits stranded (and suppressing PR reconciliation), verify
+      // the remote — if origin/<branch> already points at our headSha, the push
+      // actually landed and this was a transport hiccup, so report success rather
+      // than misreporting published work as lost (issue #231).
+      let landed = false;
+      // The work branch's VERIFIED remote tip whose OBJECT is local (fetched below),
+      // so it is safe to feed to `rev-list --not`. The clone-time refs/remotes/origin/
+      // <branch> is NOT refreshed by the fetch below (that updates FETCH_HEAD only), so
+      // the strand walk must exclude against THIS verified tip rather than trust the
+      // stale remote-tracking ref (advisory: stranded list uses a stale remote ref).
+      let verifiedRemoteTip = null;
+      // Did the remote-tip VERIFICATION itself fail (ls-remote could not query, or the
+      // remote tip is known-different but the follow-up fetch failed)? If so, the
+      // clone-time refs/remotes/origin/<branch> the strand filter falls back to is
+      // KNOWN-STALE, so the resulting strand list is best-effort — surface that via
+      // scanError below rather than presenting it as exact (advisory: fail-closed on
+      // remote-tip verification failure, not just the final rev-list).
+      let remoteTipVerifyFailed = false;
+      if (out.headSha) {
+        // Query the EXACT `refs/heads/<branch>` ref (with `--heads`) so a same-named
+        // TAG at headSha can't spoof a "landed" head: a bare `<branch>` pattern makes
+        // `ls-remote` match tags too, which would falsely suppress pushFailed. The
+        // fully-qualified `refs/heads/` pattern is always 'r'-prefixed, so no
+        // `--end-of-options` is needed (and `ls-remote` doesn't reliably accept it on
+        // git <2.24).
+        const ls = lateScanGit([...credArgs(), 'ls-remote', '--heads', 'origin', `refs/heads/${workingBranch}`], { cwd: workspaceDir, env: gitEnv, timeoutMs: netTimeoutMs() });
+        if (ls.status === 0) {
+          const remoteSha = ((ls.stdout || '').trim().split(/\s+/)[0] || '');
+          if (remoteSha && remoteSha === out.headSha) {
+            landed = true; // exact-match fast path
+          } else if (remoteSha) {
+            // The remote tip differs from our head but may be a DESCENDANT of it:
+            // another actor (or the harness) pushed a further commit on the SAME
+            // branch after ours landed, so `origin/<branch>` is ahead of `headSha`
+            // and our work is already published — not stranded. Fetch the ref so its
+            // objects are local, then test `headSha` is an ancestor of the remote
+            // tip. Best-effort: a failed fetch/ancestry check just falls through to
+            // the strand path (issue #231, suppressed advisory 4689).
+            const ff = lateScanGit([...credArgs(), 'fetch', '--no-tags', '--end-of-options', 'origin', `refs/heads/${workingBranch}`], { cwd: workspaceDir, env: gitEnv, timeoutMs: netTimeoutMs() });
+            if (ff.status === 0) {
+              // The fetch made `remoteSha`'s object local (via FETCH_HEAD). Record it
+              // as the verified remote tip so the strand walk can exclude commits
+              // already reachable from the CURRENT remote tip even though the
+              // clone-time refs/remotes/origin/<branch> was never refreshed.
+              verifiedRemoteTip = remoteSha;
+              const anc = lateScanGit(['merge-base', '--is-ancestor', out.headSha, remoteSha], { cwd: workspaceDir, env: gitEnv, timeoutMs: netTimeoutMs() });
+              if (anc.status === 0) landed = true;
+            } else {
+              // The remote tip is known-DIFFERENT from headSha, but we could not fetch
+              // it to verify ancestry — so the strand filter cannot exclude against the
+              // real tip and must fall back to the STALE clone-time tracking ref.
+              remoteTipVerifyFailed = true;
+            }
+          } else {
+            // `ls-remote` succeeded but returned NO sha for refs/heads/<branch> — the
+            // branch was DELETED on the remote between clone and this verification. The
+            // clone-time refs/remotes/origin/<branch> is now stale (points at a tip that
+            // no longer exists), so a `--not --remotes` walk against it can omit commits
+            // reachable only through that dangling tracking ref and present an INCOMPLETE
+            // strand list as exact. Treat an empty result as an UNVERIFIED remote tip so
+            // the list is flagged best-effort (scanError) and the workspace is preserved.
+            remoteTipVerifyFailed = true;
+          }
+        } else {
+          // ls-remote could not query the remote at all — we cannot confirm whether the
+          // clone-time tracking ref is current, so the strand fallback is best-effort.
+          remoteTipVerifyFailed = true;
+        }
+      }
+      if (landed) {
+        out.pushed = true;
+        log.warn?.(`finalizeGit${cs}: 'git push' exited nonzero but origin/'${workingBranch}' already contains ${out.headSha.slice(0, 12)} (at or ahead of it) — treating as a transport hiccup after the ref was accepted, not a strand`);
+      } else {
+        // A rejected push (typically non-fast-forward) would otherwise strand every
+        // new commit in this throwaway workspace. Surface the at-risk SHAs explicitly
+        // (issue #231, defense #2) so the failure is a hard, actionable signal with
+        // the commits to recover — not a soft pushError that reads as "completed".
+        out.pushError = describeGitFailure('git push', push, { token, timeoutMs: pushTimeout });
+        out.pushFailed = true;
+        // Union the work-branch commit list into the stranded set: out.commits is now
+        // the promoted branchCommits, but if HEAD sat off the branch and promotion
+        // found no tip, out.commits could still be the (empty) final-HEAD range —
+        // branchCommits carries the commits the rejected push actually strands, so
+        // include them explicitly (suppressed advisory 4812). But a NON-FF reject does
+        // NOT mean the whole branch is unpushed: an earlier prefix may already be on
+        // the remote (e.g. C1 landed, local C2 followed, another actor advanced the
+        // remote from C1, so pushing C2 is rejected — yet C1 is already recoverable).
+        // Reporting C1 as stranded is a false alarm, so filter the union against every
+        // remote-tracking ref (`--not --remotes`) exactly as the branch-mismatch path
+        // does, leaving only the genuinely unpublished commits; fall back to the raw
+        // union only if the rev-list itself errors (suppressed advisory 4960). The
+        // clone-time refs/remotes/origin/<branch> is STALE (never refreshed from the
+        // verified tip above), so `--not --remotes` alone could list an already-landed
+        // commit — another actor's post-clone push — as UNPUSHED; also exclude against
+        // the VERIFIED remote tip whose object we fetched (advisory: stranded list uses
+        // a stale remote-tracking ref).
+        let stranded = [...new Set([...out.commits, ...branchCommits])];
+        // The strand filter excludes against the VERIFIED remote tip when we have it;
+        // without it (verification failed) it falls back to the clone-time tracking ref,
+        // which — when `remoteTipVerifyFailed` — is KNOWN-STALE, so the resulting list is
+        // best-effort even if the rev-list itself succeeds.
+        const strandFilterStale = !verifiedRemoteTip && remoteTipVerifyFailed;
+        if (stranded.length > 0) {
+          const strandExcludes = verifiedRemoteTip
+            ? ['--not', '--remotes', verifiedRemoteTip]
+            : ['--not', '--remotes'];
+          const sr = lateScanGit(['rev-list', ...stranded, ...strandExcludes], { cwd: workspaceDir, env: gitEnv, timeoutMs: netTimeoutMs() });
+          if (sr.status === 0) stranded = sr.stdout.trim().split('\n').filter(Boolean);
+          // Fail CLOSED: if the remote-reachability filter did NOT complete, the
+          // unfiltered union stays as `stranded` — which can falsely label
+          // already-remote commits as unpushed. Surface the incomplete scan via
+          // `scanError` so a consumer distinguishes an EXACT recovery list from this
+          // best-effort fallback (advisory: fail-closed on the final stranded scan).
+          else noteScanFail('rev-list <stranded> --not --remotes', sr);
+        }
+        out.strandedCommits = stranded;
+        // Even when the rev-list SUCCEEDED, a failed remote-tip verification means it
+        // filtered against a stale clone-time ref — so the list is best-effort. Mark it
+        // scanError too (advisory: fail-closed on remote-tip VERIFICATION failure, not
+        // just the final rev-list).
+        if (strandFilterStale && !scanFailed) {
+          scanFailed = true;
+          scanFailedReason = 'remote-tip verification (ls-remote/fetch) failed — strand filter used stale clone-time tracking refs';
+        }
+        if (scanFailed) out.scanError = out.scanError || scanFailedReason;
+        // #229/#232 observability: elevate the push failure to a LOUD, correlated
+        // signal. `hasPrBranch` (threaded from provisionRepo, which knows the branch
+        // the clone ACTUALLY landed on) says whether the stranded commits sit on a
+        // DISTINCT work branch; fall back to the envelope heuristic only for direct
+        // callers that don't thread it. Even a distinct branch's commits are LOST when
+        // the throwaway run workspace is reaped, UNLESS `--keep-runs` retains it — so
+        // the wording distinguishes cause (no PR branch vs. reaped workspace) and fate
+        // (LOST vs. retained).
+        const prBranch = typeof hasPrBranch === 'boolean'
+          ? hasPrBranch
+          : (!!envelope.branch?.create && workingBranch !== (envelope.repository?.ref || envelope.branch?.base || ''));
+        const n = out.strandedCommits.length;
+        const lossNote = prBranch
+          ? (keepRuns
+            ? `${n} commit(s) are unpushed on branch '${workingBranch}' and retained in the run workspace (--keep-runs)`
+            : `${n} commit(s) are unpushed on branch '${workingBranch}' and will be LOST when the run workspace is reaped (re-run with --keep-runs to retain them)`)
+          : (keepRuns
+            ? `${n} commit(s) are unpushed (no PR branch) but retained in the run workspace (--keep-runs)`
+            : `${n} commit(s) are unpushed and will be LOST (no PR branch, and the run workspace is reaped — re-run with --keep-runs to retain them)`);
+        log.error?.(`git finalize: push of branch '${workingBranch}' FAILED — ${lossNote}: ${oneLineLog(out.pushError)}${cs}`);
+      }
     }
+    } // end HEAD-on-workingBranch else
   }
 
-  if (workingBranch && envelope.task?.allowPr) {
+  // Skip PR reconciliation when the push FAILED (issue #231): a non-fast-forward
+  // reject leaves this run's commits stranded, but an explicit work branch may
+  // still have an OLDER remote PR — reporting `pr.found` for it would falsely
+  // claim this run's stranded commits are in a PR. Leave `out.pr` unset so the
+  // envelope + completion note carry only the `pushFailed`/`strandedCommits`
+  // recovery signal, not a misleading PR reference.
+  if (workingBranch && envelope.task?.allowPr && !out.pushFailed) {
     out.pr = reconcileAgentPr({ workspaceDir, token, branch: workingBranch, provider: envelope.repository?.provider || 'github' });
     // Record the agent's authorship on the PR (commits carry the operator's
     // identity now, so this preserves the machine-generated provenance).
@@ -6336,6 +7157,27 @@ function buildResultEnvelope(result, { sandbox, image, git, result: agentResult,
     env.commits = git.commits ?? [];
     env.pushed = !!git.pushed;
     if (git.pushError) env.pushError = git.pushError;
+    // Forward the explicit failure flag AND the stranded SHAs together: consumers
+    // of io.nanobpm.agentResult key off `pushFailed` for the hard "push rejected"
+    // signal, and `strandedCommits` carries the SHAs to recover (see README).
+    if (git.pushFailed) env.pushFailed = true;
+    if (git.strandedCommits && git.strandedCommits.length) env.strandedCommits = git.strandedCommits;
+    // Distinguish an INCOMPLETE local commit scan from a real rejected push. The
+    // incomplete-graph path in finalizeGit sets `pushFailed=true` even though NO push
+    // was attempted (a critical rev-list did not complete), recording the cause in
+    // `scanError` — and in that case `strandedCommits` may be only PARTIAL. Forwarding
+    // only `pushFailed`/`strandedCommits` makes (a) a rejected push and (b) an
+    // incomplete scan look identical, so a consumer cannot tell that the stranded list
+    // is best-effort and the run must be recovered manually (advisory: envelope drops
+    // scanError). Thread `scanError` through so the two are distinguishable; a plain
+    // rejected push carries `pushError`, not `scanError`.
+    if (git.scanError) env.scanError = git.scanError;
+    // Forward the branch-mismatch detail too (thread 6530): for a branch-mismatch
+    // refusal the README/finalizeGit contract lists `branchMismatch` as part of the
+    // envelope, and it is the only field carrying the expected-vs-actual ref a
+    // consumer needs to route recovery — the SHAs alone don't say which ref they sit
+    // on. Without this the mismatch reason is dropped from io.nanobpm.agentResult.
+    if (git.branchMismatch) env.branchMismatch = git.branchMismatch;
     if (git.pr) env.pr = git.pr;
     if (git.error) env.gitError = git.error;
   }
@@ -8293,7 +9135,7 @@ async function workAgent(req, flags) {
             mkdirSync(workerNsDir, { recursive: true });
             runDir = mkdtempSync(join(workerNsDir, 'run-'));
             liveRunDirs.add(runDir);
-            provisioned = provisionRepo({ envelope, token: repoToken, runDir, timeoutMs: cloneTimeoutMs, logger, corr: aiCorr });
+            provisioned = provisionRepo({ envelope, token: repoToken, runDir, runId, timeoutMs: cloneTimeoutMs, logger, corr: aiCorr });
             if (provisioned.baseFetchError) {
               logger.warn(`[${jobType}] job ${job.jobKey} base fetch failed (${aiCorr}) — ${oneLineLog(provisioned.baseFetchError)}; base...head diffs may be unavailable`);
             }
@@ -8520,12 +9362,43 @@ async function workAgent(req, flags) {
                 gitEnv: provisioned.gitEnv,
                 startSha: provisioned.startSha,
                 workingBranch: provisioned.workingBranch,
+                baseBranch: provisioned.baseBranch,
+                baseCloneSha: provisioned.baseCloneSha,
+                baseBaselineUnknown: provisioned.baseBaselineUnknown,
                 hasPrBranch: provisioned.hasPrBranch,
                 envelope,
                 token: repoToken,
                 logger,
                 corr: aiCorr,
                 keepRuns,
+                // Cap finalization's cumulative network-git wall-time below the
+                // worker's activation-lock/recovery window so its event-loop-blocking
+                // spawnSync ops cannot outlast the lease and let this job be
+                // reactivated mid-finalization (thread 4754). Use the WORKER-level
+                // `recoveryWindowMs`, NOT the per-task `effectiveRecoveryWindowMs`: a
+                // task override widens only the harness liveness window, not the
+                // broker lock (see #172 note above + dispatch config below), so
+                // budgeting against the widened value could still let the git ops run
+                // past the real lease (thread 8811). SUBTRACT `lockExtendIntervalMs`:
+                // the lock is renewed to a full `recoveryWindowMs` only at each
+                // heartbeat, and the heartbeat fiber cannot fire while finalization's
+                // spawnSync ops block the event loop. At finalization start the last
+                // beat could have fired up to `lockExtendIntervalMs` ago, so the lease
+                // GUARANTEED to remain is `recoveryWindowMs - lockExtendIntervalMs`
+                // (e.g. 300s window, 100s interval ⇒ 200s left, not 300s). Budgeting
+                // against that worst-case remaining lease — not the full window —
+                // keeps the git ops inside the lock even across a stale heartbeat
+                // (thread 4678). Pass a MINIMUM of 1 (not 0): finalizeGit treats
+                // budgetMs 0 as "no budget" and restores the full per-op 120s
+                // timeouts, so a window too small to budget (e.g. recoveryWindowMs
+                // equal to lockExtendIntervalMs ⇒ difference 0) must still enforce a
+                // near-zero deadline that fails the git ops FAST rather than defeat
+                // the lease-safety cap (suppressed advisory 8877).
+                budgetMs: Math.max(1, recoveryWindowMs - lockExtendIntervalMs),
+                // Provisioned job: a null baseCloneSha means no genuine clone-time
+                // base snapshot exists, so finalizeGit must NOT fall back to a live
+                // (post-harness) read for its staleness count (advisory 4764).
+                provisioned: true,
               });
             } catch (err) {
               gitResult = { remote: provisioned.remote, branch: provisioned.workingBranch, baseSha: provisioned.startSha || null, commits: [], pushed: false, error: redactToken(err.message, repoToken) };
@@ -8548,7 +9421,44 @@ async function workAgent(req, flags) {
           // owning lifecycle's finally is the authoritative "job finished" signal,
           // so this namespace no longer holds a surviving harness for this job.
           removeJobMarker(workerNsDir, job.jobKey);
-          if (runDir && !keepRuns) { try { rmSync(runDir, { recursive: true, force: true }); } catch { /* best effort */ } }
+          // Preserve the workspace when a push FAILED even under the default
+          // --keep-runs=false (issue #231): a rejected push strands the new commits
+          // in this throwaway clone's object database, so `strandedCommits` is only a
+          // recovery HANDLE if the objects still exist. Keep the run dir (still
+          // age-gated by the reaper, so it is a recovery window, not a leak) and log
+          // its path so an operator can recover the SHAs the error line named.
+          const preserveForRecovery = shouldPreserveRunDir(gitResult);
+          // Correlation handle (issue #231 observability): join these push-failure
+          // diagnostics to the AgentInstance / relay timelines even with concurrent
+          // jobs — jobKey alone is not enough, so carry the process + element keys.
+          const corr = `instance ${job.processInstanceKey ?? '-'}/elem ${job.elementInstanceKey ?? '-'}`;
+          if (runDir && !keepRuns && !preserveForRecovery) { try { rmSync(runDir, { recursive: true, force: true }); } catch { /* best effort */ } }
+          else if (runDir && preserveForRecovery) {
+            // Refresh the run dir's mtime so the age-gated reaper grants it a FULL
+            // recovery window from NOW. The reaper deletes `run-*`/`res-*` dirs whose
+            // mtime is older than maxAgeMs (default 1h); a long-running (multi-hour)
+            // job's dir is already aged when the push fails, so without this touch the
+            // "preserved" recovery workspace would be reaped on the very next sweep,
+            // defeating the preservation (thread 8905). Also refresh the ENCLOSING
+            // worker namespace dir: the cross-process reclaimer (`reclaimOrphanNamespaces`)
+            // age-gates on the NAMESPACE dir's mtime, NOT the child run dir's, so once
+            // this worker exits (owner proven dead) a sibling would otherwise see the
+            // already-aged namespace as old and delete it WHOLE — taking the just-preserved
+            // recovery workspace with it (thread 9056). Best-effort — a failed touch
+            // must never mask the recovery log below.
+            try { const t = new Date(); utimesSync(runDir, t, t); if (workerNsDir) utimesSync(workerNsDir, t, t); } catch { /* best effort */ }
+            // Label the stranded location accurately: an `offBranch` mismatch means
+            // HEAD is BACK on the work branch but commits were left on ANOTHER local
+            // branch, so "HEAD left the work branch" would be wrong for it; a moved
+            // mismatch means HEAD itself left (advisory 8907).
+            const bm = gitResult?.branchMismatch;
+            const reason = bm
+              ? (bm.offBranch
+                  ? 'push refused — commits left on another local branch'
+                  : `push refused — HEAD left the work branch (now on '${bm.actual || 'detached HEAD'}')`)
+              : 'push failed';
+            logger.error(`[${jobType}] job ${job.jobKey} (${corr}): preserving workspace '${runDir}' (${reason}) so the stranded commit(s) remain recoverable — copy them out before the reaper ages it away`);
+          }
           if (runDir) liveRunDirs.delete(runDir);
           // Emit the relay session's `phase:close` lifecycle event and drain its
           // outbound buffer before the job settles (so the live-terminal tail is
@@ -8556,11 +9466,12 @@ async function workAgent(req, flags) {
           // subscription so it never outlives the job or leaks a steer listener
           // across jobs. Bounded internally — a hub outage never wedges completion.
           // #229: pass a close reason (normal / job-killed / error) so the relay's
-          // close log distinguishes a clean end from a killed/errored run.
+          // close log distinguishes a clean end from a killed/errored run. The error
+          // reason is keyed off `pushFailed` (not `pushError`) so a branch-mismatch /
+          // incomplete-scan finalize — which strands work + preserves the workspace
+          // but attempts NO push — still closes as `error`. See computeRelayCloseReason.
           if (relaySession) {
-            const relayCloseReason = result?.aborted
-              ? 'job-killed'
-              : (!runCompleted || (result && result.ok === false) || gitResult?.pushError ? 'error' : 'normal');
+            const relayCloseReason = computeRelayCloseReason(result, runCompleted, gitResult);
             try { await relaySession.close(relayCloseReason); } catch { /* best effort */ }
           }
         }
@@ -8577,10 +9488,60 @@ async function workAgent(req, flags) {
         const resultEnvelope = buildResultEnvelope(result, { sandbox, image, git: gitResult, result: rawResult, promptResourceKey });
         if (result.ok) {
           const gitNote = gitResult
-            ? ` [${gitResult.branch ? `branch ${gitResult.branch}` : 'detached HEAD'}: ${gitResult.commits.length} commit(s), ${gitResult.branch ? (gitResult.pushed ? 'pushed' : (gitResult.pushError ? 'push FAILED' : 'not pushed')) : 'no branch to push'}${gitResult.pr?.found ? `, PR #${gitResult.pr.number}` : ''}]`
+            ? ` [${gitResult.branch ? `branch ${gitResult.branch}` : 'detached HEAD'}: ${gitResult.commits.length} commit(s), ${gitResult.branch ? (gitResult.pushed ? 'pushed' : (gitResult.pushFailed ? 'push FAILED' : 'not pushed')) : 'no branch to push'}${gitResult.pr?.found ? `, PR #${gitResult.pr.number}` : ''}]`
             : '';
           logger.info(`[${jobType}] job ${job.jobKey} complete (exit 0)${result.truncated ? ' [output truncated]' : ''}${gitNote}`);
-          if (gitResult?.pushError) logger.warn(`[${jobType}] job ${job.jobKey}: branch push failed (${aiCorr}) — ${oneLineLog(gitResult.pushError)}`);
+          if (gitResult?.pushFailed) {
+            // Elevate a push failure from a terse info tail to a loud, actionable
+            // error naming the stranded commit SHAs (issue #231): these commits are
+            // unpushed in a throwaway workspace and will be lost with no PR unless
+            // recovered from these SHAs. Key off `pushFailed`, not `pushError`, so
+            // the branch-mismatch strand (HEAD moved off the work branch — no push
+            // attempted, so no pushError) is reported too; use its `branchMismatch`
+            // as the failure detail when there is no push error string.
+            const stranded = gitResult.strandedCommits && gitResult.strandedCommits.length ? gitResult.strandedCommits : (gitResult.commits || []);
+            // Label the stranded commits with the ref they ACTUALLY sit on. For a
+            // branch mismatch where HEAD moved that is `branchMismatch.actual` (the
+            // ref the harness moved HEAD to, or '(detached)'); for the off-branch
+            // case (HEAD returned to the work branch, `offBranch` set, actual null)
+            // the commits sit on ANOTHER local branch — render neutral wording, NOT
+            // '(detached)', which would misdescribe them (suppressed advisory 8746).
+            // Fall back to the work branch for a plain (non-mismatch) push failure.
+            const strandedRef = gitResult.branchMismatch
+              ? (gitResult.branchMismatch.actual
+                  || (gitResult.branchMismatch.offBranch ? '(another local branch)' : '(detached)'))
+              : gitResult.branch;
+            // A branch-mismatch strand is a UNION of commits on two different refs:
+            // the ones the harness left off the work branch (on `strandedRef`) AND
+            // the work-branch commits we refused to push (`strandedOnBranch`). Naming
+            // a single ref for the whole set would misdescribe the work-branch
+            // portion, so when the strand is genuinely MIXED attribute each group to
+            // its own ref; otherwise keep the precise single-ref wording (suppressed
+            // advisory 8882).
+            const onBranchCount = gitResult.branchMismatch?.strandedOnBranch || 0;
+            let shaNote = '';
+            if (stranded.length) {
+              if (gitResult.branchMismatch && onBranchCount > 0 && onBranchCount < stranded.length) {
+                const elsewhereCount = stranded.length - onBranchCount;
+                shaNote = ` — ${stranded.length} commit(s) are UNPUSHED and will be lost, no PR (${onBranchCount} on work branch '${gitResult.branchMismatch.expected}', ${elsewhereCount} on '${strandedRef}') [stranded: ${stranded.join(', ')}]`;
+              } else {
+                // Whole strand sits on one ref: the work branch itself when every
+                // stranded commit is a work-branch commit, else `strandedRef`.
+                const soleRef = (gitResult.branchMismatch && onBranchCount >= stranded.length)
+                  ? gitResult.branchMismatch.expected
+                  : strandedRef;
+                shaNote = ` — ${stranded.length} commit(s) on branch '${soleRef}' are UNPUSHED and will be lost, no PR [stranded: ${stranded.join(', ')}]`;
+              }
+            }
+            const corr = `instance ${job.processInstanceKey ?? '-'}/elem ${job.elementInstanceKey ?? '-'}`;
+            const failDetail = gitResult.pushError
+              || (gitResult.branchMismatch
+                ? (gitResult.branchMismatch.offBranch
+                    ? `commits were left on another local branch (HEAD returned to work branch '${gitResult.branchMismatch.expected}') — refused to push stale work`
+                    : `HEAD moved to '${gitResult.branchMismatch.actual || '(detached)'}' off work branch '${gitResult.branchMismatch.expected}' — refused to push stale work`)
+                : 'push not attempted');
+            logger.error(`[${jobType}] job ${job.jobKey} (${corr}): branch push FAILED${shaNote} — ${failDetail}`);
+          }
           // Guard the operator against silent empty escalations: a success that
           // yields no *effective* result vars (no file/sentinel at all, an empty
           // `{}`, or only reserved keys that were sanitized away) means the
@@ -14083,6 +15044,10 @@ export {
   ensureAcpFlag,
   provisionRepo,
   finalizeGit,
+  runGit,
+  sanitizeBranchSegment,
+  shouldPreserveRunDir,
+  computeRelayCloseReason,
   describeGitFailure,
   boundGitOutput,
   reconcileAgentPr,

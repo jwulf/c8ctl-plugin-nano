@@ -728,7 +728,7 @@ only `latest`, so the key is the reproducibility handle).
 
 On completion the plugin writes an **output envelope** back under
 `io.nanobpm.agentResult` (`{schemaVersion, status, sandbox, image, output, truncated, stderrTruncated, exitCode, signal, error, promptResourceKey?}`). When a repository was
-provisioned (below) it also carries `{repository, branch, baseSha, headSha, commits[], pushed, pushError?, gitError?, pr?}`.
+provisioned (below) it also carries `{repository, branch, baseSha, headSha, commits[], pushed, pushError?, pushFailed?, strandedCommits?, branchMismatch?, scanError?, gitError?, pr?}`. `pushFailed` is the explicit "push failed" flag — set for a non-zero `git push` **whose result could not be confirmed as landed at the remote** (a non-fast-forward rejection, or an auth, hook, or network error), not only a server rejection. **`pushFailed` does not by itself prove a remote push was attempted or rejected:** `finalizeGit` also sets it (with `strandedCommits` and a `branchMismatch` `{expected, actual}`) when it *refuses to push at all* because the harness moved HEAD off the provisioned work branch — or left commits abandoned on another local branch — so pushing the work branch would publish stale work and strand those commits (no `git push` runs, so `pushError` is absent in that case). As a guard against false strands, a non-zero push is re-checked with `ls-remote`: if `origin/<branch>` already points at `headSha` — or the remote tip is a **descendant** of `headSha` (another actor pushed a further commit after ours landed) — the push is treated as a transport hiccup that landed after the ref was accepted (`pushed: true`, no `pushFailed`/`pushError`); otherwise `pushFailed` is set and `strandedCommits` lists the SHAs of the new commits left UNPUSHED in the throwaway workspace — together they are the recovery handle for a failed push, so consumers must not treat `pushed: false` alone as the only signal. On such a failure (a rejected push **or** a branch-mismatch refusal) the throwaway workspace is preserved **best-effort** (even under the default `--keep-runs=false`) so those SHAs stay recoverable, but this is a *recovery window, not a durable archive*: the run-directory reaper still ages it out by mtime and worker shutdown removes the namespace — copy the stranded commits out promptly (or run with `--keep-runs`). **`scanError`** flags a **best-effort/PARTIAL** `strandedCommits` list: a commit or remote-reachability scan did **not** complete, so a consumer should recover the whole preserved workspace rather than trust the list exactly. It arises two ways: (a) a **pre-push** commit-enumeration scan failed, so `finalizeGit` refused to push on an incomplete graph — **no push was attempted** (`pushError` is absent) and `strandedCommits` is a partial surfacing; or (b) a push was **ATTEMPTED and rejected** but the remote-reachability FILTER that trims already-published commits from the strand set itself failed — so `scanError` is present **alongside** `pushError`, marking the rejected-push strand list as best-effort (it may falsely include an already-landed commit). Either way `pushFailed` stays authoritative; `scanError` is how a consumer knows the strand list is inexact (recover the whole workspace) versus an exact list (a rejected push with no `scanError`).
 
 **Git provisioning (host).** When `--sandbox none` (the default) and the envelope
 carries a `repository.url`, the plugin provisions a workspace on the host around
@@ -764,7 +764,17 @@ the harness:
    per envelope (default 120s, or the `--clone-timeout` worker flag) as a backstop
    for repos big enough to approach the cap even when shallow; a timeout is now
    reported *as a timeout* rather than an opaque `exit 128`;
-3. create `branch.create` (if set) off that target;
+3. create `branch.create` (if set) off that target — or, when `branch.create` is
+   **absent** (or names the effective base itself) **and push is enabled**, cut a
+   generated fallback work branch `nano/agent-work/<base>-<runId>` so commits are
+   never made directly on the base branch; the branch actually used (configured or
+   generated) rides back in the result envelope (`branch`) and is exported to the
+   harness as `AGENT_REPO_BRANCH`. **Exception — a detached tag/SHA checkout with
+   no `branch.create`:** with no symbolic branch to name a fallback from, it stays
+   `branch: null` and its commits are **not** pushed even when push is enabled —
+   this holds for *any* detached no-`branch.create` checkout, **including** when a
+   `branch.base` is configured (the base name is not used to synthesize a fallback
+   here). Supply `branch.create` to publish work committed off a tag/SHA base;
 4. set a **committer identity** on the workspace, preferring the operator's own
    (`GIT_AUTHOR_*` env → global `git config user.name/email` → the
    `gh`-authenticated GitHub user), and only falling back to `nano-agent` when
@@ -793,10 +803,36 @@ config is neutralized (`GIT_CONFIG_GLOBAL` → the platform null device,
 or `url.*.insteadOf` can't silently inject operator credentials. (An **SSH**
 remote — `git@…`/`ssh://…` — can still authenticate via the host's SSH
 agent/config; use HTTPS URLs if you need a guaranteed-anonymous clone.)
-Token-backed jobs keep global config (e.g. `http.proxy`). A push failure is
-reported as `pushError` (the job still completes) so a later BPMN step can drive
-the merge; a clone/checkout failure sheds the job (retryable). Workspaces are
-deleted after each job (keep them with `--keep-runs`).
+Token-backed jobs keep global config (e.g. `http.proxy`). **`pushFailed` is the
+authoritative "work is stranded, workspace preserved" flag** (the job still
+completes, so a later BPMN step can drive the merge); a clone/checkout failure
+sheds the job (retryable). `pushError` is present **only** for a push that was
+ATTEMPTED and rejected/unconfirmed — when `finalizeGit` refuses to push at all (a
+branch mismatch, or a partial/incomplete commit scan), it sets `pushFailed`
+(with `branchMismatch` or `scanError`) but **no** `pushError`, so consumers must
+key recovery off `pushFailed`, not `pushError`. **`scanError` flags a
+best-effort/PARTIAL `strandedCommits` list** — a commit/reachability scan did not
+complete, so the list may omit or (after a rejected push) falsely include commits
+and a consumer should recover the whole preserved workspace rather than trust the
+list exactly. It arises two ways: (a) a pre-push commit-enumeration scan failed, so
+`finalizeGit` refused to push on an incomplete graph (**no** `git push` ran, so
+`pushError` is absent); or (b) a push was ATTEMPTED and rejected but the
+remote-reachability FILTER that trims already-published commits from the strand set
+itself failed — so `scanError` is present **alongside** `pushError`, marking the
+otherwise-complete rejected-push strand list as best-effort. Either way `pushFailed`
+stays authoritative. Workspaces are
+deleted after each job (keep them with `--keep-runs`) — **except** a job whose
+`git push` **could not be confirmed as landed** (a non-fast-forward rejection, or
+an auth/hook/network error whose `ls-remote` re-check did not find `origin/<branch>`
+at or ahead of `headSha` — `pushFailed` + `pushError`), **or** one where
+`finalizeGit` refused to push (no `git push` ran, so `pushError` is absent)
+because HEAD moved off the provisioned work branch — or left commits on another
+local branch or an abandoned detached HEAD reachable only via the reflog (a
+`branchMismatch` strand) — **or** because a critical local commit scan did not
+complete (a `scanError` strand, with a best-effort PARTIAL `strandedCommits`),
+whose workspace is preserved best-effort so its
+`strandedCommits` stay recoverable; that preservation is still age-gated by the
+reaper and cleared on worker shutdown, so recover the SHAs promptly.
 
 ```bash
 # The harness sees a cloned repo at $AGENT_WORKSPACE; branch/push/PR are handled for it.

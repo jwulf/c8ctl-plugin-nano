@@ -976,9 +976,14 @@ export function createAgentInstanceProducer(opts = {}) {
     // transcript content.
     if (!classifiesToPersistedTurn(rawUpdate)) return;
     const size = sizeOfUpdate(rawUpdate);
+    // The byte cap applies even to the FIRST buffered update: a single persisted ACP
+    // update (e.g. an arbitrarily large tool-result) whose JSON alone exceeds
+    // preMintBufferMaxBytes would otherwise be retained in full during a prolonged
+    // create outage, defeating the memory bound. Drop (and count) it instead of
+    // special-casing an empty buffer (issue #230).
     if (
       preMintBuffer.length >= preMintBufferMax ||
-      (preMintBuffer.length > 0 && preMintBufferBytes + size > preMintBufferMaxBytes)
+      preMintBufferBytes + size > preMintBufferMaxBytes
     ) {
       preMintDropped += 1;
       if (!preMintOverflowLogged) {

@@ -114,7 +114,7 @@ function baseFetchEnvelope(origin = 'https://example.com/o/r.git') {
   };
 }
 
-test('#222 provisionRepo bails after the clone when the signal is ALREADY aborted — throws before the base fetch (no side effect past the abort)', () => {
+test('#222 provisionRepo bails at ENTRY when the signal is ALREADY aborted — throws before the clone (no repo side effect at all)', () => {
   const runDir = mkdtempSync(join(tmpdir(), 'nano-abort-'));
   const ac = new AbortController();
   ac.abort();
@@ -123,11 +123,11 @@ test('#222 provisionRepo bails after the clone when the signal is ALREADY aborte
   try {
     assert.throws(
       () => provisionRepo({ envelope: baseFetchEnvelope(), token: null, runDir, abortSignal: ac.signal, _runGit: fakeGit }),
-      /provisioning aborted/,
-      'an already-aborted signal throws a ProvisionError right after the clone',
+      /provisioning aborted during entry/,
+      'an already-aborted signal throws a ProvisionError at the entry gate',
     );
-    assert.ok(calls.some((a) => a.includes('clone')), 'the clone (the first, dominant blocking op) still ran');
-    assert.ok(!calls.some((a) => a.includes('fetch')), 'the base fetch never ran — provisioning stopped at the post-clone gate');
+    assert.ok(!calls.some((a) => a.includes('clone')), 'the clone never ran — the entry gate stops before the first repo side effect');
+    assert.ok(!calls.some((a) => a.includes('fetch')), 'the base fetch never ran either');
   } finally {
     rmSync(runDir, { recursive: true, force: true });
   }
@@ -216,6 +216,36 @@ test('#222 provisionRepo (SHA pin) bails when the abort wins DURING the sha fetc
     );
     assert.ok(calls.some((a) => a.includes('fetch') && a.includes(sha)), 'the sha fetch ran');
     assert.ok(!calls.some((a) => a.includes('checkout')), 'the detached checkout never ran — provisioning stopped before mutating the tree');
+  } finally {
+    rmSync(runDir, { recursive: true, force: true });
+  }
+});
+
+// #222 (thread 4293): the pre-base-fetch recheck is not the LAST gate — the base
+// fetch, the committer-config writes, and the branch-state probes/checkouts all run
+// after it. An abort that wins WHILE the base fetch is blocking must stop before the
+// committer config mutates .git/config and before the branch checkout mutates the
+// tree. These prove the post-base-fetch and pre-branch-checkout rechecks.
+test('#222 provisionRepo bails when the abort wins DURING the base fetch — throws before the committer-config writes', () => {
+  const runDir = mkdtempSync(join(tmpdir(), 'nano-basefetch-abort-'));
+  const ac = new AbortController(); // live through entry + clone…
+  const calls = [];
+  const fakeGit = (args) => {
+    calls.push(args);
+    // …the lock-loss race wins WHILE the base fetch (`fetch … +main:refs/remotes/…`)
+    // is blocking; the post-base-fetch recheck must observe it.
+    if (args.includes('fetch') && args.some((a) => a.includes('refs/remotes/origin/main'))) ac.abort();
+    return gitOk();
+  };
+  try {
+    assert.throws(
+      () => provisionRepo({ envelope: baseFetchEnvelope(), token: null, runDir, abortSignal: ac.signal, _runGit: fakeGit }),
+      /provisioning aborted during post-base-fetch/,
+      'an abort during the base fetch is caught by the post-base-fetch recheck',
+    );
+    assert.ok(calls.some((a) => a.includes('fetch')), 'the base fetch ran');
+    assert.ok(!calls.some((a) => a.includes('config')), 'the committer-config writes never ran — stopped before mutating .git/config');
+    assert.ok(!calls.some((a) => a.includes('checkout')), 'no branch checkout — stopped before mutating the tree');
   } finally {
     rmSync(runDir, { recursive: true, force: true });
   }

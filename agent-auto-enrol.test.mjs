@@ -236,6 +236,38 @@ test('serviceTaskOptsOutOfAutoSubscribe is not fooled by a hyphen-suffixed prope
   assert.equal(serviceTaskOptsOutOfAutoSubscribe(real), true);
 });
 
+test('serviceTaskOptsOutOfAutoSubscribe is case-sensitive on the property element name', () => {
+  // The property scan is compiled WITHOUT the `i` flag: XML element names are
+  // case-sensitive and the convention specifies the literal `property`, so a
+  // non-canonical `<zeebe:Property …>` must NOT opt a task out of `--auto`.
+  const upper = '<zeebe:Property name="io.nanobpm.agentTask.autoSubscribe" value="false" />';
+  assert.equal(serviceTaskOptsOutOfAutoSubscribe(upper), false);
+  const allCaps = '<zeebe:PROPERTY name="io.nanobpm.agentTask.autoSubscribe" value="false" />';
+  assert.equal(serviceTaskOptsOutOfAutoSubscribe(allCaps), false);
+  // The exact lowercase element still opts out.
+  const real = '<zeebe:property name="io.nanobpm.agentTask.autoSubscribe" value="false" />';
+  assert.equal(serviceTaskOptsOutOfAutoSubscribe(real), true);
+});
+
+test('serviceTaskElementIds is not truncated by an inert </serviceTask> in a comment/CDATA', () => {
+  // The task-body capture is non-greedy, so a fake `</serviceTask>` inside a
+  // comment or CDATA would truncate the body at that inert close and hide a real
+  // marker/property that follows. The whole document is stripped BEFORE matching,
+  // so the real marker/property later in the same task is still seen.
+  const commentedClose =
+    '<bpmn:serviceTask id="t">' +
+    '<!-- </bpmn:serviceTask> -->' +
+    '<zeebe:agentDefinition agentType="external" />' +
+    '</bpmn:serviceTask>';
+  assert.deepEqual([...externalAgentElementIds(commentedClose)], ['t']);
+  const cdataClose =
+    '<bpmn:serviceTask id="t">' +
+    '<![CDATA[ </bpmn:serviceTask> ]]>' +
+    '<zeebe:property name="io.nanobpm.agentTask.autoSubscribe" value="false" />' +
+    '</bpmn:serviceTask>';
+  assert.deepEqual([...autoSubscribeOptOutElementIds(cdataClose)], ['t']);
+});
+
 test('autoSubscribeOptOutElementIds collects opted-out service-task ids only', () => {
   const xml = model('feature', [
     { id: 'plan', type: 'senior:plan', external: true },

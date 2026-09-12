@@ -3176,7 +3176,10 @@ function serviceTaskOptsOutOfAutoSubscribe(body) {
   // foreign element named `<zeebe:property-extra …>`, which — if it carried the
   // same `name`/`value` attributes — could wrongly opt a task out. Require XML
   // whitespace or tag termination right after the exact element name.
-  const propRe = /<(?:\w+:)?property(?=[\s/>])([^>]*?)\/?>/gi;
+  // CASE-SENSITIVE (no `i` flag): XML element names are case-sensitive and the
+  // convention specifies the literal `property`, so a non-canonical `<zeebe:Property …>`
+  // is NOT the opt-out element and must not remove a task from `--auto`.
+  const propRe = /<(?:\w+:)?property(?=[\s/>])([^>]*?)\/?>/g;
   let m;
   while ((m = propRe.exec(src)) !== null) {
     if (readXmlAttr(m[1], 'name') !== AGENT_TASK_AUTO_SUBSCRIBE_PROP) continue;
@@ -3200,18 +3203,23 @@ function stripXmlCommentsAndCdata(s) {
 // `elementId`. Shared by the external-marker and auto-subscribe-opt-out scans.
 function serviceTaskElementIds(xml, guardSubstring, predicate) {
   const ids = new Set();
-  const src = String(xml || '');
-  // Cheap guard: skip the full `<serviceTask>` walk when the document cannot
-  // possibly match, so `--auto` enrolment loops don't parse every deployed
-  // definition needlessly.
-  if (guardSubstring && !src.includes(guardSubstring)) return ids;
+  const raw = String(xml || '');
+  // Cheap guard on the RAW document: skip the full `<serviceTask>` walk when the
+  // document cannot possibly match, so `--auto` enrolment loops don't parse every
+  // deployed definition needlessly. (A marker that appears ONLY inside a comment/
+  // CDATA still passes this guard, but the strip below then correctly drops it.)
+  if (guardSubstring && !raw.includes(guardSubstring)) return ids;
+  // Strip comments/CDATA from the WHOLE document BEFORE matching serviceTasks: a
+  // marker/property inside a comment or CDATA is inert and must not drive enrolment
+  // or opt-out, AND an inert `</serviceTask>` inside a comment/CDATA would otherwise
+  // truncate the non-greedy task-body capture at that fake close — hiding a real
+  // marker/property later in the same task (silently omitting it from `--auto`).
+  const src = stripXmlCommentsAndCdata(raw);
   const taskRe =
     /<(?:\w+:)?serviceTask\b[^>]*?\bid\s*=\s*(["'])(.*?)\1[^>]*?>([\s\S]*?)<\/(?:\w+:)?serviceTask>/g;
   let m;
   while ((m = taskRe.exec(src)) !== null) {
-    // Strip comments/CDATA before matching: a marker/property inside a comment or
-    // CDATA is inert and must not drive enrolment or opt-out.
-    if (predicate(stripXmlCommentsAndCdata(m[3]))) ids.add(m[2]);
+    if (predicate(m[3])) ids.add(m[2]);
   }
   return ids;
 }
@@ -3407,7 +3415,7 @@ async function createAgenticEndpoint(opts) {
 // @param {string} [opts.worker]         worker id stamped on activations
 // @param {Array<{id: string, types?: Iterable<string>, capacity?: number}>} [opts.workers]  registry seed
 // @param {string} [opts.autoWorkerId]   worker whose types the reconcile loop rewrites
-// @param {Iterable<string>} [opts.autoExtraTypes]  explicit `--job-type` extras unioned into every reconcile write (survive the auto rewrite)
+// @param {ReadonlyArray<string>} [opts.autoExtraTypes]  explicit `--job-type` extras unioned into every reconcile write (survive the auto rewrite). MUST be an array (the supervisor gates the union on `.length`); a bare `Iterable`/`Set` would be silently dropped.
 // @param {import('./supervisor.dist.js').AgenticEndpoint} [opts.agenticEndpoint]  the ownership wire
 // @param {object} [opts.agenticConfig]  reconnect backoff config
 // @param {string} [opts.scope]          reconcile process-id scope narrowing

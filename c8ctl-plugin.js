@@ -3134,15 +3134,25 @@ function resolveAutoRestConfig(camunda, env = process.env) {
 // is NOT the canonical marker and must not auto-enrol a non-conforming task.
 // Boundaries are anchored on XML whitespace / tag termination, NOT `\b`
 // (a word boundary): `agentDefinition\b` would also match a foreign element
-// like `<zeebe:agentDefinition-extra …>`, and `\bagentType` would match a
-// prefixed attribute like `other:agentType="external"`. Require `[\s/>]` after
-// the element name and a leading `\s` before the (unqualified) `agentType`
-// attribute so only the canonical marker enrols a task.
-const AGENT_DEFINITION_EXTERNAL_RE = new RegExp(
-  `<(?:\\w+:)?agentDefinition(?=[\\s/>])[^>]*\\sagentType\\s*=\\s*(["'])external\\1`
-);
+// like `<zeebe:agentDefinition-extra …>`. Require `[\s/>]` after the element
+// name so only the canonical marker enrols a task. Attribute matching is
+// QUOTE-AWARE (`parseXmlAttrs`, not a raw substring scan): a naive
+// `\sagentType\s*=\s*"external"` would also fire on `agentType='external'`
+// nested inside ANOTHER attribute's quoted value (e.g.
+// `description="text agentType='external'"`), auto-enrolling a non-conforming
+// task; parsing the element's attributes left-to-right and reading the real
+// unqualified `agentType` avoids that (and naturally rejects a prefixed
+// `other:agentType`). Compiled once — called per matched `<serviceTask>` during
+// `--auto` scans, so recompiling per call would allocate needlessly.
+const AGENT_DEFINITION_RE = /<(?:\w+:)?agentDefinition(?=[\s/>])([^>]*)>/g;
 function serviceTaskIsExternalAgent(body) {
-  return AGENT_DEFINITION_EXTERNAL_RE.test(String(body || ''));
+  const src = String(body || '');
+  AGENT_DEFINITION_RE.lastIndex = 0;
+  let m;
+  while ((m = AGENT_DEFINITION_RE.exec(src)) !== null) {
+    if (parseXmlAttrs(m[1]).agentType === 'external') return true;
+  }
+  return false;
 }
 
 // Opt-out namespace (issue #235): an external agent task authored with
@@ -3154,15 +3164,34 @@ function serviceTaskIsExternalAgent(body) {
 // `value="false"` opts out (fail-safe: any other value, or absence, auto-subscribes).
 const AGENT_TASK_AUTO_SUBSCRIBE_PROP = `${AGENT_TASK_NS}.autoSubscribe`;
 
+// Parse a raw element attribute string (`name="…" other='…'`) into a
+// `{ name: value }` map, walking LEFT-TO-RIGHT and consuming each COMPLETE quoted
+// value so text INSIDE one attribute's value can never be mistaken for a separate
+// attribute. This is the quote-aware core both the external-marker and the
+// auto-subscribe-opt-out scans read through: a plain "search the whole string for
+// `key=…`" would match e.g. `value='false'` embedded in another attribute's
+// quoted value and misclassify the element. First occurrence wins (XML attribute
+// names are unique). Attribute NAMES may be namespace-prefixed and carry XML name
+// chars (`:`/`-`/`.`); values hold any non-quote text. Case-sensitive: XML
+// attribute names are case-sensitive and the conventions here are literal.
+function parseXmlAttrs(attrs) {
+  const out = Object.create(null);
+  const re = /([:\w.\-]+)\s*=\s*(["'])([\s\S]*?)\2/g;
+  let m;
+  while ((m = re.exec(String(attrs || ''))) !== null) {
+    if (!(m[1] in out)) out[m[1]] = m[3];
+  }
+  return out;
+}
+
 // Read a named attribute's value from a raw element's attribute string
 // (`name="…"`/`name='…'`), quote-style and order tolerant; undefined when absent.
-// The key must sit at the START of the attribute string or after XML whitespace —
-// NOT a `\b` boundary, which (because `-` is a non-word char) would let
-// `other-name`/`other-value` masquerade as the canonical `name`/`value`.
+// Quote-aware (via `parseXmlAttrs`): only a REAL attribute matches, so neither a
+// `\b`-style boundary trick (`other-name`) NOR text nested inside another
+// attribute's quoted value can masquerade as the canonical `name`/`value`.
 // Case-sensitive: XML attribute names are case-sensitive and the convention is literal.
 function readXmlAttr(attrs, key) {
-  const m = new RegExp(`(?:^|\\s)${key}\\s*=\\s*(["'])(.*?)\\1`).exec(String(attrs || ''));
-  return m ? m[2] : undefined;
+  return parseXmlAttrs(attrs)[key];
 }
 
 // True when `body` (a service task's inner XML) declares a

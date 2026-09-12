@@ -104,6 +104,26 @@ test('scanAgentTaskLeaves ignores a prompt-linked task without the external mark
   assert.deepEqual(scanAgentTaskLeaves(xml, scanTaskDefinitions), []);
 });
 
+// Regression (PR #242 review): the retired legacy `io.nanobpm.agentTask.*`
+// task-header path is NOT a discovery signal. A task carrying ONLY legacy
+// agent-task headers (and NO external marker) must be ignored — proving the
+// single-convention switch (issue #235) did not silently keep the old
+// header-fallback detection alive.
+test('scanAgentTaskLeaves ignores a task with only legacy io.nanobpm.agentTask headers', () => {
+  const xml =
+    '<?xml version="1.0"?><bpmn:definitions xmlns:bpmn="http://x" xmlns:zeebe="http://y">' +
+    '<bpmn:process id="feature" isExecutable="true">' +
+    '<bpmn:serviceTask id="legacy"><bpmn:extensionElements>' +
+    '<zeebe:taskDefinition type="senior:feature" />' +
+    '<zeebe:taskHeaders>' +
+    '<zeebe:header key="io.nanobpm.agentTask.prompt" value="do the thing" />' +
+    '<zeebe:header key="io.nanobpm.agentTask.rank" value="senior" />' +
+    '</zeebe:taskHeaders>' +
+    '</bpmn:extensionElements></bpmn:serviceTask>' +
+    '</bpmn:process></bpmn:definitions>';
+  assert.deepEqual(scanAgentTaskLeaves(xml, scanTaskDefinitions), []);
+});
+
 // Opt-out namespace (issue #235): an external agent task marked
 // `autoSubscribe="false"` is excluded from `--auto`; its external sibling stays.
 test('scanAgentTaskLeaves excludes an external task marked autoSubscribe=false', () => {
@@ -188,6 +208,23 @@ test('serviceTaskIsExternalAgent rejects hyphen-suffixed elements and prefixed a
   assert.equal(serviceTaskIsExternalAgent('<zeebe:agentDefinition foo="1" agentType="external" />'), true);
 });
 
+test('serviceTaskIsExternalAgent ignores agentType nested inside another attribute value', () => {
+  // Quote-aware (PR #242 review): `agentType='external'` embedded in a
+  // `description` value is NOT a real attribute and must NOT be treated as the
+  // canonical marker — otherwise a non-conforming task auto-enrols.
+  assert.equal(
+    serviceTaskIsExternalAgent(`<zeebe:agentDefinition description="text agentType='external'" />`),
+    false,
+  );
+  // …but a REAL `agentType="external"` alongside such a decoy value still matches.
+  assert.equal(
+    serviceTaskIsExternalAgent(
+      `<zeebe:agentDefinition description="x agentType='nope'" agentType="external" />`,
+    ),
+    true,
+  );
+});
+
 test('serviceTaskIsExternalAgent ignores a marker inside an XML comment or CDATA', () => {
   const commented = '<!-- <zeebe:agentDefinition agentType="external" /> -->';
   const cdata = '<![CDATA[ <zeebe:agentDefinition agentType="external" /> ]]>';
@@ -222,6 +259,19 @@ test('serviceTaskOptsOutOfAutoSubscribe is not fooled by hyphen-suffixed attribu
   // `other-value` as the canonical `name`/`value` and misclassify the property.
   const decoy = '<zeebe:property other-name="io.nanobpm.agentTask.autoSubscribe" other-value="false" />';
   assert.equal(serviceTaskOptsOutOfAutoSubscribe(decoy), false);
+});
+
+test('serviceTaskOptsOutOfAutoSubscribe ignores name/value nested inside another attribute value', () => {
+  // Quote-aware (PR #242 review): a decoy attribute whose VALUE contains
+  // `name='io.nanobpm.agentTask.autoSubscribe' value='false'` must NOT opt the
+  // task out — those are text inside another attribute's value, not real
+  // attributes, so the fail-safe (stay auto-subscribed) holds.
+  const decoy =
+    `<zeebe:property meta="name='io.nanobpm.agentTask.autoSubscribe' value='false'" />`;
+  assert.equal(serviceTaskOptsOutOfAutoSubscribe(decoy), false);
+  // The real, un-nested attributes still opt out.
+  const real = '<zeebe:property name="io.nanobpm.agentTask.autoSubscribe" value="false" />';
+  assert.equal(serviceTaskOptsOutOfAutoSubscribe(real), true);
 });
 
 test('serviceTaskOptsOutOfAutoSubscribe is not fooled by a hyphen-suffixed property element', () => {

@@ -15216,6 +15216,7 @@ export {
   runSupervisorDaemon,
   startSupervisorDaemon,
   supervisorRequest,
+  supervisorStartCmd,
   supervisorAddCmd,
   runningSupervisor,
   readSupervisorState,

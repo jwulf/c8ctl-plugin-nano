@@ -2532,8 +2532,10 @@ const RESERVED_RESULT_KEYS = new Set([
   // rejected" signal, the recovery SHAs, and the branch-mismatch detail into
   // io.nanobpm.agentResult. Reserve them alongside branch/commits/pushed so
   // untrusted agent output cannot inject/shadow them as top-level completion vars
-  // and spoof the finalize contract downstream (thread 6772).
-  'pushFailed', 'strandedCommits', 'branchMismatch',
+  // and spoof the finalize contract downstream (thread 6772). `scanError` marks an
+  // INCOMPLETE local scan (partial strandedCommits, no push attempted) distinctly
+  // from a rejected push — reserve it too so an agent can't forge it.
+  'pushFailed', 'strandedCommits', 'branchMismatch', 'scanError',
 ]);
 
 // Parse `text` as a JSON object, returning it only when it is a plain object.
@@ -4844,6 +4846,26 @@ function finalizeGit({ workspaceDir, gitEnv, startSha, workingBranch, baseBranch
     const stray = runGit(strayArgs, { cwd: workspaceDir, env: gitEnv, timeoutMs: netTimeoutMs() });
     if (stray.status === 0) offBranchStray = stray.stdout.trim().split('\n').filter(Boolean);
     else noteScanFail('rev-list --branches --not --remotes', stray);
+
+    // The `--branches` walk above misses a commit that sits on NO branch at all: a
+    // harness that DETACHES HEAD, commits, then checks the work branch back out (or
+    // deletes the temp branch) leaves that commit reachable ONLY via the reflog. It
+    // is absent from BOTH out.commits (startSha..HEAD — HEAD is back on the work
+    // branch) AND offBranchStray (no branch points at it), so the push gate below
+    // would see "no strays", skip preservation, and the run-dir reaper would destroy
+    // the only copy of that commit (advisory: detached/reflog commit scan gap). Walk
+    // the reflog for reachable-but-unpushed commits that the work-branch push would
+    // NOT publish and fold them into the stray set, so they gate preservation and land
+    // in strandedCommits exactly like an off-branch stray. Fail CLOSED on a scan error
+    // (preserve) as with every other enumeration above.
+    const reflogArgs = noCommitYet
+      ? ['rev-list', '--reflog', '--not', '--remotes']
+      : ['rev-list', '--reflog', '--not', '--remotes', `refs/heads/${workingBranch}`];
+    const reflog = runGit(reflogArgs, { cwd: workspaceDir, env: gitEnv, timeoutMs: netTimeoutMs() });
+    if (reflog.status === 0) {
+      const reflogStray = reflog.stdout.trim().split('\n').filter(Boolean);
+      if (reflogStray.length) offBranchStray = [...new Set([...offBranchStray, ...reflogStray])];
+    } else noteScanFail('rev-list --reflog --not --remotes', reflog);
   }
 
   // Commits the work branch ITSELF carries, anchored on refs/heads/<workingBranch>
@@ -4969,7 +4991,7 @@ function finalizeGit({ workspaceDir, gitEnv, startSha, workingBranch, baseBranch
         : { expected: workingBranch, actual: null, offBranch: true, strandedOnBranch };
       const where = movedOff
         ? `HEAD is on '${currentBranch || '(detached)'}'`
-        : `HEAD is back on '${workingBranch}' but ${offBranchStray.length} commit(s) were left on another local branch`;
+        : `HEAD is back on '${workingBranch}' but ${offBranchStray.length} commit(s) were left on another local branch or an abandoned detached HEAD`;
       log.warn?.(`finalizeGit${cs}: ${where} — the harness moved HEAD off the provisioned work branch; refusing to push '${workingBranch}' (it would publish stale work and strand the ${out.strandedCommits.length} new commit(s)). Preserving workspace for recovery.`);
     } else {
     // We are pushing `workingBranch`. Promote the WORK-BRANCH tip + its commit list
@@ -6992,6 +7014,16 @@ function buildResultEnvelope(result, { sandbox, image, git, result: agentResult,
     // signal, and `strandedCommits` carries the SHAs to recover (see README).
     if (git.pushFailed) env.pushFailed = true;
     if (git.strandedCommits && git.strandedCommits.length) env.strandedCommits = git.strandedCommits;
+    // Distinguish an INCOMPLETE local commit scan from a real rejected push. The
+    // incomplete-graph path in finalizeGit sets `pushFailed=true` even though NO push
+    // was attempted (a critical rev-list did not complete), recording the cause in
+    // `scanError` — and in that case `strandedCommits` may be only PARTIAL. Forwarding
+    // only `pushFailed`/`strandedCommits` makes (a) a rejected push and (b) an
+    // incomplete scan look identical, so a consumer cannot tell that the stranded list
+    // is best-effort and the run must be recovered manually (advisory: envelope drops
+    // scanError). Thread `scanError` through so the two are distinguishable; a plain
+    // rejected push carries `pushError`, not `scanError`.
+    if (git.scanError) env.scanError = git.scanError;
     // Forward the branch-mismatch detail too (thread 6530): for a branch-mismatch
     // refusal the README/finalizeGit contract lists `branchMismatch` as part of the
     // envelope, and it is the only field carrying the expected-vs-actual ref a

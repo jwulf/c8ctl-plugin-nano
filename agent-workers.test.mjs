@@ -1090,6 +1090,22 @@ test('buildResultEnvelope merges the git block when a repo was provisioned', () 
     { sandbox: 'none', git: { remote: 'https://github.com/o/r.git', branch: 'feat/x', baseSha: 'aaa', headSha: 'bbb', commits: ['bbb'], pushed: true } },
   );
   assert.equal('branchMismatch' in noMismatch, false, 'no branchMismatch key on a clean push');
+
+  // An INCOMPLETE local scan sets pushFailed WITHOUT attempting a push (a rev-list
+  // did not complete): it records the cause in `scanError` and its strandedCommits
+  // list is only PARTIAL. The envelope must forward `scanError` so a consumer can
+  // distinguish it from a real rejected push (whose stranded list is complete) —
+  // otherwise the two are indistinguishable and the recovery contract is defeated
+  // (Copilot advisory: envelope drops scanError).
+  const incompleteScan = buildResultEnvelope(
+    { ok: true, stdout: 'done', exitCode: 0 },
+    { sandbox: 'none', git: { remote: 'https://github.com/o/r.git', branch: 'feat/x', baseSha: 'aaa', headSha: 'ccc', commits: ['ccc'], pushed: false, pushFailed: true, scanError: 'rev-list --branches --not --remotes exited 128', strandedCommits: ['ccc'] } },
+  );
+  assert.equal(incompleteScan.pushFailed, true);
+  assert.equal(incompleteScan.scanError, 'rev-list --branches --not --remotes exited 128', 'scanError is forwarded so an incomplete scan is distinguishable from a rejected push');
+  assert.equal('pushError' in incompleteScan, false, 'an incomplete scan attempted no push, so it carries no pushError');
+  // The plain rejected push above must NOT look like an incomplete scan.
+  assert.equal('scanError' in rejected, false, 'a genuinely rejected push carries no scanError — the two are distinguishable');
 });
 
 // --- Structured agent result channel ($AGENT_RESULT_FILE + fallback) ---------
@@ -1157,12 +1173,13 @@ test('sanitizeResultVars strips harness-reserved keys and the io.nanobpm namespa
     pushFailed: true,
     strandedCommits: ['deadbeef'],
     branchMismatch: { expected: 'x', actual: 'main' },
+    scanError: 'forged incomplete-scan reason',
     [AGENT_RESULT_KEY]: { forged: true },
     'io.nanobpm.somethingElse': 1,
   });
   assert.deepEqual({ ...vars }, { status: 'converged', summary: 'ok' });
   for (const k of RESERVED_RESULT_KEYS) assert.equal(k in vars, false, `${k} must be stripped`);
-  for (const k of ['pushFailed', 'strandedCommits', 'branchMismatch']) assert.equal(k in vars, false, `git-contract key ${k} must be stripped`);
+  for (const k of ['pushFailed', 'strandedCommits', 'branchMismatch', 'scanError']) assert.equal(k in vars, false, `git-contract key ${k} must be stripped`);
   assert.deepEqual(sanitizeResultVars(null), {});
   assert.deepEqual(sanitizeResultVars('nope'), {});
 });
@@ -2329,6 +2346,44 @@ test('finalizeGit reports a detached-HEAD harness move as detached, not a branch
   }
 });
 
+test('finalizeGit surfaces a REFLOG-ONLY detached commit (HEAD returned to the work branch) as stranded + preserves the run (Copilot advisory: detached/reflog scan gap)', { skip: !gitOk }, () => {
+  const { root, origin } = makeOriginRepo();
+  const runDir = mkdtempSync(join(root, 'run-'));
+  try {
+    const envelope = {
+      schemaVersion: 1,
+      repository: { provider: 'github', url: origin, submodules: false },
+      branch: { base: 'main', create: 'feat/work', push: true },
+      setup: { commands: [], env: {}, secretRefs: [] },
+      task: { allowPr: false },
+    };
+    const prov = provisionRepo({ envelope, token: null, runDir });
+    assert.equal(prov.workingBranch, 'feat/work');
+    const startSha = g(['rev-parse', 'HEAD'], prov.workspaceDir);
+
+    // The harness DETACHES HEAD, commits there, then checks the work branch back
+    // out. The detached commit is now on NO branch and HEAD is back at startSha, so
+    // it is invisible to BOTH startSha..HEAD (out.commits) AND the `--branches` stray
+    // scan — it is reachable ONLY via the reflog. Without the reflog scan the push
+    // gate sees nothing and cleanup would reap the only copy.
+    g(['checkout', '-q', '--detach', 'HEAD'], prov.workspaceDir);
+    writeFileSync(join(prov.workspaceDir, 'stray.txt'), 'reflog-only\n');
+    g(['add', '-A'], prov.workspaceDir);
+    g(['-c', 'user.name=nano', '-c', 'user.email=nano@example.com', 'commit', '-q', '-m', 'work on a since-abandoned detached HEAD'], prov.workspaceDir);
+    const detachedSha = g(['rev-parse', 'HEAD'], prov.workspaceDir);
+    g(['checkout', '-q', 'feat/work'], prov.workspaceDir);
+    assert.equal(g(['rev-parse', 'HEAD'], prov.workspaceDir), startSha, 'HEAD is back on the (unmodified) work branch — the detached commit lives only in the reflog');
+    assert.equal(g(['branch', '--contains', detachedSha, '--all'], prov.workspaceDir), '', 'no branch reaches the detached commit');
+
+    const out = finalizeGit({ ...prov, envelope, token: null });
+    assert.equal(out.pushFailed, true, 'a reflog-only stray must fail-preserve, not silently skip the push');
+    assert.ok(out.strandedCommits?.includes(detachedSha), 'the reflog-only detached commit is surfaced for recovery');
+    assert.equal(shouldPreserveRunDir(out), true, 'the run workspace is preserved so the reflog-only commit stays recoverable');
+  } finally {
+    rmSync(root, { recursive: true, force: true });
+  }
+});
+
 test('finalizeGit measures base advance against the CLONE-TIME base SHA even if the harness re-fetched the base (issue #231/#229, thread 4600)', { skip: !gitOk }, () => {
   const { root, origin } = makeOriginRepo();
   const runDir = mkdtempSync(join(root, 'run-'));
@@ -2726,7 +2781,16 @@ test('finalizeGit pushes a work branch whose name collides with a remote TAG via
     };
     const prov = provisionRepo({ envelope, token: null, runDir });
     assert.equal(prov.workingBranch, 'v1', 'the work branch is the tag-colliding name');
-    assert.equal(g(['rev-parse', '--verify', '--quiet', 'refs/tags/v1'], prov.workspaceDir).length, 40, 'the clone fetched the same-named tag, so a bare push would be ambiguous');
+    // provisionRepo clones with `--no-tags` (which disables AUTO tag-following);
+    // whether the same-named refs/tags/v1 lands in the workspace is git-version /
+    // clone-shape dependent, so explicitly fetch it to DETERMINISTICALLY guarantee
+    // the collision exists when finalizeGit pushes — otherwise a bare `git push
+    // origin v1` might not be ambiguous and the test would not exercise the
+    // explicit-heads-refspec disambiguation it targets (Copilot advisory: same-named
+    // -tag test setup). The fetch is a no-op fast-forward when the clone already
+    // created it.
+    g(['fetch', '--no-tags', 'origin', 'refs/tags/v1:refs/tags/v1'], prov.workspaceDir);
+    assert.equal(g(['rev-parse', '--verify', '--quiet', 'refs/tags/v1'], prov.workspaceDir).length, 40, 'the same-named tag now exists, so a bare push would be ambiguous');
     writeFileSync(join(prov.workspaceDir, 'work.txt'), 'work\n');
     g(['add', '-A'], prov.workspaceDir);
     g(['-c', 'user.name=nano', '-c', 'user.email=nano@example.com', 'commit', '-q', '-m', 'work on v1'], prov.workspaceDir);
@@ -2774,7 +2838,16 @@ test('provisionRepo derives the checked-out base via symbolic-ref, unfooled by a
       task: { allowPr: false },
     };
     const prov = provisionRepo({ envelope, token: null, runDir });
-    assert.equal(g(['rev-parse', '--verify', '--quiet', 'refs/tags/v1'], prov.workspaceDir).length, 40, 'the clone fetched the same-named tag, so abbrev-ref would read heads/v1');
+    // provisionRepo clones with `--no-tags` (which disables AUTO tag-following); a
+    // `--branch v1` clone still materializes refs/tags/v1 because it points at the
+    // fetched branch tip, so the heads/v1-vs-tags/v1 collision is normally LIVE while
+    // provisionRepo derives the base. Explicitly fetch the tag so that precondition
+    // holds DETERMINISTICALLY (a stricter git that suppressed it would otherwise make
+    // this bare rev-list throw on a missing ref BEFORE the real assertion, silently
+    // not exercising the abbrev-ref path) — Copilot advisory: same-named-tag test
+    // setup. The fetch is a no-op fast-forward when the clone already created it.
+    g(['fetch', '--no-tags', 'origin', 'refs/tags/v1:refs/tags/v1'], prov.workspaceDir);
+    assert.equal(g(['rev-parse', '--verify', '--quiet', 'refs/tags/v1'], prov.workspaceDir).length, 40, 'refs/tags/v1 exists so abbrev-ref would read the qualified heads/v1 — the exact collision symbolic-ref must survive');
     assert.equal(prov.baseBranch, 'v1', "the base is the clean 'v1', not the tag-disambiguated 'heads/v1'");
     assert.notEqual(prov.workingBranch, 'v1', 'a fallback work branch is cut so commits never land on the base');
     assert.match(prov.workingBranch, /^nano\/agent-work\/v1-/, "fallback is namespaced off the clean base 'v1', not 'heads/v1'");

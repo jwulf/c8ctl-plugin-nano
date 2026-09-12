@@ -86,8 +86,16 @@ SDK client (job workers) — do **not** add the SDK as a dependency or use raw
   **engine-backed, so cross-machine** — and, when it carries real prior work,
   `seedResumeEnvelope` reframes `envelope.task.prompt` as a continuation (rendered
   transcript + recovery-scope contract). Committed work is recovered from the
-  pushed branch; **uncommitted deltas are lost** (workspace is throwaway — the
-  isolated-context persistence increment is later). Gated to external agent jobs;
+  pushed branch **only when the next activation re-provisions the same stable
+  branch** — i.e. a `repository.ref` that names a NON-base branch (cloned and
+  checked out directly with its prior commits). A `branch.create` (provisioned via
+  `git checkout -B` off the base, so prior commits are absent), a base-like ref
+  (fresh per-activation fallback branch), a detached tag/SHA, a failed push, or a
+  repo-less / `branch.push=false` job have no recoverable branch, so those degrade
+  to a **transcript-only** continuation (`envelopeHasPushedBranch` gates the seeded
+  recovery text on exactly the stable-branch case). **Uncommitted deltas are lost**
+  in every case (workspace is throwaway — the isolated-context persistence increment
+  is later). Gated to external agent jobs;
   a read failure / no read surface / no prior work / `NANO_AGENT_RESUME=off` falls
   through to the legacy cold rerun (`effectiveEnvelope === envelope`). The prompt
   seed is the only change — repository/setup are untouched, and the AgentInstance

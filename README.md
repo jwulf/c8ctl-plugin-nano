@@ -679,10 +679,19 @@ the job with a decremented retry count. Profiles are stored in the plugin's
 >   PRs).
 >
 > **Recovery scope (what survives a re-activation):**
-> - **Committed work is durable** — it is already on the pushed branch, so the
->   resumed agent picks up from the **last pushed commit** (git provisioning checks
->   out the existing `feat/…` branch; inspect `git log` / the open PR for what
->   landed).
+> - **Committed work is durable *when a stable pushed branch is re-provisioned*** —
+>   that means a `repository.ref` naming a NON-base branch, which git provisioning
+>   re-clones and checks out directly with its prior commits, so the resumed agent
+>   picks up from the **last pushed commit** (inspect `git log` / the open PR for
+>   what landed). This does **not** cover a `branch.create` (provisioned with
+>   `git checkout -B` off the base, so prior commits are *not* present), a base-like
+>   ref (a fresh per-activation `nano/agent-work/…` fallback branch is cut), a
+>   detached tag/SHA checkout, or a run whose push failed — none of those hand the
+>   next worker a branch carrying the committed work.
+> - **Transcript-only fallback** — for every case above without a stable pushed
+>   branch (including repo-less / `branch.push=false` jobs), the durable transcript
+>   is the only recoverable state; the resume preamble says so explicitly and does
+>   **not** tell the agent to check out a branch that will not be provisioned.
 > - **Uncommitted working-tree changes are *not* recovered** in this increment —
 >   the throwaway workspace does not persist across activations, so any delta the
 >   previous run had not committed is lost and the resumed agent re-derives it. The

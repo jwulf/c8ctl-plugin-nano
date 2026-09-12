@@ -9107,18 +9107,22 @@ async function workAgent(req, flags) {
         // reasoning/steps so the resumed agent doesn't repeat completed work.
         //
         // COMMITTED work is recovered from the pushed branch only when this activation
-        // provisions the SAME branch the prior one pushed. That holds when the envelope
-        // carries a STABLE branch identity: an explicit `branch.create`, or a
-        // `repository.ref` that names a NON-base branch (which `provisionRepo` checks out
-        // and commits on directly). It does NOT hold for a plain push-enabled job whose
-        // ref is base-like and sets no `branch.create`: `provisionRepo` then cuts a fresh
-        // per-activation `nano/agent-work/<base>-<runId>` fallback, so the prior commits
-        // are on a DIFFERENT branch and are not checked out — that case (and any repo-less
-        // / `branch.push=false` job) degrades to a transcript-only continuation, which the
-        // seeded prompt states honestly (`seedResumeEnvelope` gates the recovery text on a
-        // declared pushed branch). Carrying the prior `workingBranch` across reactivations
-        // (or a full prior-branch resolve+checkout) is the later isolated-context
-        // increment; uncommitted deltas from the prior run are not recovered in any case.
+        // re-provisions the SAME branch the prior one pushed WITH its commits. That
+        // holds ONLY when the envelope names a STABLE, already-pushed branch via a
+        // `repository.ref` that is a NON-base branch: `provisionRepo` clones and checks
+        // that ref out directly (carrying its prior commits) and pushes back to it. It
+        // does NOT hold for an explicit `branch.create` — provisionRepo does
+        // `git checkout -B <create>` from the freshly cloned base/ref HEAD and never
+        // fetches an existing remote `<create>`, so the prior commits are not present —
+        // nor for a base-like ref with no stable branch (a fresh per-activation
+        // `nano/agent-work/<base>-<runId>` fallback is cut), a detached tag/SHA ref, or
+        // a repo-less / `branch.push=false` job. All of those degrade to a
+        // transcript-only continuation, which the seeded prompt states honestly
+        // (`seedResumeEnvelope` → `envelopeHasPushedBranch` gates the recovery text on
+        // exactly this non-base-branch-ref condition). Carrying the prior `workingBranch`
+        // across reactivations (or a full prior-branch resolve+checkout) is the later
+        // isolated-context increment; uncommitted deltas from the prior run are not
+        // recovered in any case.
         //
         // The gating + best-effort read/seed live in `resolveEffectiveEnvelope`
         // (unit-tested) so this wiring stays a thin call; a read failure /

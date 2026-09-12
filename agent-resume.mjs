@@ -66,6 +66,13 @@ export const RESUME_READ_TIMEOUT_MS = 10_000;
 export const RESUME_READ_CONSISTENCY_MS = 5_000;
 const READ_CONSISTENCY = { consistency: { waitUpToMs: RESUME_READ_CONSISTENCY_MS } };
 
+// The engine history search is cursor-paginated (`items` + `page.endCursor`); a long
+// transcript spans several pages, and consuming only the first truncates the resume
+// context. We follow the forward cursor to exhaustion, capped at this many pages as a
+// belt-and-suspenders guard against a mispaginating surface looping forever (the
+// per-read timeout is the outer fence).
+const MAX_HISTORY_PAGES = 1_000;
+
 // Race a promise against a deadline; rejects with a tagged timeout error so the
 // best-effort caller degrades to a cold rerun rather than blocking forever. The
 // deadline timer is cleared as soon as the read settles (win or lose), so it never
@@ -298,21 +305,75 @@ async function defaultRead({ camunda, elementInstanceKey }) {
   if (!match) return [];
 
   // 3. Prefer an embedded history; else fetch it by agentInstanceKey.
-  let turns = normalizeHistory(match.history != null ? match : { history: match.history });
-  if (!turns.length && Array.isArray(match.history)) turns = match.history.filter(isPlainObject);
+  //
+  // An embedded `history` rides on the INSTANCE, whose granularity can span several
+  // sibling element instances (see `instanceElementKeys`), so — unlike the filtered
+  // `searchAgentInstanceHistory` fetch below — it is NOT inherently scoped to THIS
+  // element. Using it verbatim can seed sibling turns (including sensitive tool
+  // results) into this job (cross-job exposure + wrong continuation). Only trust the
+  // embedded history when we can PROVE it is element-scoped: either the matched
+  // instance is associated with exactly THIS element, or its turns carry an
+  // `elementInstanceKey` we can filter on. Otherwise drop it and fall through to the
+  // element-filtered fetch.
+  let turns = scopeEmbeddedHistoryToElement(match, eik);
   if (!turns.length) {
     const aik = match.agentInstanceKey ?? match.key;
     if (isNonBlank(aik)) {
       for (const m of HISTORY_METHODS) {
         if (typeof camunda[m] !== 'function') continue;
         try {
-          turns = normalizeHistory(await camunda[m]({ agentInstanceKey: String(aik), filter: { elementInstanceKey: eik } }, READ_CONSISTENCY));
+          turns = await fetchAllHistoryPages(camunda, m, String(aik), eik);
         } catch { turns = []; }
         if (turns.length) break;
       }
     }
   }
   return turns;
+}
+
+// Return the embedded instance history ONLY when it is provably scoped to `eik`:
+//   • the instance is associated with exactly THIS element (single-element instance),
+//     so its embedded turns cannot belong to a sibling; OR
+//   • the turns are element-tagged — keep strictly the `elementInstanceKey === eik`
+//     ones and drop the rest.
+// A multi-element instance whose turns carry NO `elementInstanceKey` is unverifiable,
+// so return [] and let the caller fetch the element-filtered history instead.
+function scopeEmbeddedHistoryToElement(match, eik) {
+  const embedded = normalizeHistory(match);
+  if (!embedded.length) return [];
+  const keys = instanceElementKeys(match);
+  if (keys.length === 1 && keys[0] === eik) return embedded;
+  if (embedded.some((t) => t.elementInstanceKey != null)) {
+    return embedded.filter((t) => t.elementInstanceKey != null && String(t.elementInstanceKey) === eik);
+  }
+  return [];
+}
+
+// Follow the SDK's forward cursor (`page.endCursor`, replayed as the request's
+// `page.after`) until the history is exhausted, aggregating every page. Consuming
+// only the first page truncates a long transcript — defeating the tail/continuation
+// guarantee — so pull them all. Bounded by MAX_HISTORY_PAGES and a strict
+// no-progress/endCursor-repeat break so a mispaginating surface can never loop
+// forever. Surfaces that return a bare array (or no `page`) yield a single page.
+async function fetchAllHistoryPages(camunda, method, aik, eik) {
+  const all = [];
+  let after;
+  const seenCursors = new Set();
+  for (let i = 0; i < MAX_HISTORY_PAGES; i++) {
+    const query = { agentInstanceKey: aik, filter: { elementInstanceKey: eik } };
+    if (after) query.page = { after };
+    const res = await camunda[method](query, READ_CONSISTENCY);
+    const page = normalizeHistory(res);
+    if (page.length) all.push(...page);
+    const next = isPlainObject(res) && isPlainObject(res.page) ? res.page.endCursor : null;
+    // Stop when there is no next cursor, it did not advance, or the page was empty:
+    // any of these means there is nothing more to pull (or the surface is not
+    // cursor-paginated at all).
+    if (!isNonBlank(next) || seenCursors.has(next) || !page.length) break;
+    seenCursors.add(next);
+    after = next;
+  }
+  return all;
 }
 
 /**
@@ -437,15 +498,42 @@ export function seedResumeEnvelope(envelope, transcriptText) {
   return { ...envelope, task: { ...envelope.task, prompt: seeded } };
 }
 
-// Does this envelope declare a repository branch the prior run would have PUSHED, so
-// committed work is durably recoverable from it? A repo-less job (no `repository.url`)
-// or one with `branch.push === false` leaves the throwaway workspace as the only copy —
-// the recovery preamble must then NOT promise a pushed branch to check out. (A push that
-// was *rejected* at runtime is not knowable here; the declared intent is the best signal
-// available at seed time.)
+// Does this envelope declare a repository branch the prior run would have PUSHED *and*
+// that the NEXT activation will re-check-out WITH its prior commits, so committed work
+// is durably recoverable from it? This is deliberately NARROW, matching what
+// `provisionRepo` actually does — an over-broad "true" tells the resumed agent to check
+// out a branch that will not be provisioned, so it can repeat already-committed work:
+//   • a repo-less job (no `repository.url`) or `branch.push === false` never pushes;
+//   • an explicit `branch.create` makes provisionRepo `git checkout -B <create>` from
+//     the freshly cloned base/ref HEAD — it does NOT fetch an existing remote
+//     `<create>`, so prior commits are absent on reactivation;
+//   • a base-like `repository.ref` (equal to `baseRef`/`branch.base`) with no stable
+//     branch gets a FRESH per-runId `nano/agent-work/<base>-<runId>` fallback;
+//   • a raw commit SHA ref detaches HEAD — there is no branch at all;
+//   • a rejected push (unknowable here) leaves nothing.
+// Only a `repository.ref` naming a NON-base branch is re-cloned WITH its prior commits
+// and pushed back to the same ref, so ONLY that case promises branch recovery; every
+// other case degrades to a transcript-only continuation. (A ref that is really a TAG
+// cannot be told from a branch by name at seed time — an accepted residual: the seeded
+// text is advisory, and the declared intent is the best signal available here.)
 function envelopeHasPushedBranch(envelope) {
   const repo = envelope?.repository;
-  return isPlainObject(repo) && isNonBlank(repo.url) && envelope?.branch?.push !== false;
+  if (!isPlainObject(repo) || !isNonBlank(repo.url)) return false;
+  if (envelope?.branch?.push === false) return false;
+  if (isNonBlank(envelope?.branch?.create)) return false;
+  const ref = repo.ref;
+  if (!isNonBlank(ref) || isLikelyCommitSha(ref)) return false;
+  const base = isNonBlank(repo.baseRef) ? String(repo.baseRef)
+    : (isNonBlank(envelope?.branch?.base) ? String(envelope.branch.base) : '');
+  if (base && String(ref) === base) return false;
+  return true;
+}
+
+// A `repository.ref` that is a raw commit SHA (hex, 7–40 chars) detaches HEAD in
+// `provisionRepo` — no branch, so no branch-recovery. Mirrors provisionRepo's own SHA
+// validation.
+function isLikelyCommitSha(ref) {
+  return typeof ref === 'string' && /^[0-9a-f]{7,40}$/i.test(ref.trim());
 }
 
 /** Is engine-transcript resume disabled by the kill switch (`NANO_AGENT_RESUME=off`)? */

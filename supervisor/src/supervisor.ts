@@ -86,6 +86,14 @@ export interface SupervisorDeps {
   readonly logger?: Logger;
   /** When set, this worker's serviceable types are rewritten from each reconcile. */
   readonly autoWorkerId?: string;
+  /**
+   * Explicit `--job-type` extras that must ALWAYS be served in addition to the
+   * engine-read auto set. Unioned into every reconcile's `setTypes` write so they
+   * survive the reconcile that replaces the worker's set with the scan result
+   * (otherwise an explicit subscription silently stops being served after the
+   * first successful reconcile).
+   */
+  readonly autoExtraTypes?: ReadonlyArray<string>;
   /** When set, the whole runtime executes inside this agentic connection's scope. */
   readonly agenticEndpoint?: AgenticEndpoint;
   readonly agenticConfig?: AgenticConfig;
@@ -181,7 +189,12 @@ export const makeSupervisor = (deps: SupervisorDeps): Effect.Effect<Supervisor> 
         Ref.set(cacheRef, res.cache).pipe(
           Effect.flatMap(() =>
             deps.autoWorkerId
-              ? deps.registry.setTypes(deps.autoWorkerId, res.cache.jobTypes)
+              ? deps.registry.setTypes(
+                  deps.autoWorkerId,
+                  deps.autoExtraTypes && deps.autoExtraTypes.length > 0
+                    ? Array.from(new Set([...res.cache.jobTypes, ...deps.autoExtraTypes]))
+                    : res.cache.jobTypes,
+                )
               : Effect.void,
           ),
         ),

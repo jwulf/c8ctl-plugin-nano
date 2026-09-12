@@ -803,17 +803,24 @@ config is neutralized (`GIT_CONFIG_GLOBAL` → the platform null device,
 or `url.*.insteadOf` can't silently inject operator credentials. (An **SSH**
 remote — `git@…`/`ssh://…` — can still authenticate via the host's SSH
 agent/config; use HTTPS URLs if you need a guaranteed-anonymous clone.)
-Token-backed jobs keep global config (e.g. `http.proxy`). A push failure is
-reported as `pushError` (the job still completes) so a later BPMN step can drive
-the merge; a clone/checkout failure sheds the job (retryable). Workspaces are
+Token-backed jobs keep global config (e.g. `http.proxy`). **`pushFailed` is the
+authoritative "work is stranded, workspace preserved" flag** (the job still
+completes, so a later BPMN step can drive the merge); a clone/checkout failure
+sheds the job (retryable). `pushError` is present **only** for a push that was
+ATTEMPTED and rejected/unconfirmed — when `finalizeGit` refuses to push at all (a
+branch mismatch, or a partial/incomplete commit scan), it sets `pushFailed`
+(with `branchMismatch` or `scanError`) but **no** `pushError`, so consumers must
+key recovery off `pushFailed`, not `pushError`. Workspaces are
 deleted after each job (keep them with `--keep-runs`) — **except** a job whose
 `git push` **could not be confirmed as landed** (a non-fast-forward rejection, or
 an auth/hook/network error whose `ls-remote` re-check did not find `origin/<branch>`
-at or ahead of `headSha`), **or** one where `finalizeGit` refused to push because
-HEAD moved off the provisioned work branch — or left commits on another local
-branch or an abandoned detached HEAD reachable only via the reflog (a
-`branchMismatch` strand — no `git
-push` ran), whose workspace is preserved best-effort so its
+at or ahead of `headSha` — `pushFailed` + `pushError`), **or** one where
+`finalizeGit` refused to push (no `git push` ran, so `pushError` is absent)
+because HEAD moved off the provisioned work branch — or left commits on another
+local branch or an abandoned detached HEAD reachable only via the reflog (a
+`branchMismatch` strand) — **or** because a critical local commit scan did not
+complete (a `scanError` strand, with a best-effort PARTIAL `strandedCommits`),
+whose workspace is preserved best-effort so its
 `strandedCommits` stay recoverable; that preservation is still age-gated by the
 reaper and cleared on worker shutdown, so recover the SHAs promptly.
 

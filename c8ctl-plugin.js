@@ -4248,18 +4248,42 @@ function provisionRepo({ envelope, token, runDir, runId, timeoutMs = 120_000, lo
   // ref so the harness can compute `git diff origin/<base>...HEAD`. Best-effort:
   // a failed base fetch is recorded, not fatal (the head clone still succeeded).
   //
-  // Snapshot the SHA of the ref that base fetch is ABOUT to update, BEFORE it runs
-  // (suppressed advisory 4433): a baseRef fetch maps refs/heads/<baseRef> onto
-  // refs/remotes/origin/<baseRef> and fast-forwards it if the base advanced since
-  // clone, so reading that remote-tracking ref AFTER the fetch (where `baseCloneSha`
-  // is captured below) would record the already-advanced tip and make finalizeGit's
-  // pre-push staleness check under-count a real base advance. Best-effort — null
-  // when the ref is absent (a single-branch clone of a different ref the fetch will
-  // CREATE, which has no genuine clone-time value anyway).
-  let baseRefCloneSha = null;
-  if (repo.baseRef && !String(repo.baseRef).startsWith('-')) {
-    const br0 = runGit(['rev-parse', '--verify', '--quiet', `refs/remotes/origin/${repo.baseRef}`], { cwd: workspaceDir, env: gitEnv });
-    baseRefCloneSha = br0.status === 0 ? ((br0.stdout || '').trim() || null) : null;
+  // Snapshot the CONFIGURED base's clone-time tip BEFORE the optional base fetch
+  // below, so finalizeGit's pre-push base-advanced staleness check anchors on a
+  // genuine clone-time baseline. The explicitly-configured base is `branch.base`
+  // (or `repository.baseRef`); anything else `effectiveBase` (below) resolves to is
+  // the ref the CLONE itself landed on, whose `origin/<base>` is present locally and
+  // read directly there. This pre-fetch snapshot guards two hazards:
+  //   * a baseRef fetch fast-forwards refs/remotes/origin/<baseRef>, so reading that
+  //     remote-tracking ref AFTER the fetch records the already-advanced tip and
+  //     under-counts a real base advance (suppressed advisory 4433); and
+  //   * a single-branch clone of a DIFFERENT ref has NO local origin/<base>, so the
+  //     baseline must come from the remote — and taking that `ls-remote` AFTER the
+  //     fetch lets a base advance in the fetch→query window slip into the baseline
+  //     (TOCTOU under-count). Doing it PRE-fetch pins the true clone-time tip.
+  // Capture the LOCAL remote-tracking tip when present (full clone, cheap, no
+  // network); else query the remote ONCE, pre-fetch. A BRANCH base yields a SHA (the
+  // baseline finalizeGit measures against); a TAG/absent base yields empty (tags are
+  // immutable → the staleness skip is correct); a failed remote query leaves the
+  // baseline UNKNOWN so finalizeGit reports it explicitly rather than silently
+  // skipping (covers an explicit `branch.base` single-branch clone too, not only
+  // `repository.baseRef`).
+  const configuredBase = envelope.branch?.base
+    || (repo.baseRef && !String(repo.baseRef).startsWith('-') ? String(repo.baseRef) : '');
+  let baseCloneSnapshot = null;    // pre-fetch clone-time baseline SHA (null ⇒ none)
+  let baseSnapshotUnknown = false; // remote query failed ⇒ baseline cannot be confirmed
+  if (configuredBase && !String(configuredBase).startsWith('-')) {
+    const local = runGit(['rev-parse', '--verify', '--quiet', `refs/remotes/origin/${configuredBase}`], { cwd: workspaceDir, env: gitEnv });
+    if (local.status === 0 && (local.stdout || '').trim()) {
+      baseCloneSnapshot = (local.stdout || '').trim();
+    } else {
+      const ls = runGit([...credArgs(), 'ls-remote', '--heads', '--end-of-options', 'origin', `refs/heads/${configuredBase}`], { cwd: workspaceDir, env: gitEnv, timeoutMs: effectiveTimeoutMs });
+      if (ls.status === 0) {
+        baseCloneSnapshot = ((ls.stdout || '').trim().split(/\s+/)[0] || '') || null; // branch → baseline; empty → tag/absent (skip)
+      } else {
+        baseSnapshotUnknown = true; // network failure — cannot confirm branch vs tag
+      }
+    }
   }
   let base = '';
   let baseFetchError;
@@ -4580,44 +4604,26 @@ function provisionRepo({ envelope, token, runDir, runId, timeoutMs = 120_000, lo
   // single-branch clone of a different ref), in which case finalizeGit anchors on
   // the clone-time HEAD instead.
   let baseCloneSha = null;
-  // Advisory #3: for a single-branch clone of a DIFFERENT ref whose base is a
-  // BRANCH, origin/<base> is absent at clone so `baseCloneSha` would be null and
-  // finalizeGit would SILENTLY skip the base-advanced staleness check. When we could
-  // not capture a genuine pre-harness baseline for a base that MIGHT be a branch,
-  // flag it so finalizeGit emits an EXPLICIT unknown-count diagnostic instead of the
-  // (tag-base) silent skip. Stays false for a captured baseline or a confirmed
-  // tag/absent base (tags are immutable — the silent skip is correct there).
+  // When we could not capture a genuine pre-harness baseline for a base that MIGHT
+  // be a branch, flag it so finalizeGit emits an EXPLICIT unknown-count diagnostic
+  // instead of the (tag-base) silent skip. Stays false for a captured baseline or a
+  // confirmed tag/absent base (tags are immutable — the silent skip is correct).
   let baseBaselineUnknown = false;
   if (effectiveBase && !effectiveBase.startsWith('-')) {
-    // Prefer the pre-fetch snapshot when the optional base fetch above targeted
-    // THIS ref: re-reading refs/remotes/origin/<effectiveBase> now would return the
-    // tip that fetch fast-forwarded to, not the clone-time value (suppressed 4433).
-    if (baseRefCloneSha !== null && String(repo.baseRef || '') === effectiveBase) {
-      baseCloneSha = baseRefCloneSha;
-    } else if (baseRefCloneSha === null && String(repo.baseRef || '') === effectiveBase) {
-      // The optional base fetch above TARGETED effectiveBase, but the remote-tracking
-      // ref was ABSENT at clone time (baseRefCloneSha null) — e.g. a single-branch
-      // clone of a DIFFERENT ref that the fetch then CREATED. Re-reading
-      // origin/<effectiveBase> now would record the POST-fetch tip as if it were the
-      // clone-time snapshot, silently dropping any base commits that landed during
-      // the clone/base-fetch window from finalizeGit's baseAdvanced count. There is
-      // no genuine clone-time value in the local ref, so instead snapshot the base
-      // tip DIRECTLY from the remote, PRE-HARNESS, with a fresh `ls-remote` query
-      // (advisory #3: singleBranch base-advanced staleness silently skipped). The
-      // `refs/heads/<base>` query naturally distinguishes a BRANCH base (returns a
-      // SHA → capture it as the clone-time baseline finalizeGit measures against)
-      // from a TAG/absent base (empty → keep the tag-base skip; a tag cannot
-      // advance). A network failure leaves us unable to tell, so mark the baseline
-      // unknown so finalizeGit reports it explicitly rather than skipping silently.
-      const lsBase = runGit([...credArgs(), 'ls-remote', '--heads', '--end-of-options', 'origin', `refs/heads/${effectiveBase}`], { cwd: workspaceDir, env: gitEnv, timeoutMs: effectiveTimeoutMs });
-      if (lsBase.status === 0) {
-        const tip = ((lsBase.stdout || '').trim().split(/\s+/)[0] || '');
-        baseCloneSha = tip || null; // branch → baseline; empty → tag/absent (skip)
-      } else {
-        baseCloneSha = null;
-        baseBaselineUnknown = true; // network failure — cannot confirm branch vs tag
-      }
+    if (configuredBase && effectiveBase === configuredBase) {
+      // effectiveBase is the EXPLICITLY-configured base (`branch.base`/`baseRef`).
+      // Use the PRE-FETCH snapshot captured above — NEVER a post-fetch or
+      // post-harness tip (advisories 4433 / TOCTOU / singleBranch silent skip). A
+      // branch base carries a baseline SHA; a tag/absent base carries null (correct
+      // silent skip); a failed remote query marks the baseline unknown so finalizeGit
+      // says so explicitly. This now covers an explicit `branch.base` single-branch
+      // clone too, not only `repository.baseRef`.
+      baseCloneSha = baseCloneSnapshot;
+      baseBaselineUnknown = baseSnapshotUnknown;
     } else {
+      // effectiveBase is the ref the CLONE itself landed on (no explicit
+      // branch.base/baseRef) — its origin/<base> is present locally, so read the
+      // clone-time tip directly.
       const br = runGit(['rev-parse', '--verify', '--quiet', `refs/remotes/origin/${effectiveBase}`], { cwd: workspaceDir, env: gitEnv });
       baseCloneSha = br.status === 0 ? ((br.stdout || '').trim() || null) : null;
     }
@@ -4754,6 +4760,21 @@ function postAgentAttribution({ workspaceDir, token, number, agentName = AGENT_A
 // #231): the cleanup boundary calls this instead of inlining the predicate.
 function shouldPreserveRunDir(gitResult) {
   return !!gitResult?.pushFailed;
+}
+
+// Decide the agentic/transcript relay's close reason (normal / job-killed / error)
+// for a finished job. Pure + exported so the close-reason contract is unit-tested
+// without spinning a full worker job. `error` must cover ANY hard finalization
+// failure: a killed run (`job-killed` takes precedence), a run that did not
+// complete, a failed harness result, OR a stranded-work finalize — the latter is
+// keyed off `pushFailed`, NOT `pushError`, because the branch-mismatch and
+// incomplete-scan paths set `pushFailed` (with `branchMismatch`/`scanError`)
+// WITHOUT attempting a push, so `pushError` is absent yet the work is preserved and
+// the loud error is logged (#229 relay close-reason).
+function computeRelayCloseReason(result, runCompleted, gitResult) {
+  if (result?.aborted) return 'job-killed';
+  if (!runCompleted || (result && result.ok === false) || gitResult?.pushFailed || gitResult?.pushError) return 'error';
+  return 'normal';
 }
 
 // After the harness runs: enumerate new commits, push the branch (when
@@ -9318,11 +9339,12 @@ async function workAgent(req, flags) {
           // subscription so it never outlives the job or leaks a steer listener
           // across jobs. Bounded internally — a hub outage never wedges completion.
           // #229: pass a close reason (normal / job-killed / error) so the relay's
-          // close log distinguishes a clean end from a killed/errored run.
+          // close log distinguishes a clean end from a killed/errored run. The error
+          // reason is keyed off `pushFailed` (not `pushError`) so a branch-mismatch /
+          // incomplete-scan finalize — which strands work + preserves the workspace
+          // but attempts NO push — still closes as `error`. See computeRelayCloseReason.
           if (relaySession) {
-            const relayCloseReason = result?.aborted
-              ? 'job-killed'
-              : (!runCompleted || (result && result.ok === false) || gitResult?.pushError ? 'error' : 'normal');
+            const relayCloseReason = computeRelayCloseReason(result, runCompleted, gitResult);
             try { await relaySession.close(relayCloseReason); } catch { /* best effort */ }
           }
         }
@@ -14897,6 +14919,7 @@ export {
   finalizeGit,
   sanitizeBranchSegment,
   shouldPreserveRunDir,
+  computeRelayCloseReason,
   describeGitFailure,
   boundGitOutput,
   reconcileAgentPr,

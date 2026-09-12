@@ -62,6 +62,7 @@ import {
   finalizeGit,
   sanitizeBranchSegment,
   shouldPreserveRunDir,
+  computeRelayCloseReason,
   describeGitFailure,
   boundGitOutput,
   reconcileAgentPr,
@@ -2016,6 +2017,24 @@ test('shouldPreserveRunDir preserves the run dir only when a push FAILED (issue 
   assert.equal(shouldPreserveRunDir(undefined), false, 'undefined git result ⇒ no preserve');
 });
 
+test('computeRelayCloseReason closes as error on ANY hard finalize failure, keyed off pushFailed not pushError (Copilot advisory: relay close-reason)', () => {
+  // A clean run closes normal.
+  assert.equal(computeRelayCloseReason({ ok: true, aborted: false }, true, { pushed: true }), 'normal');
+  assert.equal(computeRelayCloseReason({ ok: true }, true, null), 'normal');
+  // A killed run takes precedence over everything.
+  assert.equal(computeRelayCloseReason({ aborted: true, ok: false }, false, { pushFailed: true }), 'job-killed');
+  // A failed harness / incomplete run closes error.
+  assert.equal(computeRelayCloseReason({ ok: false }, true, null), 'error', 'failed harness result ⇒ error');
+  assert.equal(computeRelayCloseReason({ ok: true }, false, null), 'error', 'run did not complete ⇒ error');
+  // An ATTEMPTED-and-rejected push (pushError present) closes error.
+  assert.equal(computeRelayCloseReason({ ok: true }, true, { pushFailed: true, pushError: '! [rejected] (non-fast-forward)' }), 'error');
+  // The regression the advisory targets: a branch-mismatch / incomplete-scan finalize
+  // sets pushFailed WITHOUT pushError (no push was attempted) — it MUST still close
+  // as error, not normal.
+  assert.equal(computeRelayCloseReason({ ok: true }, true, { pushFailed: true, branchMismatch: { expected: 'feat/x', actual: 'main' } }), 'error', 'branch-mismatch strand (no pushError) ⇒ error');
+  assert.equal(computeRelayCloseReason({ ok: true }, true, { pushFailed: true, scanError: 'rev-list ... exited 128' }), 'error', 'incomplete-scan strand (no pushError) ⇒ error');
+});
+
 test('provisionRepo mints the fallback branch from the run UUID, not the run-dir basename (cross-worker collision safety, issue #231)', { skip: !gitOk }, () => {
   const { root, origin } = makeOriginRepo();
   const runDir = mkdtempSync(join(root, 'run-'));
@@ -2276,6 +2295,104 @@ test('finalizeGit detects a base advance for a singleBranch clone whose BRANCH b
       warnings.some((m) => /remote base 'main' advanced 1 commit\(s\) since clone/.test(m) && /\[job 1 eik 2 pik 3\]/.test(m)),
       'emits the correlated base-advanced staleness warning instead of silently skipping',
     );
+  } finally {
+    rmSync(root, { recursive: true, force: true });
+  }
+});
+
+test('finalizeGit detects a base advance for a singleBranch clone whose base is an explicit branch.base with NO repository.baseRef (Copilot advisory: branch.base staleness gap)', { skip: !gitOk }, () => {
+  const { root, origin } = makeOriginRepo();
+  // Publish feat/x so we can single-branch clone it (origin/main ABSENT at clone).
+  const wc = mkdtempSync(join(root, 'wc-'));
+  g(['clone', '-q', origin, wc], undefined);
+  g(['checkout', '-q', '-b', 'feat/x'], wc);
+  writeFileSync(join(wc, 'feature.txt'), 'feature\n');
+  g(['add', '-A'], wc);
+  g(['-c', 'user.name=seed', '-c', 'user.email=seed@example.com', 'commit', '-aqm', 'feature'], wc);
+  g(['push', '-q', 'origin', 'feat/x'], wc);
+  const runDir = mkdtempSync(join(root, 'run-'));
+  try {
+    // The gap: `branch.base=main` is the base, but there is NO `repository.baseRef`,
+    // so provisionRepo runs no base fetch and origin/main is absent at clone —
+    // baseCloneSha would be null and finalize would take the tag/absent SILENT skip.
+    // The fix captures a pre-harness ls-remote baseline for an explicit branch.base
+    // too (not only repository.baseRef), so a base advance during the run is detected.
+    const envelope = {
+      schemaVersion: 1,
+      repository: { provider: 'github', url: origin, ref: 'feat/x', singleBranch: true, submodules: false },
+      branch: { base: 'main', create: 'feat/x', push: true },
+      setup: { commands: [], env: {}, secretRefs: [] },
+      task: { allowPr: false },
+    };
+    const prov = provisionRepo({ envelope, token: null, runDir });
+    let originMainPresent = true;
+    try { g(['rev-parse', '--verify', '--quiet', 'refs/remotes/origin/main'], prov.workspaceDir); } catch { originMainPresent = false; }
+    assert.equal(originMainPresent, false, 'origin/main is absent at clone (single-branch clone of feat/x)');
+    assert.match(prov.baseCloneSha || '', /^[0-9a-f]{40}$/, 'a pre-harness base baseline was captured for the explicit branch.base');
+    // The remote base (main) advances during the run.
+    advanceOrigin(root, origin, 'main');
+    writeFileSync(join(prov.workspaceDir, 'work.txt'), 'work\n');
+    g(['add', '-A'], prov.workspaceDir);
+    g(['-c', 'user.name=nano', '-c', 'user.email=nano@example.com', 'commit', '-q', '-m', 'agent work'], prov.workspaceDir);
+
+    const warnings = [];
+    const out = finalizeGit({
+      workspaceDir: prov.workspaceDir,
+      gitEnv: prov.gitEnv,
+      startSha: prov.startSha,
+      workingBranch: prov.workingBranch,
+      baseBranch: prov.baseBranch,
+      baseCloneSha: prov.baseCloneSha,
+      baseBaselineUnknown: prov.baseBaselineUnknown,
+      hasPrBranch: prov.hasPrBranch,
+      provisioned: true,
+      envelope,
+      token: null,
+      logger: { warn: (m) => warnings.push(m), error: () => {}, info: () => {}, debug: () => {} },
+      corr: 'job 7 eik 8 pik 9',
+    });
+    assert.equal(out.baseAdvanced, 1, 'the pre-harness branch.base baseline lets finalize detect the base advance');
+    assert.ok(
+      warnings.some((m) => /remote base 'main' advanced 1 commit\(s\) since clone/.test(m)),
+      'emits the base-advanced staleness warning instead of silently skipping',
+    );
+  } finally {
+    rmSync(root, { recursive: true, force: true });
+  }
+});
+
+test('provisionRepo captures the clone-time base baseline (pre-fetch tip), not a post-fetch advanced tip (Copilot advisory: ls-remote before optional base fetch / TOCTOU)', { skip: !gitOk }, () => {
+  const { root, origin } = makeOriginRepo();
+  // Publish feat/x so we single-branch clone it (origin/main absent at clone; the
+  // baseRef=main path runs the optional base fetch).
+  const wc = mkdtempSync(join(root, 'wc-'));
+  g(['clone', '-q', origin, wc], undefined);
+  g(['checkout', '-q', '-b', 'feat/x'], wc);
+  writeFileSync(join(wc, 'feature.txt'), 'feature\n');
+  g(['add', '-A'], wc);
+  g(['-c', 'user.name=seed', '-c', 'user.email=seed@example.com', 'commit', '-aqm', 'feature'], wc);
+  g(['push', '-q', 'origin', 'feat/x'], wc);
+  const runDir = mkdtempSync(join(root, 'run-'));
+  try {
+    // Snapshot the true clone-time base tip (what a pre-fetch ls-remote must record).
+    const cloneTimeBase = g(['ls-remote', '--heads', origin, 'refs/heads/main'], undefined).split(/\s+/)[0];
+    assert.match(cloneTimeBase, /^[0-9a-f]{40}$/);
+    const envelope = {
+      schemaVersion: 1,
+      repository: { provider: 'github', url: origin, ref: 'feat/x', singleBranch: true, baseRef: 'main', submodules: false },
+      branch: { base: 'main', create: 'feat/x', push: true },
+      setup: { commands: [], env: {}, secretRefs: [] },
+      task: { allowPr: false },
+    };
+    const prov = provisionRepo({ envelope, token: null, runDir });
+    // The baseline must be the pre-fetch clone-time tip. If the ls-remote ran AFTER
+    // the optional base fetch and the remote had advanced, this would drift.
+    assert.equal(prov.baseCloneSha, cloneTimeBase, 'baseCloneSha is the clone-time (pre-fetch) base tip');
+    // A subsequent advance is measured relative to that pinned clone-time baseline.
+    advanceOrigin(root, origin, 'main');
+    const afterAdvance = g(['ls-remote', '--heads', origin, 'refs/heads/main'], undefined).split(/\s+/)[0];
+    assert.notEqual(afterAdvance, cloneTimeBase, 'origin/main really advanced');
+    assert.equal(prov.baseCloneSha, cloneTimeBase, 'the pinned baseline is unaffected by the later advance');
   } finally {
     rmSync(root, { recursive: true, force: true });
   }

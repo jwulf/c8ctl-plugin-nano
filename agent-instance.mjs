@@ -147,12 +147,15 @@ async function callWithin(promise, timeoutMs, setTimer = setTimeout) {
 // response can't overwhelm the per-worker log (matches supervisor-engine.mjs).
 const SDK_ERROR_BODY_MAX = 500;
 
-// Fold newlines into a visible inline marker and cap length so a diagnostic stays ONE
+// Fold line breaks into a visible inline marker and cap length so a diagnostic stays ONE
 // correlatable, volume-bounded log line: a multiline SDK body/message would otherwise
 // split the worker log across lines (breaking correlation), and an over-long message
 // that embeds a large body would bypass the body cap and flood the log (issue #230).
+// Cover the SAME line-separator set as `oneLine` (CR/LF plus U+0085/U+2028/U+2029) so a
+// Unicode line separator in an engine body/message can't slip past the guard and split
+// the correlation record.
 function normalizeSdkText(value, max) {
-  let s = String(value).replace(/[\r\n]+/g, ' ⏎ ');
+  let s = String(value).replace(/[\r\n\u0085\u2028\u2029]+/g, ' ⏎ ');
   if (s.length > max) s = `${s.slice(0, max)}… (${s.length} chars)`;
   return s;
 }
@@ -207,7 +210,7 @@ export function describeSdkError(err) {
 export function leaseTokenLabel(leaseToken) {
   if (!isNonBlank(leaseToken)) return 'ABSENT';
   const s = String(leaseToken);
-  return s.length > 4 ? `present(…${s.slice(-4)})` : 'present(short)';
+  return s.length > 4 ? `present(…${oneLine(s.slice(-4))})` : 'present(short)';
 }
 
 /**
@@ -722,6 +725,8 @@ export function createAgentInstanceProducer(opts = {}) {
         logger?.debug?.(
           `AgentInstance producer: createAgentInstance failed late for a retired ` +
             `attempt (attempt ${attempt}) — status=${d.status ?? 'n/a'} message=${d.message} ` +
+            `body=${d.body ?? 'n/a'} jobLease=${leaseTokenLabel(leaseToken)} ` +
+            `model=${oneLine(def.model)} provider=${oneLine(def.provider)} ` +
             `${correlation()}; result dropped (no retry — key/finalization already latched).`,
         );
         return false;
@@ -1192,6 +1197,19 @@ export function createAgentInstanceProducer(opts = {}) {
             `is not observed here, so MANUAL RECONCILIATION may be required if the drain ` +
             `never catches up ${correlation()}.`,
         );
+        // Emit the turn counter on this path too (issue #229/#232): the aggregate
+        // append timeout is the hardest transcript failure to diagnose, so record how
+        // many turns were appended SO FAR — the count is "so far / drain still pending"
+        // here because the serialized appends have not been observed to settle.
+        {
+          const elapsedMs = activatedAt ? Math.max(0, now() - activatedAt) : 0;
+          const mins = (elapsedMs / 60000).toFixed(1);
+          logger?.info?.(
+            `AgentInstance ${agentInstanceKey} (${corr()}): ${appendedTurns} turn(s) appended ` +
+              `so far over ${mins}m (drain still pending — count unobserved), ` +
+              `terminal COMPLETED update serialized behind pending appends.`,
+          );
+        }
         return;
       }
       let completedOk = false;

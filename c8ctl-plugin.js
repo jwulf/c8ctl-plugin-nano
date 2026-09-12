@@ -3220,7 +3220,13 @@ function scanAgentTaskLeaves(xml, scanTaskDefinitions) {
   const externalIds = externalAgentElementIds(src);
   const optedOutIds = autoSubscribeOptOutElementIds(src);
   return scanTaskDefinitions(src)
-    .filter((leaf) => leaf.external === true || externalIds.has(leaf.elementId))
+    // A package-supplied boolean `leaf.external` is AUTHORITATIVE: `false` is not
+    // the same as absent — it explicitly classifies the leaf as non-external, so
+    // it must exclude the leaf even when the local marker scan sees the marker.
+    // Fall back to the local `externalAgentElementIds` scan ONLY when the package
+    // does not supply a boolean flag.
+    .filter((leaf) =>
+      typeof leaf.external === 'boolean' ? leaf.external : externalIds.has(leaf.elementId))
     .filter((leaf) => !optedOutIds.has(leaf.elementId))
     .map((leaf) => ({ taskType: leaf.taskType, process: leaf.process }));
 }
@@ -8635,9 +8641,11 @@ async function workAgent(req, flags) {
   // no capability, no app enrol endpoint, no channel connection. It is the
   // mutually-exclusive counterpart to capability-resolved SERVE: in `--auto`
   // the rank×capability matrix is bypassed entirely (any deployed agent job is
-  // served, gated only by the leaf's canonical `agentic` flag — the
-  // `linkName="prompt"` linked-resource marker read by
-  // `@nanobpm/agentic`'s demand scanner), and the
+  // served, gated only by the leaf's canonical external-agent marker —
+  // `<zeebe:agentDefinition agentType="external">` (issue #235), preferring a
+  // package-supplied boolean `leaf.external` flag and falling back to a local
+  // scan, minus any leaf that opts out via
+  // `io.nanobpm.agentTask.autoSubscribe="false"`), and the
   // desired set is reconciled by polling the engine rather than watching the
   // profile. `--auto-scope <process-id|prefix>` narrows the blast radius to one
   // app/network; without it, every agent job type on the engine is served.

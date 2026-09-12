@@ -146,6 +146,20 @@ test('scanAgentTaskLeaves honours a package-supplied leaf.external flag', () => 
   );
 });
 
+// Regression (PR #242 review): a package-supplied `leaf.external === false` is
+// AUTHORITATIVE — it must exclude the leaf even when the local XML scan sees the
+// external marker, so an explicit non-external classification is not overridden
+// by the fallback.
+test('scanAgentTaskLeaves treats leaf.external=false as authoritative over a local marker', () => {
+  // Local XML carries the external marker for element `a`...
+  const xml = model('feature', [{ id: 'a', type: 'senior:a', external: true }]);
+  // ...but the package classifies `a` as explicitly non-external.
+  const fakeScan = () => [
+    { elementId: 'a', taskType: 'senior:a', process: 'feature', external: false },
+  ];
+  assert.deepEqual(scanAgentTaskLeaves(xml, fakeScan), []);
+});
+
 test('serviceTaskIsExternalAgent matches only agentType="external"', () => {
   assert.equal(serviceTaskIsExternalAgent('<zeebe:agentDefinition agentType="external" />'), true);
   assert.equal(serviceTaskIsExternalAgent("<zeebe:agentDefinition agentType='external'/>"), true);

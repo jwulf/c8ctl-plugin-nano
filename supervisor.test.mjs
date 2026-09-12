@@ -9,6 +9,9 @@ import assert from 'node:assert/strict';
 
 import {
   reconstructWorkArgs,
+  resolveConnectionProfile,
+  explicitConnectionProfile,
+  withConnectionProfileArg,
   supervisorWorkerId,
   autoWorkerName,
   sanitizeNameToken,
@@ -107,6 +110,65 @@ test('WORK_FORWARD_FLAGS never includes non-work flags like port or worker', () 
   assert.ok(!('port' in WORK_FORWARD_FLAGS));
   assert.ok(!('worker' in WORK_FORWARD_FLAGS));
   assert.ok(!('attach' in WORK_FORWARD_FLAGS));
+});
+
+// --- connection profile (--profile) resolution & forwarding ----------------
+// jwulf/c8ctl-plugin-nano#189: `work`/`supervisor` must honour c8ctl's global
+// `--profile <name>` (delivered on the handler ctx as `ctx.profile`) instead of
+// always connecting to the active session profile.
+
+test('resolveConnectionProfile returns the ctx profile, trimmed', () => {
+  assert.equal(resolveConnectionProfile({ profile: 'nano-validate' }), 'nano-validate');
+  assert.equal(resolveConnectionProfile({ profile: '  spaced  ' }), 'spaced');
+});
+
+test('resolveConnectionProfile is undefined when ctx carries no profile', () => {
+  // undefined → createClient(undefined) resolves the active profile itself,
+  // byte-identical to the old no-arg call.
+  assert.equal(resolveConnectionProfile(undefined), undefined);
+  assert.equal(resolveConnectionProfile(null), undefined);
+  assert.equal(resolveConnectionProfile({}), undefined);
+  assert.equal(resolveConnectionProfile({ profile: '' }), undefined);
+  assert.equal(resolveConnectionProfile({ profile: '   ' }), undefined);
+  assert.equal(resolveConnectionProfile({ profile: 42 }), undefined);
+});
+
+test('explicitConnectionProfile returns only an override that differs from the active profile', () => {
+  const prev = globalThis.c8ctl;
+  try {
+    globalThis.c8ctl = { activeProfile: 'local' };
+    // A genuine per-invocation override is forwarded.
+    assert.equal(explicitConnectionProfile({ profile: 'nano-validate' }), 'nano-validate');
+    // ctx.profile merely echoing the active session profile is NOT an override —
+    // forwarding it would spuriously pin a supervised worker.
+    assert.equal(explicitConnectionProfile({ profile: 'local' }), undefined);
+    // No override present at all.
+    assert.equal(explicitConnectionProfile(undefined), undefined);
+    // No active session profile (CAMUNDA_* env user): any override is explicit.
+    globalThis.c8ctl = {};
+    assert.equal(explicitConnectionProfile({ profile: 'nano-validate' }), 'nano-validate');
+  } finally {
+    if (prev === undefined) delete globalThis.c8ctl; else globalThis.c8ctl = prev;
+  }
+});
+
+test('withConnectionProfileArg appends --profile only for an explicit override', () => {
+  const prev = globalThis.c8ctl;
+  try {
+    globalThis.c8ctl = { activeProfile: 'local' };
+    // Override differing from active → forwarded as a c8ctl global --profile
+    // token appended to the reconstructed work argv.
+    assert.deepEqual(
+      withConnectionProfileArg(['--auto'], { profile: 'nano-validate' }),
+      ['--auto', '--profile', 'nano-validate'],
+    );
+    // No override (or override == active) → the argv is returned untouched.
+    assert.deepEqual(withConnectionProfileArg(['--auto'], { profile: 'local' }), ['--auto']);
+    assert.deepEqual(withConnectionProfileArg(['--auto'], undefined), ['--auto']);
+    assert.deepEqual(withConnectionProfileArg(undefined, { profile: 'nano-validate' }), ['--profile', 'nano-validate']);
+  } finally {
+    if (prev === undefined) delete globalThis.c8ctl; else globalThis.c8ctl = prev;
+  }
 });
 
 // --- supervisorWorkerId ----------------------------------------------------

@@ -115,6 +115,44 @@ test('readPriorTranscript: an SDK with no read surface → null (legacy cold rer
   assert.equal(got, null);
 });
 
+test('readPriorTranscript: resumes off the direct searchAgentInstanceHistory surface (issue #194)', async () => {
+  // A client exposing ONLY the documented element-instance history search (no
+  // instance search/get) must still resume, not silently cold-run.
+  const camunda = {
+    searchAgentInstanceHistory: async ({ filter }) => {
+      assert.equal(filter.elementInstanceKey, '99');
+      return { history: [textTurn('ASSISTANT', 'history-search work')] };
+    },
+  };
+  const got = await readPriorTranscript({ camunda, job: { elementInstanceKey: '99' } });
+  assert.ok(got, 'resumes from the direct history-search surface');
+  assert.ok(got.text.includes('history-search work'));
+});
+
+test('readPriorTranscript: broad search with no exact element match → null (no cross-job transcript)', async () => {
+  // A broader/unfiltered search result must NOT seed this job with another
+  // element's transcript — an exact elementInstanceKey match is required.
+  const camunda = {
+    searchAgentInstances: async () => ({
+      items: [{ elementInstanceKey: 'other-1', agentInstanceKey: 'ai-x', history: [textTurn('ASSISTANT', 'someone else work')] }],
+    }),
+  };
+  const got = await readPriorTranscript({ camunda, job: { elementInstanceKey: 'mine-2' } });
+  assert.equal(got, null, 'no exact match → resume from nothing');
+});
+
+test('readPriorTranscript: a non-settling read is bounded by the deadline → null', async () => {
+  // A read that never settles must not hold the job open before the harness starts.
+  const camunda = { searchAgentInstances: () => new Promise(() => {}) };
+  const got = await readPriorTranscript({
+    camunda,
+    job: { elementInstanceKey: '1' },
+    read: () => new Promise(() => {}),
+    readTimeoutMs: 5,
+  });
+  assert.equal(got, null, 'timed-out read degrades to a cold rerun');
+});
+
 test('buildResumePrompt: preserves the original task prompt and adds continuation framing', () => {
   const p = buildResumePrompt({ basePrompt: 'Implement the widget', transcriptText: '[ASSISTANT] started it' });
   assert.ok(p.includes('RESUMING'), 'signals a resume');

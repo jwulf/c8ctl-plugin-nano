@@ -44,6 +44,30 @@ const isPlainObject = (v) => v != null && typeof v === 'object' && !Array.isArra
 // since that is where a resumed agent must continue from.
 export const RESUME_CONTEXT_CAP_CHARS = 48_000;
 
+// Bound the awaited engine read so a non-settling SDK request can NEVER hold the
+// activated job open before the harness starts (matches the producer's `callWithin`
+// bound in agent-instance.mjs, which guards this same failure mode). On timeout the
+// read degrades to `null` → the legacy cold rerun, exactly like any other read
+// failure.
+export const RESUME_READ_TIMEOUT_MS = 10_000;
+
+// Race a promise against a deadline; rejects with a tagged timeout error so the
+// best-effort caller degrades to a cold rerun rather than blocking forever. The
+// deadline timer is cleared as soon as the read settles (win or lose), so it never
+// keeps the event loop alive past the read.
+function callWithin(promise, timeoutMs, setTimer = setTimeout) {
+  if (!(timeoutMs > 0)) return Promise.resolve(promise);
+  let timer;
+  const deadline = new Promise((_resolve, reject) => {
+    timer = setTimer(() => {
+      const err = new Error(`agent resume: SDK read timed out after ${timeoutMs}ms`);
+      err.__nanoTimeout = true;
+      reject(err);
+    }, timeoutMs);
+  });
+  return Promise.race([Promise.resolve(promise), deadline]).finally(() => clearTimeout(timer));
+}
+
 // The AgentHistory roles that carry NO continuation-relevant work on their own: the
 // opening CONFIGURATION turn is just the definition/system-prompt seed (already
 // re-derived from the profile on the fresh activation), so its mere presence does
@@ -153,6 +177,13 @@ const SEARCH_METHODS = ['searchAgentInstances', 'queryAgentInstances', 'searchAg
 const GET_METHODS = ['getAgentInstance', 'getAgentInstanceByElementInstance'];
 const HISTORY_METHODS = ['getAgentInstanceHistory', 'getAgentHistory', 'searchAgentHistory'];
 
+// Direct AgentHistory search correlated on the ELEMENT instance — the read surface
+// named by issue #194. Unlike HISTORY_METHODS (which need an `agentInstanceKey`
+// resolved via a prior instance search/get), these take the `elementInstanceKey`
+// filter straight and return the history turns, so a client exposing ONLY this
+// documented surface still RESUMES instead of silently cold-running.
+const HISTORY_SEARCH_METHODS = ['searchAgentInstanceHistory', 'getAgentInstanceHistoryByElementInstance'];
+
 // Normalize a variety of list/single response shapes to an array of instance-like
 // objects (each of which may embed a `.history` array and/or an `agentInstanceKey`).
 function normalizeInstances(res) {
@@ -187,6 +218,18 @@ async function defaultRead({ camunda, elementInstanceKey }) {
   if (!isPlainObject(camunda) || !isNonBlank(elementInstanceKey)) return [];
   const eik = String(elementInstanceKey);
 
+  // 0. Direct history search by element instance (issue #194's documented read
+  // surface). A client exposing only this returns the transcript straight, with no
+  // separate instance lookup, so it never silently falls back to a cold run.
+  for (const m of HISTORY_SEARCH_METHODS) {
+    if (typeof camunda[m] !== 'function') continue;
+    let turns = [];
+    try {
+      turns = normalizeHistory(await camunda[m]({ filter: { elementInstanceKey: eik } }));
+    } catch { turns = []; }
+    if (turns.length) return turns;
+  }
+
   // 1. Search by element instance → instance record(s).
   let instances = [];
   for (const m of SEARCH_METHODS) {
@@ -208,12 +251,16 @@ async function defaultRead({ camunda, elementInstanceKey }) {
   }
   if (!instances.length) return [];
 
-  // Pick the instance for this element (the search may be broader). If several
-  // match, the last one wins — reactivations fold into the same instance, so at most
-  // one is expected, but a defensive pick keeps the newest.
-  const match =
-    instances.filter((i) => String(i.elementInstanceKey ?? '') === eik).pop() ||
-    instances[instances.length - 1];
+  // Pick the instance for THIS element. Require an EXACT elementInstanceKey match:
+  // a search surface may legitimately return a broader/unfiltered result set, and
+  // picking an arbitrary non-matching instance would seed this job with ANOTHER
+  // element's transcript (cross-job data exposure + wrong continuation). When
+  // nothing matches, resume from nothing (the caller cold-runs). Reactivations fold
+  // into the same instance, so at most one match is expected; the newest wins.
+  const match = instances
+    .filter((i) => String(i.elementInstanceKey ?? '') === eik)
+    .pop();
+  if (!match) return [];
 
   // 3. Prefer an embedded history; else fetch it by agentInstanceKey.
   let turns = normalizeHistory(match.history != null ? match : { history: match.history });
@@ -249,15 +296,26 @@ async function defaultRead({ camunda, elementInstanceKey }) {
  * @param {(args:{camunda:object,elementInstanceKey:string,job:object})=>Promise<object[]>} [opts.read]
  *        Injected read seam (defaults to the SDK probe) — the test hook.
  * @param {number} [opts.capChars] Rendered-transcript cap.
+ * @param {number} [opts.readTimeoutMs] Deadline (ms) bounding the injected read; on
+ *        timeout the read degrades to `null` (legacy cold rerun).
+ * @param {typeof setTimeout} [opts.setTimer] Timer factory (test seam).
  * @returns {Promise<{turns: object[], historyCount: number, text: string} | null>}
  */
 export async function readPriorTranscript(opts = {}) {
-  const { camunda, job, logger, read = defaultRead, capChars = RESUME_CONTEXT_CAP_CHARS } = opts;
+  const {
+    camunda,
+    job,
+    logger,
+    read = defaultRead,
+    capChars = RESUME_CONTEXT_CAP_CHARS,
+    readTimeoutMs = RESUME_READ_TIMEOUT_MS,
+    setTimer = setTimeout,
+  } = opts;
   const elementInstanceKey = job?.elementInstanceKey != null ? String(job.elementInstanceKey) : '';
   if (!isNonBlank(elementInstanceKey)) return null;
   let turns = [];
   try {
-    turns = await read({ camunda, elementInstanceKey, job });
+    turns = await callWithin(read({ camunda, elementInstanceKey, job }), readTimeoutMs, setTimer);
   } catch (err) {
     logger?.debug?.(`agent resume: prior-transcript read failed (eik ${elementInstanceKey}) — ${String(err?.message || err)}`);
     return null;

@@ -5012,7 +5012,7 @@ function finalizeGit({ workspaceDir, gitEnv, startSha, workingBranch, baseBranch
         // gained.
         {
           const ahead = runGit(['rev-list', '--count', `${beforeSha}..FETCH_HEAD`], { cwd: workspaceDir, env: gitEnv, timeoutMs: netTimeoutMs() });
-          const n = ahead.status === 0 ? parseInt((ahead.stdout || '').trim(), 10) : 0;
+          const n = ahead.status === 0 ? parseInt((ahead.stdout || '').trim(), 10) : NaN;
           if (Number.isFinite(n) && n > 0) {
             out.baseAdvanced = n;
             const shaNote = ` [base '${baseBranch}': ${beforeSha.slice(0, 12)} → ${fetchedSha ? fetchedSha.slice(0, 12) : '(unknown)'}]`;
@@ -5022,6 +5022,14 @@ function finalizeGit({ workspaceDir, gitEnv, startSha, workingBranch, baseBranch
             // distinguishable from a skipped or errored check in the logs rather than
             // leaving silence that reads as "diagnostic never ran" (advisory 4847).
             log.debug?.(`finalizeGit${corr ? ' (' + corr + ')' : ''}: remote base '${baseBranch}' unchanged since clone (0 new commit(s)) — pushing branch '${workingBranch}'`);
+          } else {
+            // The staleness count could NOT be computed — `rev-list --count` failed
+            // (timeout / incomplete graph) or returned a non-numeric result. Log it as
+            // UNKNOWN, NOT as an unchanged base: collapsing a failed probe to 0 would
+            // fabricate a clean "0 new commit(s)" and hide the exact base advance this
+            // diagnostic exists to expose, so a later non-ff push failure reads as an
+            // unchanged base (advisory 4985). Best-effort — still never fatal.
+            log.warn?.(`finalizeGit${corr ? ' (' + corr + ')' : ''}: pre-push staleness count for base '${baseBranch}' is UNKNOWN (git rev-list --count exited ${ahead.status ?? 'null'}) — cannot confirm whether the base advanced since clone; pushing branch '${workingBranch}'`);
           }
         }
       } else {

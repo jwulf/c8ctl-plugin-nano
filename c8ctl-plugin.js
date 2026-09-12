@@ -8337,6 +8337,32 @@ function localNetworkTccHint() {
 }
 
 /**
+ * #222 — setup-phase abort gate. #221 makes the dispatch heartbeat `raceFirst`
+ * interrupt the agent on a definitive lease loss, and `runAgentJob` honours that
+ * by wiring the forwarded `AbortSignal` to killTree the harness. But `workAgent`
+ * does real work BEFORE it reaches `runAgentJob` — prompt/AgentInstance setup,
+ * repository provisioning, and `relaySessionFor` (which emits `lifecycle/open`,
+ * the first transcript event). None of that setup path observes the signal, so if
+ * a lock-loss race wins DURING setup the abandoned run would still create the
+ * transcript husk (an empty `lifecycle/open`-only record) and perform repo side
+ * effects before an eventually-fenced settle. Call this at each pre-`runAgentJob`
+ * stage boundary: when the signal is already aborted it logs once and returns
+ * `true` so the caller can skip that stage's side effect and return WITHOUT
+ * settling (the lease is lost / the job is being yielded for retry). A missing or
+ * never-aborted signal is a no-op (returns `false`), leaving the normal and
+ * graceful-drain paths unchanged.
+ *
+ * @param {AbortSignal|null|undefined} abortSignal the run's interruption signal
+ * @param {{ jobType?: string, jobKey?: string|number, stage?: string, logger?: { warn?: (msg: string) => void } }} [ctx]
+ * @returns {boolean} true iff the run was aborted during setup and must stop
+ */
+function checkSetupAbort(abortSignal, { jobType, jobKey, stage, logger } = {}) {
+  if (!abortSignal || abortSignal.aborted !== true) return false;
+  logger?.warn?.(`[${jobType}] job ${jobKey} aborted during setup (${stage}) — lease loss/force-stop won the race; stopping before any side effect (no transcript husk, no repo side effects, no settle).`);
+  return true;
+}
+
+/**
  * work — turn a hire profile into live Nano job workers (one per job-type in
  * the rank×capability matrix) and poll for work in the foreground until Ctrl-C.
  * Uses the c8ctl-provided SDK client (globalThis.c8ctl.createClient()).
@@ -8983,6 +9009,12 @@ async function workAgent(req, flags) {
           }
         }
 
+        // #222: setup-abort gate (stage: prompt). If a lock-loss race already won
+        // before setup begins, stop now — before the prompt/AgentInstance fetch,
+        // repo provisioning, or the first transcript event. Return WITHOUT settling
+        // (the lease is lost / the job is being yielded), so no husk is created.
+        if (checkSetupAbort(abortSignal, { jobType, jobKey: job.jobKey, stage: 'prompt', logger })) return;
+
         // Live agent prompt (issue #63): if the job declares a `linkName: prompt`
         // linked resource, fetch its LATEST deployed content and use it as the
         // base prompt (it wins over the header-baked task.prompt). A declared
@@ -9050,6 +9082,15 @@ async function workAgent(req, flags) {
 
         const runId = randomUUID();
         if (isContainer) liveRunIds.add(runId);
+
+        // #222: setup-abort gate (stage: agent-instance). The prompt fetch above
+        // awaited the broker, so a lock-loss race may have won during it. Stop
+        // before minting the durable AgentInstance (a side effect) and return
+        // without settling; release the just-allocated container run id.
+        if (checkSetupAbort(abortSignal, { jobType, jobKey: job.jobKey, stage: 'agent-instance', logger })) {
+          if (isContainer) liveRunIds.delete(runId);
+          return;
+        }
 
         // #194: durable engine-native AgentInstance producer. For an `external`
         // agent job (one carrying the activation's lease token + elementInstanceKey)
@@ -9122,6 +9163,14 @@ async function workAgent(req, flags) {
         const hasRepo = !isContainer && !!envelope.repository?.url;
         let runDir = null;
         let provisioned = null;
+        // #222: setup-abort gate (stage: repo-provisioning). The AgentInstance
+        // activate above awaited the broker, so a lock-loss race may have won.
+        // Stop BEFORE cloning/branching (the first repo side effects) and return
+        // without settling; release the just-allocated container run id.
+        if (checkSetupAbort(abortSignal, { jobType, jobKey: job.jobKey, stage: 'repo-provisioning', logger })) {
+          if (isContainer) liveRunIds.delete(runId);
+          return;
+        }
         // The broker activation lock is owned by the single-owner runtime's dispatch
         // lifecycle (supervisor/src/dispatch.ts): it extends the winner to the
         // recovery window BEFORE this runner starts and heartbeats it on a Schedule
@@ -9221,6 +9270,19 @@ async function workAgent(req, flags) {
         // cockpit steer-in fanned back to this job's PTY by the runtime's steer
         // router. Only when the worker is enrolled (a live agentic plane); closed
         // in the finally so its steer subscription never leaks across jobs.
+        // #222: setup-abort gate (stage: relay-open). This is the last gate before
+        // `relaySessionFor` emits `lifecycle/open` — the FIRST transcript event and
+        // the source of the empty transcript husk this issue targets. If a lock-loss
+        // race won during provisioning, stop here: never open the relay session (no
+        // husk), reap the throwaway clone/run dir so no stale workspace is left, and
+        // return without settling. Runs BEFORE the try/finally below, so the run-dir
+        // reaping is done inline here.
+        if (checkSetupAbort(abortSignal, { jobType, jobKey: job.jobKey, stage: 'relay-open', logger })) {
+          if (runDir) { try { rmSync(runDir, { recursive: true, force: true }); } catch { /* best effort */ } liveRunDirs.delete(runDir); }
+          if (isContainer) liveRunIds.delete(runId);
+          return;
+        }
+
         let relaySession = null;
         if (agenticPlane) {
           // #229: thread the correlation join keys + a lazy AgentInstance-key getter
@@ -15104,6 +15166,7 @@ export {
   withIpv4FirstNodeOptions,
   DNS_RESULT_ORDER_IPV4_FIRST,
   workAgent,
+  checkSetupAbort,
   derivePollTimeoutMs,
   AGENT_TASK_NS,
   AGENT_RESULT_KEY,

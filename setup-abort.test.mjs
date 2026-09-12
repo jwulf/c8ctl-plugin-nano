@@ -25,8 +25,14 @@ import { checkSetupAbort, provisionRepo } from './c8ctl-plugin.js';
 // test below stays offline and deterministic regardless of which git op it aborts
 // on. Set at module load, before any test runs; node's test runner gives each
 // file its own process, so this does not leak into other test files.
-process.env.GIT_AUTHOR_NAME = process.env.GIT_AUTHOR_NAME || 'Nano Test Author';
-process.env.GIT_AUTHOR_EMAIL = process.env.GIT_AUTHOR_EMAIL || 'nano-test@example.com';
+// Set UNCONDITIONALLY (not `||`-guarded): an inherited BLANK or non-routable
+// PLACEHOLDER `GIT_AUTHOR_EMAIL` (e.g. `*@nano.local`) would survive a `||` guard,
+// and `resolveCommitterIdentity()`/`sanitizeIdentity()` then DISCARD that whole env
+// candidate and fall through to the real `git`/`gh` probes — the exact non-hermetic
+// spawn this guard exists to prevent. A known non-placeholder identity, pinned
+// unconditionally, short-circuits the resolver on every host.
+process.env.GIT_AUTHOR_NAME = 'Nano Test Author';
+process.env.GIT_AUTHOR_EMAIL = 'nano-test@example.com';
 
 function collectingLogger() {
   const warns = [];
@@ -338,5 +344,44 @@ test('#222 provisionRepo bails when the abort wins DURING the committer-config w
     rmSync(runDir, { recursive: true, force: true });
     if (prevName === undefined) delete process.env.GIT_AUTHOR_NAME; else process.env.GIT_AUTHOR_NAME = prevName;
     if (prevEmail === undefined) delete process.env.GIT_AUTHOR_EMAIL; else process.env.GIT_AUTHOR_EMAIL = prevEmail;
+  }
+});
+
+// #222 (suppressed advisory 4650): the `pre-branch-checkout` recheck is not the last
+// gate either — the branch-selection block below it runs `git checkout -B` (the
+// working-tree mutation) plus the HEAD/base-tip `rev-parse` probes AFTER it. An abort
+// that wins WHILE that checkout is blocking must stop at the NEXT boundary, before
+// those probes, so cleanup + the no-settle path happen. The `post-branch-checkout`
+// recheck closes it. Here the clone lands on a committed `main`, so provisionRepo cuts
+// a fallback work branch (`checkout -B`), and the abort wins during that checkout.
+test('#222 provisionRepo bails when the abort wins DURING the branch checkout — throws before the HEAD/base probes', () => {
+  const runDir = mkdtempSync(join(tmpdir(), 'nano-checkout-abort-'));
+  const ac = new AbortController(); // live through entry + clone + base fetch + committer config…
+  const calls = [];
+  const fakeGit = (args) => {
+    calls.push(args);
+    // Make the clone look like it landed on a COMMITTED `main` branch: a symbolic
+    // HEAD (`refs/heads/main`) that resolves to a commit. That yields checkedOut='main'
+    // with push enabled, so provisionRepo cuts a fallback work branch via `checkout -B`
+    // rather than treating HEAD as detached (which would skip the checkout entirely).
+    if (args.includes('symbolic-ref')) return { status: 0, stdout: 'refs/heads/main\n', stderr: '', timedOut: false };
+    if (args.includes('rev-parse') && args.includes('--verify') && args.includes('HEAD')) return { status: 0, stdout: `${'a'.repeat(40)}\n`, stderr: '', timedOut: false };
+    // …the lock-loss race wins WHILE `git checkout -B <fallback>` is blocking; the
+    // post-branch-checkout recheck must observe it before the HEAD/base-tip probes.
+    if (args.includes('checkout') && args.includes('-B')) ac.abort();
+    return gitOk();
+  };
+  try {
+    assert.throws(
+      () => provisionRepo({ envelope: baseFetchEnvelope(), token: null, runDir, abortSignal: ac.signal, _runGit: fakeGit }),
+      /provisioning aborted during post-branch-checkout/,
+      'an abort during the branch checkout is caught by the post-branch-checkout recheck',
+    );
+    assert.ok(calls.some((a) => a.includes('checkout') && a.includes('-B')), 'the fallback branch checkout ran');
+    // The final `git rev-parse HEAD` (a bare 2-arg probe) is the FIRST op after the
+    // checkout block — it must NOT have run once the abort was observed.
+    assert.ok(!calls.some((a) => a.length === 2 && a[0] === 'rev-parse' && a[1] === 'HEAD'), 'the post-checkout HEAD/base probes never ran — stopped at the boundary');
+  } finally {
+    rmSync(runDir, { recursive: true, force: true });
   }
 });

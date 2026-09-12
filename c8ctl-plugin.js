@@ -4706,6 +4706,12 @@ function provisionRepo({ envelope, token, runDir, runId, timeoutMs = 120_000, lo
       else log.debug?.(`provisionRepo${cs}: no branch.create; push disabled → working read-only on '${checkedOut}'`);
     }
   }
+  // #222: the branch-selection block above runs `git checkout -B` (the working-tree
+  // mutation) plus its fallback-branch cuts. Recheck one last time AFTER those ops and
+  // BEFORE the HEAD/base-tip probes below, so a lock-loss race that won DURING the
+  // checkout stops at this boundary (cleanup + no-settle) rather than continuing
+  // through the remaining synchronous provisioning until the later relay-open gate.
+  throwIfAborted('post-branch-checkout');
   const sha = runGitFn(['rev-parse', 'HEAD'], { cwd: workspaceDir, env: gitEnv, timeoutMs: provTimeoutMs() });
   // Capture the base ref's SHA AT CLONE TIME (issue #229/#231 observability): the
   // harness runs arbitrary code between here and finalizeGit and can itself advance
@@ -9090,6 +9096,12 @@ async function workAgent(req, flags) {
           if (!budget.ok) {
             const freeMb = budget.free != null ? Math.round(budget.free / 1_048_576) : '?';
             const retries = Math.max(0, (Number(job.retries) || 1) - 1);
+            // #222: diskBudgetOk() runs synchronous Docker probes for container jobs
+            // (including a 10s spawnSync), so the abort can flip WHILE we were checking
+            // disk. Recheck before the low-disk fail-settle: an already-lost lease must
+            // return WITHOUT settling (yield the job) rather than be clobbered into a
+            // retryable provisioning failure that races the force-stop yield.
+            if (checkSetupAbort(abortSignal, { jobType, jobKey: job.jobKey, stage: 'prompt', logger })) return;
             logger.warn(`[${jobType}] job ${job.jobKey} shed — low disk (${freeMb}MB free); retries left ${retries}`);
             return settleJob.fail({ errorMessage: `disk budget exceeded (only ${freeMb}MB free)`, retries, retryBackOff: 30_000 });
           }

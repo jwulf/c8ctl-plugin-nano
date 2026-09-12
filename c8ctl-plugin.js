@@ -85,6 +85,11 @@ import { acpUpdateToDisplayChunk } from './acp-transcript-producer.mjs';
 // #194): mints an AgentInstance for an `external` agent job and appends each ACP
 // turn to the engine's append-only AgentHistory via the host SDK client.
 import { createAgentInstanceProducer, isExternalAgentJob } from './agent-instance.mjs';
+// Engine-transcript resume (issue #239): on a re-activation, fetch the prior
+// AgentInstance transcript for this elementInstanceKey and seed the harness with it
+// so the new agent CONTINUES rather than cold-reruns — at-least-once delivery becomes
+// a continuation, not a duplicate. Best-effort; degrades to the legacy cold rerun.
+import { readPriorTranscript, seedResumeEnvelope, isResumeDisabled } from './agent-resume.mjs';
 
 const requireFromHere = createRequire(import.meta.url);
 const pluginDir = dirname(fileURLToPath(import.meta.url));
@@ -9094,6 +9099,30 @@ async function workAgent(req, flags) {
           logger.debug?.(`[${jobType}] AgentInstance producer skipped (${aiCorr}) — ${agentInstanceOff ? 'NANO_AGENT_INSTANCE=off' : 'not an external agent job (no lease token / elementInstanceKey)'}.`);
         }
 
+        // #239: engine-transcript resume. On a re-activation the durable
+        // AgentInstance transcript (minted above, #194) already holds the prior
+        // instance's work, so instead of cold-rerunning we fetch it and SEED the
+        // harness prompt with a rendered continuation — turning an at-least-once
+        // re-delivery into a continuation, not a duplicate. Committed work is
+        // recovered from the pushed branch (git provisioning checks it out); the
+        // transcript carries the reasoning/steps so the resumed agent doesn't repeat
+        // completed work. Best-effort and gated to external agent jobs (the only
+        // ones with a durable transcript): a read failure / no-prior-work / an SDK
+        // without a read surface / the NANO_AGENT_RESUME=off kill switch all fall
+        // through to the legacy cold rerun with `effectiveEnvelope === envelope`.
+        let effectiveEnvelope = envelope;
+        if (!agentInstanceOff && !isResumeDisabled() && isExternalAgentJob(job)) {
+          try {
+            const prior = await readPriorTranscript({ camunda, job, logger });
+            if (prior) {
+              effectiveEnvelope = seedResumeEnvelope(envelope, prior.text);
+              logger.info(`[${jobType}] resuming from prior engine transcript (${aiCorr}) — ${prior.historyCount} history turn(s) seeded into the harness prompt; continuing from the last pushed commit (uncommitted deltas from the prior run are not recovered).`);
+            }
+          } catch (err) {
+            logger.debug?.(`[${jobType}] engine-transcript resume skipped (${aiCorr}) — ${oneLineLog(err?.message || err)}; cold-running.`);
+          }
+        }
+
         // Fail-closed on a half-specified repository envelope (issue #129,
         // hardening 2): a `repository` block that declares intent (any field set)
         // but whose `url` is absent or not a usable clone target almost always
@@ -9267,7 +9296,10 @@ async function workAgent(req, flags) {
             // detached agent grandchild to init. Absent (undefined) on the normal
             // and graceful-drain paths, where the harness runs to completion.
             abortSignal,
-            envelope,
+            // #239: the resume-seeded envelope when this is a re-activation with a
+            // prior transcript (else the original envelope). Only the task prompt is
+            // reframed as a continuation; repository/setup are unchanged.
+            envelope: effectiveEnvelope,
             sandbox,
             image,
             runId,

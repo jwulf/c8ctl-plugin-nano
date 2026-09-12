@@ -1510,6 +1510,137 @@ test('the pre-mint buffer only retains updates that persist a turn — a plan/st
   );
 });
 
+test('the pre-mint buffer skips metadata-only message chunks (no text/metrics) so they cannot starve it (issue #230)', async () => {
+  // A message chunk with blank text and no metrics classifies to kind:'message' but
+  // persists NO turn on replay (flushMessage discards it). Buffering it would let a
+  // burst of such chunks consume the caps during a create outage and drop later real
+  // turns. They must be filtered out before buffering, mirroring flushMessage.
+  const client = fakeClient({ failCreateTimes: 1 });
+  let t = Date.parse('2026-02-03T04:05:06.000Z');
+  const p = createAgentInstanceProducer({
+    camunda: client,
+    job: EXTERNAL_JOB,
+    profile: PROFILE,
+    envelope: ENVELOPE,
+    logger: nullLogger,
+    now: () => t,
+    createRetryBaseMs: 1000,
+    createRetryMaxMs: 30000,
+    // Only 2 slots: a naive buffer would fill them with the blank chunks.
+    preMintBufferMax: 2,
+  });
+
+  await p.activate();
+  assert.equal(p.active, false);
+
+  // A burst of blank-text (whitespace-only) message chunks, then two real ones.
+  for (let i = 0; i < 5; i += 1) {
+    p.ingest({ sessionUpdate: 'agent_message_chunk', messageId: `blank-${i}`, content: { type: 'text', text: '   ' } });
+  }
+  p.ingest({ sessionUpdate: 'agent_message_chunk', messageId: 'r-a', content: { type: 'text', text: 'real-a' } });
+  p.ingest({ sessionUpdate: 'agent_message_chunk', messageId: 'r-b', content: { type: 'text', text: 'real-b' } });
+  await p.drain();
+
+  t += 2000;
+  await p.activate();
+  assert.equal(p.active, true);
+  await p.complete(true);
+
+  const texts = client.calls.update
+    .filter((u) => Array.isArray(u.history))
+    .map((u) => u.history[0].content?.[0]?.text)
+    .filter(Boolean);
+  assert.deepEqual(
+    texts,
+    ['real-a', 'real-b'],
+    'the blank message chunks were filtered; both real message turns survived the 2-slot buffer',
+  );
+});
+
+test('retryPending distinguishes a transient un-minted create from a permanently disabled producer (issue #230)', async () => {
+  // After the create-retry change, `active === false` no longer means "permanently
+  // unavailable": a transient create rejection leaves the producer armed to retry on
+  // the ACP hot path. `retryPending` exposes that transient state so the caller does
+  // not misreport a recoverable run as a lost transcript.
+  const client = fakeClient({ failCreate: true });
+  const p = makeProducer(client);
+  const ok = await p.activate();
+  assert.equal(ok, false, 'a failed create does not mint');
+  assert.equal(p.active, false);
+  assert.equal(p.retryPending, true, 'an armed create is retry-pending, not permanently unavailable');
+
+  // A producer with no classifier is DISABLED — it will never record a transcript, so
+  // it is not retry-pending.
+  const disabled = createAgentInstanceProducer({
+    camunda: client,
+    job: EXTERNAL_JOB,
+    profile: PROFILE,
+    envelope: ENVELOPE,
+    logger: nullLogger,
+    now,
+    sessionAcp: {},
+  });
+  await disabled.activate();
+  assert.equal(disabled.active, false);
+  assert.equal(disabled.retryPending, false, 'a disabled producer is not retry-pending');
+
+  // Once complete() has run its terminal path, no further retry can follow.
+  await p.complete(true);
+  assert.equal(p.retryPending, false, 'after finalization the producer is no longer retry-pending');
+});
+
+test('the post-mint append backlog is bounded — overflow drops the newest turn and warns once (issue #230)', async () => {
+  // During an AgentInstance outage each serialized append can hang up to
+  // finalizeTimeoutMs. Without a cap, ingest() could enqueue an unbounded backlog of
+  // turn payloads. Once the cap is hit the newest turn is dropped (warn-once), mirroring
+  // the pre-mint buffer's explicit drop policy.
+  const lines = { info: [], warn: [], debug: [] };
+  const logger = {
+    info: (m) => lines.info.push(m),
+    warn: (m) => lines.warn.push(m),
+    debug: (m) => lines.debug.push(m),
+  };
+  let openGate;
+  const gate = new Promise((resolve) => {
+    openGate = resolve;
+  });
+  const client = {
+    calls: { create: [], update: [] },
+    createAgentInstance: async (req) => {
+      client.calls.create.push(req);
+      return { agentInstanceKey: 'AGENT-1' };
+    },
+    updateAgentInstance: async (req) => {
+      client.calls.update.push(req);
+      // Hang until released so the append backlog cannot drain during the test.
+      await gate;
+      return { createdHistory: Array.isArray(req.history) ? req.history : [] };
+    },
+  };
+  const p = makeProducer(client, { logger, maxPendingAppends: 2 });
+  await p.activate();
+  assert.equal(p.active, true);
+
+  // Four tool-call updates → four appendTurn calls. The first two fill the backlog
+  // (one in flight on the hung update, one queued); the last two overflow and are
+  // dropped.
+  for (let i = 0; i < 4; i += 1) {
+    p.ingest({ sessionUpdate: 'tool_call', toolCallId: `tc-${i}`, title: `t-${i}`, status: 'pending' });
+  }
+
+  const backlogWarns = lines.warn.filter((m) => /append backlog full/.test(m));
+  assert.equal(backlogWarns.length, 1, 'the overflow is warned exactly once');
+  assert.match(backlogWarns[0], /cap 2/, 'the diagnostic reports the cap');
+
+  // Release the hang so the queue drains and the test does not leak a pending append.
+  openGate();
+  await p.drain();
+
+  // Only the two accepted appends ever reached the SDK; the two overflow turns were
+  // dropped and never enqueued.
+  assert.equal(client.calls.update.length, 2, 'the two overflow turns were dropped; only two appends hit the SDK');
+});
+
 test('a shaped create failure emits status/body, the redacted jobLease, model/provider, and all correlation keys (issue #230)', async () => {
   // The create-failure warning is a core observability acceptance criterion, so assert
   // the producer-level diagnostic (not just describeSdkError in isolation): a shaped SDK

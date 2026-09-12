@@ -88,6 +88,16 @@ const DEFAULT_FINALIZE_TIMEOUT_MS = 10_000;
 // are in flight, maybeStartCreate() pauses new attempts until one settles.
 const DEFAULT_MAX_INFLIGHT_CREATES = 3;
 
+// Backpressure cap on the post-mint append backlog (issue #230). Appends are serialized
+// on `queue`, and each is individually bounded at finalizeTimeoutMs — so during a
+// prolonged AgentInstance outage every append can take the full bound to settle. Without
+// a cap, ingest() (the ACP hot path is non-blocking) could enqueue an unbounded backlog
+// of turn closures/payloads and keep draining it for hours after complete() returns,
+// retaining all of it in memory. Once this many appends are pending, the NEWEST turn is
+// dropped and counted (warn-once), mirroring the pre-mint buffer's explicit drop policy
+// so the truncation is visible rather than a silent unbounded backlog.
+const DEFAULT_MAX_PENDING_APPENDS = 1000;
+
 // Race a best-effort promise against `timeoutMs`, reporting WHICH won, without ever
 // rejecting. Used to bound every create attempt so a hung createAgentInstance can
 // neither block activate() (which gates whether the harness runs at all) nor
@@ -355,6 +365,7 @@ export function createAgentInstanceProducer(opts = {}) {
     terminalRetryMax = DEFAULT_TERMINAL_RETRY_MAX,
     finalizeTimeoutMs = DEFAULT_FINALIZE_TIMEOUT_MS,
     maxInFlightCreates = DEFAULT_MAX_INFLIGHT_CREATES,
+    maxPendingAppends = DEFAULT_MAX_PENDING_APPENDS,
   } = opts;
 
   const classify = typeof sessionAcp?.classifyUpdate === 'function' ? sessionAcp.classifyUpdate : null;
@@ -453,6 +464,13 @@ export function createAgentInstanceProducer(opts = {}) {
   // Elevate the FIRST per-turn append failure to `warn` (repeats stay `debug`) so a
   // 400/404 append storm is visible without flooding the log (issue #230 / #229).
   let appendFailureLogged = false;
+  // Backpressure bookkeeping for the post-mint append backlog (issue #230):
+  // `pendingAppends` counts appends enqueued but not yet settled; `appendsDropped`
+  // counts turns dropped once the backlog hits `maxPendingAppends`; the drop is
+  // elevated to `warn` exactly once so a bounded-out backlog is visible without a storm.
+  let pendingAppends = 0;
+  let appendsDropped = 0;
+  let appendBacklogLogged = false;
   // #229 first-failure elevation for ingest faults (classifier OR handler): the FIRST
   // per-instance ingest failure logs at `warn`, repeats stay at `debug`.
   let ingestFailureLogged = false;
@@ -485,7 +503,25 @@ export function createAgentInstanceProducer(opts = {}) {
   // dedup boundary crisp). Only ever runs once the instance is minted.
   const appendTurn = (turn, status) => {
     if (disabled || !agentInstanceKey) return;
-    enqueue(async () => {
+    // Backpressure (issue #230): during an AgentInstance outage each serialized append
+    // can take up to finalizeTimeoutMs to settle, so an unbounded enqueue would let the
+    // backlog (and its retained turn payloads) grow without limit and drain for hours
+    // past complete(). Once the backlog hits the cap, DROP the newest turn — counting it
+    // and warning once — rather than retain it, mirroring the pre-mint buffer's explicit
+    // drop policy so the truncation is visible, not a silent runaway queue.
+    if (maxPendingAppends > 0 && pendingAppends >= maxPendingAppends) {
+      appendsDropped += 1;
+      if (!appendBacklogLogged) {
+        appendBacklogLogged = true;
+        logger?.warn?.(
+          `AgentInstance producer: append backlog full (${pendingAppends} pending; cap ` +
+            `${maxPendingAppends}); dropping further turns until it drains ${correlation()}.`,
+        );
+      }
+      return;
+    }
+    pendingAppends += 1;
+    const appended = enqueue(async () => {
       const req = {
         agentInstanceKey,
         elementInstanceKey,
@@ -527,6 +563,11 @@ export function createAgentInstanceProducer(opts = {}) {
           logger?.debug?.(line);
         }
       }
+    });
+    // Decrement the backlog when THIS append settles (enqueue's chain never rejects),
+    // freeing a slot for a later turn without affecting the serialized `queue`.
+    appended.finally(() => {
+      pendingAppends -= 1;
     });
   };
 
@@ -992,7 +1033,19 @@ export function createAgentInstanceProducer(opts = {}) {
       noteIngestFailure(err);
       return false;
     }
-    return !!classified && typeof classified === 'object' && PERSISTED_KINDS.has(classified.kind);
+    if (!classified || typeof classified !== 'object' || !PERSISTED_KINDS.has(classified.kind)) {
+      return false;
+    }
+    // A `message` update only persists a turn if it carries non-blank text OR metrics —
+    // mirror flushMessage()'s own predicate so a metadata-only message chunk (no text,
+    // no metrics) is not buffered. Otherwise such chunks would consume the count/byte
+    // caps during a create outage and starve later real message/tool turns, even though
+    // they contribute NOTHING on replay (flushMessage drops them). tool-call/tool-result
+    // always persist a turn, so they are buffered unconditionally (issue #230).
+    if (classified.kind === 'message') {
+      return isNonBlank(classified.text) || !!extractMetrics(rawUpdate);
+    }
+    return true;
   };
   const bufferPreMint = (rawUpdate) => {
     // Skip updates that will not persist a turn on replay so they cannot exhaust the
@@ -1049,6 +1102,18 @@ export function createAgentInstanceProducer(opts = {}) {
     /** True once the AgentInstance has been minted. */
     get active() {
       return !!agentInstanceKey && !disabled;
+    },
+    /**
+     * True when the producer is NOT yet active but its create is still armed to retry
+     * on the ACP hot path (issue #230): a create was attempted (createAttempts > 0)
+     * and neither disabled nor minted. This distinguishes a TRANSIENT `active === false`
+     * (a rejected/timed-out create that may still recover a durable transcript on a
+     * later ingest) from the PERMANENT `disabled` state (the SDK/classifier is missing,
+     * so no transcript will ever be recorded). `finalized` is treated as no longer
+     * pending — complete() has run its terminal path and no further retry can follow.
+     */
+    get retryPending() {
+      return !disabled && !agentInstanceKey && createAttempts > 0 && !finalized;
     },
     get agentInstanceKey() {
       return agentInstanceKey;
@@ -1176,6 +1241,14 @@ export function createAgentInstanceProducer(opts = {}) {
         // hold the lease for that whole span; the remaining appends drain in the
         // background past the deadline (best-effort) so job settlement isn't blocked.
         await settleWithin(this.drain(), finalizeTimeoutMs);
+        // The instance never minted, and `finalized` now guarantees the pre-mint buffer
+        // can NEVER be replayed. Release it (and its byte/drop counters) so an
+        // uncancellable create promise still hung during a prolonged outage cannot
+        // retain the full buffer (up to preMintBufferMaxBytes) for the rest of the
+        // process's life — a per-job memory leak with no possible payoff (issue #230).
+        preMintBuffer.length = 0;
+        preMintBufferBytes = 0;
+        preMintDropped = 0;
         // Only warn when we actually attempted to mint (createAttempts > 0). A
         // producer that was never activated is a clean no-op — there is no missing
         // transcript to report.

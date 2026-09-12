@@ -8240,8 +8240,10 @@ async function workAgent(req, flags) {
             const active = await agentInstanceProducer.activate();
             if (active) {
               logger.info(`[${jobType}] AgentInstance producer active for external agent job (${aiCorr}).`);
+            } else if (agentInstanceProducer.retryPending) {
+              logger.info(`[${jobType}] AgentInstance producer not yet active for external agent job (${aiCorr}) — the initial createAgentInstance did not mint a key in time (transient rejection, no-key response, or bounded-out create), but the create stays armed to retry on the ACP hot path, so a run that recovers can still record a durable transcript (job completion unaffected).`);
             } else {
-              logger.info(`[${jobType}] AgentInstance producer unavailable for external agent job (${aiCorr}) — activation not attempted or rejected: the host SDK lacks createAgentInstance/updateAgentInstance, the ACP classifier is unavailable, createAgentInstance returned no key, or the SDK rejected the create; continuing without a durable transcript (job completion unaffected).`);
+              logger.info(`[${jobType}] AgentInstance producer unavailable for external agent job (${aiCorr}) — activation not attempted: the host SDK lacks createAgentInstance/updateAgentInstance, the ACP classifier is unavailable, or this is not an external agent job; continuing without a durable transcript (job completion unaffected).`);
             }
           } catch (err) {
             logger.warn(`[${jobType}] AgentInstance producer activate() threw (${aiCorr}) — ${oneLineLog(err?.message || err)}; continuing without a durable transcript (job completion unaffected).`);

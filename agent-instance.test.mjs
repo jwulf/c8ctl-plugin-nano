@@ -15,7 +15,20 @@ import {
   deriveAgentDefinition,
   deriveLimits,
   inferProvider,
+  describeSdkError,
 } from './agent-instance.mjs';
+
+// A logger that records every line per level so observability assertions (#229)
+// can inspect exactly what the producer emitted.
+function recordingLogger() {
+  const lines = { info: [], warn: [], debug: [] };
+  return {
+    info: (m) => lines.info.push(String(m)),
+    warn: (m) => lines.warn.push(String(m)),
+    debug: (m) => lines.debug.push(String(m)),
+    lines,
+  };
+}
 
 // A fake SDK client that records calls and returns a fixed agentInstanceKey.
 //
@@ -50,7 +63,11 @@ function fakeClient({
     },
     updateAgentInstance: async (req) => {
       calls.update.push(req);
-      return { createdHistory: [] };
+      // Mirror the engine: a successful append echoes the created history entries
+      // (the append boundary is one turn per call). A status-only update carries no
+      // history, so nothing is created. Tests that model a deduplicated append
+      // override this to return an EMPTY createdHistory.
+      return { createdHistory: Array.isArray(req.history) ? req.history : [] };
     },
   };
 }
@@ -272,6 +289,23 @@ test('an ignored update (a plan) produces no history append', async () => {
   assert.equal(appends.length, 0);
 });
 
+test('a classifier exception elevates the FIRST ingest failure to warn (repeats stay debug) (#229)', async () => {
+  // A translation/classification fault must NOT vanish silently: the first ingest
+  // failure per instance is elevated to `warn`, later ones stay at `debug`.
+  const log = recordingLogger();
+  const throwingAcp = { classifyUpdate: () => { throw new Error('boom classify'); } };
+  const p = makeProducer(fakeClient(), { logger: log, sessionAcp: throwingAcp });
+  await p.activate();
+  p.ingest({ sessionUpdate: 'agent_message_chunk', content: { type: 'text', text: 'a' } });
+  p.ingest({ sessionUpdate: 'agent_message_chunk', content: { type: 'text', text: 'b' } });
+  await p.drain();
+  const warns = log.lines.warn.filter((m) => /ingest failed/.test(m));
+  const debugs = log.lines.debug.filter((m) => /ingest failed/.test(m));
+  assert.equal(warns.length, 1, 'only the first classifier fault is elevated to warn');
+  assert.ok(/boom classify/.test(warns[0]), 'the warn carries the classifier error');
+  assert.equal(debugs.length, 1, 'the second classifier fault stays at debug');
+});
+
 // ---------------------------------------------------------------------------
 // historyItemId stability (retry dedup)
 // ---------------------------------------------------------------------------
@@ -403,4 +437,176 @@ test('appended turns preserve ACP arrival order even though ingest is non-blocki
   p.ingest({ sessionUpdate: 'agent_message_chunk', content: { type: 'text', text: 'two' } });
   await p.complete(true);
   assert.deepEqual(order, ['one', 'two']);
+});
+
+// ---------------------------------------------------------------------------
+// #229 observability — root-causable create failures, turn counters, correlation
+// ---------------------------------------------------------------------------
+
+test('describeSdkError extracts HTTP status + body from common SDK error shapes', () => {
+  const a = describeSdkError({ status: 400, body: { message: 'lease fenced' }, message: 'Bad Request' });
+  assert.equal(a.status, 400);
+  assert.equal(a.body, JSON.stringify({ message: 'lease fenced' }));
+  assert.equal(a.message, 'Bad Request');
+
+  const b = describeSdkError({ response: { status: 404, data: 'not found' }, message: 'Not Found' });
+  assert.equal(b.status, 404);
+  assert.equal(b.body, 'not found');
+
+  const c = describeSdkError(new Error('plain'));
+  assert.equal(c.status, undefined);
+  assert.equal(c.message, 'plain');
+
+  assert.equal(describeSdkError(null).message, 'null');
+});
+
+test('activate() rejection logs HTTP status + body + correlation + lease tail at warn (#229)', async () => {
+  const client = fakeClient();
+  client.createAgentInstance = async (req) => {
+    client.calls.create.push(req);
+    throw { status: 400, body: { detail: 'jobLease fenced' }, message: 'Bad Request' };
+  };
+  const logger = recordingLogger();
+  const p = makeProducer(client, { logger });
+  const ok = await p.activate();
+  assert.equal(ok, false);
+  const line = logger.lines.warn.find((l) => l.includes('createAgentInstance REJECTED'));
+  assert.ok(line, 'expected a REJECTED warn line');
+  assert.match(line, /status 400/);
+  assert.match(line, /jobLease fenced/);
+  assert.match(line, /job 13954/);
+  assert.match(line, /eik EIK-7/);
+  assert.match(line, /pik 13951/);
+  assert.match(line, /lease present \(len 5\)/); // short token masked — not printed whole
+  assert.match(line, /Opus 4\.8\/anthropic/);
+});
+
+test('activate() rejection collapses a multiline error body/message to one log line (#229)', async () => {
+  const client = fakeClient();
+  client.createAgentInstance = async (req) => {
+    client.calls.create.push(req);
+    // A pretty-printed / multiline engine error must NOT split the correlation
+    // record across several worker-log lines (diagnostic dilution + log spoofing).
+    throw { status: 500, body: 'line1\nline2\r\nline3', message: 'boom\ninjected: fake log line' };
+  };
+  const logger = recordingLogger();
+  const p = makeProducer(client, { logger });
+  const ok = await p.activate();
+  assert.equal(ok, false);
+  const line = logger.lines.warn.find((l) => l.includes('createAgentInstance REJECTED'));
+  assert.ok(line, 'expected a REJECTED warn line');
+  assert.ok(!/[\r\n]/.test(line), 'the rendered SDK error must not contain CR/LF');
+  assert.match(line, /body line1 line2 line3/);
+  assert.match(line, /msg boom injected: fake log line/);
+});
+
+test('complete() logs a turn counter separating the 0-turns husk from a healthy run (#229)', async () => {
+  const client = fakeClient();
+  const logger = recordingLogger();
+  const p = makeProducer(client, { logger });
+  await p.activate();
+  await p.complete(true);
+  const line = logger.lines.info.find((l) => l.includes('turn(s) appended'));
+  assert.ok(line, 'expected a turn-counter info line');
+  assert.match(line, /0 turn\(s\) appended/);
+  assert.match(line, /status→COMPLETED/);
+  assert.match(line, /job 13954 eik EIK-7 pik 13951/);
+});
+
+test('complete(true) whose status→COMPLETED update is REJECTED reports the failed transition, not COMPLETED (#229)', async () => {
+  // The status update rides the best-effort queue whose catch swallows the
+  // rejection. Reject ONLY the terminal status update (not per-turn appends) so a
+  // 400/404 there can't masquerade as a healthy COMPLETED while the instance stays
+  // non-terminal — the exact husk-diagnosis regression the statusResolved gate
+  // guards against.
+  const client = fakeClient();
+  client.updateAgentInstance = async (req) => {
+    client.calls.update.push(req);
+    if (req.status === 'COMPLETED') throw { status: 409, message: 'lease expired' };
+    return { createdHistory: Array.isArray(req.history) ? req.history : [] };
+  };
+  const logger = recordingLogger();
+  const p = makeProducer(client, { logger });
+  await p.activate();
+  p.ingest({ sessionUpdate: 'agent_message_chunk', content: { type: 'text', text: 'hi' } });
+  await p.complete(true);
+  const line = logger.lines.info.find((l) => l.includes('turn(s) appended'));
+  assert.ok(line, 'expected a turn-counter info line');
+  assert.match(line, /COMPLETED update FAILED — left non-terminal/);
+  assert.doesNotMatch(line, /status→COMPLETED\./);
+  assert.ok(
+    client.calls.update.some((r) => r.status === 'COMPLETED'),
+    'the status→COMPLETED update was attempted',
+  );
+});
+
+test('complete() counts appended turns (#229)', async () => {
+  const client = fakeClient();
+  const logger = recordingLogger();
+  const p = makeProducer(client, { logger });
+  await p.activate();
+  p.ingest({ sessionUpdate: 'agent_message_chunk', content: { type: 'text', text: 'hello' } });
+  await p.complete(true);
+  const line = logger.lines.info.find((l) => l.includes('turn(s) appended'));
+  assert.match(line, /1 turn\(s\) appended/);
+});
+
+test('complete() counts only ENGINE-created history — a deduplicated append does not inflate the turn counter (#229/#232)', async () => {
+  // updateAgentInstance is deduplicated by historyItemId, so a retry/reactivation
+  // can return 200 with an EMPTY createdHistory. The husk/healthy counter must
+  // reflect what the engine actually appended, not the attempt — otherwise a
+  // deduplicated no-op would masquerade as a healthy turn.
+  const client = fakeClient();
+  client.updateAgentInstance = async (req) => {
+    client.calls.update.push(req);
+    return { createdHistory: [] }; // engine deduped: nothing new created
+  };
+  const logger = recordingLogger();
+  const p = makeProducer(client, { logger });
+  await p.activate();
+  p.ingest({ sessionUpdate: 'agent_message_chunk', content: { type: 'text', text: 'dup' } });
+  await p.complete(true);
+  const line = logger.lines.info.find((l) => l.includes('turn(s) appended'));
+  assert.match(line, /0 turn\(s\) appended/);
+});
+
+test('complete() falls back to +1 per append when the response omits createdHistory (#229/#232)', async () => {
+  // An older engine (or a fake) that omits createdHistory must not zero the
+  // counter — a genuine append is counted via the +1 fallback.
+  const client = fakeClient();
+  client.updateAgentInstance = async (req) => {
+    client.calls.update.push(req);
+    return {}; // no createdHistory field at all
+  };
+  const logger = recordingLogger();
+  const p = makeProducer(client, { logger });
+  await p.activate();
+  p.ingest({ sessionUpdate: 'agent_message_chunk', content: { type: 'text', text: 'x' } });
+  await p.complete(true);
+  const line = logger.lines.info.find((l) => l.includes('turn(s) appended'));
+  assert.match(line, /1 turn\(s\) appended/);
+});
+
+test('first per-turn append failure is elevated to warn, repeats stay debug (#229)', async () => {
+  const client = fakeClient();
+  await (async () => {})();
+  let calls = 0;
+  client.updateAgentInstance = async (req) => {
+    client.calls.update.push(req);
+    calls += 1;
+    throw { status: 404, message: 'gone' };
+  };
+  const logger = recordingLogger();
+  const p = makeProducer(client, { logger });
+  await p.activate();
+  p.ingest({ sessionUpdate: 'agent_message_chunk', content: { type: 'text', text: 'a' } });
+  p.ingest({ sessionUpdate: 'agent_message_chunk', messageId: 'm2', content: { type: 'text', text: 'b' } });
+  // force flush of both messages
+  await p.complete(true);
+  const appendWarns = logger.lines.warn.filter((l) => l.includes('updateAgentInstance(append) failed'));
+  assert.equal(appendWarns.length, 1, 'exactly one append failure elevated to warn');
+  assert.match(appendWarns[0], /status 404/);
+  assert.ok(calls >= 2, 'multiple append attempts were made');
+  const appendDebugs = logger.lines.debug.filter((l) => l.includes('updateAgentInstance(append) failed'));
+  assert.ok(appendDebugs.length >= 1, 'subsequent append failures stay at debug');
 });

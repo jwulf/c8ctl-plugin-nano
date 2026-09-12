@@ -60,6 +60,7 @@ import {
   parsePsTime,
   provisionRepo,
   finalizeGit,
+  runGit,
   sanitizeBranchSegment,
   shouldPreserveRunDir,
   computeRelayCloseReason,
@@ -1172,6 +1173,7 @@ test('sanitizeResultVars strips harness-reserved keys and the io.nanobpm namespa
     // Git result contract keys an untrusted agent must not be able to inject as
     // top-level completion vars (thread 6772).
     pushFailed: true,
+    pushError: '! [rejected] (forged non-fast-forward)',
     strandedCommits: ['deadbeef'],
     branchMismatch: { expected: 'x', actual: 'main' },
     scanError: 'forged incomplete-scan reason',
@@ -1180,7 +1182,7 @@ test('sanitizeResultVars strips harness-reserved keys and the io.nanobpm namespa
   });
   assert.deepEqual({ ...vars }, { status: 'converged', summary: 'ok' });
   for (const k of RESERVED_RESULT_KEYS) assert.equal(k in vars, false, `${k} must be stripped`);
-  for (const k of ['pushFailed', 'strandedCommits', 'branchMismatch', 'scanError']) assert.equal(k in vars, false, `git-contract key ${k} must be stripped`);
+  for (const k of ['pushFailed', 'pushError', 'strandedCommits', 'branchMismatch', 'scanError']) assert.equal(k in vars, false, `git-contract key ${k} must be stripped`);
   assert.deepEqual(sanitizeResultVars(null), {});
   assert.deepEqual(sanitizeResultVars('nope'), {});
 });
@@ -1759,6 +1761,139 @@ test('finalizeGit refuses to push and preserves the workspace when a critical co
     assert.equal(shouldPreserveRunDir(out), true, 'the workspace is preserved for recovery');
     // The commit was NOT published — it survives only because the workspace is kept.
     assert.throws(() => g(['-c', 'safe.bareRepository=all', 'rev-parse', '--verify', `refs/heads/${prov.workingBranch}`], origin), 'nothing was pushed to origin');
+  } finally {
+    rmSync(root, { recursive: true, force: true });
+  }
+});
+
+test('finalizeGit fails CLOSED when the final stranded-commit FILTER scan errors — flags the strand list best-effort via scanError, preserves the workspace (Copilot advisory: fail-closed on strand-filter failure)', { skip: !gitOk }, () => {
+  const { root, origin } = makeOriginRepo();
+  const runDir = mkdtempSync(join(root, 'run-'));
+  try {
+    const envelope = {
+      schemaVersion: 1,
+      repository: { provider: 'github', url: origin, submodules: false },
+      branch: { base: 'main', create: 'main', push: true },
+      setup: { commands: [], env: {}, secretRefs: [] },
+      task: { allowPr: false },
+    };
+    const prov = provisionRepo({ envelope, token: null, runDir });
+    // Force the workspace onto the base branch so HEAD is on 'main' (movedOff=false) →
+    // the rejected-push path (not the branch-mismatch path) runs the final strand scan.
+    g(['checkout', '-q', '-B', 'main', 'origin/main'], prov.workspaceDir);
+    // Commit on main so a push is attempted.
+    const baseSha = g(['rev-parse', 'HEAD'], prov.workspaceDir).trim();
+    writeFileSync(join(prov.workspaceDir, 'AGENT.txt'), 'agent change\n');
+    g(['add', '-A'], prov.workspaceDir);
+    g(['-c', 'user.name=nano', '-c', 'user.email=nano@example.com', 'commit', '-q', '-m', 'agent: add AGENT.txt'], prov.workspaceDir);
+    // A rival advances origin/main → our push is a non-fast-forward reject, driving the
+    // final stranded rev-list `<sha...> --not --remotes`.
+    advanceOrigin(root, origin, 'main');
+
+    // Inject a git runner that delegates every call to the real runGit EXCEPT the final
+    // stranded FILTER scan (`rev-list <sha...> --not --remotes`), which it forces to
+    // exit nonzero — exactly what a timeout / corrupt object DB would do. Without the
+    // fix the unfiltered union is returned as an EXACT strand list with NO scanError,
+    // so a consumer cannot tell it from a precise recovery set.
+    let forcedFail = false;
+    const failingRunGit = (args, opts) => {
+      if (args[0] === 'rev-list' && /^[0-9a-f]{7,40}$/.test(args[1] || '') && args.includes('--not') && args.includes('--remotes')) {
+        forcedFail = true;
+        return { status: 128, stdout: '', stderr: 'fatal: forced strand-filter failure', signal: null, timedOut: false, timeoutMs: opts?.timeoutMs };
+      }
+      return runGit(args, opts);
+    };
+
+    const out = finalizeGit({
+      workspaceDir: prov.workspaceDir,
+      gitEnv: prov.gitEnv,
+      startSha: baseSha,
+      workingBranch: 'main',
+      hasPrBranch: false,
+      envelope,
+      token: null,
+      logger: { warn: () => {}, error: () => {}, info: () => {}, debug: () => {} },
+      keepRuns: true,
+      _runGit: failingRunGit,
+    });
+    assert.equal(forcedFail, true, 'the injected runner actually intercepted the final stranded filter scan');
+    assert.equal(out.pushed, false, 'the non-ff push is rejected');
+    assert.equal(out.pushFailed, true, 'a rejected push is a preserved failure');
+    assert.ok(out.pushError, 'a push WAS attempted, so pushError is present');
+    assert.ok(out.scanError, 'the incomplete strand-filter is surfaced as scanError so the list is flagged best-effort');
+    assert.match(out.scanError, /rev-list <stranded>/, 'scanError names the strand-filter scan');
+    // The unfiltered union survives as the best-effort recovery handle (never dropped),
+    // and the workspace is preserved so the objects remain recoverable.
+    assert.ok(Array.isArray(out.strandedCommits) && out.strandedCommits.length > 0, 'the best-effort strand list is still surfaced');
+    assert.equal(shouldPreserveRunDir(out), true, 'the workspace is preserved for recovery');
+  } finally {
+    rmSync(root, { recursive: true, force: true });
+  }
+});
+
+test('provisionRepo names the fallback branch after the DEFAULT/base, not the tag, on a tag-detached clone with branch.create=default (Copilot advisory: tag-base mislabels fallback branch)', { skip: !gitOk }, () => {
+  const { root, origin } = makeOriginRepo();
+  // Tag the seed commit on origin so we can clone --branch <tag> (detached HEAD).
+  const tagClone = mkdtempSync(join(root, 'tag-'));
+  g(['clone', '-q', origin, tagClone], undefined);
+  g(['tag', 'v1'], tagClone);
+  g(['push', '-q', 'origin', 'v1'], tagClone);
+  const runDir = mkdtempSync(join(root, 'run-'));
+  const warnings = [];
+  try {
+    // ref=v1 (a TAG) → the clone detaches HEAD; NO branch.base / repository.baseRef, so
+    // baseBranchName falls back to the tag 'v1'. branch.create='main' NAMES the remote
+    // default, so the guard routes to cutFallbackBranch(effectiveBase='') — the OLD
+    // code then labelled the recovery branch nano/agent-work/v1-… (the TAG). The fix
+    // prefers the resolved default/base, so it must be nano/agent-work/main-….
+    const envelope = {
+      schemaVersion: 1,
+      repository: { provider: 'github', url: origin, ref: 'v1', submodules: false },
+      branch: { base: '', create: 'main', push: true },
+      setup: { commands: [], env: {}, secretRefs: [] },
+      task: { allowPr: true },
+    };
+    const prov = provisionRepo({
+      envelope, token: null, runDir,
+      logger: { warn: (m) => warnings.push(m), info: () => {}, debug: () => {} },
+    });
+    assert.equal(prov.fallbackBranch, true, 'a fallback branch was cut (create names the default base)');
+    assert.match(prov.workingBranch, /^nano\/agent-work\/main-/, 'the fallback segment names the DEFAULT branch, not the tag');
+    assert.doesNotMatch(prov.workingBranch, /^nano\/agent-work\/v1-/, 'the fallback segment must NOT be named after the tag');
+  } finally {
+    rmSync(root, { recursive: true, force: true });
+  }
+});
+
+test('provisionRepo bounds ALL provisioning git calls by ONE cumulative deadline (shrinking per-call timeouts), not an independent 120s each (Copilot advisory: cumulative provisioning lease budget)', { skip: !gitOk }, () => {
+  const { root, origin } = makeOriginRepo();
+  const runDir = mkdtempSync(join(root, 'run-'));
+  try {
+    // create=feat/x (≠ base main) with push → triggers the default-branch probe AND a
+    // base fetch, so several TIMED network git calls run in sequence.
+    const envelope = {
+      schemaVersion: 1,
+      repository: { provider: 'github', url: origin, baseRef: 'main', submodules: false },
+      branch: { base: 'main', create: 'feat/x', push: true },
+      setup: { commands: [], env: {}, secretRefs: [] },
+      task: { allowPr: false },
+    };
+    const timeouts = [];
+    const recordingRunGit = (args, opts) => {
+      if (opts && typeof opts.timeoutMs === 'number') timeouts.push(opts.timeoutMs);
+      return runGit(args, opts);
+    };
+    const timeoutMs = 120_000;
+    provisionRepo({ envelope, token: null, runDir, timeoutMs, _runGit: recordingRunGit });
+    assert.ok(timeouts.length >= 2, 'multiple provisioning git calls carried a timeout');
+    // Every call is bounded by the single budget…
+    for (const t of timeouts) assert.ok(t <= timeoutMs && t >= 1, `each provisioning timeout is drawn from the shared budget (got ${t})`);
+    // …and they SHRINK: each op takes only the REMAINING slice of one deadline, so a
+    // later call's budget is strictly smaller than the first (clone) call's. Under the
+    // OLD code every call got a fresh, identical `effectiveTimeoutMs` — no shrink.
+    assert.ok(timeouts[timeouts.length - 1] < timeouts[0], `later provisioning calls draw a SMALLER remaining budget (first=${timeouts[0]}, last=${timeouts[timeouts.length - 1]})`);
+    // The timeouts are non-increasing (a single monotonic deadline, never reset).
+    for (let i = 1; i < timeouts.length; i++) assert.ok(timeouts[i] <= timeouts[i - 1], `provisioning timeouts never RESET to the full budget (i=${i})`);
   } finally {
     rmSync(root, { recursive: true, force: true });
   }

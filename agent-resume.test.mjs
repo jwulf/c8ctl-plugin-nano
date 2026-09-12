@@ -166,15 +166,25 @@ test('readPriorTranscript: broad search with no exact element match → null (no
 
 test('readPriorTranscript: matches an element within the PLURAL elementInstanceKeys array', async () => {
   // An AgentInstance can span several element instances; the exact match must look
-  // inside the returned `elementInstanceKeys` array, not a singular scalar.
+  // inside the returned `elementInstanceKeys` array, not a singular scalar. And its
+  // embedded history is INSTANCE-granular across those siblings, so it must be SCOPED
+  // to THIS element — a sibling's turns must NOT bleed into this job's resume.
   const camunda = {
     searchAgentInstances: async () => ({
-      items: [{ elementInstanceKeys: ['sib-1', 'mine-2', 'sib-3'], agentInstanceKey: 'ai-m', history: [textTurn('ASSISTANT', 'my prior work')] }],
+      items: [{
+        elementInstanceKeys: ['sib-1', 'mine-2', 'sib-3'],
+        agentInstanceKey: 'ai-m',
+        history: [
+          { ...textTurn('ASSISTANT', 'my prior work'), elementInstanceKey: 'mine-2' },
+          { ...textTurn('ASSISTANT', 'a SIBLING element secret'), elementInstanceKey: 'sib-1' },
+        ],
+      }],
     }),
   };
   const got = await readPriorTranscript({ camunda, job: { elementInstanceKey: 'mine-2' } });
   assert.ok(got, 'matched via the plural array');
   assert.ok(got.text.includes('my prior work'));
+  assert.ok(!got.text.includes('SIBLING element secret'), 'a sibling element\'s turns do not bleed in');
 });
 
 test('readPriorTranscript: a non-settling read is bounded by the deadline → null', async () => {
@@ -225,19 +235,28 @@ test('seedResumeEnvelope: returns the original when there is no task prompt to s
 });
 
 test('seedResumeEnvelope: recovery text is conditional on a declared pushed branch', () => {
-  // A pushed-branch job is told committed work is on the branch; a repo-less or
-  // push-disabled job is told the throwaway workspace is gone and the transcript is the
-  // only recoverable state (never pointed at a branch that does not exist).
-  const pushed = seedResumeEnvelope({ task: { prompt: 'do it' }, repository: { url: 'x' }, branch: { push: true } }, 'T');
-  assert.ok(pushed.task.prompt.includes('pushed branch'), 'pushed-branch job → branch recovery text');
+  // A job that pushes onto a STABLE non-base branch (e.g. the PR head) is told committed
+  // work is recoverable from it; a repo-less, push-disabled, base-only, or bare-URL job
+  // is told the throwaway workspace is gone and the transcript is the only recoverable
+  // state (never pointed at a branch whose prior commits the next clone won't have).
+  const pushed = seedResumeEnvelope({ task: { prompt: 'do it' }, repository: { url: 'x', ref: 'feat/thing', baseRef: 'main' }, branch: { push: true } }, 'T');
+  assert.ok(pushed.task.prompt.includes('pushed branch'), 'stable non-base branch → branch recovery text');
   assert.ok(pushed.task.prompt.includes('UNCOMMITTED'), 'still documents the uncommitted-loss scope');
 
   const repoLess = seedResumeEnvelope({ task: { prompt: 'do it' } }, 'T');
   assert.ok(repoLess.task.prompt.includes('ONLY record'), 'repo-less job → transcript-only recovery text');
   assert.ok(!repoLess.task.prompt.includes('check out the'), 'no pushed-branch instruction for a repo-less job');
 
-  const noPush = seedResumeEnvelope({ task: { prompt: 'do it' }, repository: { url: 'x' }, branch: { push: false } }, 'T');
+  const noPush = seedResumeEnvelope({ task: { prompt: 'do it' }, repository: { url: 'x', ref: 'feat/thing' }, branch: { push: false } }, 'T');
   assert.ok(noPush.task.prompt.includes('ONLY record'), 'branch.push=false → transcript-only recovery text');
+
+  // A push with NO stable non-base ref (a bare-URL / base-only clone, or a per-run
+  // fallback / `branch.create`) is NOT recoverable: the next activation re-clones the
+  // base and never fetches the prior per-run branch, so the commits are gone.
+  const noRef = seedResumeEnvelope({ task: { prompt: 'do it' }, repository: { url: 'x' }, branch: { push: true } }, 'T');
+  assert.ok(noRef.task.prompt.includes('ONLY record'), 'push but no stable ref → transcript-only recovery text');
+  const baseRef = seedResumeEnvelope({ task: { prompt: 'do it' }, repository: { url: 'x', ref: 'main', baseRef: 'main' }, branch: { push: true } }, 'T');
+  assert.ok(baseRef.task.prompt.includes('ONLY record'), 'ref === baseRef → transcript-only recovery text');
 });
 
 test('readPriorTranscript: passes the mandatory consistency option and scopes history to THIS element', async () => {
@@ -275,7 +294,9 @@ test('resolveEffectiveEnvelope: external job with prior transcript → resume-se
   const envelope = { task: { prompt: 'original task' } };
   const job = { leaseToken: 'lease-1', elementInstanceKey: 'eik-1' };
   const readPrior = async () => ({ text: '[ASSISTANT] partial', historyCount: 3 });
-  const got = await resolveEffectiveEnvelope({ envelope, job, readPrior });
+  // Inject an explicit ENABLED env so an ambient `NANO_AGENT_RESUME=off` in the runner
+  // can't turn this positive case into a false pass (the kill switch must not decide it).
+  const got = await resolveEffectiveEnvelope({ envelope, job, env: {}, readPrior });
   assert.equal(got.resumed, true);
   assert.equal(got.historyCount, 3);
   assert.notEqual(got.envelope, envelope, 'a new, seeded envelope is returned');
@@ -289,9 +310,12 @@ test('resolveEffectiveEnvelope: ineligible / disabled / no-prior → original en
   const withPrior = async () => ({ text: '[ASSISTANT] x', historyCount: 1 });
 
   // Not an external agent job (no lease / eik) — never reads, returns original.
+  // Each sub-case injects an explicit ENABLED env (`env: {}`) so the assertion proves
+  // the intended reason (ineligible / no-prior / throw / unseedable) rather than being
+  // masked by an ambient `NANO_AGENT_RESUME=off`; the kill-switch case sets env itself.
   let called = false;
   const nonExternal = await resolveEffectiveEnvelope({
-    envelope, job: { elementInstanceKey: 'eik-1' }, readPrior: async () => { called = true; return withPrior(); },
+    envelope, job: { elementInstanceKey: 'eik-1' }, env: {}, readPrior: async () => { called = true; return withPrior(); },
   });
   assert.equal(nonExternal.envelope, envelope);
   assert.equal(nonExternal.resumed, false);
@@ -303,23 +327,23 @@ test('resolveEffectiveEnvelope: ineligible / disabled / no-prior → original en
   assert.equal(disabled.resumed, false);
 
   // AgentInstance producer off.
-  const aiOff = await resolveEffectiveEnvelope({ envelope, job: externalJob, agentInstanceOff: true, readPrior: withPrior });
+  const aiOff = await resolveEffectiveEnvelope({ envelope, job: externalJob, env: {}, agentInstanceOff: true, readPrior: withPrior });
   assert.equal(aiOff.envelope, envelope);
   assert.equal(aiOff.resumed, false);
 
   // No prior work.
-  const noPrior = await resolveEffectiveEnvelope({ envelope, job: externalJob, readPrior: async () => null });
+  const noPrior = await resolveEffectiveEnvelope({ envelope, job: externalJob, env: {}, readPrior: async () => null });
   assert.equal(noPrior.envelope, envelope);
   assert.equal(noPrior.resumed, false);
 
   // Read throws — best-effort degrade to cold run.
-  const threw = await resolveEffectiveEnvelope({ envelope, job: externalJob, readPrior: async () => { throw new Error('engine down'); } });
+  const threw = await resolveEffectiveEnvelope({ envelope, job: externalJob, env: {}, readPrior: async () => { throw new Error('engine down'); } });
   assert.equal(threw.envelope, envelope);
   assert.equal(threw.resumed, false);
 
   // Prior exists but the envelope has no seedable prompt → not resumed, original returned.
   const noPrompt = { task: {} };
-  const unseedable = await resolveEffectiveEnvelope({ envelope: noPrompt, job: externalJob, readPrior: withPrior });
+  const unseedable = await resolveEffectiveEnvelope({ envelope: noPrompt, job: externalJob, env: {}, readPrior: withPrior });
   assert.equal(unseedable.envelope, noPrompt);
   assert.equal(unseedable.resumed, false);
 });

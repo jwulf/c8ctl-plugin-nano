@@ -140,52 +140,76 @@ export function hasResumableTranscript(turns) {
  * unit-tested. The opening CONFIGURATION turn is dropped (its system prompt is
  * already re-seeded from the profile on the fresh activation).
  */
+// Render ONE AgentHistory turn into its 0+ transcript lines. Pure and side-effect
+// free so `renderHistoryTurns` can accumulate a bounded tail without materializing
+// the whole transcript first (advisory: bounded rendering). Preserves the exact
+// per-turn line format (text / tool-call / tool-result).
+function renderTurnLines(turn) {
+  if (!isPlainObject(turn)) return [];
+  const role = isNonBlank(turn.role) ? String(turn.role).toUpperCase() : 'ASSISTANT';
+  if (NON_WORK_ROLES.has(role)) return [];
+  const text = textForContent(turn.content);
+  // TOOL_RESULT is handled FIRST — before the tool-CALL branch below — because an
+  // engine TOOL_RESULT can carry EMPTY content (a side-effecting tool that returned
+  // nothing) while still RETAINING its `toolCalls`. Falling through to the tool-call
+  // branch would render such a completed result as an INVOCATION line, and a resumed
+  // agent could read that as an instruction to run the side-effecting tool AGAIN
+  // (duplicate side effect). Render it as an explicit (possibly empty) result.
+  if (role === 'TOOL_RESULT') {
+    const name =
+      Array.isArray(turn.toolCalls) && isPlainObject(turn.toolCalls[0]) && isNonBlank(turn.toolCalls[0].toolName)
+        ? String(turn.toolCalls[0].toolName)
+        : 'tool';
+    return [text === '' ? `[tool-result: ${name}] (no output)` : `[tool-result: ${name}] ${text}`];
+  }
+  // A tool CALL turn (ASSISTANT with toolCalls, no text) renders as an invocation
+  // line per call, echoing the arguments so a resumed agent knows exactly what ran.
+  if (Array.isArray(turn.toolCalls) && turn.toolCalls.length > 0 && text === '') {
+    const out = [];
+    for (const call of turn.toolCalls) {
+      if (!isPlainObject(call)) continue;
+      const name = isNonBlank(call.toolName) ? String(call.toolName) : 'tool';
+      let args = '';
+      if (call.arguments != null) {
+        try { args = ` ${JSON.stringify(call.arguments)}`; } catch { args = ''; }
+      }
+      out.push(`[tool-call: ${name}]${args}`);
+    }
+    return out;
+  }
+  if (text === '') return [];
+  const label = role === 'USER' ? 'USER' : role === 'ASSISTANT' ? 'ASSISTANT' : role;
+  return [`[${label}] ${text}`];
+}
+
 export function renderHistoryTurns(turns, { capChars = RESUME_CONTEXT_CAP_CHARS } = {}) {
   if (!Array.isArray(turns)) return '';
-  const lines = [];
-  for (const turn of turns) {
-    if (!isPlainObject(turn)) continue;
-    const role = isNonBlank(turn.role) ? String(turn.role).toUpperCase() : 'ASSISTANT';
-    if (NON_WORK_ROLES.has(role)) continue;
-    const text = textForContent(turn.content);
-    // TOOL_RESULT is handled FIRST — before the tool-CALL branch below — because an
-    // engine TOOL_RESULT can carry EMPTY content (a side-effecting tool that returned
-    // nothing) while still RETAINING its `toolCalls`. Falling through to the tool-call
-    // branch would render such a completed result as an INVOCATION line, and a resumed
-    // agent could read that as an instruction to run the side-effecting tool AGAIN
-    // (duplicate side effect). Render it as an explicit (possibly empty) result.
-    if (role === 'TOOL_RESULT') {
-      const name =
-        Array.isArray(turn.toolCalls) && isPlainObject(turn.toolCalls[0]) && isNonBlank(turn.toolCalls[0].toolName)
-          ? String(turn.toolCalls[0].toolName)
-          : 'tool';
-      lines.push(text === '' ? `[tool-result: ${name}] (no output)` : `[tool-result: ${name}] ${text}`);
-      continue;
-    }
-    // A tool CALL turn (ASSISTANT with toolCalls, no text) renders as an invocation
-    // line per call, echoing the arguments so a resumed agent knows exactly what ran.
-    if (Array.isArray(turn.toolCalls) && turn.toolCalls.length > 0 && text === '') {
-      for (const call of turn.toolCalls) {
-        if (!isPlainObject(call)) continue;
-        const name = isNonBlank(call.toolName) ? String(call.toolName) : 'tool';
-        let args = '';
-        if (call.arguments != null) {
-          try { args = ` ${JSON.stringify(call.arguments)}`; } catch { args = ''; }
-        }
-        lines.push(`[tool-call: ${name}]${args}`);
-      }
-      continue;
-    }
-    if (text === '') continue;
-    const label = role === 'USER' ? 'USER' : role === 'ASSISTANT' ? 'ASSISTANT' : role;
-    lines.push(`[${label}] ${text}`);
-  }
-  const rendered = lines.join('\n');
-  if (rendered.length <= capChars) return rendered;
-  // Keep the tail (most recent turns) and mark the truncation so the agent knows the
-  // earlier context was elided rather than that the run started here.
   const marker = '…[earlier transcript truncated]…\n';
-  return marker + rendered.slice(rendered.length - (capChars - marker.length));
+  // Walk NEWEST-first and keep only a bounded TAIL, so a long-lived AgentHistory (or a
+  // large tool result) never allocates/joins the FULL rendered transcript before the
+  // cap applies (advisory: bounded rendering). `tail` holds lines newest-first and is
+  // reversed into chronological order at the end; `total` tracks its joined length.
+  const tail = [];
+  let total = 0;
+  let truncated = false;
+  for (let i = turns.length - 1; i >= 0 && !truncated; i--) {
+    const turnLines = renderTurnLines(turns[i]);
+    for (let j = turnLines.length - 1; j >= 0; j--) {
+      const line = turnLines[j];
+      const add = line.length + (tail.length ? 1 : 0); // +1 for the '\n' join
+      if (total + add > capChars) { truncated = true; break; }
+      tail.push(line);
+      total += add;
+    }
+  }
+  if (!truncated) return tail.reverse().join('\n');
+  // Reserve room for the truncation marker so the whole result still fits `capChars`,
+  // dropping the OLDEST kept lines (tail is newest-first, so pop from the end).
+  while (tail.length && marker.length + total > capChars) {
+    const dropped = tail.pop();
+    total -= dropped.length + (tail.length ? 1 : 0);
+  }
+  return marker + tail.reverse().join('\n');
 }
 
 // Candidate SDK read methods, tried in order — the host `@camunda8/orchestration-cluster-api`
@@ -254,6 +278,30 @@ function instanceElementKeys(inst) {
   return keys;
 }
 
+// The element-instance key a single history turn is tagged with (the real SDK tags
+// each AgentHistory item with its `elementInstanceKey`). '' when untagged.
+function turnElementKey(turn) {
+  return isPlainObject(turn) && turn.elementInstanceKey != null ? String(turn.elementInstanceKey) : '';
+}
+
+// Return the embedded `match.history` ONLY when it is provably scoped to THIS element,
+// else an empty list (forcing the element-filtered `searchAgentInstanceHistory` fetch).
+// A shared AgentInstance can span SIBLING element instances (the real filter/response
+// key on the PLURAL `elementInstanceKeys` array), and its embedded history is
+// INSTANCE-granular — trusting it verbatim would inject a sibling element's turns (and
+// their tool results) into this job's resume: wrong continuation + cross-job exposure.
+// Trust it verbatim only when the instance covers a single element (== this eik); when
+// it spans several, keep only turns EXPLICITLY tagged for this element and drop the
+// rest (an untagged multi-element history proves nothing → drop, fetch element-scoped).
+function scopeEmbeddedHistoryToElement(match, eik) {
+  const embedded = normalizeHistory(match.history != null ? match : { history: match.history });
+  if (!embedded.length) return [];
+  const keys = instanceElementKeys(match);
+  const instanceIsSingleElement = keys.length > 0 && keys.every((k) => k === eik);
+  if (instanceIsSingleElement) return embedded;
+  return embedded.filter((t) => turnElementKey(t) === eik);
+}
+
 // The default engine read seam: probe the candidate SDK methods for a prior
 // AgentInstance correlated on `elementInstanceKey` and return its history turns.
 // Entirely best-effort — ANY rejection/throw resolves to an empty list, never
@@ -297,9 +345,9 @@ async function defaultRead({ camunda, elementInstanceKey }) {
     .pop();
   if (!match) return [];
 
-  // 3. Prefer an embedded history; else fetch it by agentInstanceKey.
-  let turns = normalizeHistory(match.history != null ? match : { history: match.history });
-  if (!turns.length && Array.isArray(match.history)) turns = match.history.filter(isPlainObject);
+  // 3. Prefer an embedded history (SCOPED to this element — see
+  //    scopeEmbeddedHistoryToElement); else fetch it element-scoped by agentInstanceKey.
+  let turns = scopeEmbeddedHistoryToElement(match, eik);
   if (!turns.length) {
     const aik = match.agentInstanceKey ?? match.key;
     if (isNonBlank(aik)) {
@@ -437,15 +485,35 @@ export function seedResumeEnvelope(envelope, transcriptText) {
   return { ...envelope, task: { ...envelope.task, prompt: seeded } };
 }
 
-// Does this envelope declare a repository branch the prior run would have PUSHED, so
-// committed work is durably recoverable from it? A repo-less job (no `repository.url`)
-// or one with `branch.push === false` leaves the throwaway workspace as the only copy —
-// the recovery preamble must then NOT promise a pushed branch to check out. (A push that
-// was *rejected* at runtime is not knowable here; the declared intent is the best signal
-// available at seed time.)
+// Does this envelope declare a stable, non-base branch the prior run would have PUSHED
+// its commits ONTO, so committed work is durably recoverable by re-cloning it? This is
+// the ONLY case that justifies the recovery preamble's "your committed work is on the
+// pushed branch" promise. It is deliberately NARROW:
+//   - a repo-less job (no `repository.url`) or one with `branch.push === false` leaves
+//     the throwaway workspace as the only copy — nothing to recover from;
+//   - a job with push but NO explicit non-base `repository.ref` (a bare-URL / base-only
+//     clone, or `branch.create`) does NOT recover: provisionRepo cuts a per-run
+//     `nano/agent-work/<base>-<runId>` fallback branch (or `-B <create>` off the freshly
+//     re-cloned base HEAD) that the NEXT activation neither knows nor fetches, so the
+//     prior commits are absent from the new workspace. Only a `repository.ref` naming a
+//     stable existing branch (e.g. the PR head) is re-cloned each activation with the
+//     prior round's reconciled commits already present.
+// A ref equal to the base branch, or one that is a bare commit SHA (detached, not a
+// branch tip that accrues pushes), is treated as non-recoverable → transcript-only.
+// (A push *rejected* at runtime is not knowable here; declared intent is the best
+// signal available at seed time.)
+function isLikelyCommitSha(ref) {
+  return typeof ref === 'string' && /^[0-9a-f]{7,40}$/i.test(ref.trim());
+}
+
 function envelopeHasPushedBranch(envelope) {
   const repo = envelope?.repository;
-  return isPlainObject(repo) && isNonBlank(repo.url) && envelope?.branch?.push !== false;
+  if (!isPlainObject(repo) || !isNonBlank(repo.url) || envelope?.branch?.push === false) return false;
+  const ref = isNonBlank(repo.ref) ? String(repo.ref).trim() : '';
+  if (ref === '') return false;
+  if (isNonBlank(repo.baseRef) && ref === String(repo.baseRef).trim()) return false;
+  if (isLikelyCommitSha(ref)) return false;
+  return true;
 }
 
 /** Is engine-transcript resume disabled by the kill switch (`NANO_AGENT_RESUME=off`)? */

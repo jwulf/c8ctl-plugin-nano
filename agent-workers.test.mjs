@@ -1984,6 +1984,67 @@ test('finalizeGit fails CLOSED when remote-tip VERIFICATION fails on a non-ff re
   }
 });
 
+// Item #2 (round 5): an `ls-remote --heads` that SUCCEEDS (exit 0) but returns NO sha —
+// the branch was DELETED on the remote between clone and this verification — must count
+// as an UNVERIFIED remote tip. Otherwise `remoteTipVerifyFailed` stays false and the
+// strand walk trusts the now-dangling clone-time refs/remotes/origin/<branch>, omitting
+// commits reachable only through it and presenting an INCOMPLETE list as EXACT.
+test('finalizeGit treats an EMPTY ls-remote result (deleted remote branch) as an unverified remote tip — scanError flags the strand list best-effort, workspace preserved (Copilot advisory: empty ls-remote must count as unverified)', { skip: !gitOk }, () => {
+  const { root, origin } = makeOriginRepo();
+  const runDir = mkdtempSync(join(root, 'run-'));
+  try {
+    const envelope = {
+      schemaVersion: 1,
+      repository: { provider: 'github', url: origin, submodules: false },
+      branch: { base: 'main', create: 'main', push: true },
+      setup: { commands: [], env: {}, secretRefs: [] },
+      task: { allowPr: false },
+    };
+    const prov = provisionRepo({ envelope, token: null, runDir });
+    g(['checkout', '-q', '-B', 'main', 'origin/main'], prov.workspaceDir);
+    const baseSha = g(['rev-parse', 'HEAD'], prov.workspaceDir).trim();
+    writeFileSync(join(prov.workspaceDir, 'AGENT.txt'), 'agent change\n');
+    g(['add', '-A'], prov.workspaceDir);
+    g(['-c', 'user.name=nano', '-c', 'user.email=nano@example.com', 'commit', '-q', '-m', 'agent: add AGENT.txt'], prov.workspaceDir);
+    advanceOrigin(root, origin, 'main');
+
+    // Force the verification ls-remote to SUCCEED but return an EMPTY result (deleted
+    // branch), while every other git call — including the final strand rev-list —
+    // runs for real. Without the fix `remoteTipVerifyFailed` stays false and the list
+    // is presented as exact with NO scanError.
+    let forcedEmpty = false;
+    const emptyLsRemoteRunGit = (args, opts) => {
+      if (args.includes('ls-remote')) {
+        forcedEmpty = true;
+        return { status: 0, stdout: '', stderr: '', signal: null, timedOut: false, timeoutMs: opts?.timeoutMs };
+      }
+      return runGit(args, opts);
+    };
+
+    const out = finalizeGit({
+      workspaceDir: prov.workspaceDir,
+      gitEnv: prov.gitEnv,
+      startSha: baseSha,
+      workingBranch: 'main',
+      hasPrBranch: false,
+      envelope,
+      token: null,
+      logger: { warn: () => {}, error: () => {}, info: () => {}, debug: () => {} },
+      keepRuns: true,
+      _runGit: emptyLsRemoteRunGit,
+    });
+    assert.equal(forcedEmpty, true, 'the injected runner actually intercepted the verification ls-remote with an empty result');
+    assert.equal(out.pushed, false, 'the non-ff push is rejected');
+    assert.equal(out.pushFailed, true, 'a rejected push is a preserved failure');
+    assert.ok(out.scanError, 'an empty ls-remote (deleted branch) is an unverified remote tip → scanError flags the list best-effort');
+    assert.match(out.scanError, /remote-tip verification/, 'scanError names the remote-tip verification failure');
+    assert.ok(Array.isArray(out.strandedCommits) && out.strandedCommits.length > 0, 'the best-effort strand list is still surfaced');
+    assert.equal(shouldPreserveRunDir(out), true, 'the workspace is preserved for recovery');
+  } finally {
+    rmSync(root, { recursive: true, force: true });
+  }
+});
+
 // Item #3: the shared provisioning deadline must bind EVERY provisioning git call —
 // including the local `checkout`/`rev-parse`/`config`/`symbolic-ref` calls that
 // previously omitted `timeoutMs` and silently fell back to the independent 120s
@@ -2016,6 +2077,53 @@ test('provisionRepo binds EVERY git call to the shared budget — no local call 
     rmSync(root, { recursive: true, force: true });
   }
 });
+
+// ---- Round 5 (Copilot review of 9de4598) ---------------------------------
+
+// Item #1: under the shared provisioning budget a mandatory branch-STATE probe
+// (`symbolic-ref -q HEAD` / `rev-parse --verify --quiet HEAD`) can TIME OUT if the
+// clone consumed the deadline. A timed-out probe must NOT be classified as
+// detached/unborn (→ workingBranch=null → push skipped → the harness commits on the
+// real base and the workspace is reaped: silent work loss). It must throw a RETRYABLE
+// ProvisionError so the job is redelivered.
+for (const probe of ['symbolic-ref', 'rev-parse']) {
+  test(`provisionRepo throws a retryable ProvisionError when the mandatory ${probe} branch-state probe TIMES OUT (never a detached/workingBranch=null success) (Copilot advisory: timeout must not look detached)`, { skip: !gitOk }, () => {
+    const { root, origin } = makeOriginRepo();
+    const runDir = mkdtempSync(join(root, 'run-'));
+    try {
+      const envelope = {
+        schemaVersion: 1,
+        repository: { provider: 'github', url: origin, submodules: false },
+        branch: { base: 'main', create: 'feat/x', push: true },
+        setup: { commands: [], env: {}, secretRefs: [] },
+        task: { allowPr: false },
+      };
+      // Delegate every git call to the real runGit EXCEPT the targeted branch-state
+      // probe, which we force to look TIMED OUT exactly as spawnSync surfaces it:
+      // SIGTERM-killed, status coerced to 128, `timedOut: true`.
+      let forced = false;
+      const timingOutRunGit = (args, opts) => {
+        const isSymref = probe === 'symbolic-ref' && args[0] === 'symbolic-ref';
+        const isHeadProbe = probe === 'rev-parse' && args[0] === 'rev-parse' && args.includes('--verify') && args.includes('HEAD');
+        if (isSymref || isHeadProbe) {
+          forced = true;
+          return { status: 128, stdout: '', stderr: '', signal: 'SIGTERM', timedOut: true, timeoutMs: opts?.timeoutMs };
+        }
+        return runGit(args, opts);
+      };
+      assert.throws(
+        () => provisionRepo({ envelope, token: null, runDir, _runGit: timingOutRunGit }),
+        (err) => {
+          assert.ok(err instanceof ProvisionError, 'a probe timeout is a RETRYABLE ProvisionError, not a silent detached success');
+          return true;
+        },
+      );
+      assert.equal(forced, true, `the injected runner actually intercepted the ${probe} probe`);
+    } finally {
+      rmSync(root, { recursive: true, force: true });
+    }
+  });
+}
 
 test('provisionRepo cuts a fallback when branch.create names the base branch (never commits on base, issue #231)', { skip: !gitOk }, () => {
   const { root, origin } = makeOriginRepo();

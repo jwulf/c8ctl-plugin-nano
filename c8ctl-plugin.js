@@ -4412,6 +4412,17 @@ function provisionRepo({ envelope, token, runDir, runId, timeoutMs = 120_000, lo
   // 4344, mirroring finalizeGit's same fix). `symbolic-ref` returns the full,
   // unambiguous ref and exits nonzero for a DETACHED HEAD → symName '' → no branch.
   const symref = runGitFn(['symbolic-ref', '-q', 'HEAD'], { cwd: workspaceDir, env: gitEnv, timeoutMs: provTimeoutMs() });
+  // A TIMEOUT (or spawn failure) on a MANDATORY branch-state probe must NOT be
+  // misread as "detached/unborn HEAD" — under the shared provisioning budget a
+  // nearly-exhausted deadline can time this probe out, and classifying that as
+  // detached would return `workingBranch=null`, make `finalizeGit` SKIP the push, and
+  // let the harness commit directly on the real base while the workspace is reaped:
+  // silent work loss (issue #231). `runGit` surfaces a timeout as `timedOut` and a
+  // spawn failure as a null status; a GENUINE detached/unborn HEAD exits 1 (a real,
+  // completed status) and is unaffected. Throw a retryable ProvisionError so the job
+  // is REDELIVERED instead of losing work.
+  const probeFailedToRun = (r) => r.timedOut === true || r.status === null;
+  if (probeFailedToRun(symref)) throw new ProvisionError(describeGitFailure('git symbolic-ref -q HEAD', symref, { token, timeoutMs }));
   const symRef = symref.status === 0 ? ((symref.stdout || '').trim()) : '';
   const symName = symRef.startsWith('refs/heads/') ? symRef.slice('refs/heads/'.length) : '';
   // A symbolic HEAD can still be UNBORN (freshly cloned EMPTY repo — a branch ref
@@ -4420,7 +4431,9 @@ function provisionRepo({ envelope, token, runDir, runId, timeoutMs = 120_000, lo
   // first commit. Separate the committed vs unborn case by whether HEAD resolves to
   // a commit, so an empty-repo job is not mis-classified as detached (which would
   // skip the push and silently strand that first commit, issue #231 work-loss).
-  const headHasCommit = runGitFn(['rev-parse', '--verify', '--quiet', 'HEAD'], { cwd: workspaceDir, env: gitEnv, timeoutMs: provTimeoutMs() }).status === 0;
+  const headProbe = runGitFn(['rev-parse', '--verify', '--quiet', 'HEAD'], { cwd: workspaceDir, env: gitEnv, timeoutMs: provTimeoutMs() });
+  if (probeFailedToRun(headProbe)) throw new ProvisionError(describeGitFailure('git rev-parse --verify --quiet HEAD', headProbe, { token, timeoutMs }));
+  const headHasCommit = headProbe.status === 0;
   const checkedOut = (symName && headHasCommit) ? symName : null; // null ⇒ detached HEAD or unborn branch
   const unbornBranch = (symName && !headHasCommit) ? symName : null;
   // The base we must never commit-and-push onto. Derive it ONLY from an explicit
@@ -5272,6 +5285,15 @@ function finalizeGit({ workspaceDir, gitEnv, startSha, workingBranch, baseBranch
               // real tip and must fall back to the STALE clone-time tracking ref.
               remoteTipVerifyFailed = true;
             }
+          } else {
+            // `ls-remote` succeeded but returned NO sha for refs/heads/<branch> — the
+            // branch was DELETED on the remote between clone and this verification. The
+            // clone-time refs/remotes/origin/<branch> is now stale (points at a tip that
+            // no longer exists), so a `--not --remotes` walk against it can omit commits
+            // reachable only through that dangling tracking ref and present an INCOMPLETE
+            // strand list as exact. Treat an empty result as an UNVERIFIED remote tip so
+            // the list is flagged best-effort (scanError) and the workspace is preserved.
+            remoteTipVerifyFailed = true;
           }
         } else {
           // ls-remote could not query the remote at all — we cannot confirm whether the

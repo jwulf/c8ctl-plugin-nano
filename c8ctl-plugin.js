@@ -3132,8 +3132,14 @@ function resolveAutoRestConfig(camunda, env = process.env) {
 // CASE-SENSITIVE by design: XML attribute values are case-sensitive and the
 // convention specifies the literal `external`, so `agentType="External"`/`"EXTERNAL"`
 // is NOT the canonical marker and must not auto-enrol a non-conforming task.
+// Boundaries are anchored on XML whitespace / tag termination, NOT `\b`
+// (a word boundary): `agentDefinition\b` would also match a foreign element
+// like `<zeebe:agentDefinition-extra …>`, and `\bagentType` would match a
+// prefixed attribute like `other:agentType="external"`. Require `[\s/>]` after
+// the element name and a leading `\s` before the (unqualified) `agentType`
+// attribute so only the canonical marker enrols a task.
 const AGENT_DEFINITION_EXTERNAL_RE = new RegExp(
-  `<(?:\\w+:)?agentDefinition\\b[^>]*\\bagentType\\s*=\\s*(["'])external\\1`
+  `<(?:\\w+:)?agentDefinition(?=[\\s/>])[^>]*\\sagentType\\s*=\\s*(["'])external\\1`
 );
 function serviceTaskIsExternalAgent(body) {
   return AGENT_DEFINITION_EXTERNAL_RE.test(String(body || ''));
@@ -3166,7 +3172,11 @@ function readXmlAttr(attrs, key) {
 function serviceTaskOptsOutOfAutoSubscribe(body) {
   const src = String(body || '');
   if (!src.includes(AGENT_TASK_AUTO_SUBSCRIBE_PROP)) return false;
-  const propRe = /<(?:\w+:)?property\b([^>]*?)\/?>/gi;
+  // `property(?=[\s/>])` (not `property\b`): a `\b` boundary would also match a
+  // foreign element named `<zeebe:property-extra …>`, which — if it carried the
+  // same `name`/`value` attributes — could wrongly opt a task out. Require XML
+  // whitespace or tag termination right after the exact element name.
+  const propRe = /<(?:\w+:)?property(?=[\s/>])([^>]*?)\/?>/gi;
   let m;
   while ((m = propRe.exec(src)) !== null) {
     if (readXmlAttr(m[1], 'name') !== AGENT_TASK_AUTO_SUBSCRIBE_PROP) continue;

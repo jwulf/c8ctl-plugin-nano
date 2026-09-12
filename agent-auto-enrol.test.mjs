@@ -177,6 +177,17 @@ test('serviceTaskIsExternalAgent is case-sensitive on the literal "external" val
   assert.equal(serviceTaskIsExternalAgent('<zeebe:agentDefinition agentType="EXTERNAL" />'), false);
 });
 
+test('serviceTaskIsExternalAgent rejects hyphen-suffixed elements and prefixed agentType', () => {
+  // Boundaries are XML whitespace / tag termination, NOT `\b`: a foreign element
+  // `agentDefinition-extra` or a prefixed attribute `other:agentType` must NOT
+  // satisfy the canonical marker and auto-enrol a non-conforming task.
+  assert.equal(serviceTaskIsExternalAgent('<zeebe:agentDefinition-extra agentType="external" />'), false);
+  assert.equal(serviceTaskIsExternalAgent('<agentDefinition-extra agentType="external" />'), false);
+  assert.equal(serviceTaskIsExternalAgent('<zeebe:agentDefinition other:agentType="external" />'), false);
+  // …but the canonical unqualified `agentType` on the exact element still matches.
+  assert.equal(serviceTaskIsExternalAgent('<zeebe:agentDefinition foo="1" agentType="external" />'), true);
+});
+
 test('serviceTaskIsExternalAgent ignores a marker inside an XML comment or CDATA', () => {
   const commented = '<!-- <zeebe:agentDefinition agentType="external" /> -->';
   const cdata = '<![CDATA[ <zeebe:agentDefinition agentType="external" /> ]]>';
@@ -211,6 +222,18 @@ test('serviceTaskOptsOutOfAutoSubscribe is not fooled by hyphen-suffixed attribu
   // `other-value` as the canonical `name`/`value` and misclassify the property.
   const decoy = '<zeebe:property other-name="io.nanobpm.agentTask.autoSubscribe" other-value="false" />';
   assert.equal(serviceTaskOptsOutOfAutoSubscribe(decoy), false);
+});
+
+test('serviceTaskOptsOutOfAutoSubscribe is not fooled by a hyphen-suffixed property element', () => {
+  // The property scan anchors on `property(?=[\s/>])`, NOT `property\b`: a foreign
+  // `<zeebe:property-extra …>` carrying the same name/value attributes must NOT
+  // opt a task out of `--auto`.
+  const decoy =
+    '<zeebe:property-extra name="io.nanobpm.agentTask.autoSubscribe" value="false" />';
+  assert.equal(serviceTaskOptsOutOfAutoSubscribe(decoy), false);
+  // The exact element still opts out.
+  const real = '<zeebe:property name="io.nanobpm.agentTask.autoSubscribe" value="false" />';
+  assert.equal(serviceTaskOptsOutOfAutoSubscribe(real), true);
 });
 
 test('autoSubscribeOptOutElementIds collects opted-out service-task ids only', () => {

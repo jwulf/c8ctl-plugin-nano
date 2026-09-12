@@ -4256,7 +4256,7 @@ function provisionRepo({ envelope, token, runDir, runId, timeoutMs = 120_000, lo
     // The SHA may not be present under a shallow clone of the branch — fetch it
     // explicitly (best effort), then check it out (detached HEAD).
     const fetch = runGitFn([...credArgs(), 'fetch', '--no-tags', 'origin', commitSha], { cwd: workspaceDir, env: gitEnv, timeoutMs: provTimeoutMs() });
-    const co = runGitFn(['checkout', '--detach', commitSha], { cwd: workspaceDir, env: gitEnv });
+    const co = runGitFn(['checkout', '--detach', commitSha], { cwd: workspaceDir, env: gitEnv, timeoutMs: provTimeoutMs() });
     if (co.status !== 0) {
       // Combine the fetch + checkout output (the real reason often lives in the
       // fetch), and annotate a fetch timeout explicitly so a slow `git fetch
@@ -4297,11 +4297,11 @@ function provisionRepo({ envelope, token, runDir, runId, timeoutMs = 120_000, lo
   let baseCloneSnapshot = null;    // pre-fetch clone-time baseline SHA (null ⇒ none)
   let baseSnapshotUnknown = false; // remote query failed ⇒ baseline cannot be confirmed
   if (configuredBase && !String(configuredBase).startsWith('-')) {
-    const local = runGitFn(['rev-parse', '--verify', '--quiet', `refs/remotes/origin/${configuredBase}`], { cwd: workspaceDir, env: gitEnv });
+    const local = runGitFn(['rev-parse', '--verify', '--quiet', `refs/remotes/origin/${configuredBase}`], { cwd: workspaceDir, env: gitEnv, timeoutMs: provTimeoutMs() });
     if (local.status === 0 && (local.stdout || '').trim()) {
       baseCloneSnapshot = (local.stdout || '').trim();
     } else {
-      const ls = runGitFn([...credArgs(), 'ls-remote', '--heads', '--end-of-options', 'origin', `refs/heads/${configuredBase}`], { cwd: workspaceDir, env: gitEnv, timeoutMs: provTimeoutMs() });
+      const ls = runGitFn([...credArgs(), 'ls-remote', '--heads', 'origin', `refs/heads/${configuredBase}`], { cwd: workspaceDir, env: gitEnv, timeoutMs: provTimeoutMs() });
       if (ls.status === 0) {
         baseCloneSnapshot = ((ls.stdout || '').trim().split(/\s+/)[0] || '') || null; // branch → baseline; empty → tag/absent (skip)
       } else {
@@ -4356,8 +4356,8 @@ function provisionRepo({ envelope, token, runDir, runId, timeoutMs = 120_000, lo
   // is instead recorded as a PR comment (postAgentAttribution). Set via repo-
   // level config, which overrides global, so the identity is deterministic.
   const committer = resolveCommitterIdentity();
-  runGitFn(['config', 'user.name', committer.name], { cwd: workspaceDir, env: gitEnv });
-  runGitFn(['config', 'user.email', committer.email], { cwd: workspaceDir, env: gitEnv });
+  runGitFn(['config', 'user.name', committer.name], { cwd: workspaceDir, env: gitEnv, timeoutMs: provTimeoutMs() });
+  runGitFn(['config', 'user.email', committer.email], { cwd: workspaceDir, env: gitEnv, timeoutMs: provTimeoutMs() });
   // Config alone is not enough: git honours GIT_AUTHOR_*/GIT_COMMITTER_* OVER
   // user.name/user.email config, so a placeholder GIT_AUTHOR_EMAIL inherited from
   // the launch environment (e.g. `trial-merge@nano.local`) would still be stamped
@@ -4411,7 +4411,7 @@ function provisionRepo({ envelope, token, runDir, runId, timeoutMs = 120_000, lo
   // staleness fetch target 'refs/heads/heads/v1' instead of the real base (thread
   // 4344, mirroring finalizeGit's same fix). `symbolic-ref` returns the full,
   // unambiguous ref and exits nonzero for a DETACHED HEAD → symName '' → no branch.
-  const symref = runGitFn(['symbolic-ref', '-q', 'HEAD'], { cwd: workspaceDir, env: gitEnv });
+  const symref = runGitFn(['symbolic-ref', '-q', 'HEAD'], { cwd: workspaceDir, env: gitEnv, timeoutMs: provTimeoutMs() });
   const symRef = symref.status === 0 ? ((symref.stdout || '').trim()) : '';
   const symName = symRef.startsWith('refs/heads/') ? symRef.slice('refs/heads/'.length) : '';
   // A symbolic HEAD can still be UNBORN (freshly cloned EMPTY repo — a branch ref
@@ -4420,7 +4420,7 @@ function provisionRepo({ envelope, token, runDir, runId, timeoutMs = 120_000, lo
   // first commit. Separate the committed vs unborn case by whether HEAD resolves to
   // a commit, so an empty-repo job is not mis-classified as detached (which would
   // skip the push and silently strand that first commit, issue #231 work-loss).
-  const headHasCommit = runGitFn(['rev-parse', '--verify', '--quiet', 'HEAD'], { cwd: workspaceDir, env: gitEnv }).status === 0;
+  const headHasCommit = runGitFn(['rev-parse', '--verify', '--quiet', 'HEAD'], { cwd: workspaceDir, env: gitEnv, timeoutMs: provTimeoutMs() }).status === 0;
   const checkedOut = (symName && headHasCommit) ? symName : null; // null ⇒ detached HEAD or unborn branch
   const unbornBranch = (symName && !headHasCommit) ? symName : null;
   // The base we must never commit-and-push onto. Derive it ONLY from an explicit
@@ -4447,7 +4447,7 @@ function provisionRepo({ envelope, token, runDir, runId, timeoutMs = 120_000, lo
   // unaffected — it is exactly the branch case that must not be treated the same.
   let refBaseBranch = '';
   if (!checkedOut && !unbornBranch && branchName && !branchName.startsWith('-')) {
-    const rb = runGitFn(['rev-parse', '--verify', '--quiet', `refs/remotes/origin/${branchName}`], { cwd: workspaceDir, env: gitEnv });
+    const rb = runGitFn(['rev-parse', '--verify', '--quiet', `refs/remotes/origin/${branchName}`], { cwd: workspaceDir, env: gitEnv, timeoutMs: provTimeoutMs() });
     if (rb.status === 0 && (rb.stdout || '').trim()) refBaseBranch = branchName;
   }
   // A `repository.sha` clone with NO `repository.ref` (branchName empty) still lands
@@ -4457,7 +4457,7 @@ function provisionRepo({ envelope, token, runDir, runId, timeoutMs = 120_000, lo
   // ref to name it (thread 4378). Resolve the remote's default branch from
   // origin/HEAD so it too counts as a base the guard must refuse to commit onto.
   if (!refBaseBranch && !checkedOut && !unbornBranch && !branchName) {
-    const dh = runGitFn(['rev-parse', '--abbrev-ref', 'origin/HEAD'], { cwd: workspaceDir, env: gitEnv });
+    const dh = runGitFn(['rev-parse', '--abbrev-ref', 'origin/HEAD'], { cwd: workspaceDir, env: gitEnv, timeoutMs: provTimeoutMs() });
     if (dh.status === 0) {
       const def = (dh.stdout || '').trim().replace(/^origin\//, '');
       if (def && def !== 'HEAD' && !def.startsWith('-')) refBaseBranch = def;
@@ -4538,7 +4538,7 @@ function provisionRepo({ envelope, token, runDir, runId, timeoutMs = 120_000, lo
       if (def && def !== 'HEAD' && !def.startsWith('-')) remoteDefaultBranch = def;
     }
     if (!remoteDefaultBranch) {
-      const sr = runGitFn([...credArgs(), 'ls-remote', '--symref', '--end-of-options', 'origin', 'HEAD'], { cwd: workspaceDir, env: gitEnv, timeoutMs: provTimeoutMs() });
+      const sr = runGitFn([...credArgs(), 'ls-remote', '--symref', 'origin', 'HEAD'], { cwd: workspaceDir, env: gitEnv, timeoutMs: provTimeoutMs() });
       if (sr.status === 0) {
         const m = /^ref:\s+refs\/heads\/(\S+)\s+HEAD\b/m.exec(sr.stdout || '');
         if (m && m[1] && !m[1].startsWith('-')) remoteDefaultBranch = m[1];
@@ -4547,7 +4547,11 @@ function provisionRepo({ envelope, token, runDir, runId, timeoutMs = 120_000, lo
     if (!remoteDefaultBranch && !configuredBaseRef && !envelope.branch?.base) {
       // The create could still be the unverified default — but only if it already
       // exists remotely. Probe for it; a genuinely-new branch stays honored.
-      const ec = runGitFn([...credArgs(), 'ls-remote', '--heads', '--end-of-options', 'origin', explicitCreate], { cwd: workspaceDir, env: gitEnv, timeoutMs: provTimeoutMs() });
+      // `ls-remote` does NOT reliably accept `--end-of-options` on older git (<2.24),
+      // so it is omitted here; pass the FULLY-QUALIFIED `refs/heads/<create>` pattern
+      // (always 'r'-prefixed) instead of the bare name so a create beginning with '-'
+      // can never be parsed as an option — same injection-safety without the flag.
+      const ec = runGitFn([...credArgs(), 'ls-remote', '--heads', 'origin', `refs/heads/${explicitCreate}`], { cwd: workspaceDir, env: gitEnv, timeoutMs: provTimeoutMs() });
       if (ec.status === 0) {
         const wantRef = `refs/heads/${explicitCreate}`;
         const exists = (ec.stdout || '').split('\n').some((ln) => ln.split('\t')[1] === wantRef);
@@ -4627,7 +4631,7 @@ function provisionRepo({ envelope, token, runDir, runId, timeoutMs = 120_000, lo
       else log.debug?.(`provisionRepo${cs}: no branch.create; push disabled → working read-only on '${checkedOut}'`);
     }
   }
-  const sha = runGitFn(['rev-parse', 'HEAD'], { cwd: workspaceDir, env: gitEnv });
+  const sha = runGitFn(['rev-parse', 'HEAD'], { cwd: workspaceDir, env: gitEnv, timeoutMs: provTimeoutMs() });
   // Capture the base ref's SHA AT CLONE TIME (issue #229/#231 observability): the
   // harness runs arbitrary code between here and finalizeGit and can itself advance
   // `refs/remotes/origin/<base>` (e.g. its own `git fetch`), so finalizeGit's
@@ -4657,7 +4661,7 @@ function provisionRepo({ envelope, token, runDir, runId, timeoutMs = 120_000, lo
       // effectiveBase is the ref the CLONE itself landed on (no explicit
       // branch.base/baseRef) — its origin/<base> is present locally, so read the
       // clone-time tip directly.
-      const br = runGitFn(['rev-parse', '--verify', '--quiet', `refs/remotes/origin/${effectiveBase}`], { cwd: workspaceDir, env: gitEnv });
+      const br = runGitFn(['rev-parse', '--verify', '--quiet', `refs/remotes/origin/${effectiveBase}`], { cwd: workspaceDir, env: gitEnv, timeoutMs: provTimeoutMs() });
       baseCloneSha = br.status === 0 ? ((br.stdout || '').trim() || null) : null;
     }
   }
@@ -4817,11 +4821,13 @@ function computeRelayCloseReason(result, runCompleted, gitResult) {
 function finalizeGit({ workspaceDir, gitEnv, startSha, workingBranch, baseBranch: effectiveBase, baseCloneSha = null, baseBaselineUnknown = false, hasPrBranch, envelope, token, logger = null, corr = '', budgetMs = 0, provisioned = false, keepRuns = false, _runGit = null }) {
   const log = logger || getLogger(); // route observability through the injected logger (tests) or the host logger
   // Test-only seam: the late remote-reachability FILTER scans (movedStray /
-  // unpushedBranchCommits / final stranded) are routed through `lateScanGit` so a
-  // deterministic test can force ONE of them to fail (a timeout / corrupt object DB in
-  // production) while the earlier enumeration scans still succeed — otherwise these
-  // `--not --remotes` filters cannot be made to fail without an unfiltered version also
-  // failing. Defaults to the module `runGit`, so production behaviour is unchanged.
+  // unpushedBranchCommits / final stranded) AND the remote-tip VERIFICATION calls
+  // (ls-remote / fetch / merge-base in the pushFailed path) are routed through
+  // `lateScanGit` so a deterministic test can force ONE of them to fail (a timeout /
+  // corrupt object DB / deleted remote ref in production) while the earlier enumeration
+  // scans still succeed — otherwise these `--not --remotes` filters and the verification
+  // probes cannot be made to fail deterministically. Defaults to the module `runGit`, so
+  // production behaviour is unchanged.
   const lateScanGit = _runGit || runGit;
   const cs = corr ? ` [${corr}]` : ''; // #229 cross-channel correlation suffix
   const out = { branch: workingBranch, baseSha: startSha || null, headSha: null, commits: [], pushed: false, remote: null, pr: null };
@@ -5224,11 +5230,21 @@ function finalizeGit({ workspaceDir, gitEnv, startSha, workingBranch, baseBranch
       // the strand walk must exclude against THIS verified tip rather than trust the
       // stale remote-tracking ref (advisory: stranded list uses a stale remote ref).
       let verifiedRemoteTip = null;
+      // Did the remote-tip VERIFICATION itself fail (ls-remote could not query, or the
+      // remote tip is known-different but the follow-up fetch failed)? If so, the
+      // clone-time refs/remotes/origin/<branch> the strand filter falls back to is
+      // KNOWN-STALE, so the resulting strand list is best-effort — surface that via
+      // scanError below rather than presenting it as exact (advisory: fail-closed on
+      // remote-tip verification failure, not just the final rev-list).
+      let remoteTipVerifyFailed = false;
       if (out.headSha) {
         // Query the EXACT `refs/heads/<branch>` ref (with `--heads`) so a same-named
         // TAG at headSha can't spoof a "landed" head: a bare `<branch>` pattern makes
-        // `ls-remote` match tags too, which would falsely suppress pushFailed.
-        const ls = runGit([...credArgs(), 'ls-remote', '--heads', '--end-of-options', 'origin', `refs/heads/${workingBranch}`], { cwd: workspaceDir, env: gitEnv, timeoutMs: netTimeoutMs() });
+        // `ls-remote` match tags too, which would falsely suppress pushFailed. The
+        // fully-qualified `refs/heads/` pattern is always 'r'-prefixed, so no
+        // `--end-of-options` is needed (and `ls-remote` doesn't reliably accept it on
+        // git <2.24).
+        const ls = lateScanGit([...credArgs(), 'ls-remote', '--heads', 'origin', `refs/heads/${workingBranch}`], { cwd: workspaceDir, env: gitEnv, timeoutMs: netTimeoutMs() });
         if (ls.status === 0) {
           const remoteSha = ((ls.stdout || '').trim().split(/\s+/)[0] || '');
           if (remoteSha && remoteSha === out.headSha) {
@@ -5241,17 +5257,26 @@ function finalizeGit({ workspaceDir, gitEnv, startSha, workingBranch, baseBranch
             // objects are local, then test `headSha` is an ancestor of the remote
             // tip. Best-effort: a failed fetch/ancestry check just falls through to
             // the strand path (issue #231, suppressed advisory 4689).
-            const ff = runGit([...credArgs(), 'fetch', '--no-tags', '--end-of-options', 'origin', `refs/heads/${workingBranch}`], { cwd: workspaceDir, env: gitEnv, timeoutMs: netTimeoutMs() });
+            const ff = lateScanGit([...credArgs(), 'fetch', '--no-tags', '--end-of-options', 'origin', `refs/heads/${workingBranch}`], { cwd: workspaceDir, env: gitEnv, timeoutMs: netTimeoutMs() });
             if (ff.status === 0) {
               // The fetch made `remoteSha`'s object local (via FETCH_HEAD). Record it
               // as the verified remote tip so the strand walk can exclude commits
               // already reachable from the CURRENT remote tip even though the
               // clone-time refs/remotes/origin/<branch> was never refreshed.
               verifiedRemoteTip = remoteSha;
-              const anc = runGit(['merge-base', '--is-ancestor', out.headSha, remoteSha], { cwd: workspaceDir, env: gitEnv, timeoutMs: netTimeoutMs() });
+              const anc = lateScanGit(['merge-base', '--is-ancestor', out.headSha, remoteSha], { cwd: workspaceDir, env: gitEnv, timeoutMs: netTimeoutMs() });
               if (anc.status === 0) landed = true;
+            } else {
+              // The remote tip is known-DIFFERENT from headSha, but we could not fetch
+              // it to verify ancestry — so the strand filter cannot exclude against the
+              // real tip and must fall back to the STALE clone-time tracking ref.
+              remoteTipVerifyFailed = true;
             }
           }
+        } else {
+          // ls-remote could not query the remote at all — we cannot confirm whether the
+          // clone-time tracking ref is current, so the strand fallback is best-effort.
+          remoteTipVerifyFailed = true;
         }
       }
       if (landed) {
@@ -5282,6 +5307,11 @@ function finalizeGit({ workspaceDir, gitEnv, startSha, workingBranch, baseBranch
         // the VERIFIED remote tip whose object we fetched (advisory: stranded list uses
         // a stale remote-tracking ref).
         let stranded = [...new Set([...out.commits, ...branchCommits])];
+        // The strand filter excludes against the VERIFIED remote tip when we have it;
+        // without it (verification failed) it falls back to the clone-time tracking ref,
+        // which — when `remoteTipVerifyFailed` — is KNOWN-STALE, so the resulting list is
+        // best-effort even if the rev-list itself succeeds.
+        const strandFilterStale = !verifiedRemoteTip && remoteTipVerifyFailed;
         if (stranded.length > 0) {
           const strandExcludes = verifiedRemoteTip
             ? ['--not', '--remotes', verifiedRemoteTip]
@@ -5296,6 +5326,14 @@ function finalizeGit({ workspaceDir, gitEnv, startSha, workingBranch, baseBranch
           else noteScanFail('rev-list <stranded> --not --remotes', sr);
         }
         out.strandedCommits = stranded;
+        // Even when the rev-list SUCCEEDED, a failed remote-tip verification means it
+        // filtered against a stale clone-time ref — so the list is best-effort. Mark it
+        // scanError too (advisory: fail-closed on remote-tip VERIFICATION failure, not
+        // just the final rev-list).
+        if (strandFilterStale && !scanFailed) {
+          scanFailed = true;
+          scanFailedReason = 'remote-tip verification (ls-remote/fetch) failed — strand filter used stale clone-time tracking refs';
+        }
         if (scanFailed) out.scanError = out.scanError || scanFailedReason;
         // #229/#232 observability: elevate the push failure to a LOUD, correlated
         // signal. `hasPrBranch` (threaded from provisionRepo, which knows the branch

@@ -5,7 +5,7 @@ import { test } from 'node:test';
 import assert from 'node:assert/strict';
 import { spawn, spawnSync } from 'node:child_process';
 
-import { mkdtempSync, mkdirSync, writeFileSync, rmSync, existsSync, utimesSync, readdirSync } from 'node:fs';
+import { mkdtempSync, mkdirSync, writeFileSync, rmSync, existsSync, utimesSync, readdirSync, readFileSync } from 'node:fs';
 import { tmpdir } from 'node:os';
 import { join } from 'node:path';
 
@@ -1894,6 +1894,124 @@ test('provisionRepo bounds ALL provisioning git calls by ONE cumulative deadline
     assert.ok(timeouts[timeouts.length - 1] < timeouts[0], `later provisioning calls draw a SMALLER remaining budget (first=${timeouts[0]}, last=${timeouts[timeouts.length - 1]})`);
     // The timeouts are non-increasing (a single monotonic deadline, never reset).
     for (let i = 1; i < timeouts.length; i++) assert.ok(timeouts[i] <= timeouts[i - 1], `provisioning timeouts never RESET to the full budget (i=${i})`);
+  } finally {
+    rmSync(root, { recursive: true, force: true });
+  }
+});
+
+// ---- Round 4 (Copilot review of b14894c) ---------------------------------
+
+// Item #1: `--end-of-options` was added to git 2.24 and is NOT reliably accepted by
+// `ls-remote` on older hosts — a failed probe forces the fallback path to treat valid
+// work branches as base-like and cut a spurious fallback branch. The refs it queries
+// (`HEAD`, `refs/heads/<x>`) are always 'r'-prefixed, so the flag buys no
+// injection-safety on ls-remote. Guard: NO `ls-remote` invocation in the source may
+// carry `--end-of-options` (while `fetch`/`rev-list` still may).
+test('no git ls-remote invocation carries --end-of-options (Copilot advisory: ls-remote rejects --end-of-options on git <2.24)', () => {
+  const src = readFileSync(new URL('./c8ctl-plugin.js', import.meta.url), 'utf8');
+  // Match a `ls-remote` call and everything up to the closing `]` of its arg array.
+  const re = /'ls-remote'[\s\S]*?\]/g;
+  let m;
+  let checked = 0;
+  while ((m = re.exec(src)) !== null) {
+    checked += 1;
+    assert.equal(/--end-of-options/.test(m[0]), false, `an ls-remote call must not pass --end-of-options: ${m[0].slice(0, 120)}…`);
+  }
+  assert.ok(checked >= 2, `the source-scan actually inspected the ls-remote calls (found ${checked})`);
+  // Sanity: fetch/rev-list DO still legitimately use --end-of-options somewhere.
+  assert.ok(src.includes('--end-of-options'), 'the flag is still used (on fetch/rev-list), the guard only forbids it on ls-remote');
+});
+
+// Item #2: In the non-ff rejected-push path, the strand list is filtered against the
+// VERIFIED remote tip; when that verification (ls-remote / fetch / ancestry) FAILS,
+// `verifiedRemoteTip` stays null and the filter falls back to the STALE clone-time
+// tracking ref. Without the fix that best-effort list is presented as EXACT (no
+// scanError). The fix marks it scanError so consumers can tell exact from best-effort.
+test('finalizeGit fails CLOSED when remote-tip VERIFICATION fails on a non-ff reject — strand filter fell back to stale refs, so scanError flags it best-effort (Copilot advisory: fail-closed on remote-tip verification failure)', { skip: !gitOk }, () => {
+  const { root, origin } = makeOriginRepo();
+  const runDir = mkdtempSync(join(root, 'run-'));
+  try {
+    const envelope = {
+      schemaVersion: 1,
+      repository: { provider: 'github', url: origin, submodules: false },
+      branch: { base: 'main', create: 'main', push: true },
+      setup: { commands: [], env: {}, secretRefs: [] },
+      task: { allowPr: false },
+    };
+    const prov = provisionRepo({ envelope, token: null, runDir });
+    g(['checkout', '-q', '-B', 'main', 'origin/main'], prov.workspaceDir);
+    const baseSha = g(['rev-parse', 'HEAD'], prov.workspaceDir).trim();
+    writeFileSync(join(prov.workspaceDir, 'AGENT.txt'), 'agent change\n');
+    g(['add', '-A'], prov.workspaceDir);
+    g(['-c', 'user.name=nano', '-c', 'user.email=nano@example.com', 'commit', '-q', '-m', 'agent: add AGENT.txt'], prov.workspaceDir);
+    // Rival advance → our push is a non-fast-forward reject → the verification block runs.
+    advanceOrigin(root, origin, 'main');
+
+    // Force the remote-tip VERIFICATION ls-remote to fail (a deleted ref / network
+    // flake in production) while EVERY OTHER git call — including the final strand
+    // rev-list — succeeds. So the rev-list itself does NOT fail; only verification does,
+    // and the strand walk uses the stale clone-time refs/remotes/origin/main.
+    let forcedVerifyFail = false;
+    const failingRunGit = (args, opts) => {
+      if (args.includes('ls-remote')) {
+        forcedVerifyFail = true;
+        return { status: 128, stdout: '', stderr: 'fatal: forced ls-remote failure', signal: null, timedOut: false, timeoutMs: opts?.timeoutMs };
+      }
+      return runGit(args, opts);
+    };
+
+    const out = finalizeGit({
+      workspaceDir: prov.workspaceDir,
+      gitEnv: prov.gitEnv,
+      startSha: baseSha,
+      workingBranch: 'main',
+      hasPrBranch: false,
+      envelope,
+      token: null,
+      logger: { warn: () => {}, error: () => {}, info: () => {}, debug: () => {} },
+      keepRuns: true,
+      _runGit: failingRunGit,
+    });
+    assert.equal(forcedVerifyFail, true, 'the injected runner actually intercepted the verification ls-remote');
+    assert.equal(out.pushed, false, 'the non-ff push is rejected');
+    assert.equal(out.pushFailed, true, 'a rejected push is a preserved failure');
+    assert.ok(out.scanError, 'a failed remote-tip verification flags the strand list best-effort via scanError');
+    assert.match(out.scanError, /remote-tip verification/, 'scanError names the remote-tip verification failure');
+    assert.ok(Array.isArray(out.strandedCommits) && out.strandedCommits.length > 0, 'the best-effort strand list is still surfaced');
+    assert.equal(shouldPreserveRunDir(out), true, 'the workspace is preserved for recovery');
+  } finally {
+    rmSync(root, { recursive: true, force: true });
+  }
+});
+
+// Item #3: the shared provisioning deadline must bind EVERY provisioning git call —
+// including the local `checkout`/`rev-parse`/`config`/`symbolic-ref` calls that
+// previously omitted `timeoutMs` and silently fell back to the independent 120s
+// default. Assert NO recorded provisioning git call is missing a numeric timeout, and
+// that a local `checkout` call is among them (proving the previously-unbounded calls
+// now draw from the budget).
+test('provisionRepo binds EVERY git call to the shared budget — no local call (checkout/rev-parse/config) escapes with the independent default (Copilot advisory: budget hole on checkout)', { skip: !gitOk }, () => {
+  const { root, origin } = makeOriginRepo();
+  const runDir = mkdtempSync(join(root, 'run-'));
+  try {
+    const envelope = {
+      schemaVersion: 1,
+      repository: { provider: 'github', url: origin, baseRef: 'main', submodules: false },
+      branch: { base: 'main', create: 'feat/x', push: true },
+      setup: { commands: [], env: {}, secretRefs: [] },
+      task: { allowPr: false },
+    };
+    const calls = [];
+    const recordingRunGit = (args, opts) => {
+      calls.push({ sub: args.find((a) => !a.startsWith('-') && !a.startsWith('http')) || args[0], hasTimeout: typeof opts?.timeoutMs === 'number' });
+      return runGit(args, opts);
+    };
+    provisionRepo({ envelope, token: null, runDir, timeoutMs: 120_000, _runGit: recordingRunGit });
+    // Every single provisioning git call must be budget-bound.
+    for (const c of calls) assert.equal(c.hasTimeout, true, `provisioning git call '${c.sub}' must carry a budget timeout, not fall back to the 120s default`);
+    // The previously-unbounded LOCAL calls are actually exercised (so the guard bites).
+    assert.ok(calls.some((c) => c.sub === 'checkout'), 'a checkout call was made and is budget-bound');
+    assert.ok(calls.some((c) => c.sub === 'rev-parse' || c.sub === 'symbolic-ref' || c.sub === 'config'), 'a local rev-parse/symbolic-ref/config call was made and is budget-bound');
   } finally {
     rmSync(root, { recursive: true, force: true });
   }

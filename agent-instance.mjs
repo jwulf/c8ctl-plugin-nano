@@ -1295,17 +1295,21 @@ export function createAgentInstanceProducer(opts = {}) {
         if (creating) {
           await awaitCreateBounded();
         }
-        // Honor the `maxInFlightCreates` circuit breaker here too (issue #230): this
-        // last-chance attempt calls startCreate() directly (bypassing maybeStartCreate's
-        // guard), so without this check it could launch one request beyond the cap when
-        // retired-but-hung POSTs are still outstanding — the exact outage the cap is
-        // meant to contain. When the cap is already saturated the engine is hung and a
-        // final POST would only hang and be retired too, so we skip it and fall through
-        // to the un-minted drain/warn path rather than pile on. When there is spare
-        // capacity (the common case: earlier attempts settled, so createInFlight is 0)
-        // the final attempt proceeds normally.
-        const capSaturated = maxInFlightCreates > 0 && createInFlight >= maxInFlightCreates;
-        if (!agentInstanceKey && !creating && !capSaturated) {
+        // The `maxInFlightCreates` circuit breaker (issue #230) deliberately gates
+        // HOT-PATH retries so a storm of overlapping create POSTs can't pile up during
+        // an engine outage. But this is complete()'s ONE terminal last-chance attempt —
+        // the durability backstop that lets at least the configuration turn + terminal
+        // status survive when the create finally becomes possible. It runs at most ONCE
+        // per job, so it is NOT a retry storm. Skipping it because retired-but-hung
+        // POSTs still saturate the cap would strand a run with NO durable record exactly
+        // when the engine recovers: the cap count is stale (those POSTs are uncancellable
+        // and may never settle), so "saturated" does not prove the engine is still hung —
+        // a final POST against a recovered engine would SUCCEED, not hang. So this single
+        // attempt intentionally BYPASSES the cap: a bounded, one-time +1 overshoot (itself
+        // bounded by awaitCreateBounded and retired if it hangs), never a storm. This is
+        // the fix for the "cap permanently stops recovery / complete() skips its final
+        // attempt" case (issue #230): the terminal durability attempt is always made once.
+        if (!agentInstanceKey && !creating) {
           startCreate({ final: true });
           await awaitCreateBounded();
         }
@@ -1363,10 +1367,15 @@ export function createAgentInstanceProducer(opts = {}) {
         // delayed append lands, reordering or losing that turn (issue #230). Instead,
         // SERIALIZE the terminal transition behind the queue: enqueue it so it runs
         // only after every pending append settles (each is individually bounded, so the
-        // queue keeps making progress even under an outage). We can no longer observe /
-        // retry its outcome from here, so surface that reconciliation may be needed, and
-        // return without blocking job settlement — the terminal update lands in the
-        // background once the drain catches up (best-effort, correctly ordered).
+        // queue keeps making progress even under an outage). We CANNOT observe or retry
+        // its outcome from here, and the caller settles the job the instant complete()
+        // returns (c8ctl-plugin.js) — so by the time the drain catches up this background
+        // write carries a now-VOID jobLease and is expected to be FENCE-REJECTED. We
+        // therefore do NOT rely on it landing: terminalization on this path is effectively
+        // ABANDONED and MANUAL RECONCILIATION is REQUIRED (surfaced below). The enqueue is
+        // a best-effort last try only — it wins solely in the rare case settlement is
+        // delayed long enough for the drain to catch up first. Return without blocking
+        // job settlement.
         enqueue(async () => {
           try {
             await callWithin(
@@ -1402,8 +1411,9 @@ export function createAgentInstanceProducer(opts = {}) {
           `AgentInstance ${agentInstanceKey}: history drain did not settle within ` +
             `${finalizeTimeoutMs}ms — terminal COMPLETED update SERIALIZED behind the ` +
             `pending appends (best-effort, ordered) rather than racing them; its outcome ` +
-            `is not observed here, so MANUAL RECONCILIATION may be required if the drain ` +
-            `never catches up ${correlation()}.`,
+            `is not observed here and the job settles on return, so this background write ` +
+            `is expected to be fence-rejected once its lease is void — MANUAL ` +
+            `RECONCILIATION REQUIRED (terminal status NOT confirmed) ${correlation()}.`,
         );
         // Emit the turn counter on this path too (issue #229/#232): the aggregate
         // append timeout is the hardest transcript failure to diagnose, so record how

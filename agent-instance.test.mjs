@@ -1134,33 +1134,45 @@ test('a hung FINAL last-chance create is retired with the no-further-retry diagn
     'the final-attempt retirement does not promise a hot-path retry that cannot happen');
 });
 
-test('complete()\'s FINAL last-chance create honors the maxInFlightCreates cap — it does not launch a request beyond the cap when retired POSTs are still in flight (issue #230)', async () => {
-  // The circuit breaker in maybeStartCreate() bounds retirement-driven retries, but the
-  // final last-chance attempt calls startCreate() directly. With the cap saturated by a
-  // retired-but-hung POST, that direct call would launch one request beyond the cap —
-  // the exact outage the cap contains. complete() must honor the cap here too: skip the
-  // final attempt (the engine is hung; a final POST would only hang too) and fall through
-  // to the un-minted drain/warn path.
+test('complete()\'s FINAL last-chance create BYPASSES the maxInFlightCreates cap — the terminal durability attempt is always made once, even when retired POSTs still saturate the cap (issue #230)', async () => {
+  // The circuit breaker in maybeStartCreate() bounds HOT-PATH retirement-driven retries
+  // so overlapping create POSTs can't storm during an outage. But complete()'s ONE final
+  // last-chance attempt is the durability backstop, and it runs at most once per job — it
+  // is NOT a storm. A retired-but-hung POST that keeps the cap "saturated" is uncancellable
+  // and may never settle, so the stale count does NOT prove the engine is still hung: if
+  // the engine has recovered, the final POST would SUCCEED. Skipping it on a stale count
+  // would strand a recoverable run with no durable record (the "cap permanently stops
+  // recovery" case). So the final attempt bypasses the cap: a bounded, one-time +1
+  // overshoot, always attempted once.
   const warnings = [];
   const logger = { info() {}, warn: (m) => warnings.push(m), debug() {} };
+  let createCall = 0;
   const client = {
     calls: { create: [], update: [] },
-    createAgentInstance: (req) => { client.calls.create.push(req); return new Promise(() => {}); }, // hangs, stays in flight
+    createAgentInstance: (req) => {
+      client.calls.create.push(req);
+      createCall += 1;
+      if (createCall === 1) return new Promise(() => {}); // attempt 1 hangs, stays in flight (saturates cap)
+      return Promise.resolve({ agentInstanceKey: 'AGENT-FINAL' }); // recovered engine: final attempt mints
+    },
     updateAgentInstance: async (req) => { client.calls.update.push(req); return { createdHistory: [] }; },
   };
   const p = makeProducer(client, { logger, finalizeTimeoutMs: 20, maxInFlightCreates: 1 });
   await p.activate();               // attempt 1 hangs → retired, but its POST is still in flight (count = 1 = cap)
   assert.equal(client.calls.create.length, 1, 'one (hung, still in-flight) attempt after activate');
   await p.complete(true);
-  // The cap was saturated (1 in-flight == cap), so the final attempt was NOT started —
-  // otherwise create.length would be 2, one beyond the cap.
-  assert.equal(client.calls.create.length, 1, 'the saturated cap blocked the final last-chance attempt');
-  assert.equal(p.active, false, 'the instance never minted');
+  // Despite the cap being saturated by the hung attempt-1 POST, complete() still made its
+  // single terminal attempt (create.length === 2) — and here the engine had recovered, so
+  // it minted the instance and drove the terminal COMPLETED, exactly the recovery the old
+  // cap-honoring behavior would have wrongly skipped.
+  assert.equal(client.calls.create.length, 2, 'the final last-chance attempt was made once, bypassing the saturated cap');
+  assert.equal(p.active, true, 'the final attempt minted the instance on the recovered engine');
   assert.ok(
-    warnings.some((m) => /no durable AgentInstance for this job/.test(m)),
-    'complete() fell through to the un-minted drain/warn path',
+    client.calls.update.some((u) => u.status === 'COMPLETED'),
+    'the terminal COMPLETED update ran after the final attempt minted the instance',
   );
 });
+
 
 test('complete() bounds the AGGREGATE append drain and SERIALIZES the terminal COMPLETED behind pending appends — it neither waits for every hung append serially nor races the terminal update ahead of them (issue #230)', async () => {
   // Each append is individually bounded, but the queue is serialized: N hung appends

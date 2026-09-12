@@ -55,6 +55,17 @@ export const RESUME_CONTEXT_CAP_CHARS = 48_000;
 // failure.
 export const RESUME_READ_TIMEOUT_MS = 10_000;
 
+// The host facade's agent-instance reads (`searchAgentInstances`,
+// `searchAgentInstanceHistory`, the get fallbacks) are EVENTUALLY CONSISTENT and take a
+// MANDATORY second `{ consistency }` argument — the real
+// `@camunda8/orchestration-cluster-api` client THROWS synchronously
+// (`Missing consistency options …`) when it is omitted. Without it every reactivation
+// would silently fall into the best-effort catch below and cold-run. We bound the
+// propagation wait so a read still settles well within `RESUME_READ_TIMEOUT_MS` (which
+// fences the whole probe). Passed as a trailing arg the in-memory fakes simply ignore.
+export const RESUME_READ_CONSISTENCY_MS = 5_000;
+const READ_CONSISTENCY = { consistency: { waitUpToMs: RESUME_READ_CONSISTENCY_MS } };
+
 // Race a promise against a deadline; rejects with a tagged timeout error so the
 // best-effort caller degrades to a cold rerun rather than blocking forever. The
 // deadline timer is cleared as soon as the read settles (win or lose), so it never
@@ -190,7 +201,14 @@ export function renderHistoryTurns(turns, { capChars = RESUME_CONTEXT_CAP_CHARS 
 //      `agentInstanceKey`. NOTE: `searchAgentInstanceHistory` lives HERE, not in a
 //      by-element list — its real signature takes an `agentInstanceKey` (the element
 //      instance is only an optional history *filter*), so it cannot be correlated with
-//      a bare element key and MUST follow an instance resolution.
+//      a bare element key and MUST follow an instance resolution. We DO pass the current
+//      `elementInstanceKey` in the history `filter` so a shared AgentInstance that spans
+//      SIBLING element instances never bleeds another element's turns into this resume
+//      (wrong continuation / cross-job exposure).
+//
+// Every one of these reads is eventually consistent and gets the mandatory
+// `READ_CONSISTENCY` trailing argument (see its definition) — omitting it makes the real
+// facade client throw and silently cold-run.
 const SEARCH_METHODS = ['searchAgentInstances', 'queryAgentInstances', 'searchAgentInstance'];
 const GET_METHODS = ['getAgentInstanceByElementInstance'];
 const HISTORY_METHODS = ['searchAgentInstanceHistory', 'getAgentInstanceHistory', 'getAgentHistory', 'searchAgentHistory'];
@@ -252,7 +270,7 @@ async function defaultRead({ camunda, elementInstanceKey }) {
   for (const m of SEARCH_METHODS) {
     if (typeof camunda[m] !== 'function') continue;
     try {
-      instances = normalizeInstances(await camunda[m]({ filter: { elementInstanceKeys: [eik] } }));
+      instances = normalizeInstances(await camunda[m]({ filter: { elementInstanceKeys: [eik] } }, READ_CONSISTENCY));
     } catch { instances = []; }
     if (instances.length) break;
   }
@@ -261,7 +279,7 @@ async function defaultRead({ camunda, elementInstanceKey }) {
     for (const m of GET_METHODS) {
       if (typeof camunda[m] !== 'function') continue;
       try {
-        instances = normalizeInstances(await camunda[m]({ elementInstanceKey: eik }));
+        instances = normalizeInstances(await camunda[m]({ elementInstanceKey: eik }, READ_CONSISTENCY));
       } catch { instances = []; }
       if (instances.length) break;
     }
@@ -288,7 +306,7 @@ async function defaultRead({ camunda, elementInstanceKey }) {
       for (const m of HISTORY_METHODS) {
         if (typeof camunda[m] !== 'function') continue;
         try {
-          turns = normalizeHistory(await camunda[m]({ agentInstanceKey: String(aik) }));
+          turns = normalizeHistory(await camunda[m]({ agentInstanceKey: String(aik), filter: { elementInstanceKey: eik } }, READ_CONSISTENCY));
         } catch { turns = []; }
         if (turns.length) break;
       }
@@ -345,26 +363,46 @@ export async function readPriorTranscript(opts = {}) {
 
 /**
  * Build the resume-seeded prompt: the agent's ORIGINAL task prompt, preceded by a
- * continuation preamble that hands it the prior transcript and the recovery-scope
- * contract (committed work is on the branch; uncommitted deltas are lost). The
- * original instruction is preserved verbatim so the task itself is unchanged — only
- * framed as a continuation.
+ * continuation preamble that hands it the prior transcript and a recovery-scope
+ * contract that DEPENDS on `hasPushedBranch`: with a pushed branch, committed work is on
+ * the branch (uncommitted deltas are lost); without one, the throwaway workspace is gone
+ * and the transcript is the only recoverable state. The original instruction is
+ * preserved verbatim so the task itself is unchanged — only framed as a continuation.
  */
-export function buildResumePrompt({ basePrompt, transcriptText }) {
+export function buildResumePrompt({ basePrompt, transcriptText, hasPushedBranch = true }) {
   const base = typeof basePrompt === 'string' ? basePrompt : '';
   const transcript = typeof transcriptText === 'string' ? transcriptText : '';
+  // The recovery guidance MUST match what is actually recoverable. Only a job that
+  // pushes to a repository branch has durable committed work to check out; a repo-less
+  // job, `branch.push=false`, (or a push that was rejected) leaves the prior run's
+  // THROWAWAY workspace as the only copy — which is gone after the re-activation, so
+  // telling that agent to "check out the pushed branch" points it at files that do not
+  // exist. In that case the transcript is the only recoverable state.
+  const recovery = hasPushedBranch
+    ? [
+        'Recovering the previous work:',
+        '- COMMITTED work is durable and already on your pushed branch — check out the',
+        '  existing branch and continue from its last commit (inspect `git log` / the open',
+        '  PR to see what already landed).',
+        '- UNCOMMITTED working-tree changes from the previous run were NOT preserved across',
+        '  the re-activation — treat them as lost and re-derive anything not yet committed.',
+      ]
+    : [
+        'Recovering the previous work:',
+        '- There is NO pushed branch to recover files from — the previous run used a',
+        '  throwaway workspace that was NOT preserved across the re-activation, so its',
+        '  working tree (both COMMITTED and UNCOMMITTED changes) is gone.',
+        '- The TRANSCRIPT below is the ONLY record of the prior work: use it to avoid',
+        '  repeating completed steps and external side effects, and re-derive any file',
+        '  changes you still need.',
+      ];
   const preamble = [
     'You are RESUMING a job that a previous agent instance already started — this is a',
     'continuation, NOT a fresh start. The engine re-activated the job (at-least-once',
     'delivery); do NOT repeat steps the previous instance already completed, and do NOT',
     'duplicate external side effects (comments, pushes, PRs) it already performed.',
     '',
-    'Recovering the previous work:',
-    '- COMMITTED work is durable and already on your pushed branch — check out the',
-    '  existing branch and continue from its last commit (inspect `git log` / the open',
-    '  PR to see what already landed).',
-    '- UNCOMMITTED working-tree changes from the previous run were NOT preserved across',
-    '  the re-activation — treat them as lost and re-derive anything not yet committed.',
+    ...recovery,
     '',
     'Transcript of the previous instance (most recent turns; earlier context may be',
     'truncated) — use it to understand what was already done and continue from there:',
@@ -395,8 +433,19 @@ export function seedResumeEnvelope(envelope, transcriptText) {
   // run. Guard on the prompt being a non-blank string, not merely on `task` existing.
   if (typeof envelope.task.prompt !== 'string' || envelope.task.prompt.trim() === '') return envelope;
   const basePrompt = envelope.task.prompt;
-  const seeded = buildResumePrompt({ basePrompt, transcriptText });
+  const seeded = buildResumePrompt({ basePrompt, transcriptText, hasPushedBranch: envelopeHasPushedBranch(envelope) });
   return { ...envelope, task: { ...envelope.task, prompt: seeded } };
+}
+
+// Does this envelope declare a repository branch the prior run would have PUSHED, so
+// committed work is durably recoverable from it? A repo-less job (no `repository.url`)
+// or one with `branch.push === false` leaves the throwaway workspace as the only copy —
+// the recovery preamble must then NOT promise a pushed branch to check out. (A push that
+// was *rejected* at runtime is not knowable here; the declared intent is the best signal
+// available at seed time.)
+function envelopeHasPushedBranch(envelope) {
+  const repo = envelope?.repository;
+  return isPlainObject(repo) && isNonBlank(repo.url) && envelope?.branch?.push !== false;
 }
 
 /** Is engine-transcript resume disabled by the kill switch (`NANO_AGENT_RESUME=off`)? */

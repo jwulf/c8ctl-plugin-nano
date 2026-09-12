@@ -224,6 +224,43 @@ test('seedResumeEnvelope: returns the original when there is no task prompt to s
   assert.equal(seedResumeEnvelope(nonStringPrompt, 'transcript'), nonStringPrompt, 'non-string prompt → unchanged');
 });
 
+test('seedResumeEnvelope: recovery text is conditional on a declared pushed branch', () => {
+  // A pushed-branch job is told committed work is on the branch; a repo-less or
+  // push-disabled job is told the throwaway workspace is gone and the transcript is the
+  // only recoverable state (never pointed at a branch that does not exist).
+  const pushed = seedResumeEnvelope({ task: { prompt: 'do it' }, repository: { url: 'x' }, branch: { push: true } }, 'T');
+  assert.ok(pushed.task.prompt.includes('pushed branch'), 'pushed-branch job → branch recovery text');
+  assert.ok(pushed.task.prompt.includes('UNCOMMITTED'), 'still documents the uncommitted-loss scope');
+
+  const repoLess = seedResumeEnvelope({ task: { prompt: 'do it' } }, 'T');
+  assert.ok(repoLess.task.prompt.includes('ONLY record'), 'repo-less job → transcript-only recovery text');
+  assert.ok(!repoLess.task.prompt.includes('check out the'), 'no pushed-branch instruction for a repo-less job');
+
+  const noPush = seedResumeEnvelope({ task: { prompt: 'do it' }, repository: { url: 'x' }, branch: { push: false } }, 'T');
+  assert.ok(noPush.task.prompt.includes('ONLY record'), 'branch.push=false → transcript-only recovery text');
+});
+
+test('readPriorTranscript: passes the mandatory consistency option and scopes history to THIS element', async () => {
+  // The real @camunda8 facade THROWS synchronously without `{ consistency }` on these
+  // eventually-consistent reads; the fakes mirror that guard so a regression that drops
+  // the option is caught here instead of silently cold-running against the real client.
+  // The history read also carries the current `elementInstanceKey` filter so a shared
+  // AgentInstance spanning siblings never bleeds another element's turns in.
+  const guard = (ec) => { if (!ec || !ec.consistency) throw new Error('Missing consistency options'); };
+  const camunda = {
+    searchAgentInstances: async (_q, ec) => { guard(ec); return { items: [{ elementInstanceKeys: ['77', 'sib-9'], agentInstanceKey: 'ai-77' }] }; },
+    searchAgentInstanceHistory: async (q, ec) => {
+      guard(ec);
+      assert.equal(q.agentInstanceKey, 'ai-77', 'history keyed by the resolved agentInstanceKey');
+      assert.equal(q.filter.elementInstanceKey, '77', 'history is scoped to THIS element instance');
+      return { items: [textTurn('ASSISTANT', 'scoped work')] };
+    },
+  };
+  const got = await readPriorTranscript({ camunda, job: { elementInstanceKey: '77' } });
+  assert.ok(got, 'resumes when the reads receive their consistency option');
+  assert.ok(got.text.includes('scoped work'));
+});
+
 test('renderHistoryTurns: an empty TOOL_RESULT renders an explicit result, never a re-invocation', () => {
   // A side-effecting tool that returned nothing yields a TOOL_RESULT with empty
   // content but retained toolCalls. It must NOT render as a `[tool-call: ...]` line

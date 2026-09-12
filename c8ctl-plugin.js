@@ -9106,14 +9106,19 @@ async function workAgent(req, flags) {
         // re-delivery into a continuation, not a duplicate. The transcript carries the
         // reasoning/steps so the resumed agent doesn't repeat completed work.
         //
-        // COMMITTED work is recovered from the pushed branch when this activation
-        // provisions the SAME branch the prior one pushed — which holds for envelopes
-        // carrying a stable branch identity (`repository.ref` / `branch.create`, the
-        // real agent-work path). When neither is set the provisioning layer cuts an
-        // ephemeral `nano/agent-work/<base>-<runId>` fallback that differs per
-        // activation, so that case degrades to a transcript-only continuation (a full
-        // prior-branch resolve+checkout is the later isolated-context increment);
-        // uncommitted deltas from the prior run are not recovered in either case.
+        // COMMITTED work is recovered from the pushed branch only when this activation
+        // provisions the SAME branch the prior one pushed. That holds when the envelope
+        // carries a STABLE branch identity: an explicit `branch.create`, or a
+        // `repository.ref` that names a NON-base branch (which `provisionRepo` checks out
+        // and commits on directly). It does NOT hold for a plain push-enabled job whose
+        // ref is base-like and sets no `branch.create`: `provisionRepo` then cuts a fresh
+        // per-activation `nano/agent-work/<base>-<runId>` fallback, so the prior commits
+        // are on a DIFFERENT branch and are not checked out — that case (and any repo-less
+        // / `branch.push=false` job) degrades to a transcript-only continuation, which the
+        // seeded prompt states honestly (`seedResumeEnvelope` gates the recovery text on a
+        // declared pushed branch). Carrying the prior `workingBranch` across reactivations
+        // (or a full prior-branch resolve+checkout) is the later isolated-context
+        // increment; uncommitted deltas from the prior run are not recovered in any case.
         //
         // The gating + best-effort read/seed live in `resolveEffectiveEnvelope`
         // (unit-tested) so this wiring stays a thin call; a read failure /

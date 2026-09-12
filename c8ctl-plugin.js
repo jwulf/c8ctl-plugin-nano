@@ -4157,11 +4157,22 @@ function githubCloneToken({ provider, authRef, secretResolver, ghAuthToken = ghA
 // Clone repo into <runDir>/workspace and check out / create the working branch.
 // Returns { workspaceDir, gitEnv, startSha, workingBranch, remote }. Throws a
 // ProvisionError (token-redacted) on any git failure so the caller can shed.
-function provisionRepo({ envelope, token, runDir, runId, timeoutMs = 120_000, logger = null, corr = '', _runGit = null }) {
+function provisionRepo({ envelope, token, runDir, runId, timeoutMs = 120_000, logger = null, corr = '', abortSignal = null, _runGit = null }) {
   // Test-only seam mirroring finalizeGit: route every git call through `runGitFn` so a
   // deterministic test can observe the per-call timeouts drawn from the shared
   // provisioning budget below. Defaults to the module `runGit` (production unchanged).
   const runGitFn = _runGit || runGit;
+  // #222: the git ops below are blocking spawnSync calls that cannot observe an
+  // AbortSignal mid-call, so provisioning is made signal-aware by rechecking
+  // BETWEEN operations: if a lock-loss race won, bail before the NEXT side effect
+  // (the sha fetch/checkout, base fetch, or config writes) instead of pressing on.
+  // The throw is a ProvisionError so the callsite's existing catch reaps the clone;
+  // that catch rechecks the same signal and returns WITHOUT settling.
+  const throwIfAborted = (stage) => {
+    if (abortSignal && abortSignal.aborted === true) {
+      throw new ProvisionError(`provisioning aborted during ${stage} — lease loss/force-stop won the race`);
+    }
+  };
   const repo = envelope.repository;
   if (!repo || !repo.url) throw new ProvisionError('repository.url is required to provision a workspace');
   // #229: correlation suffix so git provisioning lines can be joined to the job /
@@ -4252,6 +4263,12 @@ function provisionRepo({ envelope, token, runDir, runId, timeoutMs = 120_000, lo
     throw new ProvisionError(`git clone failed: ${gitErrorDetail(clone, token)}`);
   }
 
+  // #222: the clone (the dominant blocking op and the first repo side effect) is
+  // done. Recheck the abort signal before the remaining side effects/network ops
+  // (sha fetch+checkout, base fetch, config writes) so a lock-loss race that won
+  // during the clone stops here rather than compounding the wasted work.
+  throwIfAborted('post-clone');
+
   if (isSha) {
     // The SHA may not be present under a shallow clone of the branch — fetch it
     // explicitly (best effort), then check it out (detached HEAD).
@@ -4265,6 +4282,9 @@ function provisionRepo({ envelope, token, runDir, runId, timeoutMs = 120_000, lo
       throw new ProvisionError(`git checkout ${commitSha} failed: ${gitErrorDetail([fetch, co], token, 300)}${fetchNote}`);
     }
   }
+
+  // #222: recheck before the base-fetch network probes (another blocking op set).
+  throwIfAborted('pre-base-fetch');
 
   // Optional base fetch: with a single-branch/shallow clone the head has no base
   // and no merge-base, so a naive `git diff <base>` fails. When a base branch or
@@ -8996,6 +9016,15 @@ async function workAgent(req, flags) {
       try {
         logger.info(`[${jobType}] job ${job.jobKey} (instance ${job.processInstanceKey ?? '-'}) → ${buildAgentCommandLine(profile.command, effectiveArgs)}`);
 
+        // #222: setup-abort gate (stage: prompt). If a lock-loss race already won
+        // before setup begins, stop now — before the prompt/AgentInstance fetch,
+        // repo provisioning, or the first transcript event. Return WITHOUT settling
+        // (the lease is lost / the job is being yielded), so no husk is created.
+        // This gate sits AHEAD of every pre-setup failure/settlement branch (the
+        // disk-budget shed below included): an already-aborted run must return
+        // without settling rather than race the force-stop yield with a fail-settle.
+        if (checkSetupAbort(abortSignal, { jobType, jobKey: job.jobKey, stage: 'prompt', logger })) return;
+
         // Disk-budget admission shed: if the engine data root is below the free
         // floor, don't start a container — fail (retryable) so work sheds until
         // the reaper/host frees space.
@@ -9009,12 +9038,6 @@ async function workAgent(req, flags) {
           }
         }
 
-        // #222: setup-abort gate (stage: prompt). If a lock-loss race already won
-        // before setup begins, stop now — before the prompt/AgentInstance fetch,
-        // repo provisioning, or the first transcript event. Return WITHOUT settling
-        // (the lease is lost / the job is being yielded), so no husk is created.
-        if (checkSetupAbort(abortSignal, { jobType, jobKey: job.jobKey, stage: 'prompt', logger })) return;
-
         // Live agent prompt (issue #63): if the job declares a `linkName: prompt`
         // linked resource, fetch its LATEST deployed content and use it as the
         // base prompt (it wins over the header-baked task.prompt). A declared
@@ -9022,6 +9045,7 @@ async function workAgent(req, flags) {
         // (retryable) rather than run an agent with an empty prompt.
         let promptResourceKey = null;
         let basePromptOverride;
+        let promptFetchError = null;
         try {
           // Fetch the prompt from the broker the SDK client is connected to,
           // deriving base URL + auth from that client (not restConfig, whose base
@@ -9040,6 +9064,20 @@ async function workAgent(req, flags) {
             logger.info(`[${jobType}] job ${job.jobKey} base prompt from linked resource key ${promptResourceKey} (linkName=${linked.linkName}, ${Buffer.byteLength(String(basePromptOverride), 'utf8')} bytes)`);
           }
         } catch (err) {
+          // Capture — don't settle here. The prompt fetch above is AWAITED, so a
+          // lock-loss race can win DURING it (surfacing as either a rejection here
+          // or a value that then reaches the missing-secret settlement below). Defer
+          // the settlement past the post-await abort recheck so an aborted run
+          // returns WITHOUT settling rather than racing the force-stop yield.
+          promptFetchError = err;
+        }
+
+        // #222: recheck after the awaited prompt fetch (stage: prompt) — before the
+        // prompt-fetch failure settlement above OR the missing-secret settlement
+        // below. An abort that landed during the await returns WITHOUT settling.
+        if (checkSetupAbort(abortSignal, { jobType, jobKey: job.jobKey, stage: 'prompt', logger })) return;
+        if (promptFetchError) {
+          const err = promptFetchError;
           const retries = Math.max(0, (Number(job.retries) || 1) - 1);
           const msg = err instanceof ProvisionError ? err.message : `prompt resource fetch failed: ${err.message}`;
           logger.warn(`[${jobType}] job ${job.jobKey} not provisioned — ${msg}; retries left ${retries}`);
@@ -9135,6 +9173,24 @@ async function workAgent(req, flags) {
           logger.debug?.(`[${jobType}] AgentInstance producer skipped (${aiCorr}) — ${agentInstanceOff ? 'NANO_AGENT_INSTANCE=off' : 'not an external agent job (no lease token / elementInstanceKey)'}.`);
         }
 
+        // #222: recheck after the awaited activate() (stage: agent-instance). The
+        // pre-activate gate above only guards ENTRY; `activate()` then awaits an
+        // uncancellable createAgentInstance round-trip, so a lock-loss race can win
+        // DURING it (and a pending create may still mint a durable instance). Recheck
+        // BEFORE the later setup-failure settlements (the malformed-repository refusal
+        // below and the repo-provisioning path) so an aborted run returns WITHOUT
+        // settling. There is no delete verb for a minted instance, so best-effort
+        // DRAIN a producer that did mint (flush queued appends, release its timers)
+        // rather than leave it dangling — we deliberately do NOT complete() it (that
+        // would try to mint one for an abandoned run).
+        if (checkSetupAbort(abortSignal, { jobType, jobKey: job.jobKey, stage: 'agent-instance', logger })) {
+          if (agentInstanceProducer?.active) {
+            try { await agentInstanceProducer.drain(); } catch { /* best effort */ }
+          }
+          if (isContainer) liveRunIds.delete(runId);
+          return;
+        }
+
         // Fail-closed on a half-specified repository envelope (issue #129,
         // hardening 2): a `repository` block that declares intent (any field set)
         // but whose `url` is absent or not a usable clone target almost always
@@ -9186,7 +9242,7 @@ async function workAgent(req, flags) {
             mkdirSync(workerNsDir, { recursive: true });
             runDir = mkdtempSync(join(workerNsDir, 'run-'));
             liveRunDirs.add(runDir);
-            provisioned = provisionRepo({ envelope, token: repoToken, runDir, runId, timeoutMs: cloneTimeoutMs, logger, corr: aiCorr });
+            provisioned = provisionRepo({ envelope, token: repoToken, runDir, runId, timeoutMs: cloneTimeoutMs, logger, corr: aiCorr, abortSignal });
             if (provisioned.baseFetchError) {
               logger.warn(`[${jobType}] job ${job.jobKey} base fetch failed (${aiCorr}) — ${oneLineLog(provisioned.baseFetchError)}; base...head diffs may be unavailable`);
             }
@@ -9213,6 +9269,13 @@ async function workAgent(req, flags) {
           } catch (err) {
             if (runDir) { try { rmSync(runDir, { recursive: true, force: true }); } catch { /* best effort */ } liveRunDirs.delete(runDir); }
             if (isContainer) liveRunIds.delete(runId);
+            // #222: guard the abort/error exit BEFORE settling. `provisionRepo` runs
+            // blocking spawnSync clone/fetch/checkout ops and only observes the signal
+            // BETWEEN them, so a lock-loss race that won mid-clone surfaces here as a
+            // throw. If the run was aborted, return WITHOUT settling (the run-dir is
+            // already reaped above) rather than fail-settle and race the force-stop
+            // yield. The throwaway clone is the only residue, and it is reaped.
+            if (checkSetupAbort(abortSignal, { jobType, jobKey: job.jobKey, stage: 'repo-provisioning', logger })) return;
             const retries = Math.max(0, (Number(job.retries) || 1) - 1);
             const msg = err instanceof ProvisionError ? err.message : `provisioning error: ${err.message}`;
             // #229: include the correlation keys — a clone/checkout failure occurs

@@ -4157,17 +4157,35 @@ function githubCloneToken({ provider, authRef, secretResolver, ghAuthToken = ghA
 // Clone repo into <runDir>/workspace and check out / create the working branch.
 // Returns { workspaceDir, gitEnv, startSha, workingBranch, remote }. Throws a
 // ProvisionError (token-redacted) on any git failure so the caller can shed.
-function provisionRepo({ envelope, token, runDir, runId, timeoutMs = 120_000, logger = null, corr = '', _runGit = null }) {
+function provisionRepo({ envelope, token, runDir, runId, timeoutMs = 120_000, logger = null, corr = '', abortSignal = null, _runGit = null }) {
   // Test-only seam mirroring finalizeGit: route every git call through `runGitFn` so a
   // deterministic test can observe the per-call timeouts drawn from the shared
   // provisioning budget below. Defaults to the module `runGit` (production unchanged).
   const runGitFn = _runGit || runGit;
+  // #222: the git ops below are blocking spawnSync calls that cannot observe an
+  // AbortSignal mid-call, so provisioning is made signal-aware by rechecking
+  // BETWEEN operations: if a lock-loss race won, bail before the NEXT side effect
+  // (the sha fetch/checkout, base fetch, or config writes) instead of pressing on.
+  // The throw is a ProvisionError so the callsite's existing catch reaps the clone;
+  // that catch rechecks the same signal and returns WITHOUT settling.
+  const throwIfAborted = (stage) => {
+    if (abortSignal && abortSignal.aborted === true) {
+      throw new ProvisionError(`provisioning aborted during ${stage} — lease loss/force-stop won the race`);
+    }
+  };
   const repo = envelope.repository;
   if (!repo || !repo.url) throw new ProvisionError('repository.url is required to provision a workspace');
   // #229: correlation suffix so git provisioning lines can be joined to the job /
   // AgentInstance / relay channels (git logs carried no elementInstanceKey before).
   const cs = corr ? ` [${corr}]` : '';
   const workspaceDir = join(runDir, 'workspace');
+  // #222: honor an ALREADY-aborted signal at the seam ENTRY, before the first repo
+  // side effects (the askpass helper write and the clone). Without this, a signal
+  // that flipped before provisionRepo was even called still wrote the askpass helper
+  // and ran `git clone` before the first `throwIfAborted('post-clone')` fired — the
+  // caller's gate has a race window, so the exported provisioning seam must refuse an
+  // already-lost lease without starting any repository side effect.
+  throwIfAborted('entry');
   const askpass = writeAskpass(runDir, token);
   const gitEnv = {
     ...process.env,
@@ -4252,10 +4270,22 @@ function provisionRepo({ envelope, token, runDir, runId, timeoutMs = 120_000, lo
     throw new ProvisionError(`git clone failed: ${gitErrorDetail(clone, token)}`);
   }
 
+  // #222: the clone (the dominant blocking op and the first repo side effect) is
+  // done. Recheck the abort signal before the remaining side effects/network ops
+  // (sha fetch+checkout, base fetch, config writes) so a lock-loss race that won
+  // during the clone stops here rather than compounding the wasted work.
+  throwIfAborted('post-clone');
+
   if (isSha) {
     // The SHA may not be present under a shallow clone of the branch — fetch it
     // explicitly (best effort), then check it out (detached HEAD).
     const fetch = runGitFn([...credArgs(), 'fetch', '--no-tags', 'origin', commitSha], { cwd: workspaceDir, env: gitEnv, timeoutMs: provTimeoutMs() });
+    // #222: the fetch above is its own blocking network op — recheck the abort signal
+    // BEFORE the checkout mutates the working tree, so a lock-loss race that won while
+    // `git fetch origin <sha>` was blocking stops here (cleanup/no-settle path) rather
+    // than running `git checkout --detach` and continuing to mutate the throwaway repo
+    // after cancellation.
+    throwIfAborted('post-sha-fetch');
     const co = runGitFn(['checkout', '--detach', commitSha], { cwd: workspaceDir, env: gitEnv, timeoutMs: provTimeoutMs() });
     if (co.status !== 0) {
       // Combine the fetch + checkout output (the real reason often lives in the
@@ -4265,6 +4295,9 @@ function provisionRepo({ envelope, token, runDir, runId, timeoutMs = 120_000, lo
       throw new ProvisionError(`git checkout ${commitSha} failed: ${gitErrorDetail([fetch, co], token, 300)}${fetchNote}`);
     }
   }
+
+  // #222: recheck before the base-fetch network probes (another blocking op set).
+  throwIfAborted('pre-base-fetch');
 
   // Optional base fetch: with a single-branch/shallow clone the head has no base
   // and no merge-base, so a naive `git diff <base>` fails. When a base branch or
@@ -4309,6 +4342,13 @@ function provisionRepo({ envelope, token, runDir, runId, timeoutMs = 120_000, lo
       }
     }
   }
+  // #222: the pre-base-fetch snapshot probe above can itself BLOCK on the network
+  // (the `ls-remote --heads` fallback when there is no local `origin/<base>`), so
+  // `pre-base-fetch` (before the probe) is too early to cover an abort that wins
+  // DURING it. Recheck here — after the snapshot probe, before the OPTIONAL base
+  // fetch below — so a lock-loss race that landed while the snapshot ls-remote was
+  // blocking stops before the base fetch mutates the throwaway repo (thread 4389).
+  throwIfAborted('pre-base-fetch-op');
   let base = '';
   let baseFetchError;
   // `baseRef` (branch/tag) and `baseSha` (raw commit) are mutually exclusive — a
@@ -4349,6 +4389,12 @@ function provisionRepo({ envelope, token, runDir, runId, timeoutMs = 120_000, lo
     }
   }
 
+  // #222: the base-fetch group above is the last blocking NETWORK op set. Recheck the
+  // abort signal BEFORE the committer-config writes (which mutate .git/config) so a
+  // lock-loss race that won while the base fetch / snapshot probes were blocking stops
+  // here rather than mutating the throwaway repo's config after cancellation.
+  throwIfAborted('post-base-fetch');
+
   // Give the harness a committer identity in case it commits (many do). Prefer
   // the operator's real identity (git global / gh user) over the `nano-agent`
   // fallback so autonomous commits are authored by the human running the fleet —
@@ -4356,8 +4402,17 @@ function provisionRepo({ envelope, token, runDir, runId, timeoutMs = 120_000, lo
   // is instead recorded as a PR comment (postAgentAttribution). Set via repo-
   // level config, which overrides global, so the identity is deterministic.
   const committer = resolveCommitterIdentity();
+  // #222: `resolveCommitterIdentity()` runs blocking git/gh identity probes and the
+  // two `git config` writes below MUTATE .git/config, so `post-base-fetch` (before
+  // the identity resolution) is not the last gate. Recheck after identity resolution
+  // and around each config write so an abort that wins during any of them stops
+  // before starting the next blocking op rather than mutating the throwaway repo's
+  // config after cancellation (suppressed advisory 4389).
+  throwIfAborted('post-committer-identity');
   runGitFn(['config', 'user.name', committer.name], { cwd: workspaceDir, env: gitEnv, timeoutMs: provTimeoutMs() });
+  throwIfAborted('post-committer-name');
   runGitFn(['config', 'user.email', committer.email], { cwd: workspaceDir, env: gitEnv, timeoutMs: provTimeoutMs() });
+  throwIfAborted('post-committer-config');
   // Config alone is not enough: git honours GIT_AUTHOR_*/GIT_COMMITTER_* OVER
   // user.name/user.email config, so a placeholder GIT_AUTHOR_EMAIL inherited from
   // the launch environment (e.g. `trial-merge@nano.local`) would still be stamped
@@ -4586,6 +4641,13 @@ function provisionRepo({ envelope, token, runDir, runId, timeoutMs = 120_000, lo
   // default could NOT be verified and no base was configured, fail closed (treat every
   // such create as base-like) so an unverified default can never slip the guard (4444).
   const createNamesBase = (name) => name === effectiveBase || (!!remoteDefaultBranch && name === remoteDefaultBranch) || defaultUnverified;
+  // #222: the branch-state probes above (symref/HEAD reads, refBaseBranch and
+  // remoteDefaultBranch resolution) are blocking git ops too. Recheck the abort signal
+  // one last time BEFORE the branch-checkout decisions below, which run `git checkout
+  // -B` — the working-tree mutation this issue guards. A lock-loss race that won while
+  // those probes were blocking stops here rather than cutting/checking out a branch on
+  // the throwaway repo after cancellation.
+  throwIfAborted('pre-branch-checkout');
   // Defense against silent work-loss (issue #231): committing on the base branch
   // with intent to push is ALWAYS wrong for the PR flow — a push to the shared
   // base races it and a non-ff reject strands the commits in this throwaway
@@ -4644,6 +4706,12 @@ function provisionRepo({ envelope, token, runDir, runId, timeoutMs = 120_000, lo
       else log.debug?.(`provisionRepo${cs}: no branch.create; push disabled → working read-only on '${checkedOut}'`);
     }
   }
+  // #222: the branch-selection block above runs `git checkout -B` (the working-tree
+  // mutation) plus its fallback-branch cuts. Recheck one last time AFTER those ops and
+  // BEFORE the HEAD/base-tip probes below, so a lock-loss race that won DURING the
+  // checkout stops at this boundary (cleanup + no-settle) rather than continuing
+  // through the remaining synchronous provisioning until the later relay-open gate.
+  throwIfAborted('post-branch-checkout');
   const sha = runGitFn(['rev-parse', 'HEAD'], { cwd: workspaceDir, env: gitEnv, timeoutMs: provTimeoutMs() });
   // Capture the base ref's SHA AT CLONE TIME (issue #229/#231 observability): the
   // harness runs arbitrary code between here and finalizeGit and can itself advance
@@ -8337,6 +8405,47 @@ function localNetworkTccHint() {
 }
 
 /**
+ * #222 — setup-phase abort gate. #221 makes the dispatch heartbeat `raceFirst`
+ * interrupt the agent on a definitive lease loss, and `runAgentJob` honours that
+ * by wiring the forwarded `AbortSignal` to killTree the harness. But `workAgent`
+ * does real work BEFORE it reaches `runAgentJob` — prompt/AgentInstance setup,
+ * repository provisioning, and `relaySessionFor` (which emits `lifecycle/open`,
+ * the first transcript event). None of that setup path observes the signal, so if
+ * a lock-loss race wins DURING setup the abandoned run would still create the
+ * transcript husk (an empty `lifecycle/open`-only record) and perform repo side
+ * effects before an eventually-fenced settle. Call this at each pre-`runAgentJob`
+ * stage boundary: when the signal is already aborted it logs once and returns
+ * `true` so the caller can skip that stage's side effect and return WITHOUT
+ * settling (the lease is lost / the job is being yielded for retry). A missing or
+ * never-aborted signal is a no-op (returns `false`), leaving the normal and
+ * graceful-drain paths unchanged.
+ *
+ * @param {AbortSignal|null|undefined} abortSignal the run's interruption signal
+ * @param {{ jobType?: string, jobKey?: string|number, stage?: string, logger?: { warn?: (msg: string) => void } }} [ctx]
+ * @returns {boolean} true iff the run was aborted during setup and must stop
+ */
+function checkSetupAbort(abortSignal, { jobType, jobKey, stage, logger } = {}) {
+  if (!abortSignal || abortSignal.aborted !== true) return false;
+  // The invariant that holds at EVERY stage is the same: we stop and DO NOT settle,
+  // so the job is yielded for retry. What has already happened by this point is NOT
+  // the same across stages, though — the earlier "no repo side effects / no transcript
+  // husk" wording was inaccurate at `agent-instance` (an instance may have minted, then
+  // discarded here) and especially at `repo-provisioning`/`relay-open` (the throwaway
+  // clone + config + branch setup may already exist). Describe only what is TRUE for
+  // this stage so operators investigating a cleaned-up but partially-provisioned run
+  // are not misled (issue #222).
+  const sideEffectNote = stage === 'prompt'
+    ? 'stopping before any side effect (no transcript, no repo work, no settle)'
+    : stage === 'agent-instance'
+      ? 'any AgentInstance minted this run is discarded (no COMPLETED update); stopping without a settle'
+      : stage === 'repo-provisioning' || stage === 'relay-open'
+        ? 'any partially-provisioned throwaway workspace is removed best-effort on the way out (a failed removal is left for the age-gated reaper; the entry gate may have created none yet) and no transcript is completed; stopping without a settle'
+        : 'stopping without a settle';
+  logger?.warn?.(`[${jobType}] job ${jobKey} aborted during setup (${stage}) — lease loss/force-stop won the race; ${sideEffectNote} (the job is being yielded for retry).`);
+  return true;
+}
+
+/**
  * work — turn a hire profile into live Nano job workers (one per job-type in
  * the rank×capability matrix) and poll for work in the foreground until Ctrl-C.
  * Uses the c8ctl-provided SDK client (globalThis.c8ctl.createClient()).
@@ -8970,6 +9079,15 @@ async function workAgent(req, flags) {
       try {
         logger.info(`[${jobType}] job ${job.jobKey} (instance ${job.processInstanceKey ?? '-'}) → ${buildAgentCommandLine(profile.command, effectiveArgs)}`);
 
+        // #222: setup-abort gate (stage: prompt). If a lock-loss race already won
+        // before setup begins, stop now — before the prompt/AgentInstance fetch,
+        // repo provisioning, or the first transcript event. Return WITHOUT settling
+        // (the lease is lost / the job is being yielded), so no husk is created.
+        // This gate sits AHEAD of every pre-setup failure/settlement branch (the
+        // disk-budget shed below included): an already-aborted run must return
+        // without settling rather than race the force-stop yield with a fail-settle.
+        if (checkSetupAbort(abortSignal, { jobType, jobKey: job.jobKey, stage: 'prompt', logger })) return;
+
         // Disk-budget admission shed: if the engine data root is below the free
         // floor, don't start a container — fail (retryable) so work sheds until
         // the reaper/host frees space.
@@ -8978,6 +9096,12 @@ async function workAgent(req, flags) {
           if (!budget.ok) {
             const freeMb = budget.free != null ? Math.round(budget.free / 1_048_576) : '?';
             const retries = Math.max(0, (Number(job.retries) || 1) - 1);
+            // #222: diskBudgetOk() runs synchronous Docker probes for container jobs
+            // (including a 10s spawnSync), so the abort can flip WHILE we were checking
+            // disk. Recheck before the low-disk fail-settle: an already-lost lease must
+            // return WITHOUT settling (yield the job) rather than be clobbered into a
+            // retryable provisioning failure that races the force-stop yield.
+            if (checkSetupAbort(abortSignal, { jobType, jobKey: job.jobKey, stage: 'prompt', logger })) return;
             logger.warn(`[${jobType}] job ${job.jobKey} shed — low disk (${freeMb}MB free); retries left ${retries}`);
             return settleJob.fail({ errorMessage: `disk budget exceeded (only ${freeMb}MB free)`, retries, retryBackOff: 30_000 });
           }
@@ -8990,6 +9114,7 @@ async function workAgent(req, flags) {
         // (retryable) rather than run an agent with an empty prompt.
         let promptResourceKey = null;
         let basePromptOverride;
+        let promptFetchError = null;
         try {
           // Fetch the prompt from the broker the SDK client is connected to,
           // deriving base URL + auth from that client (not restConfig, whose base
@@ -9008,6 +9133,20 @@ async function workAgent(req, flags) {
             logger.info(`[${jobType}] job ${job.jobKey} base prompt from linked resource key ${promptResourceKey} (linkName=${linked.linkName}, ${Buffer.byteLength(String(basePromptOverride), 'utf8')} bytes)`);
           }
         } catch (err) {
+          // Capture — don't settle here. The prompt fetch above is AWAITED, so a
+          // lock-loss race can win DURING it (surfacing as either a rejection here
+          // or a value that then reaches the missing-secret settlement below). Defer
+          // the settlement past the post-await abort recheck so an aborted run
+          // returns WITHOUT settling rather than racing the force-stop yield.
+          promptFetchError = err;
+        }
+
+        // #222: recheck after the awaited prompt fetch (stage: prompt) — before the
+        // prompt-fetch failure settlement above OR the missing-secret settlement
+        // below. An abort that landed during the await returns WITHOUT settling.
+        if (checkSetupAbort(abortSignal, { jobType, jobKey: job.jobKey, stage: 'prompt', logger })) return;
+        if (promptFetchError) {
+          const err = promptFetchError;
           const retries = Math.max(0, (Number(job.retries) || 1) - 1);
           const msg = err instanceof ProvisionError ? err.message : `prompt resource fetch failed: ${err.message}`;
           logger.warn(`[${jobType}] job ${job.jobKey} not provisioned — ${msg}; retries left ${retries}`);
@@ -9051,6 +9190,15 @@ async function workAgent(req, flags) {
         const runId = randomUUID();
         if (isContainer) liveRunIds.add(runId);
 
+        // #222: setup-abort gate (stage: agent-instance). The prompt fetch above
+        // awaited the broker, so a lock-loss race may have won during it. Stop
+        // before minting the durable AgentInstance (a side effect) and return
+        // without settling; release the just-allocated container run id.
+        if (checkSetupAbort(abortSignal, { jobType, jobKey: job.jobKey, stage: 'agent-instance', logger })) {
+          if (isContainer) liveRunIds.delete(runId);
+          return;
+        }
+
         // #194: durable engine-native AgentInstance producer. For an `external`
         // agent job (one carrying the activation's lease token + elementInstanceKey)
         // mint an AgentInstance now — lease-gated on THIS activation — seeding the
@@ -9064,6 +9212,21 @@ async function workAgent(req, flags) {
         // end the instance is driven to COMPLETED (success only) — `job.complete`
         // fires exactly as before regardless.
         let agentInstanceProducer = null;
+        // #222: shared teardown for EVERY setup-abort return branch after the
+        // producer has been created. There is no delete verb for a minted instance,
+        // so `discard()` the producer: it makes it permanently inert (dropping any
+        // late/in-flight create so an abandoned run can't mint an orphaned instance
+        // after we return) and drains already-queued appends — WITHOUT driving a
+        // COMPLETED update (that would try to complete an instance for a run being
+        // yielded for retry). Covers BOTH an active producer AND a retry-pending one
+        // whose armed create could otherwise settle late. Every abort branch below
+        // (agent-instance, repo-provisioning entry, the provisionRepo-catch abort,
+        // and relay-open) routes through this so none leaves the producer un-discarded.
+        const discardAgentInstanceProducer = async () => {
+          if (agentInstanceProducer?.active || agentInstanceProducer?.retryPending) {
+            try { await agentInstanceProducer.discard(); } catch { /* best effort */ }
+          }
+        };
         const agentInstanceOff = String(process.env.NANO_AGENT_INSTANCE || '').trim().toLowerCase() === 'off';
         // #229: correlation stamp for the decision-point + outer-catch logs below,
         // so the AgentInstance producer lifecycle can be joined to the relay/git/job
@@ -9094,6 +9257,25 @@ async function workAgent(req, flags) {
           logger.debug?.(`[${jobType}] AgentInstance producer skipped (${aiCorr}) — ${agentInstanceOff ? 'NANO_AGENT_INSTANCE=off' : 'not an external agent job (no lease token / elementInstanceKey)'}.`);
         }
 
+        // #222: recheck after the awaited activate() (stage: agent-instance). The
+        // pre-activate gate above only guards ENTRY; `activate()` then awaits an
+        // uncancellable createAgentInstance round-trip, so a lock-loss race can win
+        // DURING it (and a pending create may still mint a durable instance). Recheck
+        // BEFORE the later setup-failure settlements (the malformed-repository refusal
+        // below and the repo-provisioning path) so an aborted run returns WITHOUT
+        // settling. There is no delete verb for a minted instance, so `discard()` the
+        // producer: it makes it permanently inert (dropping any late create so an
+        // abandoned run can't mint an orphaned instance after we return) and drains
+        // already-queued appends — WITHOUT driving a COMPLETED update (that would try
+        // to mint/complete an instance for a run being yielded for retry). This covers
+        // BOTH an active producer AND a retry-pending one whose in-flight/armed create
+        // could otherwise settle late and mint after the abort path returned.
+        if (checkSetupAbort(abortSignal, { jobType, jobKey: job.jobKey, stage: 'agent-instance', logger })) {
+          await discardAgentInstanceProducer();
+          if (isContainer) liveRunIds.delete(runId);
+          return;
+        }
+
         // Fail-closed on a half-specified repository envelope (issue #129,
         // hardening 2): a `repository` block that declares intent (any field set)
         // but whose `url` is absent or not a usable clone target almost always
@@ -9122,6 +9304,18 @@ async function workAgent(req, flags) {
         const hasRepo = !isContainer && !!envelope.repository?.url;
         let runDir = null;
         let provisioned = null;
+        // #222: setup-abort gate (stage: repo-provisioning). The AgentInstance
+        // activate above awaited the broker, so a lock-loss race may have won.
+        // Stop BEFORE cloning/branching (the first repo side effects) and return
+        // without settling; release the just-allocated container run id.
+        if (checkSetupAbort(abortSignal, { jobType, jobKey: job.jobKey, stage: 'repo-provisioning', logger })) {
+          // #222: an active/retry-pending producer minted before this gate must be
+          // made inert too — otherwise a late create resolves after we return and
+          // mints an orphaned AgentInstance, while an active one is never finalized.
+          await discardAgentInstanceProducer();
+          if (isContainer) liveRunIds.delete(runId);
+          return;
+        }
         // The broker activation lock is owned by the single-owner runtime's dispatch
         // lifecycle (supervisor/src/dispatch.ts): it extends the winner to the
         // recovery window BEFORE this runner starts and heartbeats it on a Schedule
@@ -9137,7 +9331,7 @@ async function workAgent(req, flags) {
             mkdirSync(workerNsDir, { recursive: true });
             runDir = mkdtempSync(join(workerNsDir, 'run-'));
             liveRunDirs.add(runDir);
-            provisioned = provisionRepo({ envelope, token: repoToken, runDir, runId, timeoutMs: cloneTimeoutMs, logger, corr: aiCorr });
+            provisioned = provisionRepo({ envelope, token: repoToken, runDir, runId, timeoutMs: cloneTimeoutMs, logger, corr: aiCorr, abortSignal });
             if (provisioned.baseFetchError) {
               logger.warn(`[${jobType}] job ${job.jobKey} base fetch failed (${aiCorr}) — ${oneLineLog(provisioned.baseFetchError)}; base...head diffs may be unavailable`);
             }
@@ -9164,6 +9358,13 @@ async function workAgent(req, flags) {
           } catch (err) {
             if (runDir) { try { rmSync(runDir, { recursive: true, force: true }); } catch { /* best effort */ } liveRunDirs.delete(runDir); }
             if (isContainer) liveRunIds.delete(runId);
+            // #222: guard the abort/error exit BEFORE settling. `provisionRepo` runs
+            // blocking spawnSync clone/fetch/checkout ops and only observes the signal
+            // BETWEEN them, so a lock-loss race that won mid-clone surfaces here as a
+            // throw. If the run was aborted, return WITHOUT settling (the run-dir is
+            // already reaped above) rather than fail-settle and race the force-stop
+            // yield. The throwaway clone is the only residue, and it is reaped.
+            if (checkSetupAbort(abortSignal, { jobType, jobKey: job.jobKey, stage: 'repo-provisioning', logger })) { await discardAgentInstanceProducer(); return; }
             const retries = Math.max(0, (Number(job.retries) || 1) - 1);
             const msg = err instanceof ProvisionError ? err.message : `provisioning error: ${err.message}`;
             // #229: include the correlation keys — a clone/checkout failure occurs
@@ -9221,6 +9422,24 @@ async function workAgent(req, flags) {
         // cockpit steer-in fanned back to this job's PTY by the runtime's steer
         // router. Only when the worker is enrolled (a live agentic plane); closed
         // in the finally so its steer subscription never leaks across jobs.
+        // #222: setup-abort gate (stage: relay-open). This is the last gate before
+        // `relaySessionFor` emits `lifecycle/open` — the FIRST transcript event and
+        // the source of the empty transcript husk this issue targets. If a lock-loss
+        // race won during provisioning, stop here: never open the relay session (no
+        // husk), reap the throwaway clone/run dir so no stale workspace is left, and
+        // return without settling. Runs BEFORE the try/finally below, so the run-dir
+        // reaping is done inline here.
+        if (checkSetupAbort(abortSignal, { jobType, jobKey: job.jobKey, stage: 'relay-open', logger })) {
+          // #222: after repository setup the producer may be active/retry-pending, so
+          // discard it before returning too — a late create would otherwise mint an
+          // orphaned instance after the runner exits, and an active one stays
+          // unfinalized. This return only reaped the run dir before.
+          await discardAgentInstanceProducer();
+          if (runDir) { try { rmSync(runDir, { recursive: true, force: true }); } catch { /* best effort */ } liveRunDirs.delete(runDir); }
+          if (isContainer) liveRunIds.delete(runId);
+          return;
+        }
+
         let relaySession = null;
         if (agenticPlane) {
           // #229: thread the correlation join keys + a lazy AgentInstance-key getter
@@ -15104,6 +15323,7 @@ export {
   withIpv4FirstNodeOptions,
   DNS_RESULT_ORDER_IPV4_FIRST,
   workAgent,
+  checkSetupAbort,
   derivePollTimeoutMs,
   AGENT_TASK_NS,
   AGENT_RESULT_KEY,

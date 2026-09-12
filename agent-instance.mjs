@@ -203,14 +203,16 @@ export function describeSdkError(err) {
 }
 
 // Redact a lease token down to a presence + short tail so it can be logged for
-// correlation without leaking the opaque fence value. For a short token (≤ 4 chars)
-// a last-4 tail would reveal the ENTIRE token, so emit a fixed redacted marker
+// correlation without leaking the opaque fence value. For a short token a last-4
+// tail would reveal most (or all) of the value, so emit a fixed redacted marker
 // instead — `isExternalAgentJob` accepts any non-blank token, so a short/custom
-// value must never be logged verbatim. The presence signal is preserved either way.
+// value must never be logged verbatim. The tail is only kept once the token is
+// longer than 8 characters, matching the producer's `leaseNote()` threshold so both
+// diagnostics disclose the same amount. The presence signal is preserved either way.
 export function leaseTokenLabel(leaseToken) {
   if (!isNonBlank(leaseToken)) return 'ABSENT';
   const s = String(leaseToken);
-  return s.length > 4 ? `present(…${oneLine(s.slice(-4))})` : 'present(short)';
+  return s.length > 8 ? `present(…${oneLine(s.slice(-4))})` : 'present(short)';
 }
 
 /**
@@ -428,6 +430,11 @@ export function createAgentInstanceProducer(opts = {}) {
   // subsequent retirements stay `debug` to avoid a warn storm during an outage.
   let createTimeoutLogged = false;
   let finalized = false;
+  // Latches true while complete() is running its terminal last-chance path. A create
+  // retired during that path (via awaitCreateBounded) is NOT followed by a hot-path
+  // retry even when it is non-final — complete() latches `finalized` immediately after —
+  // so retireCreate must not promise one (issue #230).
+  let finalizing = false;
   let createAttempts = 0;
   let lastCreateAttemptAt = 0;
   let loopIteration = 0;
@@ -784,10 +791,15 @@ export function createAgentInstanceProducer(opts = {}) {
     // The FINAL last-chance attempt is followed by `finalized` in complete(), so NO
     // hot-path retry can mint the instance afterwards — its diagnostic must not promise
     // one (matching doCreate's `final` retry clause), or operators would wait for a
-    // recovery that can't happen (issue #230).
-    const retryClause = wasFinal
-      ? `no further create will be attempted (final attempt; job completion unaffected).`
-      : `a later hot-path retry will attempt to mint the instance (job completion unaffected).`;
+    // recovery that can't happen (issue #230). The same holds for a NON-final attempt
+    // retired while complete() is finalizing (`finalizing`): complete() latches
+    // `finalized` right after awaiting it, so no hot-path retry follows there either.
+    const retryClause =
+      wasFinal || finalizing
+        ? `no further create will be attempted (${
+            wasFinal ? 'final attempt' : 'completion in progress'
+          }; job completion unaffected).`
+        : `a later hot-path retry will attempt to mint the instance (job completion unaffected).`;
     const line =
       `AgentInstance producer: createAgentInstance did not settle within ` +
       `${finalizeTimeoutMs}ms (attempt ${createAttempts}) — request RETIRED and left to ` +
@@ -939,8 +951,10 @@ export function createAgentInstanceProducer(opts = {}) {
   // notifications, so a raw-count cap alone would let a chunk storm exhaust the buffer.
   // Once either cap is hit, drop the newest update (keeping the buffered prefix
   // contiguous) and COUNT the drop so the truncation is reported (not silent) on
-  // replay. A single oversized update is still buffered (the byte cap only bites once
-  // something is already buffered) so at least one turn always survives.
+  // replay. The byte cap applies even to the FIRST buffered update: a single oversized
+  // update (e.g. a large tool-result) is dropped and counted rather than retained in
+  // full, so the buffer stays bounded even in the worst case — an outage that only ever
+  // sees oversized updates keeps NO turns but never grows the buffer.
   const sizeOfUpdate = (u) => {
     try {
       return JSON.stringify(u)?.length ?? 0;
@@ -1107,6 +1121,10 @@ export function createAgentInstanceProducer(opts = {}) {
       // completing — an AgentInstance for a run that never activated, preserving the
       // same lifecycle contract as ingest().
       if (!disabled && !agentInstanceKey && createAttempts > 0) {
+        // From here we are on the terminal last-chance path: any create retired while
+        // we finalize is not followed by a hot-path retry (retireCreate reads this to
+        // emit an accurate diagnostic; issue #230).
+        finalizing = true;
         // A throttled, ingest-triggered attempt may already be in flight — await it
         // first (bounded) so we don't start a duplicate. If it (or the lack of one)
         // leaves us un-minted, make one explicit, un-throttled FINAL attempt regardless

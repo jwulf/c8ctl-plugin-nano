@@ -83,7 +83,7 @@ function fakeClient({
 const EXTERNAL_JOB = {
   jobKey: '13954',
   type: 'senior:feature',
-  leaseToken: '99001',
+  leaseToken: 'FENCE99001',
   elementInstanceKey: 'EIK-7',
   elementId: 'agent-task',
   processInstanceKey: '13951',
@@ -158,7 +158,7 @@ test('activate mints exactly one AgentInstance, lease-gated, with an opening CON
   // Lease-gated on the activated job.
   assert.equal(req.elementInstanceKey, 'EIK-7');
   assert.equal(req.jobKey, '13954');
-  assert.equal(req.jobLease, '99001');
+  assert.equal(req.jobLease, 'FENCE99001');
   // Opening CONFIGURATION turn carries the concrete runtime definition.
   assert.equal(req.history.length, 1);
   const cfg = req.history[0];
@@ -236,7 +236,7 @@ test('assistant message chunks coalesce into ONE ASSISTANT turn on flush', async
   assert.equal(turn.role, 'ASSISTANT');
   assert.deepEqual(turn.content, [{ contentType: 'TEXT', text: 'Hello world' }]);
   assert.equal(appends[0].jobKey, '13954');
-  assert.equal(appends[0].jobLease, '99001');
+  assert.equal(appends[0].jobLease, 'FENCE99001');
   assert.equal(appends[0].elementInstanceKey, 'EIK-7');
   assert.equal(appends[0].agentInstanceKey, 'AGENT-1');
 });
@@ -359,7 +359,7 @@ test('complete(true) drives the instance status to COMPLETED', async () => {
   assert.equal(statusUpdates.length, 1);
   assert.equal(statusUpdates[0].agentInstanceKey, 'AGENT-1');
   assert.equal(statusUpdates[0].jobKey, '13954');
-  assert.equal(statusUpdates[0].jobLease, '99001');
+  assert.equal(statusUpdates[0].jobLease, 'FENCE99001');
 });
 
 test('complete(false) does NOT complete the instance (a retry continues it)', async () => {
@@ -1534,9 +1534,9 @@ test('a shaped create failure emits status/body, the redacted jobLease, model/pr
   assert.match(warn, /status=400/, 'the HTTP status is surfaced');
   assert.match(warn, /stale lease fence mismatch/, 'the response body is surfaced');
   assert.match(warn, /message=Bad Request/, 'the error message is surfaced');
-  // The lease token (99001) is redacted to a last-4 tail — never echoed verbatim.
+  // The lease token (FENCE99001) is redacted to a last-4 tail — never echoed verbatim.
   assert.match(warn, /jobLease=present\(…9001\)/, 'the lease token is redacted, not leaked');
-  assert.ok(!warn.includes('99001'), 'the raw lease token never appears verbatim');
+  assert.ok(!warn.includes('FENCE99001'), 'the raw lease token never appears verbatim');
   assert.match(warn, /model=Opus 4\.8/, 'the model is surfaced');
   assert.match(warn, /provider=anthropic/, 'the provider is surfaced');
   // Every correlation key ties the failure back to the exact activated job.
@@ -1591,13 +1591,19 @@ test('leaseTokenLabel redacts short tokens to a fixed marker (no verbatim leak) 
   assert.equal(leaseTokenLabel(undefined), 'ABSENT');
   assert.equal(leaseTokenLabel(''), 'ABSENT');
   assert.equal(leaseTokenLabel('   '), 'ABSENT');
-  // A short (≤4 char) token must NOT be echoed verbatim — its last-4 tail would be
-  // the whole value — so a fixed marker is used instead.
+  // A short (≤8 char) token must NOT be echoed verbatim — its last-4 tail would be
+  // most or all of the value — so a fixed marker is used instead, matching the
+  // producer's leaseNote() >8 threshold.
   assert.equal(leaseTokenLabel('ab'), 'present(short)');
   assert.equal(leaseTokenLabel('abcd'), 'present(short)');
   assert.ok(!leaseTokenLabel('abcd').includes('abcd'), 'the short token is not leaked verbatim');
-  // A longer token keeps only a redacted last-4 tail for correlation.
-  assert.equal(leaseTokenLabel('abcdefgh'), 'present(…efgh)');
+  assert.equal(leaseTokenLabel('abcdefgh'), 'present(short)');
+  assert.ok(
+    !leaseTokenLabel('abcdefgh').includes('efgh'),
+    'an 8-char token keeps no tail (matches leaseNote threshold)',
+  );
+  // A longer (>8 char) token keeps only a redacted last-4 tail for correlation.
+  assert.equal(leaseTokenLabel('abcdefghi'), 'present(…fghi)');
 });
 
 // ---------------------------------------------------------------------------

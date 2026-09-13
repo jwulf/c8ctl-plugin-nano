@@ -97,8 +97,10 @@ export * as sessionAcp from '@nanobpm/agentic/session/acp';
 // `httpC8RestReader` to enumerate deployed process definitions and read each
 // one's BPMN XML straight from the engine the worker already talks to — the
 // zero-config enrolment source. The header-filter that narrows those leaves to
-// *agent* job types lives in the plugin (`scanAgentTaskLeaves`), extending the
-// package's type/element/process-only scanner with a `zeebe:taskHeaders` read.
+// *agent* job types lives in the plugin (`scanAgentTaskLeaves`), narrowing the
+// package's type/element/process scanner to leaves carrying the single-convention
+// external-agent marker (`<zeebe:agentDefinition agentType="external">`, issue
+// #235) and dropping any opted out via `io.nanobpm.agentTask.autoSubscribe="false"`.
 // ---------------------------------------------------------------------------
 export * as demand from '@nanobpm/agentic/demand';
 

@@ -197,6 +197,21 @@ capabilities `code-review, testing` the matrix is:
 so a BPMN service task can target a worker at any granularity by setting its job
 type to the matching token.
 
+**Choosing which engine a worker connects to.** By default `work` (and
+`supervisor start --worker`) connects to your **active** c8ctl session profile
+(`c8ctl use profile <name>`). To point a single invocation at a different
+cluster without switching the active session, pass c8ctl's global
+`--profile <name>` — it is honoured the same way it is for core c8ctl commands:
+
+```bash
+c8ctl nano work fleet --profile nano-validate            # this worker only → nano-validate's engine
+c8ctl nano supervisor start --worker fleet --profile nano-validate   # the whole fleet → nano-validate
+```
+
+The named profile wins over the active session for that run only; a supervised
+fleet is pinned to it (the daemon forwards it to every worker it spawns), and
+`supervisor status` reports the matching `ENGINE`.
+
 To also service a job type the matrix can't express — for example a code-first
 [`@nanobpm/workflow`](https://www.npmjs.com/package/@nanobpm/workflow) flow whose
 external task type is `<flowId>:<taskName>`, or any bespoke token — add one or
@@ -236,11 +251,14 @@ How it works and why it needs no wiring:
   agent jobs at all, it and the app are already on the same engine, so *what
   agent job types exist* is answerable from that engine alone — **no cross-machine
   app discovery, no app enrol endpoint, no channel connection**.
-- **Agent-task header filter.** Not every service task is an agent task —
+- **Agent-task marker filter.** Not every service task is an agent task —
   connectors and record-keepers (e.g. `pr.record-plan`) are plain workers.
-  `--auto` keeps only leaves whose service task carries an
-  **`io.nanobpm.agentTask.`** task header (e.g. `senior:plan` carries
-  `io.nanobpm.agentTask.task.prompt`; a record-keeper does not).
+  `--auto` keeps only leaves whose service task carries the single-convention
+  external-agent marker **`<zeebe:agentDefinition agentType="external" />`** (the
+  same marker every external agent task already declares). A task can **opt out**
+  of `--auto` with `<zeebe:property name="io.nanobpm.agentTask.autoSubscribe"
+  value="false" />` — it is then served only by explicit `--job-type`/profile
+  subscription.
 - **One poller per agent job type, reconciled on change.** It opens one poller
   per agent job type and re-reads the engine periodically, adding pollers for
   newly deployed agent processes and draining pollers for undeployed ones — the

@@ -259,6 +259,7 @@ test("makeSupervisorDeps: omits absent optionals and normalizes the logger", asy
   assert.ok(!("autoWorkerId" in bare));
   assert.ok(!("agenticEndpoint" in bare));
   assert.ok(!("config" in bare));
+  assert.ok(!("autoExtraTypes" in bare));
   assert.equal(bare.logger, noopLogger); // no logger supplied → noop
 
   const full = makeSupervisorDeps({
@@ -269,9 +270,14 @@ test("makeSupervisorDeps: omits absent optionals and normalizes the logger", asy
     scan,
     logger: { info: () => {}, warn: () => {} },
     autoWorkerId: "host-1",
+    autoExtraTypes: ["senior:plan", "senior:fix-ci"],
     config: { reconcileIntervalMs: 5_000 },
   });
   assert.equal(full.autoWorkerId, "host-1");
+  // The adapter copy must carry the explicit `--job-type` extras through so the
+  // reconcile can union them into every setTypes write (else extras are dropped
+  // after the first reconcile on the c8ctl integration path).
+  assert.deepEqual(full.autoExtraTypes, ["senior:plan", "senior:fix-ci"]);
   assert.deepEqual(full.config, { reconcileIntervalMs: 5_000 });
   assert.notEqual(full.logger, noopLogger);
 });

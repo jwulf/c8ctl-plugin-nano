@@ -1264,6 +1264,50 @@ export function createAgentInstanceProducer(opts = {}) {
     },
 
     /**
+     * Abort/discard teardown for a run ABANDONED during setup (issue #222). Unlike
+     * `complete()` this does NOT drive a terminal COMPLETED update and — critically —
+     * does NOT make a last-chance create attempt: the run is being yielded for retry,
+     * so minting an instance for it would be an orphaned side effect. It makes the
+     * producer permanently INERT so no late create can mint after the runner has
+     * returned from the abort path — closing the window the suppressed advisory flags,
+     * where a retry-pending producer (`active === false`) whose in-flight/armed
+     * `createAgentInstance` settles late would still mint a durable instance:
+     *   - `finalized = true` gates `ingest()` (drops late ACP frames), `maybeStartCreate()`
+     *     (no hot-path retry), AND `doCreate()`'s latch guard (a late create success is
+     *     dropped rather than latching a key + replaying the pre-mint buffer);
+     *   - bumping `createGen` neutralises an already in-flight attempt via the SAME
+     *     identity guard `retireCreate` uses, so its late settle is dropped even before
+     *     `finalized` is read, and frees the `creating` slot;
+     *   - the pre-mint buffer is released (it can never be replayed now);
+     *   - queued appends against an ALREADY-minted instance are drained best-effort so
+     *     they are not lost, without transitioning status.
+     * Idempotent and best-effort; never throws. Safe to call for BOTH an active
+     * producer and a retry-pending one (the two cases the advisory calls out).
+     */
+    async discard() {
+      if (finalized) {
+        try { await this.drain(); } catch { /* best effort */ }
+        return;
+      }
+      finalized = true;
+      // Neutralise any in-flight create: bump the identity past the owning attempt so
+      // its late resolve/reject is dropped by doCreate's `gen !== createGen` guard, and
+      // free the slot (a retired attempt's own finally is a no-op once we've bumped).
+      createGen += 1;
+      creating = null;
+      creatingGen = 0;
+      creatingFinal = false;
+      // The pre-mint buffer can never be replayed once finalized — release it (and its
+      // counters) rather than pin it for the life of a still-hung uncancellable POST.
+      preMintBuffer.length = 0;
+      preMintBufferBytes = 0;
+      preMintDropped = 0;
+      // Flush appends already queued against a minted instance (best effort); no
+      // terminal update — the run was abandoned, not successfully completed.
+      try { await this.drain(); } catch { /* best effort */ }
+    },
+
+    /**
      * End the AgentInstance lifecycle. Flushes any pending message turn, drains the
      * append queue, then — only on a SUCCESSFUL job end (`ok`) — updates the instance
      * status to COMPLETED (there is no separate completeAgentInstance verb). On a

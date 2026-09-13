@@ -2115,3 +2115,87 @@ test('first per-turn append failure is elevated to warn, repeats stay debug (#22
   const appendDebugs = logger.lines.debug.filter((l) => l.includes('updateAgentInstance append failed'));
   assert.ok(appendDebugs.length >= 1, 'subsequent append failures stay at debug');
 });
+
+test('#222 discard() makes a retry-pending producer inert — no final create attempt, and a late in-flight create is dropped (no orphaned mint)', async () => {
+  // The setup-abort path calls discard() when a run is abandoned during setup. Unlike
+  // complete(), discard() must NOT make a last-chance create attempt (that would mint
+  // an instance for an abandoned run), and it must neutralise an ALREADY in-flight
+  // create so its late settle cannot mint a durable instance after the runner returned
+  // from the abort path — the window the suppressed advisory flags for a retry-pending
+  // (`active === false`) producer.
+  const warnings = [];
+  let createCall = 0;
+  let releaseCreate = null;
+  const createSettled = new Promise((resolve) => { releaseCreate = resolve; });
+  const client = {
+    calls: { create: [], update: [] },
+    createAgentInstance: (req) => {
+      client.calls.create.push(req);
+      createCall += 1;
+      // The (only) create attempt hangs, then resolves with a real key AFTER discard().
+      return createSettled.then(() => ({ agentInstanceKey: 'AGENT-ABANDONED' }));
+    },
+    updateAgentInstance: async (req) => {
+      client.calls.update.push(req);
+      return { createdHistory: [] };
+    },
+  };
+  const p = makeProducer(client, {
+    finalizeTimeoutMs: 20,
+    logger: { info() {}, warn: (m) => warnings.push(m), debug() {} },
+  });
+  await p.activate(); // bounds out — the create hangs
+  assert.equal(p.active, false, 'not minted yet (the create is still in flight)');
+  assert.equal(p.retryPending, true, 'retry-pending: a create was attempted but not minted/finalized');
+  assert.equal(client.calls.create.length, 1, 'exactly one create attempt so far');
+
+  await p.discard();
+  assert.equal(p.retryPending, false, 'discard() finalized the producer — no longer retry-pending');
+  assert.equal(client.calls.create.length, 1, 'discard() did NOT make a final create attempt (unlike complete())');
+
+  // Now let the in-flight create resolve LATE — its result must be dropped.
+  releaseCreate();
+  await createSettled;
+  await new Promise((r) => setImmediate(r)); // let the late .then run (deterministic)
+  assert.equal(p.active, false, 'the late create did NOT mint an orphaned instance after discard()');
+  assert.equal(client.calls.update.length, 0, 'no updates were sent to a late-minted instance');
+  assert.equal(
+    client.calls.update.filter((u) => u.status === 'COMPLETED').length,
+    0,
+    'discard() never drives a terminal COMPLETED update',
+  );
+});
+
+test('#222 discard() on an ACTIVE producer drains queued appends without a COMPLETED update', async () => {
+  // For a producer that DID mint, discard() flushes already-queued appends (best
+  // effort) so they are not lost, but — the run being abandoned, not completed — it
+  // must not send a terminal COMPLETED status update.
+  const client = {
+    calls: { create: [], update: [] },
+    createAgentInstance: async (req) => {
+      client.calls.create.push(req);
+      return { agentInstanceKey: 'AGENT-LIVE' };
+    },
+    updateAgentInstance: async (req) => {
+      client.calls.update.push(req);
+      return { createdHistory: [] };
+    },
+  };
+  const p = makeProducer(client, { finalizeTimeoutMs: 50 });
+  await p.activate();
+  assert.equal(p.active, true, 'minted');
+  p.ingest({ sessionUpdate: 'agent_message_chunk', messageId: 'm1', content: { type: 'text', text: 'hi' } });
+  await p.discard();
+  assert.equal(
+    client.calls.update.filter((u) => u.status === 'COMPLETED').length,
+    0,
+    'no COMPLETED update on a discarded (abandoned) run',
+  );
+  // A subsequent ingest is inert (finalized) — no resurrection.
+  p.ingest({ sessionUpdate: 'agent_message_chunk', messageId: 'm2', content: { type: 'text', text: 'late' } });
+  await p.drain();
+  const updatesAfter = client.calls.update.length;
+  p.ingest({ sessionUpdate: 'agent_message_chunk', messageId: 'm3', content: { type: 'text', text: 'later' } });
+  await p.drain();
+  assert.equal(client.calls.update.length, updatesAfter, 'ingest after discard() is inert (producer finalized)');
+});

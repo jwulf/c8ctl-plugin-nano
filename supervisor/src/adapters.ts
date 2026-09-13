@@ -216,6 +216,7 @@ export const makeSupervisorDeps = (input: SupervisorDepsInput): SupervisorDepsIn
     logger: asLogger(input.logger),
   };
   if (input.autoWorkerId !== undefined) deps.autoWorkerId = input.autoWorkerId;
+  if (input.autoExtraTypes !== undefined) deps.autoExtraTypes = input.autoExtraTypes;
   if (input.agenticEndpoint !== undefined) deps.agenticEndpoint = input.agenticEndpoint;
   if (input.agenticConfig !== undefined) deps.agenticConfig = input.agenticConfig;
   if (input.config !== undefined) deps.config = input.config;

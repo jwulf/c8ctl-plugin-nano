@@ -3094,84 +3094,191 @@ function resolveAutoRestConfig(camunda, env = process.env) {
 // exist" is answerable from that engine alone.
 //
 // `@nanobpm/agentic/demand` already reads deployed `taskDefinition` leaves over
-// C8 REST (`process-definitions/search` → `/{key}/xml`). As of
-// `@nanobpm/agentic@0.4.0` its `scanTaskDefinitions(xml)` tags every leaf with a
-// canonical `agentic: boolean` — true iff the service task declares a
-// `<zeebe:linkedResource … linkName="prompt">` base-prompt side-car (its internal
-// `hasPromptLink`). That flag is the SINGLE SOURCE OF TRUTH for agentic-ness (see
-// the package's `demand/taskdef.d.ts` and nano-workforce SPEC "Agent job
-// contract"): every external agent task delivers its base prompt through a
-// `linkName="prompt"` linked resource, and no in-process worker task does. Not
-// every service task is an agent task — plain connectors and record-keepers
-// (e.g. `pr.record-plan`) are ordinary workers, and they carry no prompt link.
+// C8 REST (`process-definitions/search` → `/{key}/xml`): `scanTaskDefinitions(xml)`
+// yields every service-task leaf with its `taskType`/`process`/`elementId`. Since
+// issue #235 the SINGLE auto-discovery convention is the external-agent marker
+// `<zeebe:agentDefinition agentType="external">` (see below), not the earlier
+// linked-prompt `agentic` flag or the legacy `io.nanobpm.agentTask` header. Not
+// every service task is an agent task — plain connectors and record-keepers (e.g.
+// `pr.record-plan`) carry no marker and are ordinary workers.
 //
-// Per AGENTS.md "Derivation Over Duplication: No Drift Surfaces", this plugin
-// CONSUMES that flag rather than re-implementing the scan, so the detector can
-// never drift out of lock-step with the package again (as it did in #95, when a
-// local copy keyed on the legacy `io.nanobpm.agentTask` header missed the current
-// linked-prompt marker). Advertise the raw job-type string the engine matches
-// (`senior:plan`) verbatim — colon-named types are NOT forced through the agentic
-// dot-grammar.
+// Per AGENTS.md "Derivation Over Duplication: No Drift Surfaces", the authoritative
+// task-type / process derivation still comes from `scanTaskDefinitions`; the plugin
+// only supplements the "is this an external agent task?" answer locally until the
+// package exposes an `external` leaf flag (`scanAgentTaskLeaves` prefers it when
+// present). Advertise the raw job-type string the engine matches (`senior:plan`)
+// verbatim — colon-named types are NOT forced through the agentic dot-grammar.
 // ---------------------------------------------------------------------------
 
-// Legacy (pre-nano-workforce#203) agent-task marker: a service task carried the
-// agent's prompt in an `io.nanobpm.agentTask.*` `<zeebe:header>` rather than a
-// `linkName="prompt"` linked resource. The current package detector
-// (`scanTaskDefinitions`, whose `agentic` flag keys SOLELY off the linked-prompt
-// side-car) therefore reports `agentic:false` for such tasks. We keep a narrow,
-// self-contained fallback so `--auto` still discovers agent job types against an
-// engine still holding a pre-#203 deployment (issue #120 acceptance criterion:
-// "Legacy header-based BPMN still discovers correctly"). This is a supplement to
-// — never a replacement for — the package flag: the authoritative task-type /
-// process derivation still comes from `scanTaskDefinitions`; this only answers
-// "is this leaf an agent task?" for the legacy shape.
+// Single-convention agent-task marker (issue #235): every external agent task
+// carries the ONE canonical eligibility flag
 //
-// True when `body` (a service task's inner XML) declares any
-// `io.nanobpm.agentTask*` `<zeebe:header>` key — the sole such header on a
-// pre-#203 agent service task. The regex is compiled once (it is called once
-// per matched `<serviceTask>` during `--auto` scans, so recompiling per call
-// would allocate needlessly across many deployed definitions).
-const AGENT_TASK_HEADER_RE = new RegExp(
-  `<(?:\\w+:)?header\\b[^>]*\\bkey\\s*=\\s*(["'])${AGENT_TASK_NS.replace(/[.]/g, '\\.')}(?:\\.[^"']*)?\\1`,
-  'i'
-);
-function serviceTaskHasAgentHeader(body) {
-  return AGENT_TASK_HEADER_RE.test(String(body || ''));
+//     <zeebe:agentDefinition agentType="external" />
+//
+// inside its `extensionElements` (nano-workforce enforces it via
+// `agent-marker.test.ts`; registered in its `app/contracts.ts`). This replaces the
+// former dual `--auto` detection — the `@nanobpm/agentic` linked-prompt `agentic`
+// flag OR the pre-#203 `io.nanobpm.agentTask` `<zeebe:header>` fallback — with the
+// single marker every external agent task already declares. Behaviour change: a
+// prompt-bearing task WITHOUT the external marker is no longer auto-discovered
+// (safe for nano-workforce, where every `senior:*` task carries the marker).
+//
+// Preferred long-term derivation is a package-supplied `external` flag on each
+// `scanTaskDefinitions` leaf ("derivation over duplication"); until the package
+// exposes it, this self-contained supplement scan answers "is this leaf an
+// external agent task?" and `scanAgentTaskLeaves` prefers `leaf.external` when
+// present, falling back to it. The authoritative task-type / process derivation
+// still comes from `scanTaskDefinitions`.
+//
+// True when `body` (a service task's inner XML) declares a
+// `<zeebe:agentDefinition agentType="external">` element (attribute order and
+// quote style tolerated). Compiled once — called per matched `<serviceTask>`
+// during `--auto` scans, so recompiling per call would allocate needlessly.
+// CASE-SENSITIVE by design: XML attribute values are case-sensitive and the
+// convention specifies the literal `external`, so `agentType="External"`/`"EXTERNAL"`
+// is NOT the canonical marker and must not auto-enrol a non-conforming task.
+// Boundaries are anchored on XML whitespace / tag termination, NOT `\b`
+// (a word boundary): `agentDefinition\b` would also match a foreign element
+// like `<zeebe:agentDefinition-extra …>`. Require `[\s/>]` after the element
+// name so only the canonical marker enrols a task. Attribute matching is
+// QUOTE-AWARE (`parseXmlAttrs`, not a raw substring scan): a naive
+// `\sagentType\s*=\s*"external"` would also fire on `agentType='external'`
+// nested inside ANOTHER attribute's quoted value (e.g.
+// `description="text agentType='external'"`), auto-enrolling a non-conforming
+// task; parsing the element's attributes left-to-right and reading the real
+// unqualified `agentType` avoids that (and naturally rejects a prefixed
+// `other:agentType`). Compiled once — called per matched `<serviceTask>` during
+// `--auto` scans, so recompiling per call would allocate needlessly.
+const AGENT_DEFINITION_RE = /<(?:\w+:)?agentDefinition(?=[\s/>])([^>]*)>/g;
+function serviceTaskIsExternalAgent(body) {
+  const src = String(body || '');
+  AGENT_DEFINITION_RE.lastIndex = 0;
+  let m;
+  while ((m = AGENT_DEFINITION_RE.exec(src)) !== null) {
+    if (parseXmlAttrs(m[1]).agentType === 'external') return true;
+  }
+  return false;
 }
 
-// The set of service-task element ids in `xml` bearing the legacy agent-task
-// header. Correlates back to `scanTaskDefinitions` leaves by `elementId`, so a
-// leaf is treated as legacy-agentic only when it ALSO has a `taskDefinition type`
-// (the package only yields leaves that do) — matching the issue rule "prompt link
-// OR legacy header, AND a non-empty task type".
-function legacyAgentHeaderElementIds(xml) {
+// Opt-out namespace (issue #235): an external agent task authored with
+//
+//     <zeebe:property name="io.nanobpm.agentTask.autoSubscribe" value="false" />
+//
+// is EXCLUDED from the `--auto` set — served only by explicit subscription
+// (`--job-type`/profile, unioned unchanged with `autoTypes`). Only the exact
+// `value="false"` opts out (fail-safe: any other value, or absence, auto-subscribes).
+const AGENT_TASK_AUTO_SUBSCRIBE_PROP = `${AGENT_TASK_NS}.autoSubscribe`;
+
+// Parse a raw element attribute string (`name="…" other='…'`) into a
+// `{ name: value }` map, walking LEFT-TO-RIGHT and consuming each COMPLETE quoted
+// value so text INSIDE one attribute's value can never be mistaken for a separate
+// attribute. This is the quote-aware core both the external-marker and the
+// auto-subscribe-opt-out scans read through: a plain "search the whole string for
+// `key=…`" would match e.g. `value='false'` embedded in another attribute's
+// quoted value and misclassify the element. First occurrence wins (XML attribute
+// names are unique). Attribute NAMES may be namespace-prefixed and carry XML name
+// chars (`:`/`-`/`.`); values hold any non-quote text. Case-sensitive: XML
+// attribute names are case-sensitive and the conventions here are literal.
+function parseXmlAttrs(attrs) {
+  const out = Object.create(null);
+  const re = /([:\w.\-]+)\s*=\s*(["'])([\s\S]*?)\2/g;
+  let m;
+  while ((m = re.exec(String(attrs || ''))) !== null) {
+    if (!(m[1] in out)) out[m[1]] = m[3];
+  }
+  return out;
+}
+
+// Read a named attribute's value from a raw element's attribute string
+// (`name="…"`/`name='…'`), quote-style and order tolerant; undefined when absent.
+// Quote-aware (via `parseXmlAttrs`): only a REAL attribute matches, so neither a
+// `\b`-style boundary trick (`other-name`) NOR text nested inside another
+// attribute's quoted value can masquerade as the canonical `name`/`value`.
+// Case-sensitive: XML attribute names are case-sensitive and the convention is literal.
+function readXmlAttr(attrs, key) {
+  return parseXmlAttrs(attrs)[key];
+}
+
+// True when `body` (a service task's inner XML) declares a
+// `<zeebe:property name="io.nanobpm.agentTask.autoSubscribe" value="false">` —
+// attribute order tolerated (name/value read independently). Fail-safe: only the
+// literal `false` opts out.
+function serviceTaskOptsOutOfAutoSubscribe(body) {
+  const src = String(body || '');
+  if (!src.includes(AGENT_TASK_AUTO_SUBSCRIBE_PROP)) return false;
+  // `property(?=[\s/>])` (not `property\b`): a `\b` boundary would also match a
+  // foreign element named `<zeebe:property-extra …>`, which — if it carried the
+  // same `name`/`value` attributes — could wrongly opt a task out. Require XML
+  // whitespace or tag termination right after the exact element name.
+  // CASE-SENSITIVE (no `i` flag): XML element names are case-sensitive and the
+  // convention specifies the literal `property`, so a non-canonical `<zeebe:Property …>`
+  // is NOT the opt-out element and must not remove a task from `--auto`.
+  const propRe = /<(?:\w+:)?property(?=[\s/>])([^>]*?)\/?>/g;
+  let m;
+  while ((m = propRe.exec(src)) !== null) {
+    if (readXmlAttr(m[1], 'name') !== AGENT_TASK_AUTO_SUBSCRIBE_PROP) continue;
+    if (readXmlAttr(m[1], 'value') === 'false') return true;
+  }
+  return false;
+}
+
+// Strip XML comments (`<!-- … -->`) and CDATA sections (`<![CDATA[ … ]]>`) from a
+// fragment so marker/property detection never fires on INERT text: a commented-out
+// or CDATA-wrapped `agentDefinition`/`autoSubscribe` is not a live declaration and
+// must not auto-enrol (or silently suppress) a task.
+function stripXmlCommentsAndCdata(s) {
+  return String(s || '')
+    .replace(/<!--[\s\S]*?-->/g, '')
+    .replace(/<!\[CDATA\[[\s\S]*?\]\]>/g, '');
+}
+
+// Walk `xml` collecting the service-task element ids whose inner body satisfies
+// `predicate(body)`, correlating back to `scanTaskDefinitions` leaves by
+// `elementId`. Shared by the external-marker and auto-subscribe-opt-out scans.
+function serviceTaskElementIds(xml, guardSubstring, predicate) {
   const ids = new Set();
-  const src = String(xml || '');
-  // Cheap guard: a legacy agent-task header always contains the literal
-  // `io.nanobpm.agentTask` namespace, so a document lacking that substring
-  // cannot match — skip the full `<serviceTask>` walk entirely. This avoids
-  // parsing every deployed definition in `--auto` enrolment loops when none
-  // carry the legacy marker.
-  if (!src.includes(AGENT_TASK_NS)) return ids;
+  const raw = String(xml || '');
+  // Cheap guard on the RAW document: skip the full `<serviceTask>` walk when the
+  // document cannot possibly match, so `--auto` enrolment loops don't parse every
+  // deployed definition needlessly. (A marker that appears ONLY inside a comment/
+  // CDATA still passes this guard, but the strip below then correctly drops it.)
+  if (guardSubstring && !raw.includes(guardSubstring)) return ids;
+  // Strip comments/CDATA from the WHOLE document BEFORE matching serviceTasks: a
+  // marker/property inside a comment or CDATA is inert and must not drive enrolment
+  // or opt-out, AND an inert `</serviceTask>` inside a comment/CDATA would otherwise
+  // truncate the non-greedy task-body capture at that fake close — hiding a real
+  // marker/property later in the same task (silently omitting it from `--auto`).
+  const src = stripXmlCommentsAndCdata(raw);
   const taskRe =
     /<(?:\w+:)?serviceTask\b[^>]*?\bid\s*=\s*(["'])(.*?)\1[^>]*?>([\s\S]*?)<\/(?:\w+:)?serviceTask>/g;
   let m;
   while ((m = taskRe.exec(src)) !== null) {
-    if (serviceTaskHasAgentHeader(m[3])) ids.add(m[2]);
+    if (predicate(m[3])) ids.add(m[2]);
   }
   return ids;
 }
 
-// Scan one deployed BPMN document for its *agent* task-definition leaves: the
-// subset of `@nanobpm/agentic` `demand.scanTaskDefinitions(xml)` leaves whose
-// canonical `agentic` flag is set (i.e. the service task declares a
-// `linkName="prompt"` linked resource) OR — for backward compatibility with
-// pre-#203 deployments — which carry the legacy `io.nanobpm.agentTask` header.
-// Returns `{ taskType, process }` leaves in first-occurrence order; a task
-// matched by both signals is the same leaf, so it is emitted once. The published
-// `scanTaskDefinitions` is INJECTED so this stays a pure, synchronous function;
-// `readDeployedAgentJobTypes` supplies the real one from the lazily-imported
-// demand surface (`agentic.mjs`).
+// The set of service-task element ids in `xml` carrying the external-agent
+// marker (`<zeebe:agentDefinition agentType="external">`).
+function externalAgentElementIds(xml) {
+  return serviceTaskElementIds(xml, 'agentDefinition', serviceTaskIsExternalAgent);
+}
+
+// The set of service-task element ids in `xml` opted out of `--auto`
+// (`io.nanobpm.agentTask.autoSubscribe = "false"`).
+function autoSubscribeOptOutElementIds(xml) {
+  return serviceTaskElementIds(xml, AGENT_TASK_AUTO_SUBSCRIBE_PROP, serviceTaskOptsOutOfAutoSubscribe);
+}
+
+// Scan one deployed BPMN document for its `--auto`-eligible *agent* task-definition
+// leaves: the subset of `@nanobpm/agentic` `demand.scanTaskDefinitions(xml)` leaves
+// that carry the single-convention external-agent marker (issue #235) — preferring
+// a package-supplied `leaf.external` flag, falling back to the local
+// `externalAgentElementIds` scan — MINUS any leaf that opts out via
+// `io.nanobpm.agentTask.autoSubscribe="false"`. Returns `{ taskType, process }`
+// leaves in first-occurrence order. The published `scanTaskDefinitions` is INJECTED
+// so this stays a pure, synchronous function; `readDeployedAgentJobTypes` supplies
+// the real one from the lazily-imported demand surface (`agentic.mjs`).
 function scanAgentTaskLeaves(xml, scanTaskDefinitions) {
   if (typeof scanTaskDefinitions !== 'function') {
     throw new TypeError(
@@ -3180,9 +3287,17 @@ function scanAgentTaskLeaves(xml, scanTaskDefinitions) {
     );
   }
   const src = String(xml || '');
-  const legacyIds = legacyAgentHeaderElementIds(src);
+  const externalIds = externalAgentElementIds(src);
+  const optedOutIds = autoSubscribeOptOutElementIds(src);
   return scanTaskDefinitions(src)
-    .filter((leaf) => leaf.agentic || legacyIds.has(leaf.elementId))
+    // A package-supplied boolean `leaf.external` is AUTHORITATIVE: `false` is not
+    // the same as absent — it explicitly classifies the leaf as non-external, so
+    // it must exclude the leaf even when the local marker scan sees the marker.
+    // Fall back to the local `externalAgentElementIds` scan ONLY when the package
+    // does not supply a boolean flag.
+    .filter((leaf) =>
+      typeof leaf.external === 'boolean' ? leaf.external : externalIds.has(leaf.elementId))
+    .filter((leaf) => !optedOutIds.has(leaf.elementId))
     .map((leaf) => ({ taskType: leaf.taskType, process: leaf.process }));
 }
 
@@ -3334,6 +3449,7 @@ async function createAgenticEndpoint(opts) {
 // @param {string} [opts.worker]         worker id stamped on activations
 // @param {Array<{id: string, types?: Iterable<string>, capacity?: number}>} [opts.workers]  registry seed
 // @param {string} [opts.autoWorkerId]   worker whose types the reconcile loop rewrites
+// @param {ReadonlyArray<string>} [opts.autoExtraTypes]  explicit `--job-type` extras unioned into every reconcile write (survive the auto rewrite). MUST be an array (the supervisor gates the union on `.length`); a bare `Iterable`/`Set` would be silently dropped.
 // @param {import('./supervisor.dist.js').AgenticEndpoint} [opts.agenticEndpoint]  the ownership wire
 // @param {object} [opts.agenticConfig]  reconnect backoff config
 // @param {string} [opts.scope]          reconcile process-id scope narrowing
@@ -3368,6 +3484,7 @@ async function createSupervisorDeps(opts = {}) {
     worker,
     workers = [],
     autoWorkerId,
+    autoExtraTypes,
     agenticEndpoint,
     agenticConfig,
     scope = '',
@@ -3442,6 +3559,7 @@ async function createSupervisorDeps(opts = {}) {
     scan,
     logger,
     autoWorkerId,
+    autoExtraTypes,
     agenticEndpoint,
     agenticConfig,
     config: scope ? { ...config, scope } : config,
@@ -4162,17 +4280,35 @@ function githubCloneToken({ provider, authRef, secretResolver, ghAuthToken = ghA
 // Clone repo into <runDir>/workspace and check out / create the working branch.
 // Returns { workspaceDir, gitEnv, startSha, workingBranch, remote }. Throws a
 // ProvisionError (token-redacted) on any git failure so the caller can shed.
-function provisionRepo({ envelope, token, runDir, runId, timeoutMs = 120_000, logger = null, corr = '', _runGit = null }) {
+function provisionRepo({ envelope, token, runDir, runId, timeoutMs = 120_000, logger = null, corr = '', abortSignal = null, _runGit = null }) {
   // Test-only seam mirroring finalizeGit: route every git call through `runGitFn` so a
   // deterministic test can observe the per-call timeouts drawn from the shared
   // provisioning budget below. Defaults to the module `runGit` (production unchanged).
   const runGitFn = _runGit || runGit;
+  // #222: the git ops below are blocking spawnSync calls that cannot observe an
+  // AbortSignal mid-call, so provisioning is made signal-aware by rechecking
+  // BETWEEN operations: if a lock-loss race won, bail before the NEXT side effect
+  // (the sha fetch/checkout, base fetch, or config writes) instead of pressing on.
+  // The throw is a ProvisionError so the callsite's existing catch reaps the clone;
+  // that catch rechecks the same signal and returns WITHOUT settling.
+  const throwIfAborted = (stage) => {
+    if (abortSignal && abortSignal.aborted === true) {
+      throw new ProvisionError(`provisioning aborted during ${stage} — lease loss/force-stop won the race`);
+    }
+  };
   const repo = envelope.repository;
   if (!repo || !repo.url) throw new ProvisionError('repository.url is required to provision a workspace');
   // #229: correlation suffix so git provisioning lines can be joined to the job /
   // AgentInstance / relay channels (git logs carried no elementInstanceKey before).
   const cs = corr ? ` [${corr}]` : '';
   const workspaceDir = join(runDir, 'workspace');
+  // #222: honor an ALREADY-aborted signal at the seam ENTRY, before the first repo
+  // side effects (the askpass helper write and the clone). Without this, a signal
+  // that flipped before provisionRepo was even called still wrote the askpass helper
+  // and ran `git clone` before the first `throwIfAborted('post-clone')` fired — the
+  // caller's gate has a race window, so the exported provisioning seam must refuse an
+  // already-lost lease without starting any repository side effect.
+  throwIfAborted('entry');
   const askpass = writeAskpass(runDir, token);
   const gitEnv = {
     ...process.env,
@@ -4257,10 +4393,22 @@ function provisionRepo({ envelope, token, runDir, runId, timeoutMs = 120_000, lo
     throw new ProvisionError(`git clone failed: ${gitErrorDetail(clone, token)}`);
   }
 
+  // #222: the clone (the dominant blocking op and the first repo side effect) is
+  // done. Recheck the abort signal before the remaining side effects/network ops
+  // (sha fetch+checkout, base fetch, config writes) so a lock-loss race that won
+  // during the clone stops here rather than compounding the wasted work.
+  throwIfAborted('post-clone');
+
   if (isSha) {
     // The SHA may not be present under a shallow clone of the branch — fetch it
     // explicitly (best effort), then check it out (detached HEAD).
     const fetch = runGitFn([...credArgs(), 'fetch', '--no-tags', 'origin', commitSha], { cwd: workspaceDir, env: gitEnv, timeoutMs: provTimeoutMs() });
+    // #222: the fetch above is its own blocking network op — recheck the abort signal
+    // BEFORE the checkout mutates the working tree, so a lock-loss race that won while
+    // `git fetch origin <sha>` was blocking stops here (cleanup/no-settle path) rather
+    // than running `git checkout --detach` and continuing to mutate the throwaway repo
+    // after cancellation.
+    throwIfAborted('post-sha-fetch');
     const co = runGitFn(['checkout', '--detach', commitSha], { cwd: workspaceDir, env: gitEnv, timeoutMs: provTimeoutMs() });
     if (co.status !== 0) {
       // Combine the fetch + checkout output (the real reason often lives in the
@@ -4270,6 +4418,9 @@ function provisionRepo({ envelope, token, runDir, runId, timeoutMs = 120_000, lo
       throw new ProvisionError(`git checkout ${commitSha} failed: ${gitErrorDetail([fetch, co], token, 300)}${fetchNote}`);
     }
   }
+
+  // #222: recheck before the base-fetch network probes (another blocking op set).
+  throwIfAborted('pre-base-fetch');
 
   // Optional base fetch: with a single-branch/shallow clone the head has no base
   // and no merge-base, so a naive `git diff <base>` fails. When a base branch or
@@ -4314,6 +4465,13 @@ function provisionRepo({ envelope, token, runDir, runId, timeoutMs = 120_000, lo
       }
     }
   }
+  // #222: the pre-base-fetch snapshot probe above can itself BLOCK on the network
+  // (the `ls-remote --heads` fallback when there is no local `origin/<base>`), so
+  // `pre-base-fetch` (before the probe) is too early to cover an abort that wins
+  // DURING it. Recheck here — after the snapshot probe, before the OPTIONAL base
+  // fetch below — so a lock-loss race that landed while the snapshot ls-remote was
+  // blocking stops before the base fetch mutates the throwaway repo (thread 4389).
+  throwIfAborted('pre-base-fetch-op');
   let base = '';
   let baseFetchError;
   // `baseRef` (branch/tag) and `baseSha` (raw commit) are mutually exclusive — a
@@ -4354,6 +4512,12 @@ function provisionRepo({ envelope, token, runDir, runId, timeoutMs = 120_000, lo
     }
   }
 
+  // #222: the base-fetch group above is the last blocking NETWORK op set. Recheck the
+  // abort signal BEFORE the committer-config writes (which mutate .git/config) so a
+  // lock-loss race that won while the base fetch / snapshot probes were blocking stops
+  // here rather than mutating the throwaway repo's config after cancellation.
+  throwIfAborted('post-base-fetch');
+
   // Give the harness a committer identity in case it commits (many do). Prefer
   // the operator's real identity (git global / gh user) over the `nano-agent`
   // fallback so autonomous commits are authored by the human running the fleet —
@@ -4361,8 +4525,17 @@ function provisionRepo({ envelope, token, runDir, runId, timeoutMs = 120_000, lo
   // is instead recorded as a PR comment (postAgentAttribution). Set via repo-
   // level config, which overrides global, so the identity is deterministic.
   const committer = resolveCommitterIdentity();
+  // #222: `resolveCommitterIdentity()` runs blocking git/gh identity probes and the
+  // two `git config` writes below MUTATE .git/config, so `post-base-fetch` (before
+  // the identity resolution) is not the last gate. Recheck after identity resolution
+  // and around each config write so an abort that wins during any of them stops
+  // before starting the next blocking op rather than mutating the throwaway repo's
+  // config after cancellation (suppressed advisory 4389).
+  throwIfAborted('post-committer-identity');
   runGitFn(['config', 'user.name', committer.name], { cwd: workspaceDir, env: gitEnv, timeoutMs: provTimeoutMs() });
+  throwIfAborted('post-committer-name');
   runGitFn(['config', 'user.email', committer.email], { cwd: workspaceDir, env: gitEnv, timeoutMs: provTimeoutMs() });
+  throwIfAborted('post-committer-config');
   // Config alone is not enough: git honours GIT_AUTHOR_*/GIT_COMMITTER_* OVER
   // user.name/user.email config, so a placeholder GIT_AUTHOR_EMAIL inherited from
   // the launch environment (e.g. `trial-merge@nano.local`) would still be stamped
@@ -4591,6 +4764,13 @@ function provisionRepo({ envelope, token, runDir, runId, timeoutMs = 120_000, lo
   // default could NOT be verified and no base was configured, fail closed (treat every
   // such create as base-like) so an unverified default can never slip the guard (4444).
   const createNamesBase = (name) => name === effectiveBase || (!!remoteDefaultBranch && name === remoteDefaultBranch) || defaultUnverified;
+  // #222: the branch-state probes above (symref/HEAD reads, refBaseBranch and
+  // remoteDefaultBranch resolution) are blocking git ops too. Recheck the abort signal
+  // one last time BEFORE the branch-checkout decisions below, which run `git checkout
+  // -B` — the working-tree mutation this issue guards. A lock-loss race that won while
+  // those probes were blocking stops here rather than cutting/checking out a branch on
+  // the throwaway repo after cancellation.
+  throwIfAborted('pre-branch-checkout');
   // Defense against silent work-loss (issue #231): committing on the base branch
   // with intent to push is ALWAYS wrong for the PR flow — a push to the shared
   // base races it and a non-ff reject strands the commits in this throwaway
@@ -4649,6 +4829,12 @@ function provisionRepo({ envelope, token, runDir, runId, timeoutMs = 120_000, lo
       else log.debug?.(`provisionRepo${cs}: no branch.create; push disabled → working read-only on '${checkedOut}'`);
     }
   }
+  // #222: the branch-selection block above runs `git checkout -B` (the working-tree
+  // mutation) plus its fallback-branch cuts. Recheck one last time AFTER those ops and
+  // BEFORE the HEAD/base-tip probes below, so a lock-loss race that won DURING the
+  // checkout stops at this boundary (cleanup + no-settle) rather than continuing
+  // through the remaining synchronous provisioning until the later relay-open gate.
+  throwIfAborted('post-branch-checkout');
   const sha = runGitFn(['rev-parse', 'HEAD'], { cwd: workspaceDir, env: gitEnv, timeoutMs: provTimeoutMs() });
   // Capture the base ref's SHA AT CLONE TIME (issue #229/#231 observability): the
   // harness runs arbitrary code between here and finalizeGit and can itself advance
@@ -8342,11 +8528,52 @@ function localNetworkTccHint() {
 }
 
 /**
+ * #222 — setup-phase abort gate. #221 makes the dispatch heartbeat `raceFirst`
+ * interrupt the agent on a definitive lease loss, and `runAgentJob` honours that
+ * by wiring the forwarded `AbortSignal` to killTree the harness. But `workAgent`
+ * does real work BEFORE it reaches `runAgentJob` — prompt/AgentInstance setup,
+ * repository provisioning, and `relaySessionFor` (which emits `lifecycle/open`,
+ * the first transcript event). None of that setup path observes the signal, so if
+ * a lock-loss race wins DURING setup the abandoned run would still create the
+ * transcript husk (an empty `lifecycle/open`-only record) and perform repo side
+ * effects before an eventually-fenced settle. Call this at each pre-`runAgentJob`
+ * stage boundary: when the signal is already aborted it logs once and returns
+ * `true` so the caller can skip that stage's side effect and return WITHOUT
+ * settling (the lease is lost / the job is being yielded for retry). A missing or
+ * never-aborted signal is a no-op (returns `false`), leaving the normal and
+ * graceful-drain paths unchanged.
+ *
+ * @param {AbortSignal|null|undefined} abortSignal the run's interruption signal
+ * @param {{ jobType?: string, jobKey?: string|number, stage?: string, logger?: { warn?: (msg: string) => void } }} [ctx]
+ * @returns {boolean} true iff the run was aborted during setup and must stop
+ */
+function checkSetupAbort(abortSignal, { jobType, jobKey, stage, logger } = {}) {
+  if (!abortSignal || abortSignal.aborted !== true) return false;
+  // The invariant that holds at EVERY stage is the same: we stop and DO NOT settle,
+  // so the job is yielded for retry. What has already happened by this point is NOT
+  // the same across stages, though — the earlier "no repo side effects / no transcript
+  // husk" wording was inaccurate at `agent-instance` (an instance may have minted, then
+  // discarded here) and especially at `repo-provisioning`/`relay-open` (the throwaway
+  // clone + config + branch setup may already exist). Describe only what is TRUE for
+  // this stage so operators investigating a cleaned-up but partially-provisioned run
+  // are not misled (issue #222).
+  const sideEffectNote = stage === 'prompt'
+    ? 'stopping before any side effect (no transcript, no repo work, no settle)'
+    : stage === 'agent-instance'
+      ? 'any AgentInstance minted this run is discarded (no COMPLETED update); stopping without a settle'
+      : stage === 'repo-provisioning' || stage === 'relay-open'
+        ? 'any partially-provisioned throwaway workspace is removed best-effort on the way out (a failed removal is left for the age-gated reaper; the entry gate may have created none yet) and no transcript is completed; stopping without a settle'
+        : 'stopping without a settle';
+  logger?.warn?.(`[${jobType}] job ${jobKey} aborted during setup (${stage}) — lease loss/force-stop won the race; ${sideEffectNote} (the job is being yielded for retry).`);
+  return true;
+}
+
+/**
  * work — turn a hire profile into live Nano job workers (one per job-type in
  * the rank×capability matrix) and poll for work in the foreground until Ctrl-C.
  * Uses the c8ctl-provided SDK client (globalThis.c8ctl.createClient()).
  */
-async function workAgent(req, flags) {
+async function workAgent(req, flags, ctx) {
   const logger = getLogger();
   // The hire to run always comes from the positional profile. `--name` no longer
   // selects the hire (that was a footgun: `work reviewer --name coder` silently
@@ -8596,9 +8823,11 @@ async function workAgent(req, flags) {
   // no capability, no app enrol endpoint, no channel connection. It is the
   // mutually-exclusive counterpart to capability-resolved SERVE: in `--auto`
   // the rank×capability matrix is bypassed entirely (any deployed agent job is
-  // served, gated only by the leaf's canonical `agentic` flag — the
-  // `linkName="prompt"` linked-resource marker read by
-  // `@nanobpm/agentic`'s demand scanner), and the
+  // served, gated only by the leaf's canonical external-agent marker —
+  // `<zeebe:agentDefinition agentType="external">` (issue #235), preferring a
+  // package-supplied boolean `leaf.external` flag and falling back to a local
+  // scan, minus any leaf that opts out via
+  // `io.nanobpm.agentTask.autoSubscribe="false"`), and the
   // desired set is reconciled by polling the engine rather than watching the
   // profile. `--auto-scope <process-id|prefix>` narrows the blast radius to one
   // app/network; without it, every agent job type on the engine is served.
@@ -8626,7 +8855,14 @@ async function workAgent(req, flags) {
   // bad DNS answer is corrected, without a supervisor restart. Set before the
   // client is created so every outbound inherits it.
   preferIpv4Resolution();
-  const camunda = globalThis.c8ctl.createClient();
+  // Honour c8ctl's global `--profile <name>` for this invocation: the handler
+  // ctx carries `profile` (the `--profile` override, else the active session
+  // profile). Passing it to createClient(profile) connects the worker to the
+  // profile named on the command line, not just the active session — closing the
+  // silently-ignored-`--profile` gap (jwulf/c8ctl-plugin-nano#189). ctx-less
+  // callers (undefined) fall back to createClient(undefined), which resolves the
+  // active profile itself — identical to the old no-arg behaviour.
+  const camunda = globalThis.c8ctl.createClient(resolveConnectionProfile(ctx));
 
   // Broker REST endpoint for live linked-resource prompts (issue #63) and the
   // C8 REST source for `--auto`'s engine-read enrolment. Derived from the SAME
@@ -8975,6 +9211,15 @@ async function workAgent(req, flags) {
       try {
         logger.info(`[${jobType}] job ${job.jobKey} (instance ${job.processInstanceKey ?? '-'}) → ${buildAgentCommandLine(profile.command, effectiveArgs)}`);
 
+        // #222: setup-abort gate (stage: prompt). If a lock-loss race already won
+        // before setup begins, stop now — before the prompt/AgentInstance fetch,
+        // repo provisioning, or the first transcript event. Return WITHOUT settling
+        // (the lease is lost / the job is being yielded), so no husk is created.
+        // This gate sits AHEAD of every pre-setup failure/settlement branch (the
+        // disk-budget shed below included): an already-aborted run must return
+        // without settling rather than race the force-stop yield with a fail-settle.
+        if (checkSetupAbort(abortSignal, { jobType, jobKey: job.jobKey, stage: 'prompt', logger })) return;
+
         // Disk-budget admission shed: if the engine data root is below the free
         // floor, don't start a container — fail (retryable) so work sheds until
         // the reaper/host frees space.
@@ -8983,6 +9228,12 @@ async function workAgent(req, flags) {
           if (!budget.ok) {
             const freeMb = budget.free != null ? Math.round(budget.free / 1_048_576) : '?';
             const retries = Math.max(0, (Number(job.retries) || 1) - 1);
+            // #222: diskBudgetOk() runs synchronous Docker probes for container jobs
+            // (including a 10s spawnSync), so the abort can flip WHILE we were checking
+            // disk. Recheck before the low-disk fail-settle: an already-lost lease must
+            // return WITHOUT settling (yield the job) rather than be clobbered into a
+            // retryable provisioning failure that races the force-stop yield.
+            if (checkSetupAbort(abortSignal, { jobType, jobKey: job.jobKey, stage: 'prompt', logger })) return;
             logger.warn(`[${jobType}] job ${job.jobKey} shed — low disk (${freeMb}MB free); retries left ${retries}`);
             return settleJob.fail({ errorMessage: `disk budget exceeded (only ${freeMb}MB free)`, retries, retryBackOff: 30_000 });
           }
@@ -8995,6 +9246,7 @@ async function workAgent(req, flags) {
         // (retryable) rather than run an agent with an empty prompt.
         let promptResourceKey = null;
         let basePromptOverride;
+        let promptFetchError = null;
         try {
           // Fetch the prompt from the broker the SDK client is connected to,
           // deriving base URL + auth from that client (not restConfig, whose base
@@ -9013,6 +9265,20 @@ async function workAgent(req, flags) {
             logger.info(`[${jobType}] job ${job.jobKey} base prompt from linked resource key ${promptResourceKey} (linkName=${linked.linkName}, ${Buffer.byteLength(String(basePromptOverride), 'utf8')} bytes)`);
           }
         } catch (err) {
+          // Capture — don't settle here. The prompt fetch above is AWAITED, so a
+          // lock-loss race can win DURING it (surfacing as either a rejection here
+          // or a value that then reaches the missing-secret settlement below). Defer
+          // the settlement past the post-await abort recheck so an aborted run
+          // returns WITHOUT settling rather than racing the force-stop yield.
+          promptFetchError = err;
+        }
+
+        // #222: recheck after the awaited prompt fetch (stage: prompt) — before the
+        // prompt-fetch failure settlement above OR the missing-secret settlement
+        // below. An abort that landed during the await returns WITHOUT settling.
+        if (checkSetupAbort(abortSignal, { jobType, jobKey: job.jobKey, stage: 'prompt', logger })) return;
+        if (promptFetchError) {
+          const err = promptFetchError;
           const retries = Math.max(0, (Number(job.retries) || 1) - 1);
           const msg = err instanceof ProvisionError ? err.message : `prompt resource fetch failed: ${err.message}`;
           logger.warn(`[${jobType}] job ${job.jobKey} not provisioned — ${msg}; retries left ${retries}`);
@@ -9056,6 +9322,15 @@ async function workAgent(req, flags) {
         const runId = randomUUID();
         if (isContainer) liveRunIds.add(runId);
 
+        // #222: setup-abort gate (stage: agent-instance). The prompt fetch above
+        // awaited the broker, so a lock-loss race may have won during it. Stop
+        // before minting the durable AgentInstance (a side effect) and return
+        // without settling; release the just-allocated container run id.
+        if (checkSetupAbort(abortSignal, { jobType, jobKey: job.jobKey, stage: 'agent-instance', logger })) {
+          if (isContainer) liveRunIds.delete(runId);
+          return;
+        }
+
         // #194: durable engine-native AgentInstance producer. For an `external`
         // agent job (one carrying the activation's lease token + elementInstanceKey)
         // mint an AgentInstance now — lease-gated on THIS activation — seeding the
@@ -9069,6 +9344,21 @@ async function workAgent(req, flags) {
         // end the instance is driven to COMPLETED (success only) — `job.complete`
         // fires exactly as before regardless.
         let agentInstanceProducer = null;
+        // #222: shared teardown for EVERY setup-abort return branch after the
+        // producer has been created. There is no delete verb for a minted instance,
+        // so `discard()` the producer: it makes it permanently inert (dropping any
+        // late/in-flight create so an abandoned run can't mint an orphaned instance
+        // after we return) and drains already-queued appends — WITHOUT driving a
+        // COMPLETED update (that would try to complete an instance for a run being
+        // yielded for retry). Covers BOTH an active producer AND a retry-pending one
+        // whose armed create could otherwise settle late. Every abort branch below
+        // (agent-instance, repo-provisioning entry, the provisionRepo-catch abort,
+        // and relay-open) routes through this so none leaves the producer un-discarded.
+        const discardAgentInstanceProducer = async () => {
+          if (agentInstanceProducer?.active || agentInstanceProducer?.retryPending) {
+            try { await agentInstanceProducer.discard(); } catch { /* best effort */ }
+          }
+        };
         const agentInstanceOff = String(process.env.NANO_AGENT_INSTANCE || '').trim().toLowerCase() === 'off';
         // #229: correlation stamp for the decision-point + outer-catch logs below,
         // so the AgentInstance producer lifecycle can be joined to the relay/git/job
@@ -9097,6 +9387,25 @@ async function workAgent(req, flags) {
           }
         } else {
           logger.debug?.(`[${jobType}] AgentInstance producer skipped (${aiCorr}) — ${agentInstanceOff ? 'NANO_AGENT_INSTANCE=off' : 'not an external agent job (no lease token / elementInstanceKey)'}.`);
+        }
+
+        // #222: recheck after the awaited activate() (stage: agent-instance). The
+        // pre-activate gate above only guards ENTRY; `activate()` then awaits an
+        // uncancellable createAgentInstance round-trip, so a lock-loss race can win
+        // DURING it (and a pending create may still mint a durable instance). Recheck
+        // BEFORE the later setup-failure settlements (the malformed-repository refusal
+        // below and the repo-provisioning path) so an aborted run returns WITHOUT
+        // settling. There is no delete verb for a minted instance, so `discard()` the
+        // producer: it makes it permanently inert (dropping any late create so an
+        // abandoned run can't mint an orphaned instance after we return) and drains
+        // already-queued appends — WITHOUT driving a COMPLETED update (that would try
+        // to mint/complete an instance for a run being yielded for retry). This covers
+        // BOTH an active producer AND a retry-pending one whose in-flight/armed create
+        // could otherwise settle late and mint after the abort path returned.
+        if (checkSetupAbort(abortSignal, { jobType, jobKey: job.jobKey, stage: 'agent-instance', logger })) {
+          await discardAgentInstanceProducer();
+          if (isContainer) liveRunIds.delete(runId);
+          return;
         }
 
         // #239: engine-transcript resume. On a re-activation the durable
@@ -9167,6 +9476,18 @@ async function workAgent(req, flags) {
         const hasRepo = !isContainer && !!envelope.repository?.url;
         let runDir = null;
         let provisioned = null;
+        // #222: setup-abort gate (stage: repo-provisioning). The AgentInstance
+        // activate above awaited the broker, so a lock-loss race may have won.
+        // Stop BEFORE cloning/branching (the first repo side effects) and return
+        // without settling; release the just-allocated container run id.
+        if (checkSetupAbort(abortSignal, { jobType, jobKey: job.jobKey, stage: 'repo-provisioning', logger })) {
+          // #222: an active/retry-pending producer minted before this gate must be
+          // made inert too — otherwise a late create resolves after we return and
+          // mints an orphaned AgentInstance, while an active one is never finalized.
+          await discardAgentInstanceProducer();
+          if (isContainer) liveRunIds.delete(runId);
+          return;
+        }
         // The broker activation lock is owned by the single-owner runtime's dispatch
         // lifecycle (supervisor/src/dispatch.ts): it extends the winner to the
         // recovery window BEFORE this runner starts and heartbeats it on a Schedule
@@ -9182,7 +9503,7 @@ async function workAgent(req, flags) {
             mkdirSync(workerNsDir, { recursive: true });
             runDir = mkdtempSync(join(workerNsDir, 'run-'));
             liveRunDirs.add(runDir);
-            provisioned = provisionRepo({ envelope, token: repoToken, runDir, runId, timeoutMs: cloneTimeoutMs, logger, corr: aiCorr });
+            provisioned = provisionRepo({ envelope, token: repoToken, runDir, runId, timeoutMs: cloneTimeoutMs, logger, corr: aiCorr, abortSignal });
             if (provisioned.baseFetchError) {
               logger.warn(`[${jobType}] job ${job.jobKey} base fetch failed (${aiCorr}) — ${oneLineLog(provisioned.baseFetchError)}; base...head diffs may be unavailable`);
             }
@@ -9209,6 +9530,13 @@ async function workAgent(req, flags) {
           } catch (err) {
             if (runDir) { try { rmSync(runDir, { recursive: true, force: true }); } catch { /* best effort */ } liveRunDirs.delete(runDir); }
             if (isContainer) liveRunIds.delete(runId);
+            // #222: guard the abort/error exit BEFORE settling. `provisionRepo` runs
+            // blocking spawnSync clone/fetch/checkout ops and only observes the signal
+            // BETWEEN them, so a lock-loss race that won mid-clone surfaces here as a
+            // throw. If the run was aborted, return WITHOUT settling (the run-dir is
+            // already reaped above) rather than fail-settle and race the force-stop
+            // yield. The throwaway clone is the only residue, and it is reaped.
+            if (checkSetupAbort(abortSignal, { jobType, jobKey: job.jobKey, stage: 'repo-provisioning', logger })) { await discardAgentInstanceProducer(); return; }
             const retries = Math.max(0, (Number(job.retries) || 1) - 1);
             const msg = err instanceof ProvisionError ? err.message : `provisioning error: ${err.message}`;
             // #229: include the correlation keys — a clone/checkout failure occurs
@@ -9266,6 +9594,24 @@ async function workAgent(req, flags) {
         // cockpit steer-in fanned back to this job's PTY by the runtime's steer
         // router. Only when the worker is enrolled (a live agentic plane); closed
         // in the finally so its steer subscription never leaks across jobs.
+        // #222: setup-abort gate (stage: relay-open). This is the last gate before
+        // `relaySessionFor` emits `lifecycle/open` — the FIRST transcript event and
+        // the source of the empty transcript husk this issue targets. If a lock-loss
+        // race won during provisioning, stop here: never open the relay session (no
+        // husk), reap the throwaway clone/run dir so no stale workspace is left, and
+        // return without settling. Runs BEFORE the try/finally below, so the run-dir
+        // reaping is done inline here.
+        if (checkSetupAbort(abortSignal, { jobType, jobKey: job.jobKey, stage: 'relay-open', logger })) {
+          // #222: after repository setup the producer may be active/retry-pending, so
+          // discard it before returning too — a late create would otherwise mint an
+          // orphaned instance after the runner exits, and an active one stays
+          // unfinalized. This return only reaped the run dir before.
+          await discardAgentInstanceProducer();
+          if (runDir) { try { rmSync(runDir, { recursive: true, force: true }); } catch { /* best effort */ } liveRunDirs.delete(runDir); }
+          if (isContainer) liveRunIds.delete(runId);
+          return;
+        }
+
         let relaySession = null;
         if (agenticPlane) {
           // #229: thread the correlation join keys + a lazy AgentInstance-key getter
@@ -9640,6 +9986,11 @@ async function workAgent(req, flags) {
     worker: workerName,
     workers: [{ id: workerName, types: jobTypes, capacity: 1 }],
     autoWorkerId: autoMode ? workerName : undefined,
+    // Explicit `--job-type` extras must outlive the first reconcile: the runtime's
+    // reconcile rewrites the --auto worker's set from the engine scan, so pass the
+    // extras through to be unioned into every reconcile write (else an explicit
+    // subscription stops being served once reconcile succeeds).
+    autoExtraTypes: autoMode && extraJobTypes.length > 0 ? extraJobTypes : undefined,
     scope: autoScope,
     // The ONE multiplexed host connection (issue #173): the runtime owns its
     // connect/reconnect/resync + teardown lifecycle. Omitted (undefined) when the
@@ -10017,6 +10368,55 @@ function reconstructWorkArgs(flags) {
     }
   }
   return out;
+}
+
+// The c8ctl connection profile (its global `--profile` flag) resolved for THIS
+// invocation, for handing to `createClient(profile)`. c8ctl core builds the
+// plugin handler's third `ctx` argument with `ctx.profile = --profile override
+// ?? activeProfile` (index.js), then exposes a lazy `createClient(pluginProfile)`
+// — but this plugin creates its own client via `globalThis.c8ctl.createClient()`
+// and, before this, called it with NO profile, so `work`/`supervisor` always
+// connected to the ACTIVE session profile and silently ignored a per-invocation
+// `--profile <name>` (jwulf/c8ctl-plugin-nano#189). Threading this value into
+// `createClient(profile)` makes them honour `--profile` the way core c8ctl
+// commands do. Returns undefined when ctx carries no profile, so
+// `createClient(undefined)` resolves the active session profile itself (its own
+// documented default) — byte-identical to the old no-arg call. Pure.
+function resolveConnectionProfile(ctx) {
+  const p = ctx && typeof ctx.profile === 'string' ? ctx.profile.trim() : '';
+  return p || undefined;
+}
+
+// The EXPLICIT `--profile <name>` override only (distinct from the active
+// session profile), for FORWARDING to spawned `nano work` children. When an
+// operator runs `supervisor start --worker <p> --profile <conn>` (or
+// `supervisor add … --profile <conn>`), each supervised worker is a fresh
+// `c8ctl nano work` process that must connect to <conn>, not the daemon's/
+// session's active profile. c8ctl strips the global `--profile` before the
+// plugin parser sees it, so it never lands in `flags`; we recover it from
+// `ctx.profile` and re-emit it as a `--profile` token in the child argv (c8ctl
+// core parses it position-independently as a global). Returns undefined when no
+// override was given — i.e. `ctx.profile` is absent or merely equals the active
+// session profile — so the child inherits the active profile exactly as before
+// (no spurious pin). Pure.
+function explicitConnectionProfile(ctx) {
+  const p = resolveConnectionProfile(ctx);
+  if (!p) return undefined;
+  const active = globalThis.c8ctl && typeof globalThis.c8ctl.activeProfile === 'string'
+    ? globalThis.c8ctl.activeProfile
+    : undefined;
+  return p === active ? undefined : p;
+}
+
+// Append the explicit connection-profile override (if any) to a reconstructed
+// `work` argv tail as a c8ctl global `--profile <conn>` token, so a supervised
+// worker connects to the profile named on the `supervisor start`/`add` command
+// line rather than the active session profile (jwulf/c8ctl-plugin-nano#189).
+// A no-op when no `--profile` override was passed. Pure.
+function withConnectionProfileArg(workArgs, ctx) {
+  const conn = explicitConnectionProfile(ctx);
+  const base = Array.isArray(workArgs) ? workArgs : [];
+  return conn ? [...base, '--profile', conn] : base;
 }
 
 /**
@@ -11441,13 +11841,17 @@ async function startSupervisorWithServicePolicy(logger = getLogger()) {
   return startSupervisorDaemon({ adoptOnly: serviceOwned });
 }
 
-async function supervisorStartCmd(req, flags) {
+async function supervisorStartCmd(req, flags, ctx) {
   const logger = getLogger();
   const state = await startSupervisorWithServicePolicy(logger);
   logger.info(`Supervisor daemon running (pid ${state.pid}).`);
 
   const specs = normalizeArgList(flags?.worker);
-  const workArgs = reconstructWorkArgs(flags);
+  // Forward c8ctl's global `--profile <conn>` (when it overrides the active
+  // session profile) to every spawned worker, so `supervisor start --worker <p>
+  // --profile <conn>` pins the fleet to <conn> instead of silently connecting to
+  // the active session engine (jwulf/c8ctl-plugin-nano#189).
+  const workArgs = withConnectionProfileArg(reconstructWorkArgs(flags), ctx);
   // `--name` names a single launched worker. With several `--worker` specs a lone
   // name can't apply to all of them, so honour it only for a single spec and let
   // the rest auto-name; warn so the intent isn't silently dropped.
@@ -11507,7 +11911,7 @@ async function supervisorStatusCmd() {
   printSupervisorStatus(logger, statusFromState(running));
 }
 
-async function supervisorAddCmd(req, flags) {
+async function supervisorAddCmd(req, flags, ctx) {
   const logger = getLogger();
   // The positional profile is what runs; `--name` names this worker instance
   // (forwarded to the child as `nano work … --name`, and used as its supervisor
@@ -11526,7 +11930,10 @@ async function supervisorAddCmd(req, flags) {
     process.exit(1);
   }
   await startSupervisorWithServicePolicy(logger);
-  const workArgs = reconstructWorkArgs(flags);
+  // Forward the global `--profile <conn>` override to the spawned worker(s) so
+  // `supervisor add … --profile <conn>` connects them to <conn>, matching
+  // `supervisor start` (jwulf/c8ctl-plugin-nano#189).
+  const workArgs = withConnectionProfileArg(reconstructWorkArgs(flags), ctx);
   let added = 0;
   let failed = 0;
   for (let i = 0; i < count; i++) {
@@ -12321,7 +12728,7 @@ async function maybeReparentOrWarnOnStart(logger) {
 }
 
 /** Dispatch the `supervisor` subcommand's action. */
-async function supervisorCommand(req, flags) {
+async function supervisorCommand(req, flags, ctx) {
   const action = (req.positional[0] || '').toLowerCase();
   switch (action) {
     case '__daemon':
@@ -12336,7 +12743,7 @@ async function supervisorCommand(req, flags) {
       return;
     }
     case 'start':
-      await supervisorStartCmd(req, flags);
+      await supervisorStartCmd(req, flags, ctx);
       return;
     case 'install':
       await supervisorInstallCmd();
@@ -12350,7 +12757,7 @@ async function supervisorCommand(req, flags) {
       await supervisorStatusCmd();
       return;
     case 'add':
-      await supervisorAddCmd(req, flags);
+      await supervisorAddCmd(req, flags, ctx);
       return;
     case 'remove':
     case 'rm':
@@ -15134,7 +15541,10 @@ export {
   diffJobTypes,
   parseJobTypeFlags,
   scanAgentTaskLeaves,
-  serviceTaskHasAgentHeader,
+  serviceTaskIsExternalAgent,
+  externalAgentElementIds,
+  serviceTaskOptsOutOfAutoSubscribe,
+  autoSubscribeOptOutElementIds,
   readDeployedAgentJobTypes,
   resolveAutoJobTypes,
   loadSupervisorRuntime,
@@ -15152,6 +15562,7 @@ export {
   withIpv4FirstNodeOptions,
   DNS_RESULT_ORDER_IPV4_FIRST,
   workAgent,
+  checkSetupAbort,
   derivePollTimeoutMs,
   AGENT_TASK_NS,
   AGENT_RESULT_KEY,
@@ -15163,6 +15574,9 @@ export {
 };
 export {
   reconstructWorkArgs,
+  resolveConnectionProfile,
+  explicitConnectionProfile,
+  withConnectionProfileArg,
   supervisorWorkerId,
   autoWorkerName,
   sanitizeNameToken,
@@ -15198,6 +15612,7 @@ export {
   runSupervisorDaemon,
   startSupervisorDaemon,
   supervisorRequest,
+  supervisorStartCmd,
   supervisorAddCmd,
   runningSupervisor,
   readSupervisorState,
@@ -15387,7 +15802,7 @@ export const commands = {
       manifest: { type: 'string', description: `workforce: manifest name to operate on (default ${DEFAULT_WORKFORCE_MANIFEST}); each subcommand reads/writes <stateHome>/workforce/<name>.json. Renamed from --profile (which now collides with c8ctl's global connection-profile flag).` },
       roles: { type: 'string', description: 'workforce add: comma-separated role list for the entry (→ --job-type <rank>:<role> at start); mutually exclusive with --auto' },
     },
-    handler: async (args, flags) => {
+    handler: async (args, flags, ctx) => {
       const logger = getLogger();
       const req = parseRequest(args, flags);
 
@@ -15444,10 +15859,10 @@ export const commands = {
             await assignCapabilities(req, flags);
             break;
           case 'work':
-            await workAgent(req, flags);
+            await workAgent(req, flags, ctx);
             break;
           case 'supervisor':
-            await supervisorCommand(req, flags);
+            await supervisorCommand(req, flags, ctx);
             break;
           case 'workforce':
             await workforceCommand(req, flags);

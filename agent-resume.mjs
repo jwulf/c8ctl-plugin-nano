@@ -22,11 +22,15 @@
 // Scope of recovery (documented, initial increment):
 //   - COMMITTED work is already durable — it is on the pushed branch, so the resumed
 //     agent picks up from the last commit WHEN this activation provisions the SAME
-//     branch the prior one pushed. That holds for envelopes carrying a stable branch
-//     identity (`repository.ref` / `branch.create` — the real agent-work path). An
-//     envelope with neither gets an ephemeral `nano/agent-work/<base>-<runId>`
-//     fallback branch that differs per activation, so it degrades to a transcript-only
-//     continuation (a full prior-branch resolve+checkout is the later increment).
+//     branch the prior one pushed. That holds ONLY for an envelope naming a stable,
+//     existing NON-BASE `repository.ref` (e.g. the PR head): the clone checks it out
+//     and finalizeGit pushes it back, so the next activation re-clones it WITH the
+//     prior commits. A `branch.create` does NOT qualify (provisioning recreates it
+//     with `checkout -B` off the fresh clone's base, not the prior remote branch), nor
+//     does a base-equal ref, a detached `repository.sha`, or a bare-URL/base-only clone
+//     (which gets an ephemeral `nano/agent-work/<base>-<runId>` fallback that differs
+//     per activation) — all degrade to a transcript-only continuation (a full
+//     prior-branch resolve+checkout is the later increment).
 //   - UNCOMMITTED working-tree state is NOT recoverable unless the workspace/microVM
 //     persists across activations (the isolated-context increment). This increment
 //     resumes from last-pushed commit + transcript and treats uncommitted deltas as
@@ -192,10 +196,12 @@ export function renderHistoryTurns(turns, { capChars = RESUME_CONTEXT_CAP_CHARS 
   const tail = [];
   let total = 0;
   let truncated = false;
+  let newestLine = ''; // the most-recent rendered line, kept so a single over-cap turn still seeds a suffix
   for (let i = turns.length - 1; i >= 0 && !truncated; i--) {
     const turnLines = renderTurnLines(turns[i]);
     for (let j = turnLines.length - 1; j >= 0; j--) {
       const line = turnLines[j];
+      if (newestLine === '') newestLine = line;
       const add = line.length + (tail.length ? 1 : 0); // +1 for the '\n' join
       if (total + add > capChars) { truncated = true; break; }
       tail.push(line);
@@ -208,6 +214,16 @@ export function renderHistoryTurns(turns, { capChars = RESUME_CONTEXT_CAP_CHARS 
   while (tail.length && marker.length + total > capChars) {
     const dropped = tail.pop();
     total -= dropped.length + (tail.length ? 1 : 0);
+  }
+  // If not even the newest line fit (its length alone exceeds the cap), the tail is
+  // EMPTY and returning just the marker would seed NO recent state at all — defeating
+  // resume for a single huge tool result / assistant message and letting the agent
+  // repeat already-completed work (advisory: retain a suffix of the newest line).
+  // Keep the TAIL end of that newest line within the remaining budget.
+  if (!tail.length) {
+    const budget = capChars - marker.length;
+    if (budget > 0 && newestLine) return marker + newestLine.slice(Math.max(0, newestLine.length - budget));
+    return marker;
   }
   return marker + tail.reverse().join('\n');
 }
@@ -491,6 +507,11 @@ export function seedResumeEnvelope(envelope, transcriptText) {
 // pushed branch" promise. It is deliberately NARROW:
 //   - a repo-less job (no `repository.url`) or one with `branch.push === false` leaves
 //     the throwaway workspace as the only copy — nothing to recover from;
+//   - a `repository.sha` DETACHES HEAD in provisionRepo (it checks out the sha, leaving
+//     no symbolic working branch), so finalizeGit has NO branch to push and nothing is
+//     published — regardless of what `repository.ref` names. This is the authoritative
+//     detach signal, gated on directly rather than GUESSED from the shape of `ref`
+//     (a hex-shape heuristic also wrongly rejected a legitimately hex-named branch);
 //   - a job with push but NO explicit non-base `repository.ref` (a bare-URL / base-only
 //     clone, or `branch.create`) does NOT recover: provisionRepo cuts a per-run
 //     `nano/agent-work/<base>-<runId>` fallback branch (or `-B <create>` off the freshly
@@ -498,21 +519,18 @@ export function seedResumeEnvelope(envelope, transcriptText) {
 //     prior commits are absent from the new workspace. Only a `repository.ref` naming a
 //     stable existing branch (e.g. the PR head) is re-cloned each activation with the
 //     prior round's reconciled commits already present.
-// A ref equal to the base branch, or one that is a bare commit SHA (detached, not a
-// branch tip that accrues pushes), is treated as non-recoverable → transcript-only.
+// A ref equal to the base branch is treated as non-recoverable → transcript-only.
 // (A push *rejected* at runtime is not knowable here; declared intent is the best
 // signal available at seed time.)
-function isLikelyCommitSha(ref) {
-  return typeof ref === 'string' && /^[0-9a-f]{7,40}$/i.test(ref.trim());
-}
-
 function envelopeHasPushedBranch(envelope) {
   const repo = envelope?.repository;
   if (!isPlainObject(repo) || !isNonBlank(repo.url) || envelope?.branch?.push === false) return false;
+  // A dedicated `repository.sha` detaches HEAD → no pushable working branch, so even a
+  // non-base `repository.ref` is not published/recoverable. Gate on it authoritatively.
+  if (isNonBlank(repo.sha)) return false;
   const ref = isNonBlank(repo.ref) ? String(repo.ref).trim() : '';
   if (ref === '') return false;
   if (isNonBlank(repo.baseRef) && ref === String(repo.baseRef).trim()) return false;
-  if (isLikelyCommitSha(ref)) return false;
   return true;
 }
 

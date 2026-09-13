@@ -92,7 +92,7 @@ SDK client (job workers) — do **not** add the SDK as a dependency or use raw
   re-fetched, so such a run is classified **transcript-only** (the recovery
   preamble points at the transcript, not a branch that isn't there). In every case
   **uncommitted deltas are lost** (workspace is throwaway — the isolated-context
-  isolated-context persistence increment is later). Gated to external agent jobs;
+  persistence increment is later). Gated to external agent jobs;
   a read failure / no read surface / no prior work / `NANO_AGENT_RESUME=off` falls
   through to the legacy cold rerun (`effectiveEnvelope === envelope`). The prompt
   seed is the only change — repository/setup are untouched, and the AgentInstance

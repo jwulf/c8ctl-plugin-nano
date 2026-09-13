@@ -68,6 +68,17 @@ test('renderHistoryTurns: keeps the TAIL and marks truncation when over the cap'
   assert.ok(!out.includes('turn number 0]'), 'drops the earliest turns');
 });
 
+test('renderHistoryTurns: a single over-cap newest turn still seeds a suffix, not only the marker', () => {
+  // The most-recent turn's rendered line is on its own LARGER than the cap. Returning
+  // just the marker would seed no recent state at all and let the agent repeat work;
+  // instead the tail-end of that line comes through within the remaining budget.
+  const huge = 'X'.repeat(400) + 'RECENT_TAIL_MARKER';
+  const out = renderHistoryTurns([textTurn('ASSISTANT', huge)], { capChars: 120 });
+  assert.ok(out.length <= 120, 'respects the cap');
+  assert.ok(out.startsWith('…[earlier transcript truncated]…'), 'marks the truncation');
+  assert.ok(out.includes('RECENT_TAIL_MARKER'), 'retains the tail-end of the newest over-cap line');
+});
+
 test('readPriorTranscript: injected read returning work → rendered text + counts', async () => {
   const turns = [configTurn(), textTurn('ASSISTANT', 'already implemented the parser')];
   const read = async ({ elementInstanceKey }) => {
@@ -257,6 +268,16 @@ test('seedResumeEnvelope: recovery text is conditional on a declared pushed bran
   assert.ok(noRef.task.prompt.includes('ONLY record'), 'push but no stable ref → transcript-only recovery text');
   const baseRef = seedResumeEnvelope({ task: { prompt: 'do it' }, repository: { url: 'x', ref: 'main', baseRef: 'main' }, branch: { push: true } }, 'T');
   assert.ok(baseRef.task.prompt.includes('ONLY record'), 'ref === baseRef → transcript-only recovery text');
+
+  // A `repository.sha` DETACHES HEAD (provisionRepo checks out the sha, leaving no
+  // symbolic branch), so even a non-base `repository.ref` has no pushed branch to
+  // recover — gate on the authoritative detach signal, not the shape of `ref`.
+  const detached = seedResumeEnvelope({ task: { prompt: 'do it' }, repository: { url: 'x', ref: 'feat/thing', baseRef: 'main', sha: 'deadbeefcafe' }, branch: { push: true } }, 'T');
+  assert.ok(detached.task.prompt.includes('ONLY record'), 'repository.sha detaches HEAD → transcript-only recovery text');
+  // A legitimately HEX-NAMED branch (no repository.sha) is NOT wrongly rejected — the
+  // old hex-shape heuristic on `ref` produced that false negative.
+  const hexBranch = seedResumeEnvelope({ task: { prompt: 'do it' }, repository: { url: 'x', ref: 'deadbeef', baseRef: 'main' }, branch: { push: true } }, 'T');
+  assert.ok(hexBranch.task.prompt.includes('pushed branch'), 'hex-named non-base branch (no sha) → branch recovery text');
 });
 
 test('readPriorTranscript: passes the mandatory consistency option and scopes history to THIS element', async () => {

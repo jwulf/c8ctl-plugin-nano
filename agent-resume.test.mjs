@@ -210,6 +210,20 @@ test('readPriorTranscript: a non-settling read is bounded by the deadline → nu
   assert.equal(got, null, 'timed-out read degrades to a cold rerun');
 });
 
+test('readPriorTranscript: the deadline aborts the read seam so it stops issuing SDK requests', async () => {
+  // A hung read must be signalled to stop probing once we give up on it — otherwise its
+  // async chain keeps firing follow-up SDK requests after the timeout, and repeated
+  // reactivations during an engine outage accumulate in-flight work.
+  let captured = null;
+  const got = await readPriorTranscript({
+    job: { elementInstanceKey: '1' },
+    read: ({ signal }) => { captured = signal; return new Promise(() => {}); },
+    readTimeoutMs: 5,
+  });
+  assert.equal(got, null, 'timed-out read still degrades to a cold rerun');
+  assert.ok(captured && captured.aborted === true, 'the deadline aborts the injected read signal');
+});
+
 test('buildResumePrompt: preserves the original task prompt and adds continuation framing', () => {
   const p = buildResumePrompt({ basePrompt: 'Implement the widget', transcriptText: '[ASSISTANT] started it' });
   assert.ok(p.includes('RESUMING'), 'signals a resume');

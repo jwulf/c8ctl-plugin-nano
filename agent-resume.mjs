@@ -73,12 +73,16 @@ const READ_CONSISTENCY = { consistency: { waitUpToMs: RESUME_READ_CONSISTENCY_MS
 // Race a promise against a deadline; rejects with a tagged timeout error so the
 // best-effort caller degrades to a cold rerun rather than blocking forever. The
 // deadline timer is cleared as soon as the read settles (win or lose), so it never
-// keeps the event loop alive past the read.
-function callWithin(promise, timeoutMs, setTimer = setTimeout) {
+// keeps the event loop alive past the read. On timeout `onTimeout` fires FIRST (best-
+// effort) so the caller can abort the underlying read — otherwise the losing read's
+// async chain keeps issuing follow-up SDK requests after we have already given up,
+// and repeated reactivations during an engine outage accumulate in-flight work.
+function callWithin(promise, timeoutMs, setTimer = setTimeout, onTimeout) {
   if (!(timeoutMs > 0)) return Promise.resolve(promise);
   let timer;
   const deadline = new Promise((_resolve, reject) => {
     timer = setTimer(() => {
+      try { onTimeout?.(); } catch { /* aborting is best-effort; never mask the timeout */ }
       const err = new Error(`agent resume: SDK read timed out after ${timeoutMs}ms`);
       err.__nanoTimeout = true;
       reject(err);
@@ -322,7 +326,7 @@ function scopeEmbeddedHistoryToElement(match, eik) {
 // AgentInstance correlated on `elementInstanceKey` and return its history turns.
 // Entirely best-effort — ANY rejection/throw resolves to an empty list, never
 // propagates. Injected as `read` so tests drive it deterministically.
-async function defaultRead({ camunda, elementInstanceKey }) {
+async function defaultRead({ camunda, elementInstanceKey, signal }) {
   if (!isPlainObject(camunda) || !isNonBlank(elementInstanceKey)) return [];
   const eik = String(elementInstanceKey);
 
@@ -332,6 +336,7 @@ async function defaultRead({ camunda, elementInstanceKey }) {
   // shape and still tolerate a singular scalar from an in-memory fake in the match.
   let instances = [];
   for (const m of SEARCH_METHODS) {
+    if (signal?.aborted) return [];
     if (typeof camunda[m] !== 'function') continue;
     try {
       instances = normalizeInstances(await camunda[m]({ filter: { elementInstanceKeys: [eik] } }, READ_CONSISTENCY));
@@ -341,6 +346,7 @@ async function defaultRead({ camunda, elementInstanceKey }) {
   // 2. Fall back to a direct get-by-element.
   if (!instances.length) {
     for (const m of GET_METHODS) {
+      if (signal?.aborted) return [];
       if (typeof camunda[m] !== 'function') continue;
       try {
         instances = normalizeInstances(await camunda[m]({ elementInstanceKey: eik }, READ_CONSISTENCY));
@@ -368,6 +374,7 @@ async function defaultRead({ camunda, elementInstanceKey }) {
     const aik = match.agentInstanceKey ?? match.key;
     if (isNonBlank(aik)) {
       for (const m of HISTORY_METHODS) {
+        if (signal?.aborted) return [];
         if (typeof camunda[m] !== 'function') continue;
         try {
           turns = normalizeHistory(await camunda[m]({ agentInstanceKey: String(aik), filter: { elementInstanceKey: eik } }, READ_CONSISTENCY));
@@ -392,8 +399,9 @@ async function defaultRead({ camunda, elementInstanceKey }) {
  * @param {object} opts.camunda  Host SDK client (probed for a read surface).
  * @param {object} opts.job      The activated job (needs `elementInstanceKey`).
  * @param {object} [opts.logger] Output-mode-aware logger.
- * @param {(args:{camunda:object,elementInstanceKey:string,job:object})=>Promise<object[]>} [opts.read]
- *        Injected read seam (defaults to the SDK probe) — the test hook.
+ * @param {(args:{camunda:object,elementInstanceKey:string,job:object,signal?:AbortSignal})=>Promise<object[]>} [opts.read]
+ *        Injected read seam (defaults to the SDK probe) — the test hook. Receives an
+ *        `AbortSignal` that fires when the deadline lapses so it can stop probing.
  * @param {number} [opts.capChars] Rendered-transcript cap.
  * @param {number} [opts.readTimeoutMs] Deadline (ms) bounding the injected read; on
  *        timeout the read degrades to `null` (legacy cold rerun).
@@ -412,9 +420,19 @@ export async function readPriorTranscript(opts = {}) {
   } = opts;
   const elementInstanceKey = job?.elementInstanceKey != null ? String(job.elementInstanceKey) : '';
   if (!isNonBlank(elementInstanceKey)) return null;
+  // Hand the read an AbortSignal that fires when the deadline lapses, so the losing
+  // read's async chain stops issuing further SDK requests once we have given up on it
+  // (otherwise a hung read keeps probing follow-up methods after the timeout, and
+  // repeated reactivations during an engine outage pile up in-flight requests).
+  const abort = typeof AbortController === 'function' ? new AbortController() : null;
   let turns = [];
   try {
-    turns = await callWithin(read({ camunda, elementInstanceKey, job }), readTimeoutMs, setTimer);
+    turns = await callWithin(
+      read({ camunda, elementInstanceKey, job, signal: abort?.signal }),
+      readTimeoutMs,
+      setTimer,
+      () => abort?.abort(),
+    );
   } catch (err) {
     logger?.debug?.(`agent resume: prior-transcript read failed (eik ${elementInstanceKey}) — ${String(err?.message || err)}`);
     return null;

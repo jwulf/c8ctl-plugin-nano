@@ -9132,7 +9132,7 @@ async function workAgent(req, flags) {
         // `effectiveEnvelope === envelope`.
         let effectiveEnvelope = envelope;
         {
-          const resumed = await resolveEffectiveEnvelope({ envelope, job, camunda, agentInstanceOff, logger });
+          const resumed = await resolveEffectiveEnvelope({ envelope, job, camunda, agentInstanceOff, containerMode: isContainer, logger });
           effectiveEnvelope = resumed.envelope;
           if (resumed.resumed) {
             logger.info(`[${jobType}] resuming from prior engine transcript (${aiCorr}) — ${resumed.historyCount} history turn(s) seeded into the harness prompt; continuing from the last pushed commit when the branch identity is stable (uncommitted deltas from the prior run are not recovered).`);

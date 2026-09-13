@@ -210,6 +210,22 @@ test('readPriorTranscript: a non-settling read is bounded by the deadline → nu
   assert.equal(got, null, 'timed-out read degrades to a cold rerun');
 });
 
+test('readPriorTranscript: the deadline aborts the read signal so it stops issuing requests', async () => {
+  // callWithin only stops AWAITING a hung read; the deadline must ALSO abort the read's
+  // signal so a partitioned engine cannot leave follow-up SDK requests in flight and
+  // accumulate across reactivations (suppressed advisory agent-resume.mjs:420).
+  let captured = null;
+  const got = await readPriorTranscript({
+    camunda: {},
+    job: { elementInstanceKey: '1' },
+    read: ({ signal }) => { captured = signal; return new Promise(() => {}); },
+    readTimeoutMs: 5,
+  });
+  assert.equal(got, null, 'timed-out read degrades to a cold rerun');
+  assert.ok(captured, 'the read seam receives an AbortSignal');
+  assert.equal(captured.aborted, true, 'the deadline aborts the read signal on timeout');
+});
+
 test('buildResumePrompt: preserves the original task prompt and adds continuation framing', () => {
   const p = buildResumePrompt({ basePrompt: 'Implement the widget', transcriptText: '[ASSISTANT] started it' });
   assert.ok(p.includes('RESUMING'), 'signals a resume');
@@ -278,6 +294,41 @@ test('seedResumeEnvelope: recovery text is conditional on a declared pushed bran
   // old hex-shape heuristic on `ref` produced that false negative.
   const hexBranch = seedResumeEnvelope({ task: { prompt: 'do it' }, repository: { url: 'x', ref: 'deadbeef', baseRef: 'main' }, branch: { push: true } }, 'T');
   assert.ok(hexBranch.task.prompt.includes('pushed branch'), 'hex-named non-base branch (no sha) → branch recovery text');
+});
+
+test('seedResumeEnvelope: container mode forces transcript-only recovery even for a pushable ref', () => {
+  // A container job does NOT run the host clone/push provisioning path, so no branch is
+  // ever checked out/published by this worker — promising "your committed work is on the
+  // pushed branch" points a container resume at a branch it never created (suppressed
+  // advisory agent-resume.mjs:501). The caller passes the sandbox mode IN.
+  const env = { task: { prompt: 'do it' }, repository: { url: 'x', ref: 'feat/thing', baseRef: 'main' }, branch: { push: true } };
+  const host = seedResumeEnvelope(env, 'T');
+  assert.ok(host.task.prompt.includes('pushed branch'), 'host job with a stable non-base ref → branch recovery text');
+  const container = seedResumeEnvelope(env, 'T', { containerMode: true });
+  assert.ok(container.task.prompt.includes('ONLY record'), 'container job → transcript-only recovery text');
+  assert.ok(!container.task.prompt.includes('on your pushed branch'), 'no pushed-branch promise for a container resume');
+});
+
+test('buildResumePrompt: branch recovery text is VERIFY-first, never assuming absent commits', () => {
+  // The prior run may have committed to a per-run work branch reconciled onto this one
+  // between activations; the recovery guidance must tell the agent to VERIFY what
+  // actually landed (git log) and fall back to the transcript when the commits are
+  // absent, rather than blindly "check out the pushed branch" (suppressed advisory
+  // agent-resume.mjs:534).
+  const p = buildResumePrompt({ basePrompt: 'go', transcriptText: 'T', hasPushedBranch: true });
+  assert.ok(p.includes('VERIFY'), 'instructs the agent to verify what actually landed');
+  assert.ok(p.includes('git log'), 'points at git log to confirm the real state');
+  assert.ok(p.includes('ABSENT'), 'handles the case where the prior commits did not reconcile');
+});
+
+test('resolveEffectiveEnvelope: containerMode threads through to transcript-only recovery', async () => {
+  const externalJob = { leaseToken: 'lease', elementInstanceKey: '9' };
+  const envelope = { task: { prompt: 'do it' }, repository: { url: 'x', ref: 'feat/thing', baseRef: 'main' }, branch: { push: true } };
+  const readPrior = async () => ({ text: 'prior', historyCount: 2 });
+  const host = await resolveEffectiveEnvelope({ envelope, job: externalJob, env: {}, readPrior });
+  assert.ok(host.resumed && host.envelope.task.prompt.includes('pushed branch'), 'host → branch recovery');
+  const container = await resolveEffectiveEnvelope({ envelope, job: externalJob, env: {}, containerMode: true, readPrior });
+  assert.ok(container.resumed && container.envelope.task.prompt.includes('ONLY record'), 'container → transcript-only recovery');
 });
 
 test('readPriorTranscript: passes the mandatory consistency option and scopes history to THIS element', async () => {

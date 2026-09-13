@@ -74,11 +74,23 @@ const READ_CONSISTENCY = { consistency: { waitUpToMs: RESUME_READ_CONSISTENCY_MS
 // best-effort caller degrades to a cold rerun rather than blocking forever. The
 // deadline timer is cleared as soon as the read settles (win or lose), so it never
 // keeps the event loop alive past the read.
-function callWithin(promise, timeoutMs, setTimer = setTimeout) {
+//
+// A losing race only STOPS AWAITING the read — it does not, on its own, cancel the
+// underlying SDK request. Without a cancellation signal a hung read (e.g. an engine
+// partition) keeps its search/history requests and sockets in flight AFTER the probe
+// has already returned the worker to a cold run, so repeated reactivations accumulate
+// unbounded in-flight requests. `onTimeout` is invoked SYNCHRONOUSLY when the deadline
+// fires (before the rejection propagates), giving the caller a hook to abort the read
+// it launched so no further request is issued past the deadline.
+function callWithin(promise, timeoutMs, setTimer = setTimeout, onTimeout = null) {
   if (!(timeoutMs > 0)) return Promise.resolve(promise);
   let timer;
   const deadline = new Promise((_resolve, reject) => {
     timer = setTimer(() => {
+      // Signal cancellation FIRST so an in-flight read stops issuing follow-up
+      // requests, then reject to unblock the caller. A throwing hook must not mask
+      // the timeout rejection, so swallow it.
+      try { onTimeout?.(); } catch { /* best effort: cancellation is advisory */ }
       const err = new Error(`agent resume: SDK read timed out after ${timeoutMs}ms`);
       err.__nanoTimeout = true;
       reject(err);
@@ -322,8 +334,17 @@ function scopeEmbeddedHistoryToElement(match, eik) {
 // AgentInstance correlated on `elementInstanceKey` and return its history turns.
 // Entirely best-effort — ANY rejection/throw resolves to an empty list, never
 // propagates. Injected as `read` so tests drive it deterministically.
-async function defaultRead({ camunda, elementInstanceKey }) {
+//
+// `signal` (optional AbortSignal) bounds the request FAN-OUT: once the caller's
+// deadline aborts it, this stops BEFORE issuing the next SDK request (the get
+// fallback, or the follow-up history fetch) so a timed-out probe cannot keep
+// consuming connections. It is a cooperative check between phases — the eventually-
+// consistent search backend's methods are positional and may not accept a signal, so
+// we cannot cancel a single in-flight call, but we can guarantee no ADDITIONAL request
+// is launched after the deadline.
+async function defaultRead({ camunda, elementInstanceKey, signal }) {
   if (!isPlainObject(camunda) || !isNonBlank(elementInstanceKey)) return [];
+  if (signal?.aborted) return [];
   const eik = String(elementInstanceKey);
 
   // 1. Search by element instance → instance record(s). The real
@@ -332,6 +353,7 @@ async function defaultRead({ camunda, elementInstanceKey }) {
   // shape and still tolerate a singular scalar from an in-memory fake in the match.
   let instances = [];
   for (const m of SEARCH_METHODS) {
+    if (signal?.aborted) return [];
     if (typeof camunda[m] !== 'function') continue;
     try {
       instances = normalizeInstances(await camunda[m]({ filter: { elementInstanceKeys: [eik] } }, READ_CONSISTENCY));
@@ -341,6 +363,7 @@ async function defaultRead({ camunda, elementInstanceKey }) {
   // 2. Fall back to a direct get-by-element.
   if (!instances.length) {
     for (const m of GET_METHODS) {
+      if (signal?.aborted) return [];
       if (typeof camunda[m] !== 'function') continue;
       try {
         instances = normalizeInstances(await camunda[m]({ elementInstanceKey: eik }, READ_CONSISTENCY));
@@ -364,10 +387,11 @@ async function defaultRead({ camunda, elementInstanceKey }) {
   // 3. Prefer an embedded history (SCOPED to this element — see
   //    scopeEmbeddedHistoryToElement); else fetch it element-scoped by agentInstanceKey.
   let turns = scopeEmbeddedHistoryToElement(match, eik);
-  if (!turns.length) {
+  if (!turns.length && !signal?.aborted) {
     const aik = match.agentInstanceKey ?? match.key;
     if (isNonBlank(aik)) {
       for (const m of HISTORY_METHODS) {
+        if (signal?.aborted) return turns;
         if (typeof camunda[m] !== 'function') continue;
         try {
           turns = normalizeHistory(await camunda[m]({ agentInstanceKey: String(aik), filter: { elementInstanceKey: eik } }, READ_CONSISTENCY));
@@ -392,11 +416,13 @@ async function defaultRead({ camunda, elementInstanceKey }) {
  * @param {object} opts.camunda  Host SDK client (probed for a read surface).
  * @param {object} opts.job      The activated job (needs `elementInstanceKey`).
  * @param {object} [opts.logger] Output-mode-aware logger.
- * @param {(args:{camunda:object,elementInstanceKey:string,job:object})=>Promise<object[]>} [opts.read]
- *        Injected read seam (defaults to the SDK probe) — the test hook.
+ * @param {(args:{camunda:object,elementInstanceKey:string,job:object,signal:AbortSignal})=>Promise<object[]>} [opts.read]
+ *        Injected read seam (defaults to the SDK probe) — the test hook. Receives the
+ *        deadline's `signal` so it can stop issuing further SDK requests once aborted.
  * @param {number} [opts.capChars] Rendered-transcript cap.
  * @param {number} [opts.readTimeoutMs] Deadline (ms) bounding the injected read; on
- *        timeout the read degrades to `null` (legacy cold rerun).
+ *        timeout the read degrades to `null` (legacy cold rerun) AND the read's
+ *        `signal` is aborted so no further request is issued past the deadline.
  * @param {typeof setTimeout} [opts.setTimer] Timer factory (test seam).
  * @returns {Promise<{turns: object[], historyCount: number, text: string} | null>}
  */
@@ -413,8 +439,12 @@ export async function readPriorTranscript(opts = {}) {
   const elementInstanceKey = job?.elementInstanceKey != null ? String(job.elementInstanceKey) : '';
   if (!isNonBlank(elementInstanceKey)) return null;
   let turns = [];
+  // Bound the read's request fan-out to the deadline: abort the signal when the timer
+  // fires so the read stops before issuing its next SDK call, rather than leaving
+  // search/history requests in flight after we have already degraded to a cold run.
+  const controller = new AbortController();
   try {
-    turns = await callWithin(read({ camunda, elementInstanceKey, job }), readTimeoutMs, setTimer);
+    turns = await callWithin(read({ camunda, elementInstanceKey, job, signal: controller.signal }), readTimeoutMs, setTimer, () => controller.abort());
   } catch (err) {
     logger?.debug?.(`agent resume: prior-transcript read failed (eik ${elementInstanceKey}) — ${String(err?.message || err)}`);
     return null;
@@ -445,9 +475,14 @@ export function buildResumePrompt({ basePrompt, transcriptText, hasPushedBranch 
   const recovery = hasPushedBranch
     ? [
         'Recovering the previous work:',
-        '- COMMITTED work is durable and already on your pushed branch — check out the',
-        '  existing branch and continue from its last commit (inspect `git log` / the open',
-        '  PR to see what already landed).',
+        '- Your COMMITTED work SHOULD be on your pushed branch. VERIFY this FIRST: run',
+        '  `git log` (and inspect the open PR) to see what actually landed on the branch',
+        '  you are on. The previous run may have committed to a per-run work branch that',
+        '  was reconciled onto this one BETWEEN activations — so continue from the last',
+        '  commit you can actually see, not from an assumed state.',
+        '- If the prior commits are ABSENT from this workspace (the reconciliation did not',
+        '  land), do NOT assume they exist — treat the TRANSCRIPT below as the source of',
+        '  truth and re-derive whatever is missing.',
         '- UNCOMMITTED working-tree changes from the previous run were NOT preserved across',
         '  the re-activation — treat them as lost and re-derive anything not yet committed.',
       ]
@@ -487,8 +522,16 @@ export function buildResumePrompt({ basePrompt, transcriptText, hasPushedBranch 
  * / the top-level `prompt`) continues rather than restarts. The original envelope is
  * never mutated. When the envelope has no task prompt to seed, the original is
  * returned unchanged.
+ *
+ * `opts.containerMode` (default false) forces TRANSCRIPT-ONLY recovery regardless of
+ * what the envelope declares: a container job does NOT run the host clone/push
+ * provisioning path (`workAgent` gates `hasRepo = !isContainer && repository.url`), so
+ * no branch is ever checked out or published by this worker. Promising "your committed
+ * work is on the pushed branch" to a container resume points it at a branch that this
+ * activation never created — so the mode is passed IN from the caller (which knows the
+ * sandbox) rather than inferred from the envelope, which cannot see it.
  */
-export function seedResumeEnvelope(envelope, transcriptText) {
+export function seedResumeEnvelope(envelope, transcriptText, opts = {}) {
   if (!isPlainObject(envelope) || !isPlainObject(envelope.task)) return envelope;
   // Only seed when there is a real task PROMPT to reframe. An envelope whose task
   // carries no string prompt (e.g. `task: {}`) has nothing to continue, so return it
@@ -497,7 +540,10 @@ export function seedResumeEnvelope(envelope, transcriptText) {
   // run. Guard on the prompt being a non-blank string, not merely on `task` existing.
   if (typeof envelope.task.prompt !== 'string' || envelope.task.prompt.trim() === '') return envelope;
   const basePrompt = envelope.task.prompt;
-  const seeded = buildResumePrompt({ basePrompt, transcriptText, hasPushedBranch: envelopeHasPushedBranch(envelope) });
+  // Container jobs never provision/push a host branch, so their committed work is not
+  // recoverable from a branch → force transcript-only regardless of the envelope's ref.
+  const hasPushedBranch = !opts.containerMode && envelopeHasPushedBranch(envelope);
+  const seeded = buildResumePrompt({ basePrompt, transcriptText, hasPushedBranch });
   return { ...envelope, task: { ...envelope.task, prompt: seeded } };
 }
 
@@ -568,6 +614,8 @@ function isExternalAgentJob(job) {
  * @param {object}  opts.job                The activated job (needs lease + `elementInstanceKey`).
  * @param {object}  [opts.camunda]          Host SDK client (probed for a read surface).
  * @param {boolean} [opts.agentInstanceOff] The `NANO_AGENT_INSTANCE=off` gate (no durable transcript).
+ * @param {boolean} [opts.containerMode]    True when this activation runs in a container
+ *        sandbox (no host clone/push provisioning) — forces transcript-only recovery.
  * @param {object}  [opts.env]              Environment for the kill-switch check.
  * @param {object}  [opts.logger]           Output-mode-aware logger.
  * @param {typeof readPriorTranscript} [opts.readPrior] Injected read seam (test hook).
@@ -579,6 +627,7 @@ export async function resolveEffectiveEnvelope(opts = {}) {
     job,
     camunda,
     agentInstanceOff = false,
+    containerMode = false,
     env = process.env,
     logger,
     readPrior = readPriorTranscript,
@@ -589,7 +638,7 @@ export async function resolveEffectiveEnvelope(opts = {}) {
   try {
     const prior = await readPrior({ camunda, job, logger });
     if (prior) {
-      const seeded = seedResumeEnvelope(envelope, prior.text);
+      const seeded = seedResumeEnvelope(envelope, prior.text, { containerMode });
       // `seedResumeEnvelope` returns the SAME reference when there was no prompt to
       // seed — treat that as "not resumed" so the caller behaves as a cold run.
       if (seeded !== envelope) {

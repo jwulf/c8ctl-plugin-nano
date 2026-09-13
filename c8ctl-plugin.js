@@ -9448,6 +9448,19 @@ async function workAgent(req, flags, ctx) {
           }
         }
 
+        // #239 (post-resume abort recheck): `resolveEffectiveEnvelope` above awaits an
+        // eventually-consistent transcript READ that can last up to ~10s and is not itself
+        // cancellable. The #222 recheck above only guards the `activate()` await; without a
+        // recheck HERE, a force-stop / lease-loss that wins DURING the transcript read would
+        // fall through to the malformed-repository `settleJob.fail` path below, racing the
+        // supervisor's yield and leaving the just-activated AgentInstance producer
+        // undiscarded. Recheck, discard the producer, and return WITHOUT settling.
+        if (checkSetupAbort(abortSignal, { jobType, jobKey: job.jobKey, stage: 'agent-instance-resume', logger })) {
+          await discardAgentInstanceProducer();
+          if (isContainer) liveRunIds.delete(runId);
+          return;
+        }
+
         // Fail-closed on a half-specified repository envelope (issue #129,
         // hardening 2): a `repository` block that declares intent (any field set)
         // but whose `url` is absent or not a usable clone target almost always

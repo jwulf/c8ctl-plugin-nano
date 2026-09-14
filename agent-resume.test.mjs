@@ -301,6 +301,18 @@ test('seedResumeEnvelope: recovery text is conditional on a declared pushed bran
   const createIsBase = seedResumeEnvelope({ task: { prompt: 'do it' }, repository: { url: 'x', ref: 'main', baseRef: 'main' }, branch: { create: 'main', push: true } }, 'T');
   assert.ok(createIsBase.task.prompt.includes('ONLY record'), 'ref === create === base → transcript-only recovery text');
 
+  // No configured base at all: provisionRepo falls back to the checked-out ref as the
+  // base, so ref === create with no base is base-like and fallback-branched → NOT
+  // recoverable. A blank base cannot prove `ref` is non-base.
+  const noBase = seedResumeEnvelope({ task: { prompt: 'do it' }, repository: { url: 'x', ref: 'feat/thing' }, branch: { create: 'feat/thing', push: true } }, 'T');
+  assert.ok(noBase.task.prompt.includes('ONLY record'), 'ref === create but no configured base → transcript-only recovery text');
+
+  // provisionRepo gives `branch.base` PRECEDENCE over `repository.baseRef`. A `branch.base`
+  // that equals ref === create is base-like even though `repository.baseRef` differs, so
+  // the predicate must mirror that precedence and classify it transcript-only.
+  const branchBaseWins = seedResumeEnvelope({ task: { prompt: 'do it' }, repository: { url: 'x', ref: 'feat/thing', baseRef: 'main' }, branch: { base: 'feat/thing', create: 'feat/thing', push: true } }, 'T');
+  assert.ok(branchBaseWins.task.prompt.includes('ONLY record'), 'branch.base (precedence) === ref === create → transcript-only recovery text');
+
   // A `repository.sha` DETACHES HEAD (provisionRepo checks out the sha, leaving no
   // symbolic branch), so even a would-be-recoverable ref === create has no pushed branch
   // to recover — gate on the authoritative detach signal.
@@ -417,6 +429,18 @@ test('resolveEffectiveEnvelope: ineligible / disabled / no-prior → original en
   const aiOff = await resolveEffectiveEnvelope({ envelope, job: externalJob, env: {}, agentInstanceOff: true, readPrior: withPrior });
   assert.equal(aiOff.envelope, envelope);
   assert.equal(aiOff.resumed, false);
+
+  // Producer INERT (neither active nor retry-armed): resuming would seed from a stale
+  // transcript but record no new turns, so the next reactivation replays it → repeated
+  // side effects. Must short-circuit to a cold run WITHOUT reading.
+  let readWhenInert = false;
+  const producerInert = await resolveEffectiveEnvelope({
+    envelope, job: externalJob, env: {}, producerUnavailable: true,
+    readPrior: async () => { readWhenInert = true; return withPrior(); },
+  });
+  assert.equal(producerInert.envelope, envelope);
+  assert.equal(producerInert.resumed, false);
+  assert.equal(readWhenInert, false, 'inert producer short-circuits before reading');
 
   // No prior work.
   const noPrior = await resolveEffectiveEnvelope({ envelope, job: externalJob, env: {}, readPrior: async () => null });

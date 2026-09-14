@@ -9441,7 +9441,14 @@ async function workAgent(req, flags, ctx) {
         // `effectiveEnvelope === envelope`.
         let effectiveEnvelope = envelope;
         {
-          const resumed = await resolveEffectiveEnvelope({ envelope, job, camunda, agentInstanceOff, containerMode: isContainer, logger });
+          // Only resume when the producer is actually LIVE (active or retry-armed). An
+          // inert producer (host SDK lacks create/updateAgentInstance, ACP classifier
+          // unavailable, or activate() threw) records NO new turns, so seeding from a
+          // prior transcript would leave the SAME stale transcript for the next
+          // reactivation to replay — repeating side effects. Gate resume off it exactly
+          // like NANO_AGENT_INSTANCE=off (review round 4).
+          const producerUnavailable = !(agentInstanceProducer?.active || agentInstanceProducer?.retryPending);
+          const resumed = await resolveEffectiveEnvelope({ envelope, job, camunda, agentInstanceOff, producerUnavailable, containerMode: isContainer, logger });
           effectiveEnvelope = resumed.envelope;
           if (resumed.resumed) {
             logger.info(`[${jobType}] resuming from prior engine transcript (${aiCorr}) — ${resumed.historyCount} history turn(s) read from the prior run and rendered into the harness prompt (some non-content turns, e.g. CONFIGURATION, are elided); continuing from the last pushed commit when the branch identity is stable (uncommitted deltas from the prior run are not recovered).`);

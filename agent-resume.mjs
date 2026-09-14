@@ -567,8 +567,11 @@ export function seedResumeEnvelope(envelope, transcriptText, opts = {}) {
 //     a run-scoped ref that is NOT `ref`, and the next clone of `ref` lacks them.
 //   - a repo-less job, `branch.push === false`, or a `repository.sha` (which DETACHES
 //     HEAD, leaving no symbolic branch to push) is likewise non-recoverable.
-// A `ref`/`create` equal to the base (`repository.baseRef`/`branch.base`) commits on the
-// base, which provisionRepo ALSO fallback-branches → non-recoverable.
+// A `ref`/`create` equal to the base commits on the base, which provisionRepo ALSO
+// fallback-branches → non-recoverable. The base is resolved with provisionRepo's
+// PRECEDENCE (`branch.base` before `repository.baseRef`), and a KNOWN non-blank base is
+// REQUIRED: with no configured base provisionRepo treats the checked-out `ref` as the
+// base and fallback-branches it, so a blank base cannot prove `ref` is non-base.
 // (A push *rejected* at runtime is not knowable here; declared intent is the best signal
 // available at seed time; the recovery preamble is VERIFY-first so a not-yet-reconciled
 // branch still degrades safely.)
@@ -585,11 +588,15 @@ function envelopeHasPushedBranch(envelope) {
   // per-run fallback; create-only / create !== ref → `checkout -B` off base) leaves the
   // prior commits on a branch this activation does not check out.
   if (ref === '' || create === '' || create !== ref) return false;
-  // A ref/create equal to the base commits on the base → provisionRepo cuts a fallback.
-  const base = isNonBlank(repo.baseRef)
-    ? String(repo.baseRef).trim()
-    : (isNonBlank(branch?.base) ? String(branch.base).trim() : '');
-  if (base !== '' && ref === base) return false;
+  // Mirror provisionRepo's effective-base PRECEDENCE — `branch.base` FIRST, then
+  // `repository.baseRef`. Crucially, when NEITHER is supplied provisionRepo falls back to
+  // the CHECKED-OUT ref as the base, so `ref === create` with NO configured base is
+  // treated as base-like and FALLBACK-branched → non-recoverable. Require a KNOWN
+  // non-blank base that DIFFERS from the ref (a blank base cannot prove `ref` is non-base).
+  const base = isNonBlank(branch?.base)
+    ? String(branch.base).trim()
+    : (isNonBlank(repo.baseRef) ? String(repo.baseRef).trim() : '');
+  if (base === '' || ref === base) return false;
   return true;
 }
 
@@ -618,15 +625,22 @@ function isExternalAgentJob(job) {
  * path (issue #239).
  *
  * BEST-EFFORT and non-throwing: a disabled kill switch, an ineligible job (no lease /
- * `elementInstanceKey`, or the AgentInstance producer off), a read failure/timeout, no
- * prior work, or an envelope with no seedable prompt ALL return the original envelope
- * (`resumed:false`) so the caller cold-runs exactly as before.
+ * `elementInstanceKey`, the AgentInstance producer off, or an INERT producer that will
+ * record no new turns), a read failure/timeout, no prior work, or an envelope with no
+ * seedable prompt ALL return the original envelope (`resumed:false`) so the caller
+ * cold-runs exactly as before.
  *
  * @param {object}  opts
  * @param {object}  opts.envelope           The original task envelope.
  * @param {object}  opts.job                The activated job (needs lease + `elementInstanceKey`).
  * @param {object}  [opts.camunda]          Host SDK client (probed for a read surface).
  * @param {boolean} [opts.agentInstanceOff] The `NANO_AGENT_INSTANCE=off` gate (no durable transcript).
+ * @param {boolean} [opts.producerUnavailable] True when the AgentInstance producer is
+ *        NOT live (neither active nor retry-armed) — e.g. the host SDK lacks
+ *        create/updateAgentInstance, the ACP classifier is unavailable, or `activate()`
+ *        threw. Resuming then seeds from a prior transcript but records NO new turns, so
+ *        the SAME stale transcript would drive the next reactivation and REPEAT side
+ *        effects; gate resume off it exactly like `agentInstanceOff`.
  * @param {boolean} [opts.containerMode]    True when this activation runs in a container
  *        sandbox (no host clone/push provisioning) — forces transcript-only recovery.
  * @param {object}  [opts.env]              Environment for the kill-switch check.
@@ -640,12 +654,13 @@ export async function resolveEffectiveEnvelope(opts = {}) {
     job,
     camunda,
     agentInstanceOff = false,
+    producerUnavailable = false,
     containerMode = false,
     env = process.env,
     logger,
     readPrior = readPriorTranscript,
   } = opts;
-  if (agentInstanceOff || isResumeDisabled(env) || !isExternalAgentJob(job)) {
+  if (agentInstanceOff || producerUnavailable || isResumeDisabled(env) || !isExternalAgentJob(job)) {
     return { envelope, resumed: false, historyCount: 0 };
   }
   try {

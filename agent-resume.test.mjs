@@ -16,6 +16,8 @@ import assert from 'node:assert/strict';
 import {
   RESUME_CONTEXT_CAP_CHARS,
   RESUME_BLOCK_CAP_CHARS,
+  RESUME_MAX_HISTORY_PAGES,
+  RESUME_MAX_HISTORY_BYTES,
   hasResumableTranscript,
   renderHistoryTurns,
   readPriorTranscript,
@@ -340,6 +342,14 @@ test('seedResumeEnvelope: recovery text is conditional on a declared pushed bran
   const createIsBase = seedResumeEnvelope({ task: { prompt: 'do it' }, repository: { url: 'x', ref: 'main', baseRef: 'main' }, branch: { create: 'main', push: true } }, 'T');
   assert.ok(createIsBase.task.prompt.includes('ONLY record'), 'ref === create === base → transcript-only recovery text');
 
+  // provisionRepo ALSO fallback-branches a `branch.create` that names the remote DEFAULT
+  // branch even when a DIFFERENT base is configured (createNamesBase → remoteDefaultBranch),
+  // so `ref === create === main` with baseRef=release strands the commits on a per-run
+  // fallback → NOT recoverable. The predicate conservatively classifies a default-named
+  // ref as transcript-only rather than falsely promising branch recovery.
+  const createIsDefault = seedResumeEnvelope({ task: { prompt: 'do it' }, repository: { url: 'x', ref: 'main', baseRef: 'release' }, branch: { create: 'main', push: true } }, 'T');
+  assert.ok(createIsDefault.task.prompt.includes('ONLY record'), 'ref === create names the default branch (main) → transcript-only recovery text');
+
   // No configured base at all: provisionRepo falls back to the checked-out ref as the
   // base, so ref === create with no base is base-like and fallback-branched → NOT
   // recoverable. A blank base cannot prove `ref` is non-base.
@@ -431,6 +441,195 @@ test('readPriorTranscript: passes the mandatory consistency option and scopes hi
   // the outer deadline rather than leaking an in-flight request per reactivation (#241 r6).
   assert.ok(seenSignals.length >= 2, 'both the instance search and the history read ran');
   for (const s of seenSignals) assert.ok(s && typeof s.aborted === 'boolean', 'read options carry an AbortSignal');
+});
+
+test('readPriorTranscript: paginates searchAgentInstanceHistory and KEEPS the newest page (issue #245)', async () => {
+  // A single element's activation history can span more than one cursor-paginated page.
+  // Consuming only the first (oldest) page would drop the NEWEST turns and seed the
+  // resume from a truncated-newest transcript — re-driving already-completed steps. The
+  // reader must follow `page.endCursor` → next request `page.after` to exhaustion and
+  // assemble every page IN ORDER.
+  const pages = {
+    undefined: { items: [textTurn('ASSISTANT', 'oldest work')], page: { startCursor: null, endCursor: 'cur-1', totalItems: 3, hasMoreTotalItems: true } },
+    'cur-1': { items: [textTurn('ASSISTANT', 'middle work')], page: { startCursor: 'cur-1', endCursor: 'cur-2', totalItems: 3, hasMoreTotalItems: true } },
+    'cur-2': { items: [textTurn('ASSISTANT', 'newest work')], page: { startCursor: 'cur-2', endCursor: null, totalItems: 3, hasMoreTotalItems: false } },
+  };
+  const seenAfter = [];
+  const camunda = {
+    searchAgentInstances: async () => ({ items: [{ elementInstanceKeys: ['5'], agentInstanceKey: 'ai-5' }] }),
+    searchAgentInstanceHistory: async (q) => {
+      const after = q.page?.after;
+      seenAfter.push(after);
+      const page = pages[after === undefined ? 'undefined' : after];
+      if (!page) throw new Error(`unexpected cursor ${after}`);
+      return page;
+    },
+  };
+  const got = await readPriorTranscript({ camunda, job: { elementInstanceKey: '5' } });
+  assert.ok(got, 'resumes from the fully assembled transcript');
+  assert.equal(got.historyCount, 3, 'every page assembled — none dropped');
+  assert.ok(got.text.includes('oldest work'));
+  assert.ok(got.text.includes('newest work'), 'the NEWEST page survives into the seed');
+  // Each ensuing page is requested with the PRIOR page endCursor threaded as page.after.
+  assert.deepEqual(seenAfter, [undefined, 'cur-1', 'cur-2']);
+});
+
+test('readPriorTranscript: history is requested OLDEST-first (producedAt ASC) so the tail is chronological (issue #245)', async () => {
+  // renderHistoryTurns keeps the END of the array; without an explicit ascending sort a
+  // newest-first SDK default would make us retain the OLDEST turns and repeat completed
+  // side effects. Every history page request must carry sort=[{producedAt, ASC}].
+  const seenSort = [];
+  const camunda = {
+    searchAgentInstances: async () => ({ items: [{ elementInstanceKeys: ['21'], agentInstanceKey: 'ai-21' }] }),
+    searchAgentInstanceHistory: async (q) => {
+      seenSort.push(q.sort);
+      return { items: [textTurn('ASSISTANT', 'work')], page: { endCursor: null } };
+    },
+  };
+  const got = await readPriorTranscript({ camunda, job: { elementInstanceKey: '21' } });
+  assert.ok(got, 'resumes');
+  assert.deepEqual(seenSort, [[{ field: 'producedAt', order: 'ASC' }]], 'every page requests producedAt ascending');
+});
+
+test('readPriorTranscript: a non-advancing history cursor terminates (no infinite paging, issue #245)', async () => {
+  // A server that keeps echoing the SAME endCursor must not spin the reader forever —
+  // the no-progress guard treats an unchanged cursor as end-of-stream. Crucially, the
+  // echoed page is DISCARDED (its turns are already assembled), so completed turns are
+  // never double-inserted into the seeded transcript.
+  let calls = 0;
+  const camunda = {
+    searchAgentInstances: async () => ({ items: [{ elementInstanceKeys: ['8'], agentInstanceKey: 'ai-8' }] }),
+    searchAgentInstanceHistory: async () => {
+      calls += 1;
+      return { items: [textTurn('ASSISTANT', 'stuck work')], page: { startCursor: null, endCursor: 'same' } };
+    },
+  };
+  const got = await readPriorTranscript({ camunda, job: { elementInstanceKey: '8' } });
+  assert.ok(got);
+  // Page 1 (after=undefined) then page 2 (after='same'); the echoed 'same' cursor halts it.
+  assert.equal(calls, 2, 'stops as soon as the cursor stops advancing');
+  assert.equal(got.historyCount, 1, 'the echoed no-progress page is discarded, not double-appended');
+});
+
+test('readPriorTranscript: a page-cap hit with an advancing cursor is treated as INCOMPLETE, not seeded (issue #245)', async () => {
+  // A server that ALWAYS advances the cursor would page forever without a guard. When
+  // the cap is reached while a cursor still remains, the read is TRUNCATED-NEWEST — the
+  // exact hazard resume prevents — so it must NOT be seeded: the reader rejects the
+  // partial and readPriorTranscript takes the documented cold-run fallback (null).
+  let calls = 0;
+  const camunda = {
+    searchAgentInstances: async () => ({ items: [{ elementInstanceKeys: ['9'], agentInstanceKey: 'ai-9' }] }),
+    searchAgentInstanceHistory: async () => {
+      calls += 1;
+      return { items: [textTurn('ASSISTANT', `w${calls}`)], page: { startCursor: null, endCursor: `cur-${calls}` } };
+    },
+  };
+  const got = await readPriorTranscript({ camunda, job: { elementInstanceKey: '9' } });
+  assert.equal(got, null, 'an incomplete, truncated-newest history is NOT seeded — cold-run fallback');
+  assert.equal(calls, RESUME_MAX_HISTORY_PAGES, 'the follow stops at the max-pages guard');
+});
+
+test('readPriorTranscript: crossing the aggregate byte budget is treated as INCOMPLETE, not seeded (issue #245)', async () => {
+  // A history WITHIN the page cap can still buffer huge per-page tool results. Once the
+  // accumulated raw size crosses RESUME_MAX_HISTORY_BYTES the drain must reject (like
+  // the page-cap reject) so a reactivation can't buffer an unbounded transcript just to
+  // trim it to the render cap — readPriorTranscript then cold-runs (null).
+  let calls = 0;
+  const bigText = 'x'.repeat(RESUME_MAX_HISTORY_BYTES + 1_000); // one page already over budget
+  const camunda = {
+    searchAgentInstances: async () => ({ items: [{ elementInstanceKeys: ['15'], agentInstanceKey: 'ai-15' }] }),
+    searchAgentInstanceHistory: async () => {
+      calls += 1;
+      // Always advance the cursor: without the byte guard this would page to the
+      // count cap; the byte budget must trip FIRST, on the very first oversized page.
+      return { items: [textTurn('ASSISTANT', bigText)], page: { startCursor: null, endCursor: `cur-${calls}` } };
+    },
+  };
+  const got = await readPriorTranscript({ camunda, job: { elementInstanceKey: '15' } });
+  assert.equal(got, null, 'an over-budget history is NOT seeded — cold-run fallback');
+  assert.equal(calls, 1, 'the byte budget trips on the first oversized page, before the page-count cap');
+});
+
+test('readPriorTranscript: a present page.endCursor:null is authoritative over a stale top-level cursor (issue #245)', async () => {
+  // A mixed/newer response can carry BOTH the documented terminal marker
+  // (`page.endCursor: null`) AND a leftover top-level `endCursor`/`nextCursor`. The
+  // `page` envelope wins: a PRESENT `page.endCursor` key ends the stream even when its
+  // value is null, so the reader must NOT follow the stale top-level cursor into an
+  // extra/misordered page.
+  let calls = 0;
+  const camunda = {
+    searchAgentInstances: async () => ({ items: [{ elementInstanceKeys: ['11'], agentInstanceKey: 'ai-11' }] }),
+    searchAgentInstanceHistory: async () => {
+      calls += 1;
+      // page.endCursor:null == end-of-stream, but a stale top-level endCursor also present.
+      return { items: [textTurn('ASSISTANT', 'only page')], page: { startCursor: null, endCursor: null }, endCursor: 'stale-cur', nextCursor: 'stale-next' };
+    },
+  };
+  const got = await readPriorTranscript({ camunda, job: { elementInstanceKey: '11' } });
+  assert.ok(got, 'resumes from the single terminal page');
+  assert.equal(calls, 1, 'the present page.endCursor:null ends the stream — the stale top-level cursor is ignored');
+  assert.equal(got.historyCount, 1, 'no extra page followed');
+});
+
+test('readPriorTranscript: a top-level cursor is followed ONLY when the page envelope carries no endCursor key (issue #245)', async () => {
+  // Leaner in-memory fakes / older shapes expose the cursor at the TOP level with no
+  // `page` envelope. That fallback still paginates to exhaustion.
+  const pages = {
+    undefined: { items: [textTurn('ASSISTANT', 'old')], nextCursor: 'n1' },
+    n1: { items: [textTurn('ASSISTANT', 'new')] },
+  };
+  const camunda = {
+    searchAgentInstances: async () => ({ items: [{ elementInstanceKeys: ['12'], agentInstanceKey: 'ai-12' }] }),
+    searchAgentInstanceHistory: async (q) => pages[q.page?.after === undefined ? 'undefined' : q.page.after],
+  };
+  const got = await readPriorTranscript({ camunda, job: { elementInstanceKey: '12' } });
+  assert.ok(got);
+  assert.equal(got.historyCount, 2, 'the top-level nextCursor fallback still assembles every page');
+  assert.ok(got.text.includes('new'), 'the newest top-level-cursor page survives');
+});
+
+test('readPriorTranscript: a pagination error does NOT fall through to a first-page-only alias (issue #245)', async () => {
+  // A client exposing BOTH searchAgentInstanceHistory (paginating) and
+  // getAgentInstanceHistory (first-page-only) must not, on the paginating method
+  // rejecting mid-read, silently seed the other alias's oldest-page-only result as a
+  // complete transcript. The pagination error escapes the alias loop → the read is
+  // marked incomplete → readPriorTranscript cold-runs (null).
+  let getCalled = 0;
+  let searchCalls = 0;
+  const camunda = {
+    searchAgentInstances: async () => ({ items: [{ elementInstanceKeys: ['13'], agentInstanceKey: 'ai-13' }] }),
+    searchAgentInstanceHistory: async (q) => {
+      searchCalls += 1;
+      // First request assembles a partial page WITH a forward cursor (so a partial
+      // transcript now exists in `all`); the SECOND (cursor) request rejects
+      // mid-pagination — this is the real safety case the guard protects, not a
+      // first-request reject where nothing was assembled yet.
+      if (q.page?.after === undefined) {
+        return { items: [textTurn('ASSISTANT', 'partial first page')], page: { endCursor: 'n1' } };
+      }
+      throw new Error('mid-pagination page reject');
+    },
+    getAgentInstanceHistory: async () => { getCalled += 1; return { history: [textTurn('ASSISTANT', 'oldest-only work')] }; },
+  };
+  const got = await readPriorTranscript({ camunda, job: { elementInstanceKey: '13' } });
+  assert.equal(got, null, 'the PARTIAL transcript assembled before the mid-pagination reject is discarded — cold-run fallback');
+  assert.equal(searchCalls, 2, 'a partial page was assembled before the second (cursor) request rejected');
+  assert.equal(getCalled, 0, 'the first-page-only alias is never consulted after the pagination error');
+});
+
+test('readPriorTranscript: an EMPTY read from one alias still advances to the next (issue #245)', async () => {
+  // Distinguish "this method name returned no history" (fine to try the next alias) from
+  // "a real read failed partway" (propagate). An empty return advances; a throw does not.
+  let searchCalled = 0;
+  const camunda = {
+    searchAgentInstances: async () => ({ items: [{ elementInstanceKeys: ['14'], agentInstanceKey: 'ai-14' }] }),
+    searchAgentInstanceHistory: async () => { searchCalled += 1; return { items: [] }; },
+    getAgentInstanceHistory: async () => ({ history: [textTurn('ASSISTANT', 'recovered via alias')] }),
+  };
+  const got = await readPriorTranscript({ camunda, job: { elementInstanceKey: '14' } });
+  assert.ok(got, 'the next alias supplies the history when the first returns empty');
+  assert.equal(searchCalled, 1, 'the empty first alias was tried');
+  assert.ok(got.text.includes('recovered via alias'));
 });
 
 test('renderHistoryTurns: an empty TOOL_RESULT renders an explicit result, never a re-invocation', () => {

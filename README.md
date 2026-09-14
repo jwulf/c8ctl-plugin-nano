@@ -679,6 +679,52 @@ the job with a decremented retry count. Profiles are stored in the plugin's
 > and `AGENT_*` env vars, never interpolated into the command line, so process
 > variables cannot inject shell commands.
 
+> **Resume on re-activation — a continuation, not a duplicate.** When the broker
+> re-activates an agent job (its lock lapsed after a worker death, node loss, or
+> idle-kill — see the activation-lock note above), the new worker does **not**
+> cold-rerun from scratch. Instead it **resumes from the previous agent's state**,
+> so at-least-once delivery stops being harmful — a re-activation becomes a
+> *continuation* rather than a duplicate of the agent's external side effects. On
+> re-activation, before spawning the harness, the worker:
+> - Fetches the prior **engine-native `AgentInstance` transcript** for this
+>   `elementInstanceKey` (the durable, append-only `AgentHistory` minted while the
+>   previous instance ran). Because it is **engine-backed it is cross-machine** —
+>   the resumed agent can pick up on a completely different worker box, unlike a
+>   local same-host journal.
+> - **Seeds the harness prompt** with a rendered continuation of that transcript,
+>   so the new agent continues from where the prior one left off and does not
+>   repeat already-completed steps or re-perform side effects (comments, pushes,
+>   PRs).
+>
+> **Recovery scope (what survives a re-activation):**
+> - **Committed work is durable *only when this activation re-checks-out the exact
+>   branch the prior run pushed onto*** — a single invariant: `repository.ref` names a
+>   stable non-base branch **and** `branch.create` names that **same** branch
+>   (`create === ref`). The clone lands the workspace on `ref` (prior commits present),
+>   and `provisionRepo`'s honored `git checkout -B <create>` is then a no-op that keeps
+>   the workspace on it and pushes it back, so the resumed agent can inspect it for the
+>   **last pushed commit** (`git log` / the open PR for what landed). Every other shape
+>   is **not** durable and is classified **transcript-only**: a `ref`-only job with no
+>   `branch.create` (the PR-based review/fix-ci/rebase shape) is committed onto a
+>   **per-run `nano/agent-work/<base>-<runId>` fallback branch** the next clone of `ref`
+>   never sees; a `branch.create` that differs from `ref` does `checkout -B <create>`
+>   off the freshly re-cloned base and never fetches the existing remote `<create>`; and
+>   a base-like ref/create, a bare-URL / base-only clone, `branch.push=false`, or a
+>   `repository.sha`-detached checkout likewise recover nothing. For every transcript-only
+>   run the resume preamble points at the transcript (VERIFY-first) rather than promising
+>   a branch to check out.
+> - **Uncommitted working-tree changes are *not* recovered** in this increment —
+>   the throwaway workspace does not persist across activations, so any delta the
+>   previous run had not committed is lost and the resumed agent re-derives it. The
+>   resume preamble states this explicitly. (Persisting the workspace / microVM
+>   across activations to recover uncommitted work is a later isolated-context
+>   increment.)
+>
+> Resume is **best-effort and gated to external agent jobs** (the only ones with a
+> durable transcript). A read failure, an SDK without an AgentInstance read
+> surface, no prior work to continue, or the `NANO_AGENT_RESUME=off` kill switch
+> all fall through to the legacy cold rerun with no behaviour change.
+
 ### Task envelope, sandboxes & disk hygiene
 
 For **agentic** jobs (an agent that clones a repo, works a task, pushes a

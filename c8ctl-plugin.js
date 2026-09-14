@@ -85,6 +85,11 @@ import { acpUpdateToDisplayChunk } from './acp-transcript-producer.mjs';
 // #194): mints an AgentInstance for an `external` agent job and appends each ACP
 // turn to the engine's append-only AgentHistory via the host SDK client.
 import { createAgentInstanceProducer, isExternalAgentJob } from './agent-instance.mjs';
+// Engine-transcript resume (issue #239): on a re-activation, fetch the prior
+// AgentInstance transcript for this elementInstanceKey and seed the harness with it
+// so the new agent CONTINUES rather than cold-reruns — at-least-once delivery becomes
+// a continuation, not a duplicate. Best-effort; degrades to the legacy cold rerun.
+import { resolveEffectiveEnvelope } from './agent-resume.mjs';
 
 const requireFromHere = createRequire(import.meta.url);
 const pluginDir = dirname(fileURLToPath(import.meta.url));
@@ -9403,6 +9408,66 @@ async function workAgent(req, flags, ctx) {
           return;
         }
 
+        // #239: engine-transcript resume. On a re-activation the durable
+        // AgentInstance transcript (minted above, #194) already holds the prior
+        // instance's work, so instead of cold-rerunning we fetch it and SEED the
+        // harness prompt with a rendered continuation — turning an at-least-once
+        // re-delivery into a continuation, not a duplicate. The transcript carries the
+        // reasoning/steps so the resumed agent doesn't repeat completed work.
+        //
+        // COMMITTED work is recovered from the pushed branch only when this activation
+        // RE-CHECKS-OUT the exact branch the prior one pushed its commits onto. That is a
+        // SINGLE exact invariant: `repository.ref` names a stable non-base branch AND
+        // `branch.create` names that SAME branch (`create === ref`). The clone lands the
+        // workspace on `ref` (prior commits present), and provisionRepo's honored
+        // `git checkout -B <create>` is then a NO-OP that keeps the workspace on it and
+        // pushes it back. It does NOT hold when `create !== ref` (a `checkout -B <create>`
+        // off the FRESHLY re-cloned base HEAD never fetches an existing remote `<create>`,
+        // so prior commits on it are absent), nor for a `ref`-only push job (provisionRepo
+        // cuts a fresh per-activation `nano/agent-work/<base>-<runId>` fallback, so the
+        // commits land on a DIFFERENT branch than `ref` and the next clone lacks them),
+        // nor for a base-like ref/create, repo-less, `branch.push=false`, or
+        // `repository.sha`-detached job. All those degrade to a transcript-only
+        // continuation, which the seeded prompt states honestly (`seedResumeEnvelope` →
+        // `envelopeHasPushedBranch` gates the recovery text on `create === ref`, non-base).
+        // Carrying the prior `workingBranch` across reactivations (or a full prior-branch
+        // resolve+checkout) is the later isolated-context increment; uncommitted deltas
+        // from the prior run are not recovered in any case.
+        //
+        // The gating + best-effort read/seed live in `resolveEffectiveEnvelope`
+        // (unit-tested) so this wiring stays a thin call; a read failure /
+        // no-prior-work / an SDK without a read surface / the NANO_AGENT_RESUME=off
+        // kill switch all fall through to the legacy cold rerun with
+        // `effectiveEnvelope === envelope`.
+        let effectiveEnvelope = envelope;
+        {
+          // Only resume when the producer is actually LIVE (active or retry-armed). An
+          // inert producer (host SDK lacks create/updateAgentInstance, ACP classifier
+          // unavailable, or activate() threw) records NO new turns, so seeding from a
+          // prior transcript would leave the SAME stale transcript for the next
+          // reactivation to replay — repeating side effects. Gate resume off it exactly
+          // like NANO_AGENT_INSTANCE=off (review round 4).
+          const producerUnavailable = !(agentInstanceProducer?.active || agentInstanceProducer?.retryPending);
+          const resumed = await resolveEffectiveEnvelope({ envelope, job, camunda, agentInstanceOff, producerUnavailable, containerMode: isContainer, logger });
+          effectiveEnvelope = resumed.envelope;
+          if (resumed.resumed) {
+            logger.info(`[${jobType}] resuming from prior engine transcript (${aiCorr}) — ${resumed.historyCount} history turn(s) read from the prior run and rendered into the harness prompt (some non-content turns, e.g. CONFIGURATION, are elided); continuing from the last pushed commit when the branch identity is stable (uncommitted deltas from the prior run are not recovered).`);
+          }
+        }
+
+        // #239 (post-resume abort recheck): `resolveEffectiveEnvelope` above awaits an
+        // eventually-consistent transcript READ that can last up to ~10s and is not itself
+        // cancellable. The #222 recheck above only guards the `activate()` await; without a
+        // recheck HERE, a force-stop / lease-loss that wins DURING the transcript read would
+        // fall through to the malformed-repository `settleJob.fail` path below, racing the
+        // supervisor's yield and leaving the just-activated AgentInstance producer
+        // undiscarded. Recheck, discard the producer, and return WITHOUT settling.
+        if (checkSetupAbort(abortSignal, { jobType, jobKey: job.jobKey, stage: 'agent-instance-resume', logger })) {
+          await discardAgentInstanceProducer();
+          if (isContainer) liveRunIds.delete(runId);
+          return;
+        }
+
         // Fail-closed on a half-specified repository envelope (issue #129,
         // hardening 2): a `repository` block that declares intent (any field set)
         // but whose `url` is absent or not a usable clone target almost always
@@ -9613,7 +9678,10 @@ async function workAgent(req, flags, ctx) {
             // detached agent grandchild to init. Absent (undefined) on the normal
             // and graceful-drain paths, where the harness runs to completion.
             abortSignal,
-            envelope,
+            // #239: the resume-seeded envelope when this is a re-activation with a
+            // prior transcript (else the original envelope). Only the task prompt is
+            // reframed as a continuation; repository/setup are unchanged.
+            envelope: effectiveEnvelope,
             sandbox,
             image,
             runId,

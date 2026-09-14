@@ -77,6 +77,34 @@ SDK client (job workers) — do **not** add the SDK as a dependency or use raw
   (age-gated, in-flight skipped) and deleted per-job unless `--keep-runs`.
   Container-side cloning
   (strong isolation) is a later increment; container jobs don't clone yet.
+- **Resume on re-activation (issue #239, `agent-resume.mjs`).** A re-activated
+  agent job **resumes from the prior agent's state** instead of cold-rerunning, so
+  at-least-once re-delivery is a *continuation*, not a duplicate of external side
+  effects. Before spawning the harness, `workAgent` calls `readPriorTranscript`
+  (best-effort, injected SDK read seam) to fetch the durable engine-native
+  `AgentInstance`/`AgentHistory` transcript (#194) for this `elementInstanceKey` —
+  **engine-backed, so cross-machine** — and, when it carries real prior work,
+  `seedResumeEnvelope` reframes `envelope.task.prompt` as a continuation (rendered
+  transcript + recovery-scope contract). Committed work is recovered from the
+  pushed branch **only when the job targets a stable, existing non-base branch that
+  provisioning keeps the workspace on** — the invariant `repository.ref === branch.create`
+  where `ref` names a KNOWN non-base branch (base resolved with provisioning's precedence,
+  `branch.base` then `repository.baseRef`, required non-blank; a conventional default name
+  `main`/`master` is conservatively treated as base-like since provisioning also
+  fallback-branches the resolved remote default) with no pinned
+  `repository.sha` and `branch.push !== false` (e.g. the PR head named by `repository.ref`).
+  Provisioning re-clones `ref` each activation and its honored `checkout -B <create>` is
+  then a no-op keeping the workspace on it. Any other shape — a bare-URL / base-only clone,
+  a ref-only job with no matching `create`, a `ref`/`create` that equals (or cannot be
+  proven distinct from) the base, or a per-run fallback branch — is NOT
+  re-fetched, so such a run is classified **transcript-only** (the recovery
+  preamble points at the transcript, not a branch that isn't there). In every case
+  **uncommitted deltas are lost** (workspace is throwaway — the isolated-context
+  persistence increment is later). Gated to external agent jobs;
+  a read failure / no read surface / no prior work / `NANO_AGENT_RESUME=off` falls
+  through to the legacy cold rerun (`effectiveEnvelope === envelope`). The prompt
+  seed is the only change — repository/setup are untouched, and the AgentInstance
+  producer still records the ORIGINAL system prompt.
 
 ## Worker supervisor (`supervisor`)
 

@@ -22,6 +22,7 @@
   "files": [
     "c8ctl-plugin.js",
     "agent-instance.mjs",
+    "agent-resume.mjs",
     "acp-transcript-producer.mjs",
     "platforms.mjs",
     "agentic.mjs",

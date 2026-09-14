@@ -86,9 +86,15 @@ SDK client (job workers) — do **not** add the SDK as a dependency or use raw
   **engine-backed, so cross-machine** — and, when it carries real prior work,
   `seedResumeEnvelope` reframes `envelope.task.prompt` as a continuation (rendered
   transcript + recovery-scope contract). Committed work is recovered from the
-  pushed branch **only when the job targets a stable, existing non-base branch**
-  (e.g. the PR head named by `repository.ref`), which provisioning re-clones each
-  activation; a bare-URL / base-only clone or a per-run fallback branch is NOT
+  pushed branch **only when the job targets a stable, existing non-base branch that
+  provisioning keeps the workspace on** — the invariant `repository.ref === branch.create`
+  where `ref` names a KNOWN non-base branch (base resolved with provisioning's precedence,
+  `branch.base` then `repository.baseRef`, required non-blank) with no pinned
+  `repository.sha` and `branch.push !== false` (e.g. the PR head named by `repository.ref`).
+  Provisioning re-clones `ref` each activation and its honored `checkout -B <create>` is
+  then a no-op keeping the workspace on it. Any other shape — a bare-URL / base-only clone,
+  a ref-only job with no matching `create`, a `ref`/`create` that equals (or cannot be
+  proven distinct from) the base, or a per-run fallback branch — is NOT
   re-fetched, so such a run is classified **transcript-only** (the recovery
   preamble points at the transcript, not a branch that isn't there). In every case
   **uncommitted deltas are lost** (workspace is throwaway — the isolated-context

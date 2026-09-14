@@ -454,8 +454,17 @@ function scopeEmbeddedHistoryToElement(match, eik) {
 
 // The default engine read seam: probe the candidate SDK methods for a prior
 // AgentInstance correlated on `elementInstanceKey` and return its history turns.
-// Entirely best-effort — ANY rejection/throw resolves to an empty list, never
-// propagates. Injected as `read` so tests drive it deterministically.
+// Injected as `read` so tests drive it deterministically.
+//
+// Error handling is SPLIT by phase, deliberately:
+//  - Instance CORRELATION (the search + get-by-element probes below) is entirely
+//    best-effort: any rejection/throw resolves to an empty list and never propagates,
+//    because a failed correlation just means "nothing to resume from" (cold-run).
+//  - History PAGINATION (readHistoryAllPages) does NOT swallow: a page error
+//    propagates to readPriorTranscript's try/catch so a partial/truncated read is
+//    discarded (cold-run) rather than silently falling through to another alias's
+//    first-page-only result and being seeded as a complete transcript. See the alias
+//    loop below for the full rationale.
 //
 // `signal` (optional AbortSignal) bounds the request FAN-OUT: once the caller's
 // deadline aborts it, this stops BEFORE issuing the next SDK request (the get
@@ -520,7 +529,17 @@ async function defaultRead({ camunda, elementInstanceKey, signal }) {
       for (const m of HISTORY_METHODS) {
         if (signal?.aborted) return turns;
         if (typeof camunda[m] !== 'function') continue;
-        const baseReq = { agentInstanceKey: String(aik), filter: { elementInstanceKey: eik } };
+        // Request the history OLDEST-first (`producedAt` ascending) explicitly:
+        // `renderHistoryTurns` assembles a bounded TAIL from the END of the array, so
+        // it requires chronological order. Cursor pagination preserves whatever order
+        // the API returns; without an explicit sort a newest-first (or changed) default
+        // would make us retain the OLDEST turns and let the resumed agent repeat
+        // already-completed side effects (issue #245).
+        const baseReq = {
+          agentInstanceKey: String(aik),
+          filter: { elementInstanceKey: eik },
+          sort: [{ field: 'producedAt', order: 'ASC' }],
+        };
         // Do NOT swallow a pagination error here and fall through to the NEXT alias
         // method: a partial/truncated read from one method (e.g. searchAgentInstanceHistory
         // rejecting mid-pagination, or the page-cap truncated-newest reject) must never be

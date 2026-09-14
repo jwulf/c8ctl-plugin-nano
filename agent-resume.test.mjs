@@ -473,6 +473,23 @@ test('readPriorTranscript: paginates searchAgentInstanceHistory and KEEPS the ne
   assert.deepEqual(seenAfter, [undefined, 'cur-1', 'cur-2']);
 });
 
+test('readPriorTranscript: history is requested OLDEST-first (producedAt ASC) so the tail is chronological (issue #245)', async () => {
+  // renderHistoryTurns keeps the END of the array; without an explicit ascending sort a
+  // newest-first SDK default would make us retain the OLDEST turns and repeat completed
+  // side effects. Every history page request must carry sort=[{producedAt, ASC}].
+  const seenSort = [];
+  const camunda = {
+    searchAgentInstances: async () => ({ items: [{ elementInstanceKeys: ['21'], agentInstanceKey: 'ai-21' }] }),
+    searchAgentInstanceHistory: async (q) => {
+      seenSort.push(q.sort);
+      return { items: [textTurn('ASSISTANT', 'work')], page: { endCursor: null } };
+    },
+  };
+  const got = await readPriorTranscript({ camunda, job: { elementInstanceKey: '21' } });
+  assert.ok(got, 'resumes');
+  assert.deepEqual(seenSort, [[{ field: 'producedAt', order: 'ASC' }]], 'every page requests producedAt ascending');
+});
+
 test('readPriorTranscript: a non-advancing history cursor terminates (no infinite paging, issue #245)', async () => {
   // A server that keeps echoing the SAME endCursor must not spin the reader forever —
   // the no-progress guard treats an unchanged cursor as end-of-stream. Crucially, the

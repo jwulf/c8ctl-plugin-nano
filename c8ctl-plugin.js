@@ -9416,23 +9416,23 @@ async function workAgent(req, flags, ctx) {
         // reasoning/steps so the resumed agent doesn't repeat completed work.
         //
         // COMMITTED work is recovered from the pushed branch only when this activation
-        // RE-CLONES the SAME branch the prior one pushed its commits onto. That holds
-        // ONLY when the envelope carries a STABLE, EXISTING non-base branch identity —
-        // a `repository.ref` naming a non-base branch (e.g. the PR head), which
-        // `provisionRepo` re-clones each activation with the prior round's reconciled
-        // commits already present. It does NOT hold for `branch.create`: that does a
-        // `git checkout -B <create>` off the FRESHLY re-cloned base HEAD and never
-        // fetches an existing remote `<create>`, so prior commits on it are absent.
-        // Nor for a plain push-enabled job whose ref is base-like / absent:
-        // `provisionRepo` then cuts a fresh per-activation `nano/agent-work/<base>-<runId>`
-        // fallback, so the prior commits are on a DIFFERENT branch and are not checked
-        // out. Those cases (and any repo-less / `branch.push=false` job) degrade to a
-        // transcript-only continuation, which the seeded prompt states honestly
-        // (`seedResumeEnvelope` → `envelopeHasPushedBranch` gates the recovery text on a
-        // stable non-base `repository.ref`). Carrying the prior `workingBranch` across
-        // reactivations (or a full prior-branch resolve+checkout) is the later
-        // isolated-context increment; uncommitted deltas from the prior run are not
-        // recovered in any case.
+        // RE-CHECKS-OUT the exact branch the prior one pushed its commits onto. That is a
+        // SINGLE exact invariant: `repository.ref` names a stable non-base branch AND
+        // `branch.create` names that SAME branch (`create === ref`). The clone lands the
+        // workspace on `ref` (prior commits present), and provisionRepo's honored
+        // `git checkout -B <create>` is then a NO-OP that keeps the workspace on it and
+        // pushes it back. It does NOT hold when `create !== ref` (a `checkout -B <create>`
+        // off the FRESHLY re-cloned base HEAD never fetches an existing remote `<create>`,
+        // so prior commits on it are absent), nor for a `ref`-only push job (provisionRepo
+        // cuts a fresh per-activation `nano/agent-work/<base>-<runId>` fallback, so the
+        // commits land on a DIFFERENT branch than `ref` and the next clone lacks them),
+        // nor for a base-like ref/create, repo-less, `branch.push=false`, or
+        // `repository.sha`-detached job. All those degrade to a transcript-only
+        // continuation, which the seeded prompt states honestly (`seedResumeEnvelope` →
+        // `envelopeHasPushedBranch` gates the recovery text on `create === ref`, non-base).
+        // Carrying the prior `workingBranch` across reactivations (or a full prior-branch
+        // resolve+checkout) is the later isolated-context increment; uncommitted deltas
+        // from the prior run are not recovered in any case.
         //
         // The gating + best-effort read/seed live in `resolveEffectiveEnvelope`
         // (unit-tested) so this wiring stays a thin call; a read failure /
@@ -9444,7 +9444,7 @@ async function workAgent(req, flags, ctx) {
           const resumed = await resolveEffectiveEnvelope({ envelope, job, camunda, agentInstanceOff, containerMode: isContainer, logger });
           effectiveEnvelope = resumed.envelope;
           if (resumed.resumed) {
-            logger.info(`[${jobType}] resuming from prior engine transcript (${aiCorr}) — ${resumed.historyCount} history turn(s) seeded into the harness prompt; continuing from the last pushed commit when the branch identity is stable (uncommitted deltas from the prior run are not recovered).`);
+            logger.info(`[${jobType}] resuming from prior engine transcript (${aiCorr}) — ${resumed.historyCount} history turn(s) read from the prior run and rendered into the harness prompt (some non-content turns, e.g. CONFIGURATION, are elided); continuing from the last pushed commit when the branch identity is stable (uncommitted deltas from the prior run are not recovered).`);
           }
         }
 

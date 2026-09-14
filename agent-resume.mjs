@@ -547,28 +547,28 @@ export function seedResumeEnvelope(envelope, transcriptText, opts = {}) {
   return { ...envelope, task: { ...envelope.task, prompt: seeded } };
 }
 
-// Does this envelope declare a STABLE, NAMED branch the prior run would have PUSHED its
-// commits ONTO — one that survives as more than a throwaway per-run ref — so committed
-// work is durably recoverable? This is the ONLY case that justifies the recovery
-// preamble's "your committed work is on the pushed branch" promise. It is deliberately
-// NARROW, and — critically — gated on an explicit `branch.create`, NOT on `repository.ref`
-// alone (issue #241):
-//   - a repo-less job (no `repository.url`) or one with `branch.push === false` leaves
-//     the throwaway workspace as the only copy — nothing to recover from;
-//   - a `repository.sha` DETACHES HEAD in provisionRepo (it checks out the sha, leaving
-//     no symbolic working branch), so finalizeGit has NO branch to push and nothing is
-//     published — regardless of what `repository.ref` names. This is the authoritative
-//     detach signal, gated on directly rather than GUESSED from the shape of `ref`;
-//   - a `repository.ref`+push job with NO explicit `branch.create` (the PR-based
-//     review/fix-ci/rebase shape — `repoEnvelope.ts` omits `branch.create` there) does
-//     NOT recover: provisionRepo's `else if (checkedOut && wantPush)` arm cuts a per-run
-//     `nano/agent-work/<base>-<runId>` FALLBACK branch even for a checked-out PR head, so
-//     the prior commits land on a run-scoped ref the NEXT activation neither knows nor
-//     fetches. Only an explicit `branch.create` takes provisionRepo's honored
-//     `checkout -B <create>` path, publishing a STABLE named work branch — so recovery
-//     is claimed ONLY when `branch.create` is present.
-// A `branch.create` that NAMES the base (`repository.baseRef`/`branch.base`) commits
-// directly on the base, which provisionRepo ALSO fallback-branches → non-recoverable.
+// Does this envelope declare a STABLE branch the prior run pushed its commits ONTO that
+// THIS activation will RE-CHECK-OUT with those commits present, so committed work is
+// durably recoverable? This is the ONLY case that justifies the recovery preamble's
+// "your committed work is on the pushed branch" promise, and it is a SINGLE, exact
+// invariant (issue #241): `repository.ref` names a stable non-base branch AND
+// `branch.create` names that SAME branch (`create === ref`). Why both, and why equal:
+//   - the clone checks out `repository.ref`, so only a stable `ref` lands the workspace
+//     on the branch the prior run pushed (with its commits present);
+//   - provisionRepo's honored `git checkout -B <create>` then keeps the workspace on
+//     that branch and pushes it back — but ONLY when `create === ref` is the checkout a
+//     NO-OP that preserves the prior commits. A `create !== ref` does `checkout -B
+//     <create>` off the FRESHLY re-cloned `ref`/base HEAD and never fetches an existing
+//     remote `<create>`, so prior commits on it are ABSENT;
+//   - a `ref` with NO `branch.create` does NOT recover either: provisionRepo's
+//     `checkedOut && wantPush` arm cuts a per-run `nano/agent-work/<base>-<runId>`
+//     FALLBACK branch even for a checked-out PR head (the review/fix-ci/rebase shape,
+//     which `repoEnvelope` emits with no `branch.create`), so the prior commits land on
+//     a run-scoped ref that is NOT `ref`, and the next clone of `ref` lacks them.
+//   - a repo-less job, `branch.push === false`, or a `repository.sha` (which DETACHES
+//     HEAD, leaving no symbolic branch to push) is likewise non-recoverable.
+// A `ref`/`create` equal to the base (`repository.baseRef`/`branch.base`) commits on the
+// base, which provisionRepo ALSO fallback-branches → non-recoverable.
 // (A push *rejected* at runtime is not knowable here; declared intent is the best signal
 // available at seed time; the recovery preamble is VERIFY-first so a not-yet-reconciled
 // branch still degrades safely.)
@@ -576,18 +576,20 @@ function envelopeHasPushedBranch(envelope) {
   const repo = envelope?.repository;
   const branch = envelope?.branch;
   if (!isPlainObject(repo) || !isNonBlank(repo.url) || branch?.push === false) return false;
-  // A dedicated `repository.sha` detaches HEAD → no pushable working branch, so nothing
-  // is published/recoverable regardless of `branch.create`. Gate on it authoritatively.
+  // A dedicated `repository.sha` detaches HEAD → no pushable working branch.
   if (isNonBlank(repo.sha)) return false;
-  // Only an explicit `branch.create` yields provisionRepo's honored `checkout -B <create>`
-  // stable-named-branch push; without it the ref-only shape is fallback-branched (#241).
+  const ref = isNonBlank(repo.ref) ? String(repo.ref).trim() : '';
   const create = isNonBlank(branch?.create) ? String(branch.create).trim() : '';
-  if (create === '') return false;
-  // A create equal to the base commits on the base → provisionRepo cuts a fallback.
+  // The clone must re-check-out the exact branch the prior run pushed onto: a stable
+  // `ref` AND a `branch.create` naming that SAME branch. Anything else (ref-only →
+  // per-run fallback; create-only / create !== ref → `checkout -B` off base) leaves the
+  // prior commits on a branch this activation does not check out.
+  if (ref === '' || create === '' || create !== ref) return false;
+  // A ref/create equal to the base commits on the base → provisionRepo cuts a fallback.
   const base = isNonBlank(repo.baseRef)
     ? String(repo.baseRef).trim()
     : (isNonBlank(branch?.base) ? String(branch.base).trim() : '');
-  if (base !== '' && create === base) return false;
+  if (base !== '' && ref === base) return false;
   return true;
 }
 

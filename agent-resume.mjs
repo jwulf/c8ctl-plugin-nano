@@ -75,6 +75,24 @@ export const RESUME_READ_TIMEOUT_MS = 10_000;
 export const RESUME_READ_CONSISTENCY_MS = 4_000;
 const READ_CONSISTENCY = { consistency: { waitUpToMs: RESUME_READ_CONSISTENCY_MS } };
 
+// Per-call read options: the mandatory eventual-consistency wait PLUS the probe's abort
+// `signal` when present, so a hung SDK read is CANCELLED at the outer deadline rather than
+// only stopping the await — otherwise a partition-hung `searchAgentInstances`/history
+// request leaks one in-flight socket per reactivation. The signal rides in the options
+// object (honored iff the generated client forwards it to the transport, as the fetch-based
+// `@camunda8/orchestration-cluster-api` does); a client or in-memory fake that ignores the
+// field simply degrades to the await-only timeout — no worse than before.
+function readConsistency(signal) {
+  return signal ? { ...READ_CONSISTENCY, signal } : READ_CONSISTENCY;
+}
+
+// Conventional default-branch names. provisionRepo also treats the RESOLVED REMOTE DEFAULT
+// branch as base-like (it cuts a per-run fallback when `create` names the base), and that
+// default is NOT knowable from the envelope at seed time. So a `ref === create` that is a
+// conventional default name is conservatively classified base-like → transcript-only, even
+// if a stale/mismatched `baseRef` names something else (issue #241 round 6).
+const CONVENTIONAL_BASE_BRANCHES = new Set(['main', 'master']);
+
 // Race a promise against a deadline; rejects with a tagged timeout error so the
 // best-effort caller degrades to a cold rerun rather than blocking forever. The
 // deadline timer is cleared as soon as the read settles (win or lose), so it never
@@ -361,7 +379,7 @@ async function defaultRead({ camunda, elementInstanceKey, signal }) {
     if (signal?.aborted) return [];
     if (typeof camunda[m] !== 'function') continue;
     try {
-      instances = normalizeInstances(await camunda[m]({ filter: { elementInstanceKeys: [eik] } }, READ_CONSISTENCY));
+      instances = normalizeInstances(await camunda[m]({ filter: { elementInstanceKeys: [eik] } }, readConsistency(signal)));
     } catch { instances = []; }
     if (instances.length) break;
   }
@@ -404,7 +422,7 @@ async function defaultRead({ camunda, elementInstanceKey, signal }) {
         if (signal?.aborted) return turns;
         if (typeof camunda[m] !== 'function') continue;
         try {
-          turns = normalizeHistory(await camunda[m]({ agentInstanceKey: String(aik), filter: { elementInstanceKey: eik } }, READ_CONSISTENCY));
+          turns = normalizeHistory(await camunda[m]({ agentInstanceKey: String(aik), filter: { elementInstanceKey: eik } }, readConsistency(signal)));
         } catch { turns = []; }
         if (turns.length) break;
       }
@@ -603,6 +621,12 @@ function envelopeHasPushedBranch(envelope) {
   // per-run fallback; create-only / create !== ref → `checkout -B` off base) leaves the
   // prior commits on a branch this activation does not check out.
   if (ref === '' || create === '' || create !== ref) return false;
+  // provisionRepo ALSO fallback-branches when `ref`/`create` names the RESOLVED REMOTE
+  // DEFAULT branch (base-like), which is not knowable from the envelope here. Conservatively
+  // treat a conventional default name (main/master) as base-like → transcript-only, so a
+  // stale/mismatched `baseRef` (e.g. ref===create===main, baseRef:develop) cannot over-claim
+  // pushed-branch recovery for a run that actually gets a per-run fallback branch (#241 r6).
+  if (CONVENTIONAL_BASE_BRANCHES.has(ref.toLowerCase())) return false;
   // Mirror provisionRepo's effective-base PRECEDENCE — `branch.base` FIRST, then
   // `repository.baseRef`. Crucially, when NEITHER is supplied provisionRepo falls back to
   // the CHECKED-OUT ref as the base, so `ref === create` with NO configured base is

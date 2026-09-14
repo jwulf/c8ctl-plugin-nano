@@ -89,7 +89,9 @@ SDK client (job workers) — do **not** add the SDK as a dependency or use raw
   pushed branch **only when the job targets a stable, existing non-base branch that
   provisioning keeps the workspace on** — the invariant `repository.ref === branch.create`
   where `ref` names a KNOWN non-base branch (base resolved with provisioning's precedence,
-  `branch.base` then `repository.baseRef`, required non-blank) with no pinned
+  `branch.base` then `repository.baseRef`, required non-blank; a conventional default name
+  `main`/`master` is conservatively treated as base-like since provisioning also
+  fallback-branches the resolved remote default) with no pinned
   `repository.sha` and `branch.push !== false` (e.g. the PR head named by `repository.ref`).
   Provisioning re-clones `ref` each activation and its honored `checkout -B <create>` is
   then a no-op keeping the workspace on it. Any other shape — a bare-URL / base-only clone,

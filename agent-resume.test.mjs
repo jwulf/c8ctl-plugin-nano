@@ -338,6 +338,15 @@ test('seedResumeEnvelope: recovery text is conditional on a declared pushed bran
   const branchBaseWins = seedResumeEnvelope({ task: { prompt: 'do it' }, repository: { url: 'x', ref: 'feat/thing', baseRef: 'main' }, branch: { base: 'feat/thing', create: 'feat/thing', push: true } }, 'T');
   assert.ok(branchBaseWins.task.prompt.includes('ONLY record'), 'branch.base (precedence) === ref === create → transcript-only recovery text');
 
+  // provisionRepo ALSO fallback-branches when ref === create names the RESOLVED REMOTE
+  // DEFAULT branch, which the envelope can't reveal at seed time. A conventional default
+  // name (main/master) is therefore conservatively base-like → transcript-only, even when
+  // a stale/mismatched baseRef names something else (would otherwise pass ref !== base).
+  const refIsConventionalDefault = seedResumeEnvelope({ task: { prompt: 'do it' }, repository: { url: 'x', ref: 'main', baseRef: 'develop' }, branch: { create: 'main', push: true } }, 'T');
+  assert.ok(refIsConventionalDefault.task.prompt.includes('ONLY record'), 'ref === create === main with mismatched baseRef → transcript-only recovery text');
+  const refIsMaster = seedResumeEnvelope({ task: { prompt: 'do it' }, repository: { url: 'x', ref: 'master', baseRef: 'develop' }, branch: { create: 'master', push: true } }, 'T');
+  assert.ok(refIsMaster.task.prompt.includes('ONLY record'), 'ref === create === master (conventional default) → transcript-only recovery text');
+
   // A `repository.sha` DETACHES HEAD (provisionRepo checks out the sha, leaving no
   // symbolic branch), so even a would-be-recoverable ref === create has no pushed branch
   // to recover — gate on the authoritative detach signal.
@@ -390,10 +399,12 @@ test('readPriorTranscript: passes the mandatory consistency option and scopes hi
   // The history read also carries the current `elementInstanceKey` filter so a shared
   // AgentInstance spanning siblings never bleeds another element's turns in.
   const guard = (ec) => { if (!ec || !ec.consistency) throw new Error('Missing consistency options'); };
+  const seenSignals = [];
   const camunda = {
-    searchAgentInstances: async (_q, ec) => { guard(ec); return { items: [{ elementInstanceKeys: ['77', 'sib-9'], agentInstanceKey: 'ai-77' }] }; },
+    searchAgentInstances: async (_q, ec) => { guard(ec); seenSignals.push(ec.signal); return { items: [{ elementInstanceKeys: ['77', 'sib-9'], agentInstanceKey: 'ai-77' }] }; },
     searchAgentInstanceHistory: async (q, ec) => {
       guard(ec);
+      seenSignals.push(ec.signal);
       assert.equal(q.agentInstanceKey, 'ai-77', 'history keyed by the resolved agentInstanceKey');
       assert.equal(q.filter.elementInstanceKey, '77', 'history is scoped to THIS element instance');
       return { items: [textTurn('ASSISTANT', 'scoped work')] };
@@ -402,6 +413,10 @@ test('readPriorTranscript: passes the mandatory consistency option and scopes hi
   const got = await readPriorTranscript({ camunda, job: { elementInstanceKey: '77' } });
   assert.ok(got, 'resumes when the reads receive their consistency option');
   assert.ok(got.text.includes('scoped work'));
+  // Every SDK read also carries the probe's abort signal so a hung read is cancelled at
+  // the outer deadline rather than leaking an in-flight request per reactivation (#241 r6).
+  assert.ok(seenSignals.length >= 2, 'both the instance search and the history read ran');
+  for (const s of seenSignals) assert.ok(s && typeof s.aborted === 'boolean', 'read options carry an AbortSignal');
 });
 
 test('renderHistoryTurns: an empty TOOL_RESULT renders an explicit result, never a re-invocation', () => {

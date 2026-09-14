@@ -457,6 +457,76 @@ test('readPriorTranscript: a page-cap hit with an advancing cursor is treated as
   assert.equal(calls, RESUME_MAX_HISTORY_PAGES, 'the follow stops at the max-pages guard');
 });
 
+test('readPriorTranscript: a present page.endCursor:null is authoritative over a stale top-level cursor (issue #245)', async () => {
+  // A mixed/newer response can carry BOTH the documented terminal marker
+  // (`page.endCursor: null`) AND a leftover top-level `endCursor`/`nextCursor`. The
+  // `page` envelope wins: a PRESENT `page.endCursor` key ends the stream even when its
+  // value is null, so the reader must NOT follow the stale top-level cursor into an
+  // extra/misordered page.
+  let calls = 0;
+  const camunda = {
+    searchAgentInstances: async () => ({ items: [{ elementInstanceKeys: ['11'], agentInstanceKey: 'ai-11' }] }),
+    searchAgentInstanceHistory: async () => {
+      calls += 1;
+      // page.endCursor:null == end-of-stream, but a stale top-level endCursor also present.
+      return { items: [textTurn('ASSISTANT', 'only page')], page: { startCursor: null, endCursor: null }, endCursor: 'stale-cur', nextCursor: 'stale-next' };
+    },
+  };
+  const got = await readPriorTranscript({ camunda, job: { elementInstanceKey: '11' } });
+  assert.ok(got, 'resumes from the single terminal page');
+  assert.equal(calls, 1, 'the present page.endCursor:null ends the stream — the stale top-level cursor is ignored');
+  assert.equal(got.historyCount, 1, 'no extra page followed');
+});
+
+test('readPriorTranscript: a top-level cursor is followed ONLY when the page envelope carries no endCursor key (issue #245)', async () => {
+  // Leaner in-memory fakes / older shapes expose the cursor at the TOP level with no
+  // `page` envelope. That fallback still paginates to exhaustion.
+  const pages = {
+    undefined: { items: [textTurn('ASSISTANT', 'old')], nextCursor: 'n1' },
+    n1: { items: [textTurn('ASSISTANT', 'new')] },
+  };
+  const camunda = {
+    searchAgentInstances: async () => ({ items: [{ elementInstanceKeys: ['12'], agentInstanceKey: 'ai-12' }] }),
+    searchAgentInstanceHistory: async (q) => pages[q.page?.after === undefined ? 'undefined' : q.page.after],
+  };
+  const got = await readPriorTranscript({ camunda, job: { elementInstanceKey: '12' } });
+  assert.ok(got);
+  assert.equal(got.historyCount, 2, 'the top-level nextCursor fallback still assembles every page');
+  assert.ok(got.text.includes('new'), 'the newest top-level-cursor page survives');
+});
+
+test('readPriorTranscript: a pagination error does NOT fall through to a first-page-only alias (issue #245)', async () => {
+  // A client exposing BOTH searchAgentInstanceHistory (paginating) and
+  // getAgentInstanceHistory (first-page-only) must not, on the paginating method
+  // rejecting mid-read, silently seed the other alias's oldest-page-only result as a
+  // complete transcript. The pagination error escapes the alias loop → the read is
+  // marked incomplete → readPriorTranscript cold-runs (null).
+  let getCalled = 0;
+  const camunda = {
+    searchAgentInstances: async () => ({ items: [{ elementInstanceKeys: ['13'], agentInstanceKey: 'ai-13' }] }),
+    searchAgentInstanceHistory: async () => { throw new Error('mid-pagination page reject'); },
+    getAgentInstanceHistory: async () => { getCalled += 1; return { history: [textTurn('ASSISTANT', 'oldest-only work')] }; },
+  };
+  const got = await readPriorTranscript({ camunda, job: { elementInstanceKey: '13' } });
+  assert.equal(got, null, 'the incomplete read is not replaced by a first-page-only alias — cold-run fallback');
+  assert.equal(getCalled, 0, 'the first-page-only alias is never consulted after the pagination error');
+});
+
+test('readPriorTranscript: an EMPTY read from one alias still advances to the next (issue #245)', async () => {
+  // Distinguish "this method name returned no history" (fine to try the next alias) from
+  // "a real read failed partway" (propagate). An empty return advances; a throw does not.
+  let searchCalled = 0;
+  const camunda = {
+    searchAgentInstances: async () => ({ items: [{ elementInstanceKeys: ['14'], agentInstanceKey: 'ai-14' }] }),
+    searchAgentInstanceHistory: async () => { searchCalled += 1; return { items: [] }; },
+    getAgentInstanceHistory: async () => ({ history: [textTurn('ASSISTANT', 'recovered via alias')] }),
+  };
+  const got = await readPriorTranscript({ camunda, job: { elementInstanceKey: '14' } });
+  assert.ok(got, 'the next alias supplies the history when the first returns empty');
+  assert.equal(searchCalled, 1, 'the empty first alias was tried');
+  assert.ok(got.text.includes('recovered via alias'));
+});
+
 test('renderHistoryTurns: an empty TOOL_RESULT renders an explicit result, never a re-invocation', () => {
   // A side-effecting tool that returned nothing yields a TOOL_RESULT with empty
   // content but retained toolCalls. It must NOT render as a `[tool-call: ...]` line

@@ -81,6 +81,18 @@ const READ_CONSISTENCY = { consistency: { waitUpToMs: RESUME_READ_CONSISTENCY_MS
 // is also fenced by RESUME_READ_TIMEOUT_MS and the caller's abort signal).
 export const RESUME_MAX_HISTORY_PAGES = 50;
 
+// Aggregate cap on the RAW page bytes retained while draining the cursor, independent
+// of the page COUNT above (issue #245). RESUME_MAX_HISTORY_PAGES bounds how many
+// requests we make, but each page can itself be large (a single huge tool result), so
+// a history well within the page cap could still buffer many megabytes of raw turns in
+// `all` before `renderHistoryTurns` trims it down to RESUME_CONTEXT_CAP_CHARS. This
+// bounds the peak memory a reactivation can consume: once the accumulated raw size
+// crosses the budget the drain REJECTS (like the page-cap reject) and the caller
+// cold-runs, rather than materializing an unbounded transcript just to discard all but
+// its tail. The budget is a generous multiple of the rendered cap so a normal resume
+// (whose rendered tail must fit RESUME_CONTEXT_CAP_CHARS anyway) never trips it.
+export const RESUME_MAX_HISTORY_BYTES = RESUME_CONTEXT_CAP_CHARS * 8;
+
 // Well-known repository default branch names. provisionRepo cuts a per-run fallback
 // (never recovering the prior commits onto a clone of the named branch) whenever a
 // `branch.create` names the remote DEFAULT branch — even when a DIFFERENT base is
@@ -313,6 +325,21 @@ function normalizeHistory(res) {
   return [];
 }
 
+// Approximate the retained byte size of one raw history turn, for the aggregate-size
+// budget that bounds peak resume memory (RESUME_MAX_HISTORY_BYTES). A cheap, robust
+// serialized-length estimate: JSON.stringify covers content, tool calls, and their
+// arguments; a turn that can't be serialized (cycles / exotic values) falls back to a
+// fixed nominal cost so a pathological turn still advances the budget rather than
+// counting as zero.
+function approxTurnBytes(turn) {
+  try {
+    const s = JSON.stringify(turn);
+    return typeof s === 'string' ? s.length : 1_024;
+  } catch {
+    return 1_024;
+  }
+}
+
 // The forward pagination cursor a history response carries, per the real
 // @camunda8/orchestration-cluster-api contract: `page.endCursor` (a null/absent
 // value means this was the LAST page; `page.after` of the ensuing request advances
@@ -348,6 +375,11 @@ function historyEndCursor(res) {
 //    a truncated-newest read (the exact hazard this pagination prevents), so the loop
 //    REJECTS (throws) rather than returning the partial `all` as if complete; the
 //    caller then discards it and cold-runs.
+//  - RESUME_MAX_HISTORY_BYTES caps the aggregate RAW size retained in `all` while
+//    draining, independent of the page COUNT: a history within the page cap can still
+//    carry huge per-page tool results, so crossing the byte budget REJECTS (throws)
+//    exactly like the page-cap reject — the caller discards the partial and cold-runs
+//    rather than buffering an unbounded transcript just to trim it to the render cap.
 //  - A server that echoes an unchanged cursor is treated as end-of-stream (no-progress
 //    guard). Because a paginated SDK commonly re-returns the SAME page in that case, we
 //    detect the non-advancing cursor BEFORE appending, so the echoed page's turns are
@@ -360,6 +392,7 @@ function historyEndCursor(res) {
 //    partial read is exactly what this loop avoids.
 async function readHistoryAllPages(fn, baseReq, signal) {
   const all = [];
+  let bytes = 0;
   let after;
   for (let page = 0; page < RESUME_MAX_HISTORY_PAGES; page++) {
     if (signal?.aborted) return all;
@@ -373,7 +406,17 @@ async function readHistoryAllPages(fn, baseReq, signal) {
     // the duplicate page and treat the echoed cursor as end-of-stream — appending it
     // would double-insert completed turns into the seeded transcript.
     if (after !== undefined && next === after) return all;
-    for (const turn of normalizeHistory(res)) all.push(turn);
+    for (const turn of normalizeHistory(res)) {
+      all.push(turn);
+      bytes += approxTurnBytes(turn);
+    }
+    // Aggregate-size guard: bound peak memory independently of the page COUNT. A
+    // history within RESUME_MAX_HISTORY_PAGES can still buffer megabytes of raw turns
+    // here before rendering trims them to the tail, so reject once the accumulated raw
+    // size crosses the budget → the caller discards the partial and cold-runs.
+    if (bytes > RESUME_MAX_HISTORY_BYTES) {
+      throw new Error(`resume: AgentHistory exceeded ${RESUME_MAX_HISTORY_BYTES}-byte budget before terminating; treating as incomplete`);
+    }
     // End-of-stream: the terminal page carries no forward cursor.
     if (next === null) return all;
     after = next;

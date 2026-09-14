@@ -16,6 +16,7 @@ import assert from 'node:assert/strict';
 import {
   RESUME_CONTEXT_CAP_CHARS,
   RESUME_MAX_HISTORY_PAGES,
+  RESUME_MAX_HISTORY_BYTES,
   hasResumableTranscript,
   renderHistoryTurns,
   readPriorTranscript,
@@ -474,6 +475,27 @@ test('readPriorTranscript: a page-cap hit with an advancing cursor is treated as
   assert.equal(calls, RESUME_MAX_HISTORY_PAGES, 'the follow stops at the max-pages guard');
 });
 
+test('readPriorTranscript: crossing the aggregate byte budget is treated as INCOMPLETE, not seeded (issue #245)', async () => {
+  // A history WITHIN the page cap can still buffer huge per-page tool results. Once the
+  // accumulated raw size crosses RESUME_MAX_HISTORY_BYTES the drain must reject (like
+  // the page-cap reject) so a reactivation can't buffer an unbounded transcript just to
+  // trim it to the render cap — readPriorTranscript then cold-runs (null).
+  let calls = 0;
+  const bigText = 'x'.repeat(RESUME_MAX_HISTORY_BYTES + 1_000); // one page already over budget
+  const camunda = {
+    searchAgentInstances: async () => ({ items: [{ elementInstanceKeys: ['15'], agentInstanceKey: 'ai-15' }] }),
+    searchAgentInstanceHistory: async () => {
+      calls += 1;
+      // Always advance the cursor: without the byte guard this would page to the
+      // count cap; the byte budget must trip FIRST, on the very first oversized page.
+      return { items: [textTurn('ASSISTANT', bigText)], page: { startCursor: null, endCursor: `cur-${calls}` } };
+    },
+  };
+  const got = await readPriorTranscript({ camunda, job: { elementInstanceKey: '15' } });
+  assert.equal(got, null, 'an over-budget history is NOT seeded — cold-run fallback');
+  assert.equal(calls, 1, 'the byte budget trips on the first oversized page, before the page-count cap');
+});
+
 test('readPriorTranscript: a present page.endCursor:null is authoritative over a stale top-level cursor (issue #245)', async () => {
   // A mixed/newer response can carry BOTH the documented terminal marker
   // (`page.endCursor: null`) AND a leftover top-level `endCursor`/`nextCursor`. The
@@ -519,13 +541,25 @@ test('readPriorTranscript: a pagination error does NOT fall through to a first-p
   // complete transcript. The pagination error escapes the alias loop → the read is
   // marked incomplete → readPriorTranscript cold-runs (null).
   let getCalled = 0;
+  let searchCalls = 0;
   const camunda = {
     searchAgentInstances: async () => ({ items: [{ elementInstanceKeys: ['13'], agentInstanceKey: 'ai-13' }] }),
-    searchAgentInstanceHistory: async () => { throw new Error('mid-pagination page reject'); },
+    searchAgentInstanceHistory: async (q) => {
+      searchCalls += 1;
+      // First request assembles a partial page WITH a forward cursor (so a partial
+      // transcript now exists in `all`); the SECOND (cursor) request rejects
+      // mid-pagination — this is the real safety case the guard protects, not a
+      // first-request reject where nothing was assembled yet.
+      if (q.page?.after === undefined) {
+        return { items: [textTurn('ASSISTANT', 'partial first page')], page: { endCursor: 'n1' } };
+      }
+      throw new Error('mid-pagination page reject');
+    },
     getAgentInstanceHistory: async () => { getCalled += 1; return { history: [textTurn('ASSISTANT', 'oldest-only work')] }; },
   };
   const got = await readPriorTranscript({ camunda, job: { elementInstanceKey: '13' } });
-  assert.equal(got, null, 'the incomplete read is not replaced by a first-page-only alias — cold-run fallback');
+  assert.equal(got, null, 'the PARTIAL transcript assembled before the mid-pagination reject is discarded — cold-run fallback');
+  assert.equal(searchCalls, 2, 'a partial page was assembled before the second (cursor) request rejected');
   assert.equal(getCalled, 0, 'the first-page-only alias is never consulted after the pagination error');
 });
 

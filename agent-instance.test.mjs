@@ -17,6 +17,7 @@ import {
   inferProvider,
   describeSdkError,
   leaseTokenLabel,
+  activationNamespace,
 } from './agent-instance.mjs';
 
 // A logger that records every line per level so observability assertions (#229)
@@ -91,6 +92,9 @@ const EXTERNAL_JOB = {
 
 const PROFILE = { name: 'copilot', model: 'Opus 4.8', rank: 'senior' };
 const ENVELOPE = { task: { prompt: 'You are a helpful engineering agent.' } };
+
+// #247: the per-activation historyItemId namespace for the shared EXTERNAL_JOB fixture.
+const NS = activationNamespace(EXTERNAL_JOB);
 
 // A fixed clock so producedAt is deterministic.
 const FIXED = Date.parse('2026-02-03T04:05:06.000Z');
@@ -292,7 +296,7 @@ test('a tool_call appends an ASSISTANT turn with a toolCalls entry; a tool resul
 
   const call = appends[0].history[0];
   assert.equal(call.role, 'ASSISTANT');
-  assert.equal(call.historyItemId, 'toolcall:t1');
+  assert.equal(call.historyItemId, `${NS}:toolcall:t1`);
   assert.equal(call.toolCalls.length, 1);
   assert.equal(call.toolCalls[0].toolCallId, 't1');
   assert.equal(call.toolCalls[0].toolName, 'grep');
@@ -302,7 +306,7 @@ test('a tool_call appends an ASSISTANT turn with a toolCalls entry; a tool resul
 
   const res = appends[1].history[0];
   assert.equal(res.role, 'TOOL_RESULT');
-  assert.equal(res.historyItemId, 'toolresult:t1');
+  assert.equal(res.historyItemId, `${NS}:toolresult:t1`);
   // The originating tool name is carried through from the tool_call.
   assert.equal(res.toolCalls[0].toolName, 'grep');
   // The BPMN element attribution is carried through from the activated job.
@@ -367,7 +371,76 @@ test('a stable messageId is honoured for the historyItemId', async () => {
   p.ingest({ sessionUpdate: 'agent_message_chunk', messageId: 'm-42', content: { type: 'text', text: 'x' } });
   await p.complete(true);
   const turn = client.calls.update.find((u) => Array.isArray(u.history)).history[0];
-  assert.equal(turn.historyItemId, 'assistant:m-42');
+  assert.equal(turn.historyItemId, `${NS}:assistant:m-42`);
+});
+
+test('a resumed activation namespaces its historyItemId so restarted ACP ids are recorded, not deduped as stale history (#247)', async () => {
+  // First activation: the harness emits m-1 / call-1 and completes.
+  const c1 = fakeClient();
+  const p1 = makeProducer(c1, { job: { ...EXTERNAL_JOB, leaseToken: 'LEASE-A' } });
+  await p1.activate();
+  p1.ingest({ sessionUpdate: 'agent_message_chunk', messageId: 'm-1', content: { type: 'text', text: 'first pass' } });
+  p1.ingest({ sessionUpdate: 'tool_call', toolCallId: 'call-1', title: 'grep', status: 'pending', rawInput: {} });
+  await p1.complete(true);
+
+  // Resume: a fresh, cold-started harness re-activates the SAME element instance with a
+  // NEW lease and RESTARTS its ACP numbering at m-1 / call-1 to append continuation
+  // turns. Without a per-activation namespace these would carry the SAME historyItemId
+  // as the prior activation and be silently deduped away as stale history.
+  const c2 = fakeClient();
+  const p2 = makeProducer(c2, { job: { ...EXTERNAL_JOB, leaseToken: 'LEASE-B' } });
+  await p2.activate();
+  p2.ingest({ sessionUpdate: 'agent_message_chunk', messageId: 'm-1', content: { type: 'text', text: 'second pass' } });
+  p2.ingest({ sessionUpdate: 'tool_call', toolCallId: 'call-1', title: 'grep', status: 'pending', rawInput: {} });
+  await p2.complete(true);
+
+  const idFor = (client, suffix) =>
+    client.calls.update
+      .filter((u) => Array.isArray(u.history))
+      .map((u) => u.history[0].historyItemId)
+      .find((h) => h.endsWith(suffix));
+
+  // The restarted ACP ids are identical, but the per-activation namespace differs, so
+  // the resumed turns carry DISTINCT historyItemIds — the engine records them instead
+  // of deduplicating them against the prior activation's turns.
+  assert.ok(idFor(c1, ':assistant:m-1'), 'first activation recorded its message turn');
+  assert.ok(idFor(c2, ':assistant:m-1'), 'resumed activation recorded its message turn');
+  assert.notEqual(idFor(c1, ':assistant:m-1'), idFor(c2, ':assistant:m-1'));
+  assert.notEqual(idFor(c1, ':toolcall:call-1'), idFor(c2, ':toolcall:call-1'));
+});
+
+test('at-least-once redelivery within ONE activation keeps a stable historyItemId (still dedups) (#247)', async () => {
+  // Same activation identity (lease) → same namespace → identical historyItemId for
+  // identical content, so a redelivery of the SAME activation still dedups correctly.
+  const c1 = fakeClient();
+  const p1 = makeProducer(c1, { job: { ...EXTERNAL_JOB, leaseToken: 'LEASE-SAME' } });
+  await p1.activate();
+  p1.ingest({ sessionUpdate: 'agent_message_chunk', messageId: 'm-1', content: { type: 'text', text: 'dup' } });
+  await p1.complete(true);
+
+  const c2 = fakeClient();
+  const p2 = makeProducer(c2, { job: { ...EXTERNAL_JOB, leaseToken: 'LEASE-SAME' } });
+  await p2.activate();
+  p2.ingest({ sessionUpdate: 'agent_message_chunk', messageId: 'm-1', content: { type: 'text', text: 'dup' } });
+  await p2.complete(true);
+
+  const idOf = (client) => client.calls.update.find((u) => Array.isArray(u.history)).history[0].historyItemId;
+  assert.equal(idOf(c1), idOf(c2));
+});
+
+test('activationNamespace is stable per activation, differs across activations, and prefers the lease (#247)', () => {
+  // Stable for the same identity; distinct when the lease (the activation identity) changes.
+  assert.equal(activationNamespace({ leaseToken: 'L1' }), activationNamespace({ leaseToken: 'L1' }));
+  assert.notEqual(activationNamespace({ leaseToken: 'L1' }), activationNamespace({ leaseToken: 'L2' }));
+  // The lease wins over the jobKey / elementInstanceKey (a resume keeps the eik but gets a new lease).
+  assert.notEqual(
+    activationNamespace({ leaseToken: 'L1', jobKey: 'J', elementInstanceKey: 'E' }),
+    activationNamespace({ leaseToken: 'L2', jobKey: 'J', elementInstanceKey: 'E' }),
+  );
+  // Falls back to jobKey, then elementInstanceKey, and is '' only when no identity exists.
+  assert.equal(activationNamespace({ jobKey: 'J' }), activationNamespace({ jobKey: 'J' }));
+  assert.notEqual(activationNamespace({ jobKey: 'J1' }), activationNamespace({ jobKey: 'J2' }));
+  assert.equal(activationNamespace({}), '');
 });
 
 // ---------------------------------------------------------------------------

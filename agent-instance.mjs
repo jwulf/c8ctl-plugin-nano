@@ -311,6 +311,23 @@ function shortHash(text) {
   return (h >>> 0).toString(36);
 }
 
+// #247: the per-ACTIVATION namespace folded into every content-derived historyItemId
+// so a resumed harness (which restarts its ACP message / tool-call numbering) does not
+// collide with — and get silently deduplicated against — the prior activation's turns.
+// The activation identity is the lease token (a fresh token per `activate jobs`), else
+// the jobKey, else the elementInstanceKey. It is HASHED — the lease token is a
+// secret-ish fence token that must never be embedded raw in a persisted id — and stays
+// STABLE for the life of one activation, so an at-least-once redelivery still dedups
+// within the activation while a genuine resume (new lease) gets a distinct namespace.
+// Returns '' when no identity is available, leaving the id un-namespaced (unchanged).
+export function activationNamespace(job = {}) {
+  const leaseToken = job?.leaseToken != null ? String(job.leaseToken) : '';
+  const jobKey = job?.jobKey != null ? String(job.jobKey) : '';
+  const elementInstanceKey = job?.elementInstanceKey != null ? String(job.elementInstanceKey) : '';
+  const token = leaseToken || jobKey || elementInstanceKey || '';
+  return token ? shortHash(token) : '';
+}
+
 // Extract per-call metrics from an ACP update when the agent carries them (many
 // ACP agents do not — a documented ACP fidelity gap — so this is usually absent).
 // Reads the common usage locations and maps to the AgentHistory item metric field
@@ -408,6 +425,21 @@ export function createAgentInstanceProducer(opts = {}) {
   const elementInstanceKey = job?.elementInstanceKey != null ? String(job.elementInstanceKey) : '';
   const elementId = job?.elementId != null ? String(job.elementId) : null;
   const processInstanceKey = job?.processInstanceKey != null ? String(job.processInstanceKey) : '';
+  // #247: namespace every content-derived historyItemId per ACTIVATION. When a parked
+  // process resumes, a fresh (cold-started) harness re-activates the SAME AgentInstance
+  // and generally RESTARTS its ACP message / tool-call numbering (m-1, call-1, …). The
+  // engine dedups appends by historyItemId, so without a per-activation namespace those
+  // continuation turns collide with the PRIOR activation's ids and are silently dropped
+  // as stale history — the transcript never advances, and the next reactivation replays
+  // the same side effects (the failure mode #239 exists to prevent). The namespace is
+  // derived from the job's ACTIVATION identity (see `activationNamespace`): stable for
+  // the life of this producer, so an at-least-once redelivery of the SAME activation
+  // still dedups correctly, while a genuine resume (new lease → new namespace) appends
+  // instead of colliding. The CONFIGURATION turn is left keyed on the elementInstanceKey
+  // ALONE (stable across activations) so its single header dedups per instance rather
+  // than duplicating on every resume.
+  const activationNs = activationNamespace(job);
+  const nsHistoryId = (id) => (activationNs ? `${activationNs}:${id}` : id);
   // #229 cross-channel correlation, compact form. Stamps job/eik/pik so the
   // AgentInstance channel can be joined to the job / relay / git channels. This is the
   // terse rendering used by the observability lines; `correlation()` below is the
@@ -637,7 +669,7 @@ export function createAgentInstanceProducer(opts = {}) {
     if (!hasText && !hasMetrics) return;
     const idBasis = isNonBlank(msg.messageId) ? String(msg.messageId) : `h:${shortHash(text)}`;
     const turn = {
-      historyItemId: `${msg.role.toLowerCase()}:${idBasis}`,
+      historyItemId: nsHistoryId(`${msg.role.toLowerCase()}:${idBasis}`),
       loopIteration: msg.loopIteration,
       role: msg.role,
       content: hasText ? [{ contentType: 'TEXT', text }] : [],
@@ -653,7 +685,7 @@ export function createAgentInstanceProducer(opts = {}) {
     flushMessage();
     if (isNonBlank(c.name)) toolNames.set(String(c.callId), String(c.name));
     const turn = {
-      historyItemId: `toolcall:${c.callId}`,
+      historyItemId: nsHistoryId(`toolcall:${c.callId}`),
       loopIteration,
       role: 'ASSISTANT',
       content: [],
@@ -673,7 +705,7 @@ export function createAgentInstanceProducer(opts = {}) {
   const onToolResult = (c) => {
     flushMessage();
     const turn = {
-      historyItemId: `toolresult:${c.callId}`,
+      historyItemId: nsHistoryId(`toolresult:${c.callId}`),
       loopIteration,
       role: 'TOOL_RESULT',
       content: contentForResult(c.result),

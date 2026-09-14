@@ -52,6 +52,13 @@ const isPlainObject = (v) => v != null && typeof v === 'object' && !Array.isArra
 // since that is where a resumed agent must continue from.
 export const RESUME_CONTEXT_CAP_CHARS = 48_000;
 
+// Per-content-block cap applied BEFORE blocks are joined and the transcript tail is
+// taken. A single huge block — most importantly an `OBJECT` tool result — is bounded
+// here so one pathological item cannot dominate allocation/CPU ahead of the overall
+// `RESUME_CONTEXT_CAP_CHARS` tail cap. Kept generously below the whole-transcript cap
+// so a normal multi-block turn still renders in full.
+export const RESUME_BLOCK_CAP_CHARS = 8_000;
+
 // Bound the awaited engine read so a non-settling SDK request can NEVER hold the
 // activated job open before the harness starts (matches the producer's `callWithin`
 // bound in agent-instance.mjs, which guards this same failure mode). On timeout the
@@ -129,16 +136,24 @@ function callWithin(promise, timeoutMs, setTimer = setTimeout, onTimeout = null)
 // least one real work turn (USER / ASSISTANT / TOOL_RESULT).
 const NON_WORK_ROLES = new Set(['CONFIGURATION']);
 
-// Extract the readable text from one AgentHistory content block. TEXT blocks carry
-// `.text`; OBJECT blocks carry a structured `.object` (a tool result), rendered as
-// compact JSON so a resumed agent can still read it.
+// Extract the readable text from one AgentHistory content block, BOUNDED to
+// `RESUME_BLOCK_CAP_CHARS`. TEXT blocks carry `.text`; OBJECT blocks carry a structured
+// `.object` (a tool result), rendered as compact JSON so a resumed agent can still read
+// it. A single oversized block is truncated (with a marker) so one large tool result
+// cannot balloon allocation/CPU ahead of the whole-transcript tail cap. (The one object
+// is serialized once — its size is already bounded by what the engine stored — but its
+// contribution to the prompt is capped here.)
+function capBlockText(s) {
+  if (typeof s !== 'string' || s.length <= RESUME_BLOCK_CAP_CHARS) return s;
+  return `${s.slice(0, RESUME_BLOCK_CAP_CHARS)}…[truncated]`;
+}
 function textForContentBlock(block) {
   if (!isPlainObject(block)) return '';
   if (block.contentType === 'TEXT' || typeof block.text === 'string') {
-    return typeof block.text === 'string' ? block.text : '';
+    return capBlockText(typeof block.text === 'string' ? block.text : '');
   }
   if (block.contentType === 'OBJECT' && block.object !== undefined) {
-    try { return JSON.stringify(block.object); } catch { return ''; }
+    try { return capBlockText(JSON.stringify(block.object)); } catch { return ''; }
   }
   return '';
 }
@@ -389,7 +404,7 @@ async function defaultRead({ camunda, elementInstanceKey, signal }) {
       if (signal?.aborted) return [];
       if (typeof camunda[m] !== 'function') continue;
       try {
-        instances = normalizeInstances(await camunda[m]({ elementInstanceKey: eik }, READ_CONSISTENCY));
+        instances = normalizeInstances(await camunda[m]({ elementInstanceKey: eik }, readConsistency(signal)));
       } catch { instances = []; }
       if (instances.length) break;
     }

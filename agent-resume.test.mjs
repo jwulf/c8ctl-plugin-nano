@@ -15,6 +15,7 @@ import assert from 'node:assert/strict';
 
 import {
   RESUME_CONTEXT_CAP_CHARS,
+  RESUME_BLOCK_CAP_CHARS,
   hasResumableTranscript,
   renderHistoryTurns,
   readPriorTranscript,
@@ -77,6 +78,19 @@ test('renderHistoryTurns: a single over-cap newest turn still seeds a suffix, no
   assert.ok(out.length <= 120, 'respects the cap');
   assert.ok(out.startsWith('…[earlier transcript truncated]…'), 'marks the truncation');
   assert.ok(out.includes('RECENT_TAIL_MARKER'), 'retains the tail-end of the newest over-cap line');
+});
+
+test('renderHistoryTurns: a single oversized OBJECT tool result is block-capped before rendering', () => {
+  // A pathological OBJECT tool result must NOT be materialized full-width into the
+  // prompt: `textForContentBlock` caps each block at RESUME_BLOCK_CAP_CHARS so one item
+  // cannot balloon allocation ahead of the whole-transcript tail cap (issue #241 round 7).
+  const bigObject = { blob: 'Z'.repeat(RESUME_BLOCK_CAP_CHARS * 3) };
+  const turn = { role: 'ASSISTANT', content: [{ contentType: 'OBJECT', object: bigObject }] };
+  const out = renderHistoryTurns([turn], { capChars: RESUME_CONTEXT_CAP_CHARS });
+  assert.ok(out.includes('…[truncated]'), 'oversized object block is truncated with a marker');
+  // The rendered line is bounded by the block cap (plus the short role prefix + marker),
+  // far below the raw 24k-char object.
+  assert.ok(out.length < RESUME_BLOCK_CAP_CHARS + 200, 'block cap bounds the single-object contribution');
 });
 
 test('readPriorTranscript: injected read returning work → rendered text + counts', async () => {

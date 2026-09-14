@@ -15,6 +15,7 @@ import assert from 'node:assert/strict';
 
 import {
   RESUME_CONTEXT_CAP_CHARS,
+  RESUME_MAX_HISTORY_PAGES,
   hasResumableTranscript,
   renderHistoryTurns,
   readPriorTranscript,
@@ -377,6 +378,69 @@ test('readPriorTranscript: passes the mandatory consistency option and scopes hi
   const got = await readPriorTranscript({ camunda, job: { elementInstanceKey: '77' } });
   assert.ok(got, 'resumes when the reads receive their consistency option');
   assert.ok(got.text.includes('scoped work'));
+});
+
+test('readPriorTranscript: paginates searchAgentInstanceHistory and KEEPS the newest page (issue #245)', async () => {
+  // A single element's activation history can span more than one cursor-paginated page.
+  // Consuming only the first (oldest) page would drop the NEWEST turns and seed the
+  // resume from a truncated-newest transcript — re-driving already-completed steps. The
+  // reader must follow `page.endCursor` → next request `page.after` to exhaustion and
+  // assemble every page IN ORDER.
+  const pages = {
+    undefined: { items: [textTurn('ASSISTANT', 'oldest work')], page: { startCursor: null, endCursor: 'cur-1', totalItems: 3, hasMoreTotalItems: true } },
+    'cur-1': { items: [textTurn('ASSISTANT', 'middle work')], page: { startCursor: 'cur-1', endCursor: 'cur-2', totalItems: 3, hasMoreTotalItems: true } },
+    'cur-2': { items: [textTurn('ASSISTANT', 'newest work')], page: { startCursor: 'cur-2', endCursor: null, totalItems: 3, hasMoreTotalItems: false } },
+  };
+  const seenAfter = [];
+  const camunda = {
+    searchAgentInstances: async () => ({ items: [{ elementInstanceKeys: ['5'], agentInstanceKey: 'ai-5' }] }),
+    searchAgentInstanceHistory: async (q) => {
+      const after = q.page?.after;
+      seenAfter.push(after);
+      const page = pages[after === undefined ? 'undefined' : after];
+      if (!page) throw new Error(`unexpected cursor ${after}`);
+      return page;
+    },
+  };
+  const got = await readPriorTranscript({ camunda, job: { elementInstanceKey: '5' } });
+  assert.ok(got, 'resumes from the fully assembled transcript');
+  assert.equal(got.historyCount, 3, 'every page assembled — none dropped');
+  assert.ok(got.text.includes('oldest work'));
+  assert.ok(got.text.includes('newest work'), 'the NEWEST page survives into the seed');
+  // Each ensuing page is requested with the PRIOR page endCursor threaded as page.after.
+  assert.deepEqual(seenAfter, [undefined, 'cur-1', 'cur-2']);
+});
+
+test('readPriorTranscript: a non-advancing history cursor terminates (no infinite paging, issue #245)', async () => {
+  // A server that keeps echoing the SAME endCursor must not spin the reader forever —
+  // the no-progress guard treats an unchanged cursor as end-of-stream.
+  let calls = 0;
+  const camunda = {
+    searchAgentInstances: async () => ({ items: [{ elementInstanceKeys: ['8'], agentInstanceKey: 'ai-8' }] }),
+    searchAgentInstanceHistory: async () => {
+      calls += 1;
+      return { items: [textTurn('ASSISTANT', 'stuck work')], page: { startCursor: null, endCursor: 'same' } };
+    },
+  };
+  const got = await readPriorTranscript({ camunda, job: { elementInstanceKey: '8' } });
+  assert.ok(got);
+  // Page 1 (after=undefined) then page 2 (after='same'); the echoed 'same' cursor halts it.
+  assert.equal(calls, 2, 'stops as soon as the cursor stops advancing');
+});
+
+test('readPriorTranscript: history paging is capped at RESUME_MAX_HISTORY_PAGES (issue #245)', async () => {
+  // A server that ALWAYS advances the cursor would page forever without a guard.
+  let calls = 0;
+  const camunda = {
+    searchAgentInstances: async () => ({ items: [{ elementInstanceKeys: ['9'], agentInstanceKey: 'ai-9' }] }),
+    searchAgentInstanceHistory: async () => {
+      calls += 1;
+      return { items: [textTurn('ASSISTANT', `w${calls}`)], page: { startCursor: null, endCursor: `cur-${calls}` } };
+    },
+  };
+  const got = await readPriorTranscript({ camunda, job: { elementInstanceKey: '9' } });
+  assert.ok(got);
+  assert.equal(calls, RESUME_MAX_HISTORY_PAGES, 'the follow stops at the max-pages guard');
 });
 
 test('renderHistoryTurns: an empty TOOL_RESULT renders an explicit result, never a re-invocation', () => {

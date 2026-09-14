@@ -70,6 +70,17 @@ export const RESUME_READ_TIMEOUT_MS = 10_000;
 export const RESUME_READ_CONSISTENCY_MS = 5_000;
 const READ_CONSISTENCY = { consistency: { waitUpToMs: RESUME_READ_CONSISTENCY_MS } };
 
+// A single element-scoped activation history is bounded, but the SDK's `search*`
+// surface returns it in CURSOR-PAGINATED pages (issue #245): each response carries
+// one page of `items` plus a `page.endCursor` bookmark, and the next page is fetched
+// by echoing that cursor back as the request's `page.after`. Following the cursor to
+// exhaustion is what prevents seeding a resume from a truncated-NEWEST transcript
+// (consuming only the first/oldest page would drop the newest turns → re-drive
+// already-completed steps). This caps the follow to a sane number of pages so a
+// runaway or looping server cursor can never spin the probe forever (the whole read
+// is also fenced by RESUME_READ_TIMEOUT_MS and the caller's abort signal).
+export const RESUME_MAX_HISTORY_PAGES = 50;
+
 // Race a promise against a deadline; rejects with a tagged timeout error so the
 // best-effort caller degrades to a cold rerun rather than blocking forever. The
 // deadline timer is cleared as soon as the read settles (win or lose), so it never
@@ -256,7 +267,9 @@ export function renderHistoryTurns(turns, { capChars = RESUME_CONTEXT_CAP_CHARS 
 //      a bare element key and MUST follow an instance resolution. We DO pass the current
 //      `elementInstanceKey` in the history `filter` so a shared AgentInstance that spans
 //      SIBLING element instances never bleeds another element's turns into this resume
-//      (wrong continuation / cross-job exposure).
+//      (wrong continuation / cross-job exposure). The history read is CURSOR-PAGINATED
+//      (see readHistoryAllPages) — every page is followed to exhaustion so the newest
+//      turns of a multi-page activation are never dropped (issue #245).
 //
 // Every one of these reads is eventually consistent and gets the mandatory
 // `READ_CONSISTENCY` trailing argument (see its definition) — omitting it makes the real
@@ -289,6 +302,57 @@ function normalizeHistory(res) {
     if (Array.isArray(res.agentHistory)) return res.agentHistory.filter(isPlainObject);
   }
   return [];
+}
+
+// The forward pagination cursor a history response carries, per the real
+// @camunda8/orchestration-cluster-api contract: `page.endCursor` (a null/absent
+// value means this was the LAST page; `page.after` of the ensuing request advances
+// off it). We also tolerate a top-level `endCursor`/`nextCursor` for leaner
+// in-memory fakes / older shapes. Returns null when there is no further page.
+function historyEndCursor(res) {
+  if (!isPlainObject(res)) return null;
+  const cursor = (isPlainObject(res.page) ? res.page.endCursor : undefined)
+    ?? res.endCursor
+    ?? res.nextCursor
+    ?? null;
+  return isNonBlank(cursor) ? String(cursor) : null;
+}
+
+// Drain the FULL element-scoped AgentInstance history, following the SDK's
+// cursor-forward pagination (`page.endCursor` → next request `page: { after }`)
+// until the server reports no further page (issue #245). The `search*` history
+// surface returns ONE bounded page at a time ({ items, page: { endCursor, … } }),
+// so consuming only the first response would silently drop the NEWEST turns of a
+// multi-page activation and seed the resume from a truncated-newest transcript —
+// re-driving already-completed steps, the exact hazard the resume feature exists to
+// prevent. We assemble every page IN ORDER before returning.
+//
+// Bounds:
+//  - RESUME_MAX_HISTORY_PAGES caps the follow so a runaway/looping cursor can't spin
+//    forever; a server that echoes an unchanged cursor is treated as end-of-stream
+//    (no-progress guard).
+//  - The caller's abort `signal` stops the loop BEFORE issuing the next page request
+//    once the deadline fires (the outer callWithin has by then already degraded the
+//    whole probe to a cold rerun, so a partial return here is never seeded).
+//  - Any page rejection PROPAGATES to the caller's try/catch, which discards the
+//    partial (possibly truncated-newest) transcript and cold-runs — seeding from a
+//    partial read is exactly what this loop avoids.
+async function readHistoryAllPages(fn, baseReq, signal) {
+  const all = [];
+  let after;
+  for (let page = 0; page < RESUME_MAX_HISTORY_PAGES; page++) {
+    if (signal?.aborted) break;
+    const req = after === undefined
+      ? baseReq
+      : { ...baseReq, page: { ...(isPlainObject(baseReq.page) ? baseReq.page : {}), after } };
+    const res = await fn(req, READ_CONSISTENCY);
+    for (const turn of normalizeHistory(res)) all.push(turn);
+    const next = historyEndCursor(res);
+    // Stop at end-of-stream (no cursor) or a non-advancing cursor the server echoes.
+    if (next === null || next === after) break;
+    after = next;
+  }
+  return all;
 }
 
 // Extract the element-instance keys an instance record is associated with, tolerating
@@ -393,8 +457,9 @@ async function defaultRead({ camunda, elementInstanceKey, signal }) {
       for (const m of HISTORY_METHODS) {
         if (signal?.aborted) return turns;
         if (typeof camunda[m] !== 'function') continue;
+        const baseReq = { agentInstanceKey: String(aik), filter: { elementInstanceKey: eik } };
         try {
-          turns = normalizeHistory(await camunda[m]({ agentInstanceKey: String(aik), filter: { elementInstanceKey: eik } }, READ_CONSISTENCY));
+          turns = await readHistoryAllPages(camunda[m].bind(camunda), baseReq, signal);
         } catch { turns = []; }
         if (turns.length) break;
       }

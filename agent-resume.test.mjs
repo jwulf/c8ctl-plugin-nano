@@ -302,6 +302,14 @@ test('seedResumeEnvelope: recovery text is conditional on a declared pushed bran
   const createIsBase = seedResumeEnvelope({ task: { prompt: 'do it' }, repository: { url: 'x', ref: 'main', baseRef: 'main' }, branch: { create: 'main', push: true } }, 'T');
   assert.ok(createIsBase.task.prompt.includes('ONLY record'), 'ref === create === base → transcript-only recovery text');
 
+  // provisionRepo ALSO fallback-branches a `branch.create` that names the remote DEFAULT
+  // branch even when a DIFFERENT base is configured (createNamesBase → remoteDefaultBranch),
+  // so `ref === create === main` with baseRef=release strands the commits on a per-run
+  // fallback → NOT recoverable. The predicate conservatively classifies a default-named
+  // ref as transcript-only rather than falsely promising branch recovery.
+  const createIsDefault = seedResumeEnvelope({ task: { prompt: 'do it' }, repository: { url: 'x', ref: 'main', baseRef: 'release' }, branch: { create: 'main', push: true } }, 'T');
+  assert.ok(createIsDefault.task.prompt.includes('ONLY record'), 'ref === create names the default branch (main) → transcript-only recovery text');
+
   // No configured base at all: provisionRepo falls back to the checked-out ref as the
   // base, so ref === create with no base is base-like and fallback-branched → NOT
   // recoverable. A blank base cannot prove `ref` is non-base.
@@ -413,7 +421,9 @@ test('readPriorTranscript: paginates searchAgentInstanceHistory and KEEPS the ne
 
 test('readPriorTranscript: a non-advancing history cursor terminates (no infinite paging, issue #245)', async () => {
   // A server that keeps echoing the SAME endCursor must not spin the reader forever —
-  // the no-progress guard treats an unchanged cursor as end-of-stream.
+  // the no-progress guard treats an unchanged cursor as end-of-stream. Crucially, the
+  // echoed page is DISCARDED (its turns are already assembled), so completed turns are
+  // never double-inserted into the seeded transcript.
   let calls = 0;
   const camunda = {
     searchAgentInstances: async () => ({ items: [{ elementInstanceKeys: ['8'], agentInstanceKey: 'ai-8' }] }),
@@ -426,10 +436,14 @@ test('readPriorTranscript: a non-advancing history cursor terminates (no infinit
   assert.ok(got);
   // Page 1 (after=undefined) then page 2 (after='same'); the echoed 'same' cursor halts it.
   assert.equal(calls, 2, 'stops as soon as the cursor stops advancing');
+  assert.equal(got.historyCount, 1, 'the echoed no-progress page is discarded, not double-appended');
 });
 
-test('readPriorTranscript: history paging is capped at RESUME_MAX_HISTORY_PAGES (issue #245)', async () => {
-  // A server that ALWAYS advances the cursor would page forever without a guard.
+test('readPriorTranscript: a page-cap hit with an advancing cursor is treated as INCOMPLETE, not seeded (issue #245)', async () => {
+  // A server that ALWAYS advances the cursor would page forever without a guard. When
+  // the cap is reached while a cursor still remains, the read is TRUNCATED-NEWEST — the
+  // exact hazard resume prevents — so it must NOT be seeded: the reader rejects the
+  // partial and readPriorTranscript takes the documented cold-run fallback (null).
   let calls = 0;
   const camunda = {
     searchAgentInstances: async () => ({ items: [{ elementInstanceKeys: ['9'], agentInstanceKey: 'ai-9' }] }),
@@ -439,7 +453,7 @@ test('readPriorTranscript: history paging is capped at RESUME_MAX_HISTORY_PAGES 
     },
   };
   const got = await readPriorTranscript({ camunda, job: { elementInstanceKey: '9' } });
-  assert.ok(got);
+  assert.equal(got, null, 'an incomplete, truncated-newest history is NOT seeded — cold-run fallback');
   assert.equal(calls, RESUME_MAX_HISTORY_PAGES, 'the follow stops at the max-pages guard');
 });
 

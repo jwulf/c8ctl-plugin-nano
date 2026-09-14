@@ -367,8 +367,14 @@ function historyEndCursor(res) {
 //
 // Bounds:
 //  - RESUME_MAX_HISTORY_PAGES caps the follow so a runaway/looping cursor can't spin
-//    forever; a server that echoes an unchanged cursor is treated as end-of-stream
-//    (no-progress guard).
+//    forever. Hitting the cap while a cursor STILL ADVANCES is NOT a clean end — it is
+//    a truncated-newest read (the exact hazard this pagination prevents), so the loop
+//    REJECTS (throws) rather than returning the partial `all` as if complete; the
+//    caller then discards it and cold-runs.
+//  - A server that echoes an unchanged cursor is treated as end-of-stream (no-progress
+//    guard). Because a paginated SDK commonly re-returns the SAME page in that case, we
+//    detect the non-advancing cursor BEFORE appending, so the echoed page's turns are
+//    never inserted twice into the assembled transcript.
 //  - The caller's abort `signal` stops the loop BEFORE issuing the next page request
 //    once the deadline fires (the outer callWithin has by then already degraded the
 //    whole probe to a cold rerun, so a partial return here is never seeded).
@@ -379,18 +385,26 @@ async function readHistoryAllPages(fn, baseReq, signal) {
   const all = [];
   let after;
   for (let page = 0; page < RESUME_MAX_HISTORY_PAGES; page++) {
-    if (signal?.aborted) break;
+    if (signal?.aborted) return all;
     const req = after === undefined
       ? baseReq
       : { ...baseReq, page: { ...(isPlainObject(baseReq.page) ? baseReq.page : {}), after } };
     const res = await fn(req, readConsistency(signal));
-    for (const turn of normalizeHistory(res)) all.push(turn);
     const next = historyEndCursor(res);
-    // Stop at end-of-stream (no cursor) or a non-advancing cursor the server echoes.
-    if (next === null || next === after) break;
+    // No-progress guard, checked BEFORE appending: a server echoing the previous
+    // cursor is repeating the SAME page, so its turns are already in `all`. Discard
+    // the duplicate page and treat the echoed cursor as end-of-stream — appending it
+    // would double-insert completed turns into the seeded transcript.
+    if (after !== undefined && next === after) return all;
+    for (const turn of normalizeHistory(res)) all.push(turn);
+    // End-of-stream: the terminal page carries no forward cursor.
+    if (next === null) return all;
     after = next;
   }
-  return all;
+  // Page cap reached with the cursor still advancing → a TRUNCATED-NEWEST read. Reject
+  // so the caller discards the partial transcript and takes the cold-run fallback,
+  // rather than seeding an incomplete history that re-drives completed steps.
+  throw new Error(`resume: AgentHistory exceeded ${RESUME_MAX_HISTORY_PAGES} pages without terminating; treating as incomplete`);
 }
 
 // Extract the element-instance keys an instance record is associated with, tolerating

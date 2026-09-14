@@ -349,10 +349,16 @@ function normalizeHistory(res) {
 // in-memory fakes / older shapes. Returns null when there is no further page.
 function historyEndCursor(res) {
   if (!isPlainObject(res)) return null;
-  const cursor = (isPlainObject(res.page) ? res.page.endCursor : undefined)
-    ?? res.endCursor
-    ?? res.nextCursor
-    ?? null;
+  // `page.endCursor` is AUTHORITATIVE whenever the `page` envelope carries that key —
+  // a PRESENT `endCursor` wins even when its value is `null`/blank, the documented
+  // terminal marker. Only when the `page` envelope does NOT carry an `endCursor` key at
+  // all (leaner in-memory fakes / older top-level shapes) do we fall through to a
+  // top-level `endCursor`/`nextCursor`. A plain `??` chain would instead let a stale
+  // top-level cursor OVERRIDE an explicit `page.endCursor: null`, following a mixed/newer
+  // response past its end-of-stream and seeding extra or misordered turns.
+  const cursor = (isPlainObject(res.page) && 'endCursor' in res.page)
+    ? res.page.endCursor
+    : (res.endCursor ?? res.nextCursor ?? null);
   return isNonBlank(cursor) ? String(cursor) : null;
 }
 
@@ -515,9 +521,18 @@ async function defaultRead({ camunda, elementInstanceKey, signal }) {
         if (signal?.aborted) return turns;
         if (typeof camunda[m] !== 'function') continue;
         const baseReq = { agentInstanceKey: String(aik), filter: { elementInstanceKey: eik } };
-        try {
-          turns = await readHistoryAllPages(camunda[m].bind(camunda), baseReq, signal);
-        } catch { turns = []; }
+        // Do NOT swallow a pagination error here and fall through to the NEXT alias
+        // method: a partial/truncated read from one method (e.g. searchAgentInstanceHistory
+        // rejecting mid-pagination, or the page-cap truncated-newest reject) must never be
+        // silently replaced by another alias's first-page-only result (e.g.
+        // getAgentInstanceHistory returning just the oldest page), which readHistoryAllPages
+        // would then accept as complete and seed as a truncated-newest transcript — the exact
+        // hazard the pagination guard exists to prevent for a client exposing BOTH methods.
+        // Let the error ESCAPE to readPriorTranscript's best-effort try/catch, marking the
+        // whole read incomplete so the caller cold-runs instead of seeding partial history.
+        // (A method that is simply absent is skipped by the typeof guard above; one that
+        // returns EMPTY — no history via that name — still advances to the next alias.)
+        turns = await readHistoryAllPages(camunda[m].bind(camunda), baseReq, signal);
         if (turns.length) break;
       }
     }

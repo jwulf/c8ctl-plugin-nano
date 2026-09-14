@@ -262,38 +262,46 @@ test('seedResumeEnvelope: returns the original when there is no task prompt to s
 });
 
 test('seedResumeEnvelope: recovery text is conditional on a declared pushed branch', () => {
-  // A job that pushes onto a STABLE non-base branch (e.g. the PR head) is told committed
-  // work is recoverable from it; a repo-less, push-disabled, base-only, or bare-URL job
-  // is told the throwaway workspace is gone and the transcript is the only recoverable
-  // state (never pointed at a branch whose prior commits the next clone won't have).
-  const pushed = seedResumeEnvelope({ task: { prompt: 'do it' }, repository: { url: 'x', ref: 'feat/thing', baseRef: 'main' }, branch: { push: true } }, 'T');
-  assert.ok(pushed.task.prompt.includes('pushed branch'), 'stable non-base branch → branch recovery text');
+  // A job that pushes onto a STABLE, explicitly-created non-base branch is told committed
+  // work is recoverable from it; a repo-less, push-disabled, base-only, bare-URL, or
+  // ref-only-without-branch.create job is told the throwaway workspace is gone and the
+  // transcript is the only recoverable state (never pointed at a branch whose prior
+  // commits the next clone won't have).
+  const pushed = seedResumeEnvelope({ task: { prompt: 'do it' }, repository: { url: 'x', ref: 'feat/thing', baseRef: 'main' }, branch: { create: 'feat/thing', push: true } }, 'T');
+  assert.ok(pushed.task.prompt.includes('pushed branch'), 'explicit non-base branch.create → branch recovery text');
   assert.ok(pushed.task.prompt.includes('UNCOMMITTED'), 'still documents the uncommitted-loss scope');
 
   const repoLess = seedResumeEnvelope({ task: { prompt: 'do it' } }, 'T');
   assert.ok(repoLess.task.prompt.includes('ONLY record'), 'repo-less job → transcript-only recovery text');
   assert.ok(!repoLess.task.prompt.includes('check out the'), 'no pushed-branch instruction for a repo-less job');
 
-  const noPush = seedResumeEnvelope({ task: { prompt: 'do it' }, repository: { url: 'x', ref: 'feat/thing' }, branch: { push: false } }, 'T');
+  const noPush = seedResumeEnvelope({ task: { prompt: 'do it' }, repository: { url: 'x', ref: 'feat/thing' }, branch: { create: 'feat/thing', push: false } }, 'T');
   assert.ok(noPush.task.prompt.includes('ONLY record'), 'branch.push=false → transcript-only recovery text');
 
-  // A push with NO stable non-base ref (a bare-URL / base-only clone, or a per-run
-  // fallback / `branch.create`) is NOT recoverable: the next activation re-clones the
-  // base and never fetches the prior per-run branch, so the commits are gone.
+  // A `repository.ref`+push job with NO explicit `branch.create` — the PR-based
+  // review/fix-ci/rebase shape (issue #241) — is NOT recoverable: provisionRepo's
+  // `checkedOut && wantPush` arm cuts a per-run `nano/agent-work/<base>-<runId>` fallback
+  // branch even for a checked-out PR head, so the commits land on a run-scoped ref the
+  // next activation never fetches. Only an explicit `branch.create` earns recovery text.
+  const refOnly = seedResumeEnvelope({ task: { prompt: 'do it' }, repository: { url: 'x', ref: 'feat/thing', baseRef: 'main' }, branch: { push: true } }, 'T');
+  assert.ok(refOnly.task.prompt.includes('ONLY record'), 'ref+push but no branch.create → transcript-only recovery text');
+
+  // A push with NO repository ref at all is likewise unrecoverable.
   const noRef = seedResumeEnvelope({ task: { prompt: 'do it' }, repository: { url: 'x' }, branch: { push: true } }, 'T');
-  assert.ok(noRef.task.prompt.includes('ONLY record'), 'push but no stable ref → transcript-only recovery text');
-  const baseRef = seedResumeEnvelope({ task: { prompt: 'do it' }, repository: { url: 'x', ref: 'main', baseRef: 'main' }, branch: { push: true } }, 'T');
-  assert.ok(baseRef.task.prompt.includes('ONLY record'), 'ref === baseRef → transcript-only recovery text');
+  assert.ok(noRef.task.prompt.includes('ONLY record'), 'push but no branch.create → transcript-only recovery text');
+  // A `branch.create` that NAMES the base commits directly on the base → provisionRepo
+  // fallback-branches it, so it is NOT recoverable either.
+  const createIsBase = seedResumeEnvelope({ task: { prompt: 'do it' }, repository: { url: 'x', ref: 'main', baseRef: 'main' }, branch: { create: 'main', push: true } }, 'T');
+  assert.ok(createIsBase.task.prompt.includes('ONLY record'), 'branch.create === base → transcript-only recovery text');
 
   // A `repository.sha` DETACHES HEAD (provisionRepo checks out the sha, leaving no
-  // symbolic branch), so even a non-base `repository.ref` has no pushed branch to
-  // recover — gate on the authoritative detach signal, not the shape of `ref`.
-  const detached = seedResumeEnvelope({ task: { prompt: 'do it' }, repository: { url: 'x', ref: 'feat/thing', baseRef: 'main', sha: 'deadbeefcafe' }, branch: { push: true } }, 'T');
+  // symbolic branch), so even a would-be-recoverable `branch.create` has no pushed branch
+  // to recover — gate on the authoritative detach signal.
+  const detached = seedResumeEnvelope({ task: { prompt: 'do it' }, repository: { url: 'x', ref: 'feat/thing', baseRef: 'main', sha: 'deadbeefcafe' }, branch: { create: 'feat/thing', push: true } }, 'T');
   assert.ok(detached.task.prompt.includes('ONLY record'), 'repository.sha detaches HEAD → transcript-only recovery text');
-  // A legitimately HEX-NAMED branch (no repository.sha) is NOT wrongly rejected — the
-  // old hex-shape heuristic on `ref` produced that false negative.
-  const hexBranch = seedResumeEnvelope({ task: { prompt: 'do it' }, repository: { url: 'x', ref: 'deadbeef', baseRef: 'main' }, branch: { push: true } }, 'T');
-  assert.ok(hexBranch.task.prompt.includes('pushed branch'), 'hex-named non-base branch (no sha) → branch recovery text');
+  // A legitimately HEX-NAMED created branch (no repository.sha) is NOT wrongly rejected.
+  const hexBranch = seedResumeEnvelope({ task: { prompt: 'do it' }, repository: { url: 'x', ref: 'deadbeef', baseRef: 'main' }, branch: { create: 'deadbeef', push: true } }, 'T');
+  assert.ok(hexBranch.task.prompt.includes('pushed branch'), 'hex-named non-base created branch (no sha) → branch recovery text');
 });
 
 test('seedResumeEnvelope: container mode forces transcript-only recovery even for a pushable ref', () => {
@@ -301,9 +309,9 @@ test('seedResumeEnvelope: container mode forces transcript-only recovery even fo
   // ever checked out/published by this worker — promising "your committed work is on the
   // pushed branch" points a container resume at a branch it never created (suppressed
   // advisory agent-resume.mjs:501). The caller passes the sandbox mode IN.
-  const env = { task: { prompt: 'do it' }, repository: { url: 'x', ref: 'feat/thing', baseRef: 'main' }, branch: { push: true } };
+  const env = { task: { prompt: 'do it' }, repository: { url: 'x', ref: 'feat/thing', baseRef: 'main' }, branch: { create: 'feat/thing', push: true } };
   const host = seedResumeEnvelope(env, 'T');
-  assert.ok(host.task.prompt.includes('pushed branch'), 'host job with a stable non-base ref → branch recovery text');
+  assert.ok(host.task.prompt.includes('pushed branch'), 'host job with an explicit non-base branch.create → branch recovery text');
   const container = seedResumeEnvelope(env, 'T', { containerMode: true });
   assert.ok(container.task.prompt.includes('ONLY record'), 'container job → transcript-only recovery text');
   assert.ok(!container.task.prompt.includes('on your pushed branch'), 'no pushed-branch promise for a container resume');
@@ -323,7 +331,7 @@ test('buildResumePrompt: branch recovery text is VERIFY-first, never assuming ab
 
 test('resolveEffectiveEnvelope: containerMode threads through to transcript-only recovery', async () => {
   const externalJob = { leaseToken: 'lease', elementInstanceKey: '9' };
-  const envelope = { task: { prompt: 'do it' }, repository: { url: 'x', ref: 'feat/thing', baseRef: 'main' }, branch: { push: true } };
+  const envelope = { task: { prompt: 'do it' }, repository: { url: 'x', ref: 'feat/thing', baseRef: 'main' }, branch: { create: 'feat/thing', push: true } };
   const readPrior = async () => ({ text: 'prior', historyCount: 2 });
   const host = await resolveEffectiveEnvelope({ envelope, job: externalJob, env: {}, readPrior });
   assert.ok(host.resumed && host.envelope.task.prompt.includes('pushed branch'), 'host → branch recovery');

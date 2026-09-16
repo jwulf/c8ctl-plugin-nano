@@ -122,9 +122,34 @@ SDK client (job workers) — do **not** add the SDK as a dependency or use raw
   `decodeFrames`).
 - State file `supervisor.json` (`{ pid, socket, logFile, workers:[…] }`); logs
   under `logs/supervisor/`. Management subcommands (`status|add|remove|restart|
-  stop|logs`) are thin socket clients (`supervisorRequest`) needing no
+  reload|stop|logs`) are thin socket clients (`supervisorRequest`) needing no
   interactive surface; the interactive `attach` console streams events and can
   **detach** (Ctrl-D / `detach`, leaving the daemon running) or `stop` the fleet.
+- **Hot code reload (rolling drain+respawn).** `supervisor reload [target]` (and
+  `workforce reload`) adopt updated on-disk plugin code into the running fleet
+  with **zero downtime**: the daemon rolls through the target workers (default
+  `all`) **one at a time**, gracefully draining each (the same `SIGUSR2` quiesce
+  as stop — finish in-flight jobs, then exit) and respawning it so the new
+  `nano work` child re-reads the updated `c8ctl-plugin.js` + sidecars +
+  `supervisor.dist.js` from disk. Because each worker is a separate process,
+  respawning it is what adopts the new code — so after `nano update`, a rolling
+  `reload` picks up all **worker-side** logic (job running, agent instances,
+  provisioning, agentic, the Effect runtime workers load) without stopping the
+  fleet. The `reload` socket op is **streaming** (draining can take arbitrarily
+  long) and ends with a terminal `reloaded` frame; **Ctrl-C detaches** the client
+  while the daemon keeps rolling. The drain runs OUTSIDE the op lock (so a
+  `stop --force`/`remove`/`restart` can still interrupt it), and the respawn is
+  guarded by the same **child-identity check** as `restart` (only respawn if the
+  drained child is still the worker's current child) so a concurrent
+  force-stop/restart/remove never leaks a duplicate or revives a removed worker;
+  a reload is refused while another is in progress, respects `shuttingDown`, and
+  **never clears `supervisor.json`** (it is not a stop). The daemon's OWN
+  process-manager code is NOT adopted by `reload` (its workers are its children
+  watching its pid, so a daemon re-exec would take the fleet down) — new
+  supervisor code needs a full `supervisor stop && supervisor start`. `status`
+  surfaces this: the frame carries `pluginVersion` (the version on disk, re-read
+  each call) alongside the daemon's running `version`, and the render flags
+  "update available — run `supervisor reload`" when they diverge.
 - **Graceful drain on stop (issue #202).** `supervisor stop` (and `workforce
   stop`) **drain by default**: the daemon quiesces each `nano work` child with a
   `SIGUSR2` (registry `quiesce()` latches the activation loop so it leases NO new

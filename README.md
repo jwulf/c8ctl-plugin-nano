@@ -1060,6 +1060,8 @@ c8ctl nano supervisor add reviewer                  # add + spawn a worker (forw
 c8ctl nano supervisor add reviewer --name reviewer-2 # a SECOND reviewer, named so it stays distinct
 c8ctl nano supervisor add reviewer --instances 3    # add 3 distinct auto-named reviewers in one call
 c8ctl nano supervisor restart reviewer             # by worker id or profile name
+c8ctl nano supervisor reload                        # adopt new code fleet-wide (rolling drain+respawn, zero downtime)
+c8ctl nano supervisor reload reviewer               # reload just one worker/profile
 c8ctl nano supervisor remove coder                 # stop + drop a worker (also: `all`)
 c8ctl nano supervisor logs reviewer --follow       # tail a worker's log (or the daemon's)
 c8ctl nano supervisor stop                          # stop the daemon and every worker
@@ -1108,6 +1110,44 @@ How it works and where things live:
   exit from the old process is never mis-counted against the new one).
 - Stopping is SIGTERM → grace → SIGKILL, per worker and for the daemon; `stop`
   always clears `supervisor.json` so a stale marker never wedges a future start.
+
+### Hot code reload: `supervisor reload` / `workforce reload`
+
+When you update the plugin on a machine that's already running a fleet
+(`c8ctl nano update`, or otherwise replacing the installed `c8ctl-plugin-nano`),
+`supervisor reload` adopts the new code **without stopping the fleet**:
+
+```bash
+c8ctl nano update            # pull the new harness onto disk
+c8ctl nano supervisor reload # roll it into the running fleet, zero downtime
+```
+
+- Each supervised worker is a **separate `nano work` process** that reads the
+  plugin from disk when it starts, so the daemon adopts new code by **rolling
+  through the workers one at a time** — gracefully draining each (the same
+  `SIGUSR2` quiesce as `stop`: it stops leasing new jobs, finishes the ones in
+  flight, and exits) and respawning it, which re-reads the updated
+  `c8ctl-plugin.js`, its sidecars, and `supervisor.dist.js`. Because only one
+  worker is down at a time, the rest of the fleet keeps serving — **zero fleet
+  downtime**.
+- It **never kills in-flight work**: a reload waits indefinitely for each
+  worker's jobs to finish (adopting new code is never worth losing a running
+  job). The command **streams progress** and **Ctrl-C detaches** — the daemon
+  keeps rolling in the background (rerun `supervisor status` to check). A reload
+  is refused while another is already in progress.
+- `reload [target]` defaults to the whole fleet; pass a worker id or profile to
+  reload just those. `workforce reload` rolls only the workers a manifest owns.
+- **Scope — workers, not the daemon.** A reload adopts all **worker-side** code
+  (job running, agent instances, git/container provisioning, the agentic
+  connection, the Effect runtime workers load — the bulk of the harness). The
+  supervisor **daemon** keeps running the code it started with: its workers are
+  its children and watch its pid, so re-exec'ing the daemon would take the fleet
+  down with it. To adopt new **supervisor** code, do a full restart
+  (`c8ctl nano supervisor stop && c8ctl nano supervisor start`) — a rare event,
+  since the daemon is a thin process manager. `supervisor status` shows an
+  `on disk:` line flagging "update available" whenever the code on disk has
+  advanced past the running daemon, so you know when a reload (or restart) is
+  worthwhile.
 
 ### Surviving SSH logout: `supervisor install` / `uninstall`
 
@@ -1216,6 +1256,7 @@ c8ctl nano workforce list                 # print the manifest (+ --json)
 c8ctl nano workforce start                # ensure the daemon is up, then reconcile
 c8ctl nano workforce status               # desired vs actual, per worker (+ --json)
 c8ctl nano workforce stop                 # remove this manifest's workers (+ stop an empty daemon)
+c8ctl nano workforce reload               # hot-adopt new code into this manifest's workers (rolling, zero downtime)
 c8ctl nano workforce remove qwen          # drop an entry ("all" clears the manifest)
 ```
 

@@ -739,3 +739,113 @@ test('supervisor remove (force:false): drains a worker without killing it (issue
   assert.ok(mod.runningSupervisor(), 'the daemon should keep running after a drain-remove');
   await mod.supervisorRequest({ op: 'stop', force: true });
 });
+
+// A tiny streaming reload client: opens the control socket, sends `{op:'reload'}`
+// (with a target token or targets array), and collects every decoded frame
+// until the terminal `reloaded` frame (or the socket closes). Returns the frames
+// so a test can assert on the rolling progress + terminal frame.
+async function reloadStream(mod, { target = 'all', targets = null } = {}) {
+  const socketPath = mod.getSupervisorSocketPath();
+  const { encodeFrame, decodeFrames } = mod;
+  return await new Promise((resolve, reject) => {
+    const sock = createConnection(socketPath);
+    const frames = [];
+    let buf = '';
+    let done = false;
+    const finish = () => { if (done) return; done = true; try { sock.end(); } catch {} resolve(frames); };
+    sock.setEncoding('utf8');
+    sock.on('connect', () => {
+      sock.write(encodeFrame(targets ? { op: 'reload', targets } : { op: 'reload', target }));
+    });
+    sock.on('data', (chunk) => {
+      buf += chunk;
+      const { frames: fr, rest } = decodeFrames(buf);
+      buf = rest;
+      for (const f of fr) { frames.push(f); if (f && (f.type === 'reloaded' || f.final)) finish(); }
+    });
+    sock.on('close', () => finish());
+    sock.on('error', (err) => { if (!done) { done = true; reject(err); } });
+  });
+}
+
+test('supervisor reload: gracefully drains and respawns a worker to adopt new code', async (t) => {
+  const { mod, sigFile } = await bootBusyDaemon(t, { drainMs: 150 });
+  const before = await mod.supervisorRequest({ op: 'status' });
+  assert.equal(before.workers.length, 1);
+  const id = before.workers[0].id;
+  const oldPid = before.workers[0].pid;
+
+  const frames = await reloadStream(mod, { target: 'all' });
+  // The daemon announced a rolling reload and ended with a terminal frame that
+  // lists the reloaded worker.
+  assert.ok(frames.some((f) => f && f.type === 'reloading'), `expected a reloading frame: ${JSON.stringify(frames)}`);
+  const term = frames.find((f) => f && f.type === 'reloaded' && f.final);
+  assert.ok(term, 'expected a terminal reloaded frame');
+  assert.deepEqual(term.reloaded, [id], 'the terminal frame should list the reloaded worker');
+
+  // The worker adopted new code by DRAINING (SIGUSR2 — finished its job), never
+  // a force kill.
+  assert.equal(readFileSync(sigFile, 'utf8'), 'drained', 'the worker drained (SIGUSR2), not force-killed');
+
+  // Exactly one worker remains (no leaked duplicate), with a NEW pid (respawned
+  // → re-read the plugin from disk) and restarts still 0 (a reload is not a
+  // crash-restart).
+  let after = null;
+  for (let i = 0; i < 40; i++) {
+    const s = await mod.supervisorRequest({ op: 'status' });
+    if (s.workers.length === 1 && s.workers[0].state === 'running' && s.workers[0].pid && s.workers[0].pid !== oldPid) { after = s.workers[0]; break; }
+    await sleep(50);
+  }
+  assert.ok(after, 'the worker should be running again under a new pid after reload');
+  assert.equal(after.id, id, 'the worker keeps its id across a reload');
+  assert.equal(after.restarts, 0, 'a reload must not be counted as a crash-restart');
+
+  // The daemon itself stays up and its state file is intact — a reload is not a
+  // stop.
+  assert.ok(mod.runningSupervisor(), 'the daemon should keep running after a reload');
+  await mod.supervisorRequest({ op: 'stop', force: true });
+});
+
+test('supervisor reload: rolls the whole fleet, giving every worker a fresh pid', async (t) => {
+  const { mod } = await bootBusyDaemon(t, { drainMs: 120 });
+  // Add a second busy worker so the reload is a genuine rolling pass.
+  const added = await mod.supervisorRequest({ op: 'add', profile: 'faker' });
+  assert.equal(added.ok, true);
+  // Wait for both to be running.
+  let before = [];
+  for (let i = 0; i < 40; i++) {
+    const s = await mod.supervisorRequest({ op: 'status' });
+    if (s.workers.length === 2 && s.workers.every((w) => w.state === 'running' && w.pid)) { before = s.workers; break; }
+    await sleep(50);
+  }
+  assert.equal(before.length, 2, 'two workers should be running before reload');
+  const oldPids = new Map(before.map((w) => [w.id, w.pid]));
+
+  const frames = await reloadStream(mod, { target: 'all' });
+  const term = frames.find((f) => f && f.type === 'reloaded' && f.final);
+  assert.ok(term, 'expected a terminal reloaded frame');
+  assert.equal(term.reloaded.length, 2, 'both workers should have been reloaded');
+
+  // Both workers survive (count unchanged) with fresh pids.
+  let after = [];
+  for (let i = 0; i < 60; i++) {
+    const s = await mod.supervisorRequest({ op: 'status' });
+    if (s.workers.length === 2 && s.workers.every((w) => w.state === 'running' && w.pid && w.pid !== oldPids.get(w.id))) { after = s.workers; break; }
+    await sleep(50);
+  }
+  assert.equal(after.length, 2, 'exactly two workers after a fleet reload (no leaks)');
+  for (const w of after) {
+    assert.notEqual(w.pid, oldPids.get(w.id), `worker ${w.id} should have a new pid after reload`);
+    assert.equal(w.restarts, 0, 'reload is not a crash-restart');
+  }
+  await mod.supervisorRequest({ op: 'stop', force: true });
+});
+
+test('supervisor status: surfaces the on-disk plugin version', async (t) => {
+  const { mod } = await bootBusyDaemon(t, { drainMs: 120 });
+  const s = await mod.supervisorRequest({ op: 'status' });
+  assert.ok(s.ok, 'status should succeed');
+  assert.ok(typeof s.pluginVersion === 'string' && s.pluginVersion.length > 0, 'status frame carries the on-disk plugin version');
+  assert.equal(s.pluginVersion, s.daemon.version, 'with no update on disk the running daemon and on-disk versions match');
+  await mod.supervisorRequest({ op: 'stop', force: true });
+});

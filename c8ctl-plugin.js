@@ -10937,6 +10937,13 @@ function formatSupervisorStatus(status) {
   lines.push('Supervisor:');
   lines.push(`  daemon pid: ${d.pid ?? '-'} ${alive ? '(alive)' : '(dead — stale state)'}`);
   if (d.version) lines.push(`  version:    ${d.version}`);
+  // Flag a code update the running daemon hasn't adopted yet: the plugin on disk
+  // has advanced past the daemon's version (e.g. after `nano update`). A rolling
+  // `supervisor reload` adopts the new WORKER code with zero downtime; a daemon
+  // restart is needed for new SUPERVISOR code.
+  if (status.pluginVersion && d.version && status.pluginVersion !== d.version) {
+    lines.push(`  on disk:    ${status.pluginVersion} (update available — run \`c8ctl nano supervisor reload\` to adopt new worker code; restart the daemon for new supervisor code)`);
+  }
   if (d.startedAt) lines.push(`  started:    ${d.startedAt}`);
   if (d.socket) lines.push(`  control:    ${d.socket}`);
   const workers = Array.isArray(status.workers) ? status.workers : [];
@@ -11205,6 +11212,11 @@ async function runSupervisorDaemon() {
   // restart-on-exit path and let a second `stop --force` escalate a live drain.
   let draining = false;
   let forcing = false;
+  // Hot code reload (rolling drain+respawn). A `reload` op adopts new on-disk
+  // plugin code into the worker children by gracefully draining and respawning
+  // them one at a time (so the fleet keeps serving). This flag rejects a second
+  // concurrent reload — a single rolling pass owns the fleet until it finishes.
+  let reloading = false;
   // Live-view monitor: tracks the last-broadcast fleet signature so we push a
   // refreshed status to attached consoles only on real change (see below).
   let monitorTimer = null;
@@ -11457,6 +11469,73 @@ async function runSupervisorDaemon() {
     return true;
   };
 
+  // Hot code reload of a single worker: GRACEFULLY drain it (SIGUSR2 — finish
+  // in-flight jobs, then exit) and respawn it, so the new child re-reads the
+  // updated plugin from disk. Unlike `restartWorker` (a force SIGTERM/SIGKILL
+  // swap), this waits INDEFINITELY for the drain so no in-flight job is lost —
+  // adopting new code is never worth killing running work.
+  //
+  // The drain runs OUTSIDE the op lock (it can be arbitrarily long) so a
+  // `stop --force` or a `remove`/`restart` for this same worker isn't blocked
+  // and can escalate/interrupt it. Because of that, the respawn is guarded by
+  // the child-identity check (`w.child === child`): if a concurrent
+  // force-stop/restart/remove already swapped or deleted this worker while we
+  // drained, we must NOT respawn (that would leak a duplicate child or revive a
+  // removed worker). We also skip the respawn when the daemon is shutting down.
+  const reloadWorker = async (id) => {
+    const w = workers.get(id);
+    if (!w) return false;
+    const child = w.child;
+    w.stopping = true;
+    if (w.restartTimer) { clearTimeout(w.restartTimer); w.restartTimer = null; }
+    const pid = w.pid;
+    if (child && pid) {
+      try { process.kill(pid, SUPERVISOR_DRAIN_SIGNAL); } catch { /* already gone */ }
+      await waitForChildExit(child, null);
+    }
+    // Only respawn if nobody else acted on this worker while we drained: it must
+    // still exist, we must not be shutting down, and its child handle must still
+    // be the one we drained (a concurrent restart/force-stop would have swapped
+    // it). The startWorker+guard runs under the op lock so it can't interleave
+    // with add/remove.
+    return await serializeOp(async () => {
+      const cur = workers.get(id);
+      if (!cur || cur !== w || shuttingDown || w.child !== child) return false;
+      w.stopping = false;
+      w.restarts = 0;
+      startWorker(w);
+      dlog(`worker '${id}' reloaded (adopted new code)`);
+      broadcast({ type: 'event', event: 'worker-reload', id });
+      return true;
+    });
+  };
+
+  // Rolling hot reload across a set of worker ids: drain+respawn each in turn
+  // (one at a time, so the rest of the fleet keeps serving). Streams progress to
+  // `sock` (registered as an attach consumer for the interleaved worker events)
+  // and ends with a terminal `reloaded` frame. Aborts early if the daemon starts
+  // shutting down. Never clears `supervisor.json` — a reload is not a stop.
+  const runReload = async (ids, sock) => {
+    reloading = true;
+    const reloaded = [];
+    const skipped = [];
+    try {
+      for (const id of ids) {
+        if (shuttingDown) break;
+        if (!workers.has(id)) { skipped.push(id); continue; }
+        const ok = await reloadWorker(id);
+        if (ok) reloaded.push(id); else skipped.push(id);
+        try { sock.write(encodeFrame(statusFrame(false))); } catch { /* client gone */ }
+      }
+    } catch (err) {
+      dlog(`reload error: ${err?.message || err}`);
+    } finally {
+      reloading = false;
+      try { sock.write(encodeFrame({ ok: true, type: 'reloaded', reloaded, skipped, final: true })); } catch { /* client gone */ }
+    }
+  };
+
+
   // Resolve a target token to worker ids: exact id, else all with that profile.
   const resolveTargets = (target) => {
     const t = String(target || '').trim();
@@ -11474,6 +11553,11 @@ async function runSupervisorDaemon() {
     ok: true,
     type: 'status',
     daemon: supervisorDaemonDescriptor({ pid: process.pid, startedAt, version: daemonVersion, socket: socketPath, logFile: daemonLogFile }),
+    // The plugin version currently ON DISK (re-read each call), so `status` can
+    // flag when a `nano update` has advanced the code past the running daemon —
+    // i.e. a `supervisor reload` would adopt new worker code (and a daemon
+    // restart new supervisor code). Best-effort; falls back to the daemon's own.
+    pluginVersion: (() => { try { return pluginPackage().version; } catch { return daemonVersion; } })(),
     workers: pub || [...workers.values()].map(workerPublic),
     ...(final ? { final: true } : {}),
   });
@@ -11575,6 +11659,30 @@ async function runSupervisorDaemon() {
             return ids;
           });
           sock.write(encodeFrame({ ok: true, type: 'restarted', restarted, final: true }));
+          break;
+        }
+        case 'reload': {
+          // Hot code adoption: rolling graceful drain+respawn so worker children
+          // re-read the updated plugin from disk with zero fleet downtime.
+          // Accepts a single `target` token (id|profile|all) or a `targets`
+          // array (workforce passes its exact owned id list). Streams progress
+          // and ends with a terminal `reloaded` frame — draining can take a long
+          // time, so this MUST be a streaming op, not a one-shot request.
+          if (shuttingDown) { sock.write(encodeFrame({ ok: false, error: 'supervisor is shutting down', final: true })); break; }
+          if (reloading) { sock.write(encodeFrame({ ok: false, error: 'a reload is already in progress', final: true })); break; }
+          const raw = Array.isArray(req.targets)
+            ? req.targets.flatMap((t) => resolveTargets(t))
+            : resolveTargets(req.target);
+          const ids = [...new Set(raw)];
+          if (ids.length === 0) { sock.write(encodeFrame({ ok: true, type: 'reloaded', reloaded: [], skipped: [], final: true })); break; }
+          // Register as an attach consumer so the client also sees the
+          // interleaved worker-reload/start events, then send an opening frame
+          // and kick the rolling reload asynchronously (don't block the control
+          // loop — a `stop`/`status` must still be serviceable meanwhile).
+          attachClients.add(sock);
+          sock.write(encodeFrame({ ok: true, type: 'reloading', targets: ids }));
+          sock.write(encodeFrame(statusFrame(false)));
+          setTimeout(() => { runReload(ids, sock); }, 0);
           break;
         }
         case 'attach':
@@ -11985,6 +12093,84 @@ async function supervisorRestartCmd(req) {
   if (res.ok && res.restarted.length > 0) logger.info(`Restarted worker(s): ${res.restarted.join(', ')}.`);
   else if (res.ok) { logger.warn(`No worker matched "${target}".`); }
   else { logger.error(res.error); process.exit(1); }
+}
+
+/**
+ * Stream a rolling hot reload of the fleet and log its progress. Shared by
+ * `supervisor reload` and `workforce reload`. Sends `req` (a `reload` op with a
+ * `target` token or a `targets` array) and resolves with the outcome that ended
+ * the stream ('reloaded' | 'detached' | 'closed' | 'unreachable'). Ctrl-C
+ * DETACHES the client — the daemon keeps reloading in the background.
+ */
+async function streamSupervisorReload(socketPath, req, logger, { label = 'fleet' } = {}) {
+  return await new Promise((resolve) => {
+    let sock = null;
+    let buf = '';
+    let done = false;
+    let onSigint = null;
+    const cleanup = () => {
+      if (onSigint) { try { process.removeListener('SIGINT', onSigint); } catch { /* ignore */ } }
+      try { if (sock) sock.end(); } catch { /* ignore */ }
+    };
+    const finish = (result) => { if (done) return; done = true; cleanup(); resolve(result); };
+
+    supervisorConnect(socketPath).then((s) => {
+      sock = s;
+      sock.setEncoding('utf8');
+      onSigint = () => {
+        logger.info('Detached — supervisor keeps reloading in the background. Rerun `nano supervisor status` to check progress.');
+        finish('detached');
+      };
+      process.on('SIGINT', onSigint);
+
+      sock.on('data', (chunk) => {
+        buf += chunk;
+        const { frames, rest } = decodeFrames(buf);
+        buf = rest;
+        for (const frame of frames) {
+          if (!frame) continue;
+          if (frame.ok === false) { logger.error(frame.error || 'reload failed'); finish('error'); return; }
+          if (frame.type === 'reloading') {
+            const n = Array.isArray(frame.targets) ? frame.targets.length : 0;
+            logger.info(`Reloading ${n} worker(s) in ${label} one at a time (draining in-flight jobs first). Press Ctrl-C to detach.`);
+          } else if (frame.event === 'worker-reload' && frame.id) {
+            logger.info(`  reloaded "${frame.id}" (adopted new code).`);
+          } else if (frame.type === 'reloaded' || frame.final) {
+            const reloaded = Array.isArray(frame.reloaded) ? frame.reloaded : [];
+            const skipped = Array.isArray(frame.skipped) ? frame.skipped : [];
+            if (reloaded.length > 0) logger.info(`Reloaded ${reloaded.length} worker(s): ${reloaded.join(', ')}.`);
+            else logger.warn('No workers were reloaded.');
+            if (skipped.length > 0) logger.warn(`Skipped (gone/changed during reload): ${skipped.join(', ')}.`);
+            finish('reloaded');
+            return;
+          }
+        }
+      });
+      sock.on('error', () => finish('closed'));
+      sock.on('close', () => finish('closed'));
+      sock.write(encodeFrame(req));
+    }).catch(() => finish('unreachable'));
+  });
+}
+
+/**
+ * Hot-adopt new plugin code into the running fleet with zero downtime: roll
+ * through the target workers, gracefully draining (finish in-flight jobs) and
+ * respawning each so the new child re-reads the updated `c8ctl-plugin.js` from
+ * disk. Defaults to the whole fleet. Note this adopts new WORKER code only; the
+ * supervisor daemon itself keeps running its startup code until a full restart
+ * (`supervisor stop && supervisor start`).
+ */
+async function supervisorReloadCmd(req) {
+  const logger = getLogger();
+  // Default to the whole fleet: "adopt new code" naturally means every worker.
+  const target = req.positional[1] || 'all';
+  const running = await liveSupervisor();
+  if (!running) { logger.error('Supervisor is not running.'); process.exit(1); }
+  const socketPath = running.socket || getSupervisorSocketPath();
+  const outcome = await streamSupervisorReload(socketPath, { op: 'reload', target }, logger, { label: 'the fleet' });
+  if (outcome === 'unreachable') { logger.error('Could not reach the supervisor control socket to reload it.'); process.exit(1); }
+  if (outcome === 'error') process.exit(1);
 }
 
 /**
@@ -12786,6 +12972,9 @@ async function supervisorCommand(req, flags, ctx) {
     case 'restart':
       await supervisorRestartCmd(req);
       return;
+    case 'reload':
+      await supervisorReloadCmd(req);
+      return;
     case 'stop':
       await supervisorStopCmd(coerceBool(flags?.force, false));
       return;
@@ -12794,7 +12983,7 @@ async function supervisorCommand(req, flags, ctx) {
       supervisorLogsCmd(req);
       return;
     default:
-      getLogger().error(`Unknown supervisor action "${action}". Use: start|install|uninstall|status|add|remove|restart|stop|logs|attach`);
+      getLogger().error(`Unknown supervisor action "${action}". Use: start|install|uninstall|status|add|remove|restart|reload|stop|logs|attach`);
       process.exit(1);
   }
 }
@@ -13743,6 +13932,40 @@ async function workforceStopCmd(req, flags, manifestName) {
   if (hadError) process.exit(1);
 }
 
+/**
+ * Hot-adopt new plugin code into a workforce's running workers with zero
+ * downtime: roll through the manifest-owned workers, gracefully draining and
+ * respawning each so the new child re-reads the updated plugin from disk.
+ * Mirrors `workforce stop`'s ownership resolution (longest-prefix match + a
+ * live-profile collision guard) so it only ever reloads workers this manifest
+ * owns.
+ */
+async function workforceReloadCmd(req, flags, manifestName) {
+  const logger = getLogger();
+  const running = await liveSupervisor();
+  if (!running) { logger.error('Supervisor is not running.'); process.exit(1); }
+  const manifestNames = listWorkforceManifestNames();
+  const { running: stillRunning, reachable, workers: live } = await fetchSupervisorWorkers();
+  if (!stillRunning) { logger.warn('Supervisor is not running — nothing to reload.'); return; }
+  if (!reachable) {
+    logger.error('Supervisor is running but its status socket is unreachable — cannot enumerate workers.');
+    process.exit(1);
+  }
+  const owned = live
+    .filter((w) => w && typeof w.id === 'string' && isWorkforceOwnedWorker(w.id, manifestName, manifestNames))
+    .filter((w) => {
+      const embedded = workforceProfileFromWorkerName(manifestName, w.id);
+      if (embedded != null && w.profile != null && w.profile !== embedded) return false;
+      return true;
+    })
+    .map((w) => w.id);
+  if (owned.length === 0) { logger.info(`No workers from workforce "${manifestName}" are running.`); return; }
+  const socketPath = running.socket || getSupervisorSocketPath();
+  const outcome = await streamSupervisorReload(socketPath, { op: 'reload', targets: owned }, logger, { label: `workforce "${manifestName}"` });
+  if (outcome === 'unreachable') { logger.error('Could not reach the supervisor control socket to reload it.'); process.exit(1); }
+  if (outcome === 'error') process.exit(1);
+}
+
 async function workforceCommand(req, flags) {
   const logger = getLogger();
   const action = (req.positional[0] || '').toLowerCase();
@@ -13780,8 +14003,11 @@ async function workforceCommand(req, flags) {
     case 'down':
       await workforceStopCmd(req, flags, manifestName);
       return;
+    case 'reload':
+      await workforceReloadCmd(req, flags, manifestName);
+      return;
     default:
-      logger.error(`Unknown workforce action "${action}". Use: add|remove|list|start|status|stop`);
+      logger.error(`Unknown workforce action "${action}". Use: add|remove|list|start|status|stop|reload`);
       process.exit(1);
   }
 }
@@ -15634,6 +15860,8 @@ export {
   supervisorRequest,
   supervisorStartCmd,
   supervisorAddCmd,
+  supervisorReloadCmd,
+  workforceReloadCmd,
   runningSupervisor,
   readSupervisorState,
   clearSupervisorState,
@@ -15740,6 +15968,7 @@ export const metadata = {
         { command: 'c8ctl nano supervisor add decider', description: 'Add a supervised worker (forwarding work flags) to the running supervisor' },
         { command: 'c8ctl nano supervisor add reviewer --instances 3', description: 'Add 3 distinct auto-named instances of a profile in one call' },
         { command: 'c8ctl nano supervisor restart reviewer', description: 'Restart a supervised worker by id or profile' },
+        { command: 'c8ctl nano supervisor reload', description: 'Adopt updated harness code with zero downtime: after `nano update`, roll through the fleet draining in-flight jobs and respawning each worker so it re-reads the new plugin (workers only; restart the daemon for new supervisor code)' },
         { command: 'c8ctl nano supervisor stop', description: 'Stop the supervisor daemon and all its workers' },
         { command: 'c8ctl nano workforce add copilot --instances 5 --auto', description: 'Compose a reusable fleet: 5 copilot workers serving every deployed agent job type (--auto)' },
         { command: 'c8ctl nano workforce add qwen --instances 2 --roles pr-review,feature', description: "Add an entry mapped to explicit job types (<rank>:pr-review, <rank>:feature, where <rank> is the qwen hire's rank at start) — does not mutate the hired profile" },
@@ -15748,6 +15977,7 @@ export const metadata = {
         { command: 'c8ctl nano workforce status --json', description: 'Manifest entries joined against live supervisor status (desired vs actual), machine-readable for the install script / CI' },
         { command: 'c8ctl nano workforce list', description: 'Print the default manifest and list the manifests that exist on this machine' },
         { command: 'c8ctl nano workforce stop', description: "Remove this manifest's workers; stop the daemon too if no supervised workers remain" },
+        { command: 'c8ctl nano workforce reload', description: "Hot-adopt updated code into this manifest's workers (rolling graceful drain+respawn, zero downtime)" },
       ],
     },
     processos: {

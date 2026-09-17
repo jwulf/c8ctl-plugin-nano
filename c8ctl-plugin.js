@@ -3484,6 +3484,14 @@ function bindJobSettle(settle, job) {
 // idle worker stops writing activity, so read-time enforcement is what actually
 // expires a ghost on an otherwise-quiet worker.
 const SETTLEMENT_PENDING_GHOST_TTL_MS = 30 * 60 * 1000;
+// #256 review: cap the per-key `settleInFlightByKey` entry Map. A same-key
+// redelivery loop whose fenced settles never resolve could otherwise append
+// unboundedly many live entries WITHIN the ghost TTL window (TTL GC only drops
+// AGED entries). Evicting oldest-first when a key exceeds this cap keeps the map
+// constant-space per key while retaining the newest live identity that governs
+// protection — a generous headroom over the 1–2 realistic concurrent same-key
+// activations (an interrupted older runner still settling while a newer one runs).
+const MAX_SETTLE_IN_FLIGHT_PER_KEY = 16;
 
 // #254 (PR #256 review): does a fenced-settle rejection mean the activation was
 // DEFINITIVELY lost — the lock lapsed and the broker reclaimed the job, or the
@@ -3522,8 +3530,9 @@ function isLeaseLostSettleError(err) {
   // Parse the explicit status from the message (transport status only — see
   // HTTP_STATUS_RE) AND the cause chain, separating a definitive lease-loss status
   // (404/409) from a contradictory one. SDK rejections often carry the status as
-  // `err.status`/`err.statusCode`/`err.response.status` rather than in the message;
-  // the cause walk is bounded so a cycle can't loop.
+  // `err.status`/`err.statusCode`/`err.response.status`/`err.response.statusCode`
+  // rather than in the message (all the nested shapes `describeSdkError` normalizes,
+  // agent-instance.mjs); the cause walk is bounded so a cycle can't loop.
   let leaseStatus = false;
   let otherStatus = false;
   const m = HTTP_STATUS_RE.exec(msg);
@@ -3534,7 +3543,7 @@ function isLeaseLostSettleError(err) {
   }
   let e = err;
   for (let depth = 0; e != null && typeof e === 'object' && depth <= 4; depth += 1) {
-    const s = e.status ?? e.statusCode ?? (e.response && e.response.status);
+    const s = e.status ?? e.statusCode ?? (e.response && (e.response.status ?? e.response.statusCode));
     if (s === 409 || s === 404) leaseStatus = true;
     else if (Number.isFinite(s)) otherStatus = true;
     e = e.cause;
@@ -3569,6 +3578,9 @@ function pruneActivationGuard(lastActivationByKey, settleInFlightByKey, opts = {
   const ttlMs = Number.isFinite(opts.ttlMs) ? opts.ttlMs : SETTLEMENT_PENDING_GHOST_TTL_MS;
   const maxGhosts = Number.isFinite(opts.maxGhosts) ? opts.maxGhosts : 64;
   const hardMax = Number.isFinite(opts.hardMax) ? opts.hardMax : maxGhosts * 4;
+  const maxInFlightPerKey = Number.isFinite(opts.maxInFlightPerKey)
+    ? opts.maxInFlightPerKey
+    : MAX_SETTLE_IN_FLIGHT_PER_KEY;
   const isProtected = (key) => {
     const entries = settleInFlightByKey.get(key);
     if (!entries) return false;
@@ -3581,10 +3593,19 @@ function pruneActivationGuard(lastActivationByKey, settleInFlightByKey, opts = {
   };
   // GC never-resolving in-flight markers so settleInFlightByKey itself stays
   // bounded (a hung settle's clear() may never run). Drop aged per-activation
-  // entries individually, then drop a key once it has no entries left.
+  // entries individually, cap the per-key count so a same-key redelivery loop
+  // cannot accumulate unbounded live entries WITHIN the TTL window, then drop a
+  // key once it has no entries left.
   for (const [key, entries] of settleInFlightByKey.entries()) {
     for (const [id, since] of entries) {
       if (nowMs - (since ?? nowMs) > ttlMs) entries.delete(id);
+    }
+    // Per-key cap: evict oldest-first (insertion order === id order ===
+    // non-decreasing `since`), retaining the newest live identity that governs
+    // protection (#256 review).
+    while (entries.size > maxInFlightPerKey) {
+      const oldest = entries.keys().next().value;
+      entries.delete(oldest);
     }
     if (entries.size === 0) settleInFlightByKey.delete(key);
   }
@@ -9183,6 +9204,15 @@ async function workAgent(req, flags, ctx) {
     if (!entries) { entries = new Map(); settleInFlightByKey.set(key, entries); }
     const id = (settleMarkSeq += 1);
     entries.set(id, nowMs);
+    // Bound the per-key entry count immediately (not only at the next prune): a
+    // same-key redelivery loop whose settles never resolve could otherwise append
+    // unbounded live entries within the TTL window. Evict oldest-first (insertion
+    // order === id order === non-decreasing `since`), retaining the newest live
+    // identity that governs protection (#256 review).
+    while (entries.size > MAX_SETTLE_IN_FLIGHT_PER_KEY) {
+      const oldest = entries.keys().next().value;
+      entries.delete(oldest);
+    }
     return { key, id };
   };
   const clearSettleInFlight = (mark) => {
@@ -9332,37 +9362,37 @@ async function workAgent(req, flags, ctx) {
   // grow without bound on a long-lived worker.
   const recordSettlementPending = (job, phase) => {
     const key = String(job.jobKey);
+    // Settlement-pending is a FENCED-settle concept: it surfaces a lease whose
+    // ownership we could no longer prove on settle (a 404/409 on the fenced
+    // complete/fail). An UNLEASED job carries NO fencing identity — `leaseToken` is
+    // documented as absent for ordinary service jobs (supervisor/src/ports.ts) — so
+    // two same-key unleased activations are indistinguishable (both `leaseToken`
+    // values compare === undefined), and an older superseded runner's late 404/409
+    // could resurrect a false ghost against a newer run's identity. There is no
+    // identity to fence, hence no ghost to record: skip unleased failures entirely
+    // (#256 review).
+    if (job.leaseToken == null) return;
     const cur = activeJobs.get(key);
     // Only the CURRENT activation may create a ghost. A same-key reactivation
     // (recordJobStart) installs a newer leaseToken; if THIS (older) activation's
     // fenced settle then fails, recording a ghost would surface a stale row after
     // the newer run's recordJobEnd — even when the newer settle succeeded. Skip it
-    // (mirrors recordJobEnd's identity guard); an unleased job (no token on either
-    // side) records as before.
+    // (mirrors recordJobEnd's identity guard).
     //
     // `cur` can also be ABSENT here: the newer activation already ran AND finished,
     // so recordJobEnd removed its activeJobs entry. A bare `cur &&` guard would then
     // let this older runner's late rejection resurrect a stale ghost. Fall back to
-    // the retained last-activation identity: if the newest activation seen for this
-    // key is NOT this job, a newer run superseded it — skip. If the identity guard
-    // is ALSO gone, a TOKEN-bearing job is treated as stale/unknown and skipped
-    // (we can't prove it's current); only a genuinely unleased job (no token on
-    // either side) records via this fallback (#256 review).
+    // the retained last-activation identity: record only if the newest activation
+    // seen for this key is THIS job (matching leaseToken). If the identity guard is
+    // ALSO gone (TTL / hard cap), we can no longer prove currency — treat it as
+    // stale/unknown and skip (#256 review).
     if (cur) {
       if (cur.leaseToken !== job.leaseToken) return;
     } else {
       const last = lastActivationByKey.get(key);
-      if (last) {
-        if (last.token !== job.leaseToken) return;
-      } else if (job.leaseToken != null) {
-        // Token-bearing activation whose identity guard was ALSO pruned (TTL / hard
-        // cap): we can no longer prove THIS late rejection is the current activation
-        // rather than a superseded older one, so treat the absent identity as
-        // stale/unknown and skip — recording here could resurrect a ghost after a
-        // newer same-key activation already succeeded (#256 review). Reserve the
-        // fallback record for a genuinely UNLEASED job (no token on either side).
-        return;
-      }
+      // Token-bearing job (unleased already returned above): record only when the
+      // retained identity still names THIS run; a pruned guard can't prove currency.
+      if (!last || last.token !== job.leaseToken) return;
     }
     const recordedAt = Date.now();
     settlementPendingJobs.set(key, {

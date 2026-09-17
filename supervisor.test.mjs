@@ -1251,6 +1251,25 @@ test('isLeaseLostSettleError ignores a status code that only appears in the resp
   );
 });
 
+// #256 review: the cause-chain status extraction must read the NESTED
+// `response.statusCode` shape too, not only `response.status`. The repository's
+// own SDK-error normalizer (describeSdkError, agent-instance.mjs) supports
+// `err.response.statusCode`, so a 404/409 shaped that way must classify as lease
+// loss (else the settle path never records the fenced settlement-pending marker).
+test('isLeaseLostSettleError reads a 404/409 from a nested response.statusCode', () => {
+  const e404 = new Error('settle failed'); e404.response = { statusCode: 404 };
+  assert.equal(isLeaseLostSettleError(e404), true, 'nested response.statusCode 404 is lease loss');
+  const e409 = new Error('settle failed'); e409.response = { statusCode: 409 };
+  assert.equal(isLeaseLostSettleError(e409), true, 'nested response.statusCode 409 is lease loss');
+  // A non-loss nested status is a contradictory signal, not a lease loss, and it
+  // vetoes a body ownership word.
+  const e500 = new Error('settle failed: job not found'); e500.response = { statusCode: 500 };
+  assert.equal(isLeaseLostSettleError(e500), false, 'nested response.statusCode 500 is not lease loss');
+  // The loss status is found even one hop down the cause chain.
+  const wrapped = new Error('outer'); wrapped.cause = e409;
+  assert.equal(isLeaseLostSettleError(wrapped), true, 'nested response.statusCode 409 on the cause chain is lease loss');
+});
+
 // #256 review: INTEGRATION test for the runner hot-path settle wiring
 // #256 review: the runner hot path composes its fenced, settlement-pending-aware
 // settle seam through the SHARED `composeFencedSettleJob` helper (the exact call
@@ -1353,6 +1372,32 @@ test('pruneActivationGuard retains a guard while a newer same-key activation is 
   pruneActivationGuard(guard, inflight, { nowMs: later, ttlMs, maxGhosts: 64, hardMax: 256 });
   assert.equal(guard.has('k0'), false, 'guard TTL-pruned once no activation remains live');
   assert.equal(inflight.has('k0'), false, 'in-flight key dropped once it has no entries left');
+});
+
+// #256 review: settleInFlightByKey keeps a per-key entry Map, and TTL GC only drops
+// AGED entries — so a same-key redelivery loop whose settles never resolve could
+// accumulate unbounded LIVE entries within the TTL window. pruneActivationGuard caps
+// the per-key count, evicting oldest-first so the map is constant-space per key while
+// retaining the newest live identity that governs protection.
+test('pruneActivationGuard caps the per-key in-flight entry Map (oldest-first, newest retained)', () => {
+  const now = 1_000_000;
+  const ttlMs = 30 * 60 * 1000;
+  const guard = new Map();
+  guard.set('kFlood', { token: 't', at: now });
+  const inflight = new Map();
+  // 50 live (recent) same-key activations — a never-resolving redelivery loop.
+  const entries = new Map();
+  for (let i = 1; i <= 50; i += 1) entries.set(i, now - (50 - i)); // id 1 oldest … id 50 newest
+  inflight.set('kFlood', entries);
+  pruneActivationGuard(guard, inflight, { nowMs: now, ttlMs, maxGhosts: 64, hardMax: 256, maxInFlightPerKey: 16 });
+  const kept = inflight.get('kFlood');
+  assert.equal(kept.size, 16, 'per-key entries bounded to the cap');
+  assert.equal(kept.has(50), true, 'the newest activation entry is retained');
+  assert.equal(kept.has(35), true, 'the newest 16 (ids 35..50) are retained');
+  assert.equal(kept.has(34), false, 'older entries beyond the cap are evicted oldest-first');
+  assert.equal(kept.has(1), false, 'the oldest activation entry is evicted');
+  // The guard stays protected: a live newest entry remains in flight.
+  assert.ok(guard.has('kFlood'), 'guard retained — the newest live activation still protects it');
 });
 
 // #254: settlement-pending ghosts are not drained/counted as in-flight work.

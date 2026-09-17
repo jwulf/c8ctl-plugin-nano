@@ -132,8 +132,21 @@ export const makeAgenticEndpoint = (connect: RawEmitConnect): AgenticEndpoint =>
         Effect.runSync(Deferred.succeed(closed, void 0));
       });
 
-      const didOpen = yield* Deferred.await(opened);
+      // `connect()` has already built the raw client and STARTED its transport
+      // (its internal reconnect timers/sockets are live). Until we successfully
+      // hand a handle to the outer `acquireRelease` — whose `disconnect`
+      // finalizer owns teardown thereafter — WE own closing it. If this connect
+      // is interrupted (e.g. the supervisor fiber is interrupted on a SIGUSR2
+      // drain / SIGTERM abort) or fails while still parked on `opened` (the hub
+      // is unreachable, so onOpen never fires), the client would otherwise leak
+      // its live timers and keep the worker process alive forever after
+      // teardown — wedging the daemon's drain (issue #258). Close it on any exit
+      // that does not return the handle.
+      const didOpen = yield* Deferred.await(opened).pipe(
+        Effect.onInterrupt(() => Effect.sync(() => raw.close())),
+      );
       if (!didOpen) {
+        raw.close();
         return yield* Effect.fail(new SupervisorError("agentic connection closed before it opened"));
       }
 

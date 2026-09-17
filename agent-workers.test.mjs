@@ -4476,6 +4476,7 @@ test('probeAgentCliVersion runs `<command> --version` (bounded) and extracts the
   assert.equal(calls[0].opts.shell, true);
   assert.ok(calls[0].opts.timeout > 0, 'a hard timeout is set so a hung harness cannot block');
   assert.deepEqual(calls[0].opts.stdio, ['ignore', 'pipe', 'pipe'], 'stdin closed so an interactive harness gets EOF');
+  assert.ok(Number.isFinite(calls[0].opts.maxBuffer) && calls[0].opts.maxBuffer > 0, 'a finite maxBuffer caps a chatty harness so it cannot exhaust memory');
 });
 
 test('probeAgentCliVersion is best-effort: blank command, thrown spawn, or off-switch → null', () => {

@@ -1753,6 +1753,12 @@ function probeAgentCliVersion(command, { timeoutMs = 1500, run = spawnSync } = {
       killSignal: 'SIGKILL',
       encoding: 'utf8',
       stdio: ['ignore', 'pipe', 'pipe'],
+      // #257 review: cap the captured output. Without a finite maxBuffer a harness
+      // that streams continuously during the timeout window makes each worker retain
+      // unbounded stdout/stderr (exhausting memory) before the 64-byte transcript cap
+      // is ever applied. On overflow spawnSync sets `out.error` (ENOBUFS), which the
+      // guard below already rejects — so the probe stays best-effort (yields null).
+      maxBuffer: 256 * 1024,
       windowsHide: true,
     });
   } catch {
@@ -8805,12 +8811,20 @@ async function workAgent(req, flags, ctx) {
   // #243: probe the agent harness CLI's own version ONCE per worker process (bounded,
   // best-effort) so the durable transcript's provenance block can attribute a run to a
   // specific harness build. Never fatal — a null result just omits the field.
-  // #257 review: only probe for HOST execution. A container job runs `sh -c` inside the
-  // selected image, so a same-named host binary would report a plausible-but-wrong
-  // version (or a host-shell failure) and misattribute the run to a different executable.
-  // Leave agentCliVersion unset for container workers rather than record a host reading.
+  // #257 review: only probe when ALL of the following hold, else omit the field:
+  //   - HOST execution (a container job runs `sh -c` inside the selected image, so a
+  //     same-named host binary would report a plausible-but-wrong version);
+  //   - AgentInstance transcripts are enabled — the probe's ONLY consumer is the
+  //     AgentInstance producer (skipped when NANO_AGENT_INSTANCE=off), so probing under
+  //     the kill-switch is pure waste and needlessly executes a possibly non-idempotent
+  //     harness with no reader;
+  //   - the profile command alone is the full invocation (no extra args). For an
+  //     interpreter-style profile (`command: 'node', args: ['agent.js']`) `command
+  //     --version` would probe the interpreter (Node's version), not the harness, and
+  //     misattribute the run — omit rather than record a wrong reading.
   let agentCliVersion = null;
-  if (!isContainer) {
+  const agentInstanceProbeOff = String(process.env.NANO_AGENT_INSTANCE || '').trim().toLowerCase() === 'off';
+  if (!isContainer && !agentInstanceProbeOff && effectiveArgs.length === 0) {
     try { agentCliVersion = probeAgentCliVersion(profile?.command); } catch { /* best effort */ }
   }
   let workerNsDir;

@@ -146,7 +146,7 @@ export const makeAgenticEndpoint = (connect: RawEmitConnect): AgenticEndpoint =>
         Effect.onInterrupt(() => Effect.sync(() => raw.close())),
       );
       if (!didOpen) {
-        raw.close();
+        yield* Effect.sync(() => raw.close());
         return yield* Effect.fail(new SupervisorError("agentic connection closed before it opened"));
       }
 

@@ -58,7 +58,7 @@ import { lookup as dnsLookup } from 'node:dns/promises';
 import * as nodeDns from 'node:dns';
 import { randomUUID, createHash, randomBytes } from 'node:crypto';
 import { homedir, platform as osPlatform, devNull, tmpdir, hostname } from 'node:os';
-import { join, isAbsolute, resolve as resolvePath, dirname, basename, sep } from 'node:path';
+import { join, isAbsolute, resolve as resolvePath, dirname, basename, sep, delimiter } from 'node:path';
 import { createRequire } from 'node:module';
 import { fileURLToPath } from 'node:url';
 import { createInterface } from 'node:readline/promises';
@@ -1769,6 +1769,19 @@ function probeAgentCliVersion(command, { timeoutMs = 1500, run = spawnSync, env 
   {
     const cmd = command.trim();
     if (/[\\/]/.test(cmd) && !isAbsolute(cmd)) return null;
+    // #257 review: a BARE PATH-resolved name is only cwd-independent if PATH itself
+    // is. If the caller-supplied env's PATH carries a RELATIVE or EMPTY entry (e.g.
+    // `.`, an empty field meaning cwd, or `./node_modules/.bin`), resolution depends
+    // on the working directory — and the probe's cwd (the WORKER's) is NOT the per-job
+    // cwd (the run dir / cloned repo) the harness is launched from — so `--version`
+    // could resolve a different executable/version than the job's. Omit rather than
+    // record a cwd-ambiguous reading. An ABSOLUTE command bypasses PATH entirely, so
+    // it is unaffected; a probe with no explicit `env` inherits `process.env` verbatim
+    // (the caller opted into that resolution) and is left untouched.
+    if (env && !isAbsolute(cmd)) {
+      const pathVar = env.PATH ?? env.Path ?? env.path ?? '';
+      if (String(pathVar).split(delimiter).some((e) => e === '' || !isAbsolute(e))) return null;
+    }
   }
   let out;
   try {
@@ -8974,8 +8987,9 @@ async function workAgent(req, flags, ctx) {
   //     interpreter-style profile (`command:'node', args:['agent.js']`) would probe the
   //     interpreter, not the harness — omit rather than misattribute.
   // The probe itself (probeAgentCliVersion) additionally refuses an embedded-argument
-  // command and runs under the SAME merged profile+setup env, so PATH resolves the real
-  // harness binary.
+  // command and runs under the WORKER-STATIC profile env (see maybeProbeAgentCliVersion
+  // for why per-job setup.env is deliberately excluded), so PATH resolves a stable
+  // representative harness binary.
   const agentInstanceProbeOff = String(process.env.NANO_AGENT_INSTANCE || '').trim().toLowerCase() === 'off';
   const sdkSupportsAgentInstance =
     !!camunda &&
@@ -8984,13 +8998,18 @@ async function workAgent(req, flags, ctx) {
   const agentCliProbeEligible =
     !isContainer && !agentInstanceProbeOff && sdkSupportsAgentInstance && effectiveArgs.length === 0;
   // #257 review: DEFER the probe until an external-agent job is actually being
-  // serviced, and run it in that job's launch context — so (a) a worker that only
-  // ever receives ordinary service jobs never runs the harness `--version` at all
-  // (no wasted startup delay / side effect), and (b) the probe env includes the
-  // per-job `setup.env` overlay (which can change PATH), matching the env the harness
-  // is spawned under in `runAgentJob`. Runs at most once per worker (cached), so the
-  // per-job hot path pays nothing after the first external activation.
-  const maybeProbeAgentCliVersion = (jobEnvelope) => {
+  // serviced — so a worker that only ever receives ordinary service jobs never runs
+  // the harness `--version` at all (no wasted startup delay / side effect). Runs at
+  // most once per worker (cached), so the per-job hot path pays nothing after the
+  // first external activation. The probe env is WORKER-STATIC — `process.env` merged
+  // with the profile `env` only, NOT the per-job `setup.env`: `agentCliProbed` is a
+  // worker-wide latch, so folding a single job's `setup.env` (which can change PATH,
+  // and thus which CLI build resolves) into the cache would leak THAT job's reading
+  // to every later job serviced by the same worker (#257). A worker-static basis makes
+  // the cached `agentCliVersion` a correct-by-construction representative reading for
+  // the profile; a job whose `setup.env` genuinely alters the resolved binary is a
+  // per-job divergence the single cached provenance reading deliberately does not chase.
+  const maybeProbeAgentCliVersion = () => {
     if (agentCliProbed || !agentCliProbeEligible) return;
     agentCliProbed = true;
     try {
@@ -8998,7 +9017,6 @@ async function workAgent(req, flags, ctx) {
         env: {
           ...process.env,
           ...normalizeEnvMap(profileEnv),
-          ...normalizeEnvMap(jobEnvelope?.setup?.env),
         },
       });
     } catch { /* best effort */ }
@@ -9506,7 +9524,18 @@ async function workAgent(req, flags, ctx) {
         // job, never on these lines).
         const aiCorr = `job ${job.jobKey} eik ${job.elementInstanceKey ?? '?'} pik ${job.processInstanceKey ?? '?'}`;
         if (!agentInstanceOff && isExternalAgentJob(job)) {
-          maybeProbeAgentCliVersion(envelope);
+          maybeProbeAgentCliVersion();
+          // #257 review: the synchronous CLI `--version` probe above can block for up
+          // to its timeout on the FIRST external activation. A force-stop/lease-loss
+          // can win that race while spawnSync is blocked, so re-check the setup-abort
+          // gate before minting the durable AgentInstance — otherwise an already-aborted
+          // run would call activate() and mint an instance/transcript that is then
+          // immediately orphaned (the post-activate gates run too late to prevent the
+          // create). Mirrors the pre-probe agent-instance gate above.
+          if (checkSetupAbort(abortSignal, { jobType, jobKey: job.jobKey, stage: 'agent-instance', logger })) {
+            if (isContainer) liveRunIds.delete(runId);
+            return;
+          }
           agentInstanceProducer = createAgentInstanceProducer({ camunda, job, profile, envelope, logger, runtimeVersion: pluginVersion, agentCliVersion });
           try {
             // `createAgentInstanceProducer` always returns an object — including a

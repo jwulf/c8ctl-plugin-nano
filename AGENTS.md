@@ -125,12 +125,16 @@ SDK client (job workers) — do **not** add the SDK as a dependency or use raw
   interpreter, not the harness) — the field is omitted rather than misattributed; the
   probe further refuses an embedded-argument/compound `command` (and a RELATIVE-path
   `command` like `./harness`, whose resolution against the worker's cwd — not the
-  per-job cwd the harness actually launches from — is ambiguous; only bare PATH names
-  and absolute paths are probed) and runs (once, cached)
-  in that first external job's launch context under the SAME merged profile+`setup.env`
-  env, so `${command} --version` can neither execute a script nor resolve
-  a different PATH binary than the real run (and a worker that only services ordinary
-  jobs never probes at all); a
+  per-job cwd the harness actually launches from — is ambiguous; a bare PATH-resolved
+  name is likewise omitted when the resolved `PATH` carries a relative/empty
+  (cwd-dependent) entry; only cwd-independent bare PATH names and absolute paths are
+  probed) and runs (once, cached)
+  under the WORKER-STATIC probe env — `process.env` merged with the profile `env`
+  only, NOT the per-job `setup.env`, since the once-per-worker cache would otherwise
+  leak one job's `setup.env`-derived reading to every later job on that worker — so
+  `${command} --version` can neither execute a script nor resolve
+  a different PATH binary than a stable representative run (and a worker that only
+  services ordinary jobs never probes at all); a
   bounded `maxBuffer` caps the capture; a probe that returns a non-zero/`error` result
   omits the field rather than record its diagnostics; `NANO_AGENT_CLI_PROBE=off`
   disables it), and `host`/`pid`

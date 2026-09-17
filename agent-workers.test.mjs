@@ -4540,6 +4540,35 @@ test('probeAgentCliVersion runs under the caller-supplied env so PATH matches th
   assert.equal(bare[0].env, undefined, 'without an explicit env the probe inherits process.env');
 });
 
+test('probeAgentCliVersion skips a bare name when the supplied env PATH is cwd-ambiguous (#257)', () => {
+  // A bare PATH-resolved name is only cwd-independent if PATH is. When the caller-
+  // supplied env's PATH carries a RELATIVE or EMPTY entry (cwd-dependent resolution),
+  // the probe's cwd (the worker's) may resolve a different binary than the job's, so
+  // omit the reading. An absolute command bypasses PATH and is unaffected.
+  for (const badPath of ['.', './node_modules/.bin', '/usr/bin:.', '/usr/bin:', ':/usr/bin', 'rel/dir']) {
+    let called = false;
+    const env = { ...process.env, PATH: badPath };
+    assert.equal(
+      probeAgentCliVersion('copilot', { run: () => { called = true; return { status: 0, stdout: '9.9.9' }; }, env }),
+      null,
+      `bare name with cwd-ambiguous PATH "${badPath}" is not probed`,
+    );
+    assert.equal(called, false, 'the spawner is never invoked when PATH resolution is cwd-ambiguous');
+  }
+  // An all-absolute PATH is unambiguous — the bare name still probes.
+  assert.equal(
+    probeAgentCliVersion('copilot', { run: () => ({ status: 0, stdout: 'copilot 7.0.0' }), env: { PATH: '/usr/local/bin:/usr/bin' } }),
+    '7.0.0',
+    'a bare name with an all-absolute PATH still probes',
+  );
+  // An ABSOLUTE command bypasses PATH entirely, so a cwd-ambiguous PATH is irrelevant.
+  assert.equal(
+    probeAgentCliVersion('/opt/bin/harness', { run: () => ({ status: 0, stdout: 'harness 8.0.0' }), env: { PATH: '.' } }),
+    '8.0.0',
+    'an absolute command probes regardless of PATH',
+  );
+});
+
 test('probeAgentCliVersion is best-effort: blank command, thrown spawn, or off-switch → null', () => {
   assert.equal(probeAgentCliVersion('', { run: () => { throw new Error('nope'); } }), null);
   assert.equal(probeAgentCliVersion('   ', { run: () => ({ stdout: '1.0.0' }) }), null);

@@ -41,6 +41,7 @@ import {
   agenticStateForTarget,
   normalizeAgenticMessage,
   buildActivityPayload,
+  activityMarkerReadyFor,
   supervisorWorkerActivityFile,
   WORK_FORWARD_FLAGS,
 } from './c8ctl-plugin.js';
@@ -1033,6 +1034,20 @@ test('buildActivityPayload carries engine + agentic and derives busy from jobs',
   assert.equal(noJobs.readyAt, null, 'readyAt defaults to null (not-yet-ready)');
   const ready = buildActivityPayload({ pid: 1, updatedAt: 3, jobs: [], engine: 'e', agentic: { status: 'off' }, readyAt: 4242 });
   assert.equal(ready.readyAt, 4242, 'a stamped readyAt rides through untouched');
+});
+
+test('activityMarkerReadyFor: a marker is ready only with a finite readyAt AND a matching pid (#253)', () => {
+  // Happy path: this child's marker, stamped ready.
+  assert.equal(activityMarkerReadyFor({ pid: 4242, readyAt: 100 }, 4242), true);
+  // Not-yet-ready: no readyAt (activation loop hasn't reported in).
+  assert.equal(activityMarkerReadyFor({ pid: 4242, readyAt: null }, 4242), false);
+  assert.equal(activityMarkerReadyFor({ pid: 4242 }, 4242), false);
+  // Stale marker: a readyAt from a PREVIOUS incarnation (foreign pid) must NOT
+  // satisfy the gate for the freshly spawned replacement — the core of the fix.
+  assert.equal(activityMarkerReadyFor({ pid: 999999, readyAt: 100 }, 4242), false);
+  // A non-finite readyAt is never ready; a missing marker is never ready.
+  assert.equal(activityMarkerReadyFor({ pid: 4242, readyAt: NaN }, 4242), false);
+  assert.equal(activityMarkerReadyFor(null, 4242), false);
 });
 
 test('supervisorStatusSignature changes when the polled engine changes', () => {

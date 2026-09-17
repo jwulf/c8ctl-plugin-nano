@@ -53,6 +53,48 @@ test("end-to-end: a job is activated, its worker claimed, winner extended, agent
   );
 });
 
+test("onFirstActivation fires exactly once at loop entry, before the first activation poll resolves (#253 readiness handshake)", async () => {
+  await Effect.runPromise(
+    Effect.gen(function* () {
+      // A very slow long-poll: if readiness were tied to the first tick COMPLETING,
+      // it would be delayed for the whole poll window. The handshake must fire on
+      // loop entry, BEFORE the poll, so a real replacement reports ready promptly.
+      const engine = makeEngine({
+        activate: activateAfter({ x: { job: job("Jx", "x"), delayMs: 50_000 } }),
+      });
+      const runner = makeRunner(1_000);
+      const reg = yield* makeRegistry();
+      yield* reg.add("w1", ["x"], 1);
+      const reader = makeReader([[]], {});
+
+      let fired = 0;
+      const sup = yield* makeSupervisor({
+        engine,
+        runner,
+        registry: reg,
+        reconcileReader: reader,
+        scan,
+        logger: noopLogger,
+        onFirstActivation: Effect.sync(() => { fired += 1; }),
+        config: { idleSpacingMs: 1_000, activation: { requestTimeoutMs: 60_000, initialLockMs: 15_000, emptyPollBackoffMs: 0, maxBatchPerType: 10 } },
+      });
+
+      const fiber = yield* Effect.forkChild(sup.run);
+      // Let the fiber reach loop entry (reconcile/presence forked) but NOT let the
+      // 50s long-poll resolve — readiness must already be stamped by now.
+      yield* TestClock.adjust(Duration.millis(1));
+      assert.equal(fired, 1, "readiness fired at loop entry, before the long-poll resolved");
+
+      // Drive many further ticks: it is a one-shot handshake, never re-fired.
+      yield* TestClock.adjust(Duration.millis(120_000));
+      assert.equal(fired, 1, "onFirstActivation is a one-shot handshake");
+
+      yield* Fiber.interrupt(fiber);
+    }).pipe(Effect.provide(TestClock.layer())),
+  );
+});
+
+
 test("reconcile wiring: an --auto worker's serviceable types are published from the cached crawl", async () => {
   await Effect.runPromise(
     Effect.gen(function* () {

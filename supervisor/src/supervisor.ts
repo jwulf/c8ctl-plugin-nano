@@ -98,6 +98,18 @@ export interface SupervisorDeps {
   readonly agenticEndpoint?: AgenticEndpoint;
   readonly agenticConfig?: AgenticConfig;
   readonly config?: Partial<SupervisorConfig>;
+  /**
+   * Fired ONCE, on the runtime fiber, the instant the activation loop is about to
+   * begin leasing — after reconcile/presence are forked and (under agentic) the
+   * connection is established. The plugin uses this as its readiness handshake for
+   * rolling reload (#253): a bare `Effect.runFork(run)` only *schedules* this
+   * fiber and may return before it has executed at all, so stamping readiness in
+   * the JS caller's continuation can report a replacement ready before it is
+   * serving. Firing from here runs on the fiber itself, so it cannot. It fires
+   * BEFORE the first `tick` because the first activation poll can block for the
+   * whole long-poll window. Best-effort — never fails the loop.
+   */
+  readonly onFirstActivation?: Effect.Effect<void>;
 }
 
 export interface Supervisor {
@@ -256,6 +268,13 @@ export const makeSupervisor = (deps: SupervisorDeps): Effect.Effect<Supervisor> 
       if (deps.agenticEndpoint) {
         yield* Effect.forkChild(projectPresence(ownership, presenceSink, presenceKnownRef, cfg.presence));
       }
+      // The activation loop is about to run ON this fiber — imports and the SDK
+      // client were built before `runFork`, reconcile/presence are forked, and
+      // (under agentic) the connection is established. Fire the readiness handshake
+      // once here so the plugin stamps readiness only when the runtime is genuinely
+      // serving, not merely scheduled (#253). Must precede the first `tick`: the
+      // first activation poll can block for the whole long-poll window.
+      if (deps.onFirstActivation) yield* deps.onFirstActivation;
       return yield* tick.pipe(Effect.forever);
     });
 

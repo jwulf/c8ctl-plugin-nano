@@ -220,5 +220,6 @@ export const makeSupervisorDeps = (input: SupervisorDepsInput): SupervisorDepsIn
   if (input.agenticEndpoint !== undefined) deps.agenticEndpoint = input.agenticEndpoint;
   if (input.agenticConfig !== undefined) deps.agenticConfig = input.agenticConfig;
   if (input.config !== undefined) deps.config = input.config;
+  if (input.onFirstActivation !== undefined) deps.onFirstActivation = input.onFirstActivation;
   return deps;
 };

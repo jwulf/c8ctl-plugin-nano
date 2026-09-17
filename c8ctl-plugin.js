@@ -339,6 +339,19 @@ function readWorkerActivity(id) {
 }
 
 /**
+ * Whether an activity marker proves a specific child (`pid`) is up and leasing.
+ * Both conditions are required (#253): a finite `readyAt` (the runtime's
+ * first-activation handshake fired) AND `act.pid === pid` (the marker belongs to
+ * THIS child, not a stale one a failed best-effort delete left behind from a
+ * previous incarnation — which would otherwise let the rolling reload advance
+ * before the fresh replacement has actually reported ready). Pure so it can be
+ * unit-tested directly.
+ */
+function activityMarkerReadyFor(act, pid) {
+  return !!(act && act.pid === pid && Number.isFinite(act.readyAt));
+}
+
+/**
  * Deterministic control-socket path shared by the daemon and every client.
  * Derived from a hash of the (possibly overridden) state home so distinct
  * C8CTL_NANO_HOME instances get distinct sockets, and kept SHORT to stay under
@@ -3504,6 +3517,11 @@ async function createSupervisorDeps(opts = {}) {
     config,
     fetchImpl,
     env = process.env,
+    // A plain JS thunk (Effect-free, monolith-supplied) fired ONCE when the
+    // activation loop begins leasing — lifted below into the runtime's
+    // `onFirstActivation` Effect. Used as the rolling-reload readiness handshake
+    // (#253): stamping readiness only when the runtime is actually serving.
+    onFirstActivation,
   } = opts;
   if (!runner || typeof runner.run !== 'function') {
     throw new TypeError('createSupervisorDeps: `runner` must be a raw job runner `{ run(job): Promise<void> }`');
@@ -3512,7 +3530,6 @@ async function createSupervisorDeps(opts = {}) {
   const rt = await loadSupervisorRuntime();
   const { demand } = await import('./agentic.mjs');
   const { createRawEngineClient } = await import('./supervisor-engine.mjs');
-
   // Base/auth: the single canonical worker-engine chain (explicit restConfig →
   // profile restAddress → localhost), ALWAYS run through the token same-origin
   // gate — even when a caller pins the base via `restConfig` — so token
@@ -3576,6 +3593,11 @@ async function createSupervisorDeps(opts = {}) {
     agenticEndpoint,
     agenticConfig,
     config: scope ? { ...config, scope } : config,
+    // Lift the plain readiness thunk into an Effect the runtime runs on its own
+    // fiber the instant it starts leasing (#253). Effect-free JS in, Effect out —
+    // the same "monolith supplies plain JS, TS lifts it" seam as the other ports.
+    onFirstActivation:
+      typeof onFirstActivation === 'function' ? rt.Effect.sync(onFirstActivation) : undefined,
   });
 
   // The `settle` seam (issue #156, escalation answer (a)): the runner settles a
@@ -10039,6 +10061,14 @@ async function workAgent(req, flags, ctx) {
     // agentic target didn't resolve to a connect — the runtime then runs with no
     // agentic scope and presence/steer degrade to no-ops.
     agenticEndpoint: agenticEndpoint || undefined,
+    // Readiness handshake (#253): the runtime fires this the instant its activation
+    // loop begins leasing (on its OWN fiber, after reconcile/presence are forked
+    // and — under agentic — the connection is established). Stamp `readyAt` on the
+    // activity marker here so the supervisor's rolling `reload` waits for THIS
+    // replacement to be genuinely serving before draining the next worker. A bare
+    // `runFork` return (which only schedules the fiber) is NOT readiness.
+    // Best-effort — a marker write never fails the worker.
+    onFirstActivation: () => { readyAt = Date.now(); writeActivity(); },
     config: {
       activation: { requestTimeoutMs: pollTimeoutMs },
       dispatch: { recoveryWindowMs, extendIntervalMs: lockExtendIntervalMs },
@@ -10066,14 +10096,11 @@ async function workAgent(req, flags, ctx) {
   const supervisor = await SupervisorEffect.runPromise(makeSupervisorRuntime(supervisorDeps));
   const supervisorFiber = SupervisorEffect.runFork(supervisor.run);
 
-  // Readiness handshake (Copilot review on #253): the activation loop is now
-  // running — this worker has finished importing, built its SDK client, and begun
-  // leasing jobs. Stamp `readyAt` on the activity marker so the supervisor's
-  // rolling `reload` waits for THIS replacement to be serving before it drains the
-  // next worker, keeping the roll genuinely one-at-a-time (a spawn/PID alone is
-  // not readiness). Best-effort — a marker write never fails the worker.
-  readyAt = Date.now();
-  writeActivity();
+  // Readiness is stamped by the runtime's `onFirstActivation` handshake (wired
+  // into `createSupervisorDeps` above), NOT here: `runFork` only *schedules* the
+  // fiber and can return before it has executed at all, so stamping `readyAt`
+  // in this continuation could report the worker ready before its activation loop
+  // is leasing — defeating the rolling reload's one-at-a-time guarantee (#253).
 
   // Seed this worker's presence into the runtime's ownership registry (issue
   // #173) and late-bind the per-job relay seam to the running supervisor. The
@@ -11547,7 +11574,11 @@ async function runSupervisorDaemon() {
       if (w.child !== child) return false;
       if (child.exitCode !== null || child.signalCode !== null) return false;
       const act = readWorkerActivity(w.id);
-      if (act && Number.isFinite(act.readyAt)) return true;
+      // Require the marker to be from THIS replacement child (`act.pid === child.pid`)
+      // AND carry a finite `readyAt` (#253): a stale marker left by a previous
+      // incarnation must not pass this gate before the freshly spawned child has
+      // reported ready — see activityMarkerReadyFor.
+      if (activityMarkerReadyFor(act, child.pid)) return true;
       if (shuttingDown || Date.now() >= deadline) {
         dlog(`worker '${w.id}' not ready within ${timeoutMs}ms after reload — advancing anyway`);
         return false;
@@ -15959,6 +15990,7 @@ export {
   agenticStateForTarget,
   normalizeAgenticMessage,
   buildActivityPayload,
+  activityMarkerReadyFor,
   supervisorWorkerActivityFile,
   WORK_FORWARD_FLAGS,
   installParentDeathWatchdog,

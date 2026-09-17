@@ -10062,8 +10062,10 @@ async function workAgent(req, flags, ctx) {
     // agentic scope and presence/steer degrade to no-ops.
     agenticEndpoint: agenticEndpoint || undefined,
     // Readiness handshake (#253): the runtime fires this the instant its activation
-    // loop begins leasing (on its OWN fiber, after reconcile/presence are forked
-    // and — under agentic — the connection is established). Stamp `readyAt` on the
+    // loop begins leasing (on its OWN fiber, after reconcile/presence are forked;
+    // under agentic the connect cycle is a concurrent child, so the connection may
+    // still be connecting — readiness is LEASING-gated, not connection-gated). Stamp
+    // `readyAt` on the
     // activity marker here so the supervisor's rolling `reload` waits for THIS
     // replacement to be genuinely serving before draining the next worker. A bare
     // `runFork` return (which only schedules the fiber) is NOT readiness.
@@ -12002,11 +12004,19 @@ async function runSupervisorDaemon() {
     return Number.isFinite(n) && n >= 0 ? Math.floor(n) : SUPERVISOR_MONITOR_INTERVAL_MS;
   })();
   if (monitorMs > 0) {
-    lastMonitorSig = supervisorStatusSignature([...workers.values()].map(workerPublic));
+    // Fold the on-disk plugin version into the monitor signature so a `nano update`
+    // that changes ONLY the on-disk package (no worker transition) still repaints
+    // attached consoles with the new version + `supervisor reload` hint (#253
+    // review). The worker-field signature alone never changes on a version-only
+    // bump, so an idle fleet would otherwise hide an available reload until an
+    // unrelated worker transition or a manual `status`.
+    const monitorSignature = (pub) =>
+      `${supervisorStatusSignature(pub)}\u0000${(() => { try { return pluginPackage().version; } catch { return daemonVersion; } })()}`;
+    lastMonitorSig = monitorSignature([...workers.values()].map(workerPublic));
     monitorTimer = setInterval(() => {
       if (shuttingDown) return;
       const pub = [...workers.values()].map(workerPublic);
-      const sig = supervisorStatusSignature(pub);
+      const sig = monitorSignature(pub);
       const changed = sig !== lastMonitorSig;
       lastMonitorSig = sig;
       if (changed && attachClients.size > 0) broadcast(statusFrame(false, pub));

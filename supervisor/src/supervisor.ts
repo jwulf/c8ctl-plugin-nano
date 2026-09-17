@@ -100,8 +100,13 @@ export interface SupervisorDeps {
   readonly config?: Partial<SupervisorConfig>;
   /**
    * Fired ONCE, on the runtime fiber, the instant the activation loop is about to
-   * begin leasing — after reconcile/presence are forked and (under agentic) the
-   * connection is established. The plugin uses this as its readiness handshake for
+   * begin leasing — after reconcile/presence are forked. Readiness is gated on
+   * LEASING, NOT on the agentic connection: under agentic, `superviseAgentic`
+   * forks the connect→establish cycle as a CHILD fiber and runs this loop
+   * concurrently, so the agentic handle may still be connecting when this fires
+   * (see the run-site comment). That is deliberate — the leasing loop does not
+   * depend on the connection, so a rolling reload needs only "the replacement is
+   * leasing". The plugin uses this as its readiness handshake for
    * rolling reload (#253): a bare `Effect.runFork(run)` only *schedules* this
    * fiber and may return before it has executed at all, so stamping readiness in
    * the JS caller's continuation can report a replacement ready before it is

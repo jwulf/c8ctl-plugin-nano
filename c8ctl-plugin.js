@@ -8855,9 +8855,11 @@ async function workAgent(req, flags, ctx) {
   // (bounded, best-effort) so the durable transcript's provenance block can attribute
   // a run to a specific harness build. The probe is DEFERRED until the FIRST
   // external-agent activation (its only consumer is the AgentInstance producer), so a
-  // worker that only services ordinary jobs never runs the harness `--version`, and
-  // the probe sees that job's launch context (setup.env). Never fatal — a null result
-  // just omits the field. `agentCliProbed` latches the once-only semantics.
+  // worker that only services ordinary jobs never runs the harness `--version`. The
+  // probe env is WORKER-STATIC — `process.env` merged with the profile `env` only,
+  // NOT the per-job `setup.env` — so the once-per-worker cache can't leak one job's
+  // setup-derived reading to later jobs (#257). Never fatal — a null result just omits
+  // the field. `agentCliProbed` latches the once-only semantics.
   let agentCliVersion = null;
   let agentCliProbed = false;
   let workerNsDir;

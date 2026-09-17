@@ -19,6 +19,8 @@
 // append an AgentInstance must NEVER crash the harness or change `job.complete`
 // behaviour — the AgentInstance lifecycle is orthogonal to job completion.
 
+import { hostname } from 'node:os';
+
 import { sessionAcp as defaultSessionAcp } from './agentic.mjs';
 
 // The two AgentInstance surfaces we call on the host SDK client. A client missing
@@ -296,6 +298,49 @@ export function deriveAgentDefinition({ profile, envelope } = {}) {
   return { model, provider, systemPrompt };
 }
 
+// #243: marker discriminating the provenance blob inside a CONFIGURATION turn's
+// `content[]` from an ordinary message/tool OBJECT block. Versioned so a consumer can
+// evolve the shape without ambiguity.
+export const PROVENANCE_KIND = 'nanobpm.provenance/v1';
+
+/**
+ * #243: build the parity-safe provenance content block for the opening CONFIGURATION
+ * turn.
+ *
+ * Camunda's AgentInstance schema pins the CONFIGURATION `definition` to
+ * model/provider/systemPrompt (no metadata/attributes field), and nanobpmn promises
+ * parity — so producer-invented top-level fields are off-limits. BUT a history item's
+ * `content[]` is a discriminated union that already includes an `OBJECT` variant
+ * (`{ contentType: 'OBJECT', object: <arbitrary JSON> }`) — the SAME shape the producer
+ * already emits for a structured tool result (`contentForResult`). Ride it to attribute
+ * a run to the agent harness (`agentName`), the nano runtime (`runtimeVersion` — the
+ * plugin `package.json` version, which is one and the same as the nano supervisor
+ * version), and, best-effort, the underlying agent CLI (`agentCliVersion`), WITHOUT
+ * diverging from the Camunda API.
+ *
+ * Returns `null` when no substantive identity field is present, so a bare `host`/`pid`
+ * (diagnostics only) never emits a noisy content block.
+ *
+ * @param {object} [p]
+ * @param {object} [p.profile]         Worker profile (`name` → `agentName`).
+ * @param {string} [p.runtimeVersion]  Nano plugin/supervisor version (`pluginVersion`).
+ * @param {string} [p.agentCliVersion] Best-effort underlying-CLI version (may be blank).
+ * @param {string} [p.host]            Host name (diagnostic).
+ * @param {number} [p.pid]             Worker pid (diagnostic).
+ * @returns {{ contentType: 'OBJECT', object: object } | null}
+ */
+export function buildProvenanceContent({ profile, runtimeVersion, agentCliVersion, host, pid } = {}) {
+  const object = { kind: PROVENANCE_KIND };
+  if (isNonBlank(profile?.name)) object.agentName = String(profile.name);
+  if (isNonBlank(runtimeVersion)) object.runtimeVersion = String(runtimeVersion);
+  if (isNonBlank(agentCliVersion)) object.agentCliVersion = String(agentCliVersion);
+  if (isNonBlank(host)) object.host = String(host);
+  if (Number.isInteger(pid) && pid > 0) object.pid = pid;
+  // Only agent/runtime identity justifies a block; host/pid alone are diagnostics.
+  if (!(object.agentName || object.runtimeVersion || object.agentCliVersion)) return null;
+  return { contentType: 'OBJECT', object };
+}
+
 // Map the ACP classifier's message role to the AgentHistory role enum. ACP has no
 // distinct REASONING role, so a `reasoning` chunk folds into ASSISTANT.
 function historyRole(acpRole) {
@@ -396,6 +441,15 @@ export function createAgentInstanceProducer(opts = {}) {
     logger = console,
     now = () => Date.now(),
     sessionAcp = defaultSessionAcp,
+    // #243: durable-transcript provenance for the opening CONFIGURATION turn. The nano
+    // runtime version (== the supervisor version) and the agent harness name/CLI version
+    // ride a parity-safe OBJECT content block (see `buildProvenanceContent`). All are
+    // best-effort/optional — a blank value simply omits its field, and if none are
+    // present no provenance block is emitted. `host`/`pid` default to this process.
+    runtimeVersion = '',
+    agentCliVersion = '',
+    host = hostname(),
+    pid = process.pid,
     createRetryBaseMs = DEFAULT_CREATE_RETRY_BASE_MS,
     createRetryMaxMs = DEFAULT_CREATE_RETRY_MAX_MS,
     preMintBufferMax = DEFAULT_PRE_MINT_BUFFER_MAX,
@@ -743,11 +797,17 @@ export function createAgentInstanceProducer(opts = {}) {
   // Build the opening CONFIGURATION turn from the concrete runtime definition.
   const buildConfigTurn = () => {
     const def = deriveAgentDefinition({ profile, envelope });
+    // #243: a parity-safe provenance OBJECT (agent name, nano runtime/supervisor
+    // version, best-effort agent-CLI version) rides the CONFIGURATION turn's content[]
+    // — the same OBJECT content variant the producer already emits for tool results —
+    // so no field is invented on the Camunda-pinned CONFIGURATION definition. Omitted
+    // entirely when no substantive identity is available.
+    const provenance = buildProvenanceContent({ profile, runtimeVersion, agentCliVersion, host, pid });
     const configTurn = {
       historyItemId: `configuration:${elementInstanceKey}`,
       loopIteration: 1,
       role: 'CONFIGURATION',
-      content: [],
+      content: provenance ? [provenance] : [],
       producedAt: iso(),
       model: def.model,
       provider: def.provider,

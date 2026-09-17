@@ -105,6 +105,42 @@ SDK client (job workers) — do **not** add the SDK as a dependency or use raw
   through to the legacy cold rerun (`effectiveEnvelope === envelope`). The prompt
   seed is the only change — repository/setup are untouched, and the AgentInstance
   producer still records the ORIGINAL system prompt.
+- **Transcript provenance (issue #243, `agent-instance.mjs`).** The opening
+  `CONFIGURATION` turn already carries `model`/`provider`/`systemPrompt`/`limits`.
+  Camunda pins that `definition` shape and nanobpmn promises **parity**, so we do
+  NOT invent top-level fields; instead `buildProvenanceContent` rides the turn's
+  `content[]` — the same `{ contentType:'OBJECT', object }` variant the producer
+  already emits for structured tool results — with a marked
+  (`kind:'nanobpm.provenance/v1'`) blob: `agentName` (profile name), `runtimeVersion`
+  (the plugin `package.json` version == the nano **supervisor** version), best-effort
+  `agentCliVersion` (a bounded, once-per-worker `probeAgentCliVersion` of the harness
+  `command --version` — HOST execution only, since a container job runs the harness
+  inside its image where a same-named host binary would misattribute the version, so
+  container workers leave it unset; skipped too when the `NANO_AGENT_INSTANCE=off`
+  kill-switch is set (the probe's only consumer is the AgentInstance producer), when
+  the host SDK client lacks `createAgentInstance`/`updateAgentInstance` (the producer
+  then degrades to a disabled facade, so probing is pure waste — the probe is deferred
+  until the FIRST external-agent activation and gated on that capability), or when
+  the profile carries extra args (an interpreter-style `node agent.js` would probe the
+  interpreter, not the harness) — the field is omitted rather than misattributed; the
+  probe further refuses an embedded-argument/compound `command` (and a RELATIVE-path
+  `command` like `./harness`, whose resolution against the worker's cwd — not the
+  per-job cwd the harness actually launches from — is ambiguous; a bare PATH-resolved
+  name is likewise omitted when the resolved `PATH` carries a relative/empty
+  (cwd-dependent) entry; only cwd-independent bare PATH names and absolute paths are
+  probed) and runs (once, cached)
+  under the WORKER-STATIC probe env — `process.env` merged with the profile `env`
+  only, NOT the per-job `setup.env`, since the once-per-worker cache would otherwise
+  leak one job's `setup.env`-derived reading to every later job on that worker — so
+  `${command} --version` can neither execute a script nor resolve
+  a different PATH binary than a stable representative run (and a worker that only
+  services ordinary jobs never probes at all); a
+  bounded `maxBuffer` caps the capture; a probe that returns a non-zero/`error` result
+  omits the field rather than record its diagnostics; `NANO_AGENT_CLI_PROBE=off`
+  disables it), and `host`/`pid`
+  diagnostics. All optional: a turn with no substantive identity emits no block, so
+  the wire is byte-unchanged for a bare run. A first-class typed field would need a
+  **generic** upstream Camunda extension (an `attributes` map), tracked in #243.
 
 ## Worker supervisor (`supervisor`)
 

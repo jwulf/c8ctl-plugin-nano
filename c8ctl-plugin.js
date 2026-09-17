@@ -58,7 +58,7 @@ import { lookup as dnsLookup } from 'node:dns/promises';
 import * as nodeDns from 'node:dns';
 import { randomUUID, createHash, randomBytes } from 'node:crypto';
 import { homedir, platform as osPlatform, devNull, tmpdir, hostname } from 'node:os';
-import { join, isAbsolute, resolve as resolvePath, dirname, basename, sep } from 'node:path';
+import { join, isAbsolute, resolve as resolvePath, dirname, basename, sep, delimiter } from 'node:path';
 import { createRequire } from 'node:module';
 import { fileURLToPath } from 'node:url';
 import { createInterface } from 'node:readline/promises';
@@ -1719,6 +1719,104 @@ function buildAgentCommandLine(command, args) {
   const list = normalizeArgList(args);
   if (list.length === 0) return command;
   return `${command} ${list.map(shQuote).join(' ')}`;
+}
+
+// #243: extract a plausible version token from an agent CLI's `--version` output for
+// the durable transcript's provenance block. Prefers a semver-ish token, else the
+// first non-empty line; length-capped so a chatty (or adversarial) harness can't bloat
+// the transcript. Returns null when nothing usable is present.
+export function extractVersionToken(text) {
+  const s = String(text || '');
+  const semver = s.match(/\bv?\d+\.\d+(?:\.\d+)?(?:[-+][0-9A-Za-z.-]+)?\b/);
+  if (semver) return semver[0].slice(0, 64);
+  const firstLine = s.split(/\r?\n/).map((l) => l.trim()).find((l) => l.length > 0);
+  return firstLine ? firstLine.slice(0, 64) : null;
+}
+
+// #243: best-effort probe of an agent harness CLI's OWN version (distinct from the nano
+// plugin/supervisor version), for the durable transcript's provenance block. Runs
+// `<command> --version` through a shell (PATH resolution, mirroring how the harness is
+// spawned) with a hard timeout + SIGKILL and stdin closed so an interactive harness
+// gets EOF and exits rather than hanging. Restricted to a BARE single executable and run
+// under the caller-supplied `env` (the merged profile env) so it can neither run an
+// embedded-argument command nor resolve a different PATH binary than the real run
+// (#257). ENTIRELY best-effort: any failure, timeout, non-zero exit with no version-ish
+// output, an embedded/compound command, or unrecognizable output yields null (the field
+// is simply omitted). Meant to be called ONCE per worker process (the command is fixed
+// per profile), so it never taxes the activation hot path. Disable via
+// NANO_AGENT_CLI_PROBE=off. The spawner is injected for deterministic testing.
+function probeAgentCliVersion(command, { timeoutMs = 1500, run = spawnSync, env = undefined } = {}) {
+  if (typeof command !== 'string' || command.trim() === '') return null;
+  if (String(process.env.NANO_AGENT_CLI_PROBE || '').trim().toLowerCase() === 'off') return null;
+  // #257 review: only probe a BARE single executable. `buildAgentCommandLine`
+  // preserves an embedded-argument `command` verbatim when structured args are
+  // empty (e.g. `command: "node agent.js"`), so `${command} --version` would run
+  // that script/compound command — probing the interpreter or a wholly different
+  // program — and persist a false `agentCliVersion`. A token carrying whitespace or
+  // shell metacharacters is not a bare executable: omit the probe rather than
+  // record a wrong (or side-effecting) reading. A plain path token (with / \ : . _ -)
+  // is still allowed so an absolute harness path probes normally.
+  if (!/^[\w./\\:+-]+$/.test(command.trim())) return null;
+  // #257 review: SKIP a RELATIVE path command (a token carrying a path separator
+  // that is not absolute, e.g. `./harness`, `../bin/tool`, `sub/dir/cmd`). Unlike a
+  // bare PATH-resolved name (cwd-independent) or an absolute path (fully determined),
+  // a relative path resolves against the probe's cwd — which is the WORKER's cwd, NOT
+  // the per-job `cwd` (a fresh run dir / cloned repo) the harness is actually launched
+  // from in `runAgentJob`. Probing `./harness` here could read a different file/version
+  // than the command the job runs (or find nothing where the job would), persisting a
+  // false/omitted `agentCliVersion`. Best-effort: omit rather than record a wrong
+  // reading for a command whose resolution is cwd-ambiguous.
+  {
+    const cmd = command.trim();
+    if (/[\\/]/.test(cmd) && !isAbsolute(cmd)) return null;
+    // #257 review: a BARE PATH-resolved name is only cwd-independent if PATH itself
+    // is. If the caller-supplied env's PATH carries a RELATIVE or EMPTY entry (e.g.
+    // `.`, an empty field meaning cwd, or `./node_modules/.bin`), resolution depends
+    // on the working directory — and the probe's cwd (the WORKER's) is NOT the per-job
+    // cwd (the run dir / cloned repo) the harness is launched from — so `--version`
+    // could resolve a different executable/version than the job's. Omit rather than
+    // record a cwd-ambiguous reading. An ABSOLUTE command bypasses PATH entirely, so
+    // it is unaffected; a probe with no explicit `env` inherits `process.env` verbatim
+    // (the caller opted into that resolution) and is left untouched.
+    if (env && !isAbsolute(cmd)) {
+      const pathVar = env.PATH ?? env.Path ?? env.path ?? '';
+      if (String(pathVar).split(delimiter).some((e) => e === '' || !isAbsolute(e))) return null;
+    }
+  }
+  let out;
+  try {
+    out = run(`${command} --version`, {
+      shell: true,
+      timeout: timeoutMs,
+      killSignal: 'SIGKILL',
+      encoding: 'utf8',
+      stdio: ['ignore', 'pipe', 'pipe'],
+      // #257 review: run the probe under the SAME environment the harness will run
+      // under (the profile env merged over the host env), so PATH resolution matches
+      // the real invocation and the probe can't resolve a different binary than the
+      // one the job will spawn. Undefined inherits `process.env` (spawnSync default).
+      ...(env ? { env } : {}),
+      // #257 review: cap the captured output. Without a finite maxBuffer a harness
+      // that streams continuously during the timeout window makes each worker retain
+      // unbounded stdout/stderr (exhausting memory) before the 64-byte transcript cap
+      // is ever applied. On overflow spawnSync sets `out.error` (ENOBUFS), which the
+      // guard below already rejects — so the probe stays best-effort (yields null).
+      maxBuffer: 256 * 1024,
+      windowsHide: true,
+    });
+  } catch {
+    return null;
+  }
+  if (!out) return null;
+  // #257 review: spawnSync does NOT throw for a normal shell failure or timeout —
+  // with `shell: true` it returns a result carrying `error` (spawn failure /
+  // ETIMEDOUT) and/or a non-zero/null exit `status`, alongside diagnostic text on
+  // stderr (e.g. `/bin/sh: <cmd>: not found`) or a partial capture. Feeding that to
+  // extractVersionToken (whose fallback accepts the first non-empty line) would
+  // persist the error banner as a bogus `agentCliVersion`. Trust only a clean exit
+  // (no `error`, status 0); anything else omits the field.
+  if (out.error || out.status !== 0) return null;
+  return extractVersionToken(`${out.stdout || ''}\n${out.stderr || ''}`);
 }
 
 // A worker job-type token: rank/capability tokens use `:` (rank↔cap) and `+`
@@ -8753,6 +8851,17 @@ async function workAgent(req, flags, ctx) {
   const workerPidStart = pidStartToken(process.pid);
   let pluginVersion = null;
   try { pluginVersion = JSON.parse(readFileSync(join(pluginDir, 'package.json'), 'utf-8')).version ?? null; } catch { /* best effort */ }
+  // #243: the agent harness CLI's own version is probed ONCE per worker process
+  // (bounded, best-effort) so the durable transcript's provenance block can attribute
+  // a run to a specific harness build. The probe is DEFERRED until the FIRST
+  // external-agent activation (its only consumer is the AgentInstance producer), so a
+  // worker that only services ordinary jobs never runs the harness `--version`. The
+  // probe env is WORKER-STATIC — `process.env` merged with the profile `env` only,
+  // NOT the per-job `setup.env` — so the once-per-worker cache can't leak one job's
+  // setup-derived reading to later jobs (#257). Never fatal — a null result just omits
+  // the field. `agentCliProbed` latches the once-only semantics.
+  let agentCliVersion = null;
+  let agentCliProbed = false;
   let workerNsDir;
   try {
     ({ nsDir: workerNsDir } = allocateWorkerNamespace({
@@ -8863,6 +8972,66 @@ async function workAgent(req, flags, ctx) {
   // callers (undefined) fall back to createClient(undefined), which resolves the
   // active profile itself — identical to the old no-arg behaviour.
   const camunda = globalThis.c8ctl.createClient(resolveConnectionProfile(ctx));
+
+  // #243/#257: precompute the job-independent gates for the harness `--version`
+  // probe (the probe itself is DEFERRED to the first external-agent activation
+  // below — see maybeProbeAgentCliVersion). The probe only yields a consumable
+  // reading when:
+  //   - HOST execution (a container job runs `sh -c` inside the selected image, so a
+  //     same-named host binary would report a plausible-but-wrong version);
+  //   - the AgentInstance kill-switch is not set (NANO_AGENT_INSTANCE=off disables the
+  //     producer — the probe's only consumer — so probing would needlessly run a
+  //     possibly non-idempotent harness with no reader);
+  //   - the host SDK actually supports AgentInstance (create/update). The producer
+  //     degrades to a disabled facade for older clients, so probing under such a client
+  //     is pure waste + an unnecessary side effect (Copilot review, #257);
+  //   - the ACP classifier is available. `createAgentInstanceProducer` is ALSO inert
+  //     (the `usable` gate requires `classifyUpdate`) when the agentic classifier is
+  //     missing, even with a create/update-capable SDK — so probing would run the
+  //     harness `--version` for a producer that can never mint a transcript to consume
+  //     it. Mirror that precondition here so the probe stays side-effect-free whenever
+  //     the producer is disabled (Copilot review, #257);
+  //   - the profile command alone is the full invocation (no extra args). An
+  //     interpreter-style profile (`command:'node', args:['agent.js']`) would probe the
+  //     interpreter, not the harness — omit rather than misattribute.
+  // The probe itself (probeAgentCliVersion) additionally refuses an embedded-argument
+  // command and runs under the WORKER-STATIC profile env (see maybeProbeAgentCliVersion
+  // for why per-job setup.env is deliberately excluded), so PATH resolves a stable
+  // representative harness binary.
+  const agentInstanceProbeOff = String(process.env.NANO_AGENT_INSTANCE || '').trim().toLowerCase() === 'off';
+  const sdkSupportsAgentInstance =
+    !!camunda &&
+    typeof camunda.createAgentInstance === 'function' &&
+    typeof camunda.updateAgentInstance === 'function';
+  // The producer's `usable` gate also requires the ACP classifier (agent-instance.mjs);
+  // without it the producer is inert regardless of SDK support, so exclude the probe too.
+  const acpClassifierAvailable = typeof agenticSessionAcp?.classifyUpdate === 'function';
+  const agentCliProbeEligible =
+    !isContainer && !agentInstanceProbeOff && sdkSupportsAgentInstance && acpClassifierAvailable && effectiveArgs.length === 0;
+  // #257 review: DEFER the probe until an external-agent job is actually being
+  // serviced — so a worker that only ever receives ordinary service jobs never runs
+  // the harness `--version` at all (no wasted startup delay / side effect). Runs at
+  // most once per worker (cached), so the per-job hot path pays nothing after the
+  // first external activation. The probe env is WORKER-STATIC — `process.env` merged
+  // with the profile `env` only, NOT the per-job `setup.env`: `agentCliProbed` is a
+  // worker-wide latch, so folding a single job's `setup.env` (which can change PATH,
+  // and thus which CLI build resolves) into the cache would leak THAT job's reading
+  // to every later job serviced by the same worker (#257). A worker-static basis makes
+  // the cached `agentCliVersion` a correct-by-construction representative reading for
+  // the profile; a job whose `setup.env` genuinely alters the resolved binary is a
+  // per-job divergence the single cached provenance reading deliberately does not chase.
+  const maybeProbeAgentCliVersion = () => {
+    if (agentCliProbed || !agentCliProbeEligible) return;
+    agentCliProbed = true;
+    try {
+      agentCliVersion = probeAgentCliVersion(profile?.command, {
+        env: {
+          ...process.env,
+          ...normalizeEnvMap(profileEnv),
+        },
+      });
+    } catch { /* best effort */ }
+  };
 
   // Broker REST endpoint for live linked-resource prompts (issue #63) and the
   // C8 REST source for `--auto`'s engine-read enrolment. Derived from the SAME
@@ -9366,7 +9535,19 @@ async function workAgent(req, flags, ctx) {
         // job, never on these lines).
         const aiCorr = `job ${job.jobKey} eik ${job.elementInstanceKey ?? '?'} pik ${job.processInstanceKey ?? '?'}`;
         if (!agentInstanceOff && isExternalAgentJob(job)) {
-          agentInstanceProducer = createAgentInstanceProducer({ camunda, job, profile, envelope, logger });
+          maybeProbeAgentCliVersion();
+          // #257 review: the synchronous CLI `--version` probe above can block for up
+          // to its timeout on the FIRST external activation. A force-stop/lease-loss
+          // can win that race while spawnSync is blocked, so re-check the setup-abort
+          // gate before minting the durable AgentInstance — otherwise an already-aborted
+          // run would call activate() and mint an instance/transcript that is then
+          // immediately orphaned (the post-activate gates run too late to prevent the
+          // create). Mirrors the pre-probe agent-instance gate above.
+          if (checkSetupAbort(abortSignal, { jobType, jobKey: job.jobKey, stage: 'agent-instance', logger })) {
+            if (isContainer) liveRunIds.delete(runId);
+            return;
+          }
+          agentInstanceProducer = createAgentInstanceProducer({ camunda, job, profile, envelope, logger, runtimeVersion: pluginVersion, agentCliVersion });
           try {
             // `createAgentInstanceProducer` always returns an object — including a
             // DISABLED facade when the host SDK lacks createAgentInstance/
@@ -15464,6 +15645,7 @@ export {
   startAgenticChannelWatchdog,
 };
 export { compareSemver, githubRepoSlug, filterReleasesSince, renderReleaseBody };
+export { probeAgentCliVersion };
 export {
   webConsoleUrl,
   consoleLinkLabel,

@@ -11645,7 +11645,18 @@ async function runSupervisorDaemon() {
     // let the terminal frame claim success and let the roll drain the next worker
     // with this one down (#253 review). A readiness *timeout* on a still-live
     // current child still counts as success — readiness is best-effort.
-    return w.child === started && started.exitCode === null && started.signalCode === null;
+    //
+    // Gate on the LIVE PID, not just object identity + null exit/signal: a spawn
+    // failure (ENOENT/EMFILE/…) emits only 'error' with NO 'exit', so
+    // `exitCode`/`signalCode` stay null and `w.child` keeps pointing at the failed
+    // ChildProcess until its backoff retry — the identity+exit check alone would
+    // count that as reloaded (#253 review). `handleDeath` nulls `w.pid` on every
+    // death (error OR exit), and a failed spawn has no `child.pid`, so requiring
+    // `w.pid` to be non-null AND still equal to this child's pid rejects both a
+    // failed spawn and a dead/retrying child while accepting a live replacement
+    // (readiness timeout included).
+    return w.child === started && w.pid != null && w.pid === started.pid
+      && started.exitCode === null && started.signalCode === null;
   };
 
   // Rolling hot reload across a set of worker ids: drain+respawn each in turn

@@ -1132,9 +1132,14 @@ c8ctl nano supervisor reload # roll it into the running fleet, zero downtime
   downtime**. To keep it genuinely one-at-a-time, after respawning a worker the
   daemon **waits for the replacement to report ready** (its activation loop is up
   and leasing) before draining the next one — a bare spawn/PID is not readiness,
-  so a slow replacement can never leave two workers down at once. That wait is
+  so on the normal readiness path a slow replacement can never leave two workers
+  down at once. That wait is
   **bounded** (`NANO_SUPERVISOR_RELOAD_READY_TIMEOUT_MS`, default 30s): a
-  never-ready replacement can't wedge the roll — the daemon advances anyway. This
+  never-ready replacement can't wedge the roll — the daemon advances anyway. That
+  timeout fallback is the one exception to the guarantee above: when a
+  replacement never reports ready the daemon drains the next worker while the
+  previous one is still unready, so **two (or more) workers can be temporarily
+  unavailable** until the slow replacement catches up. This
   is a *fleet-level* guarantee: a worker is drained **before** its replacement
   spawns, so a **single-worker fleet** (or a job type served by only one worker)
   does lose that capacity for the drain+boot window. Run more than

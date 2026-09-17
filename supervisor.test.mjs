@@ -42,9 +42,16 @@ import {
   agenticStateForTarget,
   normalizeAgenticMessage,
   buildActivityPayload,
+  withSettlementPendingMarker,
+  composeFencedSettleJob,
+  isLeaseLostSettleError,
+  pruneActivationGuard,
+  bindJobSettle,
+  countSupervisorInFlight,
   activityMarkerReadyFor,
   waitForChildExit,
   supervisorWorkerActivityFile,
+  SETTLEMENT_PENDING_GHOST_TTL_MS,
   WORK_FORWARD_FLAGS,
 } from './c8ctl-plugin.js';
 
@@ -708,6 +715,31 @@ test('supervisorJobCell is - for a down worker and ? for an alive non-reporter',
   assert.equal(supervisorJobCell({ state: 'running', activity: null }), '?');
 });
 
+// #254: a job whose fenced settle failed rides the marker as a settlement-pending
+// ghost — the JOB cell surfaces the stuck window instead of a bare `idle`.
+test('supervisorJobCell surfaces a settlement-pending job on an otherwise idle worker', () => {
+  const row = { state: 'running', activity: { state: 'idle', jobs: [
+    { key: '77', type: 'senior:feature', sinceMs: 4000, settlementPending: true, settlePhase: 'complete' },
+  ] } };
+  const cell = supervisorJobCell(row);
+  assert.match(cell, /^77 settlement-pending \(4s\)$/);
+});
+
+test('supervisorJobCell counts extra settlement-pending ghosts and folds them into a running job', () => {
+  // Only ghosts: first shown, rest counted.
+  const onlyGhosts = { state: 'running', activity: { state: 'idle', jobs: [
+    { key: 'G1', type: 't', sinceMs: 1000, settlementPending: true },
+    { key: 'G2', type: 't', sinceMs: 2000, settlementPending: true },
+  ] } };
+  assert.match(supervisorJobCell(onlyGhosts), /^G1 settlement-pending \+1 \(1s\)$/);
+  // A running job + a ghost: the running job leads, the ghost is folded into +N.
+  const mixed = { state: 'running', activity: { state: 'busy', jobs: [
+    { key: 'R1', type: 't', sinceMs: 3000 },
+    { key: 'G1', type: 't', sinceMs: 5000, settlementPending: true },
+  ] } };
+  assert.match(supervisorJobCell(mixed), /^R1 \+1 \(3s\)$/);
+});
+
 // --- summarizeSupervisorWorker reads the on-disk activity marker -----------
 
 test('summarizeSupervisorWorker surfaces a live worker\'s serviced job from its marker', async (t) => {
@@ -738,6 +770,68 @@ test('summarizeSupervisorWorker surfaces a live worker\'s serviced job from its 
   // No marker at all → idle-with-no-report (null), rendered as '?'.
   const other = summarizeSupervisorWorker({ id: 'never-reported', profile: 'x', pid: process.pid });
   assert.equal(other.activity, null);
+});
+
+// #254: a marker carrying ONLY a settlement-pending ghost reads as idle-state
+// (the worker no longer runs it) but the ghost + its flag ride through so the
+// JOB cell can surface the stuck settlement window.
+test('summarizeSupervisorWorker reads a settlement-pending ghost as idle-state but keeps the flag', async (t) => {
+  const { mkdtempSync, mkdirSync, writeFileSync, rmSync } = await import('node:fs');
+  const { tmpdir } = await import('node:os');
+  const { join, dirname } = await import('node:path');
+  const home = mkdtempSync(join(tmpdir(), 'c8ctl-activity-sp-'));
+  const prev = process.env.C8CTL_NANO_HOME;
+  process.env.C8CTL_NANO_HOME = home;
+  t.after(() => {
+    if (prev === undefined) delete process.env.C8CTL_NANO_HOME; else process.env.C8CTL_NANO_HOME = prev;
+    try { rmSync(home, { recursive: true, force: true }); } catch { /* best effort */ }
+  });
+
+  const file = supervisorWorkerActivityFile('stuck');
+  mkdirSync(dirname(file), { recursive: true });
+  writeFileSync(file, JSON.stringify({
+    pid: process.pid, busy: false,
+    jobs: [{ key: 'JOB-SP', type: 'senior:feature', since: Date.now() - 3000, settlementPending: true, settlePhase: 'complete' }],
+  }));
+  const row = summarizeSupervisorWorker({ id: 'stuck', profile: 'stuck', pid: process.pid });
+  // A pure ghost does NOT mark the worker busy.
+  assert.equal(row.activity.state, 'idle');
+  assert.equal(row.activity.jobs[0].settlementPending, true);
+  assert.equal(row.activity.jobs[0].settlePhase, 'complete');
+  // and the JOB cell surfaces the stuck window rather than a bare `idle`.
+  assert.match(supervisorJobCell(row), /^JOB-SP settlement-pending/);
+});
+
+// #254: the read-time TTL filter is the ONLY expiry path once an idle worker
+// stops calling writeActivity, so a ghost older than SETTLEMENT_PENDING_GHOST_TTL_MS
+// must be dropped when the marker is read — otherwise the prior indefinite-ghost
+// behavior silently returns. A 3s-old ghost (above) exercises the keep path; this
+// exercises the expire path.
+test('summarizeSupervisorWorker drops a settlement-pending ghost older than the TTL at read time', async (t) => {
+  const { mkdtempSync, mkdirSync, writeFileSync, rmSync } = await import('node:fs');
+  const { tmpdir } = await import('node:os');
+  const { join, dirname } = await import('node:path');
+  const home = mkdtempSync(join(tmpdir(), 'c8ctl-activity-sp-exp-'));
+  const prev = process.env.C8CTL_NANO_HOME;
+  process.env.C8CTL_NANO_HOME = home;
+  t.after(() => {
+    if (prev === undefined) delete process.env.C8CTL_NANO_HOME; else process.env.C8CTL_NANO_HOME = prev;
+    try { rmSync(home, { recursive: true, force: true }); } catch { /* best effort */ }
+  });
+
+  const file = supervisorWorkerActivityFile('stale');
+  mkdirSync(dirname(file), { recursive: true });
+  // A ghost whose settle failed just over the TTL ago, on a worker that has since
+  // gone quiet (so writeActivity never pruned it).
+  writeFileSync(file, JSON.stringify({
+    pid: process.pid, busy: false,
+    jobs: [{ key: 'JOB-STALE', type: 'senior:feature', since: Date.now() - (SETTLEMENT_PENDING_GHOST_TTL_MS + 60_000), settlementPending: true, settlePhase: 'complete' }],
+  }));
+  const row = summarizeSupervisorWorker({ id: 'stale', profile: 'stale', pid: process.pid });
+  // The expired ghost is filtered out entirely: no jobs, idle state, idle cell.
+  assert.deepEqual(row.activity.jobs, []);
+  assert.equal(row.activity.state, 'idle');
+  assert.equal(supervisorJobCell(row), 'idle');
 });
 
 // --- supervisorStatusSignature (live-view change detection) ----------------
@@ -1073,6 +1167,401 @@ test('waitForChildExit removes its exit listener on timeout — no listener accu
   assert.equal(child.listenerCount('exit'), 0, 'exit path also removes its listener');
 });
 
+// #254: a settlement-pending ghost must not make an idle worker look busy.
+test('buildActivityPayload derives busy from running jobs, not settlement-pending ghosts', () => {
+  const onlyGhost = buildActivityPayload({
+    pid: 1, updatedAt: 1,
+    jobs: [{ key: '5', type: 't', since: 10, settlementPending: true }],
+    engine: null, agentic: { status: 'off' },
+  });
+  assert.equal(onlyGhost.busy, false);
+  // the ghost still rides the marker so status can render it
+  assert.equal(onlyGhost.jobs.length, 1);
+
+  const mixed = buildActivityPayload({
+    pid: 1, updatedAt: 1,
+    jobs: [
+      { key: '5', type: 't', since: 10, settlementPending: true },
+      { key: '6', type: 't', since: 20 },
+    ],
+    engine: null, agentic: { status: 'off' },
+  });
+  assert.equal(mixed.busy, true);
+});
+
+// #254: withSettlementPendingMarker records a failed fenced settle then re-throws.
+test('withSettlementPendingMarker marks a stuck settle and re-throws unchanged', async () => {
+  const calls = [];
+  const boom = new Error('lease lost (409 JobLeaseMismatch)');
+  const inner = {
+    complete: async () => { throw boom; },
+    fail: async () => { throw boom; },
+  };
+  const job = { jobKey: '900', type: 'senior:feature', leaseToken: 'tok' };
+  const wrapped = withSettlementPendingMarker(inner, job, (j, phase) => calls.push([j.jobKey, phase]));
+  await assert.rejects(() => wrapped.complete({ ok: 1 }), /lease lost/);
+  await assert.rejects(() => wrapped.fail({ retries: 0 }), /lease lost/);
+  assert.deepEqual(calls, [['900', 'complete'], ['900', 'fail']]);
+});
+
+test('withSettlementPendingMarker is a pass-through on a successful settle', async () => {
+  let marked = 0;
+  const inner = { complete: async (v) => ({ done: v }), fail: async () => 'failed' };
+  const wrapped = withSettlementPendingMarker(inner, { jobKey: '1' }, () => { marked++; });
+  assert.deepEqual(await wrapped.complete({ a: 1 }), { done: { a: 1 } });
+  assert.equal(await wrapped.fail({}), 'failed');
+  assert.equal(marked, 0);
+});
+
+test('withSettlementPendingMarker never lets a recorder throw mask the settle error', async () => {
+  // A definitive lease-loss rejection so the (throwing) recorder IS invoked — its
+  // throw must be swallowed and the original settle error propagate unchanged.
+  const boom = new Error('HTTP 409 reclaim');
+  const inner = { complete: async () => { throw boom; }, fail: async () => 'ok' };
+  const wrapped = withSettlementPendingMarker(inner, { jobKey: '1' }, () => { throw new Error('recorder blew up'); });
+  await assert.rejects(() => wrapped.complete({}), /HTTP 409/);
+});
+
+// #256 review: only a DEFINITIVE lease-loss rejection is a stuck settlement. A
+// transient/validation failure re-throws WITHOUT recording a false ghost.
+test('withSettlementPendingMarker does not mark a non-lease-loss settle failure', async () => {
+  const calls = [];
+  const inner = {
+    complete: async () => { throw new Error('HTTP 500 internal server error'); },
+    fail: async () => { const e = new Error('bad request'); e.status = 400; throw e; },
+  };
+  const job = { jobKey: '901', type: 'senior:feature', leaseToken: 'tok' };
+  const wrapped = withSettlementPendingMarker(inner, job, (j, phase) => calls.push([j.jobKey, phase]));
+  await assert.rejects(() => wrapped.complete({}), /HTTP 500/);
+  await assert.rejects(() => wrapped.fail({}), /bad request/);
+  assert.deepEqual(calls, []); // neither transient 5xx nor a 400 validation is a stuck settlement
+});
+
+// #256 review: the lease-loss classifier recognises the definitive ownership-loss
+// signals (409/404 in the message OR numerically on the cause chain, "not
+// activated", JobLeaseMismatch, reclaim) and rejects everything transient.
+test('isLeaseLostSettleError classifies definitive lease loss vs transient failures', () => {
+  assert.equal(isLeaseLostSettleError(new Error('HTTP 409 JobLeaseMismatch')), true);
+  assert.equal(isLeaseLostSettleError(new Error('Request failed with status code 404')), true);
+  assert.equal(isLeaseLostSettleError(new Error('job not activated')), true);
+  assert.equal(isLeaseLostSettleError(new Error('reclaim in progress')), true);
+  const wrapped = new Error('settle failed'); wrapped.cause = { status: 409 };
+  assert.equal(isLeaseLostSettleError(wrapped), true); // numeric status on the cause chain
+  assert.equal(isLeaseLostSettleError(new Error('HTTP 500 internal')), false);
+  assert.equal(isLeaseLostSettleError(new Error('ECONNRESET')), false);
+  const four29 = new Error('rate limited'); four29.statusCode = 429;
+  assert.equal(isLeaseLostSettleError(four29), false);
+  // A NUMERIC `err.code` (the shape `describeSdkError` treats as a status,
+  // agent-instance.mjs) is read from the cause-chain walk (#256 review); a string
+  // code like `ECONNRESET` is NOT a status and must stay a non-loss transient.
+  const codeLoss = new Error('completeJob failed'); codeLoss.code = 409;
+  assert.equal(isLeaseLostSettleError(codeLoss), true);
+  const codeLoss404 = new Error('failJob failed'); codeLoss404.code = 404;
+  assert.equal(isLeaseLostSettleError(codeLoss404), true);
+  const codeOther = new Error('server error'); codeOther.code = 500;
+  assert.equal(isLeaseLostSettleError(codeOther), false);
+  const strCode = new Error('socket hang up'); strCode.code = 'ECONNRESET';
+  assert.equal(isLeaseLostSettleError(strCode), false);
+  const wrappedCode = new Error('settle failed'); wrappedCode.cause = { code: 409 };
+  assert.equal(isLeaseLostSettleError(wrappedCode), true); // numeric code on the cause chain
+  assert.equal(isLeaseLostSettleError(null), false);
+});
+
+// #256 review: the STRUCTURED status vetoes the generic textual ownership words.
+// The raw settle client stamps arbitrary response-body text after "HTTP <status>
+// from …", so a 500/400 whose body merely CONTAINS "not found"/"reclaim" must NOT
+// be read as a lease loss (it would raise a false 30-minute settlement-pending
+// ghost); only an explicit 404/409 (or an unambiguous engine signal) is lease loss.
+test('isLeaseLostSettleError does not treat a non-404/409 status whose body contains "not found" as lease loss', () => {
+  // A contradictory non-loss status vetoes the generic words in the body.
+  assert.equal(isLeaseLostSettleError(new Error('complete 5: HTTP 500 from http://x/jobs/5/completion — job not found')), false);
+  assert.equal(isLeaseLostSettleError(new Error('fail 5: HTTP 400 from http://x — reclaim window expired')), false);
+  const e500 = new Error('completeJob failed: not found'); e500.status = 502;
+  assert.equal(isLeaseLostSettleError(e500), false); // numeric non-loss status on the object vetoes the body word
+  // But a genuine 404/409 with the SAME generic body IS lease loss.
+  assert.equal(isLeaseLostSettleError(new Error('fail 5: HTTP 404 from http://x/jobs/5/failure — job not found')), true);
+  assert.equal(isLeaseLostSettleError(new Error('complete 5: HTTP 409 from http://x — reclaim: job leased elsewhere')), true);
+  // A strong engine phrase with NO status still counts (a genuine loss the engine
+  // reported only in words).
+  assert.equal(isLeaseLostSettleError(new Error('job not activated')), true);
+  // #256 review (thread 4035004220): readErrorBody appends the ARBITRARY response
+  // body, so a strong engine PHRASE echoed inside a NON-loss transport response's body
+  // is vetoed by that contradictory status — a genuine loss is always stamped 404/409.
+  assert.equal(isLeaseLostSettleError(new Error('complete 5: HTTP 500 from http://x/jobs/5/completion — upstream: JobLeaseMismatch')), false);
+  assert.equal(isLeaseLostSettleError(new Error('fail 5: HTTP 400 from http://x/jobs/5/failure — job not activated')), false);
+  const strongOn502 = new Error('completeJob failed: lease mismatch'); strongOn502.status = 502;
+  assert.equal(isLeaseLostSettleError(strongOn502), false); // numeric non-loss status vetoes the strong body phrase
+});
+
+// #256 review (follow-up): the status parse reads only the STAMPED transport status
+// (`HTTP <n> from …`), not a status code that merely appears inside the appended
+// response BODY. A genuine HTTP 500 whose body text happens to mention "HTTP 409"
+// or "status code 404" must therefore NOT be classified as lease loss.
+test('isLeaseLostSettleError ignores a status code that only appears in the response body', () => {
+  assert.equal(
+    isLeaseLostSettleError(new Error('complete 5: HTTP 500 from http://x/jobs/5/completion — upstream returned HTTP 409 earlier')),
+    false,
+    'a 409 inside the body of a 500 transport response is not lease loss',
+  );
+  assert.equal(
+    isLeaseLostSettleError(new Error('fail 5: HTTP 500 from http://x/jobs/5/failure — gateway note: status code 404')),
+    false,
+    'a "status code 404" inside a 500 body is not lease loss',
+  );
+  // The stamped transport status still wins when it IS a loss, body noise notwithstanding.
+  assert.equal(
+    isLeaseLostSettleError(new Error('fail 5: HTTP 409 from http://x/jobs/5/failure — see also HTTP 500 upstream')),
+    true,
+    'the stamped 409 transport status is lease loss regardless of a 500 mentioned in the body',
+  );
+});
+
+// #256 review (follow-up, c8ctl-plugin.js:3556): a status code parsed out of the
+// MESSAGE is SUBORDINATE to a contradictory STRUCTURED status. An SDK rejection can
+// carry `... status code 404` in its message (e.g. echoed from the response body)
+// while its structured response/cause is a non-loss 5xx — that must NOT be read as a
+// lease loss, or it raises a false 30-minute settlement-pending ghost. The structured
+// status is authoritative.
+test('isLeaseLostSettleError keeps a message-only status code subordinate to a contradictory structured status', () => {
+  // Message says 404 but the structured status is a non-loss 500 -> not lease loss.
+  const sdk404on500 = new Error('Request failed with status code 404'); sdk404on500.status = 500;
+  assert.equal(isLeaseLostSettleError(sdk404on500), false, 'message 404 is vetoed by structured 500');
+  const sdk409on502 = new Error('completeJob: request failed with status code 409'); sdk409on502.statusCode = 502;
+  assert.equal(isLeaseLostSettleError(sdk409on502), false, 'message 409 is vetoed by structured 502');
+  // Same shape one hop down the cause chain.
+  const outer = new Error('Request failed with status code 404'); outer.cause = { response: { statusCode: 500 } };
+  assert.equal(isLeaseLostSettleError(outer), false, 'message 404 is vetoed by a structured 500 on the cause chain');
+  // But a message-only status code with NO structured status still classifies (the raw
+  // settle client path), and a structured 404/409 agreeing with the message is loss.
+  assert.equal(isLeaseLostSettleError(new Error('Request failed with status code 404')), true, 'message-only 404 with no structured status is lease loss');
+  const sdk404on404 = new Error('Request failed with status code 404'); sdk404on404.status = 404;
+  assert.equal(isLeaseLostSettleError(sdk404on404), true, 'structured 404 agreeing with the message is lease loss');
+});
+
+// #256 review: the cause-chain status extraction must read the NESTED
+// `response.statusCode` shape too, not only `response.status`. The repository's
+// own SDK-error normalizer (describeSdkError, agent-instance.mjs) supports
+// `err.response.statusCode`, so a 404/409 shaped that way must classify as lease
+// loss (else the settle path never records the fenced settlement-pending marker).
+test('isLeaseLostSettleError reads a 404/409 from a nested response.statusCode', () => {
+  const e404 = new Error('settle failed'); e404.response = { statusCode: 404 };
+  assert.equal(isLeaseLostSettleError(e404), true, 'nested response.statusCode 404 is lease loss');
+  const e409 = new Error('settle failed'); e409.response = { statusCode: 409 };
+  assert.equal(isLeaseLostSettleError(e409), true, 'nested response.statusCode 409 is lease loss');
+  // A non-loss nested status is a contradictory signal, not a lease loss, and it
+  // vetoes a body ownership word.
+  const e500 = new Error('settle failed: job not found'); e500.response = { statusCode: 500 };
+  assert.equal(isLeaseLostSettleError(e500), false, 'nested response.statusCode 500 is not lease loss');
+  // The loss status is found even one hop down the cause chain.
+  const wrapped = new Error('outer'); wrapped.cause = e409;
+  assert.equal(isLeaseLostSettleError(wrapped), true, 'nested response.statusCode 409 on the cause chain is lease loss');
+});
+
+// #256 review: INTEGRATION test for the runner hot-path settle wiring
+// #256 review: the runner hot path composes its fenced, settlement-pending-aware
+// settle seam through the SHARED `composeFencedSettleJob` helper (the exact call
+// the runner makes: `composeFencedSettleJob(settle, job, recordSettlementPending)`).
+// Driving that PRODUCTION helper — not a test-local reconstruction of the wrapper
+// chain — means a future refactor that drops or mis-wires either layer inside it
+// reddens this test. Asserts (a) each settle was fenced with THIS activation's
+// leaseToken, and (b) a settlement-pending ghost was recorded for the right phase.
+test('composeFencedSettleJob records a settlement-pending ghost on a lease-loss fenced settle', async () => {
+  const fenced = [];
+  const ghosts = new Map(); // stands in for settlementPendingJobs
+  // Raw engine settle seam (bindJobSettle's target): capture the fencing leaseToken,
+  // then reject exactly as the broker does when the lease was reclaimed / the job gone.
+  const rawSettle = {
+    complete: async (jobKey, _variables, leaseToken) => {
+      fenced.push(['complete', jobKey, leaseToken]);
+      throw new Error(`complete ${jobKey}: HTTP 409 from http://x/jobs/${jobKey}/completion JobLeaseMismatch`);
+    },
+    fail: async (jobKey, opts) => {
+      fenced.push(['fail', jobKey, opts.leaseToken]);
+      throw new Error(`fail ${jobKey}: HTTP 404 from http://x/jobs/${jobKey}/failure — job not found`);
+    },
+  };
+  const job = { jobKey: '7007', type: 'senior:feature', leaseToken: 'lease-abc' };
+  const recordSettlementPending = (j, phase) => ghosts.set(String(j.jobKey), { phase, type: j.type });
+  const settleJob = composeFencedSettleJob(rawSettle, job, recordSettlementPending);
+
+  await assert.rejects(() => settleJob.complete({ ok: 1 }), /HTTP 409/);
+  assert.deepEqual(fenced.at(-1), ['complete', '7007', 'lease-abc'], 'complete fenced with the activation leaseToken');
+  assert.deepEqual(ghosts.get('7007'), { phase: 'complete', type: 'senior:feature' }, 'lease-loss complete records a ghost');
+
+  ghosts.clear();
+  await assert.rejects(() => settleJob.fail({ retries: 0 }), /HTTP 404/);
+  assert.deepEqual(fenced.at(-1), ['fail', '7007', 'lease-abc'], 'fail fenced with the activation leaseToken');
+  assert.deepEqual(ghosts.get('7007'), { phase: 'fail', type: 'senior:feature' }, 'lease-loss fail records a ghost');
+});
+
+// #256 review: the activation identity guard stays ABSOLUTELY bounded. A key with
+// a live (recent) settle in flight is retained past the soft cap, but a stuck
+// settle past the TTL no longer pins it, and a hard ceiling caps the map even if
+// every key were protected — so a never-resolving settle can't grow it unbounded.
+test('pruneActivationGuard bounds the guard map (soft cap retains live settles, hard ceiling + TTL cap the rest)', () => {
+  const now = 1_000_000;
+  const ttlMs = 30 * 60 * 1000;
+  // 1) Soft cap retains a key whose settle is currently in flight.
+  const guard = new Map();
+  const inflight = new Map();
+  for (let i = 0; i < 70; i += 1) guard.set(`k${i}`, { token: `t${i}`, at: now - i });
+  inflight.set('k69', new Map([[1, now]])); // freshest key, live settle
+  pruneActivationGuard(guard, inflight, { nowMs: now, ttlMs, maxGhosts: 64, hardMax: 256 });
+  assert.ok(guard.size <= 64, `soft cap enforced: ${guard.size}`);
+  assert.ok(guard.has('k69'), 'a key with a live in-flight settle is retained past the soft cap');
+
+  // 2) A settle in flight PAST the TTL is treated as never-resolving: GC'd from the
+  //    in-flight map and no longer protects its guard.
+  const guard2 = new Map();
+  const inflight2 = new Map();
+  for (let i = 0; i < 70; i += 1) guard2.set(`k${i}`, { token: `t${i}`, at: now - i });
+  inflight2.set('k69', new Map([[1, now - (ttlMs + 60_000)]])); // hung settle
+  pruneActivationGuard(guard2, inflight2, { nowMs: now, ttlMs, maxGhosts: 64, hardMax: 256 });
+  assert.ok(guard2.size <= 64, 'soft cap still enforced');
+  assert.equal(inflight2.has('k69'), false, 'a settle hung past the TTL is GC\'d from the in-flight map');
+
+  // 3) Hard ceiling: even if EVERY key has a live in-flight settle, the map can
+  //    never exceed hardMax — a never-resolving-settle flood is still bounded.
+  const guard3 = new Map();
+  const inflight3 = new Map();
+  for (let i = 0; i < 300; i += 1) {
+    guard3.set(`k${i}`, { token: `t${i}`, at: now - i });
+    inflight3.set(`k${i}`, new Map([[i + 1, now]]));
+  }
+  pruneActivationGuard(guard3, inflight3, { nowMs: now, ttlMs, maxGhosts: 64, hardMax: 256 });
+  assert.ok(guard3.size <= 256, `hard ceiling enforced even when all keys are protected: ${guard3.size}`);
+});
+
+// #256 review: concurrent same-key activations each carry their OWN start time, so
+// protection is retained while ANY of them is still non-expired. An older runner's
+// settle whose `since` has aged out no longer protects the guard, BUT a newer
+// same-key activation's fresh `since` keeps it — and GC drops only the aged entry,
+// never the newer one. This is what a single per-key `{ count, since }` (first
+// runner's timestamp) could not express.
+test('pruneActivationGuard retains a guard while a newer same-key activation is live', () => {
+  const now = 1_000_000;
+  const ttlMs = 30 * 60 * 1000;
+  const guard = new Map();
+  guard.set('k0', { token: 't-old', at: now - (ttlMs + 60_000) }); // guard itself is old
+  const inflight = new Map();
+  // One key, TWO in-flight activations: an aged older settle + a fresh newer one.
+  inflight.set('k0', new Map([
+    [1, now - (ttlMs + 60_000)], // older runner, hung past TTL
+    [2, now],                    // newer runner, live
+  ]));
+  pruneActivationGuard(guard, inflight, { nowMs: now, ttlMs, maxGhosts: 64, hardMax: 256 });
+  assert.ok(guard.has('k0'), 'guard retained because a newer same-key activation is still live');
+  assert.equal(inflight.get('k0').has(1), false, 'the aged older activation entry is GC\'d');
+  assert.equal(inflight.get('k0').has(2), true, 'the live newer activation entry is kept');
+
+  // Once the newer activation also ages out, nothing protects the guard.
+  const later = now + ttlMs + 120_000;
+  pruneActivationGuard(guard, inflight, { nowMs: later, ttlMs, maxGhosts: 64, hardMax: 256 });
+  assert.equal(guard.has('k0'), false, 'guard TTL-pruned once no activation remains live');
+  assert.equal(inflight.has('k0'), false, 'in-flight key dropped once it has no entries left');
+});
+
+// #256 review (suppressed advisory, c8ctl-plugin.js:9670): at the soft-cap boundary
+// the runner must protect an activation (markSettleInFlight) BEFORE recordJobStart's
+// own pruneLastActivation, not after. This test documents WHY: pruneActivationGuard
+// evicts the newest UNPROTECTED key when every older key is protected by a live
+// settle, so a just-inserted guard not yet in settleInFlightByKey would be dropped —
+// leaving the subsequent fenced settle with no identity guard (an interrupted run
+// whose settle rejects after recordJobEnd would then silently drop its ghost).
+test('pruneActivationGuard evicts a just-inserted UNPROTECTED guard at the soft cap when all others are protected (protect-before-prune invariant)', () => {
+  const now = 1_000_000;
+  const ttlMs = 30 * 60 * 1000;
+
+  // 64 older keys, each protected by a live in-flight settle, + one FRESH key (k64)
+  // just inserted by recordJobStart but NOT yet marked in settleInFlightByKey.
+  const guardUnprotected = new Map();
+  const inflight = new Map();
+  for (let i = 0; i < 64; i += 1) {
+    guardUnprotected.set(`k${i}`, { token: `t${i}`, at: now - (64 - i) });
+    inflight.set(`k${i}`, new Map([[i + 1, now]])); // all older keys protected
+  }
+  guardUnprotected.set('k64', { token: 't64', at: now }); // newest, NOT protected
+  pruneActivationGuard(guardUnprotected, inflight, { nowMs: now, ttlMs, maxGhosts: 64, hardMax: 256 });
+  assert.equal(guardUnprotected.has('k64'), false,
+    'an unprotected just-inserted guard is evicted at the soft cap when every other key is protected');
+
+  // Same layout, but the fresh key IS protected first (markSettleInFlight BEFORE the
+  // prune, as the runner now does): its guard survives.
+  const guardProtected = new Map();
+  const inflight2 = new Map();
+  for (let i = 0; i < 64; i += 1) {
+    guardProtected.set(`k${i}`, { token: `t${i}`, at: now - (64 - i) });
+    inflight2.set(`k${i}`, new Map([[i + 1, now]]));
+  }
+  guardProtected.set('k64', { token: 't64', at: now });
+  inflight2.set('k64', new Map([[65, now]])); // protected BEFORE the prune
+  pruneActivationGuard(guardProtected, inflight2, { nowMs: now, ttlMs, maxGhosts: 64, hardMax: 256 });
+  assert.equal(guardProtected.has('k64'), true,
+    'a protected activation survives the same prune — proving mark-before-recordJobStart keeps the identity guard');
+});
+
+// #256 review: settleInFlightByKey keeps a per-key entry Map, and TTL GC only drops
+// AGED entries — so a same-key redelivery loop whose settles never resolve could
+// accumulate unbounded LIVE entries within the TTL window. pruneActivationGuard caps
+// the per-key count, evicting oldest-first so the map is constant-space per key while
+// retaining the newest live identity that governs protection.
+test('pruneActivationGuard caps the per-key in-flight entry Map (oldest-first, newest retained)', () => {
+  const now = 1_000_000;
+  const ttlMs = 30 * 60 * 1000;
+  const guard = new Map();
+  guard.set('kFlood', { token: 't', at: now });
+  const inflight = new Map();
+  // 50 live (recent) same-key activations — a never-resolving redelivery loop.
+  const entries = new Map();
+  for (let i = 1; i <= 50; i += 1) entries.set(i, now - (50 - i)); // id 1 oldest … id 50 newest
+  inflight.set('kFlood', entries);
+  pruneActivationGuard(guard, inflight, { nowMs: now, ttlMs, maxGhosts: 64, hardMax: 256, maxInFlightPerKey: 16 });
+  const kept = inflight.get('kFlood');
+  assert.equal(kept.size, 16, 'per-key entries bounded to the cap');
+  assert.equal(kept.has(50), true, 'the newest activation entry is retained');
+  assert.equal(kept.has(35), true, 'the newest 16 (ids 35..50) are retained');
+  assert.equal(kept.has(34), false, 'older entries beyond the cap are evicted oldest-first');
+  assert.equal(kept.has(1), false, 'the oldest activation entry is evicted');
+  // The guard stays protected: a live newest entry remains in flight.
+  assert.ok(guard.has('kFlood'), 'guard retained — the newest live activation still protects it');
+});
+
+// #256 review: the per-key cap bounds each key's entries, but a stream of UNIQUE
+// never-resolving keys could still grow the OUTER settleInFlightByKey map until each
+// key's TTL. pruneActivationGuard also caps the total KEY count (oldest-first), so
+// the settle map is absolutely bounded, and an evicted key's guard loses protection
+// and falls to the normal TTL/size/hard-cap eviction.
+test('pruneActivationGuard caps the total settleInFlight key count (oldest-first)', () => {
+  const now = 1_000_000;
+  const ttlMs = 30 * 60 * 1000;
+  const guard = new Map();
+  const inflight = new Map();
+  // 40 distinct keys, each with one LIVE (recent) never-resolving settle.
+  for (let i = 1; i <= 40; i += 1) {
+    guard.set(`k${i}`, { token: `t${i}`, at: now - (40 - i) });
+    inflight.set(`k${i}`, new Map([[i, now - (40 - i)]])); // k1 oldest … k40 newest
+  }
+  pruneActivationGuard(guard, inflight, { nowMs: now, ttlMs, maxGhosts: 64, hardMax: 256, maxKeys: 16 });
+  assert.equal(inflight.size, 16, 'total settleInFlight keys bounded to maxKeys');
+  assert.equal(inflight.has('k40'), true, 'the newest key is retained');
+  assert.equal(inflight.has('k25'), true, 'the newest 16 keys (k25..k40) are retained');
+  assert.equal(inflight.has('k24'), false, 'older keys beyond the cap are evicted oldest-first');
+  assert.equal(inflight.has('k1'), false, 'the oldest key is evicted');
+  // An evicted key's guard loses protection: k1 (aged past nothing here but unprotected
+  // once its settle entry is gone) is now governed only by the guard's own caps.
+  assert.equal(guard.has('k40'), true, 'a retained-key guard is still protected by its live settle');
+});
+
+// #254: settlement-pending ghosts are not drained/counted as in-flight work.
+test('countSupervisorInFlight excludes settlement-pending ghosts', () => {
+  const workers = [
+    { activity: { jobs: [{ key: 'a' }, { key: 'b', settlementPending: true }] } },
+    { activity: { jobs: [{ key: 'c', settlementPending: true }] } },
+    { activity: { jobs: [{ key: 'd' }] } },
+  ];
+  assert.equal(countSupervisorInFlight(workers), 2); // a + d only
+});
+
 test('supervisorStatusSignature changes when the polled engine changes', () => {
   const a = pub({ engine: 'http://merlin.local:8080' });
   const b = pub({ engine: 'http://omarchy.local:8080' });
@@ -1110,6 +1599,53 @@ test('reageSupervisorStatus keeps the snapshot value when no absolute base is pr
   assert.equal(reaged.workers[0].activity.jobs[0].sinceMs, 42);
 });
 
+// #256 review: reageSupervisorStatus (the attached-console per-tick re-age, which
+// never rebuilds the snapshot) must apply the same ghost TTL, so a stale
+// settlement-pending ghost self-expires on the live view rather than lingering
+// with NANO_SUPERVISOR_MONITOR_MS=0 / between status frames.
+test('reageSupervisorStatus drops an expired settlement-pending ghost and flips the worker to idle', () => {
+  const now0 = 5_000_000;
+  const ttl = SETTLEMENT_PENDING_GHOST_TTL_MS;
+  const status = {
+    workers: [{
+      id: 'a', state: 'running', startedAtMs: now0 - 1000, uptimeMs: 1000,
+      // A pure ghost: worker reported idle-state with one settlement-pending entry.
+      activity: { state: 'idle', jobs: [{ key: 'g', type: 't', sinceMs: 0, sinceEpochMs: now0, settlementPending: true }] },
+    }],
+  };
+  // Before TTL: the ghost survives (re-aged) and the worker stays idle (a ghost is
+  // never busy).
+  const fresh = reageSupervisorStatus(status, now0 + 1000);
+  assert.equal(fresh.workers[0].activity.jobs.length, 1);
+  assert.equal(fresh.workers[0].activity.state, 'idle');
+  // Past TTL: the ghost is dropped entirely and the worker reads idle-with-no-jobs.
+  const reaged = reageSupervisorStatus(status, now0 + ttl + 60_000);
+  assert.deepEqual(reaged.workers[0].activity.jobs, []);
+  assert.equal(reaged.workers[0].activity.state, 'idle');
+  // Pure: input untouched.
+  assert.equal(status.workers[0].activity.jobs.length, 1);
+});
+
+// A live running job alongside a ghost keeps the worker busy; expiring the ghost
+// does not disturb the running job or its re-aged age.
+test('reageSupervisorStatus keeps a running job busy while expiring a co-resident ghost', () => {
+  const now0 = 6_000_000;
+  const ttl = SETTLEMENT_PENDING_GHOST_TTL_MS;
+  const status = {
+    workers: [{
+      id: 'a', state: 'running', startedAtMs: now0 - 1000, uptimeMs: 1000,
+      activity: { state: 'busy', jobs: [
+        { key: 'run', type: 't', sinceMs: 0, sinceEpochMs: now0 },
+        { key: 'ghost', type: 't', sinceMs: 0, sinceEpochMs: now0, settlementPending: true },
+      ] },
+    }],
+  };
+  const reaged = reageSupervisorStatus(status, now0 + ttl + 60_000);
+  assert.equal(reaged.workers[0].activity.jobs.length, 1);
+  assert.equal(reaged.workers[0].activity.jobs[0].key, 'run');
+  assert.equal(reaged.workers[0].activity.jobs[0].sinceMs, ttl + 60_000);
+  assert.equal(reaged.workers[0].activity.state, 'busy');
+});
 test('reageSupervisorStatus passes non-object / no-workers frames through untouched', () => {
   assert.equal(reageSupervisorStatus(null, 1), null);
   const noWorkers = { daemon: { pid: 1 } };

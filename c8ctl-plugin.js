@@ -3535,32 +3535,47 @@ function isLeaseLostSettleError(err) {
   // `err.status`/`err.statusCode`/`err.response.status`/`err.response.statusCode`
   // or a NUMERIC `err.code` (a string code like `ECONNRESET` is NOT a status)
   // rather than in the message (all the nested shapes `describeSdkError` normalizes,
-  // agent-instance.mjs); the cause walk is bounded so a cycle can't loop.
-  let leaseStatus = false;
-  let otherStatus = false;
+  // agent-instance.mjs); the cause walk is bounded so a cycle can't loop. The
+  // STRUCTURED status (from the object / cause chain) is AUTHORITATIVE and is tracked
+  // SEPARATELY from a status parsed out of the message text: readErrorBody appends the
+  // arbitrary response body, and an SDK's own message may echo a `status code <n>`
+  // that DISAGREES with its structured response, so a message-only status match must
+  // stay SUBORDINATE to a contradictory structured status (#256 review).
+  let msgLease = false;
+  let msgOther = false;
   const m = HTTP_STATUS_RE.exec(msg);
   if (m) {
     const code = Number(m[1] ?? m[2]);
-    if (code === 404 || code === 409) leaseStatus = true;
-    else otherStatus = true;
+    if (code === 404 || code === 409) msgLease = true;
+    else msgOther = true;
   }
+  let structLease = false;
+  let structOther = false;
   let e = err;
   for (let depth = 0; e != null && typeof e === 'object' && depth <= 4; depth += 1) {
     const s = e.status ?? e.statusCode ?? (e.response && (e.response.status ?? e.response.statusCode))
       ?? (typeof e.code === 'number' ? e.code : undefined);
-    if (s === 409 || s === 404) leaseStatus = true;
-    else if (Number.isFinite(s)) otherStatus = true;
+    if (s === 409 || s === 404) structLease = true;
+    else if (Number.isFinite(s)) structOther = true;
     e = e.cause;
   }
-  // A definitive 404/409 anywhere is lease loss.
-  if (leaseStatus) return true;
+  // Structured status is AUTHORITATIVE: a definitive 404/409 on the object/cause chain
+  // IS lease loss, and a contradictory (non-404/409) structured status vetoes
+  // EVERYTHING below it — even a message that itself mentions `status code 404`, which
+  // may merely be echoed from the arbitrary response body of a 5xx rejection (#256).
+  if (structLease) return true;
+  if (structOther) return false;
+  // No structured status — fall back to the message-STAMPED transport status. The raw
+  // settle client's authoritative status IS the `HTTP <n> from` stamp, so a 404/409
+  // there is lease loss.
+  if (msgLease) return true;
   // Message ownership phrases — engine-semantic (STRONG) or generic (WEAK) — are read
   // from the message, and readErrorBody appends the ARBITRARY response body to it, so
   // a NON-loss transport response (e.g. HTTP 500/400) whose body merely ECHOES
   // "not activated"/"lease mismatch"/"not found" is NOT a lease loss. A genuine engine
   // loss is always stamped 404/409 (handled above), so a contradictory (non-404/409)
-  // status vetoes EITHER phrase — removing only the false-ghost class, never a real loss.
-  if (!otherStatus && (LEASE_LOST_STRONG_RE.test(msg) || LEASE_LOST_WEAK_RE.test(msg))) return true;
+  // message status vetoes EITHER phrase — removing only the false-ghost class.
+  if (!msgOther && (LEASE_LOST_STRONG_RE.test(msg) || LEASE_LOST_WEAK_RE.test(msg))) return true;
   return false;
 }
 
@@ -9242,6 +9257,20 @@ async function workAgent(req, flags, ctx) {
       const oldest = entries.keys().next().value;
       entries.delete(oldest);
     }
+    // Bound the TOTAL key count immediately too (#256 review): recordJobStart runs
+    // pruneLastActivation (which enforces the maxKeys ceiling on this map) BEFORE this
+    // insertion, and writeActivity no-ops for a standalone worker, so without an
+    // eviction here a fresh activation could leave settleInFlightByKey above its
+    // absolute key ceiling until the next job start. Evict oldest keys first (Map
+    // insertion order), but never THIS key — it is the newest and holds the live
+    // in-flight marker we just recorded.
+    if (settleInFlightByKey.size > HARD_MAX_LAST_ACTIVATIONS) {
+      for (const k of [...settleInFlightByKey.keys()]) {
+        if (settleInFlightByKey.size <= HARD_MAX_LAST_ACTIVATIONS) break;
+        if (k === key) continue;
+        settleInFlightByKey.delete(k);
+      }
+    }
     return { key, id };
   };
   const clearSettleInFlight = (mark) => {
@@ -9268,6 +9297,7 @@ async function workAgent(req, flags, ctx) {
       ttlMs: SETTLEMENT_PENDING_GHOST_TTL_MS,
       maxGhosts: MAX_SETTLEMENT_PENDING_LAST_ACTIVATIONS,
       hardMax: HARD_MAX_LAST_ACTIVATIONS,
+      maxKeys: HARD_MAX_LAST_ACTIVATIONS,
     });
   // Which engine this worker polls jobs from, surfaced to `supervisor status` via
   // the activity marker (#99). Derived from resolveWorkerPollEngineBase — the SDK

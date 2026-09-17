@@ -1272,6 +1272,28 @@ test('isLeaseLostSettleError ignores a status code that only appears in the resp
   );
 });
 
+// #256 review (follow-up, c8ctl-plugin.js:3556): a status code parsed out of the
+// MESSAGE is SUBORDINATE to a contradictory STRUCTURED status. An SDK rejection can
+// carry `... status code 404` in its message (e.g. echoed from the response body)
+// while its structured response/cause is a non-loss 5xx — that must NOT be read as a
+// lease loss, or it raises a false 30-minute settlement-pending ghost. The structured
+// status is authoritative.
+test('isLeaseLostSettleError keeps a message-only status code subordinate to a contradictory structured status', () => {
+  // Message says 404 but the structured status is a non-loss 500 -> not lease loss.
+  const sdk404on500 = new Error('Request failed with status code 404'); sdk404on500.status = 500;
+  assert.equal(isLeaseLostSettleError(sdk404on500), false, 'message 404 is vetoed by structured 500');
+  const sdk409on502 = new Error('completeJob: request failed with status code 409'); sdk409on502.statusCode = 502;
+  assert.equal(isLeaseLostSettleError(sdk409on502), false, 'message 409 is vetoed by structured 502');
+  // Same shape one hop down the cause chain.
+  const outer = new Error('Request failed with status code 404'); outer.cause = { response: { statusCode: 500 } };
+  assert.equal(isLeaseLostSettleError(outer), false, 'message 404 is vetoed by a structured 500 on the cause chain');
+  // But a message-only status code with NO structured status still classifies (the raw
+  // settle client path), and a structured 404/409 agreeing with the message is loss.
+  assert.equal(isLeaseLostSettleError(new Error('Request failed with status code 404')), true, 'message-only 404 with no structured status is lease loss');
+  const sdk404on404 = new Error('Request failed with status code 404'); sdk404on404.status = 404;
+  assert.equal(isLeaseLostSettleError(sdk404on404), true, 'structured 404 agreeing with the message is lease loss');
+});
+
 // #256 review: the cause-chain status extraction must read the NESTED
 // `response.statusCode` shape too, not only `response.status`. The repository's
 // own SDK-error normalizer (describeSdkError, agent-instance.mjs) supports

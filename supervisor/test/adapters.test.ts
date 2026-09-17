@@ -260,6 +260,7 @@ test("makeSupervisorDeps: omits absent optionals and normalizes the logger", asy
   assert.ok(!("agenticEndpoint" in bare));
   assert.ok(!("config" in bare));
   assert.ok(!("autoExtraTypes" in bare));
+  assert.ok(!("onFirstActivation" in bare));
   assert.equal(bare.logger, noopLogger); // no logger supplied → noop
 
   const full = makeSupervisorDeps({
@@ -280,6 +281,34 @@ test("makeSupervisorDeps: omits absent optionals and normalizes the logger", asy
   assert.deepEqual(full.autoExtraTypes, ["senior:plan", "senior:fix-ci"]);
   assert.deepEqual(full.config, { reconcileIntervalMs: 5_000 });
   assert.notEqual(full.logger, noopLogger);
+});
+
+test("makeSupervisorDeps: threads onFirstActivation through so the runtime fires the readiness stamp (#253)", async () => {
+  const registry = await Effect.runPromise(makeRegistry());
+  const engine = makeEngineClient({ ...noSettle, activate: async () => [], extendLock: async () => {} });
+  const runner = makeJobRunner({ run: async () => {} });
+  const reconcileReader = makeReconcileReader({
+    searchProcessDefinitionKeys: async () => [],
+    getProcessDefinitionXml: async () => "",
+  });
+  const scan = (_xml: string) => [] as ReadonlyArray<{ taskType: string; process: string }>;
+
+  // The monolith supplies the readiness stamp as an Effect; the adapter must
+  // carry it through unchanged so `supervisor.run` can fire it at loop entry.
+  // Assert by RUNNING the effect the deps expose and observing the side effect —
+  // a bare identity check wouldn't catch the port being dropped or wrapped.
+  let stamped = 0;
+  const deps = makeSupervisorDeps({
+    engine,
+    runner,
+    registry,
+    reconcileReader,
+    scan,
+    onFirstActivation: Effect.sync(() => { stamped += 1; }),
+  });
+  assert.ok("onFirstActivation" in deps, "the optional Effect must be threaded through");
+  await Effect.runPromise(deps.onFirstActivation!);
+  assert.equal(stamped, 1, "running the threaded Effect performs the readiness stamp exactly once");
 });
 
 test("lifted ports drive makeRegistry-backed dispatch shape end to end", async () => {

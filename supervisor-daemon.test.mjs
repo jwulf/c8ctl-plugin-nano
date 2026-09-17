@@ -120,12 +120,35 @@ function writeShim(shimPath, { recordArgv = false, workArgvDir = null, ignoreSig
     //   - SIGTERM (force abort): record and exit at once.
     // It records which signal it received to `sigFile`, so a test can prove a
     // drain finished the job vs a force cut it short.
-    const { drainMs = 300, sigFile } = busy;
+    const { drainMs = 300, sigFile, notReady = false, crashOnRespawn = false } = busy;
+    // A `notReady` stand-in stamps NO `readyAt`, modelling a replacement whose
+    // activation loop never comes up — the supervisor's rolling-reload readiness
+    // gate must then advance on its bounded timeout rather than wedge the roll.
+    const marker = notReady
+      ? `{ pid: process.pid, jobs: [{ key: 'J1', type: 'faker:senior', since: Date.now() }] }`
+      : `{ pid: process.pid, readyAt: Date.now(), jobs: [{ key: 'J1', type: 'faker:senior', since: Date.now() }] }`;
     lines.push(
-      `  const { writeFileSync: wf, rmSync: rm, mkdirSync: mk } = await import('node:fs');`,
+      `  const { writeFileSync: wf, rmSync: rm, mkdirSync: mk, existsSync: ex } = await import('node:fs');`,
       `  const { dirname } = await import('node:path');`,
       `  const actFile = process.env.NANO_SUPERVISOR_ACTIVITY_FILE;`,
-      `  try { mk(dirname(actFile), { recursive: true }); wf(actFile, JSON.stringify({ pid: process.pid, jobs: [{ key: 'J1', type: 'faker:senior', since: Date.now() }] })); } catch {}`,
+      `  try { mk(dirname(actFile), { recursive: true }); } catch {}`,
+    );
+    if (crashOnRespawn) {
+      // Model a replacement that FAILS to come up: the first incarnation runs
+      // normally, but a per-worker sentinel (keyed on the stable activity-file
+      // path) makes every *respawn* exit(1) at once — as if the reloaded child
+      // crashed on boot. `reloadWorker` then returns false and `runReload` must
+      // abort the rest of the roll (Copilot review on #253). The activity dir is
+      // created ABOVE first so the very first worker's sentinel write can't fail
+      // with ENOENT (which would let its respawn run healthy instead of crashing).
+      lines.push(
+        `  const sentinel = actFile + '.spawned';`,
+        `  if (ex(sentinel)) { process.exit(1); }`,
+        `  try { wf(sentinel, '1'); } catch {}`,
+      );
+    }
+    lines.push(
+      `  try { wf(actFile, JSON.stringify(${marker})); } catch {}`,
       `  let ending = false;`,
       `  const endWith = (how, delay) => {`,
       `    if (ending && how !== 'forced') return; ending = true;`,
@@ -142,6 +165,11 @@ function writeShim(shimPath, { recordArgv = false, workArgvDir = null, ignoreSig
   } else {
     if (ignoreSigterm) lines.push(`  process.on('SIGTERM', () => {}); // force the SIGKILL path on restart`);
     lines.push(
+      // Stamp a ready activity marker so the supervisor's rolling-reload readiness
+      // gate (`waitForWorkerReady`) resolves at once for this idle stand-in instead
+      // of waiting out the bounded timeout — the real worker stamps `readyAt` once
+      // its activation loop is up.
+      `  try { const { writeFileSync: rwf, mkdirSync: rmk } = await import('node:fs'); const { dirname: rdn } = await import('node:path'); const raf = process.env.NANO_SUPERVISOR_ACTIVITY_FILE; if (raf) { rmk(rdn(raf), { recursive: true }); rwf(raf, JSON.stringify({ pid: process.pid, readyAt: Date.now(), jobs: [] })); } } catch {}`,
       `  const { installParentDeathWatchdog } = await import(${JSON.stringify(pluginUrl)});`,
       `  const dp = Number.parseInt(process.env.NANO_SUPERVISOR_DAEMON_PID ?? '', 10);`,
       `  installParentDeathWatchdog({ intervalMs: 100, parentPid: Number.isInteger(dp) ? dp : undefined });`,
@@ -647,19 +675,24 @@ async function stopStream(mod, { force = false, sendAfter = null } = {}) {
   });
 }
 
-async function bootBusyDaemon(t, { drainMs = 300 } = {}) {
+async function bootBusyDaemon(t, { drainMs = 300, notReady = false, readyTimeoutMs = null, crashOnRespawn = false } = {}) {
   const HOME = mkdtempSync(join(tmpdir(), 'c8ctl-sup-drain-'));
   const prevHome = process.env.C8CTL_NANO_HOME;
   const prevEntry = process.env.C8CTL_NANO_ENTRY;
   const prevMon = process.env.NANO_SUPERVISOR_MONITOR_MS;
+  const prevReadyTimeout = process.env.NANO_SUPERVISOR_RELOAD_READY_TIMEOUT_MS;
   process.env.C8CTL_NANO_HOME = HOME;
   process.env.NANO_SUPERVISOR_MONITOR_MS = '80'; // keep status broadcasts prompt
+  // The reload readiness timeout is read at plugin load in the spawned daemon,
+  // which inherits this env — set it BEFORE startSupervisorDaemon so a never-ready
+  // replacement's bounded wait is short in the test.
+  if (readyTimeoutMs != null) process.env.NANO_SUPERVISOR_RELOAD_READY_TIMEOUT_MS = String(readyTimeoutMs);
   writeFileSync(join(HOME, 'config.json'), JSON.stringify({
     hires: { faker: { name: 'faker', rank: 'senior', command: 'true', model: '', capabilities: [] } },
   }));
   const sigFile = join(HOME, 'worker-signal.txt');
   const shim = join(HOME, 'fake-entry.mjs');
-  writeShim(shim, { busy: { drainMs, sigFile } });
+  writeShim(shim, { busy: { drainMs, sigFile, notReady, crashOnRespawn } });
   process.env.C8CTL_NANO_ENTRY = shim;
   const mod = await import(pluginUrl);
   t.after(async () => {
@@ -669,6 +702,7 @@ async function bootBusyDaemon(t, { drainMs = 300 } = {}) {
     restoreEnv('C8CTL_NANO_ENTRY', prevEntry);
     restoreEnv('C8CTL_NANO_HOME', prevHome);
     restoreEnv('NANO_SUPERVISOR_MONITOR_MS', prevMon);
+    restoreEnv('NANO_SUPERVISOR_RELOAD_READY_TIMEOUT_MS', prevReadyTimeout);
     try { rmSync(HOME, { recursive: true, force: true }); } catch {}
   });
   const state = await mod.startSupervisorDaemon();
@@ -738,4 +772,232 @@ test('supervisor remove (force:false): drains a worker without killing it (issue
   // The daemon itself stays up (only the worker was removed).
   assert.ok(mod.runningSupervisor(), 'the daemon should keep running after a drain-remove');
   await mod.supervisorRequest({ op: 'stop', force: true });
+});
+
+// A tiny streaming reload client: opens the control socket, sends `{op:'reload'}`
+// (with a target token or targets array), and collects every decoded frame
+// until the terminal `reloaded` frame (or the socket closes). Returns the frames
+// so a test can assert on the rolling progress + terminal frame.
+async function reloadStream(mod, { target = 'all', targets = null } = {}) {
+  const socketPath = mod.getSupervisorSocketPath();
+  const { encodeFrame, decodeFrames } = mod;
+  return await new Promise((resolve, reject) => {
+    const sock = createConnection(socketPath);
+    const frames = [];
+    let buf = '';
+    let done = false;
+    const finish = () => { if (done) return; done = true; try { sock.end(); } catch {} resolve(frames); };
+    sock.setEncoding('utf8');
+    sock.on('connect', () => {
+      sock.write(encodeFrame(targets ? { op: 'reload', targets } : { op: 'reload', target }));
+    });
+    sock.on('data', (chunk) => {
+      buf += chunk;
+      const { frames: fr, rest } = decodeFrames(buf);
+      buf = rest;
+      for (const f of fr) { frames.push(f); if (f && (f.type === 'reloaded' || f.final)) finish(); }
+    });
+    sock.on('close', () => finish());
+    sock.on('error', (err) => { if (!done) { done = true; reject(err); } });
+  });
+}
+
+test('supervisor reload: gracefully drains and respawns a worker to adopt new code', async (t) => {
+  const { mod, sigFile } = await bootBusyDaemon(t, { drainMs: 150 });
+  const before = await mod.supervisorRequest({ op: 'status' });
+  assert.equal(before.workers.length, 1);
+  const id = before.workers[0].id;
+  const oldPid = before.workers[0].pid;
+
+  const frames = await reloadStream(mod, { target: 'all' });
+  // The daemon announced a rolling reload and ended with a terminal frame that
+  // lists the reloaded worker.
+  assert.ok(frames.some((f) => f && f.type === 'reloading'), `expected a reloading frame: ${JSON.stringify(frames)}`);
+  const term = frames.find((f) => f && f.type === 'reloaded' && f.final);
+  assert.ok(term, 'expected a terminal reloaded frame');
+  assert.deepEqual(term.reloaded, [id], 'the terminal frame should list the reloaded worker');
+
+  // A successful reload broadcasts the per-worker `worker-reload` progress event
+  // (gated on the final success gate, #253 review) so the streaming client can
+  // print `reloaded "…" (adopted new code)` for a genuinely-adopted worker.
+  assert.ok(
+    frames.some((f) => f && f.event === 'worker-reload' && f.id === id),
+    'a successful reload should broadcast a per-worker worker-reload progress event',
+  );
+
+  // The worker adopted new code by DRAINING (SIGUSR2 — finished its job), never
+  // a force kill.
+  assert.equal(readFileSync(sigFile, 'utf8'), 'drained', 'the worker drained (SIGUSR2), not force-killed');
+
+  // Exactly one worker remains (no leaked duplicate), with a NEW pid (respawned
+  // → re-read the plugin from disk) and restarts still 0 (a reload is not a
+  // crash-restart).
+  let after = null;
+  for (let i = 0; i < 40; i++) {
+    const s = await mod.supervisorRequest({ op: 'status' });
+    if (s.workers.length === 1 && s.workers[0].state === 'running' && s.workers[0].pid && s.workers[0].pid !== oldPid) { after = s.workers[0]; break; }
+    await sleep(50);
+  }
+  assert.ok(after, 'the worker should be running again under a new pid after reload');
+  assert.equal(after.id, id, 'the worker keeps its id across a reload');
+  assert.equal(after.restarts, 0, 'a reload must not be counted as a crash-restart');
+
+  // The daemon itself stays up and its state file is intact — a reload is not a
+  // stop.
+  assert.ok(mod.runningSupervisor(), 'the daemon should keep running after a reload');
+  await mod.supervisorRequest({ op: 'stop', force: true });
+});
+
+test('supervisor reload: rolls the whole fleet, giving every worker a fresh pid', async (t) => {
+  const { mod } = await bootBusyDaemon(t, { drainMs: 120 });
+  // Add a second busy worker so the reload is a genuine rolling pass.
+  const added = await mod.supervisorRequest({ op: 'add', profile: 'faker' });
+  assert.equal(added.ok, true);
+  // Wait for both to be running.
+  let before = [];
+  for (let i = 0; i < 40; i++) {
+    const s = await mod.supervisorRequest({ op: 'status' });
+    if (s.workers.length === 2 && s.workers.every((w) => w.state === 'running' && w.pid)) { before = s.workers; break; }
+    await sleep(50);
+  }
+  assert.equal(before.length, 2, 'two workers should be running before reload');
+  const oldPids = new Map(before.map((w) => [w.id, w.pid]));
+
+  const frames = await reloadStream(mod, { target: 'all' });
+  const term = frames.find((f) => f && f.type === 'reloaded' && f.final);
+  assert.ok(term, 'expected a terminal reloaded frame');
+  assert.equal(term.reloaded.length, 2, 'both workers should have been reloaded');
+
+  // Both workers survive (count unchanged) with fresh pids.
+  let after = [];
+  for (let i = 0; i < 60; i++) {
+    const s = await mod.supervisorRequest({ op: 'status' });
+    if (s.workers.length === 2 && s.workers.every((w) => w.state === 'running' && w.pid && w.pid !== oldPids.get(w.id))) { after = s.workers; break; }
+    await sleep(50);
+  }
+  assert.equal(after.length, 2, 'exactly two workers after a fleet reload (no leaks)');
+  for (const w of after) {
+    assert.notEqual(w.pid, oldPids.get(w.id), `worker ${w.id} should have a new pid after reload`);
+    assert.equal(w.restarts, 0, 'reload is not a crash-restart');
+  }
+  await mod.supervisorRequest({ op: 'stop', force: true });
+});
+
+test('supervisor reload: a never-ready replacement does not wedge the roll (bounded readiness gate)', async (t) => {
+  // The replacement never stamps `readyAt`, so the readiness gate can only clear
+  // on its bounded timeout — set short here. The roll must still finish, listing
+  // the worker as reloaded (it advanced anyway), not hang forever.
+  const { mod } = await bootBusyDaemon(t, { drainMs: 100, notReady: true, readyTimeoutMs: 300 });
+  const before = await mod.supervisorRequest({ op: 'status' });
+  assert.equal(before.workers.length, 1);
+  const id = before.workers[0].id;
+  const oldPid = before.workers[0].pid;
+
+  const started = Date.now();
+  const frames = await reloadStream(mod, { target: 'all' });
+  const elapsed = Date.now() - started;
+  const term = frames.find((f) => f && f.type === 'reloaded' && f.final);
+  assert.ok(term, 'expected a terminal reloaded frame even when the replacement never reports ready');
+  assert.deepEqual(term.reloaded, [id], 'the never-ready worker still counts as reloaded (advanced on timeout)');
+  // The bounded gate means the roll completes near the readiness timeout, not
+  // indefinitely — generously bounded to stay robust on a slow CI box.
+  assert.ok(elapsed < 8000, `reload should complete on the bounded timeout, took ${elapsed}ms`);
+
+  // The worker was genuinely respawned (new pid), just never signalled ready.
+  let after = null;
+  for (let i = 0; i < 40; i++) {
+    const s = await mod.supervisorRequest({ op: 'status' });
+    if (s.workers.length === 1 && s.workers[0].state === 'running' && s.workers[0].pid && s.workers[0].pid !== oldPid) { after = s.workers[0]; break; }
+    await sleep(50);
+  }
+  assert.ok(after, 'the worker should be respawned under a new pid even without a readiness signal');
+  assert.ok(mod.runningSupervisor(), 'the daemon should keep running after a bounded-timeout reload');
+  await mod.supervisorRequest({ op: 'stop', force: true });
+});
+
+test('supervisor reload: a failed replacement aborts the roll (canary) and is reported as a partial failure', async (t) => {
+  // Both workers crash on RESPAWN (a per-worker sentinel makes the reloaded child
+  // exit 1 on boot). When the first worker's replacement fails, `reloadWorker`
+  // returns false and `runReload` must ABORT the rest of the pass rather than
+  // drain the next worker on top of the gap — so the second worker is left
+  // untouched (original pid) and the terminal frame reports a partial failure
+  // (`ok:false`, remaining ids skipped). #253 review (suppressed advisories).
+  // A large readiness timeout does NOT slow this test: `waitForWorkerReady`
+  // returns EARLY the moment the replacement exits, so the crash resolves the
+  // gate at once. The generous bound only guarantees the (slow, cold) node boot
+  // reaches the sentinel-crash BEFORE the timeout — otherwise a still-booting
+  // child would be counted as a best-effort timeout-success and the failure path
+  // wouldn't be exercised deterministically.
+  const { mod } = await bootBusyDaemon(t, { drainMs: 60, crashOnRespawn: true, readyTimeoutMs: 10_000 });
+  await mod.supervisorRequest({ op: 'add', profile: 'faker' });
+  // Wait until BOTH workers are up with pids.
+  let before = null;
+  for (let i = 0; i < 60; i++) {
+    const s = await mod.supervisorRequest({ op: 'status' });
+    if (s.workers.length === 2 && s.workers.every((w) => w.pid)) { before = s; break; }
+    await sleep(50);
+  }
+  assert.ok(before, 'both workers should be up before the reload');
+  const pidById = new Map(before.workers.map((w) => [w.id, w.pid]));
+
+  const frames = await reloadStream(mod, { target: 'all' });
+  const term = frames.find((f) => f && f.type === 'reloaded' && f.final);
+  assert.ok(term, 'expected a terminal reloaded frame');
+  assert.equal(term.ok, false, 'a failed reload must make the terminal frame a partial failure (ok:false)');
+  assert.equal(term.reloaded.length, 0, 'the crashing replacement is not counted as reloaded');
+  assert.equal(term.skipped.length, 2, 'the failed worker AND the not-yet-rolled worker are both skipped (roll aborted)');
+  assert.deepEqual([...term.skipped].sort(), [...pidById.keys()].sort(), 'both worker ids appear in skipped');
+
+  // The per-worker `worker-reload` progress event is gated on the final success
+  // gate, so a reload that FAILS (crash/spawn-fail) must NOT broadcast it — a
+  // spawn-time broadcast would let the streaming client print `reloaded "…"
+  // (adopted new code)` for a worker that actually ended up skipped (#253 review).
+  assert.ok(
+    !frames.some((f) => f && f.event === 'worker-reload'),
+    'a failed reload must not broadcast a per-worker worker-reload progress event',
+  );
+
+  // Exactly one worker was drained (the first, which then crashed on respawn);
+  // the other must be UNTOUCHED — still on its original pid — proving the roll
+  // aborted instead of draining it too.
+  const after = await mod.supervisorRequest({ op: 'status' });
+  const untouched = after.workers.filter((w) => w.pid && w.pid === pidById.get(w.id));
+  assert.equal(untouched.length >= 1, true, 'at least one worker must be left untouched (roll aborted before draining it)');
+  assert.ok(mod.runningSupervisor(), 'the daemon should keep running after an aborted reload');
+  await mod.supervisorRequest({ op: 'stop', force: true });
+});
+
+test('supervisor status: surfaces the on-disk plugin version', async (t) => {
+  const { mod } = await bootBusyDaemon(t, { drainMs: 120 });
+  const s = await mod.supervisorRequest({ op: 'status' });
+  assert.ok(s.ok, 'status should succeed');
+  assert.ok(typeof s.pluginVersion === 'string' && s.pluginVersion.length > 0, 'status frame carries the on-disk plugin version');
+  assert.equal(s.pluginVersion, s.daemon.version, 'with no update on disk the running daemon and on-disk versions match');
+  await mod.supervisorRequest({ op: 'stop', force: true });
+});
+
+test('formatSupervisorStatus: renders the update-available reload hint when the on-disk version differs', async () => {
+  const mod = await import(pluginUrl);
+  // On-disk plugin has advanced past the running daemon → the mismatch branch
+  // must render the operator-visible "update available … run `… supervisor reload`"
+  // hint. Pass pluginVersion explicitly so the render is deterministic (no
+  // dependency on the repo's actual package version).
+  const stale = mod.formatSupervisorStatus({
+    daemon: { pid: 999999999, version: '1.0.0', socket: '/tmp/sock' },
+    pluginVersion: '1.1.0',
+    workers: [],
+  });
+  assert.match(stale, /on disk:\s+1\.1\.0/, 'the on-disk version is shown');
+  assert.match(stale, /update available/, 'the update-available warning is rendered');
+  assert.match(stale, /supervisor reload/, 'the reload hint names the reload command');
+
+  // Matching versions → NO warning line at all (guards against a regression that
+  // inverts or drops the `!==` check and warns on every status).
+  const current = mod.formatSupervisorStatus({
+    daemon: { pid: 999999999, version: '1.1.0', socket: '/tmp/sock' },
+    pluginVersion: '1.1.0',
+    workers: [],
+  });
+  assert.doesNotMatch(current, /on disk:/, 'no on-disk line when versions match');
+  assert.doesNotMatch(current, /update available/, 'no update-available warning when versions match');
 });

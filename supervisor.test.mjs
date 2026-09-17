@@ -1207,6 +1207,19 @@ test('isLeaseLostSettleError classifies definitive lease loss vs transient failu
   assert.equal(isLeaseLostSettleError(new Error('ECONNRESET')), false);
   const four29 = new Error('rate limited'); four29.statusCode = 429;
   assert.equal(isLeaseLostSettleError(four29), false);
+  // A NUMERIC `err.code` (the shape `describeSdkError` treats as a status,
+  // agent-instance.mjs) is read from the cause-chain walk (#256 review); a string
+  // code like `ECONNRESET` is NOT a status and must stay a non-loss transient.
+  const codeLoss = new Error('completeJob failed'); codeLoss.code = 409;
+  assert.equal(isLeaseLostSettleError(codeLoss), true);
+  const codeLoss404 = new Error('failJob failed'); codeLoss404.code = 404;
+  assert.equal(isLeaseLostSettleError(codeLoss404), true);
+  const codeOther = new Error('server error'); codeOther.code = 500;
+  assert.equal(isLeaseLostSettleError(codeOther), false);
+  const strCode = new Error('socket hang up'); strCode.code = 'ECONNRESET';
+  assert.equal(isLeaseLostSettleError(strCode), false);
+  const wrappedCode = new Error('settle failed'); wrappedCode.cause = { code: 409 };
+  assert.equal(isLeaseLostSettleError(wrappedCode), true); // numeric code on the cause chain
   assert.equal(isLeaseLostSettleError(null), false);
 });
 

@@ -3531,6 +3531,7 @@ function isLeaseLostSettleError(err) {
   // HTTP_STATUS_RE) AND the cause chain, separating a definitive lease-loss status
   // (404/409) from a contradictory one. SDK rejections often carry the status as
   // `err.status`/`err.statusCode`/`err.response.status`/`err.response.statusCode`
+  // or a NUMERIC `err.code` (a string code like `ECONNRESET` is NOT a status)
   // rather than in the message (all the nested shapes `describeSdkError` normalizes,
   // agent-instance.mjs); the cause walk is bounded so a cycle can't loop.
   let leaseStatus = false;
@@ -3543,7 +3544,8 @@ function isLeaseLostSettleError(err) {
   }
   let e = err;
   for (let depth = 0; e != null && typeof e === 'object' && depth <= 4; depth += 1) {
-    const s = e.status ?? e.statusCode ?? (e.response && (e.response.status ?? e.response.statusCode));
+    const s = e.status ?? e.statusCode ?? (e.response && (e.response.status ?? e.response.statusCode))
+      ?? (typeof e.code === 'number' ? e.code : undefined);
     if (s === 409 || s === 404) leaseStatus = true;
     else if (Number.isFinite(s)) otherStatus = true;
     e = e.cause;

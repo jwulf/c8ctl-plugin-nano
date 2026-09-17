@@ -123,7 +123,10 @@ SDK client (job workers) — do **not** add the SDK as a dependency or use raw
   until the FIRST external-agent activation and gated on that capability), or when
   the profile carries extra args (an interpreter-style `node agent.js` would probe the
   interpreter, not the harness) — the field is omitted rather than misattributed; the
-  probe further refuses an embedded-argument/compound `command` and runs (once, cached)
+  probe further refuses an embedded-argument/compound `command` (and a RELATIVE-path
+  `command` like `./harness`, whose resolution against the worker's cwd — not the
+  per-job cwd the harness actually launches from — is ambiguous; only bare PATH names
+  and absolute paths are probed) and runs (once, cached)
   in that first external job's launch context under the SAME merged profile+`setup.env`
   env, so `${command} --version` can neither execute a script nor resolve
   a different PATH binary than the real run (and a worker that only services ordinary

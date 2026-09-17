@@ -1755,8 +1755,21 @@ function probeAgentCliVersion(command, { timeoutMs = 1500, run = spawnSync, env 
   // program — and persist a false `agentCliVersion`. A token carrying whitespace or
   // shell metacharacters is not a bare executable: omit the probe rather than
   // record a wrong (or side-effecting) reading. A plain path token (with / \ : . _ -)
-  // is still allowed so an absolute/relative harness path probes normally.
+  // is still allowed so an absolute harness path probes normally.
   if (!/^[\w./\\:+-]+$/.test(command.trim())) return null;
+  // #257 review: SKIP a RELATIVE path command (a token carrying a path separator
+  // that is not absolute, e.g. `./harness`, `../bin/tool`, `sub/dir/cmd`). Unlike a
+  // bare PATH-resolved name (cwd-independent) or an absolute path (fully determined),
+  // a relative path resolves against the probe's cwd — which is the WORKER's cwd, NOT
+  // the per-job `cwd` (a fresh run dir / cloned repo) the harness is actually launched
+  // from in `runAgentJob`. Probing `./harness` here could read a different file/version
+  // than the command the job runs (or find nothing where the job would), persisting a
+  // false/omitted `agentCliVersion`. Best-effort: omit rather than record a wrong
+  // reading for a command whose resolution is cwd-ambiguous.
+  {
+    const cmd = command.trim();
+    if (/[\\/]/.test(cmd) && !isAbsolute(cmd)) return null;
+  }
   let out;
   try {
     out = run(`${command} --version`, {

@@ -4493,11 +4493,38 @@ test('probeAgentCliVersion omits an embedded-argument / compound command rather 
     );
     assert.equal(called, false, 'the spawner is never invoked for a non-bare command');
   }
-  // A plain absolute/relative path token IS a bare executable — probe it normally.
+  // A plain absolute path token IS a bare executable — probe it normally.
   assert.equal(
     probeAgentCliVersion('/usr/local/bin/copilot', { run: () => ({ status: 0, stdout: 'copilot 1.2.3' }) }),
     '1.2.3',
     'a bare path executable still probes',
+  );
+});
+
+test('probeAgentCliVersion skips a RELATIVE path command (cwd-ambiguous) but not bare/absolute (#257)', () => {
+  // A relative path resolves against the probe's cwd (the worker's), not the per-job
+  // cwd the harness actually runs from, so it could read a different file/version.
+  // Omit it. Bare PATH names and absolute paths remain probeable.
+  for (const rel of ['./harness', '../bin/tool', 'sub/dir/cmd', '.\\harness']) {
+    let called = false;
+    assert.equal(
+      probeAgentCliVersion(rel, { run: () => { called = true; return { status: 0, stdout: '9.9.9' }; } }),
+      null,
+      `relative path "${rel}" is not probed`,
+    );
+    assert.equal(called, false, 'the spawner is never invoked for a relative-path command');
+  }
+  // A bare PATH-resolved name (cwd-independent) still probes.
+  assert.equal(
+    probeAgentCliVersion('copilot', { run: () => ({ status: 0, stdout: 'copilot 3.0.0' }) }),
+    '3.0.0',
+    'a bare PATH name still probes',
+  );
+  // An absolute path (fully determined) still probes.
+  assert.equal(
+    probeAgentCliVersion('/opt/bin/harness', { run: () => ({ status: 0, stdout: 'harness 4.5.6' }) }),
+    '4.5.6',
+    'an absolute path still probes',
   );
 });
 

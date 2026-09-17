@@ -161,6 +161,53 @@ test("connect fails when the socket closes before it opens (superviseAgentic the
   assert.match(result, /closed before it opened/);
 });
 
+test("a raw send that never opens is torn down when the connect is INTERRUPTED", async () => {
+  // Regression (worker drain wedge): the raw emit client is built — and its
+  // internal reconnect timers/sockets started (`client.open()`) — BEFORE the
+  // socket opens. When the hub is unreachable it never fires onOpen (and a
+  // transient drop just reconnects internally, never firing the single-shot
+  // onClose), so `connect` blocks on `opened` forever. If the supervisor fiber
+  // is then interrupted (SIGUSR2 drain / SIGTERM abort), `connect` must close
+  // the half-open raw client it created; otherwise its live timers keep the
+  // worker process alive after teardown and the daemon's drain wedges (0
+  // in-flight jobs, yet the child never exits).
+  const raw = new FakeRawClient();
+  const endpoint = makeAgenticEndpoint(() => raw);
+
+  await Effect.runPromise(
+    Effect.gen(function* () {
+      const fiber = yield* Effect.forkChild(endpoint.connect());
+      yield* Effect.yieldNow; // let connect build the raw client and park on `opened`
+      assert.equal(raw.closedByCaller, false, "not closed while connecting");
+      // Interrupt before any open ever fires (the unreachable-hub case).
+      yield* Fiber.interrupt(fiber);
+      assert.equal(
+        raw.closedByCaller,
+        true,
+        "an interrupted connect must close the half-open raw client it created",
+      );
+    }),
+  );
+});
+
+test("connect closes the raw client when the socket closes before it opens", async () => {
+  // The fail-before-open path must ALSO tear the half-open client down (same
+  // leak as the interrupt case): `superviseAgentic` retries `connect`, so a
+  // leaked client per failed attempt would pile up live sockets/timers.
+  const raw = new FakeRawClient();
+  const endpoint = makeAgenticEndpoint(() => raw);
+
+  await Effect.runPromise(
+    Effect.gen(function* () {
+      const fiber = yield* Effect.forkChild(endpoint.connect());
+      yield* Effect.yieldNow;
+      raw.drop(); // close before any open → connect fails
+      yield* Fiber.join(fiber).pipe(Effect.catch(() => Effect.void));
+      assert.equal(raw.closedByCaller, true, "a connect that fails before open closes the client");
+    }),
+  );
+});
+
 test("a raw send failure surfaces as a SupervisorError the caller can swallow", async () => {
   const raw = new FakeRawClient();
   const endpoint = makeAgenticEndpoint(() => raw);

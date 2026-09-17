@@ -6,6 +6,7 @@
 // exercised separately.
 import { test } from 'node:test';
 import assert from 'node:assert/strict';
+import { EventEmitter } from 'node:events';
 
 import {
   reconstructWorkArgs,
@@ -47,6 +48,8 @@ import {
   pruneActivationGuard,
   bindJobSettle,
   countSupervisorInFlight,
+  activityMarkerReadyFor,
+  waitForChildExit,
   supervisorWorkerActivityFile,
   SETTLEMENT_PENDING_GHOST_TTL_MS,
   WORK_FORWARD_FLAGS,
@@ -1103,6 +1106,7 @@ test('buildActivityPayload carries engine + agentic and derives busy from jobs',
     jobs: [],
     engine: 'http://localhost:8080',
     agentic: { status: 'connected', mode: 'local' },
+    readyAt: null,
   });
 
   // Busy: jobs present → busy:true; the live job list rides through untouched.
@@ -1121,6 +1125,46 @@ test('buildActivityPayload carries engine + agentic and derives busy from jobs',
   const noJobs = buildActivityPayload({ pid: 1, updatedAt: 3, jobs: undefined, engine: 'e', agentic: { status: 'off' } });
   assert.deepEqual(noJobs.jobs, []);
   assert.equal(noJobs.busy, false);
+  // readyAt: null until the worker's activation loop is up; passes through verbatim
+  // once stamped (the supervisor's rolling reload gates on it, so it must survive).
+  assert.equal(noJobs.readyAt, null, 'readyAt defaults to null (not-yet-ready)');
+  const ready = buildActivityPayload({ pid: 1, updatedAt: 3, jobs: [], engine: 'e', agentic: { status: 'off' }, readyAt: 4242 });
+  assert.equal(ready.readyAt, 4242, 'a stamped readyAt rides through untouched');
+});
+
+test('activityMarkerReadyFor: a marker is ready only with a finite readyAt AND a matching pid (#253)', () => {
+  // Happy path: this child's marker, stamped ready.
+  assert.equal(activityMarkerReadyFor({ pid: 4242, readyAt: 100 }, 4242), true);
+  // Not-yet-ready: no readyAt (activation loop hasn't reported in).
+  assert.equal(activityMarkerReadyFor({ pid: 4242, readyAt: null }, 4242), false);
+  assert.equal(activityMarkerReadyFor({ pid: 4242 }, 4242), false);
+  // Stale marker: a readyAt from a PREVIOUS incarnation (foreign pid) must NOT
+  // satisfy the gate for the freshly spawned replacement — the core of the fix.
+  assert.equal(activityMarkerReadyFor({ pid: 999999, readyAt: 100 }, 4242), false);
+  // A non-finite readyAt is never ready; a missing marker is never ready.
+  assert.equal(activityMarkerReadyFor({ pid: 4242, readyAt: NaN }, 4242), false);
+  assert.equal(activityMarkerReadyFor(null, 4242), false);
+});
+
+test('waitForChildExit removes its exit listener on timeout — no listener accumulation across polls (#253)', async () => {
+  // A fake long-lived child: never exits, so every poll resolves via timeout.
+  const child = new EventEmitter();
+  child.exitCode = null;
+  child.signalCode = null;
+  // The readiness poll calls waitForChildExit ~every 100ms for up to 30s. Simulate
+  // many poll cycles: if the timeout path leaked its `exit` listener (the pre-fix
+  // bug), the count would climb with each call and eventually warn.
+  for (let i = 0; i < 50; i++) {
+    await waitForChildExit(child, 1);
+  }
+  assert.equal(child.listenerCount('exit'), 0, 'no exit listeners retained after timed-out polls');
+
+  // The child eventually exits: an armed wait still resolves and cleans up.
+  const p = waitForChildExit(child, 10_000);
+  child.exitCode = 0;
+  child.emit('exit', 0, null);
+  await p;
+  assert.equal(child.listenerCount('exit'), 0, 'exit path also removes its listener');
 });
 
 // #254: a settlement-pending ghost must not make an idle worker look busy.

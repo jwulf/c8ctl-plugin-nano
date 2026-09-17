@@ -1076,6 +1076,8 @@ c8ctl nano supervisor add reviewer                  # add + spawn a worker (forw
 c8ctl nano supervisor add reviewer --name reviewer-2 # a SECOND reviewer, named so it stays distinct
 c8ctl nano supervisor add reviewer --instances 3    # add 3 distinct auto-named reviewers in one call
 c8ctl nano supervisor restart reviewer             # by worker id or profile name
+c8ctl nano supervisor reload                        # adopt new code fleet-wide (rolling drain+respawn, zero downtime)
+c8ctl nano supervisor reload reviewer               # reload just one worker/profile
 c8ctl nano supervisor remove coder                 # stop + drop a worker (also: `all`)
 c8ctl nano supervisor logs reviewer --follow       # tail a worker's log (or the daemon's)
 c8ctl nano supervisor stop                          # stop the daemon and every worker
@@ -1124,6 +1126,73 @@ How it works and where things live:
   exit from the old process is never mis-counted against the new one).
 - Stopping is SIGTERM → grace → SIGKILL, per worker and for the daemon; `stop`
   always clears `supervisor.json` so a stale marker never wedges a future start.
+
+### Hot code reload: `supervisor reload` / `workforce reload`
+
+When you update the plugin on a machine that's already running a fleet
+(`c8ctl nano update`, or otherwise replacing the installed `c8ctl-plugin-nano`),
+`supervisor reload` adopts the new code **without stopping the fleet**:
+
+```bash
+c8ctl nano update            # pull the new harness onto disk
+c8ctl nano supervisor reload # roll it into the running fleet, zero downtime
+```
+
+- Each supervised worker is a **separate `nano work` process** that reads the
+  plugin from disk when it starts, so the daemon adopts new code by **rolling
+  through the workers one at a time** — gracefully draining each (the same
+  `SIGUSR2` quiesce as `stop`: it stops leasing new jobs, finishes the ones in
+  flight, and exits) and respawning it, which re-reads the updated
+  `c8ctl-plugin.js`, its sidecars, and `supervisor.dist.js`. Because only one
+  worker is down at a time, the rest of the fleet keeps serving — **zero fleet
+  downtime**. To keep it genuinely one-at-a-time, after respawning a worker the
+  daemon **waits for the replacement to report ready** (its activation loop is up
+  and leasing) before draining the next one — a bare spawn/PID is not readiness,
+  so on the normal readiness path a slow replacement can never leave two workers
+  down at once. That wait is
+  **bounded** (`NANO_SUPERVISOR_RELOAD_READY_TIMEOUT_MS`, default 30s): a
+  never-ready replacement can't wedge the roll — the daemon advances anyway. That
+  timeout fallback is the one exception to the guarantee above: when a
+  replacement never reports ready the daemon drains the next worker while the
+  previous one is still unready, so **two (or more) workers can be temporarily
+  unavailable** until the slow replacement catches up. This
+  is a *fleet-level* guarantee: a worker is drained **before** its replacement
+  spawns, so a **single-worker fleet** (or a job type served by only one worker)
+  does lose that capacity for the drain+boot window. Run more than
+  one worker for a type if you need it served continuously across a reload.
+- It **never kills in-flight work**: a reload waits indefinitely for each
+  worker's jobs to finish (adopting new code is never worth losing a running
+  job). The command **streams progress** and **Ctrl-C detaches** — the daemon
+  keeps rolling in the background (rerun `supervisor status` to check). A reload
+  is refused while another is already in progress.
+- It **stops the roll on a failed reload** (a canary): if a worker's replacement
+  crashes, fails to spawn, or is swapped out from under the roll — i.e. it has no
+  confirmed serving child — the daemon aborts the remaining pass rather than drain
+  the next worker on top of that gap (which would both break one-at-a-time and
+  risk rolling a broken replacement across the whole fleet). The remaining workers
+  are reported **skipped** and the terminal frame reports a partial failure
+  (`ok:false`), so automation sees it. A readiness *timeout* on a still-live
+  replacement is **not** a failure — it counts as reloaded and the roll continues.
+- `reload [target]` defaults to the whole fleet; pass a worker id or profile to
+  reload just those. `workforce reload` rolls only the workers a manifest owns.
+- **Not supported on Windows.** The graceful drain relies on `SIGUSR2` to quiesce
+  each worker, which Windows cannot deliver (Node maps a non-zero signal there to
+  a forceful, SIGKILL-like termination, so the child's drain handler never fires).
+  The daemon therefore **rejects `supervisor reload` / `workforce reload` on
+  Windows** rather than hang or hard-kill in-flight work — use
+  `supervisor restart <target>`, or a full `supervisor stop` + `start`, to adopt
+  new code there.
+- **Scope — workers, not the daemon.** A reload adopts all **worker-side** code
+  (job running, agent instances, git/container provisioning, the agentic
+  connection, the Effect runtime workers load — the bulk of the harness). The
+  supervisor **daemon** keeps running the code it started with: its workers are
+  its children and watch its pid, so re-exec'ing the daemon would take the fleet
+  down with it. To adopt new **supervisor** code, do a full restart
+  (`c8ctl nano supervisor stop && c8ctl nano supervisor start`) — a rare event,
+  since the daemon is a thin process manager. `supervisor status` shows an
+  `on disk:` line flagging "update available" whenever the code on disk has
+  advanced past the running daemon, so you know when a reload (or restart) is
+  worthwhile.
 
 ### Surviving SSH logout: `supervisor install` / `uninstall`
 
@@ -1232,6 +1301,7 @@ c8ctl nano workforce list                 # print the manifest (+ --json)
 c8ctl nano workforce start                # ensure the daemon is up, then reconcile
 c8ctl nano workforce status               # desired vs actual, per worker (+ --json)
 c8ctl nano workforce stop                 # remove this manifest's workers (+ stop an empty daemon)
+c8ctl nano workforce reload               # hot-adopt new code into this manifest's workers (rolling, zero downtime)
 c8ctl nano workforce remove qwen          # drop an entry ("all" clears the manifest)
 ```
 

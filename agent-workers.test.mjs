@@ -7,7 +7,7 @@ import { spawn, spawnSync } from 'node:child_process';
 
 import { mkdtempSync, mkdirSync, writeFileSync, rmSync, existsSync, utimesSync, readdirSync, readFileSync } from 'node:fs';
 import { tmpdir } from 'node:os';
-import { join } from 'node:path';
+import { join, delimiter } from 'node:path';
 
 import {
   normalizeTaskEnvelope,
@@ -45,6 +45,8 @@ import {
   hasValuelessArg,
   shQuote,
   buildAgentCommandLine,
+  extractVersionToken,
+  probeAgentCliVersion,
   reapAgentContainers,
   diskBudgetOk,
   normalizeStoredProfile,
@@ -4449,6 +4451,164 @@ test('buildAgentCommandLine appends shell-quoted args, verbatim when none', () =
   );
   // A malicious arg can't break out of its literal (no injection).
   assert.equal(buildAgentCommandLine('copilot', ['; rm -rf /']), `copilot '; rm -rf /'`);
+});
+
+// #243: agent-CLI version probe for the durable transcript provenance block.
+test('extractVersionToken prefers a semver-ish token, else the first non-empty line', () => {
+  assert.equal(extractVersionToken('copilot version 1.2.3'), '1.2.3');
+  assert.equal(extractVersionToken('v0.10.0-rc.4\n'), 'v0.10.0-rc.4');
+  assert.equal(extractVersionToken('  \n  claude-code (build abc)\n'), 'claude-code (build abc)');
+  assert.equal(extractVersionToken(''), null);
+  assert.equal(extractVersionToken('   \n\n  '), null);
+  // Length-capped so a chatty/adversarial harness can't bloat the transcript.
+  assert.equal(extractVersionToken('x'.repeat(200)).length, 64);
+});
+
+test('probeAgentCliVersion runs `<command> --version` (bounded) and extracts the version', () => {
+  const calls = [];
+  const run = (cmd, opts) => {
+    calls.push({ cmd, opts });
+    return { status: 0, stdout: 'copilot 3.4.5\n', stderr: '' };
+  };
+  const v = probeAgentCliVersion('copilot', { run });
+  assert.equal(v, '3.4.5');
+  assert.equal(calls[0].cmd, 'copilot --version');
+  assert.equal(calls[0].opts.shell, true);
+  assert.ok(calls[0].opts.timeout > 0, 'a hard timeout is set so a hung harness cannot block');
+  assert.deepEqual(calls[0].opts.stdio, ['ignore', 'pipe', 'pipe'], 'stdin closed so an interactive harness gets EOF');
+  assert.ok(Number.isFinite(calls[0].opts.maxBuffer) && calls[0].opts.maxBuffer > 0, 'a finite maxBuffer caps a chatty harness so it cannot exhaust memory');
+});
+
+test('probeAgentCliVersion omits an embedded-argument / compound command rather than run it (#257)', () => {
+  // `buildAgentCommandLine` preserves an embedded-argument `command` verbatim when
+  // structured args are empty, so `${command} --version` would run the script/compound
+  // command and misattribute (or side-effect). Any whitespace or shell metacharacter
+  // means it is not a bare executable — omit the probe entirely (spawner never called).
+  for (const embedded of ['node agent.js', 'copilot; rm -rf /', 'sh -c "evil"', 'a && b', 'foo|bar', 'x$(whoami)']) {
+    let called = false;
+    assert.equal(
+      probeAgentCliVersion(embedded, { run: () => { called = true; return { status: 0, stdout: '9.9.9' }; } }),
+      null,
+      `embedded/compound command "${embedded}" is not probed`,
+    );
+    assert.equal(called, false, 'the spawner is never invoked for a non-bare command');
+  }
+  // A plain absolute path token IS a bare executable — probe it normally.
+  assert.equal(
+    probeAgentCliVersion('/usr/local/bin/copilot', { run: () => ({ status: 0, stdout: 'copilot 1.2.3' }) }),
+    '1.2.3',
+    'a bare path executable still probes',
+  );
+});
+
+test('probeAgentCliVersion skips a RELATIVE path command (cwd-ambiguous) but not bare/absolute (#257)', () => {
+  // A relative path resolves against the probe's cwd (the worker's), not the per-job
+  // cwd the harness actually runs from, so it could read a different file/version.
+  // Omit it. Bare PATH names and absolute paths remain probeable.
+  for (const rel of ['./harness', '../bin/tool', 'sub/dir/cmd', '.\\harness']) {
+    let called = false;
+    assert.equal(
+      probeAgentCliVersion(rel, { run: () => { called = true; return { status: 0, stdout: '9.9.9' }; } }),
+      null,
+      `relative path "${rel}" is not probed`,
+    );
+    assert.equal(called, false, 'the spawner is never invoked for a relative-path command');
+  }
+  // A bare PATH-resolved name (cwd-independent) still probes.
+  assert.equal(
+    probeAgentCliVersion('copilot', { run: () => ({ status: 0, stdout: 'copilot 3.0.0' }) }),
+    '3.0.0',
+    'a bare PATH name still probes',
+  );
+  // An absolute path (fully determined) still probes.
+  assert.equal(
+    probeAgentCliVersion('/opt/bin/harness', { run: () => ({ status: 0, stdout: 'harness 4.5.6' }) }),
+    '4.5.6',
+    'an absolute path still probes',
+  );
+});
+
+test('probeAgentCliVersion runs under the caller-supplied env so PATH matches the real harness (#257)', () => {
+  const calls = [];
+  const run = (cmd, opts) => { calls.push({ cmd, opts }); return { status: 0, stdout: 'copilot 4.5.6' }; };
+  const env = { ...process.env, PATH: '/opt/harness/bin', NANO_MARKER: '1' };
+  probeAgentCliVersion('copilot', { run, env });
+  assert.equal(calls[0].opts.env, env, 'the probe environment is the supplied merged profile env');
+  // Default (no env) inherits process.env — spawnSync default, so no `env` key is forced.
+  const bare = [];
+  probeAgentCliVersion('copilot', { run: (cmd, opts) => { bare.push(opts); return { status: 0, stdout: 'copilot 1.0.0' }; } });
+  assert.equal(bare[0].env, undefined, 'without an explicit env the probe inherits process.env');
+});
+
+test('probeAgentCliVersion skips a bare name when the supplied env PATH is cwd-ambiguous (#257)', () => {
+  // A bare PATH-resolved name is only cwd-independent if PATH is. When the caller-
+  // supplied env's PATH carries a RELATIVE or EMPTY entry (cwd-dependent resolution),
+  // the probe's cwd (the worker's) may resolve a different binary than the job's, so
+  // omit the reading. An absolute command bypasses PATH and is unaffected.
+  // Build the multi-entry cases with the platform `delimiter` (the implementation
+  // splits PATH on it), so on Windows (`;`) `/usr/bin:.` is not mistaken for a single
+  // absolute entry — mirror the real per-platform separator instead of hard-coding `:`.
+  for (const badPath of ['.', './node_modules/.bin', `/usr/bin${delimiter}.`, `/usr/bin${delimiter}`, `${delimiter}/usr/bin`, 'rel/dir']) {
+    let called = false;
+    const env = { ...process.env, PATH: badPath };
+    assert.equal(
+      probeAgentCliVersion('copilot', { run: () => { called = true; return { status: 0, stdout: '9.9.9' }; }, env }),
+      null,
+      `bare name with cwd-ambiguous PATH "${badPath}" is not probed`,
+    );
+    assert.equal(called, false, 'the spawner is never invoked when PATH resolution is cwd-ambiguous');
+  }
+  // An all-absolute PATH is unambiguous — the bare name still probes.
+  assert.equal(
+    probeAgentCliVersion('copilot', { run: () => ({ status: 0, stdout: 'copilot 7.0.0' }), env: { PATH: `/usr/local/bin${delimiter}/usr/bin` } }),
+    '7.0.0',
+    'a bare name with an all-absolute PATH still probes',
+  );
+  // An ABSOLUTE command bypasses PATH entirely, so a cwd-ambiguous PATH is irrelevant.
+  assert.equal(
+    probeAgentCliVersion('/opt/bin/harness', { run: () => ({ status: 0, stdout: 'harness 8.0.0' }), env: { PATH: '.' } }),
+    '8.0.0',
+    'an absolute command probes regardless of PATH',
+  );
+});
+
+test('probeAgentCliVersion is best-effort: blank command, thrown spawn, or off-switch → null', () => {
+  assert.equal(probeAgentCliVersion('', { run: () => { throw new Error('nope'); } }), null);
+  assert.equal(probeAgentCliVersion('   ', { run: () => ({ stdout: '1.0.0' }) }), null);
+  assert.equal(probeAgentCliVersion('copilot', { run: () => { throw new Error('ENOENT'); } }), null);
+  // Reads stderr too (many CLIs print --version to stderr) — but only on a clean exit.
+  assert.equal(probeAgentCliVersion('copilot', { run: () => ({ status: 0, stdout: '', stderr: 'tool 2.0.1' }) }), '2.0.1');
+  const prev = process.env.NANO_AGENT_CLI_PROBE;
+  process.env.NANO_AGENT_CLI_PROBE = 'off';
+  try {
+    assert.equal(probeAgentCliVersion('copilot', { run: () => ({ stdout: '1.0.0' }) }), null, 'off-switch disables the probe');
+  } finally {
+    if (prev === undefined) delete process.env.NANO_AGENT_CLI_PROBE;
+    else process.env.NANO_AGENT_CLI_PROBE = prev;
+  }
+});
+
+test('probeAgentCliVersion rejects a returned failure result rather than persisting its diagnostics (#257)', () => {
+  // spawnSync does not throw on a missing command / shell failure — it RETURNS a result
+  // with a non-zero status and the error banner on stderr. That banner must not become
+  // a bogus agentCliVersion.
+  assert.equal(
+    probeAgentCliVersion('copilot', { run: () => ({ status: 127, stdout: '', stderr: '/bin/sh: copilot: not found' }) }),
+    null,
+    'a non-zero exit is not trusted, even with version-ish-looking stderr',
+  );
+  // A timeout surfaces as `error` (ETIMEDOUT) and/or a null status (killed by signal),
+  // with only a partial capture — reject it, do not record the partial output.
+  assert.equal(
+    probeAgentCliVersion('copilot', { run: () => ({ error: new Error('ETIMEDOUT'), status: null, stdout: 'copilot 9.9.9' }) }),
+    null,
+    'a timed-out probe (error set) is rejected',
+  );
+  assert.equal(
+    probeAgentCliVersion('copilot', { run: () => ({ status: null, signal: 'SIGKILL', stdout: 'copilot 9.9.9' }) }),
+    null,
+    'a signal-killed probe (null status) is rejected',
+  );
 });
 
 test('normalizeStoredProfile normalizes the args list', () => {

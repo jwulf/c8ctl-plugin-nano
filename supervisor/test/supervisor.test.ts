@@ -53,6 +53,141 @@ test("end-to-end: a job is activated, its worker claimed, winner extended, agent
   );
 });
 
+test("onFirstActivation fires exactly once on the first non-empty poll set (leasing), before the activation poll resolves (#253 readiness handshake)", async () => {
+  await Effect.runPromise(
+    Effect.gen(function* () {
+      // A very slow long-poll: if readiness were tied to the first tick COMPLETING,
+      // it would be delayed for the whole poll window. The handshake must fire the
+      // moment the worker has a serviceable poll set — BEFORE the poll blocks — so
+      // a real replacement reports ready promptly.
+      const engine = makeEngine({
+        activate: activateAfter({ x: { job: job("Jx", "x"), delayMs: 50_000 } }),
+      });
+      const runner = makeRunner(1_000);
+      const reg = yield* makeRegistry();
+      yield* reg.add("w1", ["x"], 1);
+      const reader = makeReader([[]], {});
+
+      let fired = 0;
+      const sup = yield* makeSupervisor({
+        engine,
+        runner,
+        registry: reg,
+        reconcileReader: reader,
+        scan,
+        logger: noopLogger,
+        onFirstActivation: Effect.sync(() => { fired += 1; }),
+        config: { idleSpacingMs: 1_000, activation: { requestTimeoutMs: 60_000, initialLockMs: 15_000, emptyPollBackoffMs: 0, maxBatchPerType: 10 } },
+      });
+
+      const fiber = yield* Effect.forkChild(sup.run);
+      // Let the fiber reach its first tick (which sees w1's type x with a free
+      // slot) but NOT let the 50s long-poll resolve — readiness must already be
+      // stamped by now.
+      yield* TestClock.adjust(Duration.millis(1));
+      assert.equal(fired, 1, "readiness fired on the first non-empty poll set, before the long-poll resolved");
+
+      // Drive many further ticks: it is a one-shot handshake, never re-fired.
+      yield* TestClock.adjust(Duration.millis(120_000));
+      assert.equal(fired, 1, "onFirstActivation is a one-shot handshake");
+
+      yield* Fiber.interrupt(fiber);
+    }).pipe(Effect.provide(TestClock.layer())),
+  );
+});
+
+test("onFirstActivation does NOT fire while the worker has zero serviceable types — it fires once types arrive (#253 leasing-gated readiness)", async () => {
+  await Effect.runPromise(
+    Effect.gen(function* () {
+      // An --auto worker whose initial engine read failed enters the loop with
+      // ZERO serviceable types (registered with no types; reconcile keeps the empty
+      // set because the reader has nothing yet). Readiness must NOT be stamped while
+      // it cannot lease — otherwise the rolling reload would drain the next worker
+      // while this replacement has no pollers. It becomes ready only once reconcile
+      // fills in a serviceable type and the loop begins leasing.
+      const engine = makeEngine({
+        activate: activateAfter({ x: { job: job("Jx", "x"), delayMs: 50_000 } }),
+      });
+      const runner = makeRunner(1_000);
+      const reg = yield* makeRegistry();
+      yield* reg.add("w1", [], 1); // zero serviceable types at loop entry
+      // Reconcile reads empty first, then discovers type "x" on a later crawl.
+      const reader = makeReader([[], ["x"]], { "x": "x" });
+
+      let fired = 0;
+      const sup = yield* makeSupervisor({
+        engine,
+        runner,
+        registry: reg,
+        reconcileReader: reader,
+        scan,
+        logger: noopLogger,
+        autoWorkerId: "w1", // reconcile rewrites w1's serviceable types
+        onFirstActivation: Effect.sync(() => { fired += 1; }),
+        config: { idleSpacingMs: 1_000, reconcileIntervalMs: 5_000, activation: { requestTimeoutMs: 60_000, initialLockMs: 15_000, emptyPollBackoffMs: 0, maxBatchPerType: 10 } },
+      });
+
+      const fiber = yield* Effect.forkChild(sup.run);
+      // First reconcile (immediate) reads [] → w1 still has zero types → idle ticks
+      // only, so readiness must NOT have fired despite the loop being up.
+      yield* TestClock.adjust(Duration.millis(1));
+      assert.equal(fired, 0, "no readiness stamp while the worker has zero serviceable types");
+      yield* TestClock.adjust(Duration.millis(3_000));
+      assert.equal(fired, 0, "still not ready — idling with nothing to lease");
+
+      // Second reconcile crawl discovers type "x"; the next non-empty tick leases
+      // and stamps readiness exactly once.
+      yield* TestClock.adjust(Duration.millis(5_000));
+      assert.equal(fired, 1, "readiness fired once the worker gained a serviceable type and began leasing");
+      yield* TestClock.adjust(Duration.millis(30_000));
+      assert.equal(fired, 1, "still a one-shot handshake after it fired");
+
+      yield* Fiber.interrupt(fiber);
+    }).pipe(Effect.provide(TestClock.layer())),
+  );
+});
+
+
+test("a throwing onFirstActivation is swallowed — the loop keeps activating (#253 best-effort handshake)", async () => {
+  await Effect.runPromise(
+    Effect.gen(function* () {
+      // The readiness handshake is best-effort: a defect thrown by the injected
+      // thunk (e.g. the plugin's writeActivity() hitting an fs error) must NOT
+      // terminate run before the first activation tick.
+      const engine = makeEngine({
+        activate: activateAfter({ x: { job: job("Jx", "x"), delayMs: 10 } }),
+      });
+      const runner = makeRunner(1_000);
+      const reg = yield* makeRegistry();
+      yield* reg.add("w1", ["x"], 1);
+      const reader = makeReader([[]], {});
+
+      let fired = 0;
+      const sup = yield* makeSupervisor({
+        engine,
+        runner,
+        registry: reg,
+        reconcileReader: reader,
+        scan,
+        logger: noopLogger,
+        onFirstActivation: Effect.sync(() => { fired += 1; throw new Error("marker write failed"); }),
+        config: { idleSpacingMs: 1_000, activation: { requestTimeoutMs: 10_000, initialLockMs: 15_000, emptyPollBackoffMs: 0, maxBatchPerType: 10 } },
+      });
+
+      const fiber = yield* Effect.forkChild(sup.run);
+      yield* TestClock.adjust(Duration.millis(10)); // winning long-poll resolves
+      yield* TestClock.adjust(Duration.millis(5)); // let dispatch fork run
+
+      assert.equal(fired, 1, "the handshake did run (and threw)");
+      // Despite the thrown defect, the loop reached its first activation and
+      // dispatched the job — run was NOT terminated by the handshake failure.
+      assert.deepEqual(runner.ran, ["Jx"], "the loop kept activating after the handshake threw");
+
+      yield* Fiber.interrupt(fiber);
+    }).pipe(Effect.provide(TestClock.layer())),
+  );
+});
+
 test("reconcile wiring: an --auto worker's serviceable types are published from the cached crawl", async () => {
   await Effect.runPromise(
     Effect.gen(function* () {

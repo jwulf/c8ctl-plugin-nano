@@ -58,7 +58,7 @@ import { lookup as dnsLookup } from 'node:dns/promises';
 import * as nodeDns from 'node:dns';
 import { randomUUID, createHash, randomBytes } from 'node:crypto';
 import { homedir, platform as osPlatform, devNull, tmpdir, hostname } from 'node:os';
-import { join, isAbsolute, resolve as resolvePath, dirname, basename, sep } from 'node:path';
+import { join, isAbsolute, resolve as resolvePath, dirname, basename, sep, delimiter } from 'node:path';
 import { createRequire } from 'node:module';
 import { fileURLToPath } from 'node:url';
 import { createInterface } from 'node:readline/promises';
@@ -159,6 +159,19 @@ const STOP_GRACE_MS = 8_000;
 // `nano work` child to quiesce it — stop leasing new jobs, finish in-flight work,
 // then exit. SIGTERM/SIGINT remain the FORCE abort (kill harness, yield jobs).
 const SUPERVISOR_DRAIN_SIGNAL = 'SIGUSR2';
+// Hot-reload readiness gate: after a rolling `supervisor reload` respawns a
+// worker, the daemon waits (bounded) for the replacement to STAMP `readyAt` on
+// its activity marker — i.e. its activation loop is up and leasing jobs — before
+// draining the NEXT worker, so at most one worker is ever unavailable at a time.
+// A bare spawn/PID is not readiness: the child still has to import the plugin,
+// build its SDK client and start its activation loop. The wait is bounded so a
+// slow/never-ready replacement (e.g. a wedged engine) can't stall the roll — on
+// timeout the daemon advances anyway (degrading to the old spawn-and-advance).
+const SUPERVISOR_RELOAD_READY_POLL_MS = 100;
+const SUPERVISOR_RELOAD_READY_TIMEOUT_MS = Math.max(
+  0,
+  Number.parseInt(process.env.NANO_SUPERVISOR_RELOAD_READY_TIMEOUT_MS ?? '', 10) || 30_000,
+);
 // Upper bound on one `--auto` engine-read reconcile (enumerate deployed
 // definitions + fetch each BPMN). A read that stalls past this is treated as a
 // transient failure so the running poller set is KEPT and, crucially, shutdown
@@ -323,6 +336,19 @@ function readWorkerActivity(id) {
   } catch {
     return null;
   }
+}
+
+/**
+ * Whether an activity marker proves a specific child (`pid`) is up and leasing.
+ * Both conditions are required (#253): a finite `readyAt` (the runtime's
+ * first-activation handshake fired) AND `act.pid === pid` (the marker belongs to
+ * THIS child, not a stale one a failed best-effort delete left behind from a
+ * previous incarnation — which would otherwise let the rolling reload advance
+ * before the fresh replacement has actually reported ready). Pure so it can be
+ * unit-tested directly.
+ */
+function activityMarkerReadyFor(act, pid) {
+  return !!(act && act.pid === pid && Number.isFinite(act.readyAt));
 }
 
 /**
@@ -1719,6 +1745,104 @@ function buildAgentCommandLine(command, args) {
   const list = normalizeArgList(args);
   if (list.length === 0) return command;
   return `${command} ${list.map(shQuote).join(' ')}`;
+}
+
+// #243: extract a plausible version token from an agent CLI's `--version` output for
+// the durable transcript's provenance block. Prefers a semver-ish token, else the
+// first non-empty line; length-capped so a chatty (or adversarial) harness can't bloat
+// the transcript. Returns null when nothing usable is present.
+export function extractVersionToken(text) {
+  const s = String(text || '');
+  const semver = s.match(/\bv?\d+\.\d+(?:\.\d+)?(?:[-+][0-9A-Za-z.-]+)?\b/);
+  if (semver) return semver[0].slice(0, 64);
+  const firstLine = s.split(/\r?\n/).map((l) => l.trim()).find((l) => l.length > 0);
+  return firstLine ? firstLine.slice(0, 64) : null;
+}
+
+// #243: best-effort probe of an agent harness CLI's OWN version (distinct from the nano
+// plugin/supervisor version), for the durable transcript's provenance block. Runs
+// `<command> --version` through a shell (PATH resolution, mirroring how the harness is
+// spawned) with a hard timeout + SIGKILL and stdin closed so an interactive harness
+// gets EOF and exits rather than hanging. Restricted to a BARE single executable and run
+// under the caller-supplied `env` (the merged profile env) so it can neither run an
+// embedded-argument command nor resolve a different PATH binary than the real run
+// (#257). ENTIRELY best-effort: any failure, timeout, non-zero exit with no version-ish
+// output, an embedded/compound command, or unrecognizable output yields null (the field
+// is simply omitted). Meant to be called ONCE per worker process (the command is fixed
+// per profile), so it never taxes the activation hot path. Disable via
+// NANO_AGENT_CLI_PROBE=off. The spawner is injected for deterministic testing.
+function probeAgentCliVersion(command, { timeoutMs = 1500, run = spawnSync, env = undefined } = {}) {
+  if (typeof command !== 'string' || command.trim() === '') return null;
+  if (String(process.env.NANO_AGENT_CLI_PROBE || '').trim().toLowerCase() === 'off') return null;
+  // #257 review: only probe a BARE single executable. `buildAgentCommandLine`
+  // preserves an embedded-argument `command` verbatim when structured args are
+  // empty (e.g. `command: "node agent.js"`), so `${command} --version` would run
+  // that script/compound command — probing the interpreter or a wholly different
+  // program — and persist a false `agentCliVersion`. A token carrying whitespace or
+  // shell metacharacters is not a bare executable: omit the probe rather than
+  // record a wrong (or side-effecting) reading. A plain path token (with / \ : . _ -)
+  // is still allowed so an absolute harness path probes normally.
+  if (!/^[\w./\\:+-]+$/.test(command.trim())) return null;
+  // #257 review: SKIP a RELATIVE path command (a token carrying a path separator
+  // that is not absolute, e.g. `./harness`, `../bin/tool`, `sub/dir/cmd`). Unlike a
+  // bare PATH-resolved name (cwd-independent) or an absolute path (fully determined),
+  // a relative path resolves against the probe's cwd — which is the WORKER's cwd, NOT
+  // the per-job `cwd` (a fresh run dir / cloned repo) the harness is actually launched
+  // from in `runAgentJob`. Probing `./harness` here could read a different file/version
+  // than the command the job runs (or find nothing where the job would), persisting a
+  // false/omitted `agentCliVersion`. Best-effort: omit rather than record a wrong
+  // reading for a command whose resolution is cwd-ambiguous.
+  {
+    const cmd = command.trim();
+    if (/[\\/]/.test(cmd) && !isAbsolute(cmd)) return null;
+    // #257 review: a BARE PATH-resolved name is only cwd-independent if PATH itself
+    // is. If the caller-supplied env's PATH carries a RELATIVE or EMPTY entry (e.g.
+    // `.`, an empty field meaning cwd, or `./node_modules/.bin`), resolution depends
+    // on the working directory — and the probe's cwd (the WORKER's) is NOT the per-job
+    // cwd (the run dir / cloned repo) the harness is launched from — so `--version`
+    // could resolve a different executable/version than the job's. Omit rather than
+    // record a cwd-ambiguous reading. An ABSOLUTE command bypasses PATH entirely, so
+    // it is unaffected; a probe with no explicit `env` inherits `process.env` verbatim
+    // (the caller opted into that resolution) and is left untouched.
+    if (env && !isAbsolute(cmd)) {
+      const pathVar = env.PATH ?? env.Path ?? env.path ?? '';
+      if (String(pathVar).split(delimiter).some((e) => e === '' || !isAbsolute(e))) return null;
+    }
+  }
+  let out;
+  try {
+    out = run(`${command} --version`, {
+      shell: true,
+      timeout: timeoutMs,
+      killSignal: 'SIGKILL',
+      encoding: 'utf8',
+      stdio: ['ignore', 'pipe', 'pipe'],
+      // #257 review: run the probe under the SAME environment the harness will run
+      // under (the profile env merged over the host env), so PATH resolution matches
+      // the real invocation and the probe can't resolve a different binary than the
+      // one the job will spawn. Undefined inherits `process.env` (spawnSync default).
+      ...(env ? { env } : {}),
+      // #257 review: cap the captured output. Without a finite maxBuffer a harness
+      // that streams continuously during the timeout window makes each worker retain
+      // unbounded stdout/stderr (exhausting memory) before the 64-byte transcript cap
+      // is ever applied. On overflow spawnSync sets `out.error` (ENOBUFS), which the
+      // guard below already rejects — so the probe stays best-effort (yields null).
+      maxBuffer: 256 * 1024,
+      windowsHide: true,
+    });
+  } catch {
+    return null;
+  }
+  if (!out) return null;
+  // #257 review: spawnSync does NOT throw for a normal shell failure or timeout —
+  // with `shell: true` it returns a result carrying `error` (spawn failure /
+  // ETIMEDOUT) and/or a non-zero/null exit `status`, alongside diagnostic text on
+  // stderr (e.g. `/bin/sh: <cmd>: not found`) or a partial capture. Feeding that to
+  // extractVersionToken (whose fallback accepts the first non-empty line) would
+  // persist the error banner as a bogus `agentCliVersion`. Trust only a clean exit
+  // (no `error`, status 0); anything else omits the field.
+  if (out.error || out.status !== 0) return null;
+  return extractVersionToken(`${out.stdout || ''}\n${out.stderr || ''}`);
 }
 
 // A worker job-type token: rank/capability tokens use `:` (rank↔cap) and `+`
@@ -3743,6 +3867,11 @@ async function createSupervisorDeps(opts = {}) {
     config,
     fetchImpl,
     env = process.env,
+    // A plain JS thunk (Effect-free, monolith-supplied) fired ONCE when the
+    // activation loop begins leasing — lifted below into the runtime's
+    // `onFirstActivation` Effect. Used as the rolling-reload readiness handshake
+    // (#253): stamping readiness only when the runtime is actually serving.
+    onFirstActivation,
   } = opts;
   if (!runner || typeof runner.run !== 'function') {
     throw new TypeError('createSupervisorDeps: `runner` must be a raw job runner `{ run(job): Promise<void> }`');
@@ -3751,7 +3880,6 @@ async function createSupervisorDeps(opts = {}) {
   const rt = await loadSupervisorRuntime();
   const { demand } = await import('./agentic.mjs');
   const { createRawEngineClient } = await import('./supervisor-engine.mjs');
-
   // Base/auth: the single canonical worker-engine chain (explicit restConfig →
   // profile restAddress → localhost), ALWAYS run through the token same-origin
   // gate — even when a caller pins the base via `restConfig` — so token
@@ -3815,6 +3943,11 @@ async function createSupervisorDeps(opts = {}) {
     agenticEndpoint,
     agenticConfig,
     config: scope ? { ...config, scope } : config,
+    // Lift the plain readiness thunk into an Effect the runtime runs on its own
+    // fiber the instant it starts leasing (#253). Effect-free JS in, Effect out —
+    // the same "monolith supplies plain JS, TS lifts it" seam as the other ports.
+    onFirstActivation:
+      typeof onFirstActivation === 'function' ? rt.Effect.sync(onFirstActivation) : undefined,
   });
 
   // The `settle` seam (issue #156, escalation answer (a)): the runner settles a
@@ -8546,7 +8679,7 @@ function agenticStateForTarget(target, safeUrl = (u) => u) {
  * without making an idle worker look busy or inflating the drain's in-flight count.
  * @param {{ pid:number, updatedAt:number, jobs:Array<{key:string,type:string,since:number,settlementPending?:boolean}>, engine:(string|null), agentic:object }} fields
  */
-function buildActivityPayload({ pid, updatedAt, jobs, engine, agentic }) {
+function buildActivityPayload({ pid, updatedAt, jobs, engine, agentic, readyAt }) {
   const jobList = Array.isArray(jobs) ? jobs : [];
   return {
     pid,
@@ -8555,6 +8688,10 @@ function buildActivityPayload({ pid, updatedAt, jobs, engine, agentic }) {
     jobs: jobList,
     engine: engine ?? null,
     agentic,
+    // When the worker's activation loop has started (it has imported, built its
+    // SDK client and begun leasing), the producer stamps this; null until then.
+    // The supervisor's rolling reload gates on it (a spawn/PID is not readiness).
+    readyAt: readyAt ?? null,
   };
 }
 
@@ -9011,6 +9148,17 @@ async function workAgent(req, flags, ctx) {
   const workerPidStart = pidStartToken(process.pid);
   let pluginVersion = null;
   try { pluginVersion = JSON.parse(readFileSync(join(pluginDir, 'package.json'), 'utf-8')).version ?? null; } catch { /* best effort */ }
+  // #243: the agent harness CLI's own version is probed ONCE per worker process
+  // (bounded, best-effort) so the durable transcript's provenance block can attribute
+  // a run to a specific harness build. The probe is DEFERRED until the FIRST
+  // external-agent activation (its only consumer is the AgentInstance producer), so a
+  // worker that only services ordinary jobs never runs the harness `--version`. The
+  // probe env is WORKER-STATIC — `process.env` merged with the profile `env` only,
+  // NOT the per-job `setup.env` — so the once-per-worker cache can't leak one job's
+  // setup-derived reading to later jobs (#257). Never fatal — a null result just omits
+  // the field. `agentCliProbed` latches the once-only semantics.
+  let agentCliVersion = null;
+  let agentCliProbed = false;
   let workerNsDir;
   try {
     ({ nsDir: workerNsDir } = allocateWorkerNamespace({
@@ -9121,6 +9269,66 @@ async function workAgent(req, flags, ctx) {
   // callers (undefined) fall back to createClient(undefined), which resolves the
   // active profile itself — identical to the old no-arg behaviour.
   const camunda = globalThis.c8ctl.createClient(resolveConnectionProfile(ctx));
+
+  // #243/#257: precompute the job-independent gates for the harness `--version`
+  // probe (the probe itself is DEFERRED to the first external-agent activation
+  // below — see maybeProbeAgentCliVersion). The probe only yields a consumable
+  // reading when:
+  //   - HOST execution (a container job runs `sh -c` inside the selected image, so a
+  //     same-named host binary would report a plausible-but-wrong version);
+  //   - the AgentInstance kill-switch is not set (NANO_AGENT_INSTANCE=off disables the
+  //     producer — the probe's only consumer — so probing would needlessly run a
+  //     possibly non-idempotent harness with no reader);
+  //   - the host SDK actually supports AgentInstance (create/update). The producer
+  //     degrades to a disabled facade for older clients, so probing under such a client
+  //     is pure waste + an unnecessary side effect (Copilot review, #257);
+  //   - the ACP classifier is available. `createAgentInstanceProducer` is ALSO inert
+  //     (the `usable` gate requires `classifyUpdate`) when the agentic classifier is
+  //     missing, even with a create/update-capable SDK — so probing would run the
+  //     harness `--version` for a producer that can never mint a transcript to consume
+  //     it. Mirror that precondition here so the probe stays side-effect-free whenever
+  //     the producer is disabled (Copilot review, #257);
+  //   - the profile command alone is the full invocation (no extra args). An
+  //     interpreter-style profile (`command:'node', args:['agent.js']`) would probe the
+  //     interpreter, not the harness — omit rather than misattribute.
+  // The probe itself (probeAgentCliVersion) additionally refuses an embedded-argument
+  // command and runs under the WORKER-STATIC profile env (see maybeProbeAgentCliVersion
+  // for why per-job setup.env is deliberately excluded), so PATH resolves a stable
+  // representative harness binary.
+  const agentInstanceProbeOff = String(process.env.NANO_AGENT_INSTANCE || '').trim().toLowerCase() === 'off';
+  const sdkSupportsAgentInstance =
+    !!camunda &&
+    typeof camunda.createAgentInstance === 'function' &&
+    typeof camunda.updateAgentInstance === 'function';
+  // The producer's `usable` gate also requires the ACP classifier (agent-instance.mjs);
+  // without it the producer is inert regardless of SDK support, so exclude the probe too.
+  const acpClassifierAvailable = typeof agenticSessionAcp?.classifyUpdate === 'function';
+  const agentCliProbeEligible =
+    !isContainer && !agentInstanceProbeOff && sdkSupportsAgentInstance && acpClassifierAvailable && effectiveArgs.length === 0;
+  // #257 review: DEFER the probe until an external-agent job is actually being
+  // serviced — so a worker that only ever receives ordinary service jobs never runs
+  // the harness `--version` at all (no wasted startup delay / side effect). Runs at
+  // most once per worker (cached), so the per-job hot path pays nothing after the
+  // first external activation. The probe env is WORKER-STATIC — `process.env` merged
+  // with the profile `env` only, NOT the per-job `setup.env`: `agentCliProbed` is a
+  // worker-wide latch, so folding a single job's `setup.env` (which can change PATH,
+  // and thus which CLI build resolves) into the cache would leak THAT job's reading
+  // to every later job serviced by the same worker (#257). A worker-static basis makes
+  // the cached `agentCliVersion` a correct-by-construction representative reading for
+  // the profile; a job whose `setup.env` genuinely alters the resolved binary is a
+  // per-job divergence the single cached provenance reading deliberately does not chase.
+  const maybeProbeAgentCliVersion = () => {
+    if (agentCliProbed || !agentCliProbeEligible) return;
+    agentCliProbed = true;
+    try {
+      agentCliVersion = probeAgentCliVersion(profile?.command, {
+        env: {
+          ...process.env,
+          ...normalizeEnvMap(profileEnv),
+        },
+      });
+    } catch { /* best effort */ }
+  };
 
   // Broker REST endpoint for live linked-resource prompts (issue #63) and the
   // C8 REST source for `--auto`'s engine-read enrolment. Derived from the SAME
@@ -9327,6 +9535,11 @@ async function workAgent(req, flags, ctx) {
   // is updated once the channel target is resolved and again on each
   // connect/disconnect below.
   let agenticState = { status: 'starting' };
+  // Readiness handshake (Copilot review on #253): null until this worker's
+  // activation loop is actually up and leasing; the supervisor's rolling reload
+  // waits for this stamp before draining the next worker so a bare spawn/PID is
+  // never mistaken for a serving replacement.
+  let readyAt = null;
   const writeActivity = () => {
     if (!activityFile) return;
     const jobs = [...activeJobs.entries()].map(([key, v]) => ({ key, type: v.type, since: v.since }));
@@ -9348,7 +9561,7 @@ async function workAgent(req, flags, ctx) {
     // Bound the last-activation guard map (TTL + settle-aware size cap). Shared
     // with recordJobStart so a standalone worker still prunes it.
     pruneLastActivation(nowMs);
-    const payload = buildActivityPayload({ pid: process.pid, updatedAt: Date.now(), jobs, engine: workerEngine, agentic: agenticState });
+    const payload = buildActivityPayload({ pid: process.pid, updatedAt: Date.now(), jobs, engine: workerEngine, agentic: agenticState, readyAt });
     const tmp = `${activityFile}.${process.pid}.tmp`;
     try {
       mkdirSync(dirname(activityFile), { recursive: true });
@@ -9844,7 +10057,19 @@ async function workAgent(req, flags, ctx) {
         // job, never on these lines).
         const aiCorr = `job ${job.jobKey} eik ${job.elementInstanceKey ?? '?'} pik ${job.processInstanceKey ?? '?'}`;
         if (!agentInstanceOff && isExternalAgentJob(job)) {
-          agentInstanceProducer = createAgentInstanceProducer({ camunda, job, profile, envelope, logger });
+          maybeProbeAgentCliVersion();
+          // #257 review: the synchronous CLI `--version` probe above can block for up
+          // to its timeout on the FIRST external activation. A force-stop/lease-loss
+          // can win that race while spawnSync is blocked, so re-check the setup-abort
+          // gate before minting the durable AgentInstance — otherwise an already-aborted
+          // run would call activate() and mint an instance/transcript that is then
+          // immediately orphaned (the post-activate gates run too late to prevent the
+          // create). Mirrors the pre-probe agent-instance gate above.
+          if (checkSetupAbort(abortSignal, { jobType, jobKey: job.jobKey, stage: 'agent-instance', logger })) {
+            if (isContainer) liveRunIds.delete(runId);
+            return;
+          }
+          agentInstanceProducer = createAgentInstanceProducer({ camunda, job, profile, envelope, logger, runtimeVersion: pluginVersion, agentCliVersion });
           try {
             // `createAgentInstanceProducer` always returns an object — including a
             // DISABLED facade when the host SDK lacks createAgentInstance/
@@ -10496,6 +10721,16 @@ async function workAgent(req, flags, ctx) {
     // agentic target didn't resolve to a connect — the runtime then runs with no
     // agentic scope and presence/steer degrade to no-ops.
     agenticEndpoint: agenticEndpoint || undefined,
+    // Readiness handshake (#253): the runtime fires this the instant its activation
+    // loop begins leasing (on its OWN fiber, after reconcile/presence are forked;
+    // under agentic the connect cycle is a concurrent child, so the connection may
+    // still be connecting — readiness is LEASING-gated, not connection-gated). Stamp
+    // `readyAt` on the
+    // activity marker here so the supervisor's rolling `reload` waits for THIS
+    // replacement to be genuinely serving before draining the next worker. A bare
+    // `runFork` return (which only schedules the fiber) is NOT readiness.
+    // Best-effort — a marker write never fails the worker.
+    onFirstActivation: () => { readyAt = Date.now(); writeActivity(); },
     config: {
       activation: { requestTimeoutMs: pollTimeoutMs },
       dispatch: { recoveryWindowMs, extendIntervalMs: lockExtendIntervalMs },
@@ -10522,6 +10757,12 @@ async function workAgent(req, flags, ctx) {
   // next reconcile — the same liveness the retired ref'd auto-poll timer provided.
   const supervisor = await SupervisorEffect.runPromise(makeSupervisorRuntime(supervisorDeps));
   const supervisorFiber = SupervisorEffect.runFork(supervisor.run);
+
+  // Readiness is stamped by the runtime's `onFirstActivation` handshake (wired
+  // into `createSupervisorDeps` above), NOT here: `runFork` only *schedules* the
+  // fiber and can return before it has executed at all, so stamping `readyAt`
+  // in this continuation could report the worker ready before its activation loop
+  // is leasing — defeating the rolling reload's one-at-a-time guarantee (#253).
 
   // Seed this worker's presence into the runtime's ownership registry (issue
   // #173) and late-bind the per-job relay seam to the running supervisor. The
@@ -11461,6 +11702,19 @@ function formatSupervisorStatus(status) {
   lines.push('Supervisor:');
   lines.push(`  daemon pid: ${d.pid ?? '-'} ${alive ? '(alive)' : '(dead — stale state)'}`);
   if (d.version) lines.push(`  version:    ${d.version}`);
+  // Flag a code update the running daemon hasn't adopted yet: the plugin on disk
+  // has advanced past the daemon's version (e.g. after `nano update`). A rolling
+  // `supervisor reload` adopts the new WORKER code with zero downtime; a daemon
+  // restart is needed for new SUPERVISOR code. `status.pluginVersion` is only
+  // present on a live socket `status` frame; the socket-unreachable fallback
+  // (`statusFromState()`) has no such field, so read the on-disk package version
+  // locally as a fallback — otherwise the warning silently disappears exactly
+  // when the daemon is alive but its control socket is briefly unreachable.
+  const onDiskVersion = status.pluginVersion
+    ?? (() => { try { return pluginPackage().version; } catch { return null; } })();
+  if (onDiskVersion && d.version && onDiskVersion !== d.version) {
+    lines.push(`  on disk:    ${onDiskVersion} (update available — run \`c8ctl nano supervisor reload\` to adopt new worker code; restart the daemon for new supervisor code)`);
+  }
   if (d.startedAt) lines.push(`  started:    ${d.startedAt}`);
   if (d.socket) lines.push(`  control:    ${d.socket}`);
   const workers = Array.isArray(status.workers) ? status.workers : [];
@@ -11631,7 +11885,19 @@ function waitForChildExit(child, timeoutMs) {
     // #202: a null/undefined timeout means WAIT INDEFINITELY (graceful drain) —
     // no timer is armed, so we only resolve when the child actually exits.
     const t = timeoutMs == null ? null : setTimeout(() => finish(), timeoutMs);
-    function finish() { if (done) return; done = true; if (t) clearTimeout(t); resolve(); }
+    // `finish` ALWAYS removes the `exit` listener, including the timeout path:
+    // `child.once` only self-removes when the event fires, so a timed-out wait
+    // would otherwise leave its listener attached. The readiness poll calls this
+    // ~every 100ms for up to 30s, so a leaked listener per poll accumulates
+    // hundreds on a long-lived child — a `MaxListenersExceededWarning` plus
+    // retained closures (#253 review).
+    function finish() {
+      if (done) return;
+      done = true;
+      if (t) clearTimeout(t);
+      child.removeListener('exit', finish);
+      resolve();
+    }
     child.once('exit', finish);
   });
 }
@@ -11729,6 +11995,11 @@ async function runSupervisorDaemon() {
   // restart-on-exit path and let a second `stop --force` escalate a live drain.
   let draining = false;
   let forcing = false;
+  // Hot code reload (rolling drain+respawn). A `reload` op adopts new on-disk
+  // plugin code into the worker children by gracefully draining and respawning
+  // them one at a time (so the fleet keeps serving). This flag rejects a second
+  // concurrent reload — a single rolling pass owns the fleet until it finishes.
+  let reloading = false;
   // Live-view monitor: tracks the last-broadcast fleet signature so we push a
   // refreshed status to attached consoles only on real change (see below).
   let monitorTimer = null;
@@ -11981,6 +12252,216 @@ async function runSupervisorDaemon() {
     return true;
   };
 
+  // Hot code reload of a single worker: GRACEFULLY drain it (SIGUSR2 — finish
+  // in-flight jobs, then exit) and respawn it, so the new child re-reads the
+  // updated plugin from disk. Unlike `restartWorker` (a force SIGTERM/SIGKILL
+  // swap), this waits INDEFINITELY for the drain so no in-flight job is lost —
+  // adopting new code is never worth killing running work.
+  //
+  // CAPACITY CAVEAT: this drains the worker BEFORE spawning its replacement, so
+  // for the drain+boot window that worker serves no jobs. The fleet's "zero
+  // downtime" guarantee is therefore a FLEET-level one — with >1 worker the rest
+  // keep serving while one drains. A single-worker fleet (or a job type served by
+  // only this one worker) does lose that type's serving capacity until the drain
+  // finishes, `startWorker` runs, AND the replacement reports ready. Preserving an
+  // overlapping serving replacement would need a two-child handoff; that is
+  // intentionally out of scope here (documented in README/AGENTS).
+  //
+  // ONE-AT-A-TIME: after respawning, this waits (bounded) for the replacement to
+  // stamp `readyAt` on its activity marker — it is up and leasing — before it
+  // returns, so `runReload` never drains the NEXT worker while this one is still
+  // booting. A bare spawn/PID is not readiness (Copilot review on #253).
+  //
+  // The drain runs OUTSIDE the op lock (it can be arbitrarily long) so a
+  // `stop --force` or a `remove`/`restart` for this same worker isn't blocked
+  // and can escalate/interrupt it. Because of that, the respawn is guarded by
+  // the child-identity check (`w.child === child`): if a concurrent
+  // force-stop/restart/remove already swapped or deleted this worker while we
+  // drained, we must NOT respawn (that would leak a duplicate child or revive a
+  // removed worker). We also skip the respawn when the daemon is shutting down.
+  // Poll a freshly (re)spawned worker's activity marker until it stamps `readyAt`
+  // (its activation loop is up and leasing), the child is swapped/exits, the
+  // daemon starts shutting down, or the bounded deadline passes. Returns whether
+  // it became ready; the caller advances regardless — readiness is a best-effort
+  // gate, never a hard block. Used by the rolling reload so it does not drain the
+  // next worker while this replacement is still booting (Copilot review on #253).
+  const waitForWorkerReady = async (w, child, timeoutMs) => {
+    const deadline = Date.now() + Math.max(0, timeoutMs);
+    for (;;) {
+      // Stop waiting if a concurrent restart/force-stop swapped this child, or it
+      // already exited — it is no longer a booting replacement to gate on.
+      if (w.child !== child) return false;
+      if (child.exitCode !== null || child.signalCode !== null) return false;
+      // Abort at once on a spawn failure (ENOENT/EMFILE/…): it emits only 'error'
+      // with NO 'exit', so `exitCode`/`signalCode` stay null and the two checks
+      // above never fire — without this the loop would poll the full ready-timeout
+      // (~30s) before the final live-PID gate rejects a worker that never started
+      // (#253 review). `handleDeath` nulls `w.pid` on that 'error' (and a failed
+      // spawn has no `child.pid` to begin with), so a null `w.pid` for THIS still
+      // -current child means the replacement is dead — stop waiting immediately.
+      if (w.pid == null) return false;
+      const act = readWorkerActivity(w.id);
+      // Require the marker to be from THIS replacement child (`act.pid === child.pid`)
+      // AND carry a finite `readyAt` (#253): a stale marker left by a previous
+      // incarnation must not pass this gate before the freshly spawned child has
+      // reported ready — see activityMarkerReadyFor.
+      if (activityMarkerReadyFor(act, child.pid)) return true;
+      if (shuttingDown || Date.now() >= deadline) {
+        dlog(`worker '${w.id}' not ready within ${timeoutMs}ms after reload — advancing anyway`);
+        return false;
+      }
+      // waitForChildExit doubles as a poll sleep: it resolves early if the child
+      // exits (the loop-top guard then returns) so we never busy-spin on a dead child.
+      await waitForChildExit(child, SUPERVISOR_RELOAD_READY_POLL_MS);
+    }
+  };
+
+  const reloadWorker = async (id) => {
+    const w = workers.get(id);
+    if (!w) return false;
+    const child = w.child;
+    w.stopping = true;
+    if (w.restartTimer) { clearTimeout(w.restartTimer); w.restartTimer = null; }
+    const pid = w.pid;
+    if (child && pid) {
+      try { process.kill(pid, SUPERVISOR_DRAIN_SIGNAL); } catch { /* already gone */ }
+      await waitForChildExit(child, null);
+    }
+    // Only respawn if nobody else acted on this worker while we drained: it must
+    // still exist, we must not be shutting down, and its child handle must still
+    // be the one we drained (a concurrent restart/force-stop would have swapped
+    // it). The startWorker+guard runs under the op lock so it can't interleave
+    // with add/remove.
+    const started = await serializeOp(async () => {
+      const cur = workers.get(id);
+      if (!cur || cur !== w || shuttingDown || w.child !== child) return null;
+      w.stopping = false;
+      w.restarts = 0;
+      startWorker(w);
+      dlog(`worker '${id}' respawned (awaiting readiness before adopting new code)`);
+      return w.child;
+    });
+    if (!started) return false;
+    // `startWorker` returns the instant the child is forked — but the replacement
+    // still has to import the plugin, build its SDK client, and start its
+    // activation loop before it serves jobs. Signalling "reloaded" here lets
+    // `runReload` advance to drain the NEXT worker, so returning on the bare spawn
+    // could leave the just-respawned worker AND the next (draining) worker down at
+    // once, breaking the one-at-a-time guarantee (Copilot review on #253). Gate on
+    // the replacement stamping `readyAt` on its activity marker (it is up and
+    // leasing) before we return. Bounded so a slow/never-ready replacement can't
+    // wedge the roll — on timeout we advance anyway (degrading to spawn-and-advance).
+    await waitForWorkerReady(w, started, SUPERVISOR_RELOAD_READY_TIMEOUT_MS);
+    // Report reloaded only when the child we spawned is STILL this worker's live
+    // current child. `waitForWorkerReady` returns even when the replacement exited
+    // (crash/spawn-fail) or was swapped by a concurrent restart/remove — in those
+    // cases no replacement is actually running, so counting it as reloaded would
+    // let the terminal frame claim success and let the roll drain the next worker
+    // with this one down (#253 review). A readiness *timeout* on a still-live
+    // current child still counts as success — readiness is best-effort.
+    //
+    // Gate on the LIVE PID, not just object identity + null exit/signal: a spawn
+    // failure (ENOENT/EMFILE/…) emits only 'error' with NO 'exit', so
+    // `exitCode`/`signalCode` stay null and `w.child` keeps pointing at the failed
+    // ChildProcess until its backoff retry — the identity+exit check alone would
+    // count that as reloaded (#253 review). `handleDeath` nulls `w.pid` on every
+    // death (error OR exit), and a failed spawn has no `child.pid`, so requiring
+    // `w.pid` to be non-null AND still equal to this child's pid rejects both a
+    // failed spawn and a dead/retrying child while accepting a live replacement
+    // (readiness timeout included).
+    //
+    // Also reject `w.stopping`: a concurrent `remove`/`restart`/`stop` sets that
+    // flag (and clears the restart timer) BEFORE its kill signal lands, so for a
+    // brief window `w.child`/`w.pid` still point at the live replacement we just
+    // spawned. Counting that as reloaded would let the roll drain the NEXT worker
+    // while this one is being torn down — a partial-fleet outage. A worker being
+    // stopped has no confirmed serving replacement, so treat it as a failed
+    // reload (the `runReload` else-branch then aborts the roll, #253 review).
+    //
+    // Also reject `shuttingDown`: a `stop` can begin DURING this replacement's
+    // readiness wait, after which `waitForWorkerReady` still returns and (for a
+    // last target) `w.stopping` may not be latched yet — so without this the gate
+    // would report a clean reload while shutdown is already tearing the fleet
+    // down. A daemon that is shutting down has no serving future for this worker,
+    // so treat a shutdown observed before the gate as a failed/interrupted reload
+    // (the `runReload` else-branch aborts the roll, #253 review).
+    return w.child === started && !w.stopping && !shuttingDown && w.pid != null && w.pid === started.pid
+      && started.exitCode === null && started.signalCode === null;
+  };
+
+  // Rolling hot reload across a set of worker ids: drain+respawn each in turn
+  // (one at a time, so the rest of the fleet keeps serving). Streams progress to
+  // `sock` (registered as an attach consumer for the interleaved worker events)
+  // and ends with a terminal `reloaded` frame. Aborts early if the daemon starts
+  // shutting down. Never clears `supervisor.json` — a reload is not a stop.
+  const runReload = async (ids, sock) => {
+    reloading = true;
+    const reloaded = [];
+    const skipped = [];
+    let interrupted = false;
+    try {
+      for (let i = 0; i < ids.length; i++) {
+        const id = ids[i];
+        // If the daemon starts shutting down mid-roll, the remaining workers
+        // never adopt the new code — record them as skipped (and flag the roll
+        // interrupted) so the terminal frame can't report a clean success for a
+        // pass that stopped early.
+        if (shuttingDown) {
+          interrupted = true;
+          for (let j = i; j < ids.length; j++) skipped.push(ids[j]);
+          break;
+        }
+        // A target that has vanished mid-roll (only `remove`/drain-remove deletes
+        // the entry — `restart` keeps it) has NO confirmed serving replacement,
+        // exactly like the reload-failure branch below. Continuing to drain the
+        // NEXT worker on top of that gap is the same partial-fleet risk the canary
+        // exists to prevent, so treat a removed-mid-roll target uniformly: mark it
+        // and every remaining id skipped and abort the roll (#253 review).
+        if (!workers.has(id)) {
+          interrupted = true;
+          for (let j = i; j < ids.length; j++) skipped.push(ids[j]);
+          break;
+        }
+        const ok = await reloadWorker(id);
+        if (ok) {
+          reloaded.push(id);
+          // Emit the per-worker "reloaded" progress signal ONLY after the final
+          // success gate above confirmed a live, still-current replacement — not
+          // at spawn time. A crash/spawn-fail makes `reloadWorker` return false
+          // and the worker is skipped, so broadcasting at spawn time would let the
+          // streaming client print `reloaded "…" (adopted new code)` for a reload
+          // that actually failed (#253 review).
+          broadcast({ type: 'event', event: 'worker-reload', id });
+        }
+        else {
+          // A reload FAILURE (not a mere readiness timeout — that returns true on
+          // a still-live child) means this worker has NO confirmed serving
+          // replacement: it crashed, failed to spawn, or was concurrently swapped.
+          // Draining the NEXT worker on top of that gap breaks the one-at-a-time
+          // guarantee AND could roll a broken replacement across the whole fleet.
+          // Stop the roll here (a canary), marking this + every remaining id
+          // skipped so the terminal frame reports a partial failure (#253 review).
+          interrupted = true;
+          for (let j = i; j < ids.length; j++) skipped.push(ids[j]);
+          break;
+        }
+        try { sock.write(encodeFrame(statusFrame(false))); } catch { /* client gone */ }
+      }
+    } catch (err) {
+      interrupted = true;
+      dlog(`reload error: ${err?.message || err}`);
+    } finally {
+      reloading = false;
+      // Terminal success requires BOTH a clean pass (not interrupted) AND nothing
+      // skipped: a skipped worker (failed reload, or removed/absent mid-roll) is a
+      // partial reload, so `ok: true` would let the streaming client exit zero and
+      // hide it from automation (#253 review). Propagate the partial failure.
+      const ok = !interrupted && skipped.length === 0;
+      try { sock.write(encodeFrame({ ok, type: 'reloaded', reloaded, skipped, interrupted, final: true })); } catch { /* client gone */ }
+    }
+  };
+
+
   // Resolve a target token to worker ids: exact id, else all with that profile.
   const resolveTargets = (target) => {
     const t = String(target || '').trim();
@@ -11998,6 +12479,11 @@ async function runSupervisorDaemon() {
     ok: true,
     type: 'status',
     daemon: supervisorDaemonDescriptor({ pid: process.pid, startedAt, version: daemonVersion, socket: socketPath, logFile: daemonLogFile }),
+    // The plugin version currently ON DISK (re-read each call), so `status` can
+    // flag when a `nano update` has advanced the code past the running daemon —
+    // i.e. a `supervisor reload` would adopt new worker code (and a daemon
+    // restart new supervisor code). Best-effort; falls back to the daemon's own.
+    pluginVersion: (() => { try { return pluginPackage().version; } catch { return daemonVersion; } })(),
     workers: pub || [...workers.values()].map(workerPublic),
     ...(final ? { final: true } : {}),
   });
@@ -12099,6 +12585,50 @@ async function runSupervisorDaemon() {
             return ids;
           });
           sock.write(encodeFrame({ ok: true, type: 'restarted', restarted, final: true }));
+          break;
+        }
+        case 'reload': {
+          // Hot code adoption: rolling graceful drain+respawn so worker children
+          // re-read the updated plugin from disk with zero fleet downtime.
+          // Accepts a single `target` token (id|profile|all) or a `targets`
+          // array (workforce passes its exact owned id list). Streams progress
+          // and ends with a terminal `reloaded` frame — draining can take a long
+          // time, so this MUST be a streaming op, not a one-shot request.
+          if (shuttingDown) { sock.write(encodeFrame({ ok: false, error: 'supervisor is shutting down', final: true })); break; }
+          if (reloading) { sock.write(encodeFrame({ ok: false, error: 'a reload is already in progress', final: true })); break; }
+          // Reject reload explicitly on Windows BEFORE draining anything. The
+          // rolling reload's graceful drain relies on SIGUSR2 (SUPERVISOR_DRAIN_SIGNAL)
+          // to quiesce each worker child; Windows cannot deliver SIGUSR2 (Node maps
+          // a non-zero signal there to a forceful, SIGKILL-like termination, and the
+          // child's `process.once('SIGUSR2')` drain handler never fires), so a
+          // "graceful" drain either hard-kills in-flight work or leaves `reloadWorker`
+          // waiting forever for a child that was never asked to exit. Fail fast with
+          // an actionable message instead of hanging the roll on the first worker
+          // (#253 review). `restart`/`stop`+`start` remain the Windows path to adopt
+          // new code.
+          if (osPlatform() === 'win32') {
+            sock.write(encodeFrame({ ok: false, error: 'hot reload is not supported on Windows (its graceful drain relies on SIGUSR2, which Windows cannot deliver) — use `supervisor restart <target>`, or `supervisor stop` + `start`, to adopt new code', final: true }));
+            break;
+          }
+          const raw = Array.isArray(req.targets)
+            ? req.targets.flatMap((t) => resolveTargets(t))
+            : resolveTargets(req.target);
+          const ids = [...new Set(raw)];
+          if (ids.length === 0) { sock.write(encodeFrame({ ok: true, type: 'reloaded', reloaded: [], skipped: [], final: true })); break; }
+          // Register as an attach consumer so the client also sees the
+          // interleaved worker-reload/start events, then send an opening frame
+          // and kick the rolling reload asynchronously (don't block the control
+          // loop — a `stop`/`status` must still be serviceable meanwhile). Latch
+          // `reloading` HERE, before scheduling: `runReload` only sets it once it
+          // actually runs on a later tick, so a second `reload` socket arriving
+          // in that window would otherwise still see `false` and start a duplicate
+          // rolling pass over the same workers. The flag is reset in runReload's
+          // `finally`.
+          reloading = true;
+          attachClients.add(sock);
+          sock.write(encodeFrame({ ok: true, type: 'reloading', targets: ids }));
+          sock.write(encodeFrame(statusFrame(false)));
+          setTimeout(() => { runReload(ids, sock); }, 0);
           break;
         }
         case 'attach':
@@ -12222,11 +12752,19 @@ async function runSupervisorDaemon() {
     return Number.isFinite(n) && n >= 0 ? Math.floor(n) : SUPERVISOR_MONITOR_INTERVAL_MS;
   })();
   if (monitorMs > 0) {
-    lastMonitorSig = supervisorStatusSignature([...workers.values()].map(workerPublic));
+    // Fold the on-disk plugin version into the monitor signature so a `nano update`
+    // that changes ONLY the on-disk package (no worker transition) still repaints
+    // attached consoles with the new version + `supervisor reload` hint (#253
+    // review). The worker-field signature alone never changes on a version-only
+    // bump, so an idle fleet would otherwise hide an available reload until an
+    // unrelated worker transition or a manual `status`.
+    const monitorSignature = (pub) =>
+      `${supervisorStatusSignature(pub)}\u0000${(() => { try { return pluginPackage().version; } catch { return daemonVersion; } })()}`;
+    lastMonitorSig = monitorSignature([...workers.values()].map(workerPublic));
     monitorTimer = setInterval(() => {
       if (shuttingDown) return;
       const pub = [...workers.values()].map(workerPublic);
-      const sig = supervisorStatusSignature(pub);
+      const sig = monitorSignature(pub);
       const changed = sig !== lastMonitorSig;
       lastMonitorSig = sig;
       if (changed && attachClients.size > 0) broadcast(statusFrame(false, pub));
@@ -12418,7 +12956,7 @@ async function supervisorStartCmd(req, flags, ctx) {
   await supervisorStatusCmd();
   logger.info('');
   logger.info('Attach an interactive console with: c8ctl nano supervisor');
-  logger.info('Manage without it:                  c8ctl nano supervisor add|remove|restart|status|stop');
+  logger.info('Manage without it:                  c8ctl nano supervisor add|remove|restart|reload|status|stop');
 }
 
 async function supervisorStatusCmd() {
@@ -12509,6 +13047,97 @@ async function supervisorRestartCmd(req) {
   if (res.ok && res.restarted.length > 0) logger.info(`Restarted worker(s): ${res.restarted.join(', ')}.`);
   else if (res.ok) { logger.warn(`No worker matched "${target}".`); }
   else { logger.error(res.error); process.exit(1); }
+}
+
+/**
+ * Stream a rolling hot reload of the fleet and log its progress. Shared by
+ * `supervisor reload` and `workforce reload`. Sends `req` (a `reload` op with a
+ * `target` token or a `targets` array) and resolves with the outcome that ended
+ * the stream ('reloaded' | 'detached' | 'closed' | 'unreachable'). Ctrl-C
+ * DETACHES the client — the daemon keeps reloading in the background.
+ */
+async function streamSupervisorReload(socketPath, req, logger, { label = 'fleet' } = {}) {
+  return await new Promise((resolve) => {
+    let sock = null;
+    let buf = '';
+    let done = false;
+    let onSigint = null;
+    const cleanup = () => {
+      if (onSigint) { try { process.removeListener('SIGINT', onSigint); } catch { /* ignore */ } }
+      try { if (sock) sock.end(); } catch { /* ignore */ }
+    };
+    const finish = (result) => { if (done) return; done = true; cleanup(); resolve(result); };
+
+    supervisorConnect(socketPath).then((s) => {
+      sock = s;
+      sock.setEncoding('utf8');
+      onSigint = () => {
+        logger.info('Detached — supervisor keeps reloading in the background. Rerun `nano supervisor status` to check progress.');
+        finish('detached');
+      };
+      process.on('SIGINT', onSigint);
+
+      sock.on('data', (chunk) => {
+        buf += chunk;
+        const { frames, rest } = decodeFrames(buf);
+        buf = rest;
+        for (const frame of frames) {
+          if (!frame) continue;
+          // Handle the terminal `reloaded` frame BEFORE the generic `ok:false`
+          // request-error guard: `runReload` emits a partial failure as a
+          // terminal `{ type:'reloaded', final:true, ok:false, reloaded, skipped }`
+          // frame, so the bare `ok === false` guard would swallow it as a generic
+          // "reload failed" and hide which workers reloaded/skipped (#253 review).
+          // We still exit non-zero for `ok:false` so automation sees the partial.
+          // Match ONLY `type:'reloaded'`, never a bare `frame.final`: generic
+          // terminal error frames (e.g. `{ok:false, error:'a reload is already in
+          // progress', final:true}`) are also `final` but carry no reloaded/skipped
+          // lists, so this branch would print "No workers were reloaded" and hide
+          // `frame.error` — they must fall through to the `ok === false` guard below.
+          if (frame.type === 'reloaded') {
+            const reloaded = Array.isArray(frame.reloaded) ? frame.reloaded : [];
+            const skipped = Array.isArray(frame.skipped) ? frame.skipped : [];
+            if (reloaded.length > 0) logger.info(`Reloaded ${reloaded.length} worker(s): ${reloaded.join(', ')}.`);
+            else logger.warn('No workers were reloaded.');
+            if (skipped.length > 0) logger.warn(`Skipped (gone/changed, or roll aborted after a failed reload): ${skipped.join(', ')}.`);
+            finish(frame.ok === false ? 'error' : 'reloaded');
+            return;
+          }
+          if (frame.ok === false) { logger.error(frame.error || 'reload failed'); finish('error'); return; }
+          if (frame.type === 'reloading') {
+            const n = Array.isArray(frame.targets) ? frame.targets.length : 0;
+            logger.info(`Reloading ${n} worker(s) in ${label} one at a time (draining in-flight jobs first). Press Ctrl-C to detach.`);
+          } else if (frame.event === 'worker-reload' && frame.id) {
+            logger.info(`  reloaded "${frame.id}" (adopted new code).`);
+          }
+        }
+      });
+      sock.on('error', () => finish('closed'));
+      sock.on('close', () => finish('closed'));
+      sock.write(encodeFrame(req));
+    }).catch(() => finish('unreachable'));
+  });
+}
+
+/**
+ * Hot-adopt new plugin code into the running fleet with zero downtime: roll
+ * through the target workers, gracefully draining (finish in-flight jobs) and
+ * respawning each so the new child re-reads the updated `c8ctl-plugin.js` from
+ * disk. Defaults to the whole fleet. Note this adopts new WORKER code only; the
+ * supervisor daemon itself keeps running its startup code until a full restart
+ * (`supervisor stop && supervisor start`).
+ */
+async function supervisorReloadCmd(req) {
+  const logger = getLogger();
+  // Default to the whole fleet: "adopt new code" naturally means every worker.
+  const target = req.positional[1] || 'all';
+  const running = await liveSupervisor();
+  if (!running) { logger.error('Supervisor is not running.'); process.exit(1); }
+  const socketPath = running.socket || getSupervisorSocketPath();
+  const outcome = await streamSupervisorReload(socketPath, { op: 'reload', target }, logger, { label: 'the fleet' });
+  if (outcome === 'unreachable') { logger.error('Could not reach the supervisor control socket to reload it.'); process.exit(1); }
+  if (outcome === 'closed') { logger.error('The supervisor closed the connection before the reload finished (daemon crash or concurrent stop?) — the roll may be incomplete. Rerun `nano supervisor status` to check the fleet.'); process.exit(1); }
+  if (outcome === 'error') process.exit(1);
 }
 
 /**
@@ -13312,6 +13941,9 @@ async function supervisorCommand(req, flags, ctx) {
     case 'restart':
       await supervisorRestartCmd(req);
       return;
+    case 'reload':
+      await supervisorReloadCmd(req);
+      return;
     case 'stop':
       await supervisorStopCmd(coerceBool(flags?.force, false));
       return;
@@ -13320,7 +13952,7 @@ async function supervisorCommand(req, flags, ctx) {
       supervisorLogsCmd(req);
       return;
     default:
-      getLogger().error(`Unknown supervisor action "${action}". Use: start|install|uninstall|status|add|remove|restart|stop|logs|attach`);
+      getLogger().error(`Unknown supervisor action "${action}". Use: start|install|uninstall|status|add|remove|restart|reload|stop|logs|attach`);
       process.exit(1);
   }
 }
@@ -14269,6 +14901,41 @@ async function workforceStopCmd(req, flags, manifestName) {
   if (hadError) process.exit(1);
 }
 
+/**
+ * Hot-adopt new plugin code into a workforce's running workers with zero
+ * downtime: roll through the manifest-owned workers, gracefully draining and
+ * respawning each so the new child re-reads the updated plugin from disk.
+ * Mirrors `workforce stop`'s ownership resolution (longest-prefix match + a
+ * live-profile collision guard) so it only ever reloads workers this manifest
+ * owns.
+ */
+async function workforceReloadCmd(req, flags, manifestName) {
+  const logger = getLogger();
+  const running = await liveSupervisor();
+  if (!running) { logger.error('Supervisor is not running.'); process.exit(1); }
+  const manifestNames = listWorkforceManifestNames();
+  const { running: stillRunning, reachable, workers: live } = await fetchSupervisorWorkers();
+  if (!stillRunning) { logger.warn('Supervisor is not running — nothing to reload.'); return; }
+  if (!reachable) {
+    logger.error('Supervisor is running but its status socket is unreachable — cannot enumerate workers.');
+    process.exit(1);
+  }
+  const owned = live
+    .filter((w) => w && typeof w.id === 'string' && isWorkforceOwnedWorker(w.id, manifestName, manifestNames))
+    .filter((w) => {
+      const embedded = workforceProfileFromWorkerName(manifestName, w.id);
+      if (embedded != null && w.profile != null && w.profile !== embedded) return false;
+      return true;
+    })
+    .map((w) => w.id);
+  if (owned.length === 0) { logger.info(`No workers from workforce "${manifestName}" are running.`); return; }
+  const socketPath = running.socket || getSupervisorSocketPath();
+  const outcome = await streamSupervisorReload(socketPath, { op: 'reload', targets: owned }, logger, { label: `workforce "${manifestName}"` });
+  if (outcome === 'unreachable') { logger.error('Could not reach the supervisor control socket to reload it.'); process.exit(1); }
+  if (outcome === 'closed') { logger.error('The supervisor closed the connection before the reload finished (daemon crash or concurrent stop?) — the roll may be incomplete. Rerun `nano supervisor status` to check the fleet.'); process.exit(1); }
+  if (outcome === 'error') process.exit(1);
+}
+
 async function workforceCommand(req, flags) {
   const logger = getLogger();
   const action = (req.positional[0] || '').toLowerCase();
@@ -14306,8 +14973,11 @@ async function workforceCommand(req, flags) {
     case 'down':
       await workforceStopCmd(req, flags, manifestName);
       return;
+    case 'reload':
+      await workforceReloadCmd(req, flags, manifestName);
+      return;
     default:
-      logger.error(`Unknown workforce action "${action}". Use: add|remove|list|start|status|stop`);
+      logger.error(`Unknown workforce action "${action}". Use: add|remove|list|start|status|stop|reload`);
       process.exit(1);
   }
 }
@@ -15990,6 +16660,7 @@ export {
   startAgenticChannelWatchdog,
 };
 export { compareSemver, githubRepoSlug, filterReleasesSince, renderReleaseBody };
+export { probeAgentCliVersion };
 export {
   webConsoleUrl,
   consoleLinkLabel,
@@ -16157,6 +16828,8 @@ export {
   agenticStateForTarget,
   normalizeAgenticMessage,
   buildActivityPayload,
+  activityMarkerReadyFor,
+  waitForChildExit,
   supervisorWorkerActivityFile,
   SETTLEMENT_PENDING_GHOST_TTL_MS,
   WORK_FORWARD_FLAGS,
@@ -16166,6 +16839,8 @@ export {
   supervisorRequest,
   supervisorStartCmd,
   supervisorAddCmd,
+  supervisorReloadCmd,
+  workforceReloadCmd,
   runningSupervisor,
   readSupervisorState,
   clearSupervisorState,
@@ -16272,6 +16947,7 @@ export const metadata = {
         { command: 'c8ctl nano supervisor add decider', description: 'Add a supervised worker (forwarding work flags) to the running supervisor' },
         { command: 'c8ctl nano supervisor add reviewer --instances 3', description: 'Add 3 distinct auto-named instances of a profile in one call' },
         { command: 'c8ctl nano supervisor restart reviewer', description: 'Restart a supervised worker by id or profile' },
+        { command: 'c8ctl nano supervisor reload', description: 'Adopt updated harness code with zero downtime: after `nano update`, roll through the fleet draining in-flight jobs and respawning each worker so it re-reads the new plugin (workers only; restart the daemon for new supervisor code)' },
         { command: 'c8ctl nano supervisor stop', description: 'Stop the supervisor daemon and all its workers' },
         { command: 'c8ctl nano workforce add copilot --instances 5 --auto', description: 'Compose a reusable fleet: 5 copilot workers serving every deployed agent job type (--auto)' },
         { command: 'c8ctl nano workforce add qwen --instances 2 --roles pr-review,feature', description: "Add an entry mapped to explicit job types (<rank>:pr-review, <rank>:feature, where <rank> is the qwen hire's rank at start) — does not mutate the hired profile" },
@@ -16280,6 +16956,7 @@ export const metadata = {
         { command: 'c8ctl nano workforce status --json', description: 'Manifest entries joined against live supervisor status (desired vs actual), machine-readable for the install script / CI' },
         { command: 'c8ctl nano workforce list', description: 'Print the default manifest and list the manifests that exist on this machine' },
         { command: 'c8ctl nano workforce stop', description: "Remove this manifest's workers; stop the daemon too if no supervised workers remain" },
+        { command: 'c8ctl nano workforce reload', description: "Hot-adopt updated code into this manifest's workers (rolling graceful drain+respawn, zero downtime)" },
       ],
     },
     processos: {
@@ -16511,8 +17188,8 @@ function printUsage() {
   console.log('  c8ctl nano hire [--name <n>] [--rank <r>] [--command <c>] [--arg <switch> ...] [--model <m>] [--capabilities <a,b>] [--sandbox none|docker|podman] [--image <ref>] [--terminal pty|pipe] [--protocol pipe|acp] [--permission yolo|escalate|filter] [--env NAME=VALUE ...] [--list]');
   console.log('  c8ctl nano assign <profileName> <cap[,cap...]> [--name <n>] [--capabilities <a,b>]');
   console.log('  c8ctl nano work <profileName> [--auto [--auto-scope <p>]] [--arg <switch> ...] [--recovery-window <ms>] [--idle-timeout <ms>] [--job-timeout <ms>] [--poll-timeout <ms>] [--job-type <token> ...] [--sandbox none|docker|podman] [--image <ref>] [--env NAME=VALUE ...] [--secret-resolver host] [--min-free-mb <n>] [--clone-timeout <ms>] [--keep-runs] [--stream]');
-  console.log('  c8ctl nano supervisor [start|install|uninstall|status|add|remove|restart|stop|logs|attach] ... (manage many workers from one terminal)');
-  console.log('  c8ctl nano workforce [add|remove|list|start|status|stop] ... [--manifest <manifest>] (declarative, reusable fleet manifests)');
+  console.log('  c8ctl nano supervisor [start|install|uninstall|status|add|remove|restart|reload|stop|logs|attach] ... (manage many workers from one terminal)');
+  console.log('  c8ctl nano workforce [add|remove|list|start|status|stop|reload] ... [--manifest <manifest>] (declarative, reusable fleet manifests)');
   console.log('');
   console.log('Subcommands:');
   console.log('  start    Spawn an N-node local cluster wired to talk to each other on localhost');
@@ -16531,7 +17208,7 @@ function printUsage() {
   console.log('  assign   Grant new capabilities (roles) to an existing hire (additive; comma-separated; workers hot-reload)');
   console.log('  work     Run a hired profile as Nano job workers, polling for work until Ctrl-C');
   console.log('  supervisor  Run/manage a fleet of workers from one terminal (detachable console + non-interactive control)');
-  console.log('  workforce   Compose a reusable, declarative fleet manifest and reconcile it up/down (add|remove|list|start|status|stop)');
+  console.log('  workforce   Compose a reusable, declarative fleet manifest and reconcile it up/down (add|remove|list|start|status|stop|reload)');
   console.log('');
   console.log('Options:');
   console.log('  <nodes>              Number of nodes to start (default 1)');

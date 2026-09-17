@@ -98,6 +98,23 @@ export interface SupervisorDeps {
   readonly agenticEndpoint?: AgenticEndpoint;
   readonly agenticConfig?: AgenticConfig;
   readonly config?: Partial<SupervisorConfig>;
+  /**
+   * Fired ONCE, on the runtime fiber, the instant the activation loop is about to
+   * begin leasing — after reconcile/presence are forked. Readiness is gated on
+   * LEASING, NOT on the agentic connection: under agentic, `superviseAgentic`
+   * forks the connect→establish cycle as a CHILD fiber and runs this loop
+   * concurrently, so the agentic handle may still be connecting when this fires
+   * (see the run-site comment). That is deliberate — the leasing loop does not
+   * depend on the connection, so a rolling reload needs only "the replacement is
+   * leasing". The plugin uses this as its readiness handshake for
+   * rolling reload (#253): a bare `Effect.runFork(run)` only *schedules* this
+   * fiber and may return before it has executed at all, so stamping readiness in
+   * the JS caller's continuation can report a replacement ready before it is
+   * serving. Firing from here runs on the fiber itself, so it cannot. It fires
+   * BEFORE the first `tick` because the first activation poll can block for the
+   * whole long-poll window. Best-effort — never fails the loop.
+   */
+  readonly onFirstActivation?: Effect.Effect<void>;
 }
 
 export interface Supervisor {
@@ -173,6 +190,36 @@ export const makeSupervisor = (deps: SupervisorDeps): Effect.Effect<Supervisor> 
     const presenceKnownRef = yield* Ref.make<ReadonlySet<string>>(new Set());
     const steerRouter = yield* makeSteerRouter(logger);
 
+    // Readiness handshake latch (#253). The rolling reload waits for a fresh
+    // replacement to stamp `readyAt` before draining the next worker, so readiness
+    // must mean "this worker can actually lease" — NOT merely "the loop fiber is
+    // scheduled". It fires exactly once, the first time the activation loop has a
+    // non-empty poll set (a serviceable-with-capacity type it is about to lease),
+    // guarded by this one-shot latch. See `fireReadinessOnce`.
+    const readinessFiredRef = yield* Ref.make(false);
+    // Fire the readiness handshake at most once. Best-effort: a failure — or a
+    // DEFECT thrown by the injected thunk (e.g. the plugin's `writeActivity()`
+    // hitting an fs error) — must only delay readiness, never terminate the
+    // activation loop, so both are swallowed. `getAndSet` is the atomic one-shot
+    // gate: the first caller sees `false` and fires; every later caller sees `true`
+    // and no-ops.
+    const fireReadinessOnce: Effect.Effect<void> = deps.onFirstActivation
+      ? Ref.getAndSet(readinessFiredRef, true).pipe(
+          Effect.flatMap((already) =>
+            already
+              ? Effect.void
+              : deps.onFirstActivation!.pipe(
+                  Effect.catchDefect((defect) =>
+                    Effect.sync(() =>
+                      logger.warn(`readiness handshake failed (ignored) — ${String(defect)}`),
+                    ),
+                  ),
+                  Effect.ignore,
+                ),
+          ),
+        )
+      : Effect.void;
+
     const dispatchDeps = {
       engine: deps.engine,
       runner: deps.runner,
@@ -209,6 +256,13 @@ export const makeSupervisor = (deps: SupervisorDeps): Effect.Effect<Supervisor> 
     const tick: Effect.Effect<void> = deps.registry.pollBatch.pipe(
       Effect.flatMap((targets) => {
         if (targets.length === 0) {
+          // Zero serviceable-with-capacity types → nothing to lease this tick, so
+          // do NOT stamp readiness (#253). An --auto worker whose initial engine
+          // read failed starts with zero types and fills them in on a later
+          // reconcile; stamping readiness here would let the rolling reload drain
+          // the next worker while this replacement has no pollers and cannot lease
+          // anything — defeating the one-at-a-time guarantee. It becomes ready on
+          // the first tick that actually has a poll set (below).
           return Effect.sleep(Duration.millis(cfg.idleSpacingMs));
         }
         const typeSet = new Set(targets.map((t) => t.type));
@@ -225,7 +279,7 @@ export const makeSupervisor = (deps: SupervisorDeps): Effect.Effect<Supervisor> 
               }
             }
           });
-        return parking.takeFor(typeSet).pipe(
+        const activate: Effect.Effect<void> = parking.takeFor(typeSet).pipe(
           Effect.flatMap((parked) => {
             if (parked) {
               return deps.registry.claim(parked.job.type).pipe(
@@ -244,6 +298,11 @@ export const makeSupervisor = (deps: SupervisorDeps): Effect.Effect<Supervisor> 
             );
           }),
         );
+        // Readiness is LEASING-gated (#253): the first tick with a non-empty poll
+        // set is the moment this worker is genuinely serving, so fire the one-shot
+        // handshake here (before the promote/poll), NOT unconditionally at loop
+        // entry. Best-effort and one-shot — see `fireReadinessOnce`.
+        return Effect.flatMap(fireReadinessOnce, () => activate);
       }),
     );
 
@@ -256,6 +315,33 @@ export const makeSupervisor = (deps: SupervisorDeps): Effect.Effect<Supervisor> 
       if (deps.agenticEndpoint) {
         yield* Effect.forkChild(projectPresence(ownership, presenceSink, presenceKnownRef, cfg.presence));
       }
+      // The activation loop is about to run ON this fiber — imports and the SDK
+      // client were built before `runFork`, and reconcile/presence are forked.
+      //
+      // Readiness is stamped by `tick` on the first NON-EMPTY poll set, NOT here
+      // at loop entry (#253 review). The rolling reload waits for a replacement to
+      // report ready before draining the next worker, so readiness must mean "this
+      // worker can actually lease" — a serviceable-with-capacity type. An --auto
+      // worker whose initial engine read failed enters the loop with ZERO types;
+      // stamping readiness unconditionally here would let the reload drain the next
+      // worker while this replacement has no activation pollers and cannot lease
+      // anything, breaking the one-at-a-time guarantee. Gating on the first
+      // non-empty tick fixes that: the worker becomes ready the moment reconcile
+      // fills its types and it begins leasing; if types never arrive it never
+      // stamps ready and the daemon's bounded ready-timeout advances the roll.
+      //
+      // Readiness is also deliberately gated on LEASING, NOT on the agentic
+      // connection. Under agentic, `superviseAgentic` forks the connect→establish
+      // cycle as a CHILD fiber and runs this `run` concurrently, so the agentic
+      // handle may still be connecting when the first tick leases. That is correct:
+      // the activation/leasing loop does not depend on the agentic connection
+      // (presence/steer resync themselves once the handle opens, and a job leased
+      // before the connection is up degrades gracefully), so a rolling reload's
+      // one-at-a-time guarantee needs only "the replacement is leasing", not "the
+      // replacement's agentic socket is up". Gating readiness on `onEstablished`
+      // would instead let a slow/failing connect stall the roll (only the bounded
+      // ready-timeout would rescue it) for a dependency leasing does not have — so
+      // we intentionally do NOT do that (#253 review).
       return yield* tick.pipe(Effect.forever);
     });
 

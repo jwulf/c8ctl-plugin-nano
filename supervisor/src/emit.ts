@@ -117,21 +117,6 @@ export const makeAgenticEndpoint = (connect: RawEmitConnect): AgenticEndpoint =>
           ),
       });
 
-      // `closed` completes on a mid-life drop; `opened` unblocks the connect with
-      // `true` on the first open, or `false` if the socket closes before opening.
-      // Both completions are idempotent (first winner sticks), so the single
-      // onOpen/onClose registrations below are safe against either ordering.
-      const closed = yield* Deferred.make<void>();
-      const opened = yield* Deferred.make<boolean>();
-
-      raw.onOpen(() => {
-        Effect.runSync(Deferred.succeed(opened, true));
-      });
-      raw.onClose(() => {
-        Effect.runSync(Deferred.succeed(opened, false));
-        Effect.runSync(Deferred.succeed(closed, void 0));
-      });
-
       // `connect()` has already built the raw client and STARTED its transport
       // (its internal reconnect timers/sockets are live). Until we successfully
       // hand a handle to the outer `acquireRelease` — whose `disconnect`
@@ -142,8 +127,37 @@ export const makeAgenticEndpoint = (connect: RawEmitConnect): AgenticEndpoint =>
       // its live timers and keep the worker process alive forever after
       // teardown — wedging the daemon's drain (issue #258). Close it on any exit
       // that does not return the handle.
-      const didOpen = yield* Deferred.await(opened).pipe(
-        Effect.onInterrupt(() => Effect.sync(() => raw.close())),
+      //
+      // The `onInterrupt` close only guards a fiber parked on `Deferred.await`,
+      // so the Deferred creation + handler wiring that precedes it must be
+      // UNINTERRUPTIBLE: an interrupt landing after `raw` is built but before we
+      // reach the await (e.g. during `Deferred.make`) would otherwise exit
+      // WITHOUT running the close, re-leaking the half-open client. Mask the
+      // setup and re-enable interruption only for the await, so any pending
+      // interrupt is deferred until the await that owns the close.
+      const { didOpen, closed } = yield* Effect.uninterruptibleMask((restore) =>
+        Effect.gen(function* () {
+          // `closed` completes on a mid-life drop; `opened` unblocks the connect
+          // with `true` on the first open, or `false` if the socket closes
+          // before opening. Both completions are idempotent (first winner
+          // sticks), so the single onOpen/onClose registrations below are safe
+          // against either ordering.
+          const closed = yield* Deferred.make<void>();
+          const opened = yield* Deferred.make<boolean>();
+
+          raw.onOpen(() => {
+            Effect.runSync(Deferred.succeed(opened, true));
+          });
+          raw.onClose(() => {
+            Effect.runSync(Deferred.succeed(opened, false));
+            Effect.runSync(Deferred.succeed(closed, void 0));
+          });
+
+          const didOpen = yield* restore(Deferred.await(opened)).pipe(
+            Effect.onInterrupt(() => Effect.sync(() => raw.close())),
+          );
+          return { didOpen, closed };
+        }),
       );
       if (!didOpen) {
         yield* Effect.sync(() => raw.close());

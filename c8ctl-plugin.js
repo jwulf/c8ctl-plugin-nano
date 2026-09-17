@@ -11673,7 +11673,15 @@ async function runSupervisorDaemon() {
     // while this one is being torn down — a partial-fleet outage. A worker being
     // stopped has no confirmed serving replacement, so treat it as a failed
     // reload (the `runReload` else-branch then aborts the roll, #253 review).
-    return w.child === started && !w.stopping && w.pid != null && w.pid === started.pid
+    //
+    // Also reject `shuttingDown`: a `stop` can begin DURING this replacement's
+    // readiness wait, after which `waitForWorkerReady` still returns and (for a
+    // last target) `w.stopping` may not be latched yet — so without this the gate
+    // would report a clean reload while shutdown is already tearing the fleet
+    // down. A daemon that is shutting down has no serving future for this worker,
+    // so treat a shutdown observed before the gate as a failed/interrupted reload
+    // (the `runReload` else-branch aborts the roll, #253 review).
+    return w.child === started && !w.stopping && !shuttingDown && w.pid != null && w.pid === started.pid
       && started.exitCode === null && started.signalCode === null;
   };
 
@@ -16435,7 +16443,7 @@ function printUsage() {
   console.log('  c8ctl nano assign <profileName> <cap[,cap...]> [--name <n>] [--capabilities <a,b>]');
   console.log('  c8ctl nano work <profileName> [--auto [--auto-scope <p>]] [--arg <switch> ...] [--recovery-window <ms>] [--idle-timeout <ms>] [--job-timeout <ms>] [--poll-timeout <ms>] [--job-type <token> ...] [--sandbox none|docker|podman] [--image <ref>] [--env NAME=VALUE ...] [--secret-resolver host] [--min-free-mb <n>] [--clone-timeout <ms>] [--keep-runs] [--stream]');
   console.log('  c8ctl nano supervisor [start|install|uninstall|status|add|remove|restart|reload|stop|logs|attach] ... (manage many workers from one terminal)');
-  console.log('  c8ctl nano workforce [add|remove|list|start|status|stop] ... [--manifest <manifest>] (declarative, reusable fleet manifests)');
+  console.log('  c8ctl nano workforce [add|remove|list|start|status|stop|reload] ... [--manifest <manifest>] (declarative, reusable fleet manifests)');
   console.log('');
   console.log('Subcommands:');
   console.log('  start    Spawn an N-node local cluster wired to talk to each other on localhost');
@@ -16454,7 +16462,7 @@ function printUsage() {
   console.log('  assign   Grant new capabilities (roles) to an existing hire (additive; comma-separated; workers hot-reload)');
   console.log('  work     Run a hired profile as Nano job workers, polling for work until Ctrl-C');
   console.log('  supervisor  Run/manage a fleet of workers from one terminal (detachable console + non-interactive control)');
-  console.log('  workforce   Compose a reusable, declarative fleet manifest and reconcile it up/down (add|remove|list|start|status|stop)');
+  console.log('  workforce   Compose a reusable, declarative fleet manifest and reconcile it up/down (add|remove|list|start|status|stop|reload)');
   console.log('');
   console.log('Options:');
   console.log('  <nodes>              Number of nodes to start (default 1)');

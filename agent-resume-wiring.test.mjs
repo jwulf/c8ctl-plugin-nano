@@ -26,6 +26,21 @@
 //   - each gate (NANO_AGENT_INSTANCE=off, producer-unavailable, NANO_AGENT_RESUME=off
 //     kill switch, and a non-external job) falls through to the ORIGINAL envelope so
 //     the harness stdin carries the original — unseeded — prompt.
+//
+// LIMIT (honest scope): `driveResumeWiring` reproduces `workAgent`'s ordering against
+// the real collaborators rather than invoking the ~1000-line `workAgent` itself (which
+// is welded to activation, provisioning, relay, and abort-recheck machinery this test
+// deliberately avoids). That means the integration test above proves the COLLABORATORS
+// compose correctly, but a regression in `workAgent`'s OWN wiring — handing `runAgentJob`
+// the original `envelope` instead of `effectiveEnvelope`, or minting the producer from
+// the seeded envelope — would be invisible to it. The `workAgent resume wiring is pinned
+// at the source` test below closes exactly that gap: it scans the production source and
+// asserts the real runner mints the producer from the ORIGINAL `envelope`, threads
+// `resolveEffectiveEnvelope`'s result into `effectiveEnvelope`, and passes
+// `envelope: effectiveEnvelope` to `runAgentJob` — so the two together catch both a
+// collaborator regression AND a runner-wiring swap (the repo has no ESLint, so a
+// source-scanning `node --test` guard is the established pattern; cf.
+// supervisor-engine-sdk-preference.test.mjs).
 
 import { test } from 'node:test';
 import assert from 'node:assert/strict';
@@ -66,8 +81,13 @@ const PROFILE = (echoScript) => ({
   model: 'Opus 4.8',
   capabilities: ['feature'],
   // A real, dependency-free harness: dump stdin verbatim to the file named by the
-  // single appended `--arg`, then exit 0. This makes `runAgentJob`'s spawn a genuine
-  // process (not a stub) whose stdin we can read back to assert what reached it.
+  // NANO_TEST_CAPTURE env var, then exit 0. This makes `runAgentJob`'s spawn a genuine
+  // process (not a stub) whose stdin we can read back to assert what reached it. The
+  // capture path rides an env var (not a structured `--arg`) DELIBERATELY: `runAgentJob`
+  // rejects a non-empty `args` on the host path on Windows (c8ctl-plugin.js — POSIX
+  // single-quoted `--arg` tokens cmd.exe won't honour), so a structured-args harness
+  // would fail every case on Windows before the echo ran. An env var keeps the profile
+  // command args-free, so these integration tests run identically on every platform.
   command: `node ${echoScript}`,
 });
 
@@ -92,11 +112,13 @@ let ECHO;
 test.before(() => {
   TMP = mkdtempSync(join(tmpdir(), 'nano-resume-wiring-'));
   ECHO = join(TMP, 'echo-stdin.cjs');
-  // Read all of stdin and write it verbatim to argv[2], then exit. Node core only
-  // (a .cjs file so `require` is available regardless of any ambient package type).
+  // Read all of stdin and write it verbatim to the path in NANO_TEST_CAPTURE, then
+  // exit. Node core only (a .cjs file so `require` is available regardless of any
+  // ambient package type). The capture path arrives via env (not argv) so the profile
+  // command stays args-free — see PROFILE for why (Windows host-args rejection).
   writeFileSync(ECHO, [
     "const fs = require('node:fs');",
-    'const out = process.argv[2];',
+    'const out = process.env.NANO_TEST_CAPTURE;',
     'const chunks = [];',
     "process.stdin.on('data', (c) => chunks.push(c));",
     "process.stdin.on('end', () => {",
@@ -149,14 +171,16 @@ async function driveResumeWiring({
   const effectiveEnvelope = resumed.envelope;
 
   // Spawn the harness with the EFFECTIVE envelope (seeded on a resume) and the
-  // producer's ingest as onAcpUpdate — exactly workAgent's runOpts.
+  // producer's ingest as onAcpUpdate — exactly workAgent's runOpts. The capture path
+  // rides `extraEnv` (→ harness env), not a structured `--arg`, so the profile command
+  // stays args-free and the harness runs identically on Windows (see PROFILE).
   const result = await runAgentJob(profile, job, {
     envelope: effectiveEnvelope,
     onAcpUpdate: producer ? (u) => producer.ingest(u) : undefined,
     timeoutMs: 30_000,
     idleTimeoutMs: 30_000,
     recoveryWindowMs: 5_000,
-    args: [captureFile],
+    extraEnv: { NANO_TEST_CAPTURE: captureFile },
   });
 
   assert.equal(result.ok, true, `harness should exit 0 (stderr: ${result.stderr})`);
@@ -241,4 +265,37 @@ test('resume wiring: a read that yields no prior work cold-runs even for an elig
   assert.equal(camunda.calls.create.length, 1, 'the producer is still minted');
   assert.equal(stdin.prompt, ORIGINAL_PROMPT);
   assert.doesNotMatch(stdin.prompt, /You are RESUMING a job/);
+});
+
+// The integration cases above drive the resume COLLABORATORS through a reproduced copy
+// of workAgent's ordering; they cannot see a regression in workAgent's OWN wiring (e.g.
+// handing runAgentJob the original `envelope` instead of `effectiveEnvelope`, or minting
+// the producer from the seeded envelope). This source-scanning guard pins that wiring
+// directly: workAgent must mint the producer from the ORIGINAL `envelope`, thread
+// `resolveEffectiveEnvelope`'s output into `effectiveEnvelope`, and hand runAgentJob
+// `envelope: effectiveEnvelope`. It fails the moment the runner swaps either envelope —
+// the exact regression class the integration tests are blind to (the repo has no ESLint,
+// so a source guard is the established pattern; cf. supervisor-engine-sdk-preference.test.mjs).
+test('workAgent resume wiring is pinned at the source (producer←original, harness←effective)', () => {
+  const src = readFileSync(new URL('./c8ctl-plugin.js', import.meta.url), 'utf8');
+
+  // The AgentInstance producer is minted from the ORIGINAL envelope — its options object
+  // names `envelope`, never the seeded `effectiveEnvelope`.
+  const producerCall = src.match(/createAgentInstanceProducer\(\{[^}]*\}\)/);
+  assert.ok(producerCall, 'workAgent must call createAgentInstanceProducer({ … })');
+  assert.match(producerCall[0], /\benvelope\b/, 'the producer must be minted from the original `envelope`');
+  assert.doesNotMatch(
+    producerCall[0],
+    /effectiveEnvelope/,
+    'the producer must NOT be seeded from the resume-seeded `effectiveEnvelope`',
+  );
+
+  // `effectiveEnvelope` starts as the original and is (re)assigned from the resolver's
+  // result — so the harness gets the seeded envelope on a resume and the original otherwise.
+  assert.match(src, /let\s+effectiveEnvelope\s*=\s*envelope\s*;/, 'effectiveEnvelope must default to the original envelope');
+  assert.match(src, /effectiveEnvelope\s*=\s*resumed\.envelope\s*;/, 'effectiveEnvelope must be threaded from resolveEffectiveEnvelope');
+  assert.match(src, /resolveEffectiveEnvelope\(\{[^}]*\benvelope\b[^}]*\}\)/, 'the resolver must be fed the original envelope');
+
+  // runAgentJob receives the EFFECTIVE (possibly seeded) envelope, never the bare original.
+  assert.match(src, /envelope:\s*effectiveEnvelope\b/, 'runAgentJob must be handed `envelope: effectiveEnvelope`');
 });

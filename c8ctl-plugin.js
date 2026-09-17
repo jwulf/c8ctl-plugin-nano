@@ -3475,6 +3475,35 @@ function bindJobSettle(settle, job) {
   };
 }
 
+// #254: wrap a job's fenced settle seam so a settle FAILURE — the fenced
+// `complete`/`fail` was rejected (typically the activation's lease was lost
+// around settlement, leaving the engine still projecting the job `CREATED`) — is
+// recorded as `settlement-pending` for `supervisor status` BEFORE the error is
+// re-thrown unchanged. Purely observational: it never swallows the rejection or
+// alters the settle outcome, so the runtime's dispatch handles the failed settle
+// exactly as before. `onPending(job, phase)` is the recorder; `phase` is
+// 'complete' or 'fail' (which settle call was stuck), and a throw from the
+// recorder itself is swallowed so a marker write can never mask the real error.
+// @param {{ complete: Function, fail: Function }} settleJob  the per-activation settle seam (see bindJobSettle)
+// @param {{ jobKey: string, type?: string, leaseToken?: string }} job  the activation being settled
+// @param {(job: object, phase: 'complete'|'fail') => void} onPending  records the stuck settlement
+// @returns {{ complete: Function, fail: Function }}
+function withSettlementPendingMarker(settleJob, job, onPending) {
+  const mark = (phase) => {
+    try { if (typeof onPending === 'function') onPending(job, phase); } catch { /* advisory only */ }
+  };
+  return {
+    complete: async (variables) => {
+      try { return await settleJob.complete(variables); }
+      catch (err) { mark('complete'); throw err; }
+    },
+    fail: async (opts2) => {
+      try { return await settleJob.fail(opts2); }
+      catch (err) { mark('fail'); throw err; }
+    },
+  };
+}
+
 async function createSupervisorDeps(opts = {}) {
   const {
     runner,
@@ -8286,14 +8315,20 @@ function agenticStateForTarget(target, safeUrl = (u) => u) {
  * `agentic` from THIS payload — leaving every supervised worker's Engine/Agentic
  * column stuck at `?` — would otherwise slip through. `jobs` is the live active-job
  * list; `busy` is derived so callers can't desync it from `jobs`.
- * @param {{ pid:number, updatedAt:number, jobs:Array<{key:string,type:string,since:number}>, engine:(string|null), agentic:object }} fields
+ *
+ * `busy` counts only ACTIVELY-RUNNING jobs, never a `settlementPending` ghost
+ * (#254): a job whose fenced settle failed (activation ownership lost around
+ * `completeJob`/`failJob`, so the engine may still project it `CREATED`) is no
+ * longer running here, so it rides the marker as a flagged, observational entry
+ * without making an idle worker look busy or inflating the drain's in-flight count.
+ * @param {{ pid:number, updatedAt:number, jobs:Array<{key:string,type:string,since:number,settlementPending?:boolean}>, engine:(string|null), agentic:object }} fields
  */
 function buildActivityPayload({ pid, updatedAt, jobs, engine, agentic }) {
   const jobList = Array.isArray(jobs) ? jobs : [];
   return {
     pid,
     updatedAt,
-    busy: jobList.length > 0,
+    busy: jobList.some((j) => j && !j.settlementPending),
     jobs: jobList,
     engine: engine ?? null,
     agentic,
@@ -8930,6 +8965,17 @@ async function workAgent(req, flags, ctx) {
     installParentDeathWatchdog({ parentPid: Number.isInteger(daemonPid) ? daemonPid : undefined });
   }
   const activeJobs = new Map(); // jobKey -> { type, since (ms epoch) }
+  // #254: settlement-pending ghosts — jobKey -> { type, since, phase, leaseToken }.
+  // A job whose fenced settle FAILED (activation ownership lost around
+  // `completeJob`/`failJob`, so the engine may still project it `CREATED`) is
+  // recorded here so `supervisor status` can SURFACE the stuck window instead of
+  // an operator inferring it from a silently-idle worker + a stuck `CREATED` job.
+  // Kept OUT of `activeJobs` on purpose: these jobs are no longer running here, so
+  // they must not count as busy/in-flight (force-abort yield, drain, capacity) —
+  // this is observation only; recovery is already owned by the lease-fence +
+  // transcript-resume path. Bounded so a long-lived worker can't accumulate ghosts.
+  const settlementPendingJobs = new Map();
+  const MAX_SETTLEMENT_PENDING_GHOSTS = 64;
   // Which engine this worker polls jobs from, surfaced to `supervisor status` via
   // the activity marker (#99). Derived from resolveWorkerPollEngineBase — the SDK
   // client's OWN profile restAddress (the base createJobWorker actually activates
@@ -8958,6 +9004,13 @@ async function workAgent(req, flags, ctx) {
   const writeActivity = () => {
     if (!activityFile) return;
     const jobs = [...activeJobs.entries()].map(([key, v]) => ({ key, type: v.type, since: v.since }));
+    // #254: append settlement-pending ghosts as flagged, observational entries. A
+    // ghost whose key was re-activated (now live in `activeJobs`) is superseded —
+    // skip it so a reactivation replaces the stuck row rather than duplicating it.
+    for (const [key, v] of settlementPendingJobs.entries()) {
+      if (activeJobs.has(key)) continue;
+      jobs.push({ key, type: v.type, since: v.since, settlementPending: true, settlePhase: v.phase ?? null });
+    }
     const payload = buildActivityPayload({ pid: process.pid, updatedAt: Date.now(), jobs, engine: workerEngine, agentic: agenticState });
     const tmp = `${activityFile}.${process.pid}.tmp`;
     try {
@@ -8998,6 +9051,9 @@ async function workAgent(req, flags, ctx) {
   // cockpit's jobKeys — so the recorders no longer poke a per-process channel.
   const recordJobStart = (job, jobType) => {
     activeJobs.set(String(job.jobKey), { type: jobType, since: Date.now(), retries: Number(job.retries), leaseToken: job.leaseToken });
+    // #254: a fresh activation of this key supersedes any earlier stuck-settlement
+    // ghost — clear it so status shows the live run, not a stale pending row.
+    settlementPendingJobs.delete(String(job.jobKey));
     writeActivity();
   };
   const recordJobEnd = (job) => {
@@ -9010,6 +9066,28 @@ async function workAgent(req, flags, ctx) {
     const cur = activeJobs.get(String(job.jobKey));
     if (cur && cur.leaseToken !== job.leaseToken) return;
     activeJobs.delete(String(job.jobKey));
+    writeActivity();
+  };
+  // #254: record a job whose fenced settle FAILED as settlement-pending so
+  // `supervisor status` surfaces the stuck window. Derived purely from the
+  // in-flight settle outcome the worker already knows (no durable journal, no
+  // extra engine read) — the superseded settlement approach of the closed PR #226.
+  // `since` inherits the active job's start time so the cell shows how long the
+  // job has been stuck; the map is bounded (oldest evicted) so ghosts can't grow
+  // without bound on a long-lived worker.
+  const recordSettlementPending = (job, phase) => {
+    const key = String(job.jobKey);
+    const cur = activeJobs.get(key);
+    settlementPendingJobs.set(key, {
+      type: cur?.type ?? job.type ?? null,
+      since: Number.isFinite(cur?.since) ? cur.since : Date.now(),
+      phase: phase ?? null,
+      leaseToken: job.leaseToken,
+    });
+    while (settlementPendingJobs.size > MAX_SETTLEMENT_PENDING_GHOSTS) {
+      const oldest = settlementPendingJobs.keys().next().value;
+      settlementPendingJobs.delete(oldest);
+    }
     writeActivity();
   };
   // Seed an initial idle marker so status reports 'idle' immediately after spawn.
@@ -9207,7 +9285,7 @@ async function workAgent(req, flags, ctx) {
       // is still unwinding, so a map lookup could fence the completion with the
       // WRONG (newer) token and clobber the new activation — the very lease bypass
       // this fence exists to prevent. `job.leaseToken` in the closure cannot drift.
-      const settleJob = bindJobSettle(settle, job);
+      const settleJob = withSettlementPendingMarker(bindJobSettle(settle, job), job, recordSettlementPending);
       try {
         logger.info(`[${jobType}] job ${job.jobKey} (instance ${job.processInstanceKey ?? '-'}) → ${buildAgentCommandLine(profile.command, effectiveArgs)}`);
 
@@ -10675,9 +10753,16 @@ function summarizeSupervisorWorker(w, now = Date.now()) {
             // console can re-age the job cell locally (mirrors uptimeMs above).
             sinceMs: Number.isFinite(j.since) ? Math.max(0, now - j.since) : null,
             sinceEpochMs: Number.isFinite(j.since) ? j.since : null,
+            // #254: carry the settlement-pending flag (+ which settle call was
+            // stuck) so the JOB cell can surface the stuck window; a plain running
+            // job leaves both absent/false.
+            settlementPending: Boolean(j.settlementPending),
+            settlePhase: j.settlementPending ? (j.settlePhase ?? null) : null,
           }))
         : [];
-      activity = { state: jobs.length > 0 ? 'busy' : 'idle', jobs };
+      // A worker with ONLY settlement-pending ghosts is idle (it no longer runs
+      // them) — derive busy from the actively-running jobs, never a ghost (#254).
+      activity = { state: jobs.some((j) => !j.settlementPending) ? 'busy' : 'idle', jobs };
       // Engine + agentic-channel status ride the same pid-guarded marker, so a
       // stale incarnation can't show a dead worker as connected to a hub.
       engine = typeof act.engine === 'string' && act.engine ? act.engine : null;
@@ -10726,7 +10811,7 @@ function supervisorStatusSignature(workers) {
       w.lastExit ?? '',
       w.activity ? w.activity.state : null,
       w.activity
-        ? w.activity.jobs.map((j) => `${j.key}\u0000${j.type ?? ''}`).sort()
+        ? w.activity.jobs.map((j) => `${j.key}\u0000${j.type ?? ''}\u0000${j.settlementPending ? 'sp' : ''}`).sort()
         : null,
       // Engine + agentic-channel status: a connect/disconnect or an engine
       // change is a real transition that must repaint attached consoles (#99).
@@ -10741,10 +10826,25 @@ function supervisorJobCell(w) {
   if (w.state !== 'running') return '-';
   const a = w.activity;
   if (!a) return '?'; // alive but not reporting (older worker / marker not yet written)
-  if (a.state !== 'busy' || a.jobs.length === 0) return 'idle';
-  const [first, ...rest] = a.jobs;
+  const jobs = Array.isArray(a.jobs) ? a.jobs : [];
+  const running = jobs.filter((j) => !j.settlementPending);
+  const pending = jobs.filter((j) => j.settlementPending);
+  // #254: a worker with no running job but a stuck settlement shows the
+  // settlement-pending window (job key + how long it's been stuck) rather than a
+  // bare `idle`, so an operator can see (and act on) a job caught between an
+  // agent's side effect and broker settlement instead of inferring it.
+  if (running.length === 0) {
+    if (pending.length === 0) return 'idle';
+    const [first] = pending;
+    const dur = first.sinceMs != null ? ` (${formatDuration(first.sinceMs)})` : '';
+    const more = pending.length > 1 ? ` +${pending.length - 1}` : '';
+    return `${first.key} settlement-pending${more}${dur}`;
+  }
+  const [first, ...rest] = running;
   const dur = first.sinceMs != null ? ` (${formatDuration(first.sinceMs)})` : '';
-  const more = rest.length > 0 ? ` +${rest.length}` : '';
+  // Fold any additional running jobs AND settlement-pending ghosts into the +N.
+  const extra = rest.length + pending.length;
+  const more = extra > 0 ? ` +${extra}` : '';
   return `${first.key}${more}${dur}`;
 }
 
@@ -11995,7 +12095,9 @@ async function supervisorRestartCmd(req) {
 function countSupervisorInFlight(workers) {
   let n = 0;
   for (const w of workers || []) {
-    if (w && w.activity && Array.isArray(w.activity.jobs)) n += w.activity.jobs.length;
+    // #254: a settlement-pending ghost is no longer running here (its worker
+    // released it), so it must not inflate the in-flight count an operator drains.
+    if (w && w.activity && Array.isArray(w.activity.jobs)) n += w.activity.jobs.filter((j) => !j.settlementPending).length;
   }
   return n;
 }
@@ -15571,6 +15673,7 @@ export {
   createAgenticEndpoint,
   createSupervisorDeps,
   bindJobSettle,
+  withSettlementPendingMarker,
   enableEngineHappyEyeballs,
   preferIpv4Resolution,
   isLikelyLocalNetworkTccBlock,
@@ -15621,6 +15724,7 @@ export {
   printSupervisorStatus,
   supervisorStatusSignature,
   supervisorJobCell,
+  countSupervisorInFlight,
   supervisorEngineCell,
   supervisorAgenticCell,
   agenticStateForTarget,

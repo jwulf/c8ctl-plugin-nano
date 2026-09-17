@@ -379,6 +379,18 @@ If workers show `advisory` (or stay `connecting`) while jobs still run, that's t
 "connected to the engine but empty Cockpit" case: point them at the app with
 `export NANO_AGENTIC_URL=http://<engine-host>:<appUi.port>` (e.g. `:3000`).
 
+**`settlement-pending` in the `JOB` column.** A worker's `JOB` cell normally
+shows the job key it is running (or `idle`). If an agent finished its external
+side effect but the worker then lost its activation lease around
+`completeJob`/`failJob` — so the fenced settle failed and the engine may still
+project the job as `CREATED` — the cell instead shows
+`<jobKey> settlement-pending (<age>)`. This is **observational only**: recovery is
+already handled by the lease-fence + transcript-resume path, and such a job is
+*not* counted as busy/in-flight (it doesn't hold up a drain). The state lets you
+*see* a job caught between side effect and settlement rather than inferring it
+from a silently-idle worker plus a stuck `CREATED` job; it clears when the job is
+re-activated or the worker restarts.
+
 **Liveness watchdog (auto-recovery from a wedged channel).** If the nano server
 restarts, crashes, or a network partition drops the connection *without* a clean
 close (a **half-open** socket), a worker's channel client can sit `disconnected`

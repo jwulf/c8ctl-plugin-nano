@@ -41,6 +41,8 @@ import {
   agenticStateForTarget,
   normalizeAgenticMessage,
   buildActivityPayload,
+  withSettlementPendingMarker,
+  countSupervisorInFlight,
   supervisorWorkerActivityFile,
   WORK_FORWARD_FLAGS,
 } from './c8ctl-plugin.js';
@@ -705,6 +707,31 @@ test('supervisorJobCell is - for a down worker and ? for an alive non-reporter',
   assert.equal(supervisorJobCell({ state: 'running', activity: null }), '?');
 });
 
+// #254: a job whose fenced settle failed rides the marker as a settlement-pending
+// ghost — the JOB cell surfaces the stuck window instead of a bare `idle`.
+test('supervisorJobCell surfaces a settlement-pending job on an otherwise idle worker', () => {
+  const row = { state: 'running', activity: { state: 'idle', jobs: [
+    { key: '77', type: 'senior:feature', sinceMs: 4000, settlementPending: true, settlePhase: 'complete' },
+  ] } };
+  const cell = supervisorJobCell(row);
+  assert.match(cell, /^77 settlement-pending \(4s\)$/);
+});
+
+test('supervisorJobCell counts extra settlement-pending ghosts and folds them into a running job', () => {
+  // Only ghosts: first shown, rest counted.
+  const onlyGhosts = { state: 'running', activity: { state: 'idle', jobs: [
+    { key: 'G1', type: 't', sinceMs: 1000, settlementPending: true },
+    { key: 'G2', type: 't', sinceMs: 2000, settlementPending: true },
+  ] } };
+  assert.match(supervisorJobCell(onlyGhosts), /^G1 settlement-pending \+1 \(1s\)$/);
+  // A running job + a ghost: the running job leads, the ghost is folded into +N.
+  const mixed = { state: 'running', activity: { state: 'busy', jobs: [
+    { key: 'R1', type: 't', sinceMs: 3000 },
+    { key: 'G1', type: 't', sinceMs: 5000, settlementPending: true },
+  ] } };
+  assert.match(supervisorJobCell(mixed), /^R1 \+1 \(3s\)$/);
+});
+
 // --- summarizeSupervisorWorker reads the on-disk activity marker -----------
 
 test('summarizeSupervisorWorker surfaces a live worker\'s serviced job from its marker', async (t) => {
@@ -735,6 +762,36 @@ test('summarizeSupervisorWorker surfaces a live worker\'s serviced job from its 
   // No marker at all → idle-with-no-report (null), rendered as '?'.
   const other = summarizeSupervisorWorker({ id: 'never-reported', profile: 'x', pid: process.pid });
   assert.equal(other.activity, null);
+});
+
+// #254: a marker carrying ONLY a settlement-pending ghost reads as idle-state
+// (the worker no longer runs it) but the ghost + its flag ride through so the
+// JOB cell can surface the stuck settlement window.
+test('summarizeSupervisorWorker reads a settlement-pending ghost as idle-state but keeps the flag', async (t) => {
+  const { mkdtempSync, mkdirSync, writeFileSync, rmSync } = await import('node:fs');
+  const { tmpdir } = await import('node:os');
+  const { join, dirname } = await import('node:path');
+  const home = mkdtempSync(join(tmpdir(), 'c8ctl-activity-sp-'));
+  const prev = process.env.C8CTL_NANO_HOME;
+  process.env.C8CTL_NANO_HOME = home;
+  t.after(() => {
+    if (prev === undefined) delete process.env.C8CTL_NANO_HOME; else process.env.C8CTL_NANO_HOME = prev;
+    try { rmSync(home, { recursive: true, force: true }); } catch { /* best effort */ }
+  });
+
+  const file = supervisorWorkerActivityFile('stuck');
+  mkdirSync(dirname(file), { recursive: true });
+  writeFileSync(file, JSON.stringify({
+    pid: process.pid, busy: false,
+    jobs: [{ key: 'JOB-SP', type: 'senior:feature', since: Date.now() - 3000, settlementPending: true, settlePhase: 'complete' }],
+  }));
+  const row = summarizeSupervisorWorker({ id: 'stuck', profile: 'stuck', pid: process.pid });
+  // A pure ghost does NOT mark the worker busy.
+  assert.equal(row.activity.state, 'idle');
+  assert.equal(row.activity.jobs[0].settlementPending, true);
+  assert.equal(row.activity.jobs[0].settlePhase, 'complete');
+  // and the JOB cell surfaces the stuck window rather than a bare `idle`.
+  assert.match(supervisorJobCell(row), /^JOB-SP settlement-pending/);
 });
 
 // --- supervisorStatusSignature (live-view change detection) ----------------
@@ -1027,6 +1084,69 @@ test('buildActivityPayload carries engine + agentic and derives busy from jobs',
   const noJobs = buildActivityPayload({ pid: 1, updatedAt: 3, jobs: undefined, engine: 'e', agentic: { status: 'off' } });
   assert.deepEqual(noJobs.jobs, []);
   assert.equal(noJobs.busy, false);
+});
+
+// #254: a settlement-pending ghost must not make an idle worker look busy.
+test('buildActivityPayload derives busy from running jobs, not settlement-pending ghosts', () => {
+  const onlyGhost = buildActivityPayload({
+    pid: 1, updatedAt: 1,
+    jobs: [{ key: '5', type: 't', since: 10, settlementPending: true }],
+    engine: null, agentic: { status: 'off' },
+  });
+  assert.equal(onlyGhost.busy, false);
+  // the ghost still rides the marker so status can render it
+  assert.equal(onlyGhost.jobs.length, 1);
+
+  const mixed = buildActivityPayload({
+    pid: 1, updatedAt: 1,
+    jobs: [
+      { key: '5', type: 't', since: 10, settlementPending: true },
+      { key: '6', type: 't', since: 20 },
+    ],
+    engine: null, agentic: { status: 'off' },
+  });
+  assert.equal(mixed.busy, true);
+});
+
+// #254: withSettlementPendingMarker records a failed fenced settle then re-throws.
+test('withSettlementPendingMarker marks a stuck settle and re-throws unchanged', async () => {
+  const calls = [];
+  const boom = new Error('lease lost (409 JobLeaseMismatch)');
+  const inner = {
+    complete: async () => { throw boom; },
+    fail: async () => { throw boom; },
+  };
+  const job = { jobKey: '900', type: 'senior:feature', leaseToken: 'tok' };
+  const wrapped = withSettlementPendingMarker(inner, job, (j, phase) => calls.push([j.jobKey, phase]));
+  await assert.rejects(() => wrapped.complete({ ok: 1 }), /lease lost/);
+  await assert.rejects(() => wrapped.fail({ retries: 0 }), /lease lost/);
+  assert.deepEqual(calls, [['900', 'complete'], ['900', 'fail']]);
+});
+
+test('withSettlementPendingMarker is a pass-through on a successful settle', async () => {
+  let marked = 0;
+  const inner = { complete: async (v) => ({ done: v }), fail: async () => 'failed' };
+  const wrapped = withSettlementPendingMarker(inner, { jobKey: '1' }, () => { marked++; });
+  assert.deepEqual(await wrapped.complete({ a: 1 }), { done: { a: 1 } });
+  assert.equal(await wrapped.fail({}), 'failed');
+  assert.equal(marked, 0);
+});
+
+test('withSettlementPendingMarker never lets a recorder throw mask the settle error', async () => {
+  const boom = new Error('settle failed');
+  const inner = { complete: async () => { throw boom; }, fail: async () => 'ok' };
+  const wrapped = withSettlementPendingMarker(inner, { jobKey: '1' }, () => { throw new Error('recorder blew up'); });
+  await assert.rejects(() => wrapped.complete({}), /settle failed/);
+});
+
+// #254: settlement-pending ghosts are not drained/counted as in-flight work.
+test('countSupervisorInFlight excludes settlement-pending ghosts', () => {
+  const workers = [
+    { activity: { jobs: [{ key: 'a' }, { key: 'b', settlementPending: true }] } },
+    { activity: { jobs: [{ key: 'c', settlementPending: true }] } },
+    { activity: { jobs: [{ key: 'd' }] } },
+  ];
+  assert.equal(countSupervisorInFlight(workers), 2); // a + d only
 });
 
 test('supervisorStatusSignature changes when the polled engine changes', () => {

@@ -289,11 +289,20 @@ test('workAgent resume wiring is pinned at the source (producer←original, harn
   // names `envelope`, never the seeded `effectiveEnvelope`.
   const producerCall = src.match(/createAgentInstanceProducer\(\{[^}]*\}\)/);
   assert.ok(producerCall, 'workAgent must call createAgentInstanceProducer({ … })');
-  assert.match(producerCall[0], /\benvelope\b/, 'the producer must be minted from the original `envelope`');
+  // Assert the property VALUE is the original `envelope` variable itself — either the
+  // shorthand `{ …, envelope, … }` or an explicit `envelope: envelope`. Checking for a
+  // bare `envelope` identifier plus the absence of `effectiveEnvelope` is too weak: a
+  // regression to `envelope: resumed.envelope` (or any other seeded variable) would
+  // satisfy both yet still mint the producer from the continuation.
+  assert.match(
+    producerCall[0],
+    /[{,]\s*envelope\s*[,}]|\benvelope\s*:\s*envelope\b/,
+    'the producer must be minted from the original `envelope` (shorthand or `envelope: envelope`), not a seeded value',
+  );
   assert.doesNotMatch(
     producerCall[0],
-    /effectiveEnvelope/,
-    'the producer must NOT be seeded from the resume-seeded `effectiveEnvelope`',
+    /envelope\s*:\s*(?!envelope\b)\S/,
+    'the producer must NOT be seeded from any envelope other than the original (e.g. `effectiveEnvelope`/`resumed.envelope`)',
   );
 
   // `effectiveEnvelope` starts as the original and is (re)assigned from the resolver's

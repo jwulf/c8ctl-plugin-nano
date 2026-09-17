@@ -104,39 +104,40 @@ export type RawEmitConnect = () => RawEmitClient;
 export const makeAgenticEndpoint = (connect: RawEmitConnect): AgenticEndpoint => ({
   connect: () =>
     Effect.gen(function* () {
-      // A synchronous throw from `connect()` (e.g. a transportFactory failure
-      // while opening the socket) must land in the SupervisorError channel, not
-      // as a defect — otherwise `superviseAgentic`'s `Effect.retry` can't see it
-      // and the supervisor crashes instead of reconnecting.
-      const raw = yield* Effect.try({
-        try: connect,
-        catch: (cause) =>
-          new SupervisorError(
-            cause instanceof Error ? cause.message : "agentic connect failed",
-            cause,
-          ),
-      });
-
-      // `connect()` has already built the raw client and STARTED its transport
-      // (its internal reconnect timers/sockets are live). Until we successfully
-      // hand a handle to the outer `acquireRelease` — whose `disconnect`
-      // finalizer owns teardown thereafter — WE own closing it. If this connect
-      // is interrupted (e.g. the supervisor fiber is interrupted on a SIGUSR2
-      // drain / SIGTERM abort) or fails while still parked on `opened` (the hub
-      // is unreachable, so onOpen never fires), the client would otherwise leak
-      // its live timers and keep the worker process alive forever after
-      // teardown — wedging the daemon's drain (issue #258). Close it on any exit
-      // that does not return the handle.
+      // `connect()` builds the raw client and immediately STARTS its transport
+      // (its internal reconnect timers/sockets go live the moment it returns).
+      // Until we successfully hand a handle to the outer `acquireRelease` —
+      // whose `disconnect` finalizer owns teardown thereafter — WE own closing
+      // it. If this connect is interrupted (e.g. the supervisor fiber is
+      // interrupted on a SIGUSR2 drain / SIGTERM abort) or fails while still
+      // parked on `opened` (the hub is unreachable, so onOpen never fires), the
+      // client would otherwise leak its live timers and keep the worker process
+      // alive forever after teardown — wedging the daemon's drain (issue #258).
       //
       // The `onInterrupt` close only guards a fiber parked on `Deferred.await`,
-      // so the Deferred creation + handler wiring that precedes it must be
-      // UNINTERRUPTIBLE: an interrupt landing after `raw` is built but before we
-      // reach the await (e.g. during `Deferred.make`) would otherwise exit
-      // WITHOUT running the close, re-leaking the half-open client. Mask the
-      // setup and re-enable interruption only for the await, so any pending
-      // interrupt is deferred until the await that owns the close.
-      const { didOpen, closed } = yield* Effect.uninterruptibleMask((restore) =>
+      // so EVERYTHING from constructing `raw` through wiring that handler must
+      // be UNINTERRUPTIBLE: an interrupt landing after `raw` is built but before
+      // the close is installed (e.g. between the construction and `Deferred.make`,
+      // or during it) would otherwise exit WITHOUT running the close, re-leaking
+      // the half-open client. So `connect()` itself runs INSIDE the mask — the
+      // raw client can never exist without its cleanup handler in place — and
+      // interruption is re-enabled only for the await that owns the close.
+      const { raw, didOpen, closed } = yield* Effect.uninterruptibleMask((restore) =>
         Effect.gen(function* () {
+          // A synchronous throw from `connect()` (e.g. a transportFactory
+          // failure while opening the socket) must land in the SupervisorError
+          // channel, not as a defect — otherwise `superviseAgentic`'s
+          // `Effect.retry` can't see it and the supervisor crashes instead of
+          // reconnecting. No client exists yet on this path, so nothing leaks.
+          const raw = yield* Effect.try({
+            try: connect,
+            catch: (cause) =>
+              new SupervisorError(
+                cause instanceof Error ? cause.message : "agentic connect failed",
+                cause,
+              ),
+          });
+
           // `closed` completes on a mid-life drop; `opened` unblocks the connect
           // with `true` on the first open, or `false` if the socket closes
           // before opening. Both completions are idempotent (first winner
@@ -156,7 +157,7 @@ export const makeAgenticEndpoint = (connect: RawEmitConnect): AgenticEndpoint =>
           const didOpen = yield* restore(Deferred.await(opened)).pipe(
             Effect.onInterrupt(() => Effect.sync(() => raw.close())),
           );
-          return { didOpen, closed };
+          return { raw, didOpen, closed };
         }),
       );
       if (!didOpen) {

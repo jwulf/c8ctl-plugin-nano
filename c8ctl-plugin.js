@@ -3475,6 +3475,16 @@ function bindJobSettle(settle, job) {
   };
 }
 
+// #254: how long a settlement-pending ghost may linger before it self-expires.
+// A ghost is process-local (see settlementPendingJobs), so a same-key
+// reactivation on ANOTHER worker can never clear this worker's in-memory entry;
+// the TTL bounds the stale-observation window without shared cross-worker state.
+// Module-scoped so BOTH the producer (writeActivity prunes on write) and the
+// reader (summarizeSupervisorWorker drops on read) enforce the same bound — an
+// idle worker stops writing activity, so read-time enforcement is what actually
+// expires a ghost on an otherwise-quiet worker.
+const SETTLEMENT_PENDING_GHOST_TTL_MS = 30 * 60 * 1000;
+
 // #254: wrap a job's fenced settle seam so a settle FAILURE — the fenced
 // `complete`/`fail` was rejected (typically the activation's lease was lost
 // around settlement, leaving the engine still projecting the job `CREATED`) — is
@@ -8981,13 +8991,20 @@ async function workAgent(req, flags, ctx) {
   // (that worker can't reach this in-memory map). To stop such a ghost lingering
   // until this worker restarts, every ghost also carries an explicit TTL: it
   // self-expires SETTLEMENT_PENDING_GHOST_TTL_MS after the settle FAILED (pruned
-  // in writeActivity), bounding the stale-observation window without needing
-  // shared cross-worker state. Both the TTL and the ghost's displayed age are
-  // anchored at recordedAt (when settlement failed), not the job's activation
+  // in writeActivity on the producer, AND dropped at read time in
+  // summarizeSupervisorWorker so an idle worker that has stopped writing activity
+  // still expires the ghost), bounding the stale-observation window without
+  // needing shared cross-worker state. Both the TTL and the ghost's displayed age
+  // are anchored at recordedAt (when settlement failed), not the job's activation
   // start.
   const settlementPendingJobs = new Map();
   const MAX_SETTLEMENT_PENDING_GHOSTS = 64;
-  const SETTLEMENT_PENDING_GHOST_TTL_MS = 30 * 60 * 1000;
+  // The most recent activation leaseToken seen per key, retained AFTER the job
+  // ends so a late fenced settle from an OLDER, interrupted runner cannot
+  // resurrect a ghost once its own activeJobs entry is gone (recordJobEnd removed
+  // it). Pruned by TTL/size in writeActivity like the ghost map. See
+  // recordSettlementPending's absent-`cur` guard.
+  const lastActivationByKey = new Map();
   // Which engine this worker polls jobs from, surfaced to `supervisor status` via
   // the activity marker (#99). Derived from resolveWorkerPollEngineBase — the SDK
   // client's OWN profile restAddress (the base createJobWorker actually activates
@@ -9030,6 +9047,15 @@ async function workAgent(req, flags, ctx) {
       }
       if (activeJobs.has(key)) continue;
       jobs.push({ key, type: v.type, since: v.since, settlementPending: true, settlePhase: v.phase ?? null });
+    }
+    // Bound the last-activation guard map: drop entries older than the ghost TTL
+    // (a late older-runner settle can't plausibly arrive after it) and cap size,
+    // so it can't grow without bound on a long-lived worker.
+    for (const [key, v] of lastActivationByKey.entries()) {
+      if (nowMs - (v.at ?? nowMs) > SETTLEMENT_PENDING_GHOST_TTL_MS) lastActivationByKey.delete(key);
+    }
+    while (lastActivationByKey.size > MAX_SETTLEMENT_PENDING_GHOSTS) {
+      lastActivationByKey.delete(lastActivationByKey.keys().next().value);
     }
     const payload = buildActivityPayload({ pid: process.pid, updatedAt: Date.now(), jobs, engine: workerEngine, agentic: agenticState });
     const tmp = `${activityFile}.${process.pid}.tmp`;
@@ -9074,6 +9100,9 @@ async function workAgent(req, flags, ctx) {
     // #254: a fresh activation of this key supersedes any earlier stuck-settlement
     // ghost — clear it so status shows the live run, not a stale pending row.
     settlementPendingJobs.delete(String(job.jobKey));
+    // Remember this as the newest activation for the key so a late settle from an
+    // older runner (whose activeJobs entry is already gone) can't resurrect a ghost.
+    lastActivationByKey.set(String(job.jobKey), { token: job.leaseToken, at: Date.now() });
     writeActivity();
   };
   const recordJobEnd = (job) => {
@@ -9108,7 +9137,19 @@ async function workAgent(req, flags, ctx) {
     // the newer run's recordJobEnd — even when the newer settle succeeded. Skip it
     // (mirrors recordJobEnd's identity guard); an unleased job (no token on either
     // side) records as before.
-    if (cur && cur.leaseToken !== job.leaseToken) return;
+    //
+    // `cur` can also be ABSENT here: the newer activation already ran AND finished,
+    // so recordJobEnd removed its activeJobs entry. A bare `cur &&` guard would then
+    // let this older runner's late rejection resurrect a stale ghost. Fall back to
+    // the retained last-activation identity: if the newest activation seen for this
+    // key is NOT this job, a newer run superseded it — skip. Only record when no
+    // newer identity is known (the normal current-and-only, or unleased, path).
+    if (cur) {
+      if (cur.leaseToken !== job.leaseToken) return;
+    } else {
+      const last = lastActivationByKey.get(key);
+      if (last && last.token !== job.leaseToken) return;
+    }
     const recordedAt = Date.now();
     settlementPendingJobs.set(key, {
       type: cur?.type ?? job.type ?? null,
@@ -10779,7 +10820,8 @@ function summarizeSupervisorWorker(w, now = Date.now()) {
     const act = readWorkerActivity(w.id);
     if (act && act.pid === w.pid) {
       const jobs = Array.isArray(act.jobs)
-        ? act.jobs.map((j) => ({
+        ? act.jobs
+            .map((j) => ({
             key: String(j.key),
             type: j.type ?? null,
             // Both the snapshot-time duration and its absolute base, so the
@@ -10792,6 +10834,13 @@ function summarizeSupervisorWorker(w, now = Date.now()) {
             settlementPending: Boolean(j.settlementPending),
             settlePhase: j.settlementPending ? (j.settlePhase ?? null) : null,
           }))
+            // #254: enforce the ghost TTL at READ time too. writeActivity prunes
+            // expired ghosts only when it runs, but an idle worker stops writing
+            // activity, so a persisted ghost would otherwise linger in the JOB cell
+            // past its TTL. Drop a settlement-pending entry once it is older than
+            // SETTLEMENT_PENDING_GHOST_TTL_MS so it self-expires as documented even
+            // on a quiet worker. A running job (no epoch, or not pending) is kept.
+            .filter((j) => !(j.settlementPending && j.sinceEpochMs != null && now - j.sinceEpochMs > SETTLEMENT_PENDING_GHOST_TTL_MS))
         : [];
       // A worker with ONLY settlement-pending ghosts is idle (it no longer runs
       // them) — derive busy from the actively-running jobs, never a ghost (#254).
@@ -10828,8 +10877,12 @@ function summarizeSupervisorWorker(w, now = Date.now()) {
  * Deliberately excludes ticking durations (uptimeMs, per-job sinceMs) so that a
  * merely-elapsing clock doesn't count as a change — only real transitions (a
  * worker going up/down, idle↔busy, picking up/finishing a job, a restart) alter
- * the signature. The daemon uses this to push a refreshed status to attached
- * consoles only when something actually changed, keeping a quiet fleet silent.
+ * the signature. For a settlement-pending ghost it also folds in the STABLE
+ * pending-instance identity (sinceEpochMs + settlePhase, not the ticking sinceMs)
+ * so a same-key job that fails settlement again between ticks — yielding a fresh
+ * ghost with a new sinceEpochMs — is detected as a change and repaints, rather
+ * than being masked by the previous ghost's identical [key,type,sp] tuple.
+ * The daemon uses this to push a refreshed status to attached consoles only when something actually changed, keeping a quiet fleet silent.
  * `workers` is an array of `summarizeSupervisorWorker` results.
  */
 function supervisorStatusSignature(workers) {
@@ -10844,7 +10897,7 @@ function supervisorStatusSignature(workers) {
       w.lastExit ?? '',
       w.activity ? w.activity.state : null,
       w.activity
-        ? w.activity.jobs.map((j) => `${j.key}\u0000${j.type ?? ''}\u0000${j.settlementPending ? 'sp' : ''}`).sort()
+        ? w.activity.jobs.map((j) => `${j.key}\u0000${j.type ?? ''}\u0000${j.settlementPending ? `sp\u0000${j.sinceEpochMs ?? ''}\u0000${j.settlePhase ?? ''}` : ''}`).sort()
         : null,
       // Engine + agentic-channel status: a connect/disconnect or an engine
       // change is a real transition that must repaint attached consoles (#99).

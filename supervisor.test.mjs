@@ -1417,6 +1417,45 @@ test('pruneActivationGuard retains a guard while a newer same-key activation is 
   assert.equal(inflight.has('k0'), false, 'in-flight key dropped once it has no entries left');
 });
 
+// #256 review (suppressed advisory, c8ctl-plugin.js:9670): at the soft-cap boundary
+// the runner must protect an activation (markSettleInFlight) BEFORE recordJobStart's
+// own pruneLastActivation, not after. This test documents WHY: pruneActivationGuard
+// evicts the newest UNPROTECTED key when every older key is protected by a live
+// settle, so a just-inserted guard not yet in settleInFlightByKey would be dropped —
+// leaving the subsequent fenced settle with no identity guard (an interrupted run
+// whose settle rejects after recordJobEnd would then silently drop its ghost).
+test('pruneActivationGuard evicts a just-inserted UNPROTECTED guard at the soft cap when all others are protected (protect-before-prune invariant)', () => {
+  const now = 1_000_000;
+  const ttlMs = 30 * 60 * 1000;
+
+  // 64 older keys, each protected by a live in-flight settle, + one FRESH key (k64)
+  // just inserted by recordJobStart but NOT yet marked in settleInFlightByKey.
+  const guardUnprotected = new Map();
+  const inflight = new Map();
+  for (let i = 0; i < 64; i += 1) {
+    guardUnprotected.set(`k${i}`, { token: `t${i}`, at: now - (64 - i) });
+    inflight.set(`k${i}`, new Map([[i + 1, now]])); // all older keys protected
+  }
+  guardUnprotected.set('k64', { token: 't64', at: now }); // newest, NOT protected
+  pruneActivationGuard(guardUnprotected, inflight, { nowMs: now, ttlMs, maxGhosts: 64, hardMax: 256 });
+  assert.equal(guardUnprotected.has('k64'), false,
+    'an unprotected just-inserted guard is evicted at the soft cap when every other key is protected');
+
+  // Same layout, but the fresh key IS protected first (markSettleInFlight BEFORE the
+  // prune, as the runner now does): its guard survives.
+  const guardProtected = new Map();
+  const inflight2 = new Map();
+  for (let i = 0; i < 64; i += 1) {
+    guardProtected.set(`k${i}`, { token: `t${i}`, at: now - (64 - i) });
+    inflight2.set(`k${i}`, new Map([[i + 1, now]]));
+  }
+  guardProtected.set('k64', { token: 't64', at: now });
+  inflight2.set('k64', new Map([[65, now]])); // protected BEFORE the prune
+  pruneActivationGuard(guardProtected, inflight2, { nowMs: now, ttlMs, maxGhosts: 64, hardMax: 256 });
+  assert.equal(guardProtected.has('k64'), true,
+    'a protected activation survives the same prune — proving mark-before-recordJobStart keeps the identity guard');
+});
+
 // #256 review: settleInFlightByKey keeps a per-key entry Map, and TTL GC only drops
 // AGED entries — so a same-key redelivery loop whose settles never resolve could
 // accumulate unbounded LIVE entries within the TTL window. pruneActivationGuard caps

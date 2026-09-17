@@ -9235,10 +9235,13 @@ async function workAgent(req, flags, ctx) {
   // same-key newer runner's marker (#256 review). An interrupted older runner's
   // settle keeps running (dispatch does not cancel it), so while its outcome is
   // pending its identity guard in lastActivationByKey must be retained past the size
-  // cap. Bracketed by the RUNNER lifecycle (markSettleInFlight right after
+  // cap. Bracketed by the RUNNER lifecycle (markSettleInFlight right BEFORE
   // recordJobStart → clearSettleInFlight in the runner's finally), NOT the settle
   // promise, so the guard is protected across the awaits BEFORE the settle even
-  // begins. Each entry's `since` (runner start) time-bounds the protection: a settle
+  // begins — AND across recordJobStart's own pruneLastActivation, which would
+  // otherwise evict this activation's just-inserted (still unprotected) guard at the
+  // soft-cap boundary when every other guard is protected (#256 review). Each entry's
+  // `since` (runner start) time-bounds the protection: a settle
   // hung past the ghost TTL is treated as never-resolving and GC'd, so the map can
   // never grow without bound.
   const settleInFlightByKey = new Map();
@@ -9658,16 +9661,23 @@ async function workAgent(req, flags, ctx) {
   const runner = {
     run: async (job, abortSignal) => {
       const jobType = job.type;
-      recordJobStart(job, jobType);
-      // #256 review: retain THIS activation's identity guard from runner START —
-      // not merely once the settle promise begins — so a same-key eviction can't
-      // drop it during the awaits BEFORE settlement, which would let an interrupted
-      // older runner's late fenced settle find no identity and resurrect a stale
-      // ghost. Balanced in the finally (clearSettleInFlight) via the returned
-      // per-activation handle, so an older runner's clear removes only ITS marker,
-      // never a same-key newer runner's; the guard is then pruned with a time bound
-      // + hard ceiling so a never-resolving settle cannot pin it forever.
+      // #256 review: mark THIS activation's settle in flight BEFORE recordJobStart,
+      // so its identity guard is already PROTECTED (present in settleInFlightByKey)
+      // when recordJobStart runs its own pruneLastActivation. Otherwise, at the
+      // soft-cap boundary the just-inserted guard is still unprotected (this key is
+      // not in settleInFlightByKey yet) and — if every OTHER guard is protected by an
+      // older interrupted settle — the soft-cap eviction drops THIS newly inserted
+      // (unprotected) key, leaving the subsequent settle with no matching identity
+      // guard; an interrupted run whose fenced settle then rejects after recordJobEnd
+      // clears activeJobs would find no currency proof and silently drop the ghost.
+      // Marking first also retains the guard from runner START — not merely once the
+      // settle promise begins — so a same-key eviction can't drop it during the awaits
+      // BEFORE settlement either. Balanced in the finally (clearSettleInFlight) via the
+      // returned per-activation handle, so an older runner's clear removes only ITS
+      // marker, never a same-key newer runner's; the guard is then pruned with a time
+      // bound + hard ceiling so a never-resolving settle cannot pin it forever.
       const settleMark = markSettleInFlight(String(job.jobKey));
+      recordJobStart(job, jobType);
       // Bind the settler to THIS activation's lease token, captured from the job
       // in closure scope. A settlement is fenced with the exact activation that
       // ran — NOT a token re-read from the shared activeJobs map at settle time: a

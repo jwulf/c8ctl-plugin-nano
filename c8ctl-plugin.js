@@ -3508,20 +3508,26 @@ const SETTLEMENT_PENDING_GHOST_TTL_MS = 30 * 60 * 1000;
 // when NO contradictory (non-404/409) status is present.
 const LEASE_LOST_STRONG_RE = /\bnot activated\b|joblease\s*mismatch|lease\s*mismatch/i;
 const LEASE_LOST_WEAK_RE = /\bnot found\b|\breclaim/i;
-// Every explicit HTTP status the raw settle client stamps ("HTTP <n> from …" or an
-// SDK's "status code <n>") — used to TRUST a 404/409 and to VETO the weak signals
-// when the status is explicitly something else.
-const HTTP_STATUS_RE = /\bHTTP\s+(\d{3})\b|status\s*code\s*(\d{3})\b/ig;
+// The AUTHORITATIVE transport status the raw settle client stamps: it formats the
+// message as `<phase> <jobKey>: HTTP <n> from <url><arbitrary response body>`
+// (supervisor-engine.mjs), so only an `HTTP <n> from` (or an SDK's `status code
+// <n>`) is a real status — a bare `HTTP 409`/`status code 404` mentioned INSIDE the
+// appended response body is not. The `from` anchor pins the HTTP alternative to the
+// stamped transport prefix, and we read only the FIRST match (the transport status
+// precedes the body) so body text can never override the real status (#256 review).
+const HTTP_STATUS_RE = /\bHTTP\s+(\d{3})\s+from\b|status\s*code\s*(\d{3})\b/i;
 function isLeaseLostSettleError(err) {
   if (err == null) return false;
   const msg = err instanceof Error ? err.message : String(err);
-  // Parse explicit statuses from the message AND the cause chain, separating a
-  // definitive lease-loss status (404/409) from a contradictory one. SDK rejections
-  // often carry the status as `err.status`/`err.statusCode`/`err.response.status`
-  // rather than in the message; the cause walk is bounded so a cycle can't loop.
+  // Parse the explicit status from the message (transport status only — see
+  // HTTP_STATUS_RE) AND the cause chain, separating a definitive lease-loss status
+  // (404/409) from a contradictory one. SDK rejections often carry the status as
+  // `err.status`/`err.statusCode`/`err.response.status` rather than in the message;
+  // the cause walk is bounded so a cycle can't loop.
   let leaseStatus = false;
   let otherStatus = false;
-  for (const m of msg.matchAll(HTTP_STATUS_RE)) {
+  const m = HTTP_STATUS_RE.exec(msg);
+  if (m) {
     const code = Number(m[1] ?? m[2]);
     if (code === 404 || code === 409) leaseStatus = true;
     else otherStatus = true;
@@ -3545,8 +3551,8 @@ function isLeaseLostSettleError(err) {
 
 // #254 (PR #256 review): prune the per-key activation identity guard
 // (`lastActivationByKey`) so it stays bounded no matter how settlements behave.
-// A key whose fenced settle is still in flight (`settleInFlightByKey`, keyed
-// `{ count, since }`) is RETAINED past the soft size cap so an interrupted older
+// A key whose fenced settle is still in flight (`settleInFlightByKey`, a Map of
+// per-activation `id -> since`) is RETAINED past the soft size cap so an interrupted older
 // runner's late settle can still find its identity and not resurrect a stale
 // ghost. But that protection is itself TIME-BOUNDED — a settle that has hung past
 // the ghost TTL (the production SDK settle path has no deadline, so a
@@ -3564,13 +3570,23 @@ function pruneActivationGuard(lastActivationByKey, settleInFlightByKey, opts = {
   const maxGhosts = Number.isFinite(opts.maxGhosts) ? opts.maxGhosts : 64;
   const hardMax = Number.isFinite(opts.hardMax) ? opts.hardMax : maxGhosts * 4;
   const isProtected = (key) => {
-    const s = settleInFlightByKey.get(key);
-    return Boolean(s) && nowMs - (s.since ?? nowMs) <= ttlMs;
+    const entries = settleInFlightByKey.get(key);
+    if (!entries) return false;
+    // Retained while ANY non-expired activation is still in flight: a newer same-key
+    // run's fresh `since` keeps the guard even after an older run's `since` ages out.
+    for (const since of entries.values()) {
+      if (nowMs - (since ?? nowMs) <= ttlMs) return true;
+    }
+    return false;
   };
   // GC never-resolving in-flight markers so settleInFlightByKey itself stays
-  // bounded (a hung settle's clear() may never run).
-  for (const [key, s] of settleInFlightByKey.entries()) {
-    if (nowMs - (s.since ?? nowMs) > ttlMs) settleInFlightByKey.delete(key);
+  // bounded (a hung settle's clear() may never run). Drop aged per-activation
+  // entries individually, then drop a key once it has no entries left.
+  for (const [key, entries] of settleInFlightByKey.entries()) {
+    for (const [id, since] of entries) {
+      if (nowMs - (since ?? nowMs) > ttlMs) entries.delete(id);
+    }
+    if (entries.size === 0) settleInFlightByKey.delete(key);
   }
   // 1) TTL: drop aged, unprotected identity entries.
   for (const [key, v] of lastActivationByKey.entries()) {
@@ -3631,6 +3647,19 @@ function withSettlementPendingMarker(settleJob, job, onPending) {
     complete: (variables) => around('complete', () => settleJob.complete(variables)),
     fail: (opts2) => around('fail', () => settleJob.fail(opts2)),
   };
+}
+
+// #256 review: the SINGLE composition the runner hot path uses to build a job's
+// fenced, settlement-pending-aware settle seam — `withSettlementPendingMarker`
+// wrapping a `bindJobSettle`-fenced settler. Extracted so the exact production
+// wiring (not a test-local reconstruction of it) is exercised by a test: removing
+// or mis-wiring either layer here reddens `composeFencedSettleJob`'s coverage.
+// @param {{ complete: Function, fail: Function }} settle  the raw per-key engine settle seam
+// @param {{ jobKey: string, type?: string, leaseToken?: string }} job  the activation being settled
+// @param {(job: object, phase: 'complete'|'fail') => void} onPending  records the stuck settlement
+// @returns {{ complete: Function, fail: Function }}
+function composeFencedSettleJob(settle, job, onPending) {
+  return withSettlementPendingMarker(bindJobSettle(settle, job), job, onPending);
 }
 
 async function createSupervisorDeps(opts = {}) {
@@ -9131,26 +9160,37 @@ async function workAgent(req, flags, ctx) {
   // settle path has no deadline) can never grow it without bound (#256 review). See
   // recordSettlementPending's absent-`cur` guard.
   const lastActivationByKey = new Map();
-  // Keys with an UNOBSERVED fenced settle in flight, `{ count, since }` per key.
-  // An interrupted older runner's settle keeps running (dispatch does not cancel
-  // it), so while its outcome is pending its identity guard in lastActivationByKey
-  // must be retained past the size cap. Bracketed by the RUNNER lifecycle
-  // (markSettleInFlight right after recordJobStart → clearSettleInFlight in the
-  // runner's finally), NOT the settle promise, so the guard is protected across the
-  // awaits BEFORE the settle even begins (#256 review). `since` (runner start)
-  // time-bounds the protection: a settle hung past the ghost TTL is treated as
-  // never-resolving and GC'd, so the map can never grow without bound.
+  // Keys with an UNOBSERVED fenced settle in flight. Each key maps to a Map of
+  // per-ACTIVATION entries `id -> since` (NOT a single {count, since}): concurrent
+  // same-key activations (an interrupted older runner still settling while a newer
+  // one starts) must each carry their OWN start time and identity, so (a) protection
+  // is retained while ANY non-expired activation remains — a newer run's fresh
+  // `since` keeps the guard even after the older run's `since` crosses the TTL — and
+  // (b) an older runner's `clearSettleInFlight` removes only ITS entry, never a
+  // same-key newer runner's marker (#256 review). An interrupted older runner's
+  // settle keeps running (dispatch does not cancel it), so while its outcome is
+  // pending its identity guard in lastActivationByKey must be retained past the size
+  // cap. Bracketed by the RUNNER lifecycle (markSettleInFlight right after
+  // recordJobStart → clearSettleInFlight in the runner's finally), NOT the settle
+  // promise, so the guard is protected across the awaits BEFORE the settle even
+  // begins. Each entry's `since` (runner start) time-bounds the protection: a settle
+  // hung past the ghost TTL is treated as never-resolving and GC'd, so the map can
+  // never grow without bound.
   const settleInFlightByKey = new Map();
+  let settleMarkSeq = 0;
   const markSettleInFlight = (key, nowMs = Date.now()) => {
-    const s = settleInFlightByKey.get(key);
-    if (s) s.count += 1;
-    else settleInFlightByKey.set(key, { count: 1, since: nowMs });
+    let entries = settleInFlightByKey.get(key);
+    if (!entries) { entries = new Map(); settleInFlightByKey.set(key, entries); }
+    const id = (settleMarkSeq += 1);
+    entries.set(id, nowMs);
+    return { key, id };
   };
-  const clearSettleInFlight = (key) => {
-    const s = settleInFlightByKey.get(key);
-    if (!s) return;
-    if (s.count > 1) s.count -= 1;
-    else settleInFlightByKey.delete(key);
+  const clearSettleInFlight = (mark) => {
+    if (!mark) return;
+    const entries = settleInFlightByKey.get(mark.key);
+    if (!entries) return;
+    entries.delete(mark.id);
+    if (entries.size === 0) settleInFlightByKey.delete(mark.key);
   };
   const MAX_SETTLEMENT_PENDING_LAST_ACTIVATIONS = MAX_SETTLEMENT_PENDING_GHOSTS;
   // Hard ceiling: even a flood of simultaneously-stuck settles can never grow the
@@ -9304,13 +9344,25 @@ async function workAgent(req, flags, ctx) {
     // so recordJobEnd removed its activeJobs entry. A bare `cur &&` guard would then
     // let this older runner's late rejection resurrect a stale ghost. Fall back to
     // the retained last-activation identity: if the newest activation seen for this
-    // key is NOT this job, a newer run superseded it — skip. Only record when no
-    // newer identity is known (the normal current-and-only, or unleased, path).
+    // key is NOT this job, a newer run superseded it — skip. If the identity guard
+    // is ALSO gone, a TOKEN-bearing job is treated as stale/unknown and skipped
+    // (we can't prove it's current); only a genuinely unleased job (no token on
+    // either side) records via this fallback (#256 review).
     if (cur) {
       if (cur.leaseToken !== job.leaseToken) return;
     } else {
       const last = lastActivationByKey.get(key);
-      if (last && last.token !== job.leaseToken) return;
+      if (last) {
+        if (last.token !== job.leaseToken) return;
+      } else if (job.leaseToken != null) {
+        // Token-bearing activation whose identity guard was ALSO pruned (TTL / hard
+        // cap): we can no longer prove THIS late rejection is the current activation
+        // rather than a superseded older one, so treat the absent identity as
+        // stale/unknown and skip — recording here could resurrect a ghost after a
+        // newer same-key activation already succeeded (#256 review). Reserve the
+        // fallback record for a genuinely UNLEASED job (no token on either side).
+        return;
+      }
     }
     const recordedAt = Date.now();
     settlementPendingJobs.set(key, {
@@ -9518,10 +9570,11 @@ async function workAgent(req, flags, ctx) {
       // not merely once the settle promise begins — so a same-key eviction can't
       // drop it during the awaits BEFORE settlement, which would let an interrupted
       // older runner's late fenced settle find no identity and resurrect a stale
-      // ghost. Balanced in the finally (clearSettleInFlight); the guard is then
-      // pruned with a time bound + hard ceiling so a never-resolving settle cannot
-      // pin it forever.
-      markSettleInFlight(String(job.jobKey));
+      // ghost. Balanced in the finally (clearSettleInFlight) via the returned
+      // per-activation handle, so an older runner's clear removes only ITS marker,
+      // never a same-key newer runner's; the guard is then pruned with a time bound
+      // + hard ceiling so a never-resolving settle cannot pin it forever.
+      const settleMark = markSettleInFlight(String(job.jobKey));
       // Bind the settler to THIS activation's lease token, captured from the job
       // in closure scope. A settlement is fenced with the exact activation that
       // ran — NOT a token re-read from the shared activeJobs map at settle time: a
@@ -9529,7 +9582,7 @@ async function workAgent(req, flags, ctx) {
       // is still unwinding, so a map lookup could fence the completion with the
       // WRONG (newer) token and clobber the new activation — the very lease bypass
       // this fence exists to prevent. `job.leaseToken` in the closure cannot drift.
-      const settleJob = withSettlementPendingMarker(bindJobSettle(settle, job), job, recordSettlementPending);
+      const settleJob = composeFencedSettleJob(settle, job, recordSettlementPending);
       try {
         logger.info(`[${jobType}] job ${job.jobKey} (instance ${job.processInstanceKey ?? '-'}) → ${buildAgentCommandLine(profile.command, effectiveArgs)}`);
 
@@ -10312,7 +10365,7 @@ async function workAgent(req, flags, ctx) {
           variables: { [AGENT_RESULT_KEY]: resultEnvelope },
         });
       } finally {
-        clearSettleInFlight(String(job.jobKey));
+        clearSettleInFlight(settleMark);
         recordJobEnd(job);
       }
     },
@@ -15942,6 +15995,7 @@ export {
   createSupervisorDeps,
   bindJobSettle,
   withSettlementPendingMarker,
+  composeFencedSettleJob,
   isLeaseLostSettleError,
   pruneActivationGuard,
   enableEngineHappyEyeballs,

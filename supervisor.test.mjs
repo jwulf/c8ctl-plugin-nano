@@ -42,6 +42,7 @@ import {
   normalizeAgenticMessage,
   buildActivityPayload,
   withSettlementPendingMarker,
+  composeFencedSettleJob,
   isLeaseLostSettleError,
   pruneActivationGuard,
   bindJobSettle,
@@ -1227,14 +1228,38 @@ test('isLeaseLostSettleError does not treat a non-404/409 status whose body cont
   assert.equal(isLeaseLostSettleError(new Error('HTTP 400 from x — job not activated')), true);
 });
 
+// #256 review (follow-up): the status parse reads only the STAMPED transport status
+// (`HTTP <n> from …`), not a status code that merely appears inside the appended
+// response BODY. A genuine HTTP 500 whose body text happens to mention "HTTP 409"
+// or "status code 404" must therefore NOT be classified as lease loss.
+test('isLeaseLostSettleError ignores a status code that only appears in the response body', () => {
+  assert.equal(
+    isLeaseLostSettleError(new Error('complete 5: HTTP 500 from http://x/jobs/5/completion — upstream returned HTTP 409 earlier')),
+    false,
+    'a 409 inside the body of a 500 transport response is not lease loss',
+  );
+  assert.equal(
+    isLeaseLostSettleError(new Error('fail 5: HTTP 500 from http://x/jobs/5/failure — gateway note: status code 404')),
+    false,
+    'a "status code 404" inside a 500 body is not lease loss',
+  );
+  // The stamped transport status still wins when it IS a loss, body noise notwithstanding.
+  assert.equal(
+    isLeaseLostSettleError(new Error('fail 5: HTTP 409 from http://x/jobs/5/failure — see also HTTP 500 upstream')),
+    true,
+    'the stamped 409 transport status is lease loss regardless of a 500 mentioned in the body',
+  );
+});
+
 // #256 review: INTEGRATION test for the runner hot-path settle wiring
-// (c8ctl-plugin.js: `withSettlementPendingMarker(bindJobSettle(settle, job), job,
-// recordSettlementPending)`). Drives the EXACT composition with a fenced
-// complete/fail that the raw engine seam rejects with a lease-loss error, and
-// asserts (a) each settle was fenced with THIS activation's leaseToken, and (b) a
-// settlement-pending ghost was recorded for the right phase. Guards against a
-// future refactor silently dropping the wrapper while the unit tests stay green.
-test('runner settle wiring records a settlement-pending ghost on a lease-loss fenced settle', async () => {
+// #256 review: the runner hot path composes its fenced, settlement-pending-aware
+// settle seam through the SHARED `composeFencedSettleJob` helper (the exact call
+// the runner makes: `composeFencedSettleJob(settle, job, recordSettlementPending)`).
+// Driving that PRODUCTION helper — not a test-local reconstruction of the wrapper
+// chain — means a future refactor that drops or mis-wires either layer inside it
+// reddens this test. Asserts (a) each settle was fenced with THIS activation's
+// leaseToken, and (b) a settlement-pending ghost was recorded for the right phase.
+test('composeFencedSettleJob records a settlement-pending ghost on a lease-loss fenced settle', async () => {
   const fenced = [];
   const ghosts = new Map(); // stands in for settlementPendingJobs
   // Raw engine settle seam (bindJobSettle's target): capture the fencing leaseToken,
@@ -1251,7 +1276,7 @@ test('runner settle wiring records a settlement-pending ghost on a lease-loss fe
   };
   const job = { jobKey: '7007', type: 'senior:feature', leaseToken: 'lease-abc' };
   const recordSettlementPending = (j, phase) => ghosts.set(String(j.jobKey), { phase, type: j.type });
-  const settleJob = withSettlementPendingMarker(bindJobSettle(rawSettle, job), job, recordSettlementPending);
+  const settleJob = composeFencedSettleJob(rawSettle, job, recordSettlementPending);
 
   await assert.rejects(() => settleJob.complete({ ok: 1 }), /HTTP 409/);
   assert.deepEqual(fenced.at(-1), ['complete', '7007', 'lease-abc'], 'complete fenced with the activation leaseToken');
@@ -1274,7 +1299,7 @@ test('pruneActivationGuard bounds the guard map (soft cap retains live settles, 
   const guard = new Map();
   const inflight = new Map();
   for (let i = 0; i < 70; i += 1) guard.set(`k${i}`, { token: `t${i}`, at: now - i });
-  inflight.set('k69', { count: 1, since: now }); // freshest key, live settle
+  inflight.set('k69', new Map([[1, now]])); // freshest key, live settle
   pruneActivationGuard(guard, inflight, { nowMs: now, ttlMs, maxGhosts: 64, hardMax: 256 });
   assert.ok(guard.size <= 64, `soft cap enforced: ${guard.size}`);
   assert.ok(guard.has('k69'), 'a key with a live in-flight settle is retained past the soft cap');
@@ -1284,7 +1309,7 @@ test('pruneActivationGuard bounds the guard map (soft cap retains live settles, 
   const guard2 = new Map();
   const inflight2 = new Map();
   for (let i = 0; i < 70; i += 1) guard2.set(`k${i}`, { token: `t${i}`, at: now - i });
-  inflight2.set('k69', { count: 1, since: now - (ttlMs + 60_000) }); // hung settle
+  inflight2.set('k69', new Map([[1, now - (ttlMs + 60_000)]])); // hung settle
   pruneActivationGuard(guard2, inflight2, { nowMs: now, ttlMs, maxGhosts: 64, hardMax: 256 });
   assert.ok(guard2.size <= 64, 'soft cap still enforced');
   assert.equal(inflight2.has('k69'), false, 'a settle hung past the TTL is GC\'d from the in-flight map');
@@ -1295,10 +1320,39 @@ test('pruneActivationGuard bounds the guard map (soft cap retains live settles, 
   const inflight3 = new Map();
   for (let i = 0; i < 300; i += 1) {
     guard3.set(`k${i}`, { token: `t${i}`, at: now - i });
-    inflight3.set(`k${i}`, { count: 1, since: now });
+    inflight3.set(`k${i}`, new Map([[i + 1, now]]));
   }
   pruneActivationGuard(guard3, inflight3, { nowMs: now, ttlMs, maxGhosts: 64, hardMax: 256 });
   assert.ok(guard3.size <= 256, `hard ceiling enforced even when all keys are protected: ${guard3.size}`);
+});
+
+// #256 review: concurrent same-key activations each carry their OWN start time, so
+// protection is retained while ANY of them is still non-expired. An older runner's
+// settle whose `since` has aged out no longer protects the guard, BUT a newer
+// same-key activation's fresh `since` keeps it — and GC drops only the aged entry,
+// never the newer one. This is what a single per-key `{ count, since }` (first
+// runner's timestamp) could not express.
+test('pruneActivationGuard retains a guard while a newer same-key activation is live', () => {
+  const now = 1_000_000;
+  const ttlMs = 30 * 60 * 1000;
+  const guard = new Map();
+  guard.set('k0', { token: 't-old', at: now - (ttlMs + 60_000) }); // guard itself is old
+  const inflight = new Map();
+  // One key, TWO in-flight activations: an aged older settle + a fresh newer one.
+  inflight.set('k0', new Map([
+    [1, now - (ttlMs + 60_000)], // older runner, hung past TTL
+    [2, now],                    // newer runner, live
+  ]));
+  pruneActivationGuard(guard, inflight, { nowMs: now, ttlMs, maxGhosts: 64, hardMax: 256 });
+  assert.ok(guard.has('k0'), 'guard retained because a newer same-key activation is still live');
+  assert.equal(inflight.get('k0').has(1), false, 'the aged older activation entry is GC\'d');
+  assert.equal(inflight.get('k0').has(2), true, 'the live newer activation entry is kept');
+
+  // Once the newer activation also ages out, nothing protects the guard.
+  const later = now + ttlMs + 120_000;
+  pruneActivationGuard(guard, inflight, { nowMs: later, ttlMs, maxGhosts: 64, hardMax: 256 });
+  assert.equal(guard.has('k0'), false, 'guard TTL-pruned once no activation remains live');
+  assert.equal(inflight.has('k0'), false, 'in-flight key dropped once it has no entries left');
 });
 
 // #254: settlement-pending ghosts are not drained/counted as in-flight work.

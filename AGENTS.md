@@ -127,7 +127,7 @@ SDK client (job workers) — do **not** add the SDK as a dependency or use raw
   **detach** (Ctrl-D / `detach`, leaving the daemon running) or `stop` the fleet.
 - **Hot code reload (rolling drain+respawn).** `supervisor reload [target]` (and
   `workforce reload`) adopt updated on-disk plugin code into the running fleet
-  with **zero downtime**: the daemon rolls through the target workers (default
+  with **zero fleet downtime**: the daemon rolls through the target workers (default
   `all`) **one at a time**, gracefully draining each (the same `SIGUSR2` quiesce
   as stop — finish in-flight jobs, then exit) and respawning it so the new
   `nano work` child re-reads the updated `c8ctl-plugin.js` + sidecars +
@@ -150,7 +150,13 @@ SDK client (job workers) — do **not** add the SDK as a dependency or use raw
   readiness), so a slow replacement can't leave two workers down at once. That
   wait is **bounded** (`NANO_SUPERVISOR_RELOAD_READY_TIMEOUT_MS`, default 30s): a
   never-ready replacement (e.g. a wedged engine) can't stall the roll — the daemon
-  advances anyway on timeout. The daemon's OWN
+  advances anyway on timeout. This "zero downtime" is a **fleet-level, normal-readiness**
+  guarantee, NOT unqualified: because a worker is drained **before** its replacement
+  spawns, a **single-worker fleet** (or a job type served by only one worker) does lose
+  that capacity for the drain+boot window, and on the bounded-timeout fallback path the
+  daemon advances while a slow replacement is still unready, so two or more workers can
+  be temporarily unavailable (see `README.md` "Hot code reload"). Run more than one
+  worker per type for continuous service across a reload. The daemon's OWN
   process-manager code is NOT adopted by `reload` (its workers are its children
   watching its pid, so a daemon re-exec would take the fleet down) — new
   supervisor code needs a full `supervisor stop && supervisor start`. `status`

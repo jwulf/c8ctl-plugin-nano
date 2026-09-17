@@ -3543,7 +3543,11 @@ function isLeaseLostSettleError(err) {
   }
   let e = err;
   for (let depth = 0; e != null && typeof e === 'object' && depth <= 4; depth += 1) {
-    const s = e.status ?? e.statusCode ?? (e.response && (e.response.status ?? e.response.statusCode));
+    // A NUMERIC `code` is a status too — `describeSdkError` (agent-instance.mjs)
+    // normalizes `typeof err.code === 'number'` as the HTTP status, so a typed
+    // completeJob/failJob rejection carrying a 404/409 that way must classify as
+    // lease loss. A string `code` (e.g. Node's 'ECONNRESET') is NOT a status.
+    const s = e.status ?? e.statusCode ?? (e.response && (e.response.status ?? e.response.statusCode)) ?? (typeof e.code === 'number' ? e.code : undefined);
     if (s === 409 || s === 404) leaseStatus = true;
     else if (Number.isFinite(s)) otherStatus = true;
     e = e.cause;

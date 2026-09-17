@@ -1270,6 +1270,29 @@ test('isLeaseLostSettleError reads a 404/409 from a nested response.statusCode',
   assert.equal(isLeaseLostSettleError(wrapped), true, 'nested response.statusCode 409 on the cause chain is lease loss');
 });
 
+// #256 review: the cause-chain status walk must also read the NUMERIC `err.code`
+// shape. The repository's own SDK-error normalizer (describeSdkError,
+// agent-instance.mjs) treats `typeof err.code === 'number'` as the HTTP status,
+// so a typed completeJob/failJob rejection reporting a 404/409 via `code` must
+// classify as lease loss (else the settle path never records the marker). A
+// STRING `code` (Node transport errors like 'ECONNRESET') must NOT be a status.
+test('isLeaseLostSettleError reads a 404/409 from a numeric err.code', () => {
+  const e404 = new Error('settle failed'); e404.code = 404;
+  assert.equal(isLeaseLostSettleError(e404), true, 'numeric code 404 is lease loss');
+  const e409 = new Error('settle failed'); e409.code = 409;
+  assert.equal(isLeaseLostSettleError(e409), true, 'numeric code 409 is lease loss');
+  // A non-loss numeric code is a contradictory signal, not a lease loss, and it
+  // vetoes a body ownership word.
+  const e500 = new Error('settle failed: job not found'); e500.code = 500;
+  assert.equal(isLeaseLostSettleError(e500), false, 'numeric code 500 is not lease loss');
+  // A STRING code (Node transport error) is not a status at all.
+  const econn = new Error('socket hang up'); econn.code = 'ECONNRESET';
+  assert.equal(isLeaseLostSettleError(econn), false, 'string code ECONNRESET is not lease loss');
+  // The loss code is found even one hop down the cause chain.
+  const wrapped = new Error('outer'); wrapped.cause = e409;
+  assert.equal(isLeaseLostSettleError(wrapped), true, 'numeric code 409 on the cause chain is lease loss');
+});
+
 // #256 review: INTEGRATION test for the runner hot-path settle wiring
 // #256 review: the runner hot path composes its fenced, settlement-pending-aware
 // settle seam through the SHARED `composeFencedSettleJob` helper (the exact call

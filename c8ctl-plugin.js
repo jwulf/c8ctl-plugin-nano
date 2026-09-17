@@ -11633,8 +11633,7 @@ async function runSupervisorDaemon() {
       w.stopping = false;
       w.restarts = 0;
       startWorker(w);
-      dlog(`worker '${id}' reloaded (adopted new code)`);
-      broadcast({ type: 'event', event: 'worker-reload', id });
+      dlog(`worker '${id}' respawned (awaiting readiness before adopting new code)`);
       return w.child;
     });
     if (!started) return false;
@@ -11719,7 +11718,16 @@ async function runSupervisorDaemon() {
           break;
         }
         const ok = await reloadWorker(id);
-        if (ok) { reloaded.push(id); }
+        if (ok) {
+          reloaded.push(id);
+          // Emit the per-worker "reloaded" progress signal ONLY after the final
+          // success gate above confirmed a live, still-current replacement — not
+          // at spawn time. A crash/spawn-fail makes `reloadWorker` return false
+          // and the worker is skipped, so broadcasting at spawn time would let the
+          // streaming client print `reloaded "…" (adopted new code)` for a reload
+          // that actually failed (#253 review).
+          broadcast({ type: 'event', event: 'worker-reload', id });
+        }
         else {
           // A reload FAILURE (not a mere readiness timeout — that returns true on
           // a still-live child) means this worker has NO confirmed serving

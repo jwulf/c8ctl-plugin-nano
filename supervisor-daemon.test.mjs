@@ -817,6 +817,14 @@ test('supervisor reload: gracefully drains and respawns a worker to adopt new co
   assert.ok(term, 'expected a terminal reloaded frame');
   assert.deepEqual(term.reloaded, [id], 'the terminal frame should list the reloaded worker');
 
+  // A successful reload broadcasts the per-worker `worker-reload` progress event
+  // (gated on the final success gate, #253 review) so the streaming client can
+  // print `reloaded "…" (adopted new code)` for a genuinely-adopted worker.
+  assert.ok(
+    frames.some((f) => f && f.event === 'worker-reload' && f.id === id),
+    'a successful reload should broadcast a per-worker worker-reload progress event',
+  );
+
   // The worker adopted new code by DRAINING (SIGUSR2 — finished its job), never
   // a force kill.
   assert.equal(readFileSync(sigFile, 'utf8'), 'drained', 'the worker drained (SIGUSR2), not force-killed');
@@ -939,6 +947,15 @@ test('supervisor reload: a failed replacement aborts the roll (canary) and is re
   assert.equal(term.reloaded.length, 0, 'the crashing replacement is not counted as reloaded');
   assert.equal(term.skipped.length, 2, 'the failed worker AND the not-yet-rolled worker are both skipped (roll aborted)');
   assert.deepEqual([...term.skipped].sort(), [...pidById.keys()].sort(), 'both worker ids appear in skipped');
+
+  // The per-worker `worker-reload` progress event is gated on the final success
+  // gate, so a reload that FAILS (crash/spawn-fail) must NOT broadcast it — a
+  // spawn-time broadcast would let the streaming client print `reloaded "…"
+  // (adopted new code)` for a worker that actually ended up skipped (#253 review).
+  assert.ok(
+    !frames.some((f) => f && f.event === 'worker-reload'),
+    'a failed reload must not broadcast a per-worker worker-reload progress event',
+  );
 
   // Exactly one worker was drained (the first, which then crashed on respawn);
   // the other must be UNTOUCHED — still on its original pid — proving the roll

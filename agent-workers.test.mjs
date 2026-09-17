@@ -7,7 +7,7 @@ import { spawn, spawnSync } from 'node:child_process';
 
 import { mkdtempSync, mkdirSync, writeFileSync, rmSync, existsSync, utimesSync, readdirSync, readFileSync } from 'node:fs';
 import { tmpdir } from 'node:os';
-import { join } from 'node:path';
+import { join, delimiter } from 'node:path';
 
 import {
   normalizeTaskEnvelope,
@@ -4545,7 +4545,10 @@ test('probeAgentCliVersion skips a bare name when the supplied env PATH is cwd-a
   // supplied env's PATH carries a RELATIVE or EMPTY entry (cwd-dependent resolution),
   // the probe's cwd (the worker's) may resolve a different binary than the job's, so
   // omit the reading. An absolute command bypasses PATH and is unaffected.
-  for (const badPath of ['.', './node_modules/.bin', '/usr/bin:.', '/usr/bin:', ':/usr/bin', 'rel/dir']) {
+  // Build the multi-entry cases with the platform `delimiter` (the implementation
+  // splits PATH on it), so on Windows (`;`) `/usr/bin:.` is not mistaken for a single
+  // absolute entry — mirror the real per-platform separator instead of hard-coding `:`.
+  for (const badPath of ['.', './node_modules/.bin', `/usr/bin${delimiter}.`, `/usr/bin${delimiter}`, `${delimiter}/usr/bin`, 'rel/dir']) {
     let called = false;
     const env = { ...process.env, PATH: badPath };
     assert.equal(
@@ -4557,7 +4560,7 @@ test('probeAgentCliVersion skips a bare name when the supplied env PATH is cwd-a
   }
   // An all-absolute PATH is unambiguous — the bare name still probes.
   assert.equal(
-    probeAgentCliVersion('copilot', { run: () => ({ status: 0, stdout: 'copilot 7.0.0' }), env: { PATH: '/usr/local/bin:/usr/bin' } }),
+    probeAgentCliVersion('copilot', { run: () => ({ status: 0, stdout: 'copilot 7.0.0' }), env: { PATH: `/usr/local/bin${delimiter}/usr/bin` } }),
     '7.0.0',
     'a bare name with an all-absolute PATH still probes',
   );

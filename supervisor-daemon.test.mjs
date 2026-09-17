@@ -975,3 +975,29 @@ test('supervisor status: surfaces the on-disk plugin version', async (t) => {
   assert.equal(s.pluginVersion, s.daemon.version, 'with no update on disk the running daemon and on-disk versions match');
   await mod.supervisorRequest({ op: 'stop', force: true });
 });
+
+test('formatSupervisorStatus: renders the update-available reload hint when the on-disk version differs', async () => {
+  const mod = await import(pluginUrl);
+  // On-disk plugin has advanced past the running daemon → the mismatch branch
+  // must render the operator-visible "update available … run `… supervisor reload`"
+  // hint. Pass pluginVersion explicitly so the render is deterministic (no
+  // dependency on the repo's actual package version).
+  const stale = mod.formatSupervisorStatus({
+    daemon: { pid: 999999999, version: '1.0.0', socket: '/tmp/sock' },
+    pluginVersion: '1.1.0',
+    workers: [],
+  });
+  assert.match(stale, /on disk:\s+1\.1\.0/, 'the on-disk version is shown');
+  assert.match(stale, /update available/, 'the update-available warning is rendered');
+  assert.match(stale, /supervisor reload/, 'the reload hint names the reload command');
+
+  // Matching versions → NO warning line at all (guards against a regression that
+  // inverts or drops the `!==` check and warns on every status).
+  const current = mod.formatSupervisorStatus({
+    daemon: { pid: 999999999, version: '1.1.0', socket: '/tmp/sock' },
+    pluginVersion: '1.1.0',
+    workers: [],
+  });
+  assert.doesNotMatch(current, /on disk:/, 'no on-disk line when versions match');
+  assert.doesNotMatch(current, /update available/, 'no update-available warning when versions match');
+});

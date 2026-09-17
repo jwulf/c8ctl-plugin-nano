@@ -11891,6 +11891,20 @@ async function runSupervisorDaemon() {
           // time, so this MUST be a streaming op, not a one-shot request.
           if (shuttingDown) { sock.write(encodeFrame({ ok: false, error: 'supervisor is shutting down', final: true })); break; }
           if (reloading) { sock.write(encodeFrame({ ok: false, error: 'a reload is already in progress', final: true })); break; }
+          // Reject reload explicitly on Windows BEFORE draining anything. The
+          // rolling reload's graceful drain relies on SIGUSR2 (SUPERVISOR_DRAIN_SIGNAL)
+          // to quiesce each worker child; Windows cannot deliver SIGUSR2 (Node maps
+          // a non-zero signal there to a forceful, SIGKILL-like termination, and the
+          // child's `process.once('SIGUSR2')` drain handler never fires), so a
+          // "graceful" drain either hard-kills in-flight work or leaves `reloadWorker`
+          // waiting forever for a child that was never asked to exit. Fail fast with
+          // an actionable message instead of hanging the roll on the first worker
+          // (#253 review). `restart`/`stop`+`start` remain the Windows path to adopt
+          // new code.
+          if (osPlatform() === 'win32') {
+            sock.write(encodeFrame({ ok: false, error: 'hot reload is not supported on Windows (its graceful drain relies on SIGUSR2, which Windows cannot deliver) — use `supervisor restart <target>`, or `supervisor stop` + `start`, to adopt new code', final: true }));
+            break;
+          }
           const raw = Array.isArray(req.targets)
             ? req.targets.flatMap((t) => resolveTargets(t))
             : resolveTargets(req.target);

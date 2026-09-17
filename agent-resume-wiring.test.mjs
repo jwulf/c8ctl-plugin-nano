@@ -88,7 +88,13 @@ const PROFILE = (echoScript) => ({
   // single-quoted `--arg` tokens cmd.exe won't honour), so a structured-args harness
   // would fail every case on Windows before the echo ran. An env var keeps the profile
   // command args-free, so these integration tests run identically on every platform.
-  command: `node ${echoScript}`,
+  //
+  // The command runs through `runAgentJob`'s `shell: true`, so both the executable and
+  // the script path are QUOTED: `process.execPath` is the current node binary (not a
+  // bare `node` that may be off-PATH), and `JSON.stringify` emits a double-quoted,
+  // backslash-escaped token the shell won't word-split — so a `TMPDIR` (or install
+  // path) containing spaces, or Windows' backslash separators, can't break the spawn.
+  command: `${JSON.stringify(process.execPath)} ${JSON.stringify(echoScript)}`,
 });
 
 // A repo-less envelope: `workAgent` computes `hasRepo = !isContainer &&

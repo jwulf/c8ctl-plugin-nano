@@ -1400,6 +1400,32 @@ test('pruneActivationGuard caps the per-key in-flight entry Map (oldest-first, n
   assert.ok(guard.has('kFlood'), 'guard retained — the newest live activation still protects it');
 });
 
+// #256 review: the per-key cap bounds each key's entries, but a stream of UNIQUE
+// never-resolving keys could still grow the OUTER settleInFlightByKey map until each
+// key's TTL. pruneActivationGuard also caps the total KEY count (oldest-first), so
+// the settle map is absolutely bounded, and an evicted key's guard loses protection
+// and falls to the normal TTL/size/hard-cap eviction.
+test('pruneActivationGuard caps the total settleInFlight key count (oldest-first)', () => {
+  const now = 1_000_000;
+  const ttlMs = 30 * 60 * 1000;
+  const guard = new Map();
+  const inflight = new Map();
+  // 40 distinct keys, each with one LIVE (recent) never-resolving settle.
+  for (let i = 1; i <= 40; i += 1) {
+    guard.set(`k${i}`, { token: `t${i}`, at: now - (40 - i) });
+    inflight.set(`k${i}`, new Map([[i, now - (40 - i)]])); // k1 oldest … k40 newest
+  }
+  pruneActivationGuard(guard, inflight, { nowMs: now, ttlMs, maxGhosts: 64, hardMax: 256, maxKeys: 16 });
+  assert.equal(inflight.size, 16, 'total settleInFlight keys bounded to maxKeys');
+  assert.equal(inflight.has('k40'), true, 'the newest key is retained');
+  assert.equal(inflight.has('k25'), true, 'the newest 16 keys (k25..k40) are retained');
+  assert.equal(inflight.has('k24'), false, 'older keys beyond the cap are evicted oldest-first');
+  assert.equal(inflight.has('k1'), false, 'the oldest key is evicted');
+  // An evicted key's guard loses protection: k1 (aged past nothing here but unprotected
+  // once its settle entry is gone) is now governed only by the guard's own caps.
+  assert.equal(guard.has('k40'), true, 'a retained-key guard is still protected by its live settle');
+});
+
 // #254: settlement-pending ghosts are not drained/counted as in-flight work.
 test('countSupervisorInFlight excludes settlement-pending ghosts', () => {
   const workers = [

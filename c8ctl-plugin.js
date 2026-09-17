@@ -3569,7 +3569,10 @@ function isLeaseLostSettleError(err) {
 // per-key counter forever) is treated as never-resolving, GC'd from
 // `settleInFlightByKey`, and no longer protects its guard — AND a HARD ceiling
 // (`hardMax`) evicts oldest-first REGARDLESS of protection, so even a flood of
-// simultaneously-stuck settles can never grow the guard without bound. The worst
+// simultaneously-stuck settles can never grow the guard without bound. The
+// `settleInFlightByKey` map is ALSO bounded on BOTH axes: per-KEY (`maxInFlightPerKey`)
+// and total-KEYS (`maxKeys`, evicting oldest keys), so a stream of UNIQUE stuck keys
+// can't grow it (or the per-prune scan cost) unbounded within the TTL either. The worst
 // case is a bounded, self-expiring stale ghost (already capped + TTL'd elsewhere),
 // never unbounded memory. Pure w.r.t. the two maps (mutated in place); `nowMs` is
 // injected for deterministic tests.
@@ -3581,6 +3584,9 @@ function pruneActivationGuard(lastActivationByKey, settleInFlightByKey, opts = {
   const maxInFlightPerKey = Number.isFinite(opts.maxInFlightPerKey)
     ? opts.maxInFlightPerKey
     : MAX_SETTLE_IN_FLIGHT_PER_KEY;
+  // Total-KEYS ceiling on settleInFlightByKey itself. Defaults to the guard's hard
+  // ceiling so the settle map is bounded by the same absolute constant.
+  const maxKeys = Number.isFinite(opts.maxKeys) ? opts.maxKeys : hardMax;
   const isProtected = (key) => {
     const entries = settleInFlightByKey.get(key);
     if (!entries) return false;
@@ -3608,6 +3614,23 @@ function pruneActivationGuard(lastActivationByKey, settleInFlightByKey, opts = {
       entries.delete(oldest);
     }
     if (entries.size === 0) settleInFlightByKey.delete(key);
+  }
+  // Total-keys ceiling on settleInFlightByKey itself. The per-key cap above bounds
+  // each key's entry count, but a stream of UNIQUE keys each with a never-resolving
+  // settle would still grow the OUTER map until each key's TTL — so a flood of
+  // distinct stuck keys could enlarge the map (and make every prune scan more
+  // expensive) within the TTL window. Evict oldest-first (insertion order) so the
+  // settle map is ABSOLUTELY bounded like lastActivationByKey. Defined behavior for
+  // an evicted identity: its marks are dropped, so its later clearSettleInFlight(mark)
+  // is a harmless no-op (entries absent) and its guard loses protection here — it
+  // then falls to the TTL / soft-cap / hard-ceiling eviction below, the SAME graceful
+  // degradation as a TTL-expired settle. Worst case a bounded self-expiring stale
+  // ghost, never unbounded memory (#256 review).
+  if (settleInFlightByKey.size > maxKeys) {
+    for (const key of [...settleInFlightByKey.keys()]) {
+      if (settleInFlightByKey.size <= maxKeys) break;
+      settleInFlightByKey.delete(key);
+    }
   }
   // 1) TTL: drop aged, unprotected identity entries.
   for (const [key, v] of lastActivationByKey.entries()) {
@@ -9370,8 +9393,12 @@ async function workAgent(req, flags, ctx) {
     // values compare === undefined), and an older superseded runner's late 404/409
     // could resurrect a false ghost against a newer run's identity. There is no
     // identity to fence, hence no ghost to record: skip unleased failures entirely
-    // (#256 review).
-    if (job.leaseToken == null) return;
+    // (#256 review). "Leased" must mirror the ENGINE's fencing predicate: it fences
+    // only NON-BLANK tokens (`isNonBlankString`, supervisor-engine.mjs) and sends a
+    // blank/whitespace token's complete/fail UNFENCED — so such a token carries no
+    // fencing identity either and must be treated as unleased here, else a '' /
+    // whitespace token would record a false ghost for an unfenced 404/409 (#256 review).
+    if (!(typeof job.leaseToken === "string" && job.leaseToken.trim() !== "")) return;
     const cur = activeJobs.get(key);
     // Only the CURRENT activation may create a ghost. A same-key reactivation
     // (recordJobStart) installs a newer leaseToken; if THIS (older) activation's

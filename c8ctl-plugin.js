@@ -11707,7 +11707,17 @@ async function runSupervisorDaemon() {
           for (let j = i; j < ids.length; j++) skipped.push(ids[j]);
           break;
         }
-        if (!workers.has(id)) { skipped.push(id); continue; }
+        // A target that has vanished mid-roll (only `remove`/drain-remove deletes
+        // the entry — `restart` keeps it) has NO confirmed serving replacement,
+        // exactly like the reload-failure branch below. Continuing to drain the
+        // NEXT worker on top of that gap is the same partial-fleet risk the canary
+        // exists to prevent, so treat a removed-mid-roll target uniformly: mark it
+        // and every remaining id skipped and abort the roll (#253 review).
+        if (!workers.has(id)) {
+          interrupted = true;
+          for (let j = i; j < ids.length; j++) skipped.push(ids[j]);
+          break;
+        }
         const ok = await reloadWorker(id);
         if (ok) { reloaded.push(id); }
         else {

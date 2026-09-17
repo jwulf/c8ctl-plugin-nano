@@ -11655,7 +11655,20 @@ async function runSupervisorDaemon() {
     // `w.pid` to be non-null AND still equal to this child's pid rejects both a
     // failed spawn and a dead/retrying child while accepting a live replacement
     // (readiness timeout included).
-    return w.child === started && w.pid != null && w.pid === started.pid
+    // `handleDeath` nulls `w.pid` on every
+    // death (error OR exit), and a failed spawn has no `child.pid`, so requiring
+    // `w.pid` to be non-null AND still equal to this child's pid rejects both a
+    // failed spawn and a dead/retrying child while accepting a live replacement
+    // (readiness timeout included).
+    //
+    // Also reject `w.stopping`: a concurrent `remove`/`restart`/`stop` sets that
+    // flag (and clears the restart timer) BEFORE its kill signal lands, so for a
+    // brief window `w.child`/`w.pid` still point at the live replacement we just
+    // spawned. Counting that as reloaded would let the roll drain the NEXT worker
+    // while this one is being torn down — a partial-fleet outage. A worker being
+    // stopped has no confirmed serving replacement, so treat it as a failed
+    // reload (the `runReload` else-branch then aborts the roll, #253 review).
+    return w.child === started && !w.stopping && w.pid != null && w.pid === started.pid
       && started.exitCode === null && started.signalCode === null;
   };
 
@@ -12312,20 +12325,27 @@ async function streamSupervisorReload(socketPath, req, logger, { label = 'fleet'
         buf = rest;
         for (const frame of frames) {
           if (!frame) continue;
+          // Handle the terminal `reloaded` frame BEFORE the generic `ok:false`
+          // request-error guard: `runReload` emits a partial failure as a
+          // terminal `{ type:'reloaded', final:true, ok:false, reloaded, skipped }`
+          // frame, so the bare `ok === false` guard would swallow it as a generic
+          // "reload failed" and hide which workers reloaded/skipped (#253 review).
+          // We still exit non-zero for `ok:false` so automation sees the partial.
+          if (frame.type === 'reloaded' || frame.final) {
+            const reloaded = Array.isArray(frame.reloaded) ? frame.reloaded : [];
+            const skipped = Array.isArray(frame.skipped) ? frame.skipped : [];
+            if (reloaded.length > 0) logger.info(`Reloaded ${reloaded.length} worker(s): ${reloaded.join(', ')}.`);
+            else logger.warn('No workers were reloaded.');
+            if (skipped.length > 0) logger.warn(`Skipped (gone/changed, or roll aborted after a failed reload): ${skipped.join(', ')}.`);
+            finish(frame.ok === false ? 'error' : 'reloaded');
+            return;
+          }
           if (frame.ok === false) { logger.error(frame.error || 'reload failed'); finish('error'); return; }
           if (frame.type === 'reloading') {
             const n = Array.isArray(frame.targets) ? frame.targets.length : 0;
             logger.info(`Reloading ${n} worker(s) in ${label} one at a time (draining in-flight jobs first). Press Ctrl-C to detach.`);
           } else if (frame.event === 'worker-reload' && frame.id) {
             logger.info(`  reloaded "${frame.id}" (adopted new code).`);
-          } else if (frame.type === 'reloaded' || frame.final) {
-            const reloaded = Array.isArray(frame.reloaded) ? frame.reloaded : [];
-            const skipped = Array.isArray(frame.skipped) ? frame.skipped : [];
-            if (reloaded.length > 0) logger.info(`Reloaded ${reloaded.length} worker(s): ${reloaded.join(', ')}.`);
-            else logger.warn('No workers were reloaded.');
-            if (skipped.length > 0) logger.warn(`Skipped (gone/changed, or roll aborted after a failed reload): ${skipped.join(', ')}.`);
-            finish('reloaded');
-            return;
           }
         }
       });

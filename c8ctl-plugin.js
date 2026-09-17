@@ -1721,6 +1721,47 @@ function buildAgentCommandLine(command, args) {
   return `${command} ${list.map(shQuote).join(' ')}`;
 }
 
+// #243: extract a plausible version token from an agent CLI's `--version` output for
+// the durable transcript's provenance block. Prefers a semver-ish token, else the
+// first non-empty line; length-capped so a chatty (or adversarial) harness can't bloat
+// the transcript. Returns null when nothing usable is present.
+export function extractVersionToken(text) {
+  const s = String(text || '');
+  const semver = s.match(/\bv?\d+\.\d+(?:\.\d+)?(?:[-+][0-9A-Za-z.-]+)?\b/);
+  if (semver) return semver[0].slice(0, 64);
+  const firstLine = s.split(/\r?\n/).map((l) => l.trim()).find((l) => l.length > 0);
+  return firstLine ? firstLine.slice(0, 64) : null;
+}
+
+// #243: best-effort probe of an agent harness CLI's OWN version (distinct from the nano
+// plugin/supervisor version), for the durable transcript's provenance block. Runs
+// `<command> --version` through a shell (PATH resolution, mirroring how the harness is
+// spawned) with a hard timeout + SIGKILL and stdin closed so an interactive harness
+// gets EOF and exits rather than hanging. ENTIRELY best-effort: any failure, timeout,
+// non-zero exit with no version-ish output, or unrecognizable output yields null (the
+// field is simply omitted). Meant to be called ONCE per worker process (the command is
+// fixed per profile), so it never taxes the activation hot path. Disable via
+// NANO_AGENT_CLI_PROBE=off. The spawner is injected for deterministic testing.
+function probeAgentCliVersion(command, { timeoutMs = 1500, run = spawnSync } = {}) {
+  if (typeof command !== 'string' || command.trim() === '') return null;
+  if (String(process.env.NANO_AGENT_CLI_PROBE || '').trim().toLowerCase() === 'off') return null;
+  let out;
+  try {
+    out = run(`${command} --version`, {
+      shell: true,
+      timeout: timeoutMs,
+      killSignal: 'SIGKILL',
+      encoding: 'utf8',
+      stdio: ['ignore', 'pipe', 'pipe'],
+      windowsHide: true,
+    });
+  } catch {
+    return null;
+  }
+  if (!out) return null;
+  return extractVersionToken(`${out.stdout || ''}\n${out.stderr || ''}`);
+}
+
 // A worker job-type token: rank/capability tokens use `:` (rank↔cap) and `+`
 // (combined caps) as delimiters, and code-first `@nanobpm/workflow` job types
 // are `<flowId>:<taskName>` or an explicit override. The first character must be
@@ -8753,6 +8794,11 @@ async function workAgent(req, flags, ctx) {
   const workerPidStart = pidStartToken(process.pid);
   let pluginVersion = null;
   try { pluginVersion = JSON.parse(readFileSync(join(pluginDir, 'package.json'), 'utf-8')).version ?? null; } catch { /* best effort */ }
+  // #243: probe the agent harness CLI's own version ONCE per worker process (bounded,
+  // best-effort) so the durable transcript's provenance block can attribute a run to a
+  // specific harness build. Never fatal — a null result just omits the field.
+  let agentCliVersion = null;
+  try { agentCliVersion = probeAgentCliVersion(profile?.command); } catch { /* best effort */ }
   let workerNsDir;
   try {
     ({ nsDir: workerNsDir } = allocateWorkerNamespace({
@@ -9366,7 +9412,7 @@ async function workAgent(req, flags, ctx) {
         // job, never on these lines).
         const aiCorr = `job ${job.jobKey} eik ${job.elementInstanceKey ?? '?'} pik ${job.processInstanceKey ?? '?'}`;
         if (!agentInstanceOff && isExternalAgentJob(job)) {
-          agentInstanceProducer = createAgentInstanceProducer({ camunda, job, profile, envelope, logger });
+          agentInstanceProducer = createAgentInstanceProducer({ camunda, job, profile, envelope, logger, runtimeVersion: pluginVersion, agentCliVersion });
           try {
             // `createAgentInstanceProducer` always returns an object — including a
             // DISABLED facade when the host SDK lacks createAgentInstance/
@@ -15464,6 +15510,7 @@ export {
   startAgenticChannelWatchdog,
 };
 export { compareSemver, githubRepoSlug, filterReleasesSince, renderReleaseBody };
+export { probeAgentCliVersion };
 export {
   webConsoleUrl,
   consoleLinkLabel,

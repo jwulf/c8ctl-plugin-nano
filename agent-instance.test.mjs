@@ -18,6 +18,8 @@ import {
   describeSdkError,
   leaseTokenLabel,
   activationNamespace,
+  buildProvenanceContent,
+  PROVENANCE_KIND,
 } from './agent-instance.mjs';
 
 // A logger that records every line per level so observability assertions (#229)
@@ -244,6 +246,76 @@ test('activate omits systemPrompt when the task carries no prompt', async () => 
   const p = makeProducer(client, { envelope: { task: {} } });
   await p.activate();
   assert.equal('systemPrompt' in client.calls.create[0].history[0], false);
+});
+
+// ---------------------------------------------------------------------------
+// #243: durable-transcript provenance (agent name, nano runtime/supervisor version,
+// best-effort agent-CLI version) rides a parity-safe OBJECT content block.
+// ---------------------------------------------------------------------------
+
+test('buildProvenanceContent packs identity + diagnostics into a marked OBJECT content block', () => {
+  const c = buildProvenanceContent({
+    profile: { name: 'copilot' },
+    runtimeVersion: '0.1.7',
+    agentCliVersion: '1.2.3',
+    host: 'merlin',
+    pid: 4242,
+  });
+  assert.equal(c.contentType, 'OBJECT');
+  assert.deepEqual(c.object, {
+    kind: PROVENANCE_KIND,
+    agentName: 'copilot',
+    runtimeVersion: '0.1.7',
+    agentCliVersion: '1.2.3',
+    host: 'merlin',
+    pid: 4242,
+  });
+});
+
+test('buildProvenanceContent omits blank fields and returns null when no identity is present', () => {
+  // A blank agentCliVersion / runtimeVersion drops its field but identity remains.
+  const c = buildProvenanceContent({ profile: { name: 'copilot' }, runtimeVersion: '', agentCliVersion: '' });
+  assert.deepEqual(Object.keys(c.object).sort(), ['agentName', 'kind']);
+  // host/pid alone (no agent/runtime/cli identity) is diagnostics-only → no block.
+  assert.equal(buildProvenanceContent({ host: 'merlin', pid: 4242 }), null);
+  assert.equal(buildProvenanceContent({ profile: {} }), null);
+  assert.equal(buildProvenanceContent(), null);
+});
+
+test('the opening CONFIGURATION turn carries the provenance OBJECT content (parity-safe carrier)', async () => {
+  const client = fakeClient();
+  const p = makeProducer(client, { runtimeVersion: '0.1.7', agentCliVersion: '9.9.9', host: 'merlin', pid: 4242 });
+  await p.activate();
+  const cfg = client.calls.create[0].history[0];
+  assert.equal(cfg.role, 'CONFIGURATION');
+  // The Camunda-pinned definition fields are untouched...
+  assert.equal(cfg.model, 'Opus 4.8');
+  assert.equal(cfg.provider, 'anthropic');
+  // ...and provenance rides content[] as a single marked OBJECT block.
+  assert.equal(cfg.content.length, 1);
+  assert.equal(cfg.content[0].contentType, 'OBJECT');
+  assert.deepEqual(cfg.content[0].object, {
+    kind: PROVENANCE_KIND,
+    agentName: 'copilot',
+    runtimeVersion: '0.1.7',
+    agentCliVersion: '9.9.9',
+    host: 'merlin',
+    pid: 4242,
+  });
+});
+
+test('the CONFIGURATION turn omits the provenance block when no substantive identity is available', async () => {
+  const client = fakeClient();
+  // No profile name, no runtime/CLI version → nothing to attribute → empty content.
+  const p = makeProducer(client, {
+    profile: { model: 'Opus 4.8', rank: 'senior' },
+    runtimeVersion: '',
+    agentCliVersion: '',
+    host: '',
+    pid: 0,
+  });
+  await p.activate();
+  assert.deepEqual(client.calls.create[0].history[0].content, []);
 });
 
 // ---------------------------------------------------------------------------

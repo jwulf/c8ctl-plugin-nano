@@ -45,6 +45,8 @@ import {
   hasValuelessArg,
   shQuote,
   buildAgentCommandLine,
+  extractVersionToken,
+  probeAgentCliVersion,
   reapAgentContainers,
   diskBudgetOk,
   normalizeStoredProfile,
@@ -4449,6 +4451,47 @@ test('buildAgentCommandLine appends shell-quoted args, verbatim when none', () =
   );
   // A malicious arg can't break out of its literal (no injection).
   assert.equal(buildAgentCommandLine('copilot', ['; rm -rf /']), `copilot '; rm -rf /'`);
+});
+
+// #243: agent-CLI version probe for the durable transcript provenance block.
+test('extractVersionToken prefers a semver-ish token, else the first non-empty line', () => {
+  assert.equal(extractVersionToken('copilot version 1.2.3'), '1.2.3');
+  assert.equal(extractVersionToken('v0.10.0-rc.4\n'), 'v0.10.0-rc.4');
+  assert.equal(extractVersionToken('  \n  claude-code (build abc)\n'), 'claude-code (build abc)');
+  assert.equal(extractVersionToken(''), null);
+  assert.equal(extractVersionToken('   \n\n  '), null);
+  // Length-capped so a chatty/adversarial harness can't bloat the transcript.
+  assert.equal(extractVersionToken('x'.repeat(200)).length, 64);
+});
+
+test('probeAgentCliVersion runs `<command> --version` (bounded) and extracts the version', () => {
+  const calls = [];
+  const run = (cmd, opts) => {
+    calls.push({ cmd, opts });
+    return { status: 0, stdout: 'copilot 3.4.5\n', stderr: '' };
+  };
+  const v = probeAgentCliVersion('copilot', { run });
+  assert.equal(v, '3.4.5');
+  assert.equal(calls[0].cmd, 'copilot --version');
+  assert.equal(calls[0].opts.shell, true);
+  assert.ok(calls[0].opts.timeout > 0, 'a hard timeout is set so a hung harness cannot block');
+  assert.deepEqual(calls[0].opts.stdio, ['ignore', 'pipe', 'pipe'], 'stdin closed so an interactive harness gets EOF');
+});
+
+test('probeAgentCliVersion is best-effort: blank command, thrown spawn, or off-switch → null', () => {
+  assert.equal(probeAgentCliVersion('', { run: () => { throw new Error('nope'); } }), null);
+  assert.equal(probeAgentCliVersion('   ', { run: () => ({ stdout: '1.0.0' }) }), null);
+  assert.equal(probeAgentCliVersion('copilot', { run: () => { throw new Error('ENOENT'); } }), null);
+  // Reads stderr too (many CLIs print --version to stderr).
+  assert.equal(probeAgentCliVersion('copilot', { run: () => ({ stdout: '', stderr: 'tool 2.0.1' }) }), '2.0.1');
+  const prev = process.env.NANO_AGENT_CLI_PROBE;
+  process.env.NANO_AGENT_CLI_PROBE = 'off';
+  try {
+    assert.equal(probeAgentCliVersion('copilot', { run: () => ({ stdout: '1.0.0' }) }), null, 'off-switch disables the probe');
+  } finally {
+    if (prev === undefined) delete process.env.NANO_AGENT_CLI_PROBE;
+    else process.env.NANO_AGENT_CLI_PROBE = prev;
+  }
 });
 
 test('normalizeStoredProfile normalizes the args list', () => {

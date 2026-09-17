@@ -8985,6 +8985,12 @@ async function workAgent(req, flags, ctx) {
   //   - the host SDK actually supports AgentInstance (create/update). The producer
   //     degrades to a disabled facade for older clients, so probing under such a client
   //     is pure waste + an unnecessary side effect (Copilot review, #257);
+  //   - the ACP classifier is available. `createAgentInstanceProducer` is ALSO inert
+  //     (the `usable` gate requires `classifyUpdate`) when the agentic classifier is
+  //     missing, even with a create/update-capable SDK — so probing would run the
+  //     harness `--version` for a producer that can never mint a transcript to consume
+  //     it. Mirror that precondition here so the probe stays side-effect-free whenever
+  //     the producer is disabled (Copilot review, #257);
   //   - the profile command alone is the full invocation (no extra args). An
   //     interpreter-style profile (`command:'node', args:['agent.js']`) would probe the
   //     interpreter, not the harness — omit rather than misattribute.
@@ -8997,8 +9003,11 @@ async function workAgent(req, flags, ctx) {
     !!camunda &&
     typeof camunda.createAgentInstance === 'function' &&
     typeof camunda.updateAgentInstance === 'function';
+  // The producer's `usable` gate also requires the ACP classifier (agent-instance.mjs);
+  // without it the producer is inert regardless of SDK support, so exclude the probe too.
+  const acpClassifierAvailable = typeof agenticSessionAcp?.classifyUpdate === 'function';
   const agentCliProbeEligible =
-    !isContainer && !agentInstanceProbeOff && sdkSupportsAgentInstance && effectiveArgs.length === 0;
+    !isContainer && !agentInstanceProbeOff && sdkSupportsAgentInstance && acpClassifierAvailable && effectiveArgs.length === 0;
   // #257 review: DEFER the probe until an external-agent job is actually being
   // serviced — so a worker that only ever receives ordinary service jobs never runs
   // the harness `--version` at all (no wasted startup delay / side effect). Runs at

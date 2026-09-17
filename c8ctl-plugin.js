@@ -3497,21 +3497,49 @@ const SETTLEMENT_PENDING_GHOST_TTL_MS = 30 * 60 * 1000;
 // as `settlement-pending` would report a false 30-minute stuck window. Mirrors the
 // supervisor runtime's `dispatch.isLeaseLostError` contract (regex on the message
 // + a numeric 409/404 anywhere on the cause chain).
-const LEASE_LOST_SETTLE_RE =
-  /HTTP 4(?:09|04)\b|status\s*code\s*4(?:09|04)\b|\bnot activated\b|joblease\s*mismatch|lease\s*mismatch|\bnot found\b|\breclaim/i;
+//
+// #256 review: the STRUCTURED status is authoritative. The raw settle client stamps
+// the message as `… HTTP <status> from <url><arbitrary response body>`, so a generic
+// ownership word ("not found", "reclaim") can appear in the body of a NON-loss
+// response (e.g. a 500/400) and must NOT then be read as lease loss. So we parse
+// every explicit HTTP status first: a 404/409 anywhere is lease loss; a definitive
+// engine-specific signal ("not activated"/lease mismatch — the broker only emits
+// these on a genuine loss) always counts; but the GENERIC words are trusted only
+// when NO contradictory (non-404/409) status is present.
+const LEASE_LOST_STRONG_RE = /\bnot activated\b|joblease\s*mismatch|lease\s*mismatch/i;
+const LEASE_LOST_WEAK_RE = /\bnot found\b|\breclaim/i;
+// Every explicit HTTP status the raw settle client stamps ("HTTP <n> from …" or an
+// SDK's "status code <n>") — used to TRUST a 404/409 and to VETO the weak signals
+// when the status is explicitly something else.
+const HTTP_STATUS_RE = /\bHTTP\s+(\d{3})\b|status\s*code\s*(\d{3})\b/ig;
 function isLeaseLostSettleError(err) {
   if (err == null) return false;
   const msg = err instanceof Error ? err.message : String(err);
-  if (LEASE_LOST_SETTLE_RE.test(msg)) return true;
-  // Walk the cause chain for a numeric 409/404 status — SDK rejections often carry
-  // it as `err.status`/`err.statusCode`/`err.response.status` rather than in the
-  // message. Bounded depth so a cyclic cause can't loop.
+  // Parse explicit statuses from the message AND the cause chain, separating a
+  // definitive lease-loss status (404/409) from a contradictory one. SDK rejections
+  // often carry the status as `err.status`/`err.statusCode`/`err.response.status`
+  // rather than in the message; the cause walk is bounded so a cycle can't loop.
+  let leaseStatus = false;
+  let otherStatus = false;
+  for (const m of msg.matchAll(HTTP_STATUS_RE)) {
+    const code = Number(m[1] ?? m[2]);
+    if (code === 404 || code === 409) leaseStatus = true;
+    else otherStatus = true;
+  }
   let e = err;
   for (let depth = 0; e != null && typeof e === 'object' && depth <= 4; depth += 1) {
     const s = e.status ?? e.statusCode ?? (e.response && e.response.status);
-    if (s === 409 || s === 404) return true;
+    if (s === 409 || s === 404) leaseStatus = true;
+    else if (Number.isFinite(s)) otherStatus = true;
     e = e.cause;
   }
+  // A definitive 404/409 anywhere is lease loss.
+  if (leaseStatus) return true;
+  // Unambiguous engine-semantic ownership signals always count.
+  if (LEASE_LOST_STRONG_RE.test(msg)) return true;
+  // Generic ownership words only when no contradictory status vetoes them — a
+  // 500/400 whose body merely CONTAINS "not found" is NOT a lease loss.
+  if (!otherStatus && LEASE_LOST_WEAK_RE.test(msg)) return true;
   return false;
 }
 

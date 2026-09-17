@@ -44,6 +44,7 @@ import {
   withSettlementPendingMarker,
   isLeaseLostSettleError,
   pruneActivationGuard,
+  bindJobSettle,
   countSupervisorInFlight,
   supervisorWorkerActivityFile,
   SETTLEMENT_PENDING_GHOST_TTL_MS,
@@ -1206,6 +1207,60 @@ test('isLeaseLostSettleError classifies definitive lease loss vs transient failu
   const four29 = new Error('rate limited'); four29.statusCode = 429;
   assert.equal(isLeaseLostSettleError(four29), false);
   assert.equal(isLeaseLostSettleError(null), false);
+});
+
+// #256 review: the STRUCTURED status vetoes the generic textual ownership words.
+// The raw settle client stamps arbitrary response-body text after "HTTP <status>
+// from …", so a 500/400 whose body merely CONTAINS "not found"/"reclaim" must NOT
+// be read as a lease loss (it would raise a false 30-minute settlement-pending
+// ghost); only an explicit 404/409 (or an unambiguous engine signal) is lease loss.
+test('isLeaseLostSettleError does not treat a non-404/409 status whose body contains "not found" as lease loss', () => {
+  // A contradictory non-loss status vetoes the generic words in the body.
+  assert.equal(isLeaseLostSettleError(new Error('complete 5: HTTP 500 from http://x/jobs/5/completion — job not found')), false);
+  assert.equal(isLeaseLostSettleError(new Error('fail 5: HTTP 400 from http://x — reclaim window expired')), false);
+  const e500 = new Error('completeJob failed: not found'); e500.status = 502;
+  assert.equal(isLeaseLostSettleError(e500), false); // numeric non-loss status on the object vetoes the body word
+  // But a genuine 404/409 with the SAME generic body IS lease loss.
+  assert.equal(isLeaseLostSettleError(new Error('fail 5: HTTP 404 from http://x/jobs/5/failure — job not found')), true);
+  assert.equal(isLeaseLostSettleError(new Error('complete 5: HTTP 409 from http://x — reclaim: job leased elsewhere')), true);
+  // And an unambiguous engine signal still counts even with an odd status.
+  assert.equal(isLeaseLostSettleError(new Error('HTTP 400 from x — job not activated')), true);
+});
+
+// #256 review: INTEGRATION test for the runner hot-path settle wiring
+// (c8ctl-plugin.js: `withSettlementPendingMarker(bindJobSettle(settle, job), job,
+// recordSettlementPending)`). Drives the EXACT composition with a fenced
+// complete/fail that the raw engine seam rejects with a lease-loss error, and
+// asserts (a) each settle was fenced with THIS activation's leaseToken, and (b) a
+// settlement-pending ghost was recorded for the right phase. Guards against a
+// future refactor silently dropping the wrapper while the unit tests stay green.
+test('runner settle wiring records a settlement-pending ghost on a lease-loss fenced settle', async () => {
+  const fenced = [];
+  const ghosts = new Map(); // stands in for settlementPendingJobs
+  // Raw engine settle seam (bindJobSettle's target): capture the fencing leaseToken,
+  // then reject exactly as the broker does when the lease was reclaimed / the job gone.
+  const rawSettle = {
+    complete: async (jobKey, _variables, leaseToken) => {
+      fenced.push(['complete', jobKey, leaseToken]);
+      throw new Error(`complete ${jobKey}: HTTP 409 from http://x/jobs/${jobKey}/completion JobLeaseMismatch`);
+    },
+    fail: async (jobKey, opts) => {
+      fenced.push(['fail', jobKey, opts.leaseToken]);
+      throw new Error(`fail ${jobKey}: HTTP 404 from http://x/jobs/${jobKey}/failure — job not found`);
+    },
+  };
+  const job = { jobKey: '7007', type: 'senior:feature', leaseToken: 'lease-abc' };
+  const recordSettlementPending = (j, phase) => ghosts.set(String(j.jobKey), { phase, type: j.type });
+  const settleJob = withSettlementPendingMarker(bindJobSettle(rawSettle, job), job, recordSettlementPending);
+
+  await assert.rejects(() => settleJob.complete({ ok: 1 }), /HTTP 409/);
+  assert.deepEqual(fenced.at(-1), ['complete', '7007', 'lease-abc'], 'complete fenced with the activation leaseToken');
+  assert.deepEqual(ghosts.get('7007'), { phase: 'complete', type: 'senior:feature' }, 'lease-loss complete records a ghost');
+
+  ghosts.clear();
+  await assert.rejects(() => settleJob.fail({ retries: 0 }), /HTTP 404/);
+  assert.deepEqual(fenced.at(-1), ['fail', '7007', 'lease-abc'], 'fail fenced with the activation leaseToken');
+  assert.deepEqual(ghosts.get('7007'), { phase: 'fail', type: 'senior:feature' }, 'lease-loss fail records a ghost');
 });
 
 // #256 review: the activation identity guard stays ABSOLUTELY bounded. A key with

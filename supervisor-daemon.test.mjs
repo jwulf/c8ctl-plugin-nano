@@ -120,12 +120,18 @@ function writeShim(shimPath, { recordArgv = false, workArgvDir = null, ignoreSig
     //   - SIGTERM (force abort): record and exit at once.
     // It records which signal it received to `sigFile`, so a test can prove a
     // drain finished the job vs a force cut it short.
-    const { drainMs = 300, sigFile } = busy;
+    const { drainMs = 300, sigFile, notReady = false } = busy;
+    // A `notReady` stand-in stamps NO `readyAt`, modelling a replacement whose
+    // activation loop never comes up — the supervisor's rolling-reload readiness
+    // gate must then advance on its bounded timeout rather than wedge the roll.
+    const marker = notReady
+      ? `{ pid: process.pid, jobs: [{ key: 'J1', type: 'faker:senior', since: Date.now() }] }`
+      : `{ pid: process.pid, readyAt: Date.now(), jobs: [{ key: 'J1', type: 'faker:senior', since: Date.now() }] }`;
     lines.push(
       `  const { writeFileSync: wf, rmSync: rm, mkdirSync: mk } = await import('node:fs');`,
       `  const { dirname } = await import('node:path');`,
       `  const actFile = process.env.NANO_SUPERVISOR_ACTIVITY_FILE;`,
-      `  try { mk(dirname(actFile), { recursive: true }); wf(actFile, JSON.stringify({ pid: process.pid, jobs: [{ key: 'J1', type: 'faker:senior', since: Date.now() }] })); } catch {}`,
+      `  try { mk(dirname(actFile), { recursive: true }); wf(actFile, JSON.stringify(${marker})); } catch {}`,
       `  let ending = false;`,
       `  const endWith = (how, delay) => {`,
       `    if (ending && how !== 'forced') return; ending = true;`,
@@ -142,6 +148,11 @@ function writeShim(shimPath, { recordArgv = false, workArgvDir = null, ignoreSig
   } else {
     if (ignoreSigterm) lines.push(`  process.on('SIGTERM', () => {}); // force the SIGKILL path on restart`);
     lines.push(
+      // Stamp a ready activity marker so the supervisor's rolling-reload readiness
+      // gate (`waitForWorkerReady`) resolves at once for this idle stand-in instead
+      // of waiting out the bounded timeout — the real worker stamps `readyAt` once
+      // its activation loop is up.
+      `  try { const { writeFileSync: rwf, mkdirSync: rmk } = await import('node:fs'); const { dirname: rdn } = await import('node:path'); const raf = process.env.NANO_SUPERVISOR_ACTIVITY_FILE; if (raf) { rmk(rdn(raf), { recursive: true }); rwf(raf, JSON.stringify({ pid: process.pid, readyAt: Date.now(), jobs: [] })); } } catch {}`,
       `  const { installParentDeathWatchdog } = await import(${JSON.stringify(pluginUrl)});`,
       `  const dp = Number.parseInt(process.env.NANO_SUPERVISOR_DAEMON_PID ?? '', 10);`,
       `  installParentDeathWatchdog({ intervalMs: 100, parentPid: Number.isInteger(dp) ? dp : undefined });`,
@@ -647,19 +658,24 @@ async function stopStream(mod, { force = false, sendAfter = null } = {}) {
   });
 }
 
-async function bootBusyDaemon(t, { drainMs = 300 } = {}) {
+async function bootBusyDaemon(t, { drainMs = 300, notReady = false, readyTimeoutMs = null } = {}) {
   const HOME = mkdtempSync(join(tmpdir(), 'c8ctl-sup-drain-'));
   const prevHome = process.env.C8CTL_NANO_HOME;
   const prevEntry = process.env.C8CTL_NANO_ENTRY;
   const prevMon = process.env.NANO_SUPERVISOR_MONITOR_MS;
+  const prevReadyTimeout = process.env.NANO_SUPERVISOR_RELOAD_READY_TIMEOUT_MS;
   process.env.C8CTL_NANO_HOME = HOME;
   process.env.NANO_SUPERVISOR_MONITOR_MS = '80'; // keep status broadcasts prompt
+  // The reload readiness timeout is read at plugin load in the spawned daemon,
+  // which inherits this env — set it BEFORE startSupervisorDaemon so a never-ready
+  // replacement's bounded wait is short in the test.
+  if (readyTimeoutMs != null) process.env.NANO_SUPERVISOR_RELOAD_READY_TIMEOUT_MS = String(readyTimeoutMs);
   writeFileSync(join(HOME, 'config.json'), JSON.stringify({
     hires: { faker: { name: 'faker', rank: 'senior', command: 'true', model: '', capabilities: [] } },
   }));
   const sigFile = join(HOME, 'worker-signal.txt');
   const shim = join(HOME, 'fake-entry.mjs');
-  writeShim(shim, { busy: { drainMs, sigFile } });
+  writeShim(shim, { busy: { drainMs, sigFile, notReady } });
   process.env.C8CTL_NANO_ENTRY = shim;
   const mod = await import(pluginUrl);
   t.after(async () => {
@@ -669,6 +685,7 @@ async function bootBusyDaemon(t, { drainMs = 300 } = {}) {
     restoreEnv('C8CTL_NANO_ENTRY', prevEntry);
     restoreEnv('C8CTL_NANO_HOME', prevHome);
     restoreEnv('NANO_SUPERVISOR_MONITOR_MS', prevMon);
+    restoreEnv('NANO_SUPERVISOR_RELOAD_READY_TIMEOUT_MS', prevReadyTimeout);
     try { rmSync(HOME, { recursive: true, force: true }); } catch {}
   });
   const state = await mod.startSupervisorDaemon();
@@ -838,6 +855,38 @@ test('supervisor reload: rolls the whole fleet, giving every worker a fresh pid'
     assert.notEqual(w.pid, oldPids.get(w.id), `worker ${w.id} should have a new pid after reload`);
     assert.equal(w.restarts, 0, 'reload is not a crash-restart');
   }
+  await mod.supervisorRequest({ op: 'stop', force: true });
+});
+
+test('supervisor reload: a never-ready replacement does not wedge the roll (bounded readiness gate)', async (t) => {
+  // The replacement never stamps `readyAt`, so the readiness gate can only clear
+  // on its bounded timeout — set short here. The roll must still finish, listing
+  // the worker as reloaded (it advanced anyway), not hang forever.
+  const { mod } = await bootBusyDaemon(t, { drainMs: 100, notReady: true, readyTimeoutMs: 300 });
+  const before = await mod.supervisorRequest({ op: 'status' });
+  assert.equal(before.workers.length, 1);
+  const id = before.workers[0].id;
+  const oldPid = before.workers[0].pid;
+
+  const started = Date.now();
+  const frames = await reloadStream(mod, { target: 'all' });
+  const elapsed = Date.now() - started;
+  const term = frames.find((f) => f && f.type === 'reloaded' && f.final);
+  assert.ok(term, 'expected a terminal reloaded frame even when the replacement never reports ready');
+  assert.deepEqual(term.reloaded, [id], 'the never-ready worker still counts as reloaded (advanced on timeout)');
+  // The bounded gate means the roll completes near the readiness timeout, not
+  // indefinitely — generously bounded to stay robust on a slow CI box.
+  assert.ok(elapsed < 8000, `reload should complete on the bounded timeout, took ${elapsed}ms`);
+
+  // The worker was genuinely respawned (new pid), just never signalled ready.
+  let after = null;
+  for (let i = 0; i < 40; i++) {
+    const s = await mod.supervisorRequest({ op: 'status' });
+    if (s.workers.length === 1 && s.workers[0].state === 'running' && s.workers[0].pid && s.workers[0].pid !== oldPid) { after = s.workers[0]; break; }
+    await sleep(50);
+  }
+  assert.ok(after, 'the worker should be respawned under a new pid even without a readiness signal');
+  assert.ok(mod.runningSupervisor(), 'the daemon should keep running after a bounded-timeout reload');
   await mod.supervisorRequest({ op: 'stop', force: true });
 });
 

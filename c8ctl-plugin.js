@@ -159,6 +159,19 @@ const STOP_GRACE_MS = 8_000;
 // `nano work` child to quiesce it — stop leasing new jobs, finish in-flight work,
 // then exit. SIGTERM/SIGINT remain the FORCE abort (kill harness, yield jobs).
 const SUPERVISOR_DRAIN_SIGNAL = 'SIGUSR2';
+// Hot-reload readiness gate: after a rolling `supervisor reload` respawns a
+// worker, the daemon waits (bounded) for the replacement to STAMP `readyAt` on
+// its activity marker — i.e. its activation loop is up and leasing jobs — before
+// draining the NEXT worker, so at most one worker is ever unavailable at a time.
+// A bare spawn/PID is not readiness: the child still has to import the plugin,
+// build its SDK client and start its activation loop. The wait is bounded so a
+// slow/never-ready replacement (e.g. a wedged engine) can't stall the roll — on
+// timeout the daemon advances anyway (degrading to the old spawn-and-advance).
+const SUPERVISOR_RELOAD_READY_POLL_MS = 100;
+const SUPERVISOR_RELOAD_READY_TIMEOUT_MS = Math.max(
+  0,
+  Number.parseInt(process.env.NANO_SUPERVISOR_RELOAD_READY_TIMEOUT_MS ?? '', 10) || 30_000,
+);
 // Upper bound on one `--auto` engine-read reconcile (enumerate deployed
 // definitions + fetch each BPMN). A read that stalls past this is treated as a
 // transient failure so the running poller set is KEPT and, crucially, shutdown
@@ -8288,7 +8301,7 @@ function agenticStateForTarget(target, safeUrl = (u) => u) {
  * list; `busy` is derived so callers can't desync it from `jobs`.
  * @param {{ pid:number, updatedAt:number, jobs:Array<{key:string,type:string,since:number}>, engine:(string|null), agentic:object }} fields
  */
-function buildActivityPayload({ pid, updatedAt, jobs, engine, agentic }) {
+function buildActivityPayload({ pid, updatedAt, jobs, engine, agentic, readyAt }) {
   const jobList = Array.isArray(jobs) ? jobs : [];
   return {
     pid,
@@ -8297,6 +8310,10 @@ function buildActivityPayload({ pid, updatedAt, jobs, engine, agentic }) {
     jobs: jobList,
     engine: engine ?? null,
     agentic,
+    // When the worker's activation loop has started (it has imported, built its
+    // SDK client and begun leasing), the producer stamps this; null until then.
+    // The supervisor's rolling reload gates on it (a spawn/PID is not readiness).
+    readyAt: readyAt ?? null,
   };
 }
 
@@ -8955,10 +8972,15 @@ async function workAgent(req, flags, ctx) {
   // is updated once the channel target is resolved and again on each
   // connect/disconnect below.
   let agenticState = { status: 'starting' };
+  // Readiness handshake (Copilot review on #253): null until this worker's
+  // activation loop is actually up and leasing; the supervisor's rolling reload
+  // waits for this stamp before draining the next worker so a bare spawn/PID is
+  // never mistaken for a serving replacement.
+  let readyAt = null;
   const writeActivity = () => {
     if (!activityFile) return;
     const jobs = [...activeJobs.entries()].map(([key, v]) => ({ key, type: v.type, since: v.since }));
-    const payload = buildActivityPayload({ pid: process.pid, updatedAt: Date.now(), jobs, engine: workerEngine, agentic: agenticState });
+    const payload = buildActivityPayload({ pid: process.pid, updatedAt: Date.now(), jobs, engine: workerEngine, agentic: agenticState, readyAt });
     const tmp = `${activityFile}.${process.pid}.tmp`;
     try {
       mkdirSync(dirname(activityFile), { recursive: true });
@@ -10043,6 +10065,15 @@ async function workAgent(req, flags, ctx) {
   // next reconcile — the same liveness the retired ref'd auto-poll timer provided.
   const supervisor = await SupervisorEffect.runPromise(makeSupervisorRuntime(supervisorDeps));
   const supervisorFiber = SupervisorEffect.runFork(supervisor.run);
+
+  // Readiness handshake (Copilot review on #253): the activation loop is now
+  // running — this worker has finished importing, built its SDK client, and begun
+  // leasing jobs. Stamp `readyAt` on the activity marker so the supervisor's
+  // rolling `reload` waits for THIS replacement to be serving before it drains the
+  // next worker, keeping the roll genuinely one-at-a-time (a spawn/PID alone is
+  // not readiness). Best-effort — a marker write never fails the worker.
+  readyAt = Date.now();
+  writeActivity();
 
   // Seed this worker's presence into the runtime's ownership registry (issue
   // #173) and late-bind the per-job relay seam to the running supervisor. The
@@ -11482,13 +11513,18 @@ async function runSupervisorDaemon() {
   // adopting new code is never worth killing running work.
   //
   // CAPACITY CAVEAT: this drains the worker BEFORE spawning its replacement, so
-  // for the drain window that worker serves no jobs. The fleet's "zero downtime"
-  // guarantee is therefore a FLEET-level one — with >1 worker the rest keep
-  // serving while one drains. A single-worker fleet (or a job type served by
+  // for the drain+boot window that worker serves no jobs. The fleet's "zero
+  // downtime" guarantee is therefore a FLEET-level one — with >1 worker the rest
+  // keep serving while one drains. A single-worker fleet (or a job type served by
   // only this one worker) does lose that type's serving capacity until the drain
-  // finishes and `startWorker` runs. Preserving an overlapping serving
-  // replacement would need a two-child handoff; that is intentionally out of
-  // scope here (documented in README/AGENTS).
+  // finishes, `startWorker` runs, AND the replacement reports ready. Preserving an
+  // overlapping serving replacement would need a two-child handoff; that is
+  // intentionally out of scope here (documented in README/AGENTS).
+  //
+  // ONE-AT-A-TIME: after respawning, this waits (bounded) for the replacement to
+  // stamp `readyAt` on its activity marker — it is up and leasing — before it
+  // returns, so `runReload` never drains the NEXT worker while this one is still
+  // booting. A bare spawn/PID is not readiness (Copilot review on #253).
   //
   // The drain runs OUTSIDE the op lock (it can be arbitrarily long) so a
   // `stop --force` or a `remove`/`restart` for this same worker isn't blocked
@@ -11497,6 +11533,31 @@ async function runSupervisorDaemon() {
   // force-stop/restart/remove already swapped or deleted this worker while we
   // drained, we must NOT respawn (that would leak a duplicate child or revive a
   // removed worker). We also skip the respawn when the daemon is shutting down.
+  // Poll a freshly (re)spawned worker's activity marker until it stamps `readyAt`
+  // (its activation loop is up and leasing), the child is swapped/exits, the
+  // daemon starts shutting down, or the bounded deadline passes. Returns whether
+  // it became ready; the caller advances regardless — readiness is a best-effort
+  // gate, never a hard block. Used by the rolling reload so it does not drain the
+  // next worker while this replacement is still booting (Copilot review on #253).
+  const waitForWorkerReady = async (w, child, timeoutMs) => {
+    const deadline = Date.now() + Math.max(0, timeoutMs);
+    for (;;) {
+      // Stop waiting if a concurrent restart/force-stop swapped this child, or it
+      // already exited — it is no longer a booting replacement to gate on.
+      if (w.child !== child) return false;
+      if (child.exitCode !== null || child.signalCode !== null) return false;
+      const act = readWorkerActivity(w.id);
+      if (act && Number.isFinite(act.readyAt)) return true;
+      if (shuttingDown || Date.now() >= deadline) {
+        dlog(`worker '${w.id}' not ready within ${timeoutMs}ms after reload — advancing anyway`);
+        return false;
+      }
+      // waitForChildExit doubles as a poll sleep: it resolves early if the child
+      // exits (the loop-top guard then returns) so we never busy-spin on a dead child.
+      await waitForChildExit(child, SUPERVISOR_RELOAD_READY_POLL_MS);
+    }
+  };
+
   const reloadWorker = async (id) => {
     const w = workers.get(id);
     if (!w) return false;
@@ -11513,16 +11574,28 @@ async function runSupervisorDaemon() {
     // be the one we drained (a concurrent restart/force-stop would have swapped
     // it). The startWorker+guard runs under the op lock so it can't interleave
     // with add/remove.
-    return await serializeOp(async () => {
+    const started = await serializeOp(async () => {
       const cur = workers.get(id);
-      if (!cur || cur !== w || shuttingDown || w.child !== child) return false;
+      if (!cur || cur !== w || shuttingDown || w.child !== child) return null;
       w.stopping = false;
       w.restarts = 0;
       startWorker(w);
       dlog(`worker '${id}' reloaded (adopted new code)`);
       broadcast({ type: 'event', event: 'worker-reload', id });
-      return true;
+      return w.child;
     });
+    if (!started) return false;
+    // `startWorker` returns the instant the child is forked — but the replacement
+    // still has to import the plugin, build its SDK client, and start its
+    // activation loop before it serves jobs. Signalling "reloaded" here lets
+    // `runReload` advance to drain the NEXT worker, so returning on the bare spawn
+    // could leave the just-respawned worker AND the next (draining) worker down at
+    // once, breaking the one-at-a-time guarantee (Copilot review on #253). Gate on
+    // the replacement stamping `readyAt` on its activity marker (it is up and
+    // leasing) before we return. Bounded so a slow/never-ready replacement can't
+    // wedge the roll — on timeout we advance anyway (degrading to spawn-and-advance).
+    await waitForWorkerReady(w, started, SUPERVISOR_RELOAD_READY_TIMEOUT_MS);
+    return true;
   };
 
   // Rolling hot reload across a set of worker ids: drain+respawn each in turn

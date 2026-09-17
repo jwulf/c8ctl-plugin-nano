@@ -1009,6 +1009,7 @@ test('buildActivityPayload carries engine + agentic and derives busy from jobs',
     jobs: [],
     engine: 'http://localhost:8080',
     agentic: { status: 'connected', mode: 'local' },
+    readyAt: null,
   });
 
   // Busy: jobs present → busy:true; the live job list rides through untouched.
@@ -1027,6 +1028,11 @@ test('buildActivityPayload carries engine + agentic and derives busy from jobs',
   const noJobs = buildActivityPayload({ pid: 1, updatedAt: 3, jobs: undefined, engine: 'e', agentic: { status: 'off' } });
   assert.deepEqual(noJobs.jobs, []);
   assert.equal(noJobs.busy, false);
+  // readyAt: null until the worker's activation loop is up; passes through verbatim
+  // once stamped (the supervisor's rolling reload gates on it, so it must survive).
+  assert.equal(noJobs.readyAt, null, 'readyAt defaults to null (not-yet-ready)');
+  const ready = buildActivityPayload({ pid: 1, updatedAt: 3, jobs: [], engine: 'e', agentic: { status: 'off' }, readyAt: 4242 });
+  assert.equal(ready.readyAt, 4242, 'a stamped readyAt rides through untouched');
 });
 
 test('supervisorStatusSignature changes when the polled engine changes', () => {

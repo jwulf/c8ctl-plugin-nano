@@ -143,7 +143,14 @@ SDK client (job workers) — do **not** add the SDK as a dependency or use raw
   drained child is still the worker's current child) so a concurrent
   force-stop/restart/remove never leaks a duplicate or revives a removed worker;
   a reload is refused while another is in progress, respects `shuttingDown`, and
-  **never clears `supervisor.json`** (it is not a stop). The daemon's OWN
+  **never clears `supervisor.json`** (it is not a stop). To keep the roll
+  genuinely **one-at-a-time**, after respawning a worker the daemon waits for the
+  replacement to report **ready** — the worker stamps `readyAt` on its activity
+  marker once its activation loop is up and leasing (a bare spawn/PID is not
+  readiness), so a slow replacement can't leave two workers down at once. That
+  wait is **bounded** (`NANO_SUPERVISOR_RELOAD_READY_TIMEOUT_MS`, default 30s): a
+  never-ready replacement (e.g. a wedged engine) can't stall the roll — the daemon
+  advances anyway on timeout. The daemon's OWN
   process-manager code is NOT adopted by `reload` (its workers are its children
   watching its pid, so a daemon re-exec would take the fleet down) — new
   supervisor code needs a full `supervisor stop && supervisor start`. `status`

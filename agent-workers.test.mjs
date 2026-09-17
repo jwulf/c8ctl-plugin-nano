@@ -4482,8 +4482,8 @@ test('probeAgentCliVersion is best-effort: blank command, thrown spawn, or off-s
   assert.equal(probeAgentCliVersion('', { run: () => { throw new Error('nope'); } }), null);
   assert.equal(probeAgentCliVersion('   ', { run: () => ({ stdout: '1.0.0' }) }), null);
   assert.equal(probeAgentCliVersion('copilot', { run: () => { throw new Error('ENOENT'); } }), null);
-  // Reads stderr too (many CLIs print --version to stderr).
-  assert.equal(probeAgentCliVersion('copilot', { run: () => ({ stdout: '', stderr: 'tool 2.0.1' }) }), '2.0.1');
+  // Reads stderr too (many CLIs print --version to stderr) — but only on a clean exit.
+  assert.equal(probeAgentCliVersion('copilot', { run: () => ({ status: 0, stdout: '', stderr: 'tool 2.0.1' }) }), '2.0.1');
   const prev = process.env.NANO_AGENT_CLI_PROBE;
   process.env.NANO_AGENT_CLI_PROBE = 'off';
   try {
@@ -4492,6 +4492,29 @@ test('probeAgentCliVersion is best-effort: blank command, thrown spawn, or off-s
     if (prev === undefined) delete process.env.NANO_AGENT_CLI_PROBE;
     else process.env.NANO_AGENT_CLI_PROBE = prev;
   }
+});
+
+test('probeAgentCliVersion rejects a returned failure result rather than persisting its diagnostics (#257)', () => {
+  // spawnSync does not throw on a missing command / shell failure — it RETURNS a result
+  // with a non-zero status and the error banner on stderr. That banner must not become
+  // a bogus agentCliVersion.
+  assert.equal(
+    probeAgentCliVersion('copilot', { run: () => ({ status: 127, stdout: '', stderr: '/bin/sh: copilot: not found' }) }),
+    null,
+    'a non-zero exit is not trusted, even with version-ish-looking stderr',
+  );
+  // A timeout surfaces as `error` (ETIMEDOUT) and/or a null status (killed by signal),
+  // with only a partial capture — reject it, do not record the partial output.
+  assert.equal(
+    probeAgentCliVersion('copilot', { run: () => ({ error: new Error('ETIMEDOUT'), status: null, stdout: 'copilot 9.9.9' }) }),
+    null,
+    'a timed-out probe (error set) is rejected',
+  );
+  assert.equal(
+    probeAgentCliVersion('copilot', { run: () => ({ status: null, signal: 'SIGKILL', stdout: 'copilot 9.9.9' }) }),
+    null,
+    'a signal-killed probe (null status) is rejected',
+  );
 });
 
 test('normalizeStoredProfile normalizes the args list', () => {

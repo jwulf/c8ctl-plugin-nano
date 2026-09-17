@@ -1759,6 +1759,14 @@ function probeAgentCliVersion(command, { timeoutMs = 1500, run = spawnSync } = {
     return null;
   }
   if (!out) return null;
+  // #257 review: spawnSync does NOT throw for a normal shell failure or timeout —
+  // with `shell: true` it returns a result carrying `error` (spawn failure /
+  // ETIMEDOUT) and/or a non-zero/null exit `status`, alongside diagnostic text on
+  // stderr (e.g. `/bin/sh: <cmd>: not found`) or a partial capture. Feeding that to
+  // extractVersionToken (whose fallback accepts the first non-empty line) would
+  // persist the error banner as a bogus `agentCliVersion`. Trust only a clean exit
+  // (no `error`, status 0); anything else omits the field.
+  if (out.error || out.status !== 0) return null;
   return extractVersionToken(`${out.stdout || ''}\n${out.stderr || ''}`);
 }
 
@@ -8797,8 +8805,14 @@ async function workAgent(req, flags, ctx) {
   // #243: probe the agent harness CLI's own version ONCE per worker process (bounded,
   // best-effort) so the durable transcript's provenance block can attribute a run to a
   // specific harness build. Never fatal — a null result just omits the field.
+  // #257 review: only probe for HOST execution. A container job runs `sh -c` inside the
+  // selected image, so a same-named host binary would report a plausible-but-wrong
+  // version (or a host-shell failure) and misattribute the run to a different executable.
+  // Leave agentCliVersion unset for container workers rather than record a host reading.
   let agentCliVersion = null;
-  try { agentCliVersion = probeAgentCliVersion(profile?.command); } catch { /* best effort */ }
+  if (!isContainer) {
+    try { agentCliVersion = probeAgentCliVersion(profile?.command); } catch { /* best effort */ }
+  }
   let workerNsDir;
   try {
     ({ nsDir: workerNsDir } = allocateWorkerNamespace({

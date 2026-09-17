@@ -114,7 +114,11 @@ SDK client (job workers) — do **not** add the SDK as a dependency or use raw
   (`kind:'nanobpm.provenance/v1'`) blob: `agentName` (profile name), `runtimeVersion`
   (the plugin `package.json` version == the nano **supervisor** version), best-effort
   `agentCliVersion` (a bounded, once-per-worker `probeAgentCliVersion` of the harness
-  `command --version`; `NANO_AGENT_CLI_PROBE=off` disables it), and `host`/`pid`
+  `command --version` — HOST execution only, since a container job runs the harness
+  inside its image where a same-named host binary would misattribute the version, so
+  container workers leave it unset; a probe that returns a non-zero/`error` result
+  omits the field rather than record its diagnostics; `NANO_AGENT_CLI_PROBE=off`
+  disables it), and `host`/`pid`
   diagnostics. All optional: a turn with no substantive identity emits no block, so
   the wire is byte-unchanged for a bare run. A first-class typed field would need a
   **generic** upstream Camunda extension (an `attributes` map), tracked in #243.

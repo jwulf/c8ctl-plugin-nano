@@ -120,7 +120,7 @@ function writeShim(shimPath, { recordArgv = false, workArgvDir = null, ignoreSig
     //   - SIGTERM (force abort): record and exit at once.
     // It records which signal it received to `sigFile`, so a test can prove a
     // drain finished the job vs a force cut it short.
-    const { drainMs = 300, sigFile, notReady = false } = busy;
+    const { drainMs = 300, sigFile, notReady = false, crashOnRespawn = false } = busy;
     // A `notReady` stand-in stamps NO `readyAt`, modelling a replacement whose
     // activation loop never comes up — the supervisor's rolling-reload readiness
     // gate must then advance on its bounded timeout rather than wedge the roll.
@@ -128,10 +128,27 @@ function writeShim(shimPath, { recordArgv = false, workArgvDir = null, ignoreSig
       ? `{ pid: process.pid, jobs: [{ key: 'J1', type: 'faker:senior', since: Date.now() }] }`
       : `{ pid: process.pid, readyAt: Date.now(), jobs: [{ key: 'J1', type: 'faker:senior', since: Date.now() }] }`;
     lines.push(
-      `  const { writeFileSync: wf, rmSync: rm, mkdirSync: mk } = await import('node:fs');`,
+      `  const { writeFileSync: wf, rmSync: rm, mkdirSync: mk, existsSync: ex } = await import('node:fs');`,
       `  const { dirname } = await import('node:path');`,
       `  const actFile = process.env.NANO_SUPERVISOR_ACTIVITY_FILE;`,
-      `  try { mk(dirname(actFile), { recursive: true }); wf(actFile, JSON.stringify(${marker})); } catch {}`,
+      `  try { mk(dirname(actFile), { recursive: true }); } catch {}`,
+    );
+    if (crashOnRespawn) {
+      // Model a replacement that FAILS to come up: the first incarnation runs
+      // normally, but a per-worker sentinel (keyed on the stable activity-file
+      // path) makes every *respawn* exit(1) at once — as if the reloaded child
+      // crashed on boot. `reloadWorker` then returns false and `runReload` must
+      // abort the rest of the roll (Copilot review on #253). The activity dir is
+      // created ABOVE first so the very first worker's sentinel write can't fail
+      // with ENOENT (which would let its respawn run healthy instead of crashing).
+      lines.push(
+        `  const sentinel = actFile + '.spawned';`,
+        `  if (ex(sentinel)) { process.exit(1); }`,
+        `  try { wf(sentinel, '1'); } catch {}`,
+      );
+    }
+    lines.push(
+      `  try { wf(actFile, JSON.stringify(${marker})); } catch {}`,
       `  let ending = false;`,
       `  const endWith = (how, delay) => {`,
       `    if (ending && how !== 'forced') return; ending = true;`,
@@ -658,7 +675,7 @@ async function stopStream(mod, { force = false, sendAfter = null } = {}) {
   });
 }
 
-async function bootBusyDaemon(t, { drainMs = 300, notReady = false, readyTimeoutMs = null } = {}) {
+async function bootBusyDaemon(t, { drainMs = 300, notReady = false, readyTimeoutMs = null, crashOnRespawn = false } = {}) {
   const HOME = mkdtempSync(join(tmpdir(), 'c8ctl-sup-drain-'));
   const prevHome = process.env.C8CTL_NANO_HOME;
   const prevEntry = process.env.C8CTL_NANO_ENTRY;
@@ -675,7 +692,7 @@ async function bootBusyDaemon(t, { drainMs = 300, notReady = false, readyTimeout
   }));
   const sigFile = join(HOME, 'worker-signal.txt');
   const shim = join(HOME, 'fake-entry.mjs');
-  writeShim(shim, { busy: { drainMs, sigFile, notReady } });
+  writeShim(shim, { busy: { drainMs, sigFile, notReady, crashOnRespawn } });
   process.env.C8CTL_NANO_ENTRY = shim;
   const mod = await import(pluginUrl);
   t.after(async () => {
@@ -887,6 +904,49 @@ test('supervisor reload: a never-ready replacement does not wedge the roll (boun
   }
   assert.ok(after, 'the worker should be respawned under a new pid even without a readiness signal');
   assert.ok(mod.runningSupervisor(), 'the daemon should keep running after a bounded-timeout reload');
+  await mod.supervisorRequest({ op: 'stop', force: true });
+});
+
+test('supervisor reload: a failed replacement aborts the roll (canary) and is reported as a partial failure', async (t) => {
+  // Both workers crash on RESPAWN (a per-worker sentinel makes the reloaded child
+  // exit 1 on boot). When the first worker's replacement fails, `reloadWorker`
+  // returns false and `runReload` must ABORT the rest of the pass rather than
+  // drain the next worker on top of the gap — so the second worker is left
+  // untouched (original pid) and the terminal frame reports a partial failure
+  // (`ok:false`, remaining ids skipped). #253 review (suppressed advisories).
+  // A large readiness timeout does NOT slow this test: `waitForWorkerReady`
+  // returns EARLY the moment the replacement exits, so the crash resolves the
+  // gate at once. The generous bound only guarantees the (slow, cold) node boot
+  // reaches the sentinel-crash BEFORE the timeout — otherwise a still-booting
+  // child would be counted as a best-effort timeout-success and the failure path
+  // wouldn't be exercised deterministically.
+  const { mod } = await bootBusyDaemon(t, { drainMs: 60, crashOnRespawn: true, readyTimeoutMs: 10_000 });
+  await mod.supervisorRequest({ op: 'add', profile: 'faker' });
+  // Wait until BOTH workers are up with pids.
+  let before = null;
+  for (let i = 0; i < 60; i++) {
+    const s = await mod.supervisorRequest({ op: 'status' });
+    if (s.workers.length === 2 && s.workers.every((w) => w.pid)) { before = s; break; }
+    await sleep(50);
+  }
+  assert.ok(before, 'both workers should be up before the reload');
+  const pidById = new Map(before.workers.map((w) => [w.id, w.pid]));
+
+  const frames = await reloadStream(mod, { target: 'all' });
+  const term = frames.find((f) => f && f.type === 'reloaded' && f.final);
+  assert.ok(term, 'expected a terminal reloaded frame');
+  assert.equal(term.ok, false, 'a failed reload must make the terminal frame a partial failure (ok:false)');
+  assert.equal(term.reloaded.length, 0, 'the crashing replacement is not counted as reloaded');
+  assert.equal(term.skipped.length, 2, 'the failed worker AND the not-yet-rolled worker are both skipped (roll aborted)');
+  assert.deepEqual([...term.skipped].sort(), [...pidById.keys()].sort(), 'both worker ids appear in skipped');
+
+  // Exactly one worker was drained (the first, which then crashed on respawn);
+  // the other must be UNTOUCHED — still on its original pid — proving the roll
+  // aborted instead of draining it too.
+  const after = await mod.supervisorRequest({ op: 'status' });
+  const untouched = after.workers.filter((w) => w.pid && w.pid === pidById.get(w.id));
+  assert.equal(untouched.length >= 1, true, 'at least one worker must be left untouched (roll aborted before draining it)');
+  assert.ok(mod.runningSupervisor(), 'the daemon should keep running after an aborted reload');
   await mod.supervisorRequest({ op: 'stop', force: true });
 });
 

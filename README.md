@@ -1149,6 +1149,14 @@ c8ctl nano supervisor reload # roll it into the running fleet, zero downtime
   job). The command **streams progress** and **Ctrl-C detaches** — the daemon
   keeps rolling in the background (rerun `supervisor status` to check). A reload
   is refused while another is already in progress.
+- It **stops the roll on a failed reload** (a canary): if a worker's replacement
+  crashes, fails to spawn, or is swapped out from under the roll — i.e. it has no
+  confirmed serving child — the daemon aborts the remaining pass rather than drain
+  the next worker on top of that gap (which would both break one-at-a-time and
+  risk rolling a broken replacement across the whole fleet). The remaining workers
+  are reported **skipped** and the terminal frame reports a partial failure
+  (`ok:false`), so automation sees it. A readiness *timeout* on a still-live
+  replacement is **not** a failure — it counts as reloaded and the roll continues.
 - `reload [target]` defaults to the whole fleet; pass a worker id or profile to
   reload just those. `workforce reload` rolls only the workers a manifest owns.
 - **Scope — workers, not the daemon.** A reload adopts all **worker-side** code

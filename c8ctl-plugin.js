@@ -11683,7 +11683,19 @@ async function runSupervisorDaemon() {
         }
         if (!workers.has(id)) { skipped.push(id); continue; }
         const ok = await reloadWorker(id);
-        if (ok) reloaded.push(id); else skipped.push(id);
+        if (ok) { reloaded.push(id); }
+        else {
+          // A reload FAILURE (not a mere readiness timeout — that returns true on
+          // a still-live child) means this worker has NO confirmed serving
+          // replacement: it crashed, failed to spawn, or was concurrently swapped.
+          // Draining the NEXT worker on top of that gap breaks the one-at-a-time
+          // guarantee AND could roll a broken replacement across the whole fleet.
+          // Stop the roll here (a canary), marking this + every remaining id
+          // skipped so the terminal frame reports a partial failure (#253 review).
+          interrupted = true;
+          for (let j = i; j < ids.length; j++) skipped.push(ids[j]);
+          break;
+        }
         try { sock.write(encodeFrame(statusFrame(false))); } catch { /* client gone */ }
       }
     } catch (err) {
@@ -11691,7 +11703,12 @@ async function runSupervisorDaemon() {
       dlog(`reload error: ${err?.message || err}`);
     } finally {
       reloading = false;
-      try { sock.write(encodeFrame({ ok: !interrupted, type: 'reloaded', reloaded, skipped, interrupted, final: true })); } catch { /* client gone */ }
+      // Terminal success requires BOTH a clean pass (not interrupted) AND nothing
+      // skipped: a skipped worker (failed reload, or removed/absent mid-roll) is a
+      // partial reload, so `ok: true` would let the streaming client exit zero and
+      // hide it from automation (#253 review). Propagate the partial failure.
+      const ok = !interrupted && skipped.length === 0;
+      try { sock.write(encodeFrame({ ok, type: 'reloaded', reloaded, skipped, interrupted, final: true })); } catch { /* client gone */ }
     }
   };
 
@@ -12306,7 +12323,7 @@ async function streamSupervisorReload(socketPath, req, logger, { label = 'fleet'
             const skipped = Array.isArray(frame.skipped) ? frame.skipped : [];
             if (reloaded.length > 0) logger.info(`Reloaded ${reloaded.length} worker(s): ${reloaded.join(', ')}.`);
             else logger.warn('No workers were reloaded.');
-            if (skipped.length > 0) logger.warn(`Skipped (gone/changed during reload): ${skipped.join(', ')}.`);
+            if (skipped.length > 0) logger.warn(`Skipped (gone/changed, or roll aborted after a failed reload): ${skipped.join(', ')}.`);
             finish('reloaded');
             return;
           }

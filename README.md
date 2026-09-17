@@ -1159,6 +1159,13 @@ c8ctl nano supervisor reload # roll it into the running fleet, zero downtime
   replacement is **not** a failure — it counts as reloaded and the roll continues.
 - `reload [target]` defaults to the whole fleet; pass a worker id or profile to
   reload just those. `workforce reload` rolls only the workers a manifest owns.
+- **Not supported on Windows.** The graceful drain relies on `SIGUSR2` to quiesce
+  each worker, which Windows cannot deliver (Node maps a non-zero signal there to
+  a forceful, SIGKILL-like termination, so the child's drain handler never fires).
+  The daemon therefore **rejects `supervisor reload` / `workforce reload` on
+  Windows** rather than hang or hard-kill in-flight work — use
+  `supervisor restart <target>`, or a full `supervisor stop` + `start`, to adopt
+  new code there.
 - **Scope — workers, not the daemon.** A reload adopts all **worker-side** code
   (job running, agent instances, git/container provisioning, the agentic
   connection, the Effect runtime workers load — the bulk of the harness). The

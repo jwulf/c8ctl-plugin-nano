@@ -8827,12 +8827,13 @@ async function workAgent(req, flags, ctx) {
   try { pluginVersion = JSON.parse(readFileSync(join(pluginDir, 'package.json'), 'utf-8')).version ?? null; } catch { /* best effort */ }
   // #243: the agent harness CLI's own version is probed ONCE per worker process
   // (bounded, best-effort) so the durable transcript's provenance block can attribute
-  // a run to a specific harness build. The probe is DEFERRED until AFTER the SDK client
-  // is created (below), because its ONLY consumer is the AgentInstance producer — so we
-  // gate it on the client actually supporting AgentInstance and must not run the
-  // harness's `--version` when no transcript can consume the result. Never fatal — a
-  // null result just omits the field.
+  // a run to a specific harness build. The probe is DEFERRED until the FIRST
+  // external-agent activation (its only consumer is the AgentInstance producer), so a
+  // worker that only services ordinary jobs never runs the harness `--version`, and
+  // the probe sees that job's launch context (setup.env). Never fatal — a null result
+  // just omits the field. `agentCliProbed` latches the once-only semantics.
   let agentCliVersion = null;
+  let agentCliProbed = false;
   let workerNsDir;
   try {
     ({ nsDir: workerNsDir } = allocateWorkerNamespace({
@@ -8944,9 +8945,10 @@ async function workAgent(req, flags, ctx) {
   // active profile itself — identical to the old no-arg behaviour.
   const camunda = globalThis.c8ctl.createClient(resolveConnectionProfile(ctx));
 
-  // #243/#257: now that the SDK client exists, run the deferred harness `--version`
-  // probe — but only when it can actually yield a consumable reading, else omit the
-  // field entirely:
+  // #243/#257: precompute the job-independent gates for the harness `--version`
+  // probe (the probe itself is DEFERRED to the first external-agent activation
+  // below — see maybeProbeAgentCliVersion). The probe only yields a consumable
+  // reading when:
   //   - HOST execution (a container job runs `sh -c` inside the selected image, so a
   //     same-named host binary would report a plausible-but-wrong version);
   //   - the AgentInstance kill-switch is not set (NANO_AGENT_INSTANCE=off disables the
@@ -8954,25 +8956,40 @@ async function workAgent(req, flags, ctx) {
   //     possibly non-idempotent harness with no reader);
   //   - the host SDK actually supports AgentInstance (create/update). The producer
   //     degrades to a disabled facade for older clients, so probing under such a client
-  //     is pure waste + an unnecessary startup side effect (Copilot review, #257);
+  //     is pure waste + an unnecessary side effect (Copilot review, #257);
   //   - the profile command alone is the full invocation (no extra args). An
   //     interpreter-style profile (`command:'node', args:['agent.js']`) would probe the
   //     interpreter, not the harness — omit rather than misattribute.
   // The probe itself (probeAgentCliVersion) additionally refuses an embedded-argument
-  // command and runs under the SAME merged profile env, so PATH resolves the real
+  // command and runs under the SAME merged profile+setup env, so PATH resolves the real
   // harness binary.
   const agentInstanceProbeOff = String(process.env.NANO_AGENT_INSTANCE || '').trim().toLowerCase() === 'off';
   const sdkSupportsAgentInstance =
     !!camunda &&
     typeof camunda.createAgentInstance === 'function' &&
     typeof camunda.updateAgentInstance === 'function';
-  if (!isContainer && !agentInstanceProbeOff && sdkSupportsAgentInstance && effectiveArgs.length === 0) {
+  const agentCliProbeEligible =
+    !isContainer && !agentInstanceProbeOff && sdkSupportsAgentInstance && effectiveArgs.length === 0;
+  // #257 review: DEFER the probe until an external-agent job is actually being
+  // serviced, and run it in that job's launch context — so (a) a worker that only
+  // ever receives ordinary service jobs never runs the harness `--version` at all
+  // (no wasted startup delay / side effect), and (b) the probe env includes the
+  // per-job `setup.env` overlay (which can change PATH), matching the env the harness
+  // is spawned under in `runAgentJob`. Runs at most once per worker (cached), so the
+  // per-job hot path pays nothing after the first external activation.
+  const maybeProbeAgentCliVersion = (jobEnvelope) => {
+    if (agentCliProbed || !agentCliProbeEligible) return;
+    agentCliProbed = true;
     try {
       agentCliVersion = probeAgentCliVersion(profile?.command, {
-        env: { ...process.env, ...normalizeEnvMap(profileEnv) },
+        env: {
+          ...process.env,
+          ...normalizeEnvMap(profileEnv),
+          ...normalizeEnvMap(jobEnvelope?.setup?.env),
+        },
       });
     } catch { /* best effort */ }
-  }
+  };
 
   // Broker REST endpoint for live linked-resource prompts (issue #63) and the
   // C8 REST source for `--auto`'s engine-read enrolment. Derived from the SAME
@@ -9476,6 +9493,7 @@ async function workAgent(req, flags, ctx) {
         // job, never on these lines).
         const aiCorr = `job ${job.jobKey} eik ${job.elementInstanceKey ?? '?'} pik ${job.processInstanceKey ?? '?'}`;
         if (!agentInstanceOff && isExternalAgentJob(job)) {
+          maybeProbeAgentCliVersion(envelope);
           agentInstanceProducer = createAgentInstanceProducer({ camunda, job, profile, envelope, logger, runtimeVersion: pluginVersion, agentCliVersion });
           try {
             // `createAgentInstanceProducer` always returns an object — including a

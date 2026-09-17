@@ -120,12 +120,14 @@ SDK client (job workers) — do **not** add the SDK as a dependency or use raw
   kill-switch is set (the probe's only consumer is the AgentInstance producer), when
   the host SDK client lacks `createAgentInstance`/`updateAgentInstance` (the producer
   then degrades to a disabled facade, so probing is pure waste — the probe is deferred
-  until after the client is built and gated on that capability), or when
+  until the FIRST external-agent activation and gated on that capability), or when
   the profile carries extra args (an interpreter-style `node agent.js` would probe the
   interpreter, not the harness) — the field is omitted rather than misattributed; the
-  probe further refuses an embedded-argument/compound `command` and runs under the SAME
-  merged profile env, so `${command} --version` can neither execute a script nor resolve
-  a different PATH binary than the real run; a
+  probe further refuses an embedded-argument/compound `command` and runs (once, cached)
+  in that first external job's launch context under the SAME merged profile+`setup.env`
+  env, so `${command} --version` can neither execute a script nor resolve
+  a different PATH binary than the real run (and a worker that only services ordinary
+  jobs never probes at all); a
   bounded `maxBuffer` caps the capture; a probe that returns a non-zero/`error` result
   omits the field rather than record its diagnostics; `NANO_AGENT_CLI_PROBE=off`
   disables it), and `host`/`pid`

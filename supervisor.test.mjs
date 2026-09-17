@@ -1237,8 +1237,16 @@ test('isLeaseLostSettleError does not treat a non-404/409 status whose body cont
   // But a genuine 404/409 with the SAME generic body IS lease loss.
   assert.equal(isLeaseLostSettleError(new Error('fail 5: HTTP 404 from http://x/jobs/5/failure — job not found')), true);
   assert.equal(isLeaseLostSettleError(new Error('complete 5: HTTP 409 from http://x — reclaim: job leased elsewhere')), true);
-  // And an unambiguous engine signal still counts even with an odd status.
-  assert.equal(isLeaseLostSettleError(new Error('HTTP 400 from x — job not activated')), true);
+  // A strong engine phrase with NO status still counts (a genuine loss the engine
+  // reported only in words).
+  assert.equal(isLeaseLostSettleError(new Error('job not activated')), true);
+  // #256 review (thread 4035004220): readErrorBody appends the ARBITRARY response
+  // body, so a strong engine PHRASE echoed inside a NON-loss transport response's body
+  // is vetoed by that contradictory status — a genuine loss is always stamped 404/409.
+  assert.equal(isLeaseLostSettleError(new Error('complete 5: HTTP 500 from http://x/jobs/5/completion — upstream: JobLeaseMismatch')), false);
+  assert.equal(isLeaseLostSettleError(new Error('fail 5: HTTP 400 from http://x/jobs/5/failure — job not activated')), false);
+  const strongOn502 = new Error('completeJob failed: lease mismatch'); strongOn502.status = 502;
+  assert.equal(isLeaseLostSettleError(strongOn502), false); // numeric non-loss status vetoes the strong body phrase
 });
 
 // #256 review (follow-up): the status parse reads only the STAMPED transport status

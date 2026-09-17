@@ -3507,13 +3507,15 @@ const MAX_SETTLE_IN_FLIGHT_PER_KEY = 16;
 // + a numeric 409/404 anywhere on the cause chain).
 //
 // #256 review: the STRUCTURED status is authoritative. The raw settle client stamps
-// the message as `… HTTP <status> from <url><arbitrary response body>`, so a generic
-// ownership word ("not found", "reclaim") can appear in the body of a NON-loss
-// response (e.g. a 500/400) and must NOT then be read as lease loss. So we parse
-// every explicit HTTP status first: a 404/409 anywhere is lease loss; a definitive
-// engine-specific signal ("not activated"/lease mismatch — the broker only emits
-// these on a genuine loss) always counts; but the GENERIC words are trusted only
-// when NO contradictory (non-404/409) status is present.
+// the message as `… HTTP <status> from <url><arbitrary response body>` (readErrorBody
+// appends the ARBITRARY response body), so EITHER an engine-semantic phrase
+// ("not activated"/lease mismatch) OR a generic ownership word ("not found",
+// "reclaim") can appear in the body of a NON-loss response (e.g. a 500/400) and must
+// NOT then be read as lease loss. So we parse every explicit HTTP status first: a
+// 404/409 anywhere is lease loss; a message ownership phrase (strong OR weak) is
+// trusted only when NO contradictory (non-404/409) status is present. A GENUINE
+// engine lease loss is always stamped 404/409, so this veto only ever removes a
+// phrase echoed inside some other status's body, never a real loss (#256 review).
 const LEASE_LOST_STRONG_RE = /\bnot activated\b|joblease\s*mismatch|lease\s*mismatch/i;
 const LEASE_LOST_WEAK_RE = /\bnot found\b|\breclaim/i;
 // The AUTHORITATIVE transport status the raw settle client stamps: it formats the
@@ -3552,11 +3554,13 @@ function isLeaseLostSettleError(err) {
   }
   // A definitive 404/409 anywhere is lease loss.
   if (leaseStatus) return true;
-  // Unambiguous engine-semantic ownership signals always count.
-  if (LEASE_LOST_STRONG_RE.test(msg)) return true;
-  // Generic ownership words only when no contradictory status vetoes them — a
-  // 500/400 whose body merely CONTAINS "not found" is NOT a lease loss.
-  if (!otherStatus && LEASE_LOST_WEAK_RE.test(msg)) return true;
+  // Message ownership phrases — engine-semantic (STRONG) or generic (WEAK) — are read
+  // from the message, and readErrorBody appends the ARBITRARY response body to it, so
+  // a NON-loss transport response (e.g. HTTP 500/400) whose body merely ECHOES
+  // "not activated"/"lease mismatch"/"not found" is NOT a lease loss. A genuine engine
+  // loss is always stamped 404/409 (handled above), so a contradictory (non-404/409)
+  // status vetoes EITHER phrase — removing only the false-ghost class, never a real loss.
+  if (!otherStatus && (LEASE_LOST_STRONG_RE.test(msg) || LEASE_LOST_WEAK_RE.test(msg))) return true;
   return false;
 }
 

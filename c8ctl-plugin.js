@@ -8980,10 +8980,11 @@ async function workAgent(req, flags, ctx) {
   // fleet a key re-activated on ANOTHER worker never clears this worker's ghost
   // (that worker can't reach this in-memory map). To stop such a ghost lingering
   // until this worker restarts, every ghost also carries an explicit TTL: it
-  // self-expires SETTLEMENT_PENDING_GHOST_TTL_MS after it was recorded (pruned in
-  // writeActivity), bounding the stale-observation window without needing shared
-  // cross-worker state. TTL is measured from when the settle FAILED (recordedAt),
-  // not the job's display `since`.
+  // self-expires SETTLEMENT_PENDING_GHOST_TTL_MS after the settle FAILED (pruned
+  // in writeActivity), bounding the stale-observation window without needing
+  // shared cross-worker state. Both the TTL and the ghost's displayed age are
+  // anchored at recordedAt (when settlement failed), not the job's activation
+  // start.
   const settlementPendingJobs = new Map();
   const MAX_SETTLEMENT_PENDING_GHOSTS = 64;
   const SETTLEMENT_PENDING_GHOST_TTL_MS = 30 * 60 * 1000;
@@ -9091,18 +9092,30 @@ async function workAgent(req, flags, ctx) {
   // `supervisor status` surfaces the stuck window. Derived purely from the
   // in-flight settle outcome the worker already knows (no durable journal, no
   // extra engine read) — the superseded settlement approach of the closed PR #226.
-  // `since` inherits the active job's start time so the cell shows how long the
-  // job has been stuck; the map is bounded (oldest evicted) so ghosts can't grow
-  // without bound on a long-lived worker.
+  // `since` is anchored at the moment the settle failed (the settlement-pending
+  // window, which is what the JOB cell labels), NOT the job's activation start —
+  // otherwise a job that ran 20m and then failed settlement would immediately
+  // render as `settlement-pending (20m)`. Only the CURRENT activation may create a
+  // ghost (leaseToken guard), so a superseded run's late settle failure can't
+  // resurrect a stale row. The map is bounded (oldest evicted) so ghosts can't
+  // grow without bound on a long-lived worker.
   const recordSettlementPending = (job, phase) => {
     const key = String(job.jobKey);
     const cur = activeJobs.get(key);
+    // Only the CURRENT activation may create a ghost. A same-key reactivation
+    // (recordJobStart) installs a newer leaseToken; if THIS (older) activation's
+    // fenced settle then fails, recording a ghost would surface a stale row after
+    // the newer run's recordJobEnd — even when the newer settle succeeded. Skip it
+    // (mirrors recordJobEnd's identity guard); an unleased job (no token on either
+    // side) records as before.
+    if (cur && cur.leaseToken !== job.leaseToken) return;
+    const recordedAt = Date.now();
     settlementPendingJobs.set(key, {
       type: cur?.type ?? job.type ?? null,
-      since: Number.isFinite(cur?.since) ? cur.since : Date.now(),
+      since: recordedAt,
       phase: phase ?? null,
       leaseToken: job.leaseToken,
-      recordedAt: Date.now(),
+      recordedAt,
     });
     while (settlementPendingJobs.size > MAX_SETTLEMENT_PENDING_GHOSTS) {
       const oldest = settlementPendingJobs.keys().next().value;

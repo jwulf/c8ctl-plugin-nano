@@ -1129,7 +1129,10 @@ c8ctl nano supervisor reload # roll it into the running fleet, zero downtime
   flight, and exits) and respawning it, which re-reads the updated
   `c8ctl-plugin.js`, its sidecars, and `supervisor.dist.js`. Because only one
   worker is down at a time, the rest of the fleet keeps serving — **zero fleet
-  downtime**.
+  downtime**. This is a *fleet-level* guarantee: a worker is drained **before**
+  its replacement spawns, so a **single-worker fleet** (or a job type served by
+  only one worker) does lose that capacity for the drain window. Run more than
+  one worker for a type if you need it served continuously across a reload.
 - It **never kills in-flight work**: a reload waits indefinitely for each
   worker's jobs to finish (adopting new code is never worth losing a running
   job). The command **streams progress** and **Ctrl-C detaches** — the daemon

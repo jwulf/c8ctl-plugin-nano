@@ -10940,9 +10940,15 @@ function formatSupervisorStatus(status) {
   // Flag a code update the running daemon hasn't adopted yet: the plugin on disk
   // has advanced past the daemon's version (e.g. after `nano update`). A rolling
   // `supervisor reload` adopts the new WORKER code with zero downtime; a daemon
-  // restart is needed for new SUPERVISOR code.
-  if (status.pluginVersion && d.version && status.pluginVersion !== d.version) {
-    lines.push(`  on disk:    ${status.pluginVersion} (update available — run \`c8ctl nano supervisor reload\` to adopt new worker code; restart the daemon for new supervisor code)`);
+  // restart is needed for new SUPERVISOR code. `status.pluginVersion` is only
+  // present on a live socket `status` frame; the socket-unreachable fallback
+  // (`statusFromState()`) has no such field, so read the on-disk package version
+  // locally as a fallback — otherwise the warning silently disappears exactly
+  // when the daemon is alive but its control socket is briefly unreachable.
+  const onDiskVersion = status.pluginVersion
+    ?? (() => { try { return pluginPackage().version; } catch { return null; } })();
+  if (onDiskVersion && d.version && onDiskVersion !== d.version) {
+    lines.push(`  on disk:    ${onDiskVersion} (update available — run \`c8ctl nano supervisor reload\` to adopt new worker code; restart the daemon for new supervisor code)`);
   }
   if (d.startedAt) lines.push(`  started:    ${d.startedAt}`);
   if (d.socket) lines.push(`  control:    ${d.socket}`);
@@ -11475,6 +11481,15 @@ async function runSupervisorDaemon() {
   // swap), this waits INDEFINITELY for the drain so no in-flight job is lost —
   // adopting new code is never worth killing running work.
   //
+  // CAPACITY CAVEAT: this drains the worker BEFORE spawning its replacement, so
+  // for the drain window that worker serves no jobs. The fleet's "zero downtime"
+  // guarantee is therefore a FLEET-level one — with >1 worker the rest keep
+  // serving while one drains. A single-worker fleet (or a job type served by
+  // only this one worker) does lose that type's serving capacity until the drain
+  // finishes and `startWorker` runs. Preserving an overlapping serving
+  // replacement would need a two-child handoff; that is intentionally out of
+  // scope here (documented in README/AGENTS).
+  //
   // The drain runs OUTSIDE the op lock (it can be arbitrarily long) so a
   // `stop --force` or a `remove`/`restart` for this same worker isn't blocked
   // and can escalate/interrupt it. Because of that, the respawn is guarded by
@@ -11519,19 +11534,30 @@ async function runSupervisorDaemon() {
     reloading = true;
     const reloaded = [];
     const skipped = [];
+    let interrupted = false;
     try {
-      for (const id of ids) {
-        if (shuttingDown) break;
+      for (let i = 0; i < ids.length; i++) {
+        const id = ids[i];
+        // If the daemon starts shutting down mid-roll, the remaining workers
+        // never adopt the new code — record them as skipped (and flag the roll
+        // interrupted) so the terminal frame can't report a clean success for a
+        // pass that stopped early.
+        if (shuttingDown) {
+          interrupted = true;
+          for (let j = i; j < ids.length; j++) skipped.push(ids[j]);
+          break;
+        }
         if (!workers.has(id)) { skipped.push(id); continue; }
         const ok = await reloadWorker(id);
         if (ok) reloaded.push(id); else skipped.push(id);
         try { sock.write(encodeFrame(statusFrame(false))); } catch { /* client gone */ }
       }
     } catch (err) {
+      interrupted = true;
       dlog(`reload error: ${err?.message || err}`);
     } finally {
       reloading = false;
-      try { sock.write(encodeFrame({ ok: true, type: 'reloaded', reloaded, skipped, final: true })); } catch { /* client gone */ }
+      try { sock.write(encodeFrame({ ok: !interrupted, type: 'reloaded', reloaded, skipped, interrupted, final: true })); } catch { /* client gone */ }
     }
   };
 
@@ -11678,7 +11704,13 @@ async function runSupervisorDaemon() {
           // Register as an attach consumer so the client also sees the
           // interleaved worker-reload/start events, then send an opening frame
           // and kick the rolling reload asynchronously (don't block the control
-          // loop — a `stop`/`status` must still be serviceable meanwhile).
+          // loop — a `stop`/`status` must still be serviceable meanwhile). Latch
+          // `reloading` HERE, before scheduling: `runReload` only sets it once it
+          // actually runs on a later tick, so a second `reload` socket arriving
+          // in that window would otherwise still see `false` and start a duplicate
+          // rolling pass over the same workers. The flag is reset in runReload's
+          // `finally`.
+          reloading = true;
           attachClients.add(sock);
           sock.write(encodeFrame({ ok: true, type: 'reloading', targets: ids }));
           sock.write(encodeFrame(statusFrame(false)));
@@ -12170,6 +12202,7 @@ async function supervisorReloadCmd(req) {
   const socketPath = running.socket || getSupervisorSocketPath();
   const outcome = await streamSupervisorReload(socketPath, { op: 'reload', target }, logger, { label: 'the fleet' });
   if (outcome === 'unreachable') { logger.error('Could not reach the supervisor control socket to reload it.'); process.exit(1); }
+  if (outcome === 'closed') { logger.error('The supervisor closed the connection before the reload finished (daemon crash or concurrent stop?) — the roll may be incomplete. Rerun `nano supervisor status` to check the fleet.'); process.exit(1); }
   if (outcome === 'error') process.exit(1);
 }
 
@@ -13963,6 +13996,7 @@ async function workforceReloadCmd(req, flags, manifestName) {
   const socketPath = running.socket || getSupervisorSocketPath();
   const outcome = await streamSupervisorReload(socketPath, { op: 'reload', targets: owned }, logger, { label: `workforce "${manifestName}"` });
   if (outcome === 'unreachable') { logger.error('Could not reach the supervisor control socket to reload it.'); process.exit(1); }
+  if (outcome === 'closed') { logger.error('The supervisor closed the connection before the reload finished (daemon crash or concurrent stop?) — the roll may be incomplete. Rerun `nano supervisor status` to check the fleet.'); process.exit(1); }
   if (outcome === 'error') process.exit(1);
 }
 

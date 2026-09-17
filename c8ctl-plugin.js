@@ -11587,6 +11587,14 @@ async function runSupervisorDaemon() {
       // already exited — it is no longer a booting replacement to gate on.
       if (w.child !== child) return false;
       if (child.exitCode !== null || child.signalCode !== null) return false;
+      // Abort at once on a spawn failure (ENOENT/EMFILE/…): it emits only 'error'
+      // with NO 'exit', so `exitCode`/`signalCode` stay null and the two checks
+      // above never fire — without this the loop would poll the full ready-timeout
+      // (~30s) before the final live-PID gate rejects a worker that never started
+      // (#253 review). `handleDeath` nulls `w.pid` on that 'error' (and a failed
+      // spawn has no `child.pid` to begin with), so a null `w.pid` for THIS still
+      // -current child means the replacement is dead — stop waiting immediately.
+      if (w.pid == null) return false;
       const act = readWorkerActivity(w.id);
       // Require the marker to be from THIS replacement child (`act.pid === child.pid`)
       // AND carry a finite `readyAt` (#253): a stale marker left by a previous
@@ -11653,11 +11661,6 @@ async function runSupervisorDaemon() {
     // `exitCode`/`signalCode` stay null and `w.child` keeps pointing at the failed
     // ChildProcess until its backoff retry — the identity+exit check alone would
     // count that as reloaded (#253 review). `handleDeath` nulls `w.pid` on every
-    // death (error OR exit), and a failed spawn has no `child.pid`, so requiring
-    // `w.pid` to be non-null AND still equal to this child's pid rejects both a
-    // failed spawn and a dead/retrying child while accepting a live replacement
-    // (readiness timeout included).
-    // `handleDeath` nulls `w.pid` on every
     // death (error OR exit), and a failed spawn has no `child.pid`, so requiring
     // `w.pid` to be non-null AND still equal to this child's pid rejects both a
     // failed spawn and a dead/retrying child while accepting a live replacement
@@ -12208,7 +12211,7 @@ async function supervisorStartCmd(req, flags, ctx) {
   await supervisorStatusCmd();
   logger.info('');
   logger.info('Attach an interactive console with: c8ctl nano supervisor');
-  logger.info('Manage without it:                  c8ctl nano supervisor add|remove|restart|status|stop');
+  logger.info('Manage without it:                  c8ctl nano supervisor add|remove|restart|reload|status|stop');
 }
 
 async function supervisorStatusCmd() {
@@ -16431,7 +16434,7 @@ function printUsage() {
   console.log('  c8ctl nano hire [--name <n>] [--rank <r>] [--command <c>] [--arg <switch> ...] [--model <m>] [--capabilities <a,b>] [--sandbox none|docker|podman] [--image <ref>] [--terminal pty|pipe] [--protocol pipe|acp] [--permission yolo|escalate|filter] [--env NAME=VALUE ...] [--list]');
   console.log('  c8ctl nano assign <profileName> <cap[,cap...]> [--name <n>] [--capabilities <a,b>]');
   console.log('  c8ctl nano work <profileName> [--auto [--auto-scope <p>]] [--arg <switch> ...] [--recovery-window <ms>] [--idle-timeout <ms>] [--job-timeout <ms>] [--poll-timeout <ms>] [--job-type <token> ...] [--sandbox none|docker|podman] [--image <ref>] [--env NAME=VALUE ...] [--secret-resolver host] [--min-free-mb <n>] [--clone-timeout <ms>] [--keep-runs] [--stream]');
-  console.log('  c8ctl nano supervisor [start|install|uninstall|status|add|remove|restart|stop|logs|attach] ... (manage many workers from one terminal)');
+  console.log('  c8ctl nano supervisor [start|install|uninstall|status|add|remove|restart|reload|stop|logs|attach] ... (manage many workers from one terminal)');
   console.log('  c8ctl nano workforce [add|remove|list|start|status|stop] ... [--manifest <manifest>] (declarative, reusable fleet manifests)');
   console.log('');
   console.log('Subcommands:');

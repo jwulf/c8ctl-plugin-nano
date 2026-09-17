@@ -6,6 +6,7 @@
 // exercised separately.
 import { test } from 'node:test';
 import assert from 'node:assert/strict';
+import { EventEmitter } from 'node:events';
 
 import {
   reconstructWorkArgs,
@@ -42,6 +43,7 @@ import {
   normalizeAgenticMessage,
   buildActivityPayload,
   activityMarkerReadyFor,
+  waitForChildExit,
   supervisorWorkerActivityFile,
   WORK_FORWARD_FLAGS,
 } from './c8ctl-plugin.js';
@@ -1048,6 +1050,27 @@ test('activityMarkerReadyFor: a marker is ready only with a finite readyAt AND a
   // A non-finite readyAt is never ready; a missing marker is never ready.
   assert.equal(activityMarkerReadyFor({ pid: 4242, readyAt: NaN }, 4242), false);
   assert.equal(activityMarkerReadyFor(null, 4242), false);
+});
+
+test('waitForChildExit removes its exit listener on timeout — no listener accumulation across polls (#253)', async () => {
+  // A fake long-lived child: never exits, so every poll resolves via timeout.
+  const child = new EventEmitter();
+  child.exitCode = null;
+  child.signalCode = null;
+  // The readiness poll calls waitForChildExit ~every 100ms for up to 30s. Simulate
+  // many poll cycles: if the timeout path leaked its `exit` listener (the pre-fix
+  // bug), the count would climb with each call and eventually warn.
+  for (let i = 0; i < 50; i++) {
+    await waitForChildExit(child, 1);
+  }
+  assert.equal(child.listenerCount('exit'), 0, 'no exit listeners retained after timed-out polls');
+
+  // The child eventually exits: an armed wait still resolves and cleans up.
+  const p = waitForChildExit(child, 10_000);
+  child.exitCode = 0;
+  child.emit('exit', 0, null);
+  await p;
+  assert.equal(child.listenerCount('exit'), 0, 'exit path also removes its listener');
 });
 
 test('supervisorStatusSignature changes when the polled engine changes', () => {

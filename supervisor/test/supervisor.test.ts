@@ -95,6 +95,46 @@ test("onFirstActivation fires exactly once at loop entry, before the first activ
 });
 
 
+test("a throwing onFirstActivation is swallowed — the loop keeps activating (#253 best-effort handshake)", async () => {
+  await Effect.runPromise(
+    Effect.gen(function* () {
+      // The readiness handshake is best-effort: a defect thrown by the injected
+      // thunk (e.g. the plugin's writeActivity() hitting an fs error) must NOT
+      // terminate run before the first activation tick.
+      const engine = makeEngine({
+        activate: activateAfter({ x: { job: job("Jx", "x"), delayMs: 10 } }),
+      });
+      const runner = makeRunner(1_000);
+      const reg = yield* makeRegistry();
+      yield* reg.add("w1", ["x"], 1);
+      const reader = makeReader([[]], {});
+
+      let fired = 0;
+      const sup = yield* makeSupervisor({
+        engine,
+        runner,
+        registry: reg,
+        reconcileReader: reader,
+        scan,
+        logger: noopLogger,
+        onFirstActivation: Effect.sync(() => { fired += 1; throw new Error("marker write failed"); }),
+        config: { idleSpacingMs: 1_000, activation: { requestTimeoutMs: 10_000, initialLockMs: 15_000, emptyPollBackoffMs: 0, maxBatchPerType: 10 } },
+      });
+
+      const fiber = yield* Effect.forkChild(sup.run);
+      yield* TestClock.adjust(Duration.millis(10)); // winning long-poll resolves
+      yield* TestClock.adjust(Duration.millis(5)); // let dispatch fork run
+
+      assert.equal(fired, 1, "the handshake did run (and threw)");
+      // Despite the thrown defect, the loop reached its first activation and
+      // dispatched the job — run was NOT terminated by the handshake failure.
+      assert.deepEqual(runner.ran, ["Jx"], "the loop kept activating after the handshake threw");
+
+      yield* Fiber.interrupt(fiber);
+    }).pipe(Effect.provide(TestClock.layer())),
+  );
+});
+
 test("reconcile wiring: an --auto worker's serviceable types are published from the cached crawl", async () => {
   await Effect.runPromise(
     Effect.gen(function* () {

@@ -274,7 +274,20 @@ export const makeSupervisor = (deps: SupervisorDeps): Effect.Effect<Supervisor> 
       // once here so the plugin stamps readiness only when the runtime is genuinely
       // serving, not merely scheduled (#253). Must precede the first `tick`: the
       // first activation poll can block for the whole long-poll window.
-      if (deps.onFirstActivation) yield* deps.onFirstActivation;
+      //
+      // Best-effort: the handshake must NEVER stop the loop. Yielding it directly
+      // would propagate a failure — or a DEFECT thrown by the injected thunk (e.g.
+      // the plugin's `writeActivity()` hitting an fs error) — and terminate
+      // `supervisor.run` before the first activation tick, leaving the worker
+      // process alive but not leasing. Swallow both so a readiness-marker problem
+      // can only delay readiness, never wedge the worker (#253 review).
+      if (deps.onFirstActivation)
+        yield* deps.onFirstActivation.pipe(
+          Effect.catchDefect((defect) =>
+            Effect.sync(() => logger.warn(`readiness handshake failed (ignored) — ${String(defect)}`)),
+          ),
+          Effect.ignore,
+        );
       return yield* tick.pipe(Effect.forever);
     });
 

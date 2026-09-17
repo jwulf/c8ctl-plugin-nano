@@ -11178,7 +11178,19 @@ function waitForChildExit(child, timeoutMs) {
     // #202: a null/undefined timeout means WAIT INDEFINITELY (graceful drain) —
     // no timer is armed, so we only resolve when the child actually exits.
     const t = timeoutMs == null ? null : setTimeout(() => finish(), timeoutMs);
-    function finish() { if (done) return; done = true; if (t) clearTimeout(t); resolve(); }
+    // `finish` ALWAYS removes the `exit` listener, including the timeout path:
+    // `child.once` only self-removes when the event fires, so a timed-out wait
+    // would otherwise leave its listener attached. The readiness poll calls this
+    // ~every 100ms for up to 30s, so a leaked listener per poll accumulates
+    // hundreds on a long-lived child — a `MaxListenersExceededWarning` plus
+    // retained closures (#253 review).
+    function finish() {
+      if (done) return;
+      done = true;
+      if (t) clearTimeout(t);
+      child.removeListener('exit', finish);
+      resolve();
+    }
     child.once('exit', finish);
   });
 }
@@ -11626,7 +11638,14 @@ async function runSupervisorDaemon() {
     // leasing) before we return. Bounded so a slow/never-ready replacement can't
     // wedge the roll — on timeout we advance anyway (degrading to spawn-and-advance).
     await waitForWorkerReady(w, started, SUPERVISOR_RELOAD_READY_TIMEOUT_MS);
-    return true;
+    // Report reloaded only when the child we spawned is STILL this worker's live
+    // current child. `waitForWorkerReady` returns even when the replacement exited
+    // (crash/spawn-fail) or was swapped by a concurrent restart/remove — in those
+    // cases no replacement is actually running, so counting it as reloaded would
+    // let the terminal frame claim success and let the roll drain the next worker
+    // with this one down (#253 review). A readiness *timeout* on a still-live
+    // current child still counts as success — readiness is best-effort.
+    return w.child === started && started.exitCode === null && started.signalCode === null;
   };
 
   // Rolling hot reload across a set of worker ids: drain+respawn each in turn
@@ -15991,6 +16010,7 @@ export {
   normalizeAgenticMessage,
   buildActivityPayload,
   activityMarkerReadyFor,
+  waitForChildExit,
   supervisorWorkerActivityFile,
   WORK_FORWARD_FLAGS,
   installParentDeathWatchdog,

@@ -4479,6 +4479,40 @@ test('probeAgentCliVersion runs `<command> --version` (bounded) and extracts the
   assert.ok(Number.isFinite(calls[0].opts.maxBuffer) && calls[0].opts.maxBuffer > 0, 'a finite maxBuffer caps a chatty harness so it cannot exhaust memory');
 });
 
+test('probeAgentCliVersion omits an embedded-argument / compound command rather than run it (#257)', () => {
+  // `buildAgentCommandLine` preserves an embedded-argument `command` verbatim when
+  // structured args are empty, so `${command} --version` would run the script/compound
+  // command and misattribute (or side-effect). Any whitespace or shell metacharacter
+  // means it is not a bare executable — omit the probe entirely (spawner never called).
+  for (const embedded of ['node agent.js', 'copilot; rm -rf /', 'sh -c "evil"', 'a && b', 'foo|bar', 'x$(whoami)']) {
+    let called = false;
+    assert.equal(
+      probeAgentCliVersion(embedded, { run: () => { called = true; return { status: 0, stdout: '9.9.9' }; } }),
+      null,
+      `embedded/compound command "${embedded}" is not probed`,
+    );
+    assert.equal(called, false, 'the spawner is never invoked for a non-bare command');
+  }
+  // A plain absolute/relative path token IS a bare executable — probe it normally.
+  assert.equal(
+    probeAgentCliVersion('/usr/local/bin/copilot', { run: () => ({ status: 0, stdout: 'copilot 1.2.3' }) }),
+    '1.2.3',
+    'a bare path executable still probes',
+  );
+});
+
+test('probeAgentCliVersion runs under the caller-supplied env so PATH matches the real harness (#257)', () => {
+  const calls = [];
+  const run = (cmd, opts) => { calls.push({ cmd, opts }); return { status: 0, stdout: 'copilot 4.5.6' }; };
+  const env = { ...process.env, PATH: '/opt/harness/bin', NANO_MARKER: '1' };
+  probeAgentCliVersion('copilot', { run, env });
+  assert.equal(calls[0].opts.env, env, 'the probe environment is the supplied merged profile env');
+  // Default (no env) inherits process.env — spawnSync default, so no `env` key is forced.
+  const bare = [];
+  probeAgentCliVersion('copilot', { run: (cmd, opts) => { bare.push(opts); return { status: 0, stdout: 'copilot 1.0.0' }; } });
+  assert.equal(bare[0].env, undefined, 'without an explicit env the probe inherits process.env');
+});
+
 test('probeAgentCliVersion is best-effort: blank command, thrown spawn, or off-switch → null', () => {
   assert.equal(probeAgentCliVersion('', { run: () => { throw new Error('nope'); } }), null);
   assert.equal(probeAgentCliVersion('   ', { run: () => ({ stdout: '1.0.0' }) }), null);

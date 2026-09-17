@@ -3494,23 +3494,41 @@ const SETTLEMENT_PENDING_GHOST_TTL_MS = 30 * 60 * 1000;
 // exactly as before. `onPending(job, phase)` is the recorder; `phase` is
 // 'complete' or 'fail' (which settle call was stuck), and a throw from the
 // recorder itself is swallowed so a marker write can never mask the real error.
+//
+// Optional `hooks.onSettleStart(job)` / `hooks.onSettleSettled(job)` bracket EACH
+// settle attempt (fired regardless of outcome) so the caller can track which
+// activations still have an UNOBSERVED fenced settle in flight. A settle call is
+// not cancelled when dispatch interrupts its runner, so this outstanding-settle
+// signal is what lets the caller retain an interrupted runner's identity guard
+// (lastActivationByKey) until its late outcome lands — instead of evicting it
+// purely by key count and letting a late rejection resurrect a stale ghost. Both
+// hooks are best-effort: a throw from either is swallowed so it can never alter
+// the settle outcome.
 // @param {{ complete: Function, fail: Function }} settleJob  the per-activation settle seam (see bindJobSettle)
 // @param {{ jobKey: string, type?: string, leaseToken?: string }} job  the activation being settled
 // @param {(job: object, phase: 'complete'|'fail') => void} onPending  records the stuck settlement
+// @param {{ onSettleStart?: (job: object) => void, onSettleSettled?: (job: object) => void }} [hooks]  in-flight settle bracket
 // @returns {{ complete: Function, fail: Function }}
-function withSettlementPendingMarker(settleJob, job, onPending) {
+function withSettlementPendingMarker(settleJob, job, onPending, hooks = {}) {
+  const onSettleStart = typeof hooks.onSettleStart === 'function' ? hooks.onSettleStart : null;
+  const onSettleSettled = typeof hooks.onSettleSettled === 'function' ? hooks.onSettleSettled : null;
   const mark = (phase) => {
     try { if (typeof onPending === 'function') onPending(job, phase); } catch { /* advisory only */ }
   };
+  const around = async (phase, call) => {
+    try { if (onSettleStart) onSettleStart(job); } catch { /* advisory only */ }
+    try {
+      return await call();
+    } catch (err) {
+      mark(phase);
+      throw err;
+    } finally {
+      try { if (onSettleSettled) onSettleSettled(job); } catch { /* advisory only */ }
+    }
+  };
   return {
-    complete: async (variables) => {
-      try { return await settleJob.complete(variables); }
-      catch (err) { mark('complete'); throw err; }
-    },
-    fail: async (opts2) => {
-      try { return await settleJob.fail(opts2); }
-      catch (err) { mark('fail'); throw err; }
-    },
+    complete: (variables) => around('complete', () => settleJob.complete(variables)),
+    fail: (opts2) => around('fail', () => settleJob.fail(opts2)),
   };
 }
 
@@ -9002,9 +9020,47 @@ async function workAgent(req, flags, ctx) {
   // The most recent activation leaseToken seen per key, retained AFTER the job
   // ends so a late fenced settle from an OLDER, interrupted runner cannot
   // resurrect a ghost once its own activeJobs entry is gone (recordJobEnd removed
-  // it). Pruned by TTL/size in writeActivity like the ghost map. See
-  // recordSettlementPending's absent-`cur` guard.
+  // it). Pruned by TTL/size in pruneLastActivation — called from recordJobStart
+  // (so a standalone `nano work`, whose writeActivity is a no-op, still bounds it)
+  // AND writeActivity. The size cap NEVER evicts a key whose fenced settle is
+  // still outstanding (settleInFlightByKey): a settle is not cancelled when its
+  // runner is interrupted, so evicting the guard purely by key count could let
+  // that late rejection resurrect a stale ghost. See recordSettlementPending's
+  // absent-`cur` guard.
   const lastActivationByKey = new Map();
+  // Keys with an UNOBSERVED fenced settle in flight (count per key). An interrupted
+  // older runner's settle keeps running (dispatch does not cancel it), so while its
+  // outcome is pending its identity guard in lastActivationByKey must be retained
+  // past the size cap. Bracketed by withSettlementPendingMarker's settle hooks.
+  const settleInFlightByKey = new Map();
+  const markSettleInFlight = (key) => {
+    settleInFlightByKey.set(key, (settleInFlightByKey.get(key) ?? 0) + 1);
+  };
+  const clearSettleInFlight = (key) => {
+    const n = (settleInFlightByKey.get(key) ?? 0) - 1;
+    if (n > 0) settleInFlightByKey.set(key, n);
+    else settleInFlightByKey.delete(key);
+  };
+  // Bound lastActivationByKey INDEPENDENTLY of writeActivity (which returns early
+  // for a standalone `nano work` with no NANO_SUPERVISOR_ACTIVITY_FILE), so a
+  // long-lived standalone worker cannot accumulate one retained token per key.
+  // Drop entries past the ghost TTL, then size-cap — but never evict a key whose
+  // fenced settle is still outstanding, so an interrupted runner's late settle can
+  // always find its guard.
+  const pruneLastActivation = (nowMs = Date.now()) => {
+    for (const [key, v] of lastActivationByKey.entries()) {
+      if (nowMs - (v.at ?? nowMs) > SETTLEMENT_PENDING_GHOST_TTL_MS && !settleInFlightByKey.has(key)) {
+        lastActivationByKey.delete(key);
+      }
+    }
+    if (lastActivationByKey.size > MAX_SETTLEMENT_PENDING_GHOSTS) {
+      for (const key of [...lastActivationByKey.keys()]) {
+        if (lastActivationByKey.size <= MAX_SETTLEMENT_PENDING_GHOSTS) break;
+        if (settleInFlightByKey.has(key)) continue; // retain the guard until its settle is observed
+        lastActivationByKey.delete(key);
+      }
+    }
+  };
   // Which engine this worker polls jobs from, surfaced to `supervisor status` via
   // the activity marker (#99). Derived from resolveWorkerPollEngineBase — the SDK
   // client's OWN profile restAddress (the base createJobWorker actually activates
@@ -9048,15 +9104,9 @@ async function workAgent(req, flags, ctx) {
       if (activeJobs.has(key)) continue;
       jobs.push({ key, type: v.type, since: v.since, settlementPending: true, settlePhase: v.phase ?? null });
     }
-    // Bound the last-activation guard map: drop entries older than the ghost TTL
-    // (a late older-runner settle can't plausibly arrive after it) and cap size,
-    // so it can't grow without bound on a long-lived worker.
-    for (const [key, v] of lastActivationByKey.entries()) {
-      if (nowMs - (v.at ?? nowMs) > SETTLEMENT_PENDING_GHOST_TTL_MS) lastActivationByKey.delete(key);
-    }
-    while (lastActivationByKey.size > MAX_SETTLEMENT_PENDING_GHOSTS) {
-      lastActivationByKey.delete(lastActivationByKey.keys().next().value);
-    }
+    // Bound the last-activation guard map (TTL + settle-aware size cap). Shared
+    // with recordJobStart so a standalone worker still prunes it.
+    pruneLastActivation(nowMs);
     const payload = buildActivityPayload({ pid: process.pid, updatedAt: Date.now(), jobs, engine: workerEngine, agentic: agenticState });
     const tmp = `${activityFile}.${process.pid}.tmp`;
     try {
@@ -9103,6 +9153,9 @@ async function workAgent(req, flags, ctx) {
     // Remember this as the newest activation for the key so a late settle from an
     // older runner (whose activeJobs entry is already gone) can't resurrect a ghost.
     lastActivationByKey.set(String(job.jobKey), { token: job.leaseToken, at: Date.now() });
+    // Bound the guard map here too: writeActivity no-ops for a standalone worker
+    // (no activity file), so the activation recorder must prune it unconditionally.
+    pruneLastActivation();
     writeActivity();
   };
   const recordJobEnd = (job) => {
@@ -9359,7 +9412,10 @@ async function workAgent(req, flags, ctx) {
       // is still unwinding, so a map lookup could fence the completion with the
       // WRONG (newer) token and clobber the new activation — the very lease bypass
       // this fence exists to prevent. `job.leaseToken` in the closure cannot drift.
-      const settleJob = withSettlementPendingMarker(bindJobSettle(settle, job), job, recordSettlementPending);
+      const settleJob = withSettlementPendingMarker(bindJobSettle(settle, job), job, recordSettlementPending, {
+        onSettleStart: () => markSettleInFlight(String(job.jobKey)),
+        onSettleSettled: () => clearSettleInFlight(String(job.jobKey)),
+      });
       try {
         logger.info(`[${jobType}] job ${job.jobKey} (instance ${job.processInstanceKey ?? '-'}) → ${buildAgentCommandLine(profile.command, effectiveArgs)}`);
 
@@ -15817,6 +15873,7 @@ export {
   normalizeAgenticMessage,
   buildActivityPayload,
   supervisorWorkerActivityFile,
+  SETTLEMENT_PENDING_GHOST_TTL_MS,
   WORK_FORWARD_FLAGS,
   installParentDeathWatchdog,
   runSupervisorDaemon,

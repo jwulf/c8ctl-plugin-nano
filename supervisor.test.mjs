@@ -44,6 +44,7 @@ import {
   withSettlementPendingMarker,
   countSupervisorInFlight,
   supervisorWorkerActivityFile,
+  SETTLEMENT_PENDING_GHOST_TTL_MS,
   WORK_FORWARD_FLAGS,
 } from './c8ctl-plugin.js';
 
@@ -792,6 +793,38 @@ test('summarizeSupervisorWorker reads a settlement-pending ghost as idle-state b
   assert.equal(row.activity.jobs[0].settlePhase, 'complete');
   // and the JOB cell surfaces the stuck window rather than a bare `idle`.
   assert.match(supervisorJobCell(row), /^JOB-SP settlement-pending/);
+});
+
+// #254: the read-time TTL filter is the ONLY expiry path once an idle worker
+// stops calling writeActivity, so a ghost older than SETTLEMENT_PENDING_GHOST_TTL_MS
+// must be dropped when the marker is read — otherwise the prior indefinite-ghost
+// behavior silently returns. A 3s-old ghost (above) exercises the keep path; this
+// exercises the expire path.
+test('summarizeSupervisorWorker drops a settlement-pending ghost older than the TTL at read time', async (t) => {
+  const { mkdtempSync, mkdirSync, writeFileSync, rmSync } = await import('node:fs');
+  const { tmpdir } = await import('node:os');
+  const { join, dirname } = await import('node:path');
+  const home = mkdtempSync(join(tmpdir(), 'c8ctl-activity-sp-exp-'));
+  const prev = process.env.C8CTL_NANO_HOME;
+  process.env.C8CTL_NANO_HOME = home;
+  t.after(() => {
+    if (prev === undefined) delete process.env.C8CTL_NANO_HOME; else process.env.C8CTL_NANO_HOME = prev;
+    try { rmSync(home, { recursive: true, force: true }); } catch { /* best effort */ }
+  });
+
+  const file = supervisorWorkerActivityFile('stale');
+  mkdirSync(dirname(file), { recursive: true });
+  // A ghost whose settle failed just over the TTL ago, on a worker that has since
+  // gone quiet (so writeActivity never pruned it).
+  writeFileSync(file, JSON.stringify({
+    pid: process.pid, busy: false,
+    jobs: [{ key: 'JOB-STALE', type: 'senior:feature', since: Date.now() - (SETTLEMENT_PENDING_GHOST_TTL_MS + 60_000), settlementPending: true, settlePhase: 'complete' }],
+  }));
+  const row = summarizeSupervisorWorker({ id: 'stale', profile: 'stale', pid: process.pid });
+  // The expired ghost is filtered out entirely: no jobs, idle state, idle cell.
+  assert.deepEqual(row.activity.jobs, []);
+  assert.equal(row.activity.state, 'idle');
+  assert.equal(supervisorJobCell(row), 'idle');
 });
 
 // --- supervisorStatusSignature (live-view change detection) ----------------

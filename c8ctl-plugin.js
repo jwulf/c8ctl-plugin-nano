@@ -12331,7 +12331,12 @@ async function streamSupervisorReload(socketPath, req, logger, { label = 'fleet'
           // frame, so the bare `ok === false` guard would swallow it as a generic
           // "reload failed" and hide which workers reloaded/skipped (#253 review).
           // We still exit non-zero for `ok:false` so automation sees the partial.
-          if (frame.type === 'reloaded' || frame.final) {
+          // Match ONLY `type:'reloaded'`, never a bare `frame.final`: generic
+          // terminal error frames (e.g. `{ok:false, error:'a reload is already in
+          // progress', final:true}`) are also `final` but carry no reloaded/skipped
+          // lists, so this branch would print "No workers were reloaded" and hide
+          // `frame.error` — they must fall through to the `ok === false` guard below.
+          if (frame.type === 'reloaded') {
             const reloaded = Array.isArray(frame.reloaded) ? frame.reloaded : [];
             const skipped = Array.isArray(frame.skipped) ? frame.skipped : [];
             if (reloaded.length > 0) logger.info(`Reloaded ${reloaded.length} worker(s): ${reloaded.join(', ')}.`);

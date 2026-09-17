@@ -269,11 +269,25 @@ export const makeSupervisor = (deps: SupervisorDeps): Effect.Effect<Supervisor> 
         yield* Effect.forkChild(projectPresence(ownership, presenceSink, presenceKnownRef, cfg.presence));
       }
       // The activation loop is about to run ON this fiber — imports and the SDK
-      // client were built before `runFork`, reconcile/presence are forked, and
-      // (under agentic) the connection is established. Fire the readiness handshake
-      // once here so the plugin stamps readiness only when the runtime is genuinely
-      // serving, not merely scheduled (#253). Must precede the first `tick`: the
-      // first activation poll can block for the whole long-poll window.
+      // client were built before `runFork`, and reconcile/presence are forked.
+      // Fire the readiness handshake once here so the plugin stamps readiness only
+      // when the runtime is genuinely LEASING, not merely scheduled (#253). Must
+      // precede the first `tick`: the first activation poll can block for the whole
+      // long-poll window.
+      //
+      // Readiness is deliberately gated on LEASING, NOT on the agentic connection.
+      // Under agentic, `superviseAgentic` forks the connect→establish cycle as a
+      // CHILD fiber and runs this `run` concurrently, so the agentic handle may
+      // still be connecting when this fires (the earlier comment here wrongly
+      // claimed "the connection is established" — it is not necessarily). That is
+      // correct: the activation/leasing loop does not depend on the agentic
+      // connection (presence/steer resync themselves once the handle opens, and a
+      // job leased before the connection is up degrades gracefully), so a rolling
+      // reload's one-at-a-time guarantee needs only "the replacement is leasing",
+      // not "the replacement's agentic socket is up". Gating readiness on
+      // `onEstablished` would instead let a slow/failing connect stall the roll
+      // (only the bounded ready-timeout would rescue it) for a dependency leasing
+      // does not have — so we intentionally do NOT do that (#253 review).
       //
       // Best-effort: the handshake must NEVER stop the loop. Yielding it directly
       // would propagate a failure — or a DEFECT thrown by the injected thunk (e.g.

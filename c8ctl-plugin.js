@@ -3485,45 +3485,118 @@ function bindJobSettle(settle, job) {
 // expires a ghost on an otherwise-quiet worker.
 const SETTLEMENT_PENDING_GHOST_TTL_MS = 30 * 60 * 1000;
 
-// #254: wrap a job's fenced settle seam so a settle FAILURE — the fenced
-// `complete`/`fail` was rejected (typically the activation's lease was lost
-// around settlement, leaving the engine still projecting the job `CREATED`) — is
-// recorded as `settlement-pending` for `supervisor status` BEFORE the error is
-// re-thrown unchanged. Purely observational: it never swallows the rejection or
-// alters the settle outcome, so the runtime's dispatch handles the failed settle
-// exactly as before. `onPending(job, phase)` is the recorder; `phase` is
-// 'complete' or 'fail' (which settle call was stuck), and a throw from the
-// recorder itself is swallowed so a marker write can never mask the real error.
-//
-// Optional `hooks.onSettleStart(job)` / `hooks.onSettleSettled(job)` bracket EACH
-// settle attempt (fired regardless of outcome) so the caller can track which
-// activations still have an UNOBSERVED fenced settle in flight. A settle call is
-// not cancelled when dispatch interrupts its runner, so this outstanding-settle
-// signal is what lets the caller retain an interrupted runner's identity guard
-// (lastActivationByKey) until its late outcome lands — instead of evicting it
-// purely by key count and letting a late rejection resurrect a stale ghost. Both
-// hooks are best-effort: a throw from either is swallowed so it can never alter
-// the settle outcome.
+// #254 (PR #256 review): does a fenced-settle rejection mean the activation was
+// DEFINITIVELY lost — the lock lapsed and the broker reclaimed the job, or the
+// lease was superseded — leaving the engine still projecting the job `CREATED`
+// and awaiting settlement? That is the ONLY case the settlement-pending ghost is
+// meant to surface. Only the unambiguous ownership-loss signals count: a 409
+// (reclaim / `JobLeaseMismatch`), a 404 (job gone), or the engine's "not
+// activated" body. Everything TRANSIENT (a 5xx, a 429, a network blip, a timeout)
+// or a deterministic client error (a 400 validation, a 401/403 auth failure) is
+// NOT lease loss — those settles retry or fail deterministically, so marking them
+// as `settlement-pending` would report a false 30-minute stuck window. Mirrors the
+// supervisor runtime's `dispatch.isLeaseLostError` contract (regex on the message
+// + a numeric 409/404 anywhere on the cause chain).
+const LEASE_LOST_SETTLE_RE =
+  /HTTP 4(?:09|04)\b|status\s*code\s*4(?:09|04)\b|\bnot activated\b|joblease\s*mismatch|lease\s*mismatch|\bnot found\b|\breclaim/i;
+function isLeaseLostSettleError(err) {
+  if (err == null) return false;
+  const msg = err instanceof Error ? err.message : String(err);
+  if (LEASE_LOST_SETTLE_RE.test(msg)) return true;
+  // Walk the cause chain for a numeric 409/404 status — SDK rejections often carry
+  // it as `err.status`/`err.statusCode`/`err.response.status` rather than in the
+  // message. Bounded depth so a cyclic cause can't loop.
+  let e = err;
+  for (let depth = 0; e != null && typeof e === 'object' && depth <= 4; depth += 1) {
+    const s = e.status ?? e.statusCode ?? (e.response && e.response.status);
+    if (s === 409 || s === 404) return true;
+    e = e.cause;
+  }
+  return false;
+}
+
+// #254 (PR #256 review): prune the per-key activation identity guard
+// (`lastActivationByKey`) so it stays bounded no matter how settlements behave.
+// A key whose fenced settle is still in flight (`settleInFlightByKey`, keyed
+// `{ count, since }`) is RETAINED past the soft size cap so an interrupted older
+// runner's late settle can still find its identity and not resurrect a stale
+// ghost. But that protection is itself TIME-BOUNDED — a settle that has hung past
+// the ghost TTL (the production SDK settle path has no deadline, so a
+// never-resolving `complete`/`fail` promise could otherwise pin its guard and its
+// per-key counter forever) is treated as never-resolving, GC'd from
+// `settleInFlightByKey`, and no longer protects its guard — AND a HARD ceiling
+// (`hardMax`) evicts oldest-first REGARDLESS of protection, so even a flood of
+// simultaneously-stuck settles can never grow the guard without bound. The worst
+// case is a bounded, self-expiring stale ghost (already capped + TTL'd elsewhere),
+// never unbounded memory. Pure w.r.t. the two maps (mutated in place); `nowMs` is
+// injected for deterministic tests.
+function pruneActivationGuard(lastActivationByKey, settleInFlightByKey, opts = {}) {
+  const nowMs = Number.isFinite(opts.nowMs) ? opts.nowMs : Date.now();
+  const ttlMs = Number.isFinite(opts.ttlMs) ? opts.ttlMs : SETTLEMENT_PENDING_GHOST_TTL_MS;
+  const maxGhosts = Number.isFinite(opts.maxGhosts) ? opts.maxGhosts : 64;
+  const hardMax = Number.isFinite(opts.hardMax) ? opts.hardMax : maxGhosts * 4;
+  const isProtected = (key) => {
+    const s = settleInFlightByKey.get(key);
+    return Boolean(s) && nowMs - (s.since ?? nowMs) <= ttlMs;
+  };
+  // GC never-resolving in-flight markers so settleInFlightByKey itself stays
+  // bounded (a hung settle's clear() may never run).
+  for (const [key, s] of settleInFlightByKey.entries()) {
+    if (nowMs - (s.since ?? nowMs) > ttlMs) settleInFlightByKey.delete(key);
+  }
+  // 1) TTL: drop aged, unprotected identity entries.
+  for (const [key, v] of lastActivationByKey.entries()) {
+    if (nowMs - (v.at ?? nowMs) > ttlMs && !isProtected(key)) lastActivationByKey.delete(key);
+  }
+  // 2) Soft size cap: evict oldest-first, retaining a live settle's guard.
+  if (lastActivationByKey.size > maxGhosts) {
+    for (const key of [...lastActivationByKey.keys()]) {
+      if (lastActivationByKey.size <= maxGhosts) break;
+      if (isProtected(key)) continue;
+      lastActivationByKey.delete(key);
+    }
+  }
+  // 3) Hard ceiling: protected keys alone can never grow past this — evict
+  //    oldest-first regardless so the guard is ABSOLUTELY bounded.
+  if (lastActivationByKey.size > hardMax) {
+    for (const key of [...lastActivationByKey.keys()]) {
+      if (lastActivationByKey.size <= hardMax) break;
+      lastActivationByKey.delete(key);
+    }
+  }
+}
+
+// #254: wrap a job's fenced settle seam so a settle FAILURE that means the
+// activation's lease was DEFINITIVELY lost (see isLeaseLostSettleError) — the
+// fenced `complete`/`fail` was rejected with a 409 reclaim / 404 / "not activated"
+// while the engine still projects the job `CREATED` — is recorded as
+// `settlement-pending` for `supervisor status` BEFORE the error is re-thrown
+// unchanged. A transient (5xx/429/network) or deterministic (validation/auth)
+// settle failure is NOT recorded: those do not establish a stuck settlement, so
+// marking them would surface a false stuck window. Purely observational: it never
+// swallows the rejection or alters the settle outcome, so the runtime's dispatch
+// handles the failed settle exactly as before. `onPending(job, phase)` is the
+// recorder; `phase` is 'complete' or 'fail' (which settle call was stuck), and a
+// throw from the recorder itself is swallowed so a marker write can never mask the
+// real error. Retention of the activation identity guard across an interrupted
+// runner's late settle is owned by the RUNNER lifecycle (markSettleInFlight from
+// runner start to its finally), not this wrapper — so the guard is protected for
+// the whole runner, including the awaits BEFORE the settle promise begins.
 // @param {{ complete: Function, fail: Function }} settleJob  the per-activation settle seam (see bindJobSettle)
 // @param {{ jobKey: string, type?: string, leaseToken?: string }} job  the activation being settled
 // @param {(job: object, phase: 'complete'|'fail') => void} onPending  records the stuck settlement
-// @param {{ onSettleStart?: (job: object) => void, onSettleSettled?: (job: object) => void }} [hooks]  in-flight settle bracket
 // @returns {{ complete: Function, fail: Function }}
-function withSettlementPendingMarker(settleJob, job, onPending, hooks = {}) {
-  const onSettleStart = typeof hooks.onSettleStart === 'function' ? hooks.onSettleStart : null;
-  const onSettleSettled = typeof hooks.onSettleSettled === 'function' ? hooks.onSettleSettled : null;
+function withSettlementPendingMarker(settleJob, job, onPending) {
   const mark = (phase) => {
     try { if (typeof onPending === 'function') onPending(job, phase); } catch { /* advisory only */ }
   };
   const around = async (phase, call) => {
-    try { if (onSettleStart) onSettleStart(job); } catch { /* advisory only */ }
     try {
       return await call();
     } catch (err) {
-      mark(phase);
+      // Only a definitive lease-loss rejection is a stuck settlement (#256 review).
+      if (isLeaseLostSettleError(err)) mark(phase);
       throw err;
-    } finally {
-      try { if (onSettleSettled) onSettleSettled(job); } catch { /* advisory only */ }
     }
   };
   return {
@@ -9022,45 +9095,53 @@ async function workAgent(req, flags, ctx) {
   // resurrect a ghost once its own activeJobs entry is gone (recordJobEnd removed
   // it). Pruned by TTL/size in pruneLastActivation — called from recordJobStart
   // (so a standalone `nano work`, whose writeActivity is a no-op, still bounds it)
-  // AND writeActivity. The size cap NEVER evicts a key whose fenced settle is
-  // still outstanding (settleInFlightByKey): a settle is not cancelled when its
-  // runner is interrupted, so evicting the guard purely by key count could let
-  // that late rejection resurrect a stale ghost. See recordSettlementPending's
-  // absent-`cur` guard.
+  // AND writeActivity. The soft size cap retains a key whose fenced settle is still
+  // outstanding (settleInFlightByKey) — a settle is not cancelled when its runner is
+  // interrupted, so evicting the guard purely by key count could let that late
+  // rejection resurrect a stale ghost — but that retention is TIME-BOUNDED and a
+  // HARD ceiling caps the map absolutely, so a never-resolving settle (the SDK
+  // settle path has no deadline) can never grow it without bound (#256 review). See
+  // recordSettlementPending's absent-`cur` guard.
   const lastActivationByKey = new Map();
-  // Keys with an UNOBSERVED fenced settle in flight (count per key). An interrupted
-  // older runner's settle keeps running (dispatch does not cancel it), so while its
-  // outcome is pending its identity guard in lastActivationByKey must be retained
-  // past the size cap. Bracketed by withSettlementPendingMarker's settle hooks.
+  // Keys with an UNOBSERVED fenced settle in flight, `{ count, since }` per key.
+  // An interrupted older runner's settle keeps running (dispatch does not cancel
+  // it), so while its outcome is pending its identity guard in lastActivationByKey
+  // must be retained past the size cap. Bracketed by the RUNNER lifecycle
+  // (markSettleInFlight right after recordJobStart → clearSettleInFlight in the
+  // runner's finally), NOT the settle promise, so the guard is protected across the
+  // awaits BEFORE the settle even begins (#256 review). `since` (runner start)
+  // time-bounds the protection: a settle hung past the ghost TTL is treated as
+  // never-resolving and GC'd, so the map can never grow without bound.
   const settleInFlightByKey = new Map();
-  const markSettleInFlight = (key) => {
-    settleInFlightByKey.set(key, (settleInFlightByKey.get(key) ?? 0) + 1);
+  const markSettleInFlight = (key, nowMs = Date.now()) => {
+    const s = settleInFlightByKey.get(key);
+    if (s) s.count += 1;
+    else settleInFlightByKey.set(key, { count: 1, since: nowMs });
   };
   const clearSettleInFlight = (key) => {
-    const n = (settleInFlightByKey.get(key) ?? 0) - 1;
-    if (n > 0) settleInFlightByKey.set(key, n);
+    const s = settleInFlightByKey.get(key);
+    if (!s) return;
+    if (s.count > 1) s.count -= 1;
     else settleInFlightByKey.delete(key);
   };
+  const MAX_SETTLEMENT_PENDING_LAST_ACTIVATIONS = MAX_SETTLEMENT_PENDING_GHOSTS;
+  // Hard ceiling: even a flood of simultaneously-stuck settles can never grow the
+  // guard past this — pruneActivationGuard evicts oldest-first regardless of
+  // protection above it, so the map is ABSOLUTELY bounded (#256 review).
+  const HARD_MAX_LAST_ACTIVATIONS = MAX_SETTLEMENT_PENDING_GHOSTS * 4;
   // Bound lastActivationByKey INDEPENDENTLY of writeActivity (which returns early
   // for a standalone `nano work` with no NANO_SUPERVISOR_ACTIVITY_FILE), so a
   // long-lived standalone worker cannot accumulate one retained token per key.
-  // Drop entries past the ghost TTL, then size-cap — but never evict a key whose
-  // fenced settle is still outstanding, so an interrupted runner's late settle can
-  // always find its guard.
-  const pruneLastActivation = (nowMs = Date.now()) => {
-    for (const [key, v] of lastActivationByKey.entries()) {
-      if (nowMs - (v.at ?? nowMs) > SETTLEMENT_PENDING_GHOST_TTL_MS && !settleInFlightByKey.has(key)) {
-        lastActivationByKey.delete(key);
-      }
-    }
-    if (lastActivationByKey.size > MAX_SETTLEMENT_PENDING_GHOSTS) {
-      for (const key of [...lastActivationByKey.keys()]) {
-        if (lastActivationByKey.size <= MAX_SETTLEMENT_PENDING_GHOSTS) break;
-        if (settleInFlightByKey.has(key)) continue; // retain the guard until its settle is observed
-        lastActivationByKey.delete(key);
-      }
-    }
-  };
+  // Delegates to the pure pruneActivationGuard (TTL → soft size cap retaining live
+  // settles → hard ceiling), so an interrupted runner's late settle can find its
+  // guard while a never-resolving settle can never pin it unbounded.
+  const pruneLastActivation = (nowMs = Date.now()) =>
+    pruneActivationGuard(lastActivationByKey, settleInFlightByKey, {
+      nowMs,
+      ttlMs: SETTLEMENT_PENDING_GHOST_TTL_MS,
+      maxGhosts: MAX_SETTLEMENT_PENDING_LAST_ACTIVATIONS,
+      hardMax: HARD_MAX_LAST_ACTIVATIONS,
+    });
   // Which engine this worker polls jobs from, surfaced to `supervisor status` via
   // the activity marker (#99). Derived from resolveWorkerPollEngineBase — the SDK
   // client's OWN profile restAddress (the base createJobWorker actually activates
@@ -9405,6 +9486,14 @@ async function workAgent(req, flags, ctx) {
     run: async (job, abortSignal) => {
       const jobType = job.type;
       recordJobStart(job, jobType);
+      // #256 review: retain THIS activation's identity guard from runner START —
+      // not merely once the settle promise begins — so a same-key eviction can't
+      // drop it during the awaits BEFORE settlement, which would let an interrupted
+      // older runner's late fenced settle find no identity and resurrect a stale
+      // ghost. Balanced in the finally (clearSettleInFlight); the guard is then
+      // pruned with a time bound + hard ceiling so a never-resolving settle cannot
+      // pin it forever.
+      markSettleInFlight(String(job.jobKey));
       // Bind the settler to THIS activation's lease token, captured from the job
       // in closure scope. A settlement is fenced with the exact activation that
       // ran — NOT a token re-read from the shared activeJobs map at settle time: a
@@ -9412,10 +9501,7 @@ async function workAgent(req, flags, ctx) {
       // is still unwinding, so a map lookup could fence the completion with the
       // WRONG (newer) token and clobber the new activation — the very lease bypass
       // this fence exists to prevent. `job.leaseToken` in the closure cannot drift.
-      const settleJob = withSettlementPendingMarker(bindJobSettle(settle, job), job, recordSettlementPending, {
-        onSettleStart: () => markSettleInFlight(String(job.jobKey)),
-        onSettleSettled: () => clearSettleInFlight(String(job.jobKey)),
-      });
+      const settleJob = withSettlementPendingMarker(bindJobSettle(settle, job), job, recordSettlementPending);
       try {
         logger.info(`[${jobType}] job ${job.jobKey} (instance ${job.processInstanceKey ?? '-'}) → ${buildAgentCommandLine(profile.command, effectiveArgs)}`);
 
@@ -10198,6 +10284,7 @@ async function workAgent(req, flags, ctx) {
           variables: { [AGENT_RESULT_KEY]: resultEnvelope },
         });
       } finally {
+        clearSettleInFlight(String(job.jobKey));
         recordJobEnd(job);
       }
     },
@@ -11043,14 +11130,25 @@ function reageSupervisorStatus(status, now = Date.now()) {
         Number.isFinite(w.startedAtMs) ? Math.max(0, now - w.startedAtMs) : w.uptimeMs;
       let activity = w.activity;
       if (activity && Array.isArray(activity.jobs)) {
-        activity = {
-          ...activity,
-          jobs: activity.jobs.map((j) =>
+        const jobs = activity.jobs
+          .map((j) =>
             j && typeof j === 'object' && Number.isFinite(j.sinceEpochMs)
               ? { ...j, sinceMs: Math.max(0, now - j.sinceEpochMs) }
               : j,
-          ),
-        };
+          )
+          // #254 (#256 review): apply the same read-time ghost TTL while re-aging.
+          // An attached console re-ages the cached snapshot on every tick (it never
+          // rebuilds it via summarizeSupervisorWorker), so with NANO_SUPERVISOR_MONITOR_MS=0
+          // — or simply between status frames — a settlement-pending ghost past its
+          // TTL would otherwise render indefinitely. Drop it here too so it
+          // self-expires as documented on the live view. A running job (no epoch, or
+          // not pending) is kept.
+          .filter((j) => !(j && typeof j === 'object' && j.settlementPending && Number.isFinite(j.sinceEpochMs) && now - j.sinceEpochMs > SETTLEMENT_PENDING_GHOST_TTL_MS));
+        // Re-derive busy/idle from the surviving actively-running jobs (a pure ghost
+        // is idle), mirroring summarizeSupervisorWorker — so expiring the last ghost
+        // flips the worker to idle instead of leaving a stale 'busy'.
+        const state = jobs.some((j) => j && typeof j === 'object' && !j.settlementPending) ? 'busy' : 'idle';
+        activity = { ...activity, jobs, state };
       }
       return { ...w, uptimeMs, activity };
     }),
@@ -15816,6 +15914,8 @@ export {
   createSupervisorDeps,
   bindJobSettle,
   withSettlementPendingMarker,
+  isLeaseLostSettleError,
+  pruneActivationGuard,
   enableEngineHappyEyeballs,
   preferIpv4Resolution,
   isLikelyLocalNetworkTccBlock,

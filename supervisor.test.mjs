@@ -42,6 +42,8 @@ import {
   normalizeAgenticMessage,
   buildActivityPayload,
   withSettlementPendingMarker,
+  isLeaseLostSettleError,
+  pruneActivationGuard,
   countSupervisorInFlight,
   supervisorWorkerActivityFile,
   SETTLEMENT_PENDING_GHOST_TTL_MS,
@@ -1166,10 +1168,82 @@ test('withSettlementPendingMarker is a pass-through on a successful settle', asy
 });
 
 test('withSettlementPendingMarker never lets a recorder throw mask the settle error', async () => {
-  const boom = new Error('settle failed');
+  // A definitive lease-loss rejection so the (throwing) recorder IS invoked — its
+  // throw must be swallowed and the original settle error propagate unchanged.
+  const boom = new Error('HTTP 409 reclaim');
   const inner = { complete: async () => { throw boom; }, fail: async () => 'ok' };
   const wrapped = withSettlementPendingMarker(inner, { jobKey: '1' }, () => { throw new Error('recorder blew up'); });
-  await assert.rejects(() => wrapped.complete({}), /settle failed/);
+  await assert.rejects(() => wrapped.complete({}), /HTTP 409/);
+});
+
+// #256 review: only a DEFINITIVE lease-loss rejection is a stuck settlement. A
+// transient/validation failure re-throws WITHOUT recording a false ghost.
+test('withSettlementPendingMarker does not mark a non-lease-loss settle failure', async () => {
+  const calls = [];
+  const inner = {
+    complete: async () => { throw new Error('HTTP 500 internal server error'); },
+    fail: async () => { const e = new Error('bad request'); e.status = 400; throw e; },
+  };
+  const job = { jobKey: '901', type: 'senior:feature', leaseToken: 'tok' };
+  const wrapped = withSettlementPendingMarker(inner, job, (j, phase) => calls.push([j.jobKey, phase]));
+  await assert.rejects(() => wrapped.complete({}), /HTTP 500/);
+  await assert.rejects(() => wrapped.fail({}), /bad request/);
+  assert.deepEqual(calls, []); // neither transient 5xx nor a 400 validation is a stuck settlement
+});
+
+// #256 review: the lease-loss classifier recognises the definitive ownership-loss
+// signals (409/404 in the message OR numerically on the cause chain, "not
+// activated", JobLeaseMismatch, reclaim) and rejects everything transient.
+test('isLeaseLostSettleError classifies definitive lease loss vs transient failures', () => {
+  assert.equal(isLeaseLostSettleError(new Error('HTTP 409 JobLeaseMismatch')), true);
+  assert.equal(isLeaseLostSettleError(new Error('Request failed with status code 404')), true);
+  assert.equal(isLeaseLostSettleError(new Error('job not activated')), true);
+  assert.equal(isLeaseLostSettleError(new Error('reclaim in progress')), true);
+  const wrapped = new Error('settle failed'); wrapped.cause = { status: 409 };
+  assert.equal(isLeaseLostSettleError(wrapped), true); // numeric status on the cause chain
+  assert.equal(isLeaseLostSettleError(new Error('HTTP 500 internal')), false);
+  assert.equal(isLeaseLostSettleError(new Error('ECONNRESET')), false);
+  const four29 = new Error('rate limited'); four29.statusCode = 429;
+  assert.equal(isLeaseLostSettleError(four29), false);
+  assert.equal(isLeaseLostSettleError(null), false);
+});
+
+// #256 review: the activation identity guard stays ABSOLUTELY bounded. A key with
+// a live (recent) settle in flight is retained past the soft cap, but a stuck
+// settle past the TTL no longer pins it, and a hard ceiling caps the map even if
+// every key were protected — so a never-resolving settle can't grow it unbounded.
+test('pruneActivationGuard bounds the guard map (soft cap retains live settles, hard ceiling + TTL cap the rest)', () => {
+  const now = 1_000_000;
+  const ttlMs = 30 * 60 * 1000;
+  // 1) Soft cap retains a key whose settle is currently in flight.
+  const guard = new Map();
+  const inflight = new Map();
+  for (let i = 0; i < 70; i += 1) guard.set(`k${i}`, { token: `t${i}`, at: now - i });
+  inflight.set('k69', { count: 1, since: now }); // freshest key, live settle
+  pruneActivationGuard(guard, inflight, { nowMs: now, ttlMs, maxGhosts: 64, hardMax: 256 });
+  assert.ok(guard.size <= 64, `soft cap enforced: ${guard.size}`);
+  assert.ok(guard.has('k69'), 'a key with a live in-flight settle is retained past the soft cap');
+
+  // 2) A settle in flight PAST the TTL is treated as never-resolving: GC'd from the
+  //    in-flight map and no longer protects its guard.
+  const guard2 = new Map();
+  const inflight2 = new Map();
+  for (let i = 0; i < 70; i += 1) guard2.set(`k${i}`, { token: `t${i}`, at: now - i });
+  inflight2.set('k69', { count: 1, since: now - (ttlMs + 60_000) }); // hung settle
+  pruneActivationGuard(guard2, inflight2, { nowMs: now, ttlMs, maxGhosts: 64, hardMax: 256 });
+  assert.ok(guard2.size <= 64, 'soft cap still enforced');
+  assert.equal(inflight2.has('k69'), false, 'a settle hung past the TTL is GC\'d from the in-flight map');
+
+  // 3) Hard ceiling: even if EVERY key has a live in-flight settle, the map can
+  //    never exceed hardMax — a never-resolving-settle flood is still bounded.
+  const guard3 = new Map();
+  const inflight3 = new Map();
+  for (let i = 0; i < 300; i += 1) {
+    guard3.set(`k${i}`, { token: `t${i}`, at: now - i });
+    inflight3.set(`k${i}`, { count: 1, since: now });
+  }
+  pruneActivationGuard(guard3, inflight3, { nowMs: now, ttlMs, maxGhosts: 64, hardMax: 256 });
+  assert.ok(guard3.size <= 256, `hard ceiling enforced even when all keys are protected: ${guard3.size}`);
 });
 
 // #254: settlement-pending ghosts are not drained/counted as in-flight work.
@@ -1219,6 +1293,53 @@ test('reageSupervisorStatus keeps the snapshot value when no absolute base is pr
   assert.equal(reaged.workers[0].activity.jobs[0].sinceMs, 42);
 });
 
+// #256 review: reageSupervisorStatus (the attached-console per-tick re-age, which
+// never rebuilds the snapshot) must apply the same ghost TTL, so a stale
+// settlement-pending ghost self-expires on the live view rather than lingering
+// with NANO_SUPERVISOR_MONITOR_MS=0 / between status frames.
+test('reageSupervisorStatus drops an expired settlement-pending ghost and flips the worker to idle', () => {
+  const now0 = 5_000_000;
+  const ttl = SETTLEMENT_PENDING_GHOST_TTL_MS;
+  const status = {
+    workers: [{
+      id: 'a', state: 'running', startedAtMs: now0 - 1000, uptimeMs: 1000,
+      // A pure ghost: worker reported idle-state with one settlement-pending entry.
+      activity: { state: 'idle', jobs: [{ key: 'g', type: 't', sinceMs: 0, sinceEpochMs: now0, settlementPending: true }] },
+    }],
+  };
+  // Before TTL: the ghost survives (re-aged) and the worker stays idle (a ghost is
+  // never busy).
+  const fresh = reageSupervisorStatus(status, now0 + 1000);
+  assert.equal(fresh.workers[0].activity.jobs.length, 1);
+  assert.equal(fresh.workers[0].activity.state, 'idle');
+  // Past TTL: the ghost is dropped entirely and the worker reads idle-with-no-jobs.
+  const reaged = reageSupervisorStatus(status, now0 + ttl + 60_000);
+  assert.deepEqual(reaged.workers[0].activity.jobs, []);
+  assert.equal(reaged.workers[0].activity.state, 'idle');
+  // Pure: input untouched.
+  assert.equal(status.workers[0].activity.jobs.length, 1);
+});
+
+// A live running job alongside a ghost keeps the worker busy; expiring the ghost
+// does not disturb the running job or its re-aged age.
+test('reageSupervisorStatus keeps a running job busy while expiring a co-resident ghost', () => {
+  const now0 = 6_000_000;
+  const ttl = SETTLEMENT_PENDING_GHOST_TTL_MS;
+  const status = {
+    workers: [{
+      id: 'a', state: 'running', startedAtMs: now0 - 1000, uptimeMs: 1000,
+      activity: { state: 'busy', jobs: [
+        { key: 'run', type: 't', sinceMs: 0, sinceEpochMs: now0 },
+        { key: 'ghost', type: 't', sinceMs: 0, sinceEpochMs: now0, settlementPending: true },
+      ] },
+    }],
+  };
+  const reaged = reageSupervisorStatus(status, now0 + ttl + 60_000);
+  assert.equal(reaged.workers[0].activity.jobs.length, 1);
+  assert.equal(reaged.workers[0].activity.jobs[0].key, 'run');
+  assert.equal(reaged.workers[0].activity.jobs[0].sinceMs, ttl + 60_000);
+  assert.equal(reaged.workers[0].activity.state, 'busy');
+});
 test('reageSupervisorStatus passes non-object / no-workers frames through untouched', () => {
   assert.equal(reageSupervisorStatus(null, 1), null);
   const noWorkers = { daemon: { pid: 1 } };

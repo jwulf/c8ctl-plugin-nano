@@ -8974,8 +8974,19 @@ async function workAgent(req, flags, ctx) {
   // they must not count as busy/in-flight (force-abort yield, drain, capacity) —
   // this is observation only; recovery is already owned by the lease-fence +
   // transcript-resume path. Bounded so a long-lived worker can't accumulate ghosts.
+  //
+  // A ghost is INVALIDATED locally when THIS worker re-activates the same key
+  // (recordJobStart). That invalidation is process-local, so in a multi-worker
+  // fleet a key re-activated on ANOTHER worker never clears this worker's ghost
+  // (that worker can't reach this in-memory map). To stop such a ghost lingering
+  // until this worker restarts, every ghost also carries an explicit TTL: it
+  // self-expires SETTLEMENT_PENDING_GHOST_TTL_MS after it was recorded (pruned in
+  // writeActivity), bounding the stale-observation window without needing shared
+  // cross-worker state. TTL is measured from when the settle FAILED (recordedAt),
+  // not the job's display `since`.
   const settlementPendingJobs = new Map();
   const MAX_SETTLEMENT_PENDING_GHOSTS = 64;
+  const SETTLEMENT_PENDING_GHOST_TTL_MS = 30 * 60 * 1000;
   // Which engine this worker polls jobs from, surfaced to `supervisor status` via
   // the activity marker (#99). Derived from resolveWorkerPollEngineBase — the SDK
   // client's OWN profile restAddress (the base createJobWorker actually activates
@@ -9007,7 +9018,15 @@ async function workAgent(req, flags, ctx) {
     // #254: append settlement-pending ghosts as flagged, observational entries. A
     // ghost whose key was re-activated (now live in `activeJobs`) is superseded —
     // skip it so a reactivation replaces the stuck row rather than duplicating it.
+    // A ghost past its TTL is pruned here (see SETTLEMENT_PENDING_GHOST_TTL_MS): a
+    // same-key reactivation on a DIFFERENT worker can never clear this worker's
+    // in-memory entry, so the TTL bounds how long a stale ghost lingers.
+    const nowMs = Date.now();
     for (const [key, v] of settlementPendingJobs.entries()) {
+      if (nowMs - (v.recordedAt ?? v.since ?? nowMs) > SETTLEMENT_PENDING_GHOST_TTL_MS) {
+        settlementPendingJobs.delete(key);
+        continue;
+      }
       if (activeJobs.has(key)) continue;
       jobs.push({ key, type: v.type, since: v.since, settlementPending: true, settlePhase: v.phase ?? null });
     }
@@ -9083,6 +9102,7 @@ async function workAgent(req, flags, ctx) {
       since: Number.isFinite(cur?.since) ? cur.since : Date.now(),
       phase: phase ?? null,
       leaseToken: job.leaseToken,
+      recordedAt: Date.now(),
     });
     while (settlementPendingJobs.size > MAX_SETTLEMENT_PENDING_GHOSTS) {
       const oldest = settlementPendingJobs.keys().next().value;

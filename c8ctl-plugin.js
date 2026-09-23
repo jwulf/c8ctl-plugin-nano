@@ -2841,7 +2841,7 @@ async function resolveAgentResultWithNudge({ result, resultFile, rerun, logger, 
     // `truncated` flag consistent with it — echo the incoming `result.truncated`
     // rather than hardcoding false, so callers that trust the return value don't
     // see an already-truncated stdout reported as untruncated.
-    return { stdout: stdout0, nudged: false, truncated: result?.truncated === true };
+    return { stdout: stdout0, nudged: false, truncated: result?.truncated === true, acpOutcome: result?.acpOutcome ?? null };
   }
   let nudge = null;
   let nudgeError = null;
@@ -2870,7 +2870,13 @@ async function resolveAgentResultWithNudge({ result, resultFile, rerun, logger, 
       ? `${logPrefix} no result on the first turn — recovered it via one re-emit nudge`
       : `${logPrefix} no result on the first turn — re-emit nudge did not recover one`);
   }
-  return { stdout, nudged: true, truncated };
+  // Propagate the rerun turn's OWN validated ACP outcome back to the caller (#263):
+  // the nudge is a continuation, so a fresh `_meta.outcome` it reports (e.g. a
+  // `blocked` that wrote no file/sentinel) is the latest state and must reach
+  // `workAgent` — otherwise the escalation and the recorded envelope outcome would
+  // silently reflect only the first turn's outcome. Fall back to the first result's
+  // outcome when the nudge reported none.
+  return { stdout, nudged: true, truncated, acpOutcome: nudge?.acpOutcome ?? result?.acpOutcome ?? null };
 }
 
 function coerceBool(v, dflt = false) {
@@ -10487,7 +10493,7 @@ async function workAgent(req, flags, ctx) {
           // the result is recoverable only via the stdout `::nano:result::`
           // sentinel, which `resolveAgentResultWithNudge` handles directly.
           if (result.ok) {
-            const { stdout, nudged, truncated } = await resolveAgentResultWithNudge({
+            const { stdout, nudged, truncated, acpOutcome } = await resolveAgentResultWithNudge({
               result,
               resultFile,
               logger,
@@ -10512,6 +10518,9 @@ async function workAgent(req, flags, ctx) {
             if (nudged) {
               result.nudgedForResult = true;
               if (truncated) result.truncated = true;
+              // Adopt the nudge turn's outcome so the escalation / envelope reflect
+              // the latest continuation, not only the first turn (#263).
+              result.acpOutcome = acpOutcome;
             }
           }
 

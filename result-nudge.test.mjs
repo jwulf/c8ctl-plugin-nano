@@ -87,6 +87,52 @@ test('does NOT nudge a run whose agent reported a blocked ACP outcome (it escala
   }
 });
 
+test('propagates the rerun turn OWN acpOutcome back to the caller (#263)', async () => {
+  const { dir, file } = tmpResultFile();
+  try {
+    // First turn wrote no result and no outcome; the nudge turn reports a `blocked`
+    // outcome via `_meta.outcome` but writes no file/sentinel. The nudge's outcome
+    // must be surfaced to the caller so workAgent escalates and records it.
+    const result = { ok: true, stdout: 'did work, dropped result, no outcome' };
+    const rerun = async () => ({ ok: true, stdout: 'still no file', acpOutcome: { status: 'blocked', summary: 'need GH_TOKEN on the rerun' } });
+    const { nudged, acpOutcome } = await resolveAgentResultWithNudge({ result, resultFile: file, rerun });
+    assert.equal(nudged, true);
+    assert.deepEqual(acpOutcome, { status: 'blocked', summary: 'need GH_TOKEN on the rerun' },
+      'the rerun turn\'s outcome reaches the caller instead of being discarded');
+  } finally {
+    rmSync(dir, { recursive: true, force: true });
+  }
+});
+
+test('falls back to the first-turn acpOutcome when the rerun reports none (#263)', async () => {
+  const { dir, file } = tmpResultFile();
+  try {
+    // The first turn already carried a `completed` outcome (which does not skip the
+    // nudge). The nudge turn reports no outcome, so the first turn's is preserved.
+    const result = { ok: true, stdout: 'opened PR', acpOutcome: { status: 'completed', summary: 'opened PR #7' } };
+    const rerun = async () => ({ ok: true, stdout: 'still no result' });
+    const { nudged, acpOutcome } = await resolveAgentResultWithNudge({ result, resultFile: file, rerun });
+    assert.equal(nudged, true);
+    assert.deepEqual(acpOutcome, { status: 'completed', summary: 'opened PR #7' },
+      'the first turn\'s outcome is kept when the rerun reports none');
+  } finally {
+    rmSync(dir, { recursive: true, force: true });
+  }
+});
+
+test('the no-nudge early return echoes the incoming acpOutcome (#263)', async () => {
+  const { dir, file } = tmpResultFile();
+  try {
+    const blocked = { ok: true, stdout: 'Blocked: need GH_TOKEN', acpOutcome: { status: 'blocked', summary: 'need GH_TOKEN' } };
+    const { nudged, acpOutcome } = await resolveAgentResultWithNudge({ result: blocked, resultFile: file, rerun: async () => ({ ok: true, stdout: '' }) });
+    assert.equal(nudged, false);
+    assert.deepEqual(acpOutcome, { status: 'blocked', summary: 'need GH_TOKEN' },
+      'the early return still surfaces the outcome the caller relies on');
+  } finally {
+    rmSync(dir, { recursive: true, force: true });
+  }
+});
+
 test('does NOT nudge when the first turn already produced a result', async () => {
   const { dir, file } = tmpResultFile();
   try {

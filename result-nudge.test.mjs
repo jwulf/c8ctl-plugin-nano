@@ -87,6 +87,28 @@ test('does NOT nudge a run whose agent reported a blocked ACP outcome (it escala
   }
 });
 
+test('an empty / reserved-keys-only result file does NOT shadow a blocked ACP outcome (no nudge)', async () => {
+  const { dir, file } = tmpResultFile();
+  try {
+    let reruns = 0;
+    const rerun = async () => { reruns++; return { ok: true, stdout: '' }; };
+    // The agent wrote a result FILE, but it carries no effective vars: an empty
+    // object, or only reserved / io.nanobpm.* keys. Raw `??` precedence would let
+    // this present-but-empty object win over the `blocked` ACP outcome and force a
+    // needless nudge; the outcome must short-circuit it instead.
+    for (const empty of ['{}', '{"io.nanobpm.agentResult":{"x":1}}', '{"status":null}']) {
+      writeFileSync(file, empty);
+      const blocked = { ok: true, stdout: 'Blocked: need GH_TOKEN', acpOutcome: { status: 'blocked', summary: 'need GH_TOKEN' } };
+      const { nudged, acpOutcome } = await resolveAgentResultWithNudge({ result: blocked, resultFile: file, rerun });
+      assert.equal(nudged, false, `empty result ${empty} must not shadow the blocked outcome`);
+      assert.deepEqual(acpOutcome, { status: 'blocked', summary: 'need GH_TOKEN' });
+    }
+    assert.equal(reruns, 0, 'the blocked outcome escalates — never nudged');
+  } finally {
+    rmSync(dir, { recursive: true, force: true });
+  }
+});
+
 test('propagates the rerun turn OWN acpOutcome back to the caller (#263)', async () => {
   const { dir, file } = tmpResultFile();
   try {

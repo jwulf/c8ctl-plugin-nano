@@ -36,6 +36,7 @@ import {
   parseAgentResultObject,
   readAgentResultFile,
   parseResultFromStdout,
+  pickAgentResult,
   sanitizeResultVars,
   resultVarsFromAcpOutcome,
   resolveAgentResultWithNudge,
@@ -745,8 +746,14 @@ async function assembleWorkerCompletion({ result, resultFile, rerun }) {
     if (truncated) result.truncated = true;
     result.acpOutcome = acpOutcome;
   }
-  // Mirror the runner's result read: file -> stdout sentinel -> ACP outcome vars.
-  const rawResult = readAgentResultFile(resultFile) ?? parseResultFromStdout(result.stdout) ?? resultVarsFromAcpOutcome(result.acpOutcome);
+  // Mirror the runner's result read: file -> stdout sentinel -> ACP outcome vars,
+  // preferring the first candidate with EFFECTIVE vars so an empty result file
+  // does not shadow a usable blocked outcome (#263).
+  const rawResult = pickAgentResult(
+    () => readAgentResultFile(resultFile),
+    () => parseResultFromStdout(result.stdout),
+    () => resultVarsFromAcpOutcome(result.acpOutcome),
+  );
   const resultVars = sanitizeResultVars(rawResult);
   const resultEnvelope = buildResultEnvelope(result, { sandbox: 'none' });
   // Mirror settleJob.complete's variable payload.
@@ -777,6 +784,34 @@ test('worker completion: a blocked ACP outcome with no result file/sentinel esca
     assert.equal(completeVars.question, 'need a deploy token');
 
     // ...and io.nanobpm.agentResult.outcome is still present on the envelope.
+    assert.deepEqual(completeVars[AGENT_RESULT_KEY].outcome, outcome);
+  } finally {
+    rmSync(dir, { recursive: true, force: true });
+  }
+});
+
+test('worker completion: an empty result file does NOT shadow a blocked ACP outcome (#263)', async () => {
+  const dir = mkdtempSync(join(tmpdir(), 'nudge-worker-'));
+  try {
+    const resultFile = join(dir, 'result.json');
+    // The agent wrote a result file, but it carries no effective vars (empty
+    // object). Raw `??` precedence would let this present-but-empty object win
+    // over the blocked outcome, forcing a needless nudge and dropping the
+    // escalation vars from the completion. pickAgentResult must prefer the
+    // blocked outcome instead.
+    writeFileSync(resultFile, '{}');
+    const outcome = { status: 'blocked', summary: 'need a deploy token' };
+    let rerunCalls = 0;
+    const rerun = async () => { rerunCalls += 1; return { ok: true, stdout: '' }; };
+    const result = { ok: true, stdout: 'work log, empty result file', acpOutcome: outcome };
+
+    const { completeVars, nudged } = await assembleWorkerCompletion({ result, resultFile, rerun });
+
+    assert.equal(nudged, false, 'the blocked outcome short-circuits the nudge despite the empty file');
+    assert.equal(rerunCalls, 0, 'the rerun harness must not be invoked');
+    assert.equal(completeVars.status, 'blocked');
+    assert.equal(completeVars.summary, 'need a deploy token');
+    assert.equal(completeVars.question, 'need a deploy token');
     assert.deepEqual(completeVars[AGENT_RESULT_KEY].outcome, outcome);
   } finally {
     rmSync(dir, { recursive: true, force: true });

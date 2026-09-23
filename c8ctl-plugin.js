@@ -2739,6 +2739,30 @@ function sanitizeResultVars(obj) {
   return out;
 }
 
+// Choose the agent's structured result from its candidate sources (result file,
+// stdout sentinel, ACP outcome) in priority order. Prefer the first candidate
+// that carries at least one EFFECTIVE var (i.e. survives sanitizeResultVars —
+// the reserved / io.nanobpm.* / proto keys stripped) so an empty `{}` or a
+// reserved-keys-only result file/sentinel does NOT shadow a usable `blocked`
+// ACP outcome via raw `??` nullish precedence: `??` only falls through on
+// null/undefined, so a present-but-empty object would otherwise win and force
+// the dropped-result nudge even though the ACP outcome already escalates. Falls
+// back to the FIRST present-but-empty candidate when none carries effective vars
+// so the raw object is still surfaced to the audit envelope and the
+// dropped-result nudge still fires. Candidates are thunks so a later source is
+// only computed when an earlier one is absent/empty (preserving the previous
+// short-circuit evaluation and never double-reading the result file needlessly).
+function pickAgentResult(...thunks) {
+  let firstPresent;
+  for (const thunk of thunks) {
+    const candidate = thunk();
+    if (candidate == null) continue;
+    if (firstPresent === undefined) firstPresent = candidate;
+    if (Object.keys(sanitizeResultVars(candidate)).length > 0) return candidate;
+  }
+  return firstPresent ?? null;
+}
+
 const SANDBOXES = ['none', 'docker', 'podman'];
 // Only container-based sandboxes need an image / disk hygiene / a runtime bin.
 const CONTAINER_SANDBOXES = new Set(['docker', 'podman']);
@@ -2829,7 +2853,11 @@ async function resolveAgentResultWithNudge({ result, resultFile, rerun, logger, 
   // nudge exists to recover — so gate on effective vars, not raw object presence.
   const hasUsableResult = (parsed) => Object.keys(sanitizeResultVars(parsed)).length > 0;
   // A `blocked` ACP outcome is a usable result (it escalates), so it needs no nudge.
-  const already = readAgentResultFile(resultFile) ?? parseResultFromStdout(stdout0) ?? resultVarsFromAcpOutcome(result?.acpOutcome);
+  const already = pickAgentResult(
+    () => readAgentResultFile(resultFile),
+    () => parseResultFromStdout(stdout0),
+    () => resultVarsFromAcpOutcome(result?.acpOutcome),
+  );
   // Only nudge a clean run that produced NO usable result but DID produce output
   // (silence means a crash/hang the idle path already handles, not a dropped result).
   // A null `resultFile` (temp-dir creation failed) is NOT a reason to skip: the
@@ -10662,7 +10690,11 @@ async function workAgent(req, flags, ctx) {
         // outputs. Read before deleting the temp dir.
         // Last resort: vars implied by the agent's ACP `_meta.outcome` (a `blocked`
         // report → an escalation) when it wrote no result of its own.
-        const rawResult = readAgentResultFile(resultFile) ?? parseResultFromStdout(result.stdout) ?? resultVarsFromAcpOutcome(result.acpOutcome);
+        const rawResult = pickAgentResult(
+          () => readAgentResultFile(resultFile),
+          () => parseResultFromStdout(result.stdout),
+          () => resultVarsFromAcpOutcome(result.acpOutcome),
+        );
         if (resultDir) { try { rmSync(resultDir, { recursive: true, force: true }); } catch { /* best effort */ } liveRunDirs.delete(resultDir); }
         const resultVars = sanitizeResultVars(rawResult);
 
@@ -16759,6 +16791,7 @@ export {
   readAgentResultFile,
   parseResultFromStdout,
   sanitizeResultVars,
+  pickAgentResult,
   buildResultNudgePrompt,
   resolveAgentResultWithNudge,
   parseEnvPairs,

@@ -164,6 +164,45 @@ test('readPriorTranscript: a config-only EMBEDDED history still triggers the by-
   assert.deepEqual(calls, ['search', 'history'], 'the by-key fetch runs despite the truthy-length config-only embed');
 });
 
+test('readPriorTranscript: a plan-only EMBEDDED history still triggers the by-key fetch (issue #241 round 6)', async () => {
+  // A plan turn renders as the latest plan, NOT as transcript, and an embedded response
+  // can be PARTIAL — carrying only CONFIGURATION + a plan while the real work turns live
+  // in the authoritative by-key history. The completeness gate ignores plan turns, so a
+  // plan-only embed does not short-circuit the fetch (else we'd resume with no work
+  // transcript and could repeat earlier side effects).
+  const plan = { role: 'ASSISTANT', content: buildPlanContent({ sessionUpdate: 'plan', entries: ENTRIES }) };
+  const calls = [];
+  const camunda = {
+    searchAgentInstances: async () => {
+      calls.push('search');
+      return { items: [{ elementInstanceKey: '8', agentInstanceKey: 'ai-8', history: [configTurn(), plan] }] };
+    },
+    getAgentInstanceHistory: async ({ agentInstanceKey }) => {
+      calls.push('history');
+      assert.equal(agentInstanceKey, 'ai-8');
+      return { history: [configTurn(), plan, textTurn('ASSISTANT', 'real work behind the plan turn')] };
+    },
+  };
+  const got = await readPriorTranscript({ camunda, job: { elementInstanceKey: '8' } });
+  assert.ok(got, 'plan-only embedded must not mask a resumable by-key history');
+  assert.ok(got.text.includes('real work behind the plan turn'));
+  assert.deepEqual(calls, ['search', 'history'], 'the by-key fetch runs despite the plan-only embed');
+});
+
+test('readPriorTranscript: a plan-only embed with no by-key surface keeps its plan (still resumable)', async () => {
+  // When the by-key fetch yields nothing (no history method / empty), the embedded
+  // plan-only history is retained rather than clobbered to empty, so a genuinely
+  // plan-only run stays resumable via its plan.
+  const plan = { role: 'ASSISTANT', content: buildPlanContent({ sessionUpdate: 'plan', entries: ENTRIES, _meta: { plan: RICH_PLAN } }) };
+  const camunda = {
+    searchAgentInstances: async () => ({ items: [{ elementInstanceKey: '8', agentInstanceKey: 'ai-8', history: [configTurn(), plan] }] }),
+    // No history-by-key method exposed → the fetch loop finds nothing to call.
+  };
+  const got = await readPriorTranscript({ camunda, job: { elementInstanceKey: '8' } });
+  assert.ok(got && got.plan, 'the embedded plan survives when the by-key fetch has no surface');
+  assert.deepEqual(got.plan.plan, RICH_PLAN);
+});
+
 test('readPriorTranscript: an SDK with no read surface → null (legacy cold rerun)', async () => {
   const got = await readPriorTranscript({ camunda: {}, job: { elementInstanceKey: '5' } });
   assert.equal(got, null);
@@ -767,6 +806,10 @@ test('renderPlan: full plan with ids, deps and notes; notes shed to fit the budg
   const tight = renderPlan(recorded, { capChars: 150 });
   assert.ok(tight.includes('(1 note omitted)') && tight.includes('pushed PR #42'), tight);
   assert.ok(renderPlan(recorded, { capChars: 20 }).length <= 20);
+  // A budget SMALLER than the 12-char truncation marker still stays within capChars
+  // (the marker itself is clamped) instead of returning the full marker.
+  assert.ok(renderPlan(recorded, { capChars: 5 }).length <= 5, 'tiny cap clamps the marker');
+  assert.equal(renderPlan(recorded, { capChars: 0 }), '');
   // Entries only (an agent without a rich plan).
   assert.equal(renderPlan({ entries: ENTRIES }), '[x] Read the parser\n[>] Add the flag');
   assert.equal(renderPlan(null), '');

@@ -227,8 +227,14 @@ export function renderPlan(recorded, { capChars = RESUME_PLAN_CAP_CHARS } = {}) 
     const text = render(openNotes, closedNotes);
     if (text.length <= capChars) return text;
   }
+  // Truncate to `capChars` INCLUDING the marker. Clamp the marker itself for a budget
+  // smaller than it (e.g. capChars < 12), so the promise to stay within `capChars`
+  // holds even for tiny caps instead of returning the full 12-char marker.
+  const marker = '…[truncated]';
   const text = render(false, false);
-  return `${text.slice(0, Math.max(0, capChars - 14))}…[truncated]`;
+  if (capChars <= 0) return '';
+  if (capChars <= marker.length) return marker.slice(0, capChars);
+  return `${text.slice(0, capChars - marker.length)}${marker}`;
 }
 
 // Extract the readable text from one AgentHistory content block, BOUNDED to
@@ -280,6 +286,22 @@ function isWorkTurn(turn) {
 export function hasResumableTranscript(turns) {
   if (!Array.isArray(turns)) return false;
   return turns.some(isWorkTurn);
+}
+
+/**
+ * Does this history carry a NON-PLAN work turn? Used ONLY as the embedded-history
+ * completeness gate in `defaultRead`: a plan turn renders as the latest plan (see
+ * buildResumePrompt), NOT as transcript, and an embedded history can be a PARTIAL
+ * response carrying only CONFIGURATION plus a plan while the real work turns live in
+ * the authoritative by-key history. Treating such a plan-only embedded response as
+ * "complete" would skip the by-key fetch and resume with no work transcript, letting
+ * the agent repeat earlier side effects. So the completeness gate ignores plan turns;
+ * `hasResumableTranscript` (which DOES count a plan) still governs whether the
+ * finally-read history is resumable, keeping a genuinely plan-only run resumable.
+ */
+function hasEmbeddedWorkTurns(turns) {
+  if (!Array.isArray(turns)) return false;
+  return turns.some((t) => isWorkTurn(t) && !planBlobOf(t));
 }
 
 /**
@@ -635,13 +657,19 @@ async function defaultRead({ camunda, elementInstanceKey, signal }) {
 
   // 3. Prefer an embedded history (SCOPED to this element — see
   //    scopeEmbeddedHistoryToElement); else fetch it element-scoped by agentInstanceKey.
-  //    Gate the by-key fetch on `!hasResumableTranscript` — NOT merely `!turns.length`:
-  //    the producer always writes the opening CONFIGURATION turn before any real work,
-  //    so a partial embedded response can carry ONLY that config turn (length ≥ 1 yet no
-  //    work). Falling through on bare length would then skip the authoritative by-key
-  //    fetch and make an instance with real prior work look non-resumable → cold rerun.
+  //    Gate the by-key fetch on `!hasEmbeddedWorkTurns` — NOT merely `!turns.length`,
+  //    and NOT `!hasResumableTranscript`: the producer always writes the opening
+  //    CONFIGURATION turn before any real work, so a partial embedded response can carry
+  //    ONLY that config turn (length ≥ 1 yet no work). It can ALSO carry a plan turn
+  //    (config + plan) while the real work turns were not embedded — and a plan turn
+  //    renders as the latest plan, not as transcript, so a plan-only embedded response
+  //    that short-circuited the fetch would resume with NO work transcript and could
+  //    repeat earlier side effects. So the gate ignores plan turns: only a NON-PLAN work
+  //    turn in the embedded history is proof enough to skip the authoritative by-key
+  //    fetch. (A genuinely plan-only run stays resumable — hasResumableTranscript, which
+  //    counts a plan, governs that downstream in readPriorTranscript.)
   let turns = scopeEmbeddedHistoryToElement(match, eik);
-  if (!hasResumableTranscript(turns) && !signal?.aborted) {
+  if (!hasEmbeddedWorkTurns(turns) && !signal?.aborted) {
     const aik = match.agentInstanceKey ?? match.key;
     if (isNonBlank(aik)) {
       for (const m of HISTORY_METHODS) {
@@ -669,8 +697,11 @@ async function defaultRead({ camunda, elementInstanceKey, signal }) {
         // whole read incomplete so the caller cold-runs instead of seeding partial history.
         // (A method that is simply absent is skipped by the typeof guard above; one that
         // returns EMPTY — no history via that name — still advances to the next alias.)
-        turns = await readHistoryAllPages(camunda[m].bind(camunda), baseReq, signal);
-        if (turns.length) break;
+        const fetched = await readHistoryAllPages(camunda[m].bind(camunda), baseReq, signal);
+        // Only ADOPT a non-empty authoritative read. If the by-key fetch yields nothing
+        // (method absent/empty), retain the embedded turns so a plan-only embedded
+        // history keeps its plan (still resumable) instead of being clobbered to empty.
+        if (fetched.length) { turns = fetched; break; }
       }
     }
   }

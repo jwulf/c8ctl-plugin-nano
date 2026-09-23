@@ -350,6 +350,14 @@ export const PLAN_KIND = 'nanobpm.plan/v1';
 // is kept only while its JSON fits this cap; past it, the ACP entries alone are kept.
 export const PLAN_OBJECT_CAP_CHARS = 32_000;
 
+// Upper bound on the number of distinct plan content-hashes the per-activation plan
+// dedup remembers (recorded + in-flight). A single activation should never emit this
+// many DISTINCT plans, so the FIFO eviction is a pure safety valve against unbounded
+// growth from a pathological plan stream; evicting the oldest hash only risks a very
+// old plan being re-enqueued, which the engine still dedups by its stable
+// content-addressed historyItemId.
+export const PLAN_DEDUP_CAP = 256;
+
 const PLAN_STATUS_MARK = { completed: '[x]', in_progress: '[>]', pending: '[ ]' };
 
 /** Is `NANO_AGENT_PLAN=off` set (don't record ACP plans or seed them on resume)? */
@@ -830,24 +838,35 @@ export function createAgentInstanceProducer(opts = {}) {
     appendTurn(turn, 'TOOL_CALLING');
   };
 
-  // One turn per DISTINCT plan: agents often resend an unchanged plan, so a repeat of
-  // the last recorded plan is skipped. The id is content-addressed like other turns.
-  // `lastPlanId` is the last plan whose append actually SUCCEEDED; `inFlightPlanId` is a
-  // plan currently being appended, so a resend that races the in-flight append does not
-  // enqueue a duplicate. Advancing the dedup marker only on a settled-successful append
-  // (not on enqueue) keeps a rejected/timed-out plan append — whose failure the queue
-  // swallows — eligible for a later resend instead of being lost (review round 3).
-  let lastPlanId = null;
-  let inFlightPlanId = null;
+  // One turn per DISTINCT plan: agents often resend an unchanged plan, and may re-emit
+  // an EARLIER plan (A → B → A) or resend a plan while another append is still settling,
+  // so a single last/current scalar marker is not enough — it only remembers the most
+  // recent hash and would let a re-emitted A enqueue a second append. Track the FULL set
+  // of recorded and in-flight content hashes instead (review round 4). `recordedPlanIds`
+  // holds every plan whose append actually SUCCEEDED; `inFlightPlanIds` holds every plan
+  // currently being appended, so a resend that races an in-flight append does not enqueue
+  // a duplicate. Advancing the recorded set only on a settled-successful append (not on
+  // enqueue) keeps a rejected/timed-out plan append — whose failure the queue swallows —
+  // eligible for a later resend instead of being lost (review round 3). Both sets are
+  // FIFO-bounded by PLAN_DEDUP_CAP so a pathological plan stream cannot grow them without
+  // limit; the engine still dedups an evicted-then-re-enqueued plan by its stable
+  // content-addressed historyItemId. The id is content-addressed like other turns.
+  const recordedPlanIds = new Set();
+  const inFlightPlanIds = new Set();
+  const rememberPlanId = (set, id) => {
+    set.add(id);
+    // Set preserves insertion order, so the first value is the oldest — evict it.
+    while (set.size > PLAN_DEDUP_CAP) set.delete(set.values().next().value);
+  };
   const onPlan = (rawUpdate) => {
     const content = buildPlanContent(rawUpdate);
     if (!content) return;
     const id = shortHash(JSON.stringify(content[1].object));
     // Already recorded, or an identical plan is still settling — skip either way so we
     // neither double-record nor enqueue a duplicate in-flight append.
-    if (id === lastPlanId || id === inFlightPlanId) return;
+    if (recordedPlanIds.has(id) || inFlightPlanIds.has(id)) return;
     flushMessage();
-    inFlightPlanId = id;
+    rememberPlanId(inFlightPlanIds, id);
     const enqueued = appendTurn(
       {
         historyItemId: nsHistoryId(`plan:${id}`),
@@ -858,18 +877,18 @@ export function createAgentInstanceProducer(opts = {}) {
       },
       undefined,
       (ok) => {
-        // Advance the dedup marker only when the append genuinely persisted the turn; a
-        // failed append leaves `lastPlanId` untouched so a later resend of the SAME plan
-        // is recorded rather than silently discarded.
-        if (ok) lastPlanId = id;
-        // Clear the in-flight guard only if it still points at THIS plan (a newer plan
-        // may have superseded it), so a subsequent resend is no longer blocked.
-        if (inFlightPlanId === id) inFlightPlanId = null;
+        // Advance the dedup set only when the append genuinely persisted the turn; a
+        // failed append leaves the recorded set untouched so a later resend of the SAME
+        // plan is recorded rather than silently discarded.
+        if (ok) rememberPlanId(recordedPlanIds, id);
+        // Clear this plan's in-flight guard now that its append settled so a subsequent
+        // resend is no longer blocked.
+        inFlightPlanIds.delete(id);
       },
     );
     // The turn never entered the queue (disabled / no instance key / backlog drop): clear
     // the in-flight guard now — `onSettled` will not fire — so a later resend can retry.
-    if (!enqueued && inFlightPlanId === id) inFlightPlanId = null;
+    if (!enqueued) inFlightPlanIds.delete(id);
   };
   const isPlanUpdate = (rawUpdate) => recordPlans && isPlainObject(rawUpdate) && rawUpdate.sessionUpdate === 'plan';
 

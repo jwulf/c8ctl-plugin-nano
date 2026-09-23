@@ -2515,3 +2515,30 @@ test('a plan resent while its first append is still in-flight does not enqueue a
     .filter((h) => h.historyItemId.includes(':plan:'));
   assert.equal(planTurns.length, 1, 'exactly one plan turn recorded after the in-flight append settled');
 });
+
+test('re-emitting an EARLIER plan (A → B → A) does not enqueue a duplicate append — review round 4', async () => {
+  // The dedup must remember EVERY recorded plan hash, not just the most recent one.
+  // A scalar last-hash marker would let a re-emitted earlier plan (A after B) pass the
+  // check and enqueue a second append for A, violating the one-turn-per-distinct-plan
+  // contract. Track the full set of recorded hashes so A stays deduped after B.
+  const client = fakeClient();
+  const p = makeProducer(client);
+  await p.activate();
+
+  const planA = PLAN_UPDATE;
+  const planB = { ...PLAN_UPDATE, entries: PLAN_UPDATE.entries.map((e) => ({ ...e, status: 'completed' })), _meta: undefined };
+
+  p.ingest(planA); // A → recorded
+  await p.drain();
+  p.ingest(planB); // B → recorded
+  await p.drain();
+  p.ingest(planA); // A again → must be deduped (already recorded), NOT re-enqueued
+  await p.drain();
+
+  const planTurns = client.calls.update
+    .filter((u) => Array.isArray(u.history))
+    .map((u) => u.history[0])
+    .filter((h) => h.historyItemId.includes(':plan:'));
+  assert.equal(planTurns.length, 2, 'A and B each recorded once; the re-emitted A is deduped');
+  assert.notEqual(planTurns[0].historyItemId, planTurns[1].historyItemId);
+});

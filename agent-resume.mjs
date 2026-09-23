@@ -166,9 +166,18 @@ const PLAN_KIND = 'nanobpm.plan/v1';
 // Budget for the plan section of a resume prompt.
 export const RESUME_PLAN_CAP_CHARS = 8_000;
 
-// The recorded plan blob of a history turn, or null.
+// The recorded plan blob of a history turn, or null. A plan turn is ALWAYS an ASSISTANT
+// turn with no tool calls (see agent-instance.mjs `onPlan`). A structured TOOL_RESULT can
+// legitimately carry an OBJECT block with this SAME `kind` — `contentForResult` preserves
+// arbitrary result objects — so keying on the marker alone would misread that tool result
+// as a plan, dropping it from the rendered transcript (`renderTurn`) and skipping it in
+// the embedded-history completeness check (`hasEmbeddedWorkTurns`). Enforce the producer's
+// invariants so only a genuine plan turn matches.
 function planBlobOf(turn) {
   if (!isPlainObject(turn) || !Array.isArray(turn.content)) return null;
+  const role = isNonBlank(turn.role) ? String(turn.role).toUpperCase() : 'ASSISTANT';
+  if (role !== 'ASSISTANT') return null;
+  if (Array.isArray(turn.toolCalls) && turn.toolCalls.length > 0) return null;
   const block = turn.content.find((b) => isPlainObject(b) && b.contentType === 'OBJECT' && isPlainObject(b.object) && b.object.kind === PLAN_KIND);
   return block ? block.object : null;
 }

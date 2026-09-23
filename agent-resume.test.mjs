@@ -859,6 +859,29 @@ test('renderHistoryTurns: plan turns are not repeated in the transcript', () => 
   assert.ok(!text.includes('Read the parser'), text);
 });
 
+test('planBlobOf: a TOOL_RESULT carrying an object with the plan kind is NOT read as a plan', () => {
+  // contentForResult preserves arbitrary result objects, so a structured tool result can
+  // legitimately carry an OBJECT block whose `kind` collides with PLAN_KIND. It must NOT
+  // be misread as a plan turn (which would drop it from the transcript and skip it in the
+  // embedded-history completeness check). Plan turns are ASSISTANT turns with no tool calls.
+  const planObject = buildPlanContent({ sessionUpdate: 'plan', entries: ENTRIES })[1].object;
+  const disguisedToolResult = {
+    role: 'TOOL_RESULT',
+    content: [{ contentType: 'OBJECT', object: planObject }],
+    toolCalls: [{ toolCallId: 'c1', toolName: 'inspect' }],
+  };
+  // Not treated as the latest plan …
+  assert.equal(latestPlan([disguisedToolResult]), null);
+  // … and it still counts as embedded work (rendered as a tool result, not dropped).
+  const text = renderHistoryTurns([disguisedToolResult]);
+  assert.ok(text.includes('inspect'), text);
+  // A genuine ASSISTANT plan turn (no tool calls) is still recognized.
+  assert.ok(latestPlan([planTurn({ entries: ENTRIES })]));
+  // An ASSISTANT turn that also carries tool calls is not a plan turn either.
+  const planWithToolCalls = { role: 'ASSISTANT', content: [{ contentType: 'OBJECT', object: planObject }], toolCalls: [{ toolCallId: 'c1', toolName: 'x' }] };
+  assert.equal(latestPlan([planWithToolCalls]), null);
+});
+
 test('buildResumePrompt: byte-identical without a plan; a plan section when one was recorded', () => {
   const base = { basePrompt: 'go', transcriptText: 'T' };
   assert.equal(buildResumePrompt({ ...base, planText: '' }), buildResumePrompt(base));

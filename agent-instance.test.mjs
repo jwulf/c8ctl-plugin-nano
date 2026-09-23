@@ -2453,9 +2453,42 @@ test('a plan update appends one ASSISTANT turn per distinct plan', async () => {
   assert.equal(turns.length, 2);
   assert.equal(turns[0].role, 'ASSISTANT');
   assert.equal(turns[0].toolCalls, undefined);
-  assert.ok(turns[0].historyItemId.startsWith(`${NS}:plan:`), turns[0].historyItemId);
+  // #247: a plan turn is EXEMPT from the per-activation namespace — its id is the stable
+  // content-addressed `plan:${hash}` (like the CONFIGURATION turn), so an identical plan
+  // re-emitted by a resumed activation dedups instead of duplicating.
+  assert.ok(turns[0].historyItemId.startsWith('plan:'), turns[0].historyItemId);
+  assert.ok(!turns[0].historyItemId.startsWith(`${NS}:`), turns[0].historyItemId);
   assert.notEqual(turns[0].historyItemId, turns[1].historyItemId);
   assert.equal(turns[1].content[0].text, 'Plan (2/2 done):\n[x] Read the parser\n[x] Add the flag');
+});
+
+test('a plan turn keeps a STABLE historyItemId across activations so a re-emitted plan dedups (#247, review round 9)', async () => {
+  // Unlike message/tool-call turns, a plan turn is content-addressed and represents
+  // idempotent LATEST state. A resumed activation (new lease) whose in-memory dedup sets
+  // start empty will re-emit the same latest plan; if the id were per-activation
+  // namespaced the engine would see a NEW id and append a DUPLICATE plan turn. Keying on
+  // the stable `plan:${hash}` lets the engine's history-item dedup collapse the resend.
+  const c1 = fakeClient();
+  const p1 = makeProducer(c1, { job: { ...EXTERNAL_JOB, leaseToken: 'LEASE-A' } });
+  await p1.activate();
+  p1.ingest(PLAN_UPDATE);
+  await p1.complete(true);
+
+  const c2 = fakeClient();
+  const p2 = makeProducer(c2, { job: { ...EXTERNAL_JOB, leaseToken: 'LEASE-B' } });
+  await p2.activate();
+  p2.ingest(PLAN_UPDATE);
+  await p2.complete(true);
+
+  const planId = (client) =>
+    client.calls.update
+      .filter((u) => Array.isArray(u.history))
+      .map((u) => u.history[0].historyItemId)
+      .find((h) => h.startsWith('plan:'));
+  // Sanity: the resumed activation DID namespace an ordinary message turn differently…
+  assert.ok(planId(c1) && planId(c2), 'both activations recorded the plan turn');
+  // …but the plan id is identical across the two distinct leases, so the engine dedups it.
+  assert.equal(planId(c1), planId(c2));
 });
 
 test('recordPlans:false (NANO_AGENT_PLAN=off) keeps plan updates out of the history', async () => {
@@ -2504,7 +2537,7 @@ test('a plan dropped for a full append backlog does not poison the dedup marker 
   const planTurns = client.calls.update
     .filter((u) => Array.isArray(u.history))
     .map((u) => u.history[0])
-    .filter((h) => h.historyItemId.includes(':plan:'));
+    .filter((h) => h.historyItemId.includes('plan:'));
   assert.equal(planTurns.length, 1, 'the resent plan is recorded after the backlog drains');
 });
 
@@ -2539,7 +2572,7 @@ test('a plan append that REJECTS does not advance the dedup marker (records on r
   const planTurns = client.calls.update
     .filter((u) => Array.isArray(u.history))
     .map((u) => u.history[0])
-    .filter((h) => h.historyItemId.includes(':plan:'));
+    .filter((h) => h.historyItemId.includes('plan:'));
   assert.equal(planTurns.length, 2, 'the resent plan is recorded after the first append failed');
 });
 
@@ -2569,7 +2602,7 @@ test('a plan resent while its first append is still in-flight does not enqueue a
   await new Promise((r) => setImmediate(r));
   const midFlight = client.calls.update
     .filter((u) => Array.isArray(u.history))
-    .filter((h) => h.history[0].historyItemId.includes(':plan:')).length;
+    .filter((h) => h.history[0].historyItemId.includes('plan:')).length;
   assert.equal(midFlight, 1, 'the resend did not enqueue a duplicate while the first was in-flight');
 
   release();
@@ -2577,7 +2610,7 @@ test('a plan resent while its first append is still in-flight does not enqueue a
   const planTurns = client.calls.update
     .filter((u) => Array.isArray(u.history))
     .map((u) => u.history[0])
-    .filter((h) => h.historyItemId.includes(':plan:'));
+    .filter((h) => h.historyItemId.includes('plan:'));
   assert.equal(planTurns.length, 1, 'exactly one plan turn recorded after the in-flight append settled');
 });
 
@@ -2603,7 +2636,7 @@ test('re-emitting an EARLIER plan (A → B → A) does not enqueue a duplicate a
   const planTurns = client.calls.update
     .filter((u) => Array.isArray(u.history))
     .map((u) => u.history[0])
-    .filter((h) => h.historyItemId.includes(':plan:'));
+    .filter((h) => h.historyItemId.includes('plan:'));
   assert.equal(planTurns.length, 2, 'A and B each recorded once; the re-emitted A is deduped');
   assert.notEqual(planTurns[0].historyItemId, planTurns[1].historyItemId);
 });

@@ -907,7 +907,19 @@ export function createAgentInstanceProducer(opts = {}) {
     rememberPlanId(inFlightPlanIds, id);
     const enqueued = appendTurn(
       {
-        historyItemId: nsHistoryId(`plan:${id}`),
+        // #247: plan turns are EXEMPT from the per-activation namespace. Unlike a
+        // continuation message / tool-call turn (whose ACP numbering restarts on resume,
+        // so it MUST be namespaced to avoid colliding with the prior activation's ids), a
+        // plan turn is content-addressed by the plan-object hash and represents idempotent
+        // LATEST state, not sequential work. Namespacing it would give the SAME latest plan
+        // a different historyItemId on each reactivation; since the in-memory dedup sets
+        // (recordedPlanIds/inFlightPlanIds) start EMPTY on a fresh activation, nothing would
+        // suppress the resend and the engine — seeing a new id — would append a DUPLICATE
+        // plan turn, breaking the documented one-turn-per-distinct-plan behavior. Keying on
+        // the stable `plan:${id}` (like the CONFIGURATION turn, also left un-namespaced) lets
+        // the engine's history-item dedup collapse an identical re-emitted plan across
+        // activations, while a genuinely new plan (new content → new id) still appends.
+        historyItemId: `plan:${id}`,
         loopIteration,
         role: 'ASSISTANT',
         content,

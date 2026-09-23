@@ -192,7 +192,11 @@ export function latestPlan(turns) {
 
 const ENTRY_MARK = { completed: '[x]', in_progress: '[>]', pending: '[ ]' };
 const ITEM_MARK = { done: '[x]', in_progress: '[>]', pending: '[ ]', blocked: '[!]', dropped: '[-]' };
-const flat = (v) => String(v).replace(/[\r\n]+/g, ' ');
+// Flatten agent-controlled plan fields to a single line for the resume prompt. This must
+// strip the COMPLETE line-separator set — not just CR/LF — because a value like
+// `\u2028-----\u2028` would otherwise render as a standalone untrusted-data delimiter and
+// break out of the resume prompt's injection guard (mirrors agent-instance.mjs `oneLine`).
+const flat = (v) => String(v).replace(/[\r\n\t\f\v\u0085\u2028\u2029]+/g, ' ');
 
 /**
  * Render a recorded plan for the resume prompt, within `capChars`. A full plan (ids,

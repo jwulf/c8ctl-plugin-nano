@@ -391,11 +391,39 @@ export function buildPlanContent(update) {
     if (size > PLAN_OBJECT_CAP_CHARS) plan = undefined;
   }
   if (entries.length === 0 && plan === undefined) return null;
-  const done = entries.filter((e) => e.status === 'completed').length;
+  // Bound the WHOLE retained/replayed plan content to PLAN_OBJECT_CAP_CHARS, not just
+  // `_meta.plan`: the ACP `entries` (their agent-controlled `content` strings) are
+  // otherwise unbounded, so an oversized plan could pin arbitrarily large data in the
+  // pre-mint slot AND enqueue a RESERVED replay turn past the byte budget the reserved
+  // append deliberately bypasses (review round 8). Shed the optional full `_meta.plan`
+  // first (the least essential), then drop trailing entries, then truncate the last
+  // remaining entry's content — so the bound holds even for a single huge entry.
+  let entryList = entries;
+  const objectSize = () => {
+    try {
+      return JSON.stringify({
+        kind: PLAN_KIND,
+        entries: entryList,
+        ...(plan !== undefined ? { plan } : {}),
+      }).length;
+    } catch { return Infinity; }
+  };
+  if (plan !== undefined && objectSize() > PLAN_OBJECT_CAP_CHARS) plan = undefined;
+  while (entryList.length > 1 && objectSize() > PLAN_OBJECT_CAP_CHARS) {
+    entryList = entryList.slice(0, -1);
+  }
+  if (entryList.length === 1 && objectSize() > PLAN_OBJECT_CAP_CHARS) {
+    // Removing N chars from the content shrinks the serialized object by AT LEAST N
+    // (each char is >=1 serialized char), so this single slice guarantees the fit.
+    const over = objectSize() - PLAN_OBJECT_CAP_CHARS;
+    const c = entryList[0].content;
+    entryList = [{ ...entryList[0], content: c.slice(0, Math.max(0, c.length - over)) }];
+  }
+  const done = entryList.filter((e) => e.status === 'completed').length;
   const goal = plan && isNonBlank(plan.goal) ? `Goal: ${oneLine(plan.goal)}\n` : '';
-  const lines = entries.map((e) => `${PLAN_STATUS_MARK[e.status]} ${oneLine(e.content)}`);
-  const text = `${goal}Plan (${done}/${entries.length} done):\n${lines.join('\n')}`;
-  const object = { kind: PLAN_KIND, entries, ...(plan !== undefined ? { plan } : {}) };
+  const lines = entryList.map((e) => `${PLAN_STATUS_MARK[e.status]} ${oneLine(e.content)}`);
+  const text = `${goal}Plan (${done}/${entryList.length} done):\n${lines.join('\n')}`;
+  const object = { kind: PLAN_KIND, entries: entryList, ...(plan !== undefined ? { plan } : {}) };
   return [{ contentType: 'TEXT', text }, { contentType: 'OBJECT', object }];
 }
 
@@ -709,7 +737,8 @@ export function createAgentInstanceProducer(opts = {}) {
     // WHOLE plan — the first casualty of the drop-newest policy. Grant it ONE slot of
     // headroom beyond BOTH caps, mirroring the pre-mint buffer already keeping the plan
     // in its own slot outside the caps. It stays bounded: at most one extra in-flight
-    // turn, itself byte-capped at PLAN_OBJECT_CAP_CHARS by buildPlanContent (issue #230).
+    // turn, itself byte-capped at PLAN_OBJECT_CAP_CHARS by buildPlanContent — which now
+    // bounds the WHOLE plan content (entries included), not just `_meta.plan` (issue #230).
     const reserved = opts?.reserved === true;
     const countCap = maxPendingAppends > 0 ? maxPendingAppends + (reserved ? 1 : 0) : 0;
     if (

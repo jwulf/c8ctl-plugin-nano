@@ -2421,6 +2421,26 @@ test('buildPlanContent: a checklist for the cockpit plus the entries and full pl
   assert.equal(capped[1].object.entries.length, 2);
 });
 
+test('buildPlanContent: the WHOLE content (unbounded ACP entries included) is capped at PLAN_OBJECT_CAP_CHARS (review round 8)', () => {
+  // The agent-controlled `entries[].content` strings are otherwise unbounded, so an
+  // oversized plan could pin arbitrary data in the pre-mint slot and enqueue a RESERVED
+  // replay turn past the byte budget the reserved append deliberately bypasses.
+  // A single huge entry: its content is truncated so the whole object fits the cap.
+  const oneHuge = { sessionUpdate: 'plan', entries: [{ content: 'y'.repeat(PLAN_OBJECT_CAP_CHARS * 2), status: 'pending' }] };
+  const c1 = buildPlanContent(oneHuge);
+  assert.ok(JSON.stringify(c1[1].object).length <= PLAN_OBJECT_CAP_CHARS, 'single-entry object is bounded');
+  assert.equal(c1[1].object.entries.length, 1, 'the entry is retained (truncated), not dropped');
+  assert.ok(c1[1].object.entries[0].content.length > 0, 'some content survives');
+
+  // Many entries that together blow the cap: trailing entries are shed until it fits,
+  // and at least the first survives.
+  const many = { sessionUpdate: 'plan', entries: Array.from({ length: 50 }, (_, i) => ({ content: `${i}:${'z'.repeat(2000)}`, status: 'pending' })) };
+  const c2 = buildPlanContent(many);
+  assert.ok(JSON.stringify(c2[1].object).length <= PLAN_OBJECT_CAP_CHARS, 'multi-entry object is bounded');
+  assert.ok(c2[1].object.entries.length >= 1 && c2[1].object.entries.length < 50, 'trailing entries shed to fit');
+  assert.ok(c2[1].object.entries[0].content.startsWith('0:'), 'earliest entries are kept');
+});
+
 test('a plan update appends one ASSISTANT turn per distinct plan', async () => {
   const client = fakeClient();
   const p = makeProducer(client);

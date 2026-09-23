@@ -758,6 +758,10 @@ export function createAgentInstanceProducer(opts = {}) {
       pendingAppends -= 1;
       pendingAppendBytes -= size;
     });
+    // Signal that the turn was actually enqueued (not disabled/key-less or dropped for
+    // backlog), so callers that dedup on a successful append (e.g. `onPlan`) can advance
+    // their marker only when the turn was really recorded.
+    return true;
   };
 
   const flushMessage = () => {
@@ -818,14 +822,18 @@ export function createAgentInstanceProducer(opts = {}) {
     const id = shortHash(JSON.stringify(content[1].object));
     if (id === lastPlanId) return;
     flushMessage();
-    lastPlanId = id;
-    appendTurn({
+    const appended = appendTurn({
       historyItemId: nsHistoryId(`plan:${id}`),
       loopIteration,
       role: 'ASSISTANT',
       content,
       producedAt: iso(),
     });
+    // Advance the dedup marker only when the turn was actually recorded: if the append
+    // threw (caught upstream by ingestClassified), was dropped for backlog, or the
+    // producer had no instance key yet, a later resend of the SAME plan must not be
+    // silently skipped as a duplicate of a turn that was never persisted.
+    if (appended) lastPlanId = id;
   };
   const isPlanUpdate = (rawUpdate) => recordPlans && isPlainObject(rawUpdate) && rawUpdate.sessionUpdate === 'plan';
 
@@ -1305,7 +1313,21 @@ export function createAgentInstanceProducer(opts = {}) {
   let preMintPlan = null;
   const bufferPreMint = (rawUpdate) => {
     if (isPlanUpdate(rawUpdate)) {
-      if (buildPlanContent(rawUpdate)) preMintPlan = rawUpdate;
+      const content = buildPlanContent(rawUpdate);
+      // Retain a NORMALIZED update rebuilt from the recorded content, not the raw one:
+      // buildPlanContent has already normalized the entries and applied the
+      // PLAN_OBJECT_CAP_CHARS cap to `_meta.plan`, so this bounds the retained slot to
+      // what would actually be persisted (dropping arbitrary extra fields and any
+      // over-cap `_meta.plan`) instead of pinning an unbounded raw update in memory
+      // for the whole pre-mint window (issue #230).
+      if (content) {
+        const object = content[1].object;
+        preMintPlan = {
+          sessionUpdate: 'plan',
+          entries: object.entries,
+          ...(object.plan !== undefined ? { _meta: { plan: object.plan } } : {}),
+        };
+      }
       return;
     }
     // Skip updates that will not persist a turn on replay so they cannot exhaust the

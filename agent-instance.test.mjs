@@ -2401,3 +2401,44 @@ test('recordPlans:false (NANO_AGENT_PLAN=off) keeps plan updates out of the hist
   await p.drain();
   assert.equal(client.calls.update.filter((u) => Array.isArray(u.history)).length, 0);
 });
+
+test('a plan dropped for a full append backlog does not poison the dedup marker (records on resend)', async () => {
+  // The dedup marker (`lastPlanId`) must advance only when the plan turn was actually
+  // enqueued. If a plan is DROPPED because the append backlog is full, a later resend
+  // of the SAME plan must still be recorded — not silently skipped as a duplicate of a
+  // turn that was never persisted.
+  let updateCalls = 0;
+  let releaseFirst;
+  const firstGate = new Promise((resolve) => { releaseFirst = resolve; });
+  const client = {
+    calls: { create: [], update: [] },
+    createAgentInstance: async (req) => { client.calls.create.push(req); return { agentInstanceKey: 'A' }; },
+    updateAgentInstance: async (req) => {
+      client.calls.update.push(req);
+      updateCalls += 1;
+      if (updateCalls === 1) await firstGate; // first append hangs, occupying the only slot
+      return { createdHistory: Array.isArray(req.history) ? req.history : [] };
+    },
+  };
+  const p = makeProducer(client, { maxPendingAppends: 1 });
+  await p.activate();
+
+  // Occupy the single backlog slot with a hanging tool_call append.
+  p.ingest({ sessionUpdate: 'tool_call', toolCallId: 't1', title: 'grep', status: 'pending' });
+  // The plan cannot enqueue (backlog full) and is dropped — its dedup marker must NOT advance.
+  p.ingest(PLAN_UPDATE);
+  await new Promise((r) => setImmediate(r));
+  assert.equal(client.calls.update.length, 1, 'only the tool_call enqueued; the plan was dropped');
+
+  // Free the slot, then resend the SAME plan: it must now be recorded, not deduped away.
+  releaseFirst();
+  await new Promise((r) => setImmediate(r));
+  p.ingest(PLAN_UPDATE);
+  await p.drain();
+
+  const planTurns = client.calls.update
+    .filter((u) => Array.isArray(u.history))
+    .map((u) => u.history[0])
+    .filter((h) => h.historyItemId.includes(':plan:'));
+  assert.equal(planTurns.length, 1, 'the resent plan is recorded after the backlog drains');
+});

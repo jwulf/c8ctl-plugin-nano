@@ -698,6 +698,9 @@ async function defaultRead({ camunda, elementInstanceKey, signal }) {
  *        timeout the read degrades to `null` (legacy cold rerun) AND the read's
  *        `signal` is aborted so no further request is issued past the deadline.
  * @param {typeof setTimeout} [opts.setTimer] Timer factory (test seam).
+ * @param {object} [opts.env] Environment for the `NANO_AGENT_PLAN` kill-switch check.
+ * @param {boolean} [opts.planDisabled] When true (`NANO_AGENT_PLAN=off`), a recorded
+ *        plan is ignored so a plan-only history is NOT resumable (cold rerun).
  * @returns {Promise<{turns: object[], historyCount: number, text: string, plan: object|null} | null>}
  */
 export async function readPriorTranscript(opts = {}) {
@@ -709,6 +712,11 @@ export async function readPriorTranscript(opts = {}) {
     capChars = RESUME_CONTEXT_CAP_CHARS,
     readTimeoutMs = RESUME_READ_TIMEOUT_MS,
     setTimer = setTimeout,
+    env = process.env,
+    // `NANO_AGENT_PLAN=off` disables plan recording AND seeding: with it set, a plan is
+    // ignored here so a plan-only history (no real work turn text) is NOT resumable and
+    // falls through to the legacy cold rerun, matching resolveEffectiveEnvelope.
+    planDisabled = String(env?.NANO_AGENT_PLAN || '').trim().toLowerCase() === 'off',
   } = opts;
   const elementInstanceKey = job?.elementInstanceKey != null ? String(job.elementInstanceKey) : '';
   if (!isNonBlank(elementInstanceKey)) return null;
@@ -725,8 +733,10 @@ export async function readPriorTranscript(opts = {}) {
   }
   if (!Array.isArray(turns) || !hasResumableTranscript(turns)) return null;
   const text = renderHistoryTurns(turns, { capChars });
-  const plan = latestPlan(turns);
-  // A run whose only work so far is a plan is still worth continuing.
+  const plan = planDisabled ? null : latestPlan(turns);
+  // A run whose only work so far is a plan is still worth continuing — UNLESS plan
+  // recording is disabled, in which case the plan is ignored and a plan-only history
+  // (blank rendered text) is not resumable.
   if (!isNonBlank(text) && !plan) return null;
   return { turns, historyCount: turns.length, text, plan };
 }
@@ -971,7 +981,7 @@ export async function resolveEffectiveEnvelope(opts = {}) {
     return { envelope, resumed: false, historyCount: 0 };
   }
   try {
-    const prior = await readPrior({ camunda, job, logger });
+    const prior = await readPrior({ camunda, job, logger, planDisabled });
     if (prior) {
       const recorded = planDisabled ? null : prior.plan || null;
       const planText = recorded ? renderPlan(recorded) : '';

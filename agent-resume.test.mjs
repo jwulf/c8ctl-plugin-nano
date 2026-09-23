@@ -793,6 +793,21 @@ test('readPriorTranscript: returns the recorded plan', async () => {
   assert.deepEqual(got.plan.plan, RICH_PLAN);
 });
 
+test('readPriorTranscript: a plan-only history is resumable, but NOT when plan recording is disabled', async () => {
+  // A history whose only work turn is a plan (no rendered transcript text).
+  const read = async () => [planTurn({ entries: ENTRIES, _meta: { plan: RICH_PLAN } })];
+  const on = await readPriorTranscript({ job: { elementInstanceKey: '1' }, read });
+  assert.ok(on && on.plan, 'plan-only history is resumable when recording is enabled');
+  assert.equal(on.text.trim(), '', 'plan turns render no transcript text');
+  // With NANO_AGENT_PLAN=off the plan is ignored, so a plan-only history is not resumable.
+  assert.equal(await readPriorTranscript({ job: { elementInstanceKey: '1' }, read, env: { NANO_AGENT_PLAN: 'off' } }), null);
+  assert.equal(await readPriorTranscript({ job: { elementInstanceKey: '1' }, read, planDisabled: true }), null);
+  // A history with real work text still resumes when disabled — only the plan is dropped.
+  const withWork = async () => [textTurn('ASSISTANT', 'real work'), planTurn({ entries: ENTRIES })];
+  const off = await readPriorTranscript({ job: { elementInstanceKey: '1' }, read: withWork, planDisabled: true });
+  assert.ok(off && off.plan === null, 'work text resumes; plan dropped when disabled');
+});
+
 test('resolveEffectiveEnvelope: returns the plan to seed; NANO_AGENT_PLAN=off ignores it', async () => {
   const job = { leaseToken: 'lease', elementInstanceKey: '9' };
   const envelope = { task: { prompt: 'do it' } };

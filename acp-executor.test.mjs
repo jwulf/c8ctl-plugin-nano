@@ -25,6 +25,7 @@ import {
   acpSessionNewParams,
 } from './c8ctl-plugin.js';
 import { readFileSync } from 'node:fs';
+import { resolveEffectiveEnvelope } from './agent-resume.mjs';
 
 // The canonical transcript seams — consumed through the single agentic import
 // surface, the SAME `parseTranscriptEvent` / `deriveView` the cockpit uses and
@@ -762,6 +763,33 @@ test('runAgentJob (acp) hands resumePlan to a plan-seeding agent in session/new'
   } finally {
     rmSync(dir, { recursive: true, force: true });
   }
+});
+
+test('workAgent handoff: resolveEffectiveEnvelope\'s plan feeds acpSessionNewParams as session/new _meta.plan', async () => {
+  // Covers the `resumePlan = resumed.plan ?? null` handoff in workAgent: the shape
+  // resolveEffectiveEnvelope returns as `plan` is exactly what acpSessionNewParams
+  // consumes as the session/new `_meta.plan` for a plan-seeding agent.
+  const RICH = { goal: 'g', items: [{ id: 1, title: 't', status: 'done' }] };
+  const ENTRIES = [{ content: 'e', status: 'completed' }];
+  const job = { leaseToken: 'l', elementInstanceKey: '9' };
+  const envelope = { task: { prompt: 'do it' } };
+  const seedingInit = { agentCapabilities: { _meta: { planSeed: true } } };
+  const seed = (resumePlan) => acpSessionNewParams({ cwd: '/w', init: seedingInit, resumePlan })._meta;
+
+  // A full plan flows through unchanged.
+  const rich = await resolveEffectiveEnvelope({ envelope, job, env: {}, readPrior: async () => ({ text: 'prior', historyCount: 1, plan: { entries: ENTRIES, plan: RICH } }) });
+  assert.deepEqual(rich.plan, RICH);
+  assert.deepEqual(seed(rich.plan ?? null), { plan: RICH, planInPrompt: true });
+
+  // An entries-only plan (agent sent no rich `_meta.plan`) flows through as `{ entries }`.
+  const entriesOnly = await resolveEffectiveEnvelope({ envelope, job, env: {}, readPrior: async () => ({ text: 'prior', historyCount: 1, plan: { entries: ENTRIES } }) });
+  assert.deepEqual(entriesOnly.plan, { entries: ENTRIES });
+  assert.deepEqual(seed(entriesOnly.plan ?? null), { plan: { entries: ENTRIES }, planInPrompt: true });
+
+  // No recorded plan → the handoff passes null and the agent gets no `_meta` at all.
+  const none = await resolveEffectiveEnvelope({ envelope, job, env: {}, readPrior: async () => ({ text: 'prior', historyCount: 1 }) });
+  assert.equal(none.plan ?? null, null);
+  assert.equal(seed(none.plan ?? null), undefined);
 });
 
 test.after(() => {

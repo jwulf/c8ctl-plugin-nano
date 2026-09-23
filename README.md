@@ -748,6 +748,15 @@ the job with a decremented retry count. Profiles are stored in the plugin's
 > `agentCapabilities._meta.planSeed` also receives it in `session/new` `_meta.plan`
 > so it can keep working the same plan. `NANO_AGENT_PLAN=off` disables both.
 
+> **Agent outcomes.** A harness may report an explicit end-of-task outcome in its
+> `session/prompt` result as `_meta.outcome` — `{ "status": "completed" | "blocked",
+> "summary": "…" }` (rusty-harness's `report_outcome` tool). It is recorded in
+> `io.nanobpm.agentResult.outcome`. If the agent returned no result of its own, a
+> `blocked` outcome becomes the result `{ "status": "blocked", "summary", "question" }`,
+> so the job escalates instead of taking a re-emit nudge turn. A result written to
+> `$AGENT_RESULT_FILE` (or the `::nano:result::` sentinel) always wins, and agents
+> that send no outcome are handled exactly as before.
+
 ### Task envelope, sandboxes & disk hygiene
 
 For **agentic** jobs (an agent that clones a repo, works a task, pushes a

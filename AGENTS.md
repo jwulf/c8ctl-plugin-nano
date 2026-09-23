@@ -156,6 +156,15 @@ SDK client (job workers) — do **not** add the SDK as a dependency or use raw
   `agentCapabilities._meta.planSeed === true` (`acpSessionNewParams`) — every other
   agent gets byte-identical params. No plan recorded → prompt byte-unchanged.
   `NANO_AGENT_PLAN=off` disables recording and seeding.
+- **Agent outcomes (`acpOutcomeFrom` / `resultVarsFromAcpOutcome`).** A
+  `session/prompt` result may carry `_meta.outcome` `{status:'completed'|'blocked',
+  summary}` (rusty-harness's `report_outcome`). `spawnCaptureAcp` surfaces it as
+  `result.acpOutcome` (absent otherwise — result shape unchanged), and
+  `buildResultEnvelope` records it as `io.nanobpm.agentResult.outcome`. It is a
+  LAST-RESORT result: only when the agent wrote no result file / sentinel does
+  `blocked` become `{status:'blocked', summary, question}` (the workforce escalation
+  arm) and skip the re-emit nudge. `completed` implies no vars (job-specific status
+  values can't be guessed), so the normal result / nudge path is unchanged.
 
 ## Worker supervisor (`supervisor`)
 

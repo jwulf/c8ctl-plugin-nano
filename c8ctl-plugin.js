@@ -2828,7 +2828,8 @@ async function resolveAgentResultWithNudge({ result, resultFile, rerun, logger, 
   // gateways with no status/decision vars — exactly the dropped-result case the
   // nudge exists to recover — so gate on effective vars, not raw object presence.
   const hasUsableResult = (parsed) => Object.keys(sanitizeResultVars(parsed)).length > 0;
-  const already = readAgentResultFile(resultFile) ?? parseResultFromStdout(stdout0);
+  // A `blocked` ACP outcome is a usable result (it escalates), so it needs no nudge.
+  const already = readAgentResultFile(resultFile) ?? parseResultFromStdout(stdout0) ?? resultVarsFromAcpOutcome(result?.acpOutcome);
   // Only nudge a clean run that produced NO usable result but DID produce output
   // (silence means a crash/hang the idle path already handles, not a dropped result).
   // A null `resultFile` (temp-dir creation failed) is NOT a reason to skip: the
@@ -6799,6 +6800,30 @@ export function acpSessionNewParams({ cwd, init, resumePlan }) {
   return params;
 }
 
+// The agent's explicit end-of-task report, when its `session/prompt` result carries
+// `_meta.outcome` (rusty-harness's `report_outcome` tool): `{ status: 'completed' |
+// 'blocked', summary }`. Anything else — no `_meta`, another agent, a malformed
+// value — is `null`, so agents that don't send it are handled exactly as before.
+const ACP_OUTCOME_STATUSES = new Set(['completed', 'blocked']);
+const ACP_OUTCOME_SUMMARY_MAX_CHARS = 8_000;
+export function acpOutcomeFrom(promptResult) {
+  const o = promptResult?._meta?.outcome;
+  if (!isPlainObject(o) || !ACP_OUTCOME_STATUSES.has(o.status)) return null;
+  const summary = typeof o.summary === 'string' ? o.summary.trim().slice(0, ACP_OUTCOME_SUMMARY_MAX_CHARS) : '';
+  if (!summary) return null;
+  return { status: o.status, summary };
+}
+
+// Result vars implied by an ACP outcome, used ONLY when the agent wrote no result
+// file / sentinel of its own. `blocked` maps to the workforce escalation contract
+// (`status: "blocked"` with a non-blank `question`), so the job escalates instead of
+// spending a re-emit nudge turn. `completed` implies no vars: job-specific status
+// values can't be guessed, so the normal result / nudge path still applies.
+export function resultVarsFromAcpOutcome(outcome) {
+  if (outcome?.status !== 'blocked') return null;
+  return { status: 'blocked', summary: outcome.summary, question: outcome.summary };
+}
+
 function spawnCaptureAcp({ command, args = [], cwd, env, stdinData, timeoutMs, idleTimeoutMs, recoveryWindowMs, relayTap = null, stream = false, streamPrefix = '', onStreamOut, onStreamErr, permission = 'yolo', shell = false, onAcpUpdate = null, abortSignal = null, onSpawn = null, resumePlan = null }) {
   return new Promise((resolve) => {
     const logger = getLogger();
@@ -6819,6 +6844,7 @@ function spawnCaptureAcp({ command, args = [], cwd, env, stdinData, timeoutMs, i
     const pending = new Map();
     let childClosed = null; // { code, signal } once the child exits
     let promptResolved = false; // the main session/prompt turn sent + resolved
+    let acpOutcome = null; // the turn's `_meta.outcome`, if the agent reported one
     let settleTimer = null; // post-turn grace before force-reaping a lingering agent
     // One-time warning latch for the reserved escalate/filter policies so the
     // deferral is observable (not silent) but never spams a warning per request.
@@ -6913,7 +6939,7 @@ function spawnCaptureAcp({ command, args = [], cwd, env, stdinData, timeoutMs, i
       if (teeSink) { tee('', true); teeErr('', true); }
       // Reap the child if it is still alive (turn resolved but agent lingering).
       try { if (child && childClosed === null) killTree(child); } catch { /* best effort */ }
-      resolve(result);
+      resolve(acpOutcome ? { ...result, acpOutcome } : result);
     };
 
     // --- JSON-RPC 2.0 plumbing (newline-delimited framing) -------------------
@@ -7368,10 +7394,11 @@ function spawnCaptureAcp({ command, args = [], cwd, env, stdinData, timeoutMs, i
       attachSteerIfAny();
       // Deliver the task envelope as the prompt (from stdinData, matching the
       // pipe/pty paths which write the same payload to stdin).
-      await request('session/prompt', {
+      const prompted = await request('session/prompt', {
         sessionId,
         prompt: [{ type: 'text', text: String(stdinData ?? '') }],
       });
+      acpOutcome = acpOutcomeFrom(prompted);
       // End-of-turn: the main session/prompt request resolved. Mark it so the
       // `close` handler can tell a completed turn from an early/handshake exit.
       promptResolved = true;
@@ -7732,6 +7759,9 @@ function buildResultEnvelope(result, { sandbox, image, git, result: agentResult,
   // shutdown (didn't exit on its own within the post-turn grace) — surfaced so
   // consistently-hanging agents are visible rather than hidden behind a success.
   if (result.forcedReap) env.forcedReap = true;
+  // The agent's explicit ACP end-of-task report (`_meta.outcome`), host-recorded
+  // alongside whatever result vars it returned.
+  if (result.acpOutcome) env.outcome = result.acpOutcome;
   // Audit (issue #63): record which linked-resource key supplied the base prompt.
   // The engine only keeps `latest` per resourceId (no pinning), so recording the
   // resolved key is the only reproducibility handle for which prompt version ran.
@@ -10621,7 +10651,9 @@ async function workAgent(req, flags, ctx) {
         // envelope; the sanitized (reserved-key-stripped) vars are merged into the
         // job completion so the model sees `status`/`summary`/… as first-class
         // outputs. Read before deleting the temp dir.
-        const rawResult = readAgentResultFile(resultFile) ?? parseResultFromStdout(result.stdout);
+        // Last resort: vars implied by the agent's ACP `_meta.outcome` (a `blocked`
+        // report → an escalation) when it wrote no result of its own.
+        const rawResult = readAgentResultFile(resultFile) ?? parseResultFromStdout(result.stdout) ?? resultVarsFromAcpOutcome(result.acpOutcome);
         if (resultDir) { try { rmSync(resultDir, { recursive: true, force: true }); } catch { /* best effort */ } liveRunDirs.delete(resultDir); }
         const resultVars = sanitizeResultVars(rawResult);
 

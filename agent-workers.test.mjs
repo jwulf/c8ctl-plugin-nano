@@ -718,6 +718,12 @@ test('buildResultEnvelope: records the resolved promptResourceKey for audit', ()
   assert.equal('promptResourceKey' in without, false);
 });
 
+test('buildResultEnvelope: records the agent\'s ACP outcome when it reported one', () => {
+  const outcome = { status: 'completed', summary: 'Opened PR #5' };
+  assert.deepEqual(buildResultEnvelope({ ok: true, stdout: '', acpOutcome: outcome }, { sandbox: 'none' }).outcome, outcome);
+  assert.equal('outcome' in buildResultEnvelope({ ok: true, stdout: '' }, { sandbox: 'none' }), false);
+});
+
 
 test('normalizeTaskEnvelope: no repository when url absent', () => {
   const env = normalizeTaskEnvelope({}, {});

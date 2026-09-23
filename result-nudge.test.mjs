@@ -70,6 +70,23 @@ test('nudges once and recovers a dropped result (agent writes the file on the re
   }
 });
 
+test('does NOT nudge a run whose agent reported a blocked ACP outcome (it escalates instead)', async () => {
+  const { dir, file } = tmpResultFile();
+  try {
+    let reruns = 0;
+    const rerun = async () => { reruns++; return { ok: true, stdout: '' }; };
+    const blocked = { ok: true, stdout: 'Blocked: need GH_TOKEN', acpOutcome: { status: 'blocked', summary: 'need GH_TOKEN' } };
+    assert.equal((await resolveAgentResultWithNudge({ result: blocked, resultFile: file, rerun })).nudged, false);
+    assert.equal(reruns, 0);
+    // A `completed` outcome carries no job-specific status, so the nudge still runs.
+    const completed = { ok: true, stdout: 'Opened PR #5', acpOutcome: { status: 'completed', summary: 'Opened PR #5' } };
+    assert.equal((await resolveAgentResultWithNudge({ result: completed, resultFile: file, rerun })).nudged, true);
+    assert.equal(reruns, 1);
+  } finally {
+    rmSync(dir, { recursive: true, force: true });
+  }
+});
+
 test('does NOT nudge when the first turn already produced a result', async () => {
   const { dir, file } = tmpResultFile();
   try {

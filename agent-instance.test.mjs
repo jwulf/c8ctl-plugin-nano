@@ -2441,6 +2441,39 @@ test('buildPlanContent: the WHOLE content (unbounded ACP entries included) is ca
   assert.ok(c2[1].object.entries[0].content.startsWith('0:'), 'earliest entries are kept');
 });
 
+test('buildPlanContent: a huge agent-controlled priority cannot bypass the whole-object cap', () => {
+  // `priority` is copied verbatim and is otherwise unbounded; truncating only the last
+  // entry's content would leave a huge priority string over the cap. The single-entry
+  // shrink drops the optional priority so the object still fits.
+  const oneHugePriority = {
+    sessionUpdate: 'plan',
+    entries: [{ content: 'do it', status: 'pending', priority: 'p'.repeat(PLAN_OBJECT_CAP_CHARS * 2) }],
+  };
+  const c = buildPlanContent(oneHugePriority);
+  assert.ok(JSON.stringify(c[1].object).length <= PLAN_OBJECT_CAP_CHARS, 'object bounded despite huge priority');
+  assert.equal(c[1].object.entries.length, 1, 'the entry is retained');
+  assert.equal(c[1].object.entries[0].priority, undefined, 'the oversized priority is dropped');
+});
+
+test('buildPlanContent: a normal-sized priority is preserved (only bounded when shrinking)', () => {
+  const c = buildPlanContent({ sessionUpdate: 'plan', entries: [{ content: 'do it', status: 'pending', priority: 'high' }] });
+  assert.equal(c[1].object.entries[0].priority, 'high', 'nonstandard/normal priority metadata survives when it fits');
+});
+
+test('buildPlanContent: shedding a many-entry plan keeps the largest fitting prefix (binary search)', () => {
+  // Regression for the O(n²) re-serialize-per-drop shed: with many small entries the prefix
+  // is found by binary search. Assert the result is the exact largest fitting prefix.
+  const entries = Array.from({ length: 400 }, (_, i) => ({ content: `${i}:${'z'.repeat(200)}`, status: 'pending' }));
+  const c = buildPlanContent({ sessionUpdate: 'plan', entries });
+  const kept = c[1].object.entries.length;
+  assert.ok(JSON.stringify(c[1].object).length <= PLAN_OBJECT_CAP_CHARS, 'kept prefix fits the cap');
+  assert.ok(kept >= 1 && kept < 400, 'trailing entries shed to fit');
+  assert.ok(c[1].object.entries[0].content.startsWith('0:'), 'earliest entries are kept');
+  // The prefix is maximal: keeping one more entry would exceed the cap.
+  const oneMore = JSON.stringify({ kind: c[1].object.kind, entries: entries.slice(0, kept + 1) }).length;
+  assert.ok(oneMore > PLAN_OBJECT_CAP_CHARS, 'kept prefix is the largest that fits');
+});
+
 test('a plan update appends one ASSISTANT turn per distinct plan', async () => {
   const client = fakeClient();
   const p = makeProducer(client);

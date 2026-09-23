@@ -399,25 +399,45 @@ export function buildPlanContent(update) {
   // first (the least essential), then drop trailing entries, then truncate the last
   // remaining entry's content — so the bound holds even for a single huge entry.
   let entryList = entries;
-  const objectSize = () => {
+  const objectSize = (list = entryList) => {
     try {
       return JSON.stringify({
         kind: PLAN_KIND,
-        entries: entryList,
+        entries: list,
         ...(plan !== undefined ? { plan } : {}),
       }).length;
     } catch { return Infinity; }
   };
   if (plan !== undefined && objectSize() > PLAN_OBJECT_CAP_CHARS) plan = undefined;
-  while (entryList.length > 1 && objectSize() > PLAN_OBJECT_CAP_CHARS) {
-    entryList = entryList.slice(0, -1);
+  // Keep the largest LEADING prefix of entries that fits, found by binary search rather
+  // than dropping one trailing entry and re-serializing the whole array each iteration —
+  // ACP frames are accepted up to 8 MiB, so a plan with many small entries would make the
+  // naive shed O(n²) on the worker's synchronous event loop, blocking ACP/lease/heartbeat
+  // work. `objectSize` is monotonic in the prefix length, so binary search is exact.
+  if (entryList.length > 1 && objectSize() > PLAN_OBJECT_CAP_CHARS) {
+    let lo = 1, hi = entryList.length; // keep at least the first entry
+    while (lo < hi) {
+      const mid = (lo + hi + 1) >> 1;
+      if (objectSize(entryList.slice(0, mid)) <= PLAN_OBJECT_CAP_CHARS) lo = mid;
+      else hi = mid - 1;
+    }
+    entryList = entryList.slice(0, lo);
   }
   if (entryList.length === 1 && objectSize() > PLAN_OBJECT_CAP_CHARS) {
-    // Removing N chars from the content shrinks the serialized object by AT LEAST N
-    // (each char is >=1 serialized char), so this single slice guarantees the fit.
-    const over = objectSize() - PLAN_OBJECT_CAP_CHARS;
-    const c = entryList[0].content;
-    entryList = [{ ...entryList[0], content: c.slice(0, Math.max(0, c.length - over)) }];
+    // A single oversized entry. Its agent-controlled `priority` is copied verbatim and is
+    // otherwise unbounded, so truncating only `content` would NOT bound the object when the
+    // priority string itself is huge — drop the optional priority first, then truncate the
+    // content. Removing N chars from the content shrinks the serialized object by AT LEAST N
+    // (each char is >=1 serialized char), so after dropping priority this single slice
+    // guarantees the fit (the residual skeleton — kind/status/empty content — is tiny).
+    const only = { ...entryList[0] };
+    delete only.priority;
+    entryList = [only];
+    if (objectSize() > PLAN_OBJECT_CAP_CHARS) {
+      const over = objectSize() - PLAN_OBJECT_CAP_CHARS;
+      const c = only.content;
+      entryList = [{ ...only, content: c.slice(0, Math.max(0, c.length - over)) }];
+    }
   }
   const done = entryList.filter((e) => e.status === 'completed').length;
   const goal = plan && isNonBlank(plan.goal) ? `Goal: ${oneLine(plan.goal)}\n` : '';

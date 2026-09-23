@@ -20,6 +20,9 @@ import {
   activationNamespace,
   buildProvenanceContent,
   PROVENANCE_KIND,
+  buildPlanContent,
+  PLAN_KIND,
+  PLAN_OBJECT_CAP_CHARS,
 } from './agent-instance.mjs';
 
 // A logger that records every line per level so observability assertions (#229)
@@ -1688,11 +1691,54 @@ test('the pre-mint buffer only retains updates that persist a turn — a plan/st
     .filter((u) => Array.isArray(u.history))
     .map((u) => u.history[0].content?.[0]?.text)
     .filter(Boolean);
-  assert.deepEqual(
-    texts,
-    ['msg-a', 'msg-b'],
-    'the plan burst was filtered out; both real message turns survived the 2-slot buffer',
-  );
+  // The plan burst takes no buffer slots: both real message turns survive the 2-slot
+  // buffer, and only the LATEST plan is recorded, after them.
+  assert.deepEqual(texts, ['msg-a', 'msg-b', 'Plan (0/1 done):\n[ ] step 4']);
+});
+
+test('the latest pre-mint plan is replayed with a RESERVED append slot — a backlog filled by the replayed turns cannot drop it (issue #230)', async () => {
+  // The plan is replayed LAST (it restates the whole plan), so if the buffered
+  // message/tool turns just filled the append backlog, the naive drop-newest policy
+  // would make the plan — the single most valuable turn — the first casualty. It gets
+  // one reserved slot of headroom so it survives a backlog exactly at the cap.
+  const client = fakeClient({ failCreateTimes: 1 });
+  let t = Date.parse('2026-02-03T04:05:06.000Z');
+  const p = createAgentInstanceProducer({
+    camunda: client,
+    job: EXTERNAL_JOB,
+    profile: PROFILE,
+    envelope: ENVELOPE,
+    logger: nullLogger,
+    now: () => t,
+    createRetryBaseMs: 1000,
+    createRetryMaxMs: 30000,
+    // Exactly enough backlog slots for the two replayed message turns: without the
+    // reservation the plan (replayed third) would be dropped as the newest.
+    maxPendingAppends: 2,
+    preMintBufferMax: 10,
+  });
+
+  await p.activate();
+  assert.equal(p.active, false);
+
+  // Two real message chunks (they will fill the 2-slot backlog on replay), then a plan.
+  p.ingest({ sessionUpdate: 'agent_message_chunk', messageId: 'm-a', content: { type: 'text', text: 'msg-a' } });
+  p.ingest({ sessionUpdate: 'agent_message_chunk', messageId: 'm-b', content: { type: 'text', text: 'msg-b' } });
+  p.ingest({ sessionUpdate: 'plan', entries: [{ content: 'step 0' }] });
+  await p.drain();
+
+  // Past the window, the next attempt succeeds → mint + replay.
+  t += 2000;
+  await p.activate();
+  assert.equal(p.active, true);
+  await p.complete(true);
+
+  const texts = client.calls.update
+    .filter((u) => Array.isArray(u.history))
+    .map((u) => u.history[0].content?.[0]?.text)
+    .filter(Boolean);
+  // Both message turns AND the reserved plan survive the 2-slot backlog on replay.
+  assert.deepEqual(texts, ['msg-a', 'msg-b', 'Plan (0/1 done):\n[ ] step 0']);
 });
 
 test('the pre-mint buffer skips metadata-only message chunks (no text/metrics) so they cannot starve it (issue #230)', async () => {
@@ -2343,4 +2389,287 @@ test('#222 discard() on an ACTIVE producer drains queued appends without a COMPL
   p.ingest({ sessionUpdate: 'agent_message_chunk', messageId: 'm3', content: { type: 'text', text: 'later' } });
   await p.drain();
   assert.equal(client.calls.update.length, updatesAfter, 'ingest after discard() is inert (producer finalized)');
+});
+
+// ---------------------------------------------------------------------------
+// ACP `plan` updates are recorded as parity-safe ASSISTANT turns (TEXT + OBJECT).
+// ---------------------------------------------------------------------------
+
+const PLAN_UPDATE = {
+  sessionUpdate: 'plan',
+  entries: [
+    { content: 'Read the parser', priority: 'medium', status: 'completed' },
+    { content: 'Add the flag', priority: 'medium', status: 'in_progress' },
+  ],
+  _meta: { plan: { goal: 'Add --json', items: [{ id: 1, title: 'Read the parser', status: 'done', notes: ['src/cli.rs'] }, { id: 2, title: 'Add the flag', status: 'in_progress' }] } },
+};
+
+test('buildPlanContent: a checklist for the cockpit plus the entries and full plan as an OBJECT', () => {
+  const content = buildPlanContent(PLAN_UPDATE);
+  assert.deepEqual(content[0], { contentType: 'TEXT', text: 'Goal: Add --json\nPlan (1/2 done):\n[x] Read the parser\n[>] Add the flag' });
+  assert.equal(content[1].contentType, 'OBJECT');
+  assert.equal(content[1].object.kind, PLAN_KIND);
+  assert.deepEqual(content[1].object.entries[0], { content: 'Read the parser', status: 'completed', priority: 'medium' });
+  assert.deepEqual(content[1].object.plan, PLAN_UPDATE._meta.plan);
+  // No plan → nothing to record.
+  assert.equal(buildPlanContent({ sessionUpdate: 'plan', entries: [] }), null);
+  assert.equal(buildPlanContent({ sessionUpdate: 'agent_message_chunk' }), null);
+  // An oversized full plan is dropped; the entries are kept.
+  const huge = { ...PLAN_UPDATE, _meta: { plan: { items: [], goal: 'x'.repeat(PLAN_OBJECT_CAP_CHARS) } } };
+  const capped = buildPlanContent(huge);
+  assert.equal(capped[1].object.plan, undefined);
+  assert.equal(capped[1].object.entries.length, 2);
+});
+
+test('buildPlanContent: the WHOLE content (unbounded ACP entries included) is capped at PLAN_OBJECT_CAP_CHARS (review round 8)', () => {
+  // The agent-controlled `entries[].content` strings are otherwise unbounded, so an
+  // oversized plan could pin arbitrary data in the pre-mint slot and enqueue a RESERVED
+  // replay turn past the byte budget the reserved append deliberately bypasses.
+  // A single huge entry: its content is truncated so the whole object fits the cap.
+  const oneHuge = { sessionUpdate: 'plan', entries: [{ content: 'y'.repeat(PLAN_OBJECT_CAP_CHARS * 2), status: 'pending' }] };
+  const c1 = buildPlanContent(oneHuge);
+  assert.ok(JSON.stringify(c1[1].object).length <= PLAN_OBJECT_CAP_CHARS, 'single-entry object is bounded');
+  assert.equal(c1[1].object.entries.length, 1, 'the entry is retained (truncated), not dropped');
+  assert.ok(c1[1].object.entries[0].content.length > 0, 'some content survives');
+
+  // Many entries that together blow the cap: trailing entries are shed until it fits,
+  // and at least the first survives.
+  const many = { sessionUpdate: 'plan', entries: Array.from({ length: 50 }, (_, i) => ({ content: `${i}:${'z'.repeat(2000)}`, status: 'pending' })) };
+  const c2 = buildPlanContent(many);
+  assert.ok(JSON.stringify(c2[1].object).length <= PLAN_OBJECT_CAP_CHARS, 'multi-entry object is bounded');
+  assert.ok(c2[1].object.entries.length >= 1 && c2[1].object.entries.length < 50, 'trailing entries shed to fit');
+  assert.ok(c2[1].object.entries[0].content.startsWith('0:'), 'earliest entries are kept');
+});
+
+test('buildPlanContent: a huge agent-controlled priority cannot bypass the whole-object cap', () => {
+  // `priority` is copied verbatim and is otherwise unbounded; truncating only the last
+  // entry's content would leave a huge priority string over the cap. The single-entry
+  // shrink drops the optional priority so the object still fits.
+  const oneHugePriority = {
+    sessionUpdate: 'plan',
+    entries: [{ content: 'do it', status: 'pending', priority: 'p'.repeat(PLAN_OBJECT_CAP_CHARS * 2) }],
+  };
+  const c = buildPlanContent(oneHugePriority);
+  assert.ok(JSON.stringify(c[1].object).length <= PLAN_OBJECT_CAP_CHARS, 'object bounded despite huge priority');
+  assert.equal(c[1].object.entries.length, 1, 'the entry is retained');
+  assert.equal(c[1].object.entries[0].priority, undefined, 'the oversized priority is dropped');
+});
+
+test('buildPlanContent: a normal-sized priority is preserved (only bounded when shrinking)', () => {
+  const c = buildPlanContent({ sessionUpdate: 'plan', entries: [{ content: 'do it', status: 'pending', priority: 'high' }] });
+  assert.equal(c[1].object.entries[0].priority, 'high', 'nonstandard/normal priority metadata survives when it fits');
+});
+
+test('buildPlanContent: shedding a many-entry plan keeps the largest fitting prefix (binary search)', () => {
+  // Regression for the O(n²) re-serialize-per-drop shed: with many small entries the prefix
+  // is found by binary search. Assert the result is the exact largest fitting prefix.
+  const entries = Array.from({ length: 400 }, (_, i) => ({ content: `${i}:${'z'.repeat(200)}`, status: 'pending' }));
+  const c = buildPlanContent({ sessionUpdate: 'plan', entries });
+  const kept = c[1].object.entries.length;
+  assert.ok(JSON.stringify(c[1].object).length <= PLAN_OBJECT_CAP_CHARS, 'kept prefix fits the cap');
+  assert.ok(kept >= 1 && kept < 400, 'trailing entries shed to fit');
+  assert.ok(c[1].object.entries[0].content.startsWith('0:'), 'earliest entries are kept');
+  // The prefix is maximal: keeping one more entry would exceed the cap.
+  const oneMore = JSON.stringify({ kind: c[1].object.kind, entries: entries.slice(0, kept + 1) }).length;
+  assert.ok(oneMore > PLAN_OBJECT_CAP_CHARS, 'kept prefix is the largest that fits');
+});
+
+test('a plan update appends one ASSISTANT turn per distinct plan', async () => {
+  const client = fakeClient();
+  const p = makeProducer(client);
+  await p.activate();
+  p.ingest(PLAN_UPDATE);
+  p.ingest(PLAN_UPDATE); // unchanged resend → no new turn
+  p.ingest({ ...PLAN_UPDATE, entries: PLAN_UPDATE.entries.map((e) => ({ ...e, status: 'completed' })), _meta: undefined });
+  await p.drain();
+  const turns = client.calls.update.filter((u) => Array.isArray(u.history)).map((u) => u.history[0]);
+  assert.equal(turns.length, 2);
+  assert.equal(turns[0].role, 'ASSISTANT');
+  assert.equal(turns[0].toolCalls, undefined);
+  // #247: a plan turn is EXEMPT from the per-activation namespace — its id is the stable
+  // content-addressed `plan:${hash}` (like the CONFIGURATION turn), so an identical plan
+  // re-emitted by a resumed activation dedups instead of duplicating.
+  assert.ok(turns[0].historyItemId.startsWith('plan:'), turns[0].historyItemId);
+  assert.ok(!turns[0].historyItemId.startsWith(`${NS}:`), turns[0].historyItemId);
+  assert.notEqual(turns[0].historyItemId, turns[1].historyItemId);
+  assert.equal(turns[1].content[0].text, 'Plan (2/2 done):\n[x] Read the parser\n[x] Add the flag');
+});
+
+test('a plan turn keeps a STABLE historyItemId across activations so a re-emitted plan dedups (#247, review round 9)', async () => {
+  // Unlike message/tool-call turns, a plan turn is content-addressed and represents
+  // idempotent LATEST state. A resumed activation (new lease) whose in-memory dedup sets
+  // start empty will re-emit the same latest plan; if the id were per-activation
+  // namespaced the engine would see a NEW id and append a DUPLICATE plan turn. Keying on
+  // the stable `plan:${hash}` lets the engine's history-item dedup collapse the resend.
+  const c1 = fakeClient();
+  const p1 = makeProducer(c1, { job: { ...EXTERNAL_JOB, leaseToken: 'LEASE-A' } });
+  await p1.activate();
+  p1.ingest(PLAN_UPDATE);
+  await p1.complete(true);
+
+  const c2 = fakeClient();
+  const p2 = makeProducer(c2, { job: { ...EXTERNAL_JOB, leaseToken: 'LEASE-B' } });
+  await p2.activate();
+  p2.ingest(PLAN_UPDATE);
+  await p2.complete(true);
+
+  const planId = (client) =>
+    client.calls.update
+      .filter((u) => Array.isArray(u.history))
+      .map((u) => u.history[0].historyItemId)
+      .find((h) => h.startsWith('plan:'));
+  // Sanity: the resumed activation DID namespace an ordinary message turn differently…
+  assert.ok(planId(c1) && planId(c2), 'both activations recorded the plan turn');
+  // …but the plan id is identical across the two distinct leases, so the engine dedups it.
+  assert.equal(planId(c1), planId(c2));
+});
+
+test('recordPlans:false (NANO_AGENT_PLAN=off) keeps plan updates out of the history', async () => {
+  const client = fakeClient();
+  const p = makeProducer(client, { recordPlans: false });
+  await p.activate();
+  p.ingest(PLAN_UPDATE);
+  await p.drain();
+  assert.equal(client.calls.update.filter((u) => Array.isArray(u.history)).length, 0);
+});
+
+test('a plan dropped for a full append backlog does not poison the dedup marker (records on resend)', async () => {
+  // The dedup marker (`lastPlanId`) must advance only when the plan turn was actually
+  // enqueued. If a plan is DROPPED because the append backlog is full, a later resend
+  // of the SAME plan must still be recorded — not silently skipped as a duplicate of a
+  // turn that was never persisted.
+  let updateCalls = 0;
+  let releaseFirst;
+  const firstGate = new Promise((resolve) => { releaseFirst = resolve; });
+  const client = {
+    calls: { create: [], update: [] },
+    createAgentInstance: async (req) => { client.calls.create.push(req); return { agentInstanceKey: 'A' }; },
+    updateAgentInstance: async (req) => {
+      client.calls.update.push(req);
+      updateCalls += 1;
+      if (updateCalls === 1) await firstGate; // first append hangs, occupying the only slot
+      return { createdHistory: Array.isArray(req.history) ? req.history : [] };
+    },
+  };
+  const p = makeProducer(client, { maxPendingAppends: 1 });
+  await p.activate();
+
+  // Occupy the single backlog slot with a hanging tool_call append.
+  p.ingest({ sessionUpdate: 'tool_call', toolCallId: 't1', title: 'grep', status: 'pending' });
+  // The plan cannot enqueue (backlog full) and is dropped — its dedup marker must NOT advance.
+  p.ingest(PLAN_UPDATE);
+  await new Promise((r) => setImmediate(r));
+  assert.equal(client.calls.update.length, 1, 'only the tool_call enqueued; the plan was dropped');
+
+  // Free the slot, then resend the SAME plan: it must now be recorded, not deduped away.
+  releaseFirst();
+  await new Promise((r) => setImmediate(r));
+  p.ingest(PLAN_UPDATE);
+  await p.drain();
+
+  const planTurns = client.calls.update
+    .filter((u) => Array.isArray(u.history))
+    .map((u) => u.history[0])
+    .filter((h) => h.historyItemId.includes('plan:'));
+  assert.equal(planTurns.length, 1, 'the resent plan is recorded after the backlog drains');
+});
+
+test('a plan append that REJECTS does not advance the dedup marker (records on resend) — review round 3', async () => {
+  // The queued SDK call swallows updateAgentInstance failures, so `appendTurn` enqueuing
+  // a turn is NOT proof it was persisted. The dedup marker must advance only after the
+  // append settles SUCCESSFULLY: a rejected (or timed-out) plan append leaves no history
+  // turn, so a later resend of the SAME plan must still be recorded, not skipped.
+  let updateCalls = 0;
+  const client = {
+    calls: { create: [], update: [] },
+    createAgentInstance: async (req) => { client.calls.create.push(req); return { agentInstanceKey: 'A' }; },
+    updateAgentInstance: async (req) => {
+      client.calls.update.push(req);
+      updateCalls += 1;
+      if (updateCalls === 1) throw new Error('boom: transient AgentInstance outage');
+      return { createdHistory: Array.isArray(req.history) ? req.history : [] };
+    },
+  };
+  const p = makeProducer(client);
+  await p.activate();
+
+  // First plan append is attempted but REJECTS (swallowed by the queue) → marker unchanged.
+  p.ingest(PLAN_UPDATE);
+  await p.drain();
+  assert.equal(client.calls.update.length, 1, 'the first plan append was attempted');
+
+  // Resend the SAME plan: because the first never persisted, it must be recorded now.
+  p.ingest(PLAN_UPDATE);
+  await p.drain();
+
+  const planTurns = client.calls.update
+    .filter((u) => Array.isArray(u.history))
+    .map((u) => u.history[0])
+    .filter((h) => h.historyItemId.includes('plan:'));
+  assert.equal(planTurns.length, 2, 'the resent plan is recorded after the first append failed');
+});
+
+test('a plan resent while its first append is still in-flight does not enqueue a duplicate — review round 3', async () => {
+  // Advancing the dedup marker only on a settled-successful append opens a window where a
+  // resend could race the in-flight append and double-record it. An `inFlightPlanId`
+  // guard prevents a duplicate enqueue while the first append is still settling.
+  let release;
+  const gate = new Promise((resolve) => { release = resolve; });
+  let updateCalls = 0;
+  const client = {
+    calls: { create: [], update: [] },
+    createAgentInstance: async (req) => { client.calls.create.push(req); return { agentInstanceKey: 'A' }; },
+    updateAgentInstance: async (req) => {
+      client.calls.update.push(req);
+      updateCalls += 1;
+      if (updateCalls === 1) await gate; // first plan append hangs (in-flight)
+      return { createdHistory: Array.isArray(req.history) ? req.history : [] };
+    },
+  };
+  const p = makeProducer(client);
+  await p.activate();
+
+  p.ingest(PLAN_UPDATE); // enqueues the first plan append (hangs)
+  await new Promise((r) => setImmediate(r));
+  p.ingest(PLAN_UPDATE); // resend while in-flight → must NOT enqueue a duplicate
+  await new Promise((r) => setImmediate(r));
+  const midFlight = client.calls.update
+    .filter((u) => Array.isArray(u.history))
+    .filter((h) => h.history[0].historyItemId.includes('plan:')).length;
+  assert.equal(midFlight, 1, 'the resend did not enqueue a duplicate while the first was in-flight');
+
+  release();
+  await p.drain();
+  const planTurns = client.calls.update
+    .filter((u) => Array.isArray(u.history))
+    .map((u) => u.history[0])
+    .filter((h) => h.historyItemId.includes('plan:'));
+  assert.equal(planTurns.length, 1, 'exactly one plan turn recorded after the in-flight append settled');
+});
+
+test('re-emitting an EARLIER plan (A → B → A) does not enqueue a duplicate append — review round 4', async () => {
+  // The dedup must remember EVERY recorded plan hash, not just the most recent one.
+  // A scalar last-hash marker would let a re-emitted earlier plan (A after B) pass the
+  // check and enqueue a second append for A, violating the one-turn-per-distinct-plan
+  // contract. Track the full set of recorded hashes so A stays deduped after B.
+  const client = fakeClient();
+  const p = makeProducer(client);
+  await p.activate();
+
+  const planA = PLAN_UPDATE;
+  const planB = { ...PLAN_UPDATE, entries: PLAN_UPDATE.entries.map((e) => ({ ...e, status: 'completed' })), _meta: undefined };
+
+  p.ingest(planA); // A → recorded
+  await p.drain();
+  p.ingest(planB); // B → recorded
+  await p.drain();
+  p.ingest(planA); // A again → must be deduped (already recorded), NOT re-enqueued
+  await p.drain();
+
+  const planTurns = client.calls.update
+    .filter((u) => Array.isArray(u.history))
+    .map((u) => u.history[0])
+    .filter((h) => h.historyItemId.includes('plan:'));
+  assert.equal(planTurns.length, 2, 'A and B each recorded once; the re-emitted A is deduped');
+  assert.notEqual(planTurns[0].historyItemId, planTurns[1].historyItemId);
 });

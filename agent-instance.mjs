@@ -341,6 +341,112 @@ export function buildProvenanceContent({ profile, runtimeVersion, agentCliVersio
   return { contentType: 'OBJECT', object };
 }
 
+// Marker for the plan blob an ACP `plan` update is recorded as (see `buildPlanContent`).
+// agent-resume.mjs mirrors it (it must stay free of this module's dependencies); keep
+// the two in lockstep.
+export const PLAN_KIND = 'nanobpm.plan/v1';
+
+// The harness's full plan (`_meta.plan`, e.g. rusty-harness's ids/notes/dependencies)
+// is kept only while its JSON fits this cap; past it, the ACP entries alone are kept.
+export const PLAN_OBJECT_CAP_CHARS = 32_000;
+
+// Upper bound on the number of distinct plan content-hashes the per-activation plan
+// dedup remembers (recorded + in-flight). A single activation should never emit this
+// many DISTINCT plans, so the FIFO eviction is a pure safety valve against unbounded
+// growth from a pathological plan stream; evicting the oldest hash only risks a very
+// old plan being re-enqueued, which the engine still dedups by its stable
+// content-addressed historyItemId.
+export const PLAN_DEDUP_CAP = 256;
+
+const PLAN_STATUS_MARK = { completed: '[x]', in_progress: '[>]', pending: '[ ]' };
+
+/** Is `NANO_AGENT_PLAN=off` set (don't record ACP plans or seed them on resume)? */
+export function isPlanDisabled(env = process.env) {
+  return String(env?.NANO_AGENT_PLAN || '').trim().toLowerCase() === 'off';
+}
+
+/**
+ * Build the content for an AgentHistory turn recording one ACP `plan` update, or `null`
+ * when the update carries no plan (no entries and no `_meta.plan`).
+ *
+ * ACP `plan` updates have no AgentHistory counterpart, and nanobpmn promises Camunda
+ * parity, so the plan rides an ordinary ASSISTANT turn:
+ *   - a TEXT checklist, which is what the cockpit shows (it renders TEXT blocks only);
+ *   - an OBJECT `{ kind: PLAN_KIND, entries, plan? }` holding the ACP entries and, when
+ *     the agent sends one, its full `_meta.plan`. Resume reads this back (agent-resume.mjs).
+ */
+export function buildPlanContent(update) {
+  if (!isPlainObject(update) || update.sessionUpdate !== 'plan') return null;
+  const entries = (Array.isArray(update.entries) ? update.entries : [])
+    .filter((e) => isPlainObject(e) && isNonBlank(e.content))
+    .map((e) => ({
+      content: String(e.content),
+      status: PLAN_STATUS_MARK[e.status] ? e.status : 'pending',
+      ...(isNonBlank(e.priority) ? { priority: String(e.priority) } : {}),
+    }));
+  let plan = isPlainObject(update._meta?.plan) ? update._meta.plan : undefined;
+  if (plan !== undefined) {
+    let size = Infinity;
+    try { size = JSON.stringify(plan).length; } catch { /* unserializable → dropped */ }
+    if (size > PLAN_OBJECT_CAP_CHARS) plan = undefined;
+  }
+  if (entries.length === 0 && plan === undefined) return null;
+  // Bound the WHOLE retained/replayed plan content to PLAN_OBJECT_CAP_CHARS, not just
+  // `_meta.plan`: the ACP `entries` (their agent-controlled `content` strings) are
+  // otherwise unbounded, so an oversized plan could pin arbitrarily large data in the
+  // pre-mint slot AND enqueue a RESERVED replay turn past the byte budget the reserved
+  // append deliberately bypasses (review round 8). Shed the optional full `_meta.plan`
+  // first (the least essential), then drop trailing entries, then truncate the last
+  // remaining entry's content — so the bound holds even for a single huge entry.
+  let entryList = entries;
+  const objectSize = (list = entryList) => {
+    try {
+      return JSON.stringify({
+        kind: PLAN_KIND,
+        entries: list,
+        ...(plan !== undefined ? { plan } : {}),
+      }).length;
+    } catch { return Infinity; }
+  };
+  if (plan !== undefined && objectSize() > PLAN_OBJECT_CAP_CHARS) plan = undefined;
+  // Keep the largest LEADING prefix of entries that fits, found by binary search rather
+  // than dropping one trailing entry and re-serializing the whole array each iteration —
+  // ACP frames are accepted up to 8 MiB, so a plan with many small entries would make the
+  // naive shed O(n²) on the worker's synchronous event loop, blocking ACP/lease/heartbeat
+  // work. `objectSize` is monotonic in the prefix length, so binary search is exact.
+  if (entryList.length > 1 && objectSize() > PLAN_OBJECT_CAP_CHARS) {
+    let lo = 1, hi = entryList.length; // keep at least the first entry
+    while (lo < hi) {
+      const mid = (lo + hi + 1) >> 1;
+      if (objectSize(entryList.slice(0, mid)) <= PLAN_OBJECT_CAP_CHARS) lo = mid;
+      else hi = mid - 1;
+    }
+    entryList = entryList.slice(0, lo);
+  }
+  if (entryList.length === 1 && objectSize() > PLAN_OBJECT_CAP_CHARS) {
+    // A single oversized entry. Its agent-controlled `priority` is copied verbatim and is
+    // otherwise unbounded, so truncating only `content` would NOT bound the object when the
+    // priority string itself is huge — drop the optional priority first, then truncate the
+    // content. Removing N chars from the content shrinks the serialized object by AT LEAST N
+    // (each char is >=1 serialized char), so after dropping priority this single slice
+    // guarantees the fit (the residual skeleton — kind/status/empty content — is tiny).
+    const only = { ...entryList[0] };
+    delete only.priority;
+    entryList = [only];
+    if (objectSize() > PLAN_OBJECT_CAP_CHARS) {
+      const over = objectSize() - PLAN_OBJECT_CAP_CHARS;
+      const c = only.content;
+      entryList = [{ ...only, content: c.slice(0, Math.max(0, c.length - over)) }];
+    }
+  }
+  const done = entryList.filter((e) => e.status === 'completed').length;
+  const goal = plan && isNonBlank(plan.goal) ? `Goal: ${oneLine(plan.goal)}\n` : '';
+  const lines = entryList.map((e) => `${PLAN_STATUS_MARK[e.status]} ${oneLine(e.content)}`);
+  const text = `${goal}Plan (${done}/${entryList.length} done):\n${lines.join('\n')}`;
+  const object = { kind: PLAN_KIND, entries: entryList, ...(plan !== undefined ? { plan } : {}) };
+  return [{ contentType: 'TEXT', text }, { contentType: 'OBJECT', object }];
+}
+
 // Map the ACP classifier's message role to the AgentHistory role enum. ACP has no
 // distinct REASONING role, so a `reasoning` chunk folds into ASSISTANT.
 function historyRole(acpRole) {
@@ -460,6 +566,9 @@ export function createAgentInstanceProducer(opts = {}) {
     maxPendingAppends = DEFAULT_MAX_PENDING_APPENDS,
     maxPendingAppendBytes = DEFAULT_MAX_PENDING_APPEND_BYTES,
     maxPendingMessageBytes = DEFAULT_MAX_PENDING_MESSAGE_BYTES,
+    // Record ACP `plan` updates as history turns (see `buildPlanContent`); the
+    // `NANO_AGENT_PLAN=off` kill switch turns this off.
+    recordPlans = !isPlanDisabled(),
     // Injected deadline-timer factory (defaults to setTimeout) — the seam that lets a
     // test drive the create-retirement / bounded-call timers deterministically instead
     // of sleeping on wall-clock time (issue #230). Only the timer is injected; the
@@ -624,8 +733,13 @@ export function createAgentInstanceProducer(opts = {}) {
   };
 
   // Append one AgentHistory turn via updateAgentInstance (one turn per call keeps the
-  // dedup boundary crisp). Only ever runs once the instance is minted.
-  const appendTurn = (turn, status) => {
+  // dedup boundary crisp). Only ever runs once the instance is minted. `onSettled`, when
+  // given, is invoked once the append has actually settled with a boolean indicating
+  // whether the SDK call SUCCEEDED (did not reject/time out) — so a caller that dedups on
+  // a persisted turn (e.g. `onPlan`) advances its marker only after the turn was really
+  // recorded, never merely enqueued. A turn dropped for backlog / no-key never enqueues,
+  // so `onSettled` is not called and the synchronous return value is falsy.
+  const appendTurn = (turn, status, onSettled, opts) => {
     if (disabled || !agentInstanceKey) return;
     // Backpressure (issue #230): during an AgentInstance outage each serialized append
     // can take up to finalizeTimeoutMs to settle, so an unbounded enqueue would let the
@@ -637,9 +751,19 @@ export function createAgentInstanceProducer(opts = {}) {
     // single arbitrarily large turn (e.g. a huge tool result) would otherwise be
     // retained in full during a prolonged outage, defeating the memory bound.
     const size = sizeOfUpdate(turn);
+    // A `reserved` append is the latest pre-mint plan being replayed LAST (after the
+    // buffered message/tool turns). Without headroom, a backlog those replayed turns
+    // just filled would make the plan — the single most valuable turn, restating the
+    // WHOLE plan — the first casualty of the drop-newest policy. Grant it ONE slot of
+    // headroom beyond BOTH caps, mirroring the pre-mint buffer already keeping the plan
+    // in its own slot outside the caps. It stays bounded: at most one extra in-flight
+    // turn, itself byte-capped at PLAN_OBJECT_CAP_CHARS by buildPlanContent — which now
+    // bounds the WHOLE plan content (entries included), not just `_meta.plan` (issue #230).
+    const reserved = opts?.reserved === true;
+    const countCap = maxPendingAppends > 0 ? maxPendingAppends + (reserved ? 1 : 0) : 0;
     if (
-      (maxPendingAppends > 0 && pendingAppends >= maxPendingAppends) ||
-      (maxPendingAppendBytes > 0 && pendingAppendBytes + size > maxPendingAppendBytes)
+      (countCap > 0 && pendingAppends >= countCap) ||
+      (!reserved && maxPendingAppendBytes > 0 && pendingAppendBytes + size > maxPendingAppendBytes)
     ) {
       appendsDropped += 1;
       if (!appendBacklogLogged) {
@@ -655,6 +779,9 @@ export function createAgentInstanceProducer(opts = {}) {
     }
     pendingAppends += 1;
     pendingAppendBytes += size;
+    // Whether the queued SDK call actually recorded the turn (did not reject/time out).
+    // Set inside the enqueued fn before it resolves, read by the `finally` below.
+    let succeeded = false;
     const appended = enqueue(async () => {
       const req = {
         agentInstanceKey,
@@ -680,6 +807,10 @@ export function createAgentInstanceProducer(opts = {}) {
         // response omits the field (older engine), so a genuine append is never
         // under-counted.
         appendedTurns += Array.isArray(res?.createdHistory) ? res.createdHistory.length : 1;
+        // The turn is persisted (the engine dedups by historyItemId, so an empty
+        // `createdHistory` still means the turn is durably present) — a resolved call
+        // is the success signal for `onSettled`.
+        succeeded = true;
       } catch (err) {
         const d = describeSdkError(err);
         // ONE canonical append-failure diagnostic (issue #230 / #229): the shaped
@@ -700,11 +831,20 @@ export function createAgentInstanceProducer(opts = {}) {
     });
     // Decrement the backlog when THIS append settles (enqueue's chain never rejects),
     // freeing a slot (and its bytes) for a later turn without affecting the serialized
-    // `queue`.
+    // `queue`. Then notify `onSettled` with whether the SDK call actually SUCCEEDED, so a
+    // dedup marker is advanced only for a genuinely persisted turn — a swallowed
+    // rejection/timeout reports `false`, keeping a later resend eligible.
     appended.finally(() => {
       pendingAppends -= 1;
       pendingAppendBytes -= size;
+      if (onSettled) {
+        try { onSettled(succeeded); } catch { /* dedup bookkeeping must never break the chain */ }
+      }
     });
+    // Signal that the turn was actually enqueued (not disabled/key-less or dropped for
+    // backlog). Enqueuing is NOT success — a caller that dedups on a persisted turn must
+    // wait for `onSettled(true)`; this only tells it the turn was accepted into the queue.
+    return true;
   };
 
   const flushMessage = () => {
@@ -755,6 +895,73 @@ export function createAgentInstanceProducer(opts = {}) {
     };
     appendTurn(turn, 'TOOL_CALLING');
   };
+
+  // One turn per DISTINCT plan: agents often resend an unchanged plan, and may re-emit
+  // an EARLIER plan (A → B → A) or resend a plan while another append is still settling,
+  // so a single last/current scalar marker is not enough — it only remembers the most
+  // recent hash and would let a re-emitted A enqueue a second append. Track the FULL set
+  // of recorded and in-flight content hashes instead (review round 4). `recordedPlanIds`
+  // holds every plan whose append actually SUCCEEDED; `inFlightPlanIds` holds every plan
+  // currently being appended, so a resend that races an in-flight append does not enqueue
+  // a duplicate. Advancing the recorded set only on a settled-successful append (not on
+  // enqueue) keeps a rejected/timed-out plan append — whose failure the queue swallows —
+  // eligible for a later resend instead of being lost (review round 3). Both sets are
+  // FIFO-bounded by PLAN_DEDUP_CAP so a pathological plan stream cannot grow them without
+  // limit; the engine still dedups an evicted-then-re-enqueued plan by its stable
+  // content-addressed historyItemId. The id is content-addressed like other turns.
+  const recordedPlanIds = new Set();
+  const inFlightPlanIds = new Set();
+  const rememberPlanId = (set, id) => {
+    set.add(id);
+    // Set preserves insertion order, so the first value is the oldest — evict it.
+    while (set.size > PLAN_DEDUP_CAP) set.delete(set.values().next().value);
+  };
+  const onPlan = (rawUpdate, opts) => {
+    const content = buildPlanContent(rawUpdate);
+    if (!content) return;
+    const id = shortHash(JSON.stringify(content[1].object));
+    // Already recorded, or an identical plan is still settling — skip either way so we
+    // neither double-record nor enqueue a duplicate in-flight append.
+    if (recordedPlanIds.has(id) || inFlightPlanIds.has(id)) return;
+    flushMessage();
+    rememberPlanId(inFlightPlanIds, id);
+    const enqueued = appendTurn(
+      {
+        // #247: plan turns are EXEMPT from the per-activation namespace. Unlike a
+        // continuation message / tool-call turn (whose ACP numbering restarts on resume,
+        // so it MUST be namespaced to avoid colliding with the prior activation's ids), a
+        // plan turn is content-addressed by the plan-object hash and represents idempotent
+        // LATEST state, not sequential work. Namespacing it would give the SAME latest plan
+        // a different historyItemId on each reactivation; since the in-memory dedup sets
+        // (recordedPlanIds/inFlightPlanIds) start EMPTY on a fresh activation, nothing would
+        // suppress the resend and the engine — seeing a new id — would append a DUPLICATE
+        // plan turn, breaking the documented one-turn-per-distinct-plan behavior. Keying on
+        // the stable `plan:${id}` (like the CONFIGURATION turn, also left un-namespaced) lets
+        // the engine's history-item dedup collapse an identical re-emitted plan across
+        // activations, while a genuinely new plan (new content → new id) still appends.
+        historyItemId: `plan:${id}`,
+        loopIteration,
+        role: 'ASSISTANT',
+        content,
+        producedAt: iso(),
+      },
+      undefined,
+      (ok) => {
+        // Advance the dedup set only when the append genuinely persisted the turn; a
+        // failed append leaves the recorded set untouched so a later resend of the SAME
+        // plan is recorded rather than silently discarded.
+        if (ok) rememberPlanId(recordedPlanIds, id);
+        // Clear this plan's in-flight guard now that its append settled so a subsequent
+        // resend is no longer blocked.
+        inFlightPlanIds.delete(id);
+      },
+      opts,
+    );
+    // The turn never entered the queue (disabled / no instance key / backlog drop): clear
+    // the in-flight guard now — `onSettled` will not fire — so a later resend can retry.
+    if (!enqueued) inFlightPlanIds.delete(id);
+  };
+  const isPlanUpdate = (rawUpdate) => recordPlans && isPlainObject(rawUpdate) && rawUpdate.sessionUpdate === 'plan';
 
   const onToolResult = (c) => {
     flushMessage();
@@ -1090,7 +1297,11 @@ export function createAgentInstanceProducer(opts = {}) {
   // the instance is already minted (an append needs the agentInstanceKey). Malformed
   // or ignored updates are dropped. Never throws. Shared by the hot path (`ingest`)
   // and the pre-mint replay so both translate a turn identically.
-  const ingestClassified = (rawUpdate) => {
+  const ingestClassified = (rawUpdate, opts) => {
+    if (isPlanUpdate(rawUpdate)) {
+      try { onPlan(rawUpdate, opts); } catch (err) { noteIngestFailure(err); }
+      return;
+    }
     let classified;
     try {
       classified = classify(rawUpdate);
@@ -1222,7 +1433,29 @@ export function createAgentInstanceProducer(opts = {}) {
     }
     return true;
   };
+  // Pre-mint, only the LATEST plan is kept (in its own slot, outside the count/byte
+  // caps): each plan update restates the whole plan, so older ones add nothing, and a
+  // plan burst must not starve message/tool updates (issue #230).
+  let preMintPlan = null;
   const bufferPreMint = (rawUpdate) => {
+    if (isPlanUpdate(rawUpdate)) {
+      const content = buildPlanContent(rawUpdate);
+      // Retain a NORMALIZED update rebuilt from the recorded content, not the raw one:
+      // buildPlanContent has already normalized the entries and applied the
+      // PLAN_OBJECT_CAP_CHARS cap to `_meta.plan`, so this bounds the retained slot to
+      // what would actually be persisted (dropping arbitrary extra fields and any
+      // over-cap `_meta.plan`) instead of pinning an unbounded raw update in memory
+      // for the whole pre-mint window (issue #230).
+      if (content) {
+        const object = content[1].object;
+        preMintPlan = {
+          sessionUpdate: 'plan',
+          entries: object.entries,
+          ...(object.plan !== undefined ? { _meta: { plan: object.plan } } : {}),
+        };
+      }
+      return;
+    }
     // Skip updates that will not persist a turn on replay so they cannot exhaust the
     // caps (issue #230). Not counted as a drop — dropping an ignored update loses no
     // transcript content.
@@ -1268,9 +1501,15 @@ export function createAgentInstanceProducer(opts = {}) {
           `updates ${correlation()}.`,
       );
     }
-    if (preMintBuffer.length === 0) return;
+    const plan = preMintPlan;
+    preMintPlan = null;
     const buffered = preMintBuffer.splice(0, preMintBuffer.length);
     for (const raw of buffered) ingestClassified(raw);
+    // Replay the latest plan LAST (it restates the whole plan, so it belongs after the
+    // turns it planned), but with a RESERVED append slot: the buffered turns just above
+    // may have filled the append backlog, and without headroom the drop-newest policy
+    // would make this — the single most valuable turn — the first casualty (issue #230).
+    if (plan) ingestClassified(plan, { reserved: true });
   };
 
   return {
@@ -1392,6 +1631,7 @@ export function createAgentInstanceProducer(opts = {}) {
       // The pre-mint buffer can never be replayed once finalized — release it (and its
       // counters) rather than pin it for the life of a still-hung uncancellable POST.
       preMintBuffer.length = 0;
+      preMintPlan = null;
       preMintBufferBytes = 0;
       preMintDropped = 0;
       // Flush appends already queued against a minted instance (best effort); no
@@ -1470,6 +1710,7 @@ export function createAgentInstanceProducer(opts = {}) {
         // retain the full buffer (up to preMintBufferMaxBytes) for the rest of the
         // process's life — a per-job memory leak with no possible payoff (issue #230).
         preMintBuffer.length = 0;
+        preMintPlan = null;
         preMintBufferBytes = 0;
         preMintDropped = 0;
         // Only warn when we actually attempted to mint (createAttempts > 0). A

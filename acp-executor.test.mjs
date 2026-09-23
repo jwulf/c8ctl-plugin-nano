@@ -22,7 +22,10 @@ import {
   runAgentJob,
   readAgentResultFile,
   normalizeTaskEnvelope,
+  acpSessionNewParams,
 } from './c8ctl-plugin.js';
+import { readFileSync } from 'node:fs';
+import { resolveEffectiveEnvelope } from './agent-resume.mjs';
 
 // The canonical transcript seams — consumed through the single agentic import
 // surface, the SAME `parseTranscriptEvent` / `deriveView` the cockpit uses and
@@ -152,8 +155,18 @@ process.stdin.on('data', (d) => {
 });
 
 function handle(m) {
-  if (m.method === 'initialize') { send({ jsonrpc: '2.0', id: m.id, result: { protocolVersion: 1, agentCapabilities: {} } }); return; }
-  if (m.method === 'session/new') { send({ jsonrpc: '2.0', id: m.id, result: { sessionId: 'sess-1' } }); return; }
+  if (m.method === 'initialize') {
+    // FAKE_PLAN_SEED: advertise the plan-seed extension (as rusty-harness does).
+    const agentCapabilities = process.env.FAKE_PLAN_SEED ? { _meta: { planSeed: true } } : {};
+    send({ jsonrpc: '2.0', id: m.id, result: { protocolVersion: 1, agentCapabilities } });
+    return;
+  }
+  if (m.method === 'session/new') {
+    // FAKE_RECORD_NEW: record the session/new params for the test to inspect.
+    if (process.env.FAKE_RECORD_NEW) writeFileSync(process.env.FAKE_RECORD_NEW, JSON.stringify(m.params));
+    send({ jsonrpc: '2.0', id: m.id, result: { sessionId: 'sess-1' } });
+    return;
+  }
   if (m.method === 'session/prompt') {
     if (promptId === null) {
       promptId = m.id;
@@ -711,6 +724,72 @@ test('runAgentJob (host) dispatches protocol:acp end-to-end without node-pty', a
   } finally {
     rmSync(dir, { recursive: true, force: true });
   }
+});
+
+test('acpSessionNewParams: a resume plan is sent only to an agent advertising _meta.planSeed', () => {
+  const plan = { goal: 'g', items: [{ id: 1, title: 'a', status: 'done' }] };
+  const seeding = { agentCapabilities: { _meta: { planSeed: true } } };
+  // Every other agent gets exactly the params it always got.
+  assert.deepEqual(acpSessionNewParams({ cwd: '/w', init: { agentCapabilities: {} }, resumePlan: plan }), { cwd: '/w', mcpServers: [] });
+  assert.deepEqual(acpSessionNewParams({ cwd: '/w', init: undefined, resumePlan: plan }), { cwd: '/w', mcpServers: [] });
+  assert.deepEqual(acpSessionNewParams({ cwd: '/w', init: { agentCapabilities: { _meta: { planSeed: 'yes' } } }, resumePlan: plan }), { cwd: '/w', mcpServers: [] });
+  // No plan (a cold run) → unchanged even for a seeding agent.
+  assert.deepEqual(acpSessionNewParams({ cwd: '/w', init: seeding, resumePlan: null }), { cwd: '/w', mcpServers: [] });
+  assert.deepEqual(acpSessionNewParams({ cwd: '/w', init: seeding, resumePlan: plan }), {
+    cwd: '/w',
+    mcpServers: [],
+    _meta: { plan, planInPrompt: true },
+  });
+});
+
+test('runAgentJob (acp) hands resumePlan to a plan-seeding agent in session/new', async () => {
+  const dir = mkdtempSync(join(tmpdir(), 'acp-plan-'));
+  try {
+    const resultFile = join(dir, 'result.json');
+    const recorded = join(dir, 'session-new.json');
+    const profile = { name: 'p', rank: 'senior', command: `node "${FAKE_AGENT}"`, model: '', capabilities: [], protocol: 'acp', permission: 'yolo' };
+    const job = { jobKey: 'jk', type: 'senior', variables: {}, customHeaders: {} };
+    const resumePlan = { entries: [{ content: 'step 1', status: 'completed' }] };
+    const run = (profileEnv) => runAgentJob(profile, job, {
+      sandbox: 'none', envelope: normalizeTaskEnvelope({}, {}), timeoutMs: 20_000, resultFile,
+      protocol: 'acp', permission: 'yolo', resumePlan, profileEnv,
+    });
+    let result = await run({ FAKE_PLAN_SEED: '1', FAKE_RECORD_NEW: recorded });
+    assert.equal(result.ok, true, result.error || result.stderr);
+    assert.deepEqual(JSON.parse(readFileSync(recorded, 'utf8'))._meta, { plan: resumePlan, planInPrompt: true });
+    result = await run({ FAKE_RECORD_NEW: recorded });
+    assert.equal(result.ok, true, result.error || result.stderr);
+    assert.equal(JSON.parse(readFileSync(recorded, 'utf8'))._meta, undefined, 'no capability → no _meta');
+  } finally {
+    rmSync(dir, { recursive: true, force: true });
+  }
+});
+
+test('workAgent handoff: resolveEffectiveEnvelope\'s plan feeds acpSessionNewParams as session/new _meta.plan', async () => {
+  // Covers the `resumePlan = resumed.plan ?? null` handoff in workAgent: the shape
+  // resolveEffectiveEnvelope returns as `plan` is exactly what acpSessionNewParams
+  // consumes as the session/new `_meta.plan` for a plan-seeding agent.
+  const RICH = { goal: 'g', items: [{ id: 1, title: 't', status: 'done' }] };
+  const ENTRIES = [{ content: 'e', status: 'completed' }];
+  const job = { leaseToken: 'l', elementInstanceKey: '9' };
+  const envelope = { task: { prompt: 'do it' } };
+  const seedingInit = { agentCapabilities: { _meta: { planSeed: true } } };
+  const seed = (resumePlan) => acpSessionNewParams({ cwd: '/w', init: seedingInit, resumePlan })._meta;
+
+  // A full plan flows through unchanged.
+  const rich = await resolveEffectiveEnvelope({ envelope, job, env: {}, readPrior: async () => ({ text: 'prior', historyCount: 1, plan: { entries: ENTRIES, plan: RICH } }) });
+  assert.deepEqual(rich.plan, RICH);
+  assert.deepEqual(seed(rich.plan ?? null), { plan: RICH, planInPrompt: true });
+
+  // An entries-only plan (agent sent no rich `_meta.plan`) flows through as `{ entries }`.
+  const entriesOnly = await resolveEffectiveEnvelope({ envelope, job, env: {}, readPrior: async () => ({ text: 'prior', historyCount: 1, plan: { entries: ENTRIES } }) });
+  assert.deepEqual(entriesOnly.plan, { entries: ENTRIES });
+  assert.deepEqual(seed(entriesOnly.plan ?? null), { plan: { entries: ENTRIES }, planInPrompt: true });
+
+  // No recorded plan → the handoff passes null and the agent gets no `_meta` at all.
+  const none = await resolveEffectiveEnvelope({ envelope, job, env: {}, readPrior: async () => ({ text: 'prior', historyCount: 1 }) });
+  assert.equal(none.plan ?? null, null);
+  assert.equal(seed(none.plan ?? null), undefined);
 });
 
 test.after(() => {

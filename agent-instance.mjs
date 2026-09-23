@@ -677,8 +677,13 @@ export function createAgentInstanceProducer(opts = {}) {
   };
 
   // Append one AgentHistory turn via updateAgentInstance (one turn per call keeps the
-  // dedup boundary crisp). Only ever runs once the instance is minted.
-  const appendTurn = (turn, status) => {
+  // dedup boundary crisp). Only ever runs once the instance is minted. `onSettled`, when
+  // given, is invoked once the append has actually settled with a boolean indicating
+  // whether the SDK call SUCCEEDED (did not reject/time out) — so a caller that dedups on
+  // a persisted turn (e.g. `onPlan`) advances its marker only after the turn was really
+  // recorded, never merely enqueued. A turn dropped for backlog / no-key never enqueues,
+  // so `onSettled` is not called and the synchronous return value is falsy.
+  const appendTurn = (turn, status, onSettled) => {
     if (disabled || !agentInstanceKey) return;
     // Backpressure (issue #230): during an AgentInstance outage each serialized append
     // can take up to finalizeTimeoutMs to settle, so an unbounded enqueue would let the
@@ -708,6 +713,9 @@ export function createAgentInstanceProducer(opts = {}) {
     }
     pendingAppends += 1;
     pendingAppendBytes += size;
+    // Whether the queued SDK call actually recorded the turn (did not reject/time out).
+    // Set inside the enqueued fn before it resolves, read by the `finally` below.
+    let succeeded = false;
     const appended = enqueue(async () => {
       const req = {
         agentInstanceKey,
@@ -733,6 +741,10 @@ export function createAgentInstanceProducer(opts = {}) {
         // response omits the field (older engine), so a genuine append is never
         // under-counted.
         appendedTurns += Array.isArray(res?.createdHistory) ? res.createdHistory.length : 1;
+        // The turn is persisted (the engine dedups by historyItemId, so an empty
+        // `createdHistory` still means the turn is durably present) — a resolved call
+        // is the success signal for `onSettled`.
+        succeeded = true;
       } catch (err) {
         const d = describeSdkError(err);
         // ONE canonical append-failure diagnostic (issue #230 / #229): the shaped
@@ -753,14 +765,19 @@ export function createAgentInstanceProducer(opts = {}) {
     });
     // Decrement the backlog when THIS append settles (enqueue's chain never rejects),
     // freeing a slot (and its bytes) for a later turn without affecting the serialized
-    // `queue`.
+    // `queue`. Then notify `onSettled` with whether the SDK call actually SUCCEEDED, so a
+    // dedup marker is advanced only for a genuinely persisted turn — a swallowed
+    // rejection/timeout reports `false`, keeping a later resend eligible.
     appended.finally(() => {
       pendingAppends -= 1;
       pendingAppendBytes -= size;
+      if (onSettled) {
+        try { onSettled(succeeded); } catch { /* dedup bookkeeping must never break the chain */ }
+      }
     });
     // Signal that the turn was actually enqueued (not disabled/key-less or dropped for
-    // backlog), so callers that dedup on a successful append (e.g. `onPlan`) can advance
-    // their marker only when the turn was really recorded.
+    // backlog). Enqueuing is NOT success — a caller that dedups on a persisted turn must
+    // wait for `onSettled(true)`; this only tells it the turn was accepted into the queue.
     return true;
   };
 
@@ -815,25 +832,44 @@ export function createAgentInstanceProducer(opts = {}) {
 
   // One turn per DISTINCT plan: agents often resend an unchanged plan, so a repeat of
   // the last recorded plan is skipped. The id is content-addressed like other turns.
+  // `lastPlanId` is the last plan whose append actually SUCCEEDED; `inFlightPlanId` is a
+  // plan currently being appended, so a resend that races the in-flight append does not
+  // enqueue a duplicate. Advancing the dedup marker only on a settled-successful append
+  // (not on enqueue) keeps a rejected/timed-out plan append — whose failure the queue
+  // swallows — eligible for a later resend instead of being lost (review round 3).
   let lastPlanId = null;
+  let inFlightPlanId = null;
   const onPlan = (rawUpdate) => {
     const content = buildPlanContent(rawUpdate);
     if (!content) return;
     const id = shortHash(JSON.stringify(content[1].object));
-    if (id === lastPlanId) return;
+    // Already recorded, or an identical plan is still settling — skip either way so we
+    // neither double-record nor enqueue a duplicate in-flight append.
+    if (id === lastPlanId || id === inFlightPlanId) return;
     flushMessage();
-    const appended = appendTurn({
-      historyItemId: nsHistoryId(`plan:${id}`),
-      loopIteration,
-      role: 'ASSISTANT',
-      content,
-      producedAt: iso(),
-    });
-    // Advance the dedup marker only when the turn was actually recorded: if the append
-    // threw (caught upstream by ingestClassified), was dropped for backlog, or the
-    // producer had no instance key yet, a later resend of the SAME plan must not be
-    // silently skipped as a duplicate of a turn that was never persisted.
-    if (appended) lastPlanId = id;
+    inFlightPlanId = id;
+    const enqueued = appendTurn(
+      {
+        historyItemId: nsHistoryId(`plan:${id}`),
+        loopIteration,
+        role: 'ASSISTANT',
+        content,
+        producedAt: iso(),
+      },
+      undefined,
+      (ok) => {
+        // Advance the dedup marker only when the append genuinely persisted the turn; a
+        // failed append leaves `lastPlanId` untouched so a later resend of the SAME plan
+        // is recorded rather than silently discarded.
+        if (ok) lastPlanId = id;
+        // Clear the in-flight guard only if it still points at THIS plan (a newer plan
+        // may have superseded it), so a subsequent resend is no longer blocked.
+        if (inFlightPlanId === id) inFlightPlanId = null;
+      },
+    );
+    // The turn never entered the queue (disabled / no instance key / backlog drop): clear
+    // the in-flight guard now — `onSettled` will not fire — so a later resend can retry.
+    if (!enqueued && inFlightPlanId === id) inFlightPlanId = null;
   };
   const isPlanUpdate = (rawUpdate) => recordPlans && isPlainObject(rawUpdate) && rawUpdate.sessionUpdate === 'plan';
 

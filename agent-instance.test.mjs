@@ -2442,3 +2442,76 @@ test('a plan dropped for a full append backlog does not poison the dedup marker 
     .filter((h) => h.historyItemId.includes(':plan:'));
   assert.equal(planTurns.length, 1, 'the resent plan is recorded after the backlog drains');
 });
+
+test('a plan append that REJECTS does not advance the dedup marker (records on resend) — review round 3', async () => {
+  // The queued SDK call swallows updateAgentInstance failures, so `appendTurn` enqueuing
+  // a turn is NOT proof it was persisted. The dedup marker must advance only after the
+  // append settles SUCCESSFULLY: a rejected (or timed-out) plan append leaves no history
+  // turn, so a later resend of the SAME plan must still be recorded, not skipped.
+  let updateCalls = 0;
+  const client = {
+    calls: { create: [], update: [] },
+    createAgentInstance: async (req) => { client.calls.create.push(req); return { agentInstanceKey: 'A' }; },
+    updateAgentInstance: async (req) => {
+      client.calls.update.push(req);
+      updateCalls += 1;
+      if (updateCalls === 1) throw new Error('boom: transient AgentInstance outage');
+      return { createdHistory: Array.isArray(req.history) ? req.history : [] };
+    },
+  };
+  const p = makeProducer(client);
+  await p.activate();
+
+  // First plan append is attempted but REJECTS (swallowed by the queue) → marker unchanged.
+  p.ingest(PLAN_UPDATE);
+  await p.drain();
+  assert.equal(client.calls.update.length, 1, 'the first plan append was attempted');
+
+  // Resend the SAME plan: because the first never persisted, it must be recorded now.
+  p.ingest(PLAN_UPDATE);
+  await p.drain();
+
+  const planTurns = client.calls.update
+    .filter((u) => Array.isArray(u.history))
+    .map((u) => u.history[0])
+    .filter((h) => h.historyItemId.includes(':plan:'));
+  assert.equal(planTurns.length, 2, 'the resent plan is recorded after the first append failed');
+});
+
+test('a plan resent while its first append is still in-flight does not enqueue a duplicate — review round 3', async () => {
+  // Advancing the dedup marker only on a settled-successful append opens a window where a
+  // resend could race the in-flight append and double-record it. An `inFlightPlanId`
+  // guard prevents a duplicate enqueue while the first append is still settling.
+  let release;
+  const gate = new Promise((resolve) => { release = resolve; });
+  let updateCalls = 0;
+  const client = {
+    calls: { create: [], update: [] },
+    createAgentInstance: async (req) => { client.calls.create.push(req); return { agentInstanceKey: 'A' }; },
+    updateAgentInstance: async (req) => {
+      client.calls.update.push(req);
+      updateCalls += 1;
+      if (updateCalls === 1) await gate; // first plan append hangs (in-flight)
+      return { createdHistory: Array.isArray(req.history) ? req.history : [] };
+    },
+  };
+  const p = makeProducer(client);
+  await p.activate();
+
+  p.ingest(PLAN_UPDATE); // enqueues the first plan append (hangs)
+  await new Promise((r) => setImmediate(r));
+  p.ingest(PLAN_UPDATE); // resend while in-flight → must NOT enqueue a duplicate
+  await new Promise((r) => setImmediate(r));
+  const midFlight = client.calls.update
+    .filter((u) => Array.isArray(u.history))
+    .filter((h) => h.history[0].historyItemId.includes(':plan:')).length;
+  assert.equal(midFlight, 1, 'the resend did not enqueue a duplicate while the first was in-flight');
+
+  release();
+  await p.drain();
+  const planTurns = client.calls.update
+    .filter((u) => Array.isArray(u.history))
+    .map((u) => u.history[0])
+    .filter((h) => h.historyItemId.includes(':plan:'));
+  assert.equal(planTurns.length, 1, 'exactly one plan turn recorded after the in-flight append settled');
+});

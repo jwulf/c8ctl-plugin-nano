@@ -208,8 +208,8 @@ export function renderPlan(recorded, { capChars = RESUME_PLAN_CAP_CHARS } = {}) 
       if (isNonBlank(plan.goal)) lines.push(`Goal: ${flat(plan.goal)}`);
       for (const item of plan.items) {
         if (!isPlainObject(item) || !isNonBlank(item.title)) continue;
-        const after = Array.isArray(item.after) && item.after.length ? ` (after ${item.after.join(', ')})` : '';
-        lines.push(`${ITEM_MARK[item.status] || '[ ]'} ${item.id}. ${flat(item.title)}${after}`);
+        const after = Array.isArray(item.after) && item.after.length ? ` (after ${item.after.map(flat).join(', ')})` : '';
+        lines.push(`${ITEM_MARK[item.status] || '[ ]'} ${flat(item.id)}. ${flat(item.title)}${after}`);
         const closed = item.status === 'done' || item.status === 'dropped';
         const notes = Array.isArray(item.notes) ? item.notes.filter(isNonBlank) : [];
         if (notes.length && (closed ? closedNotes : openNotes)) {

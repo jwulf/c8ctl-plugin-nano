@@ -34,8 +34,8 @@
 //   - UNCOMMITTED working-tree state is NOT recoverable by this module. This module
 //     resumes from last-pushed commit + transcript and treats uncommitted deltas as
 //     lost. The resume preamble tells the agent this explicitly so it re-derives any
-//     uncommitted work rather than assuming it survived. The opt-in WIP checkpoints
-//     (`agent-checkpoint.mjs`, NANO_AGENT_CHECKPOINT=on, #264) restore that state
+//     uncommitted work rather than assuming it survived. WIP checkpoints
+//     (`agent-checkpoint.mjs`, NANO_AGENT_CHECKPOINT, default auto, #264) restore that state
 //     separately and append a note that supersedes this statement.
 //
 // Everything at the process edge (the SDK read) is injected, so the orchestration is

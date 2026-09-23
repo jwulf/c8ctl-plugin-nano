@@ -90,7 +90,7 @@ import { createAgentInstanceProducer, isExternalAgentJob } from './agent-instanc
 // so the new agent CONTINUES rather than cold-reruns — at-least-once delivery becomes
 // a continuation, not a duplicate. Best-effort; degrades to the legacy cold rerun.
 import { resolveEffectiveEnvelope } from './agent-resume.mjs';
-import { checkpointConfig, checkpointRef, createGitRunner, fetchCheckpoint, restoreCheckpoint, createWorkspaceCheckpoint, createCheckpointer, deleteCheckpointRef, withCheckpointNote } from './agent-checkpoint.mjs';
+import { checkpointConfig, checkpointEligibility, checkpointRef, normalizeSecretValues, shouldSweep, sweepStaleCheckpoints, createGitRunner, fetchCheckpoint, restoreCheckpoint, createWorkspaceCheckpoint, createCheckpointer, deleteCheckpointRef, withCheckpointNote } from './agent-checkpoint.mjs';
 
 const requireFromHere = createRequire(import.meta.url);
 const pluginDir = dirname(fileURLToPath(import.meta.url));
@@ -5390,15 +5390,19 @@ function shouldPreserveRunDir(gitResult) {
 }
 
 // #264: WIP checkpoint wiring for one host-provisioned job (see agent-checkpoint.mjs).
-// Returns null when disabled/unavailable, else `{ checkpointer, restored,
-// flushTimeoutMs, discard() }`. Never throws — checkpoints are best-effort.
-async function setupWorkspaceCheckpoints({ provisioned, job, jobType, runId, camunda, logger, corr = '', env = process.env, deps = {} }) {
+// Returns null when disabled/ineligible/unavailable, else `{ checkpointer,
+// restored, flushTimeoutMs, discard(), close() }`. Never throws — best-effort.
+async function setupWorkspaceCheckpoints({ provisioned, envelope = null, token = null, secretValues = [], job, jobType, runId, camunda, logger, corr = '', env = process.env, deps = {} }) {
   const cfg = checkpointConfig(env);
-  if (!cfg.enabled || !provisioned?.workspaceDir) return null;
   const prefix = `[${jobType}] job ${job?.jobKey}`;
+  const eligible = checkpointEligibility({ mode: cfg.mode, provisioned, envelope, token });
+  if (!eligible.enabled) {
+    if (provisioned?.workspaceDir) logger.debug?.(`${prefix}: WIP checkpoints off for this job — ${eligible.reason}.`);
+    return null;
+  }
   const ref = checkpointRef(job?.elementInstanceKey);
   if (!ref) {
-    logger.warn?.(`${prefix}: WIP checkpoints enabled but the job has no usable elementInstanceKey — checkpoints off for this job.`);
+    if (cfg.mode === 'on') logger.warn?.(`${prefix}: WIP checkpoints enabled but the job has no usable elementInstanceKey — checkpoints off for this job.`);
     return null;
   }
   const {
@@ -5406,6 +5410,8 @@ async function setupWorkspaceCheckpoints({ provisioned, job, jobType, runId, cam
     fetchCheckpoint: fetchCp = fetchCheckpoint,
     restoreCheckpoint: restoreCp = restoreCheckpoint,
     deleteCheckpointRef: deleteCp = deleteCheckpointRef,
+    sweep = sweepStaleCheckpoints,
+    now = () => Date.now(),
   } = deps;
   const log = {
     warn: (m) => logger.warn?.(`${prefix} (${corr}): ${m}`),
@@ -5440,6 +5446,23 @@ async function setupWorkspaceCheckpoints({ provisioned, job, jobType, runId, cam
       }
     }
 
+    // Orphan GC for this remote, throttled per worker process, in the background.
+    let gc = Promise.resolve();
+    const gcKey = provisioned.remote || provisioned.workspaceDir;
+    if (shouldSweep(gcKey, { everyMs: cfg.gcEveryMs, now: now(), registry: deps.sweepRegistry })) {
+      const isTerminal = typeof camunda?.getElementInstance === 'function'
+        ? async (key) => {
+          const ei = await camunda.getElementInstance({ elementInstanceKey: key }, { consistency: { waitUpToMs: 0 } });
+          return ei?.state === 'COMPLETED' || ei?.state === 'TERMINATED';
+        }
+        : null;
+      gc = sweep({ git, ownRef: ref, ttlMs: cfg.ttlMs, graceMs: cfg.gcGraceMs, isTerminal, now })
+        .then((r) => {
+          if (r?.deleted?.length) logger.info?.(`${prefix} (${corr}): reclaimed ${r.deleted.length} orphaned WIP checkpoint ref(s): ${r.deleted.map((d) => `${d.ref} [${d.why}]`).join(', ')}.`);
+          else if (r?.error) log.debug(`WIP checkpoint GC skipped — ${oneLineLog(r.error)}.`);
+        }, (err) => log.debug(`WIP checkpoint GC threw — ${oneLineLog(err?.message || err)}.`));
+    }
+
     const branch = provisioned.workingBranch || null;
     let varWarned = false;
     const setVar = typeof camunda?.createElementInstanceVariables === 'function' && job?.elementInstanceKey
@@ -5464,6 +5487,7 @@ async function setupWorkspaceCheckpoints({ provisioned, job, jobType, runId, cam
       expectSha: prior?.sha || '',
       priorRunId: prior?.runId || '',
       maxFileBytes: cfg.maxFileBytes,
+      secretValues: normalizeSecretValues([...(secretValues || []), token]),
       message: `nano: WIP checkpoint for job ${job.jobKey}`,
     });
     const checkpointer = createCheckpointer({
@@ -5478,9 +5502,13 @@ async function setupWorkspaceCheckpoints({ provisioned, job, jobType, runId, cam
     });
     return {
       ref,
+      mode: cfg.mode,
       checkpointer,
       restored,
       flushTimeoutMs: cfg.flushTimeoutMs,
+      // Stop snapshotting and wait for in-flight git work (checkpoint + GC) so the
+      // run dir can be reaped safely.
+      async close() { await checkpointer.stop(); await gc; },
       async discard() {
         await checkpointer.stop();
         try {
@@ -10462,11 +10490,11 @@ async function workAgent(req, flags, ctx) {
           return;
         }
 
-        // #264: WIP checkpoints (opt-in, NANO_AGENT_CHECKPOINT=on). Restore a prior
+        // #264: WIP checkpoints (NANO_AGENT_CHECKPOINT=auto|on|off, default auto). Restore a prior
         // attempt's snapshot into the fresh clone, then snapshot the workspace to
         // `refs/nano/wip/<elementInstanceKey>` as the run progresses. Best-effort:
         // any failure logs and degrades to the transcript-only resume.
-        const checkpointing = await setupWorkspaceCheckpoints({ provisioned, job, jobType, runId, camunda, logger, corr: aiCorr });
+        const checkpointing = await setupWorkspaceCheckpoints({ provisioned, envelope, token: repoToken, secretValues: Object.values(resolved || {}), job, jobType, runId, camunda, logger, corr: aiCorr });
         if (checkpointing?.restored) effectiveEnvelope = withCheckpointNote(effectiveEnvelope, checkpointing.restored);
         const checkpointer = checkpointing?.checkpointer ?? null;
 
@@ -10691,7 +10719,7 @@ async function workAgent(req, flags, ctx) {
           // finalization error keeps this false so the relay close is 'error'.
           runCompleted = !gitFinalizeFailed;
         } finally {
-          checkpointer?.stop();
+          if (checkpointing) { try { await checkpointing.close(); } catch { /* best effort */ } }
           if (isContainer) liveRunIds.delete(runId);
           // #205: clear the in-flight job marker now the harness has stopped — the
           // owning lifecycle's finally is the authoritative "job finished" signal,

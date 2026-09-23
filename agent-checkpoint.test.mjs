@@ -5,7 +5,7 @@ import { tmpdir } from 'node:os';
 import { join } from 'node:path';
 import { spawnSync } from 'node:child_process';
 import {
-  checkpointConfig, checkpointRef, isDeniedPath, isCheckpointTrigger, createGitRunner,
+  checkpointConfig, checkpointRef, checkpointEligibility, classifyPushFailure, containsSecret, normalizeSecretValues, shouldSweep, sweepStaleCheckpoints, isDeniedPath, isCheckpointTrigger, createGitRunner,
   snapshotWorktree, pushCheckpoint, fetchCheckpoint, restoreCheckpoint, deleteCheckpointRef,
   createWorkspaceCheckpoint, createCheckpointer, withCheckpointNote,
 } from './agent-checkpoint.mjs';
@@ -42,7 +42,11 @@ function fixture() {
 }
 
 test('config, ref, deny-list, triggers', () => {
-  assert.equal(checkpointConfig({}).enabled, false);
+  assert.equal(checkpointConfig({}).mode, 'auto');
+  assert.equal(checkpointConfig({ NANO_AGENT_CHECKPOINT: 'off' }).enabled, false);
+  assert.equal(checkpointConfig({ NANO_AGENT_CHECKPOINT: '0' }).mode, 'off');
+  assert.equal(checkpointConfig({ NANO_AGENT_CHECKPOINT: 'true' }).mode, 'on');
+  assert.equal(checkpointConfig({ NANO_AGENT_CHECKPOINT: 'bogus' }).mode, 'auto');
   const c = checkpointConfig({ NANO_AGENT_CHECKPOINT: 'on', NANO_AGENT_CHECKPOINT_MIN_INTERVAL_MS: '10', NANO_AGENT_CHECKPOINT_INTERVAL_MS: '0' });
   assert.equal(c.enabled, true);
   assert.equal(c.minIntervalMs, 5000);
@@ -58,6 +62,37 @@ test('config, ref, deny-list, triggers', () => {
   assert.ok(!isCheckpointTrigger({ sessionUpdate: 'agent_message_chunk' }));
 });
 
+test('auto eligibility: only provisioned, authenticated, pushing jobs on a working branch', () => {
+  const provisioned = { workspaceDir: '/w', workingBranch: 'feat/x' };
+  const envelope = { branch: {} };
+  assert.equal(checkpointEligibility({ mode: 'auto', provisioned, envelope, token: 't' }).enabled, true);
+  assert.match(checkpointEligibility({ mode: 'auto', provisioned, envelope: { branch: { push: false } }, token: 't' }).reason, /branch\.push=false/);
+  assert.match(checkpointEligibility({ mode: 'auto', provisioned, envelope: { branch: { push: 'false' } }, token: 't' }).reason, /branch\.push=false/);
+  assert.match(checkpointEligibility({ mode: 'auto', provisioned, envelope, token: null }).reason, /anonymous/);
+  assert.match(checkpointEligibility({ mode: 'auto', provisioned: { workspaceDir: '/w' }, envelope, token: 't' }).reason, /detached/);
+  assert.equal(checkpointEligibility({ mode: 'auto', provisioned: null, envelope, token: 't' }).enabled, false);
+  assert.equal(checkpointEligibility({ mode: 'on', provisioned: { workspaceDir: '/w' }, envelope: { branch: { push: false } }, token: null }).enabled, true);
+  assert.equal(checkpointEligibility({ mode: 'off', provisioned, envelope, token: 't' }).enabled, false);
+});
+
+test('push failures are classified, not lumped together as "rejected"', () => {
+  assert.equal(classifyPushFailure(' ! [rejected]        abc -> refs/nano/wip/1 (stale info)'), 'lease');
+  assert.equal(classifyPushFailure('remote: error: GH013: Repository rule violations found for refs/nano/wip/1.\n ! [remote rejected] abc -> refs/nano/wip/1 (push declined due to repository rule violations)'), 'policy');
+  assert.equal(classifyPushFailure('remote: - GITHUB PUSH PROTECTION\n ! [remote rejected] (push declined due to secret scanning)'), 'policy');
+  assert.equal(classifyPushFailure('remote: Permission to o/r.git denied to bot.\nfatal: unable to access: The requested URL returned error: 403'), 'auth');
+  assert.equal(classifyPushFailure('fatal: unable to access: Could not resolve host: github.com'), 'transient');
+});
+
+test('secret content detection: known values and common formats', () => {
+  const vals = normalizeSecretValues(['short', '  s3cr3t-value-123  ', null, 's3cr3t-value-123']);
+  assert.deepEqual(vals, ['s3cr3t-value-123']);
+  assert.ok(containsSecret('token = s3cr3t-value-123', vals));
+  assert.ok(containsSecret('-----BEGIN OPENSSH PRIVATE KEY-----\nabc'));
+  assert.ok(containsSecret(`GH=ghp_${'a'.repeat(36)}`));
+  assert.ok(containsSecret('aws AKIAABCDEFGHIJKLMNOP'));
+  assert.ok(!containsSecret('const x = process.env.GITHUB_TOKEN;', vals));
+});
+
 test('snapshot leaves HEAD/index/branch untouched and honours ignore + deny + size', async () => {
   const f = fixture();
   try {
@@ -69,14 +104,16 @@ test('snapshot leaves HEAD/index/branch untouched and honours ignore + deny + si
     writeFileSync(join(dir, 'new.txt'), 'new\n');
     writeFileSync(join(dir, '.env'), 'SECRET=1\n');
     writeFileSync(join(dir, 'big.bin'), Buffer.alloc(2048));
+    writeFileSync(join(dir, 'config.js'), 'module.exports = { token: "s3cr3t-value-123" };\n');
+    writeFileSync(join(dir, 'a-key.txt'), '-----BEGIN RSA PRIVATE KEY-----\nMIIE\n');
     mkdirSync(join(dir, 'ignored'));
     writeFileSync(join(dir, 'ignored', 'x'), 'x');
     sh(dir, 'add', 'new.txt'); // agent's own staging must survive
     const statusBefore = sh(dir, 'status', '--porcelain');
 
-    const snap = await snapshotWorktree({ git, baseSha: base, maxFileBytes: 1024 });
+    const snap = await snapshotWorktree({ git, baseSha: base, maxFileBytes: 1024, secretValues: ['s3cr3t-value-123'] });
     assert.ok(snap.sha, JSON.stringify(snap));
-    assert.deepEqual(snap.excluded.map((e) => e.path).sort(), ['.env', 'big.bin']);
+    assert.deepEqual(snap.excluded.map((e) => `${e.path}:${e.why}`).sort(), ['.env:denied', 'a-key.txt:secret-content', 'big.bin:too-large', 'config.js:secret-content']);
     assert.equal(sh(dir, 'rev-parse', 'HEAD'), base);
     assert.equal(sh(dir, 'status', '--porcelain'), statusBefore);
     const files = sh(dir, 'ls-tree', '-r', '--name-only', snap.sha).split('\n').sort();
@@ -85,7 +122,7 @@ test('snapshot leaves HEAD/index/branch untouched and honours ignore + deny + si
     assert.equal(sh(dir, 'rev-parse', `${snap.sha}^`), base);
     assert.match(sh(dir, 'log', '-1', '--format=%B', snap.sha), new RegExp(`Nano-Checkpoint-Base: ${base}`));
 
-    assert.deepEqual(await snapshotWorktree({ git, baseSha: base, maxFileBytes: 1024, lastTree: { tree: snap.tree, head: snap.head } }), { skipped: 'unchanged' });
+    assert.deepEqual(await snapshotWorktree({ git, baseSha: base, maxFileBytes: 1024, secretValues: ['s3cr3t-value-123'], lastTree: { tree: snap.tree, head: snap.head } }), { skipped: 'unchanged' });
   } finally { f.cleanup(); }
 });
 
@@ -209,6 +246,59 @@ test('ownership: a newer run takes over from a superseded run\'s late write; the
   } finally { f.cleanup(); }
 });
 
+test('a policy rejection stops checkpointing without the takeover path', async () => {
+  const calls = [];
+  const git = async (args) => {
+    calls.push(args.join(' '));
+    if (args[0] === 'rev-parse' && args[1] === '--verify') return { status: 0, stdout: 'h\n', stderr: '' };
+    if (args[0] === 'rev-parse') return { status: 0, stdout: 'treeHead\n', stderr: '' };
+    if (args[0] === 'write-tree') return { status: 0, stdout: `t${calls.length}\n`, stderr: '' };
+    if (args[0] === 'commit-tree') return { status: 0, stdout: 'c\n', stderr: '' };
+    if (args[0] === 'push') return { status: 1, stdout: '', stderr: ' ! [remote rejected] c -> refs/nano/wip/1 (push declined due to repository rule violations)' };
+    return { status: 0, stdout: '', stderr: '' };
+  };
+  const take = createWorkspaceCheckpoint({ git, ref: 'refs/nano/wip/1', baseSha: 'b', expectSha: 'old', priorRunId: 'r0' });
+  const res = await take('tool');
+  assert.equal(res.kind, 'policy');
+  assert.match(res.disabled, /repository rule/);
+  assert.ok(!calls.some((c) => c.startsWith('fetch')), 'no takeover fetch on a policy rejection');
+  assert.match((await take('tool')).skipped, /^disabled/);
+});
+
+test('GC deletes TTL-expired and terminal-element refs, keeps own/unknown/fresh ones', async () => {
+  const f = fixture();
+  try {
+    const w = f.clone('w');
+    const base = sh(w.dir, 'rev-parse', 'HEAD');
+    const put = async (key, ageMs) => {
+      const date = `${Math.floor((Date.now() - ageMs) / 1000)} +0000`;
+      const git = createGitRunner({ cwd: w.dir, env: { ...ENV, GIT_COMMITTER_DATE: date } });
+      writeFileSync(join(w.dir, 'x.txt'), key);
+      const snap = await snapshotWorktree({ git, baseSha: base });
+      assert.ok((await pushCheckpoint({ git, ref: checkpointRef(key), sha: snap.sha })).ok);
+    };
+    const DAY = 86_400_000;
+    await put('1', 8 * DAY); // ttl
+    await put('2', 2 * 3_600_000); // terminal
+    await put('3', 2 * 3_600_000); // unknown to engine
+    await put('4', 60_000); // fresh, terminal but inside grace
+    await put('5', 9 * DAY); // own ref, never swept
+    const looked = [];
+    const isTerminal = async (key) => { looked.push(key); if (key === '3') throw new Error('404'); return key === '2' || key === '4'; };
+    const r = await sweepStaleCheckpoints({ git: w.git, ownRef: checkpointRef('5'), ttlMs: 7 * DAY, graceMs: 3_600_000, isTerminal });
+    assert.deepEqual(r.deleted.map((d) => `${d.ref}:${d.why}`).sort(), ['refs/nano/wip/1:ttl', 'refs/nano/wip/2:element-terminal']);
+    assert.deepEqual(looked.sort(), ['2', '3']);
+    const left = sh(f.root, '--git-dir', f.remote, 'for-each-ref', '--format=%(refname)', 'refs/nano/wip/').split('\n').sort();
+    assert.deepEqual(left, ['refs/nano/wip/3', 'refs/nano/wip/4', 'refs/nano/wip/5']);
+    assert.equal(sh(w.dir, 'for-each-ref', 'refs/nano-gc/'), '', 'temporary GC refs are cleaned up');
+
+    const reg = new Map();
+    assert.equal(shouldSweep('r', { everyMs: 1000, now: 0, registry: reg }), true);
+    assert.equal(shouldSweep('r', { everyMs: 1000, now: 500, registry: reg }), false);
+    assert.equal(shouldSweep('r', { everyMs: 1000, now: 1500, registry: reg }), true);
+  } finally { f.cleanup(); }
+});
+
 test('checkpointer rate-limits, coalesces triggers and flushes', async () => {
   let t = 0;
   const timers = [];
@@ -269,9 +359,14 @@ const quietLogger = () => {
   return { lines, info: (m) => lines.info.push(m), warn: (m) => lines.warn.push(m), debug: (m) => lines.debug.push(m) };
 };
 
-test('setupWorkspaceCheckpoints: off by default and without an elementInstanceKey', async () => {
+test('setupWorkspaceCheckpoints: auto skips ineligible jobs; off / no elementInstanceKey disable', async () => {
   const provisioned = { workspaceDir: '/nonexistent' };
-  assert.equal(await setupWorkspaceCheckpoints({ provisioned, job: { jobKey: '1', elementInstanceKey: '2' }, jobType: 't', runId: 'r', logger: quietLogger(), env: {} }), null);
+  const job = { jobKey: '1', elementInstanceKey: '2' };
+  const l0 = quietLogger();
+  assert.equal(await setupWorkspaceCheckpoints({ provisioned, envelope: {}, token: 't', job, jobType: 't', runId: 'r', logger: l0, env: {} }), null);
+  assert.match(l0.lines.debug[0], /detached/);
+  assert.equal(await setupWorkspaceCheckpoints({ provisioned: { ...provisioned, workingBranch: 'b' }, envelope: { branch: { push: false } }, token: 't', job, jobType: 't', runId: 'r', logger: quietLogger(), env: {} }), null);
+  assert.equal(await setupWorkspaceCheckpoints({ provisioned: { ...provisioned, workingBranch: 'b' }, envelope: {}, token: 't', job, jobType: 't', runId: 'r', logger: quietLogger(), env: { NANO_AGENT_CHECKPOINT: 'off' } }), null);
   const logger = quietLogger();
   assert.equal(await setupWorkspaceCheckpoints({ provisioned, job: { jobKey: '1' }, jobType: 't', runId: 'r', logger, env: { NANO_AGENT_CHECKPOINT: 'on' } }), null);
   assert.match(logger.lines.warn[0], /no usable elementInstanceKey/);
@@ -291,7 +386,7 @@ test('setupWorkspaceCheckpoints: checkpoint → variable → restore on the next
     const camunda = { createElementInstanceVariables: async (input) => { vars.push(input); } };
 
     const p1 = provision('run1');
-    const s1 = await setupWorkspaceCheckpoints({ provisioned: p1, job, jobType: 't', runId: 'run-1', camunda, logger: quietLogger(), env });
+    const s1 = await setupWorkspaceCheckpoints({ provisioned: p1, job, jobType: 't', runId: 'run-1', camunda, logger: quietLogger(), env, deps: { sweepRegistry: new Map() } });
     assert.equal(s1.restored, null);
     writeFileSync(join(p1.workspaceDir, 'wip.txt'), 'half done\n');
     const res = await s1.checkpointer.flush('abort', { timeoutMs: 0 });
@@ -304,11 +399,13 @@ test('setupWorkspaceCheckpoints: checkpoint → variable → restore on the next
 
     const p2 = provision('run2');
     const logger = quietLogger();
-    const s2 = await setupWorkspaceCheckpoints({ provisioned: p2, job, jobType: 't', runId: 'run-2', camunda, logger, env });
+    await s1.close();
+    const s2 = await setupWorkspaceCheckpoints({ provisioned: p2, job, jobType: 't', runId: 'run-2', camunda, logger, env, deps: { sweepRegistry: new Map() } });
     assert.equal(s2.restored?.restored, true);
     assert.match(logger.lines.info.join('\n'), /restored WIP checkpoint refs\/nano\/wip\/99/);
     assert.equal(readFileSync(join(p2.workspaceDir, 'wip.txt'), 'utf8'), 'half done\n');
     await s2.discard();
+    await s2.close();
     assert.throws(() => sh(f.root, '--git-dir', f.remote, 'rev-parse', '--verify', 'refs/nano/wip/99'));
   } finally { f.cleanup(); }
 });
@@ -320,18 +417,19 @@ test('setupWorkspaceCheckpoints: a variable-write failure warns once and never b
     const provisioned = { workspaceDir: dir, gitEnv: ENV, committer: {}, startSha: sh(dir, 'rev-parse', 'HEAD') };
     const logger = quietLogger();
     const camunda = { createElementInstanceVariables: async () => { throw new Error('404 not supported'); } };
-    const s = await setupWorkspaceCheckpoints({ provisioned, job: { jobKey: '1', elementInstanceKey: '5' }, jobType: 't', runId: 'r', camunda, logger, env: { NANO_AGENT_CHECKPOINT: 'on', NANO_AGENT_CHECKPOINT_INTERVAL_MS: '0' } });
+    const s = await setupWorkspaceCheckpoints({ provisioned, job: { jobKey: '1', elementInstanceKey: '5' }, jobType: 't', runId: 'r', camunda, logger, env: { NANO_AGENT_CHECKPOINT: 'on', NANO_AGENT_CHECKPOINT_INTERVAL_MS: '0' }, deps: { sweepRegistry: new Map() } });
     writeFileSync(join(dir, 'a.txt'), 'changed\n');
     assert.ok((await s.checkpointer.flush('failed', { timeoutMs: 0 })).sha);
     assert.equal(logger.lines.warn.filter((l) => /agentCheckpoint variable/.test(l)).length, 1);
     assert.ok(sh(f.root, '--git-dir', f.remote, 'rev-parse', 'refs/nano/wip/5'));
+    await s.close();
   } finally { f.cleanup(); }
 });
 
 test('job handler wires checkpoints: notify on ACP updates, flush on abort/failure, stop before finalize, discard after', () => {
   const src = readFileSync(new URL('./c8ctl-plugin.js', import.meta.url), 'utf8');
   const i = (s) => { const at = src.indexOf(s); assert.ok(at >= 0, `missing: ${s}`); return at; };
-  const setup = i('await setupWorkspaceCheckpoints({ provisioned, job, jobType, runId, camunda');
+  const setup = i('await setupWorkspaceCheckpoints({ provisioned, envelope, token: repoToken, secretValues: Object.values(resolved');
   const note = i('effectiveEnvelope = withCheckpointNote(effectiveEnvelope, checkpointing.restored)');
   const notify = i('checkpointer?.notify(u)');
   const abort = i("await checkpointer.flush('abort'");
@@ -341,4 +439,6 @@ test('job handler wires checkpoints: notify on ACP updates, flush on abort/failu
   const discard = i('await checkpointing.discard()');
   assert.ok(setup < note && note < notify && notify < abort && abort < failed && failed < stop && stop < finalize && finalize < discard);
   assert.ok(src.indexOf('envelope: effectiveEnvelope', setup) > setup, 'the restored note reaches the harness envelope');
+  const close = i('await checkpointing.close()');
+  assert.ok(close > discard && close < src.indexOf('rmSync(runDir', close), 'in-flight git work drains before the run dir is reaped');
 });

@@ -20,8 +20,14 @@
 //     prior run's base→snapshot diff onto the new HEAD (`--3way`), else skip.
 //   - Delete the ref after a successful finalize.
 //
-// Everything is BEST-EFFORT and opt-in (`NANO_AGENT_CHECKPOINT=on`): any failure
-// is logged and degrades to today's behaviour (transcript-only resume). Git runs
+//   - GC: a throttled background sweep deletes WIP refs past a TTL, or whose
+//     element instance the engine reports terminal (orphans from cancelled or
+//     never-reactivated jobs).
+//
+// Mode (`NANO_AGENT_CHECKPOINT`): `auto` (default) runs only for provisioned jobs
+// that already push an authenticated working branch; `on` forces it for any
+// provisioned job; `off` disables. Everything is BEST-EFFORT: any failure is
+// logged and degrades to today's behaviour (transcript-only resume). Git runs
 // ASYNC here (not spawnSync) so a slow push never blocks the ACP event loop.
 
 import { spawn } from 'node:child_process';
@@ -39,6 +45,9 @@ const DEFAULTS = Object.freeze({
   maxFileBytes: 5 * 1024 * 1024,
   gitTimeoutMs: 60_000,
   flushTimeoutMs: 20_000,
+  ttlMs: 7 * 24 * 60 * 60 * 1000,
+  gcGraceMs: 60 * 60 * 1000,
+  gcEveryMs: 60 * 60 * 1000,
 });
 const MIN_INTERVAL_FLOOR_MS = 5_000;
 
@@ -62,22 +71,81 @@ export function isDeniedPath(path) {
   return DENY_PATTERNS.some((re) => re.test(p));
 }
 
+// Content patterns for well-known credential formats. A changed file whose text
+// matches any of these (or contains a secret value this job was given) is kept
+// out of the snapshot.
+export const SECRET_CONTENT_PATTERNS = Object.freeze([
+  /-----BEGIN [A-Z ]*PRIVATE KEY-----/,
+  /\b(?:ghp|gho|ghu|ghs|ghr)_[A-Za-z0-9]{36,}\b/,
+  /\bgithub_pat_[A-Za-z0-9_]{60,}\b/,
+  /\b(?:AKIA|ASIA)[0-9A-Z]{16}\b/,
+  /\bxox[abposr]-[A-Za-z0-9-]{10,}\b/,
+  /\bsk-(?:proj-|ant-)?[A-Za-z0-9_-]{32,}\b/,
+  /\bAIza[0-9A-Za-z_-]{35}\b/,
+  /\bnpm_[A-Za-z0-9]{36}\b/,
+]);
+const MIN_SECRET_VALUE_LEN = 8;
+
+export function normalizeSecretValues(values) {
+  const out = new Set();
+  for (const v of values || []) {
+    const s = typeof v === 'string' ? v.trim() : '';
+    if (s.length >= MIN_SECRET_VALUE_LEN) out.add(s);
+  }
+  return [...out];
+}
+
+export function containsSecret(text, secretValues = []) {
+  const t = String(text ?? '');
+  if (!t) return false;
+  if (secretValues.some((v) => t.includes(v))) return true;
+  return SECRET_CONTENT_PATTERNS.some((re) => re.test(t));
+}
+
 const truthy = (v) => /^(1|on|true|yes)$/i.test(String(v ?? '').trim());
 const intOr = (v, dflt) => {
   const n = Number.parseInt(String(v ?? ''), 10);
   return Number.isFinite(n) && n >= 0 ? n : dflt;
 };
 
+const MODES = new Set(['auto', 'on', 'off']);
+export function checkpointMode(value) {
+  const v = String(value ?? '').trim().toLowerCase();
+  if (!v) return 'auto';
+  if (MODES.has(v)) return v;
+  if (truthy(v)) return 'on';
+  if (/^(0|false|no|disabled?)$/.test(v)) return 'off';
+  return 'auto';
+}
+
 export function checkpointConfig(env = process.env) {
+  const mode = checkpointMode(env.NANO_AGENT_CHECKPOINT);
   return {
-    enabled: truthy(env.NANO_AGENT_CHECKPOINT),
+    mode,
+    enabled: mode !== 'off',
     minIntervalMs: Math.max(MIN_INTERVAL_FLOOR_MS, intOr(env.NANO_AGENT_CHECKPOINT_MIN_INTERVAL_MS, DEFAULTS.minIntervalMs)),
     // 0 disables the safety-net timer (event-driven + final flush only).
     intervalMs: intOr(env.NANO_AGENT_CHECKPOINT_INTERVAL_MS, DEFAULTS.intervalMs),
     maxFileBytes: intOr(env.NANO_AGENT_CHECKPOINT_MAX_FILE_BYTES, DEFAULTS.maxFileBytes),
+    ttlMs: intOr(env.NANO_AGENT_CHECKPOINT_TTL_MS, DEFAULTS.ttlMs),
+    gcGraceMs: DEFAULTS.gcGraceMs,
+    gcEveryMs: DEFAULTS.gcEveryMs,
     gitTimeoutMs: DEFAULTS.gitTimeoutMs,
     flushTimeoutMs: DEFAULTS.flushTimeoutMs,
   };
+}
+
+// Should this job checkpoint? `auto` only when the job already publishes its work:
+// a provisioned, authenticated clone on a symbolic working branch that pushes.
+export function checkpointEligibility({ mode, provisioned, envelope, token }) {
+  if (mode === 'off') return { enabled: false, reason: 'NANO_AGENT_CHECKPOINT=off' };
+  if (!provisioned?.workspaceDir) return { enabled: false, reason: 'no provisioned workspace' };
+  if (mode === 'on') return { enabled: true, reason: 'NANO_AGENT_CHECKPOINT=on' };
+  const push = envelope?.branch?.push;
+  if (push === false || /^(false|0|no|off)$/i.test(String(push ?? ''))) return { enabled: false, reason: 'job does not push (branch.push=false)' };
+  if (!token) return { enabled: false, reason: 'anonymous clone (no push credentials)' };
+  if (!provisioned.workingBranch) return { enabled: false, reason: 'detached checkout (no working branch)' };
+  return { enabled: true, reason: 'auto: job pushes an authenticated working branch' };
 }
 
 export function checkpointRef(elementInstanceKey) {
@@ -113,7 +181,7 @@ const errText = (r) => (r?.stderr || r?.stdout || '').trim().split('\n').slice(-
 
 // Build a shadow commit of the working tree. Never writes the real index/refs.
 // Returns { sha, tree, head, excluded } or { skipped: reason }.
-export async function snapshotWorktree({ git, baseSha = '', runId = '', lastTree = null, maxFileBytes = DEFAULTS.maxFileBytes, message = 'nano: WIP checkpoint' }) {
+export async function snapshotWorktree({ git, baseSha = '', runId = '', lastTree = null, maxFileBytes = DEFAULTS.maxFileBytes, secretValues = [], message = 'nano: WIP checkpoint' }) {
   const head = await git(['rev-parse', '--verify', '-q', 'HEAD']);
   if (!ok(head)) return { skipped: 'no-head' };
   const headSha = out(head);
@@ -130,9 +198,14 @@ export async function snapshotWorktree({ git, baseSha = '', runId = '', lastTree
     const excluded = [];
     for (const path of changed.stdout.split('\0').filter(Boolean)) {
       let why = isDeniedPath(path) ? 'denied' : null;
-      if (!why && maxFileBytes > 0) {
+      if (!why) {
         const size = await git(['cat-file', '-s', `:${path}`], { env });
-        if (ok(size) && Number(out(size)) > maxFileBytes) why = 'too-large';
+        if (maxFileBytes > 0 && ok(size) && Number(out(size)) > maxFileBytes) why = 'too-large';
+        else {
+          const blob = await git(['cat-file', 'blob', `:${path}`], { env });
+          if (!ok(blob)) why = 'unreadable';
+          else if (containsSecret(blob.stdout, secretValues)) why = 'secret-content';
+        }
       }
       if (why) excluded.push({ path, why });
     }
@@ -164,11 +237,25 @@ export async function snapshotWorktree({ git, baseSha = '', runId = '', lastTree
 
 // Push `sha` to `ref`. `expectSha` is the last sha we believe the remote holds
 // ('' = must not exist). Returns { ok, rejected?, error? }.
+// Why did a push fail?
+//   lease     — our --force-with-lease expectation was stale (another writer moved the ref)
+//   policy    — the remote refused it (repository rules, secret push protection, hooks)
+//   auth      — no permission / bad credentials
+//   transient — anything else (network, timeout); worth retrying later
+export function classifyPushFailure(text) {
+  const t = String(text ?? '');
+  if (/\(stale info\)/i.test(t)) return 'lease';
+  if (/remote rejected|GH0\d\d|push protection|repository rule|pre-receive hook|protected ref|declined/i.test(t)) return 'policy';
+  if (/permission (to .* )?denied|403|authentication failed|could not read username|invalid username or password|access denied|not authorized/i.test(t)) return 'auth';
+  if (/! \[rejected\]/i.test(t)) return 'lease';
+  return 'transient';
+}
+
 export async function pushCheckpoint({ git, ref, sha, expectSha = '', remote = 'origin' }) {
   const r = await git(['push', '--quiet', '--no-verify', `--force-with-lease=${ref}:${expectSha}`, remote, `${sha}:${ref}`]);
   if (ok(r)) return { ok: true };
-  const text = `${r.stderr}\n${r.stdout}`;
-  return { ok: false, rejected: /stale info|rejected|fetch first/i.test(text), error: errText(r) };
+  const kind = classifyPushFailure(`${r.stderr}\n${r.stdout}`);
+  return { ok: false, kind, rejected: kind === 'lease', error: errText(r) };
 }
 
 export async function deleteCheckpointRef({ git, ref, remote = 'origin' }) {
@@ -238,16 +325,16 @@ export async function restoreCheckpoint({ git, checkpoint }) {
 // re-read the ref: if it was moved by that SAME superseded run (a zombie's
 // late abort-flush racing our startup) we take over from it; if it was moved by
 // any other run, a newer owner exists and we stop writing.
-export function createWorkspaceCheckpoint({ git, ref, baseSha = '', runId = '', expectSha = '', priorRunId = '', maxFileBytes, message, now = () => Date.now() }) {
+export function createWorkspaceCheckpoint({ git, ref, baseSha = '', runId = '', expectSha = '', priorRunId = '', maxFileBytes, secretValues = [], message, now = () => Date.now() }) {
   let lastTree = null;
   let remoteSha = expectSha;
   let disabled = null;
   return async function checkpoint(reason = 'manual') {
     if (disabled) return { skipped: `disabled: ${disabled}` };
-    const snap = await snapshotWorktree({ git, baseSha, runId, lastTree, maxFileBytes, message: `${message || 'nano: WIP checkpoint'} (${reason})` });
+    const snap = await snapshotWorktree({ git, baseSha, runId, lastTree, maxFileBytes, secretValues, message: `${message || 'nano: WIP checkpoint'} (${reason})` });
     if (!snap.sha) return snap;
     let pushed = await pushCheckpoint({ git, ref, sha: snap.sha, expectSha: remoteSha });
-    if (!pushed.ok && pushed.rejected) {
+    if (!pushed.ok && pushed.kind === 'lease') {
       let current = null;
       try { current = await fetchCheckpoint({ git, ref }); } catch { /* treat as foreign */ }
       const takeOver = !!(current && priorRunId && current.runId === priorRunId);
@@ -257,8 +344,11 @@ export function createWorkspaceCheckpoint({ git, ref, baseSha = '', runId = '', 
       }
     }
     if (!pushed.ok) {
-      if (pushed.rejected) disabled = 'lease rejected (ref moved by a newer run)';
-      return { skipped: `push failed: ${pushed.error}`, rejected: !!pushed.rejected };
+      // Retrying would fail the same way for everything but a transient error.
+      if (pushed.kind === 'lease') disabled = 'lease rejected (ref moved by a newer run)';
+      else if (pushed.kind === 'policy') disabled = `remote refused the push (repository rule / push protection): ${pushed.error}`;
+      else if (pushed.kind === 'auth') disabled = `no permission to push ${ref}: ${pushed.error}`;
+      return { skipped: `push failed (${pushed.kind}): ${pushed.error}`, kind: pushed.kind, rejected: pushed.kind === 'lease', disabled: disabled || null };
     }
     lastTree = { tree: snap.tree, head: snap.head };
     remoteSha = snap.sha;
@@ -300,7 +390,8 @@ export function createCheckpointer({ checkpoint, minIntervalMs = DEFAULTS.minInt
           if (onCheckpoint) { try { await onCheckpoint(res); } catch (err) { logger?.debug?.(`checkpoint onCheckpoint threw: ${err?.message || err}`); } }
         } else {
           stats.skipped++;
-          if (res?.skipped && !/^(unchanged|clean)$/.test(res.skipped)) logger?.warn?.(`WIP checkpoint (${reason}) skipped — ${res.skipped}`);
+          if (res?.disabled) logger?.warn?.(`WIP checkpoints stopped for this job — ${res.disabled}`);
+          else if (res?.skipped && !/^(unchanged|clean|disabled: )/.test(res.skipped)) logger?.warn?.(`WIP checkpoint (${reason}) skipped — ${res.skipped}`);
         }
         return res;
       } catch (err) {
@@ -350,6 +441,55 @@ export function createCheckpointer({ checkpoint, minIntervalMs = DEFAULTS.minInt
     // Clear timers and wait for any in-flight checkpoint to finish.
     stop() { clearAll(); stopped = true; return chain; },
   };
+}
+
+// ── Orphan GC ────────────────────────────────────────────────────────────────
+// A WIP ref outlives its job when the job never succeeds again (cancelled
+// instance, exhausted retries, deleted definition). Sweep them from any job's
+// clone: delete refs whose snapshot is older than `ttlMs`, and refs older than
+// `graceMs` whose element instance the engine reports terminal. An unknown /
+// unreachable element (404, another engine sharing the repo) is NOT treated as
+// terminal — only the TTL reclaims those.
+const lastSweepAt = new Map();
+
+export function shouldSweep(key, { everyMs = DEFAULTS.gcEveryMs, now = Date.now(), registry = lastSweepAt } = {}) {
+  const last = registry.get(key);
+  if (last != null && now - last < everyMs) return false;
+  registry.set(key, now);
+  return true;
+}
+
+export async function sweepStaleCheckpoints({ git, ownRef = null, ttlMs = DEFAULTS.ttlMs, graceMs = DEFAULTS.gcGraceMs, isTerminal = null, now = () => Date.now(), maxDeletes = 50, maxLookups = 20, remote = 'origin' }) {
+  const ls = await git(['ls-remote', '--refs', remote, `${CHECKPOINT_REF_PREFIX}*`]);
+  if (!ok(ls)) return { error: errText(ls), deleted: [] };
+  const refs = out(ls).split('\n').filter(Boolean).map((l) => l.split(/\s+/)[1]).filter((r) => r && r !== ownRef);
+  if (!refs.length) return { scanned: 0, deleted: [] };
+  const local = (r) => `refs/nano-gc/${r.slice(CHECKPOINT_REF_PREFIX.length)}`;
+  const fetch = await git(['fetch', '--quiet', '--no-tags', '--no-write-fetch-head', remote, ...refs.map((r) => `+${r}:${local(r)}`)]);
+  if (!ok(fetch)) return { error: errText(fetch), deleted: [] };
+  const doomed = [];
+  let lookups = 0;
+  try {
+    for (const ref of refs) {
+      if (doomed.length >= maxDeletes) break;
+      const at = Number(out(await git(['log', '-1', '--format=%ct', local(ref)]))) * 1000;
+      if (!Number.isFinite(at) || at <= 0) continue;
+      const age = now() - at;
+      if (ttlMs > 0 && age > ttlMs) { doomed.push({ ref, why: 'ttl' }); continue; }
+      if (isTerminal && age > graceMs && lookups < maxLookups) {
+        lookups++;
+        let terminal = false;
+        try { terminal = await isTerminal(ref.slice(CHECKPOINT_REF_PREFIX.length)); } catch { terminal = false; }
+        if (terminal) doomed.push({ ref, why: 'element-terminal' });
+      }
+    }
+    if (!doomed.length) return { scanned: refs.length, deleted: [] };
+    const del = await git(['push', '--quiet', '--no-verify', remote, ...doomed.map((d) => `:${d.ref}`)]);
+    if (!ok(del)) return { scanned: refs.length, deleted: [], error: errText(del) };
+    return { scanned: refs.length, deleted: doomed };
+  } finally {
+    for (const ref of refs) await git(['update-ref', '-d', local(ref)]);
+  }
 }
 
 // Prompt note appended when a checkpoint was restored into the workspace.

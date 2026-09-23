@@ -98,9 +98,8 @@ SDK client (job workers) — do **not** add the SDK as a dependency or use raw
   a ref-only job with no matching `create`, a `ref`/`create` that equals (or cannot be
   proven distinct from) the base, or a per-run fallback branch — is NOT
   re-fetched, so such a run is classified **transcript-only** (the recovery
-  preamble points at the transcript, not a branch that isn't there). In every case
-  **uncommitted deltas are lost** (workspace is throwaway — the isolated-context
-  persistence increment is later). Gated to external agent jobs;
+  preamble points at the transcript, not a branch that isn't there). Without WIP
+  checkpoints (below) **uncommitted deltas are lost** (workspace is throwaway). Gated to external agent jobs;
   a read failure / no read surface / no prior work / `NANO_AGENT_RESUME=off` falls
   through to the legacy cold rerun (`effectiveEnvelope === envelope`). The prompt
   seed is the only change — repository/setup are untouched, and the AgentInstance
@@ -156,6 +155,25 @@ SDK client (job workers) — do **not** add the SDK as a dependency or use raw
   `agentCapabilities._meta.planSeed === true` (`acpSessionNewParams`) — every other
   agent gets byte-identical params. No plan recorded → prompt byte-unchanged.
   `NANO_AGENT_PLAN=off` disables recording and seeding.
+- **WIP checkpoints (issue #264, `agent-checkpoint.mjs`).** Opt-in via
+  `NANO_AGENT_CHECKPOINT=on`, host-provisioned jobs with an `elementInstanceKey` only.
+  `setupWorkspaceCheckpoints` (c8ctl-plugin.js) runs after provisioning: it fetches
+  `refs/nano/wip/<elementInstanceKey>`, restores it (`restoreCheckpoint`: fast-forward
+  to the snapshot's parent + lay the tree down UNCOMMITTED when the fresh HEAD is an
+  ancestor; else `git apply --3way` of the `Nano-Checkpoint-Base` → snapshot diff; else
+  skip) and appends `withCheckpointNote` to the effective envelope. Snapshots are
+  shadow commits through a temp `GIT_INDEX_FILE` (the agent's HEAD/index/refs are never
+  written), deny-listed/oversized paths reverted to HEAD, pushed with
+  `--force-with-lease` against the last sha this run owns. On a lease rejection it
+  takes over ONLY if the ref was moved by the run it superseded (`Nano-Checkpoint-Run`
+  trailer — a zombie's late abort flush); otherwise it stops writing. Git runs async
+  (never `spawnSync`) so pushes don't block the ACP loop. The checkpointer is fed from
+  `onAcpUpdate` (completed/failed `tool_call_update`, `plan`), rate-limited, with a
+  safety-net timer; flushed on abort and on a failed run, stopped (awaiting in-flight)
+  before `finalizeGit`, and the ref is deleted after a clean finalize (kept on any push
+  failure). `agentCheckpoint` is written via `camunda.createElementInstanceVariables`
+  (`local:true`), best-effort, warning once. Tests: `agent-checkpoint.test.mjs`
+  (real temp repos + bare remote).
 
 ## Worker supervisor (`supervisor`)
 

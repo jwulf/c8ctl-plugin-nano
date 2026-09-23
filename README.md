@@ -729,12 +729,11 @@ the job with a decremented retry count. Profiles are stored in the plugin's
 >   `repository.sha`-detached checkout likewise recover nothing. For every transcript-only
 >   run the resume preamble points at the transcript (VERIFY-first) rather than promising
 >   a branch to check out.
-> - **Uncommitted working-tree changes are *not* recovered** in this increment —
+> - **Uncommitted working-tree changes are *not* recovered** by default —
 >   the throwaway workspace does not persist across activations, so any delta the
 >   previous run had not committed is lost and the resumed agent re-derives it. The
->   resume preamble states this explicitly. (Persisting the workspace / microVM
->   across activations to recover uncommitted work is a later isolated-context
->   increment.)
+>   resume preamble states this explicitly. Opt into **WIP checkpoints** (below) to
+>   recover them.
 >
 > Resume is **best-effort and gated to external agent jobs** (the only ones with a
 > durable transcript). A read failure, an SDK without an AgentInstance read
@@ -747,6 +746,26 @@ the job with a decremented retry count. Profiles are stored in the plugin's
 > prompt (VERIFY-first, like the transcript), and a harness that advertises
 > `agentCapabilities._meta.planSeed` also receives it in `session/new` `_meta.plan`
 > so it can keep working the same plan. `NANO_AGENT_PLAN=off` disables both.
+>
+> **WIP checkpoints (opt-in, `NANO_AGENT_CHECKPOINT=on`).** For host-provisioned
+> repository jobs the worker periodically snapshots the agent's workspace — uncommitted
+> changes *and* unpushed local commits — to `refs/nano/wip/<elementInstanceKey>` on the
+> job's remote, without touching the agent's HEAD, index or branch (a "shadow commit"
+> built through a temporary index; `.gitignore` is honoured, secrets like `.env*` /
+> `*.pem` / `id_*` and files over `NANO_AGENT_CHECKPOINT_MAX_FILE_BYTES` (5 MiB) are
+> excluded). Checkpoints fire after a completed ACP tool call or a plan change (at most
+> one per `NANO_AGENT_CHECKPOINT_MIN_INTERVAL_MS`, default 60s), on a safety-net timer
+> (`NANO_AGENT_CHECKPOINT_INTERVAL_MS`, default 300s, `0` disables — the only trigger
+> for pipe/PTY harnesses), and once more when a run fails or is force-stopped. Each
+> checkpoint also sets a best-effort `agentCheckpoint {ref, sha, head, at, reason,
+> branch}` local variable on the element instance. When a later activation of the same
+> element instance finds the ref, it restores the snapshot into the fresh clone as
+> uncommitted changes (recovering the local commits too) and tells the agent to inspect
+> `git status`/`git diff` first. The ref is deleted after a successful push. Pushes use
+> `--force-with-lease`, so a superseded worker can never clobber a newer run's
+> checkpoint. Caveat: the worker can't pause the agent, so a snapshot may catch a
+> half-written file. Everything is best-effort — a failure degrades to transcript-only
+> resume.
 
 ### Task envelope, sandboxes & disk hygiene
 

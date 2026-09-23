@@ -20,6 +20,9 @@ import {
   activationNamespace,
   buildProvenanceContent,
   PROVENANCE_KIND,
+  buildPlanContent,
+  PLAN_KIND,
+  PLAN_OBJECT_CAP_CHARS,
 } from './agent-instance.mjs';
 
 // A logger that records every line per level so observability assertions (#229)
@@ -1688,11 +1691,9 @@ test('the pre-mint buffer only retains updates that persist a turn — a plan/st
     .filter((u) => Array.isArray(u.history))
     .map((u) => u.history[0].content?.[0]?.text)
     .filter(Boolean);
-  assert.deepEqual(
-    texts,
-    ['msg-a', 'msg-b'],
-    'the plan burst was filtered out; both real message turns survived the 2-slot buffer',
-  );
+  // The plan burst takes no buffer slots: both real message turns survive the 2-slot
+  // buffer, and only the LATEST plan is recorded, after them.
+  assert.deepEqual(texts, ['msg-a', 'msg-b', 'Plan (0/1 done):\n[ ] step 4']);
 });
 
 test('the pre-mint buffer skips metadata-only message chunks (no text/metrics) so they cannot starve it (issue #230)', async () => {
@@ -2343,4 +2344,60 @@ test('#222 discard() on an ACTIVE producer drains queued appends without a COMPL
   p.ingest({ sessionUpdate: 'agent_message_chunk', messageId: 'm3', content: { type: 'text', text: 'later' } });
   await p.drain();
   assert.equal(client.calls.update.length, updatesAfter, 'ingest after discard() is inert (producer finalized)');
+});
+
+// ---------------------------------------------------------------------------
+// ACP `plan` updates are recorded as parity-safe ASSISTANT turns (TEXT + OBJECT).
+// ---------------------------------------------------------------------------
+
+const PLAN_UPDATE = {
+  sessionUpdate: 'plan',
+  entries: [
+    { content: 'Read the parser', priority: 'medium', status: 'completed' },
+    { content: 'Add the flag', priority: 'medium', status: 'in_progress' },
+  ],
+  _meta: { plan: { goal: 'Add --json', items: [{ id: 1, title: 'Read the parser', status: 'done', notes: ['src/cli.rs'] }, { id: 2, title: 'Add the flag', status: 'in_progress' }] } },
+};
+
+test('buildPlanContent: a checklist for the cockpit plus the entries and full plan as an OBJECT', () => {
+  const content = buildPlanContent(PLAN_UPDATE);
+  assert.deepEqual(content[0], { contentType: 'TEXT', text: 'Goal: Add --json\nPlan (1/2 done):\n[x] Read the parser\n[>] Add the flag' });
+  assert.equal(content[1].contentType, 'OBJECT');
+  assert.equal(content[1].object.kind, PLAN_KIND);
+  assert.deepEqual(content[1].object.entries[0], { content: 'Read the parser', status: 'completed', priority: 'medium' });
+  assert.deepEqual(content[1].object.plan, PLAN_UPDATE._meta.plan);
+  // No plan → nothing to record.
+  assert.equal(buildPlanContent({ sessionUpdate: 'plan', entries: [] }), null);
+  assert.equal(buildPlanContent({ sessionUpdate: 'agent_message_chunk' }), null);
+  // An oversized full plan is dropped; the entries are kept.
+  const huge = { ...PLAN_UPDATE, _meta: { plan: { items: [], goal: 'x'.repeat(PLAN_OBJECT_CAP_CHARS) } } };
+  const capped = buildPlanContent(huge);
+  assert.equal(capped[1].object.plan, undefined);
+  assert.equal(capped[1].object.entries.length, 2);
+});
+
+test('a plan update appends one ASSISTANT turn per distinct plan', async () => {
+  const client = fakeClient();
+  const p = makeProducer(client);
+  await p.activate();
+  p.ingest(PLAN_UPDATE);
+  p.ingest(PLAN_UPDATE); // unchanged resend → no new turn
+  p.ingest({ ...PLAN_UPDATE, entries: PLAN_UPDATE.entries.map((e) => ({ ...e, status: 'completed' })), _meta: undefined });
+  await p.drain();
+  const turns = client.calls.update.filter((u) => Array.isArray(u.history)).map((u) => u.history[0]);
+  assert.equal(turns.length, 2);
+  assert.equal(turns[0].role, 'ASSISTANT');
+  assert.equal(turns[0].toolCalls, undefined);
+  assert.ok(turns[0].historyItemId.startsWith(`${NS}:plan:`), turns[0].historyItemId);
+  assert.notEqual(turns[0].historyItemId, turns[1].historyItemId);
+  assert.equal(turns[1].content[0].text, 'Plan (2/2 done):\n[x] Read the parser\n[x] Add the flag');
+});
+
+test('recordPlans:false (NANO_AGENT_PLAN=off) keeps plan updates out of the history', async () => {
+  const client = fakeClient();
+  const p = makeProducer(client, { recordPlans: false });
+  await p.activate();
+  p.ingest(PLAN_UPDATE);
+  await p.drain();
+  assert.equal(client.calls.update.filter((u) => Array.isArray(u.history)).length, 0);
 });

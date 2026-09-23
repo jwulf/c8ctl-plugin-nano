@@ -6786,7 +6786,20 @@ const ACP_MAX_LINE_BYTES = 8 * 1024 * 1024; // 8 MiB
 // and every caller work unchanged. Because the raw stream is JSON-RPC (not human
 // output), `stdout` here is the accumulated human-readable transcript text (what
 // we relay), and `stderr` is the child's real stderr (agent diagnostics).
-function spawnCaptureAcp({ command, args = [], cwd, env, stdinData, timeoutMs, idleTimeoutMs, recoveryWindowMs, relayTap = null, stream = false, streamPrefix = '', onStreamOut, onStreamErr, permission = 'yolo', shell = false, onAcpUpdate = null, abortSignal = null, onSpawn = null }) {
+// `session/new` params. A resumed job's prior plan rides `_meta.plan` ONLY for an agent
+// that advertises `agentCapabilities._meta.planSeed === true` (e.g. rusty-harness), so
+// every other agent gets exactly the params it always did. `planInPrompt` tells the
+// agent the resume prompt already shows the plan, so it restores it without restating
+// it to the model.
+export function acpSessionNewParams({ cwd, init, resumePlan }) {
+  const params = { cwd, mcpServers: [] };
+  if (resumePlan && typeof resumePlan === 'object' && init?.agentCapabilities?._meta?.planSeed === true) {
+    params._meta = { plan: resumePlan, planInPrompt: true };
+  }
+  return params;
+}
+
+function spawnCaptureAcp({ command, args = [], cwd, env, stdinData, timeoutMs, idleTimeoutMs, recoveryWindowMs, relayTap = null, stream = false, streamPrefix = '', onStreamOut, onStreamErr, permission = 'yolo', shell = false, onAcpUpdate = null, abortSignal = null, onSpawn = null, resumePlan = null }) {
   return new Promise((resolve) => {
     const logger = getLogger();
     const humanChunks = [];
@@ -7346,11 +7359,11 @@ function spawnCaptureAcp({ command, args = [], cwd, env, stdinData, timeoutMs, i
 
     // --- drive the handshake + turn -----------------------------------------
     (async () => {
-      await request('initialize', {
+      const init = await request('initialize', {
         protocolVersion: 1,
         clientCapabilities: { fs: { readTextFile: false, writeTextFile: false } },
       });
-      const created = await request('session/new', { cwd: cwd || process.cwd(), mcpServers: [] });
+      const created = await request('session/new', acpSessionNewParams({ cwd: cwd || process.cwd(), init, resumePlan }));
       sessionId = created?.sessionId ?? null;
       attachSteerIfAny();
       // Deliver the task envelope as the prompt (from stdinData, matching the
@@ -7474,7 +7487,7 @@ function baseAgentEnv(profile, job) {
  * Both paths resolve to the same result contract.
  */
 function runAgentJob(profile, job, opts = {}) {
-  const { timeoutMs, idleTimeoutMs, recoveryWindowMs, envelope, sandbox = 'none', image, runId, secretEnv = {}, passThroughSecretNames = [], cwd, extraEnv = {}, profileEnv = {}, resultFile, stream = false, streamPrefix = '', onStreamOut, onStreamErr, args: commandArgs, terminal = 'pipe', protocol = 'pipe', permission = 'yolo', relaySession = null, ptyFactory, nudgePayload = null, onAcpUpdate = null, abortSignal = null, onSpawn = null } = opts;
+  const { timeoutMs, idleTimeoutMs, recoveryWindowMs, envelope, sandbox = 'none', image, runId, secretEnv = {}, passThroughSecretNames = [], cwd, extraEnv = {}, profileEnv = {}, resultFile, stream = false, streamPrefix = '', onStreamOut, onStreamErr, args: commandArgs, terminal = 'pipe', protocol = 'pipe', permission = 'yolo', relaySession = null, ptyFactory, nudgePayload = null, onAcpUpdate = null, abortSignal = null, onSpawn = null, resumePlan = null } = opts;
   // #110: `protocol`/`permission` drive the ACP executor branch below. The
   // pipe/PTY paths are unchanged, so `protocol === 'pipe'` behaviour is identical.
   // A `nudgePayload` (#678) carries the bespoke "re-emit your result" prompt for a
@@ -7565,6 +7578,7 @@ function runAgentJob(profile, job, opts = {}) {
         onAcpUpdate,
         abortSignal,
         onSpawn,
+        resumePlan,
       });
     }
 
@@ -10143,6 +10157,9 @@ async function workAgent(req, flags, ctx) {
         // kill switch all fall through to the legacy cold rerun with
         // `effectiveEnvelope === envelope`.
         let effectiveEnvelope = envelope;
+        // The prior run's recorded plan, handed to an ACP harness that advertises
+        // `agentCapabilities._meta.planSeed` (see spawnCaptureAcp). Null on a cold run.
+        let resumePlan = null;
         {
           // Only resume when the producer is actually LIVE (active or retry-armed). An
           // inert producer (host SDK lacks create/updateAgentInstance, ACP classifier
@@ -10153,6 +10170,7 @@ async function workAgent(req, flags, ctx) {
           const producerUnavailable = !(agentInstanceProducer?.active || agentInstanceProducer?.retryPending);
           const resumed = await resolveEffectiveEnvelope({ envelope, job, camunda, agentInstanceOff, producerUnavailable, containerMode: isContainer, logger });
           effectiveEnvelope = resumed.envelope;
+          resumePlan = resumed.plan ?? null;
           if (resumed.resumed) {
             logger.info(`[${jobType}] resuming from prior engine transcript (${aiCorr}) — ${resumed.historyCount} history turn(s) read from the prior run and rendered into the harness prompt (some non-content turns, e.g. CONFIGURATION, are elided); continuing from the last pushed commit when the branch identity is stable (uncommitted deltas from the prior run are not recovered).`);
           }
@@ -10385,6 +10403,7 @@ async function workAgent(req, flags, ctx) {
             // prior transcript (else the original envelope). Only the task prompt is
             // reframed as a continuation; repository/setup are unchanged.
             envelope: effectiveEnvelope,
+            resumePlan,
             sandbox,
             image,
             runId,
@@ -10445,6 +10464,8 @@ async function workAgent(req, flags, ctx) {
               logPrefix: `[${jobType}] job ${job.jobKey}:`,
               rerun: (nudgeText) => runAgentJob(profile, job, {
                 ...runOpts,
+                // The nudge re-emits a result; it continues no plan.
+                resumePlan: null,
                 nudgePayload: nudgeText,
                 stream: false,
                 idleTimeoutMs: Math.min(effectiveIdleTimeoutMs || NUDGE_IDLE_TIMEOUT_MS, NUDGE_IDLE_TIMEOUT_MS),

@@ -740,6 +740,13 @@ the job with a decremented retry count. Profiles are stored in the plugin's
 > durable transcript). A read failure, an SDK without an AgentInstance read
 > surface, no prior work to continue, or the `NANO_AGENT_RESUME=off` kill switch
 > all fall through to the legacy cold rerun with no behaviour change.
+>
+> **Agent plans.** When the harness publishes an ACP `plan` (e.g. rusty-harness's
+> `plan_*` tools), each distinct plan is recorded in the AgentInstance history as an
+> assistant checklist turn. A resumed run gets the latest plan restated in the resume
+> prompt (VERIFY-first, like the transcript), and a harness that advertises
+> `agentCapabilities._meta.planSeed` also receives it in `session/new` `_meta.plan`
+> so it can keep working the same plan. `NANO_AGENT_PLAN=off` disables both.
 
 ### Task envelope, sandboxes & disk hygiene
 

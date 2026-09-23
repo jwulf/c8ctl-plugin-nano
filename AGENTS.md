@@ -141,6 +141,21 @@ SDK client (job workers) — do **not** add the SDK as a dependency or use raw
   diagnostics. All optional: a turn with no substantive identity emits no block, so
   the wire is byte-unchanged for a bare run. A first-class typed field would need a
   **generic** upstream Camunda extension (an `attributes` map), tracked in #243.
+- **Agent plans (`agent-instance.mjs` + `agent-resume.mjs`).** ACP `plan` updates
+  are recorded as an ASSISTANT turn (no tool calls) whose `content[]` is a TEXT
+  checklist (what the cockpit renders) plus an OBJECT `kind:'nanobpm.plan/v1'` blob
+  carrying the ACP `entries` and, when the agent sent one, its full `_meta.plan`
+  (dropped past `PLAN_OBJECT_CAP_CHARS`). Parity-safe for the same reason as
+  provenance: no invented fields. One turn per DISTINCT plan (content-hash dedup);
+  pre-mint only the latest plan is kept, outside the pre-mint caps. On resume,
+  `latestPlan` reads it back, `renderPlan` restates it in its own delimited section
+  of the resume prompt (budget `RESUME_PLAN_CAP_CHARS`; plan turns are skipped in
+  the transcript render), and `resolveEffectiveEnvelope` returns it as `plan`. It is
+  sent in `session/new` `_meta.plan` (with `planInPrompt:true`, so the agent does not
+  restate it again) ONLY when the agent's `initialize` advertised
+  `agentCapabilities._meta.planSeed === true` (`acpSessionNewParams`) — every other
+  agent gets byte-identical params. No plan recorded → prompt byte-unchanged.
+  `NANO_AGENT_PLAN=off` disables recording and seeding.
 
 ## Worker supervisor (`supervisor`)
 

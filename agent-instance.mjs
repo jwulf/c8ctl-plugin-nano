@@ -341,6 +341,56 @@ export function buildProvenanceContent({ profile, runtimeVersion, agentCliVersio
   return { contentType: 'OBJECT', object };
 }
 
+// Marker for the plan blob an ACP `plan` update is recorded as (see `buildPlanContent`).
+// agent-resume.mjs mirrors it (it must stay free of this module's dependencies); keep
+// the two in lockstep.
+export const PLAN_KIND = 'nanobpm.plan/v1';
+
+// The harness's full plan (`_meta.plan`, e.g. rusty-harness's ids/notes/dependencies)
+// is kept only while its JSON fits this cap; past it, the ACP entries alone are kept.
+export const PLAN_OBJECT_CAP_CHARS = 32_000;
+
+const PLAN_STATUS_MARK = { completed: '[x]', in_progress: '[>]', pending: '[ ]' };
+
+/** Is `NANO_AGENT_PLAN=off` set (don't record ACP plans or seed them on resume)? */
+export function isPlanDisabled(env = process.env) {
+  return String(env?.NANO_AGENT_PLAN || '').trim().toLowerCase() === 'off';
+}
+
+/**
+ * Build the content for an AgentHistory turn recording one ACP `plan` update, or `null`
+ * when the update carries no plan (no entries and no `_meta.plan`).
+ *
+ * ACP `plan` updates have no AgentHistory counterpart, and nanobpmn promises Camunda
+ * parity, so the plan rides an ordinary ASSISTANT turn:
+ *   - a TEXT checklist, which is what the cockpit shows (it renders TEXT blocks only);
+ *   - an OBJECT `{ kind: PLAN_KIND, entries, plan? }` holding the ACP entries and, when
+ *     the agent sends one, its full `_meta.plan`. Resume reads this back (agent-resume.mjs).
+ */
+export function buildPlanContent(update) {
+  if (!isPlainObject(update) || update.sessionUpdate !== 'plan') return null;
+  const entries = (Array.isArray(update.entries) ? update.entries : [])
+    .filter((e) => isPlainObject(e) && isNonBlank(e.content))
+    .map((e) => ({
+      content: String(e.content),
+      status: PLAN_STATUS_MARK[e.status] ? e.status : 'pending',
+      ...(isNonBlank(e.priority) ? { priority: String(e.priority) } : {}),
+    }));
+  let plan = isPlainObject(update._meta?.plan) ? update._meta.plan : undefined;
+  if (plan !== undefined) {
+    let size = Infinity;
+    try { size = JSON.stringify(plan).length; } catch { /* unserializable → dropped */ }
+    if (size > PLAN_OBJECT_CAP_CHARS) plan = undefined;
+  }
+  if (entries.length === 0 && plan === undefined) return null;
+  const done = entries.filter((e) => e.status === 'completed').length;
+  const goal = plan && isNonBlank(plan.goal) ? `Goal: ${oneLine(plan.goal)}\n` : '';
+  const lines = entries.map((e) => `${PLAN_STATUS_MARK[e.status]} ${oneLine(e.content)}`);
+  const text = `${goal}Plan (${done}/${entries.length} done):\n${lines.join('\n')}`;
+  const object = { kind: PLAN_KIND, entries, ...(plan !== undefined ? { plan } : {}) };
+  return [{ contentType: 'TEXT', text }, { contentType: 'OBJECT', object }];
+}
+
 // Map the ACP classifier's message role to the AgentHistory role enum. ACP has no
 // distinct REASONING role, so a `reasoning` chunk folds into ASSISTANT.
 function historyRole(acpRole) {
@@ -460,6 +510,9 @@ export function createAgentInstanceProducer(opts = {}) {
     maxPendingAppends = DEFAULT_MAX_PENDING_APPENDS,
     maxPendingAppendBytes = DEFAULT_MAX_PENDING_APPEND_BYTES,
     maxPendingMessageBytes = DEFAULT_MAX_PENDING_MESSAGE_BYTES,
+    // Record ACP `plan` updates as history turns (see `buildPlanContent`); the
+    // `NANO_AGENT_PLAN=off` kill switch turns this off.
+    recordPlans = !isPlanDisabled(),
     // Injected deadline-timer factory (defaults to setTimeout) — the seam that lets a
     // test drive the create-retirement / bounded-call timers deterministically instead
     // of sleeping on wall-clock time (issue #230). Only the timer is injected; the
@@ -755,6 +808,26 @@ export function createAgentInstanceProducer(opts = {}) {
     };
     appendTurn(turn, 'TOOL_CALLING');
   };
+
+  // One turn per DISTINCT plan: agents often resend an unchanged plan, so a repeat of
+  // the last recorded plan is skipped. The id is content-addressed like other turns.
+  let lastPlanId = null;
+  const onPlan = (rawUpdate) => {
+    const content = buildPlanContent(rawUpdate);
+    if (!content) return;
+    const id = shortHash(JSON.stringify(content[1].object));
+    if (id === lastPlanId) return;
+    flushMessage();
+    lastPlanId = id;
+    appendTurn({
+      historyItemId: nsHistoryId(`plan:${id}`),
+      loopIteration,
+      role: 'ASSISTANT',
+      content,
+      producedAt: iso(),
+    });
+  };
+  const isPlanUpdate = (rawUpdate) => recordPlans && isPlainObject(rawUpdate) && rawUpdate.sessionUpdate === 'plan';
 
   const onToolResult = (c) => {
     flushMessage();
@@ -1091,6 +1164,10 @@ export function createAgentInstanceProducer(opts = {}) {
   // or ignored updates are dropped. Never throws. Shared by the hot path (`ingest`)
   // and the pre-mint replay so both translate a turn identically.
   const ingestClassified = (rawUpdate) => {
+    if (isPlanUpdate(rawUpdate)) {
+      try { onPlan(rawUpdate); } catch (err) { noteIngestFailure(err); }
+      return;
+    }
     let classified;
     try {
       classified = classify(rawUpdate);
@@ -1222,7 +1299,15 @@ export function createAgentInstanceProducer(opts = {}) {
     }
     return true;
   };
+  // Pre-mint, only the LATEST plan is kept (in its own slot, outside the count/byte
+  // caps): each plan update restates the whole plan, so older ones add nothing, and a
+  // plan burst must not starve message/tool updates (issue #230).
+  let preMintPlan = null;
   const bufferPreMint = (rawUpdate) => {
+    if (isPlanUpdate(rawUpdate)) {
+      if (buildPlanContent(rawUpdate)) preMintPlan = rawUpdate;
+      return;
+    }
     // Skip updates that will not persist a turn on replay so they cannot exhaust the
     // caps (issue #230). Not counted as a drop — dropping an ignored update loses no
     // transcript content.
@@ -1268,9 +1353,11 @@ export function createAgentInstanceProducer(opts = {}) {
           `updates ${correlation()}.`,
       );
     }
-    if (preMintBuffer.length === 0) return;
+    const plan = preMintPlan;
+    preMintPlan = null;
     const buffered = preMintBuffer.splice(0, preMintBuffer.length);
     for (const raw of buffered) ingestClassified(raw);
+    if (plan) ingestClassified(plan);
   };
 
   return {
@@ -1392,6 +1479,7 @@ export function createAgentInstanceProducer(opts = {}) {
       // The pre-mint buffer can never be replayed once finalized — release it (and its
       // counters) rather than pin it for the life of a still-hung uncancellable POST.
       preMintBuffer.length = 0;
+      preMintPlan = null;
       preMintBufferBytes = 0;
       preMintDropped = 0;
       // Flush appends already queued against a minted instance (best effort); no
@@ -1470,6 +1558,7 @@ export function createAgentInstanceProducer(opts = {}) {
         // retain the full buffer (up to preMintBufferMaxBytes) for the rest of the
         // process's life — a per-job memory leak with no possible payoff (issue #230).
         preMintBuffer.length = 0;
+        preMintPlan = null;
         preMintBufferBytes = 0;
         preMintDropped = 0;
         // Only warn when we actually attempted to mint (createAttempts > 0). A

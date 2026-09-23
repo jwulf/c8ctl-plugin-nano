@@ -25,7 +25,10 @@ import {
   seedResumeEnvelope,
   isResumeDisabled,
   resolveEffectiveEnvelope,
+  latestPlan,
+  renderPlan,
 } from './agent-resume.mjs';
+import { buildPlanContent } from './agent-instance.mjs';
 
 // A minimal AgentHistory turn factory mirroring agent-instance.mjs's wire shape.
 const textTurn = (role, text) => ({ role, content: [{ contentType: 'TEXT', text }] });
@@ -721,4 +724,89 @@ test('isResumeDisabled: honours the NANO_AGENT_RESUME=off kill switch', () => {
 
 test('RESUME_CONTEXT_CAP_CHARS is a sane positive cap', () => {
   assert.ok(Number.isInteger(RESUME_CONTEXT_CAP_CHARS) && RESUME_CONTEXT_CAP_CHARS > 1000);
+});
+
+// ---------------------------------------------------------------------------
+// Recorded plans: read back from the transcript, restated in the resume prompt,
+// and handed to plan-seeding agents.
+// ---------------------------------------------------------------------------
+
+const RICH_PLAN = {
+  goal: 'Add --json',
+  items: [
+    { id: 1, title: 'Read the parser', status: 'done', notes: ['args live in src/cli.rs'] },
+    { id: 2, title: 'Add the flag', status: 'in_progress', notes: ['pushed PR #42'], after: [1] },
+    { id: 3, title: 'Write tests', status: 'pending', after: [2] },
+  ],
+};
+const planTurn = (update) => ({ role: 'ASSISTANT', content: buildPlanContent({ sessionUpdate: 'plan', ...update }) });
+const ENTRIES = [{ content: 'Read the parser', status: 'completed' }, { content: 'Add the flag', status: 'in_progress' }];
+
+test('latestPlan: the newest recorded plan wins; none recorded → null', () => {
+  const old = planTurn({ entries: [{ content: 'old', status: 'pending' }] });
+  const neu = planTurn({ entries: ENTRIES, _meta: { plan: RICH_PLAN } });
+  const got = latestPlan([old, textTurn('ASSISTANT', 'hi'), neu, textTurn('USER', 'more')]);
+  assert.deepEqual(got.plan, RICH_PLAN);
+  assert.equal(got.entries.length, 2);
+  assert.deepEqual(latestPlan([old]), { entries: [{ content: 'old', status: 'pending' }] });
+  assert.equal(latestPlan([textTurn('ASSISTANT', 'hi')]), null);
+  assert.equal(latestPlan(undefined), null);
+});
+
+test('renderPlan: full plan with ids, deps and notes; notes shed to fit the budget', () => {
+  const recorded = { entries: ENTRIES, plan: RICH_PLAN };
+  assert.equal(renderPlan(recorded), [
+    'Goal: Add --json',
+    '[x] 1. Read the parser',
+    '      - args live in src/cli.rs',
+    '[>] 2. Add the flag (after 1)',
+    '      - pushed PR #42',
+    '[ ] 3. Write tests (after 2)',
+  ].join('\n'));
+  // Tight budget: finished items lose their notes first; open notes are kept.
+  const tight = renderPlan(recorded, { capChars: 150 });
+  assert.ok(tight.includes('(1 note omitted)') && tight.includes('pushed PR #42'), tight);
+  assert.ok(renderPlan(recorded, { capChars: 20 }).length <= 20);
+  // Entries only (an agent without a rich plan).
+  assert.equal(renderPlan({ entries: ENTRIES }), '[x] Read the parser\n[>] Add the flag');
+  assert.equal(renderPlan(null), '');
+});
+
+test('renderHistoryTurns: plan turns are not repeated in the transcript', () => {
+  const text = renderHistoryTurns([textTurn('ASSISTANT', 'working'), planTurn({ entries: ENTRIES })]);
+  assert.ok(text.includes('working'));
+  assert.ok(!text.includes('Read the parser'), text);
+});
+
+test('buildResumePrompt: byte-identical without a plan; a plan section when one was recorded', () => {
+  const base = { basePrompt: 'go', transcriptText: 'T' };
+  assert.equal(buildResumePrompt({ ...base, planText: '' }), buildResumePrompt(base));
+  assert.equal(buildResumePrompt({ ...base, planText: '   ' }), buildResumePrompt(base));
+  const p = buildResumePrompt({ ...base, planText: '[x] 1. Read the parser' });
+  assert.ok(p.includes('[x] 1. Read the parser'));
+  assert.ok(p.length > buildResumePrompt(base).length);
+});
+
+test('readPriorTranscript: returns the recorded plan', async () => {
+  const read = async () => [textTurn('ASSISTANT', 'x'), planTurn({ entries: ENTRIES, _meta: { plan: RICH_PLAN } })];
+  const got = await readPriorTranscript({ job: { elementInstanceKey: '1' }, read });
+  assert.deepEqual(got.plan.plan, RICH_PLAN);
+});
+
+test('resolveEffectiveEnvelope: returns the plan to seed; NANO_AGENT_PLAN=off ignores it', async () => {
+  const job = { leaseToken: 'lease', elementInstanceKey: '9' };
+  const envelope = { task: { prompt: 'do it' } };
+  const readPrior = async () => ({ text: 'prior', historyCount: 3, plan: { entries: ENTRIES, plan: RICH_PLAN } });
+  const on = await resolveEffectiveEnvelope({ envelope, job, env: {}, readPrior });
+  assert.equal(on.resumed, true);
+  assert.deepEqual(on.plan, RICH_PLAN);
+  assert.ok(on.envelope.task.prompt.includes('2. Add the flag'));
+  const entriesOnly = await resolveEffectiveEnvelope({ envelope, job, env: {}, readPrior: async () => ({ text: 'prior', historyCount: 3, plan: { entries: ENTRIES } }) });
+  assert.deepEqual(entriesOnly.plan, { entries: ENTRIES });
+  const off = await resolveEffectiveEnvelope({ envelope, job, env: { NANO_AGENT_PLAN: 'off' }, readPrior });
+  assert.equal(off.resumed, true);
+  assert.equal(off.plan, undefined);
+  assert.ok(!off.envelope.task.prompt.includes('Add the flag'));
+  const none = await resolveEffectiveEnvelope({ envelope, job, env: {}, readPrior: async () => ({ text: 'prior', historyCount: 3 }) });
+  assert.equal(none.plan, undefined);
 });

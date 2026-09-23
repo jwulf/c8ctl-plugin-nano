@@ -691,7 +691,7 @@ export function createAgentInstanceProducer(opts = {}) {
   // a persisted turn (e.g. `onPlan`) advances its marker only after the turn was really
   // recorded, never merely enqueued. A turn dropped for backlog / no-key never enqueues,
   // so `onSettled` is not called and the synchronous return value is falsy.
-  const appendTurn = (turn, status, onSettled) => {
+  const appendTurn = (turn, status, onSettled, opts) => {
     if (disabled || !agentInstanceKey) return;
     // Backpressure (issue #230): during an AgentInstance outage each serialized append
     // can take up to finalizeTimeoutMs to settle, so an unbounded enqueue would let the
@@ -703,9 +703,18 @@ export function createAgentInstanceProducer(opts = {}) {
     // single arbitrarily large turn (e.g. a huge tool result) would otherwise be
     // retained in full during a prolonged outage, defeating the memory bound.
     const size = sizeOfUpdate(turn);
+    // A `reserved` append is the latest pre-mint plan being replayed LAST (after the
+    // buffered message/tool turns). Without headroom, a backlog those replayed turns
+    // just filled would make the plan — the single most valuable turn, restating the
+    // WHOLE plan — the first casualty of the drop-newest policy. Grant it ONE slot of
+    // headroom beyond BOTH caps, mirroring the pre-mint buffer already keeping the plan
+    // in its own slot outside the caps. It stays bounded: at most one extra in-flight
+    // turn, itself byte-capped at PLAN_OBJECT_CAP_CHARS by buildPlanContent (issue #230).
+    const reserved = opts?.reserved === true;
+    const countCap = maxPendingAppends > 0 ? maxPendingAppends + (reserved ? 1 : 0) : 0;
     if (
-      (maxPendingAppends > 0 && pendingAppends >= maxPendingAppends) ||
-      (maxPendingAppendBytes > 0 && pendingAppendBytes + size > maxPendingAppendBytes)
+      (countCap > 0 && pendingAppends >= countCap) ||
+      (!reserved && maxPendingAppendBytes > 0 && pendingAppendBytes + size > maxPendingAppendBytes)
     ) {
       appendsDropped += 1;
       if (!appendBacklogLogged) {
@@ -858,7 +867,7 @@ export function createAgentInstanceProducer(opts = {}) {
     // Set preserves insertion order, so the first value is the oldest — evict it.
     while (set.size > PLAN_DEDUP_CAP) set.delete(set.values().next().value);
   };
-  const onPlan = (rawUpdate) => {
+  const onPlan = (rawUpdate, opts) => {
     const content = buildPlanContent(rawUpdate);
     if (!content) return;
     const id = shortHash(JSON.stringify(content[1].object));
@@ -885,6 +894,7 @@ export function createAgentInstanceProducer(opts = {}) {
         // resend is no longer blocked.
         inFlightPlanIds.delete(id);
       },
+      opts,
     );
     // The turn never entered the queue (disabled / no instance key / backlog drop): clear
     // the in-flight guard now — `onSettled` will not fire — so a later resend can retry.
@@ -1226,9 +1236,9 @@ export function createAgentInstanceProducer(opts = {}) {
   // the instance is already minted (an append needs the agentInstanceKey). Malformed
   // or ignored updates are dropped. Never throws. Shared by the hot path (`ingest`)
   // and the pre-mint replay so both translate a turn identically.
-  const ingestClassified = (rawUpdate) => {
+  const ingestClassified = (rawUpdate, opts) => {
     if (isPlanUpdate(rawUpdate)) {
-      try { onPlan(rawUpdate); } catch (err) { noteIngestFailure(err); }
+      try { onPlan(rawUpdate, opts); } catch (err) { noteIngestFailure(err); }
       return;
     }
     let classified;
@@ -1434,7 +1444,11 @@ export function createAgentInstanceProducer(opts = {}) {
     preMintPlan = null;
     const buffered = preMintBuffer.splice(0, preMintBuffer.length);
     for (const raw of buffered) ingestClassified(raw);
-    if (plan) ingestClassified(plan);
+    // Replay the latest plan LAST (it restates the whole plan, so it belongs after the
+    // turns it planned), but with a RESERVED append slot: the buffered turns just above
+    // may have filled the append backlog, and without headroom the drop-newest policy
+    // would make this — the single most valuable turn — the first casualty (issue #230).
+    if (plan) ingestClassified(plan, { reserved: true });
   };
 
   return {

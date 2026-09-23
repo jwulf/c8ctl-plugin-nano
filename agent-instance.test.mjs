@@ -1696,6 +1696,51 @@ test('the pre-mint buffer only retains updates that persist a turn — a plan/st
   assert.deepEqual(texts, ['msg-a', 'msg-b', 'Plan (0/1 done):\n[ ] step 4']);
 });
 
+test('the latest pre-mint plan is replayed with a RESERVED append slot — a backlog filled by the replayed turns cannot drop it (issue #230)', async () => {
+  // The plan is replayed LAST (it restates the whole plan), so if the buffered
+  // message/tool turns just filled the append backlog, the naive drop-newest policy
+  // would make the plan — the single most valuable turn — the first casualty. It gets
+  // one reserved slot of headroom so it survives a backlog exactly at the cap.
+  const client = fakeClient({ failCreateTimes: 1 });
+  let t = Date.parse('2026-02-03T04:05:06.000Z');
+  const p = createAgentInstanceProducer({
+    camunda: client,
+    job: EXTERNAL_JOB,
+    profile: PROFILE,
+    envelope: ENVELOPE,
+    logger: nullLogger,
+    now: () => t,
+    createRetryBaseMs: 1000,
+    createRetryMaxMs: 30000,
+    // Exactly enough backlog slots for the two replayed message turns: without the
+    // reservation the plan (replayed third) would be dropped as the newest.
+    maxPendingAppends: 2,
+    preMintBufferMax: 10,
+  });
+
+  await p.activate();
+  assert.equal(p.active, false);
+
+  // Two real message chunks (they will fill the 2-slot backlog on replay), then a plan.
+  p.ingest({ sessionUpdate: 'agent_message_chunk', messageId: 'm-a', content: { type: 'text', text: 'msg-a' } });
+  p.ingest({ sessionUpdate: 'agent_message_chunk', messageId: 'm-b', content: { type: 'text', text: 'msg-b' } });
+  p.ingest({ sessionUpdate: 'plan', entries: [{ content: 'step 0' }] });
+  await p.drain();
+
+  // Past the window, the next attempt succeeds → mint + replay.
+  t += 2000;
+  await p.activate();
+  assert.equal(p.active, true);
+  await p.complete(true);
+
+  const texts = client.calls.update
+    .filter((u) => Array.isArray(u.history))
+    .map((u) => u.history[0].content?.[0]?.text)
+    .filter(Boolean);
+  // Both message turns AND the reserved plan survive the 2-slot backlog on replay.
+  assert.deepEqual(texts, ['msg-a', 'msg-b', 'Plan (0/1 done):\n[ ] step 0']);
+});
+
 test('the pre-mint buffer skips metadata-only message chunks (no text/metrics) so they cannot starve it (issue #230)', async () => {
   // A message chunk with blank text and no metrics classifies to kind:'message' but
   // persists NO turn on replay (flushMessage discards it). Buffering it would let a

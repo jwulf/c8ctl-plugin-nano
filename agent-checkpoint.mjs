@@ -153,12 +153,21 @@ export function checkpointRef(elementInstanceKey) {
   return /^[0-9A-Za-z_-]{1,128}$/.test(key) ? `${CHECKPOINT_REF_PREFIX}${key}` : null;
 }
 
+// Never let git invoke the host's configured credential helper for our remote
+// checkpoint ops. The job token is delivered ONLY via GIT_ASKPASS; a configured
+// helper such as `store` would otherwise reuse or PERSIST that token to disk on a
+// push/fetch/delete. Suppress it on EVERY invocation (mirrors the provisioning
+// path's `credential.helper=` at clone/fetch/push) — it is a no-op for local ops,
+// so baking it into the runner guarantees no remote checkpoint op (main runner,
+// scratch-repo delete, or GC sweep) is ever missed. Preserves askpass-only secrets.
+const CRED_SUPPRESS = ['-c', 'credential.helper='];
+
 // Async git runner: `git(args, { env?, input? })` → { status, stdout, stderr }.
 export function createGitRunner({ cwd, env = process.env, timeoutMs = DEFAULTS.gitTimeoutMs } = {}) {
   return (args, opts = {}) => new Promise((resolve) => {
     let child;
     try {
-      child = spawn('git', args, { cwd, env: { ...env, ...(opts.env || {}) }, stdio: ['pipe', 'pipe', 'pipe'] });
+      child = spawn('git', [...CRED_SUPPRESS, ...args], { cwd, env: { ...env, ...(opts.env || {}) }, stdio: ['pipe', 'pipe', 'pipe'] });
     } catch (err) {
       resolve({ status: null, stdout: '', stderr: String(err?.message || err) });
       return;

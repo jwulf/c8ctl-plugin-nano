@@ -10506,6 +10506,12 @@ async function workAgent(req, flags, ctx) {
         // try body, so an early throw is correctly reported as `error`.
         let runCompleted = false;
         let discardCheckpointOnAck = false;
+        // #264: whether a TERMINAL WIP checkpoint decision (abort/failed flush, or the
+        // success-path stop) was already taken on the normal control flow. If the run
+        // throws before any of those (e.g. runAgentJob rejects), the finally below
+        // performs a last-chance `failed` flush so edits since the last periodic
+        // checkpoint are not lost.
+        let checkpointFinalized = false;
         // The per-job live-terminal relay session (issue #173): streams this job's
         // harness terminal over the single-owner supervisor's ONE multiplexed host
         // connection, keyed by this worker's instance + the jobKey, and accepts
@@ -10637,11 +10643,11 @@ async function workAgent(req, flags, ctx) {
             logger.warn(`[${jobType}] job ${job.jobKey} aborted (worker force-stop) — harness killed; yielding job for retry.`);
             // #264: last-chance WIP checkpoint so the retry can pick up the
             // uncommitted work (bounded; the lease guards a newer owner).
-            if (checkpointer) await checkpointer.flush('abort', { timeoutMs: checkpointing.flushTimeoutMs });
+            if (checkpointer) { await checkpointer.flush('abort', { timeoutMs: checkpointing.flushTimeoutMs }); checkpointFinalized = true; }
             return;
           }
           // #264: a failed run is retried — checkpoint what it left behind.
-          if (checkpointer && !result.ok) await checkpointer.flush('failed', { timeoutMs: checkpointing.flushTimeoutMs });
+          if (checkpointer && !result.ok) { await checkpointer.flush('failed', { timeoutMs: checkpointing.flushTimeoutMs }); checkpointFinalized = true; }
 
           // Gap 2 (#678): a clean run that emitted no machine-readable result gets
           // ONE bounded re-emit nudge in the same workspace, feeding back its own
@@ -10689,7 +10695,7 @@ async function workAgent(req, flags, ctx) {
 
           // #264: the run is done — stop snapshotting (and wait out an in-flight
           // one) before finalizeGit touches the workspace.
-          if (checkpointer && result.ok) await checkpointer.stop();
+          if (checkpointer && result.ok) { await checkpointer.stop(); checkpointFinalized = true; }
 
           // Finalize git only when the harness succeeded — never push a
           // half-finished workspace.
@@ -10754,12 +10760,27 @@ async function workAgent(req, flags, ctx) {
           // but only once the engine acks job.complete (below): until then a lost
           // lease or failed settle redelivers the job, and the next activation must
           // still be able to restore from it. Kept too when finalization failed.
-          discardCheckpointOnAck = Boolean(checkpointing && result.ok && !gitFinalizeFailed && !gitResult?.error && !gitResult?.pushFailed && !gitResult?.pushError);
+          // REQUIRE `gitResult.pushed`: the README/AGENTS contract deletes the ref
+          // only "for a run whose branch push SUCCEEDED". A clean run can restore a
+          // checkpoint as uncommitted changes and make no commit (so finalizeGit
+          // pushes nothing and `pushed` is false while none of the error flags trip)
+          // — discarding then would drop the only durable copy of the recovered WIP.
+          // When not pushed, keep the ref; the orphan GC reclaims it once the element
+          // instance is terminal.
+          discardCheckpointOnAck = Boolean(checkpointing && result.ok && gitResult?.pushed && !gitFinalizeFailed && !gitResult?.error && !gitResult?.pushFailed && !gitResult?.pushError);
           // Reached the end of the run + finalization without throwing. A git
           // finalization error keeps this false so the relay close is 'error'.
           runCompleted = !gitFinalizeFailed;
         } finally {
-          if (checkpointing) { try { await checkpointing.close(); } catch { /* best effort */ } }
+          if (checkpointing) {
+            // #264: exception path — if the run threw before any terminal checkpoint
+            // decision was taken (abort/failed flush or the success-path stop), take a
+            // last-chance `failed` flush so the retry can recover edits made since the
+            // last periodic checkpoint. `flush` forces past the post-stop guard and is
+            // bounded; the lease still protects a newer owner. Then close (drain).
+            if (checkpointer && !checkpointFinalized) { try { await checkpointer.flush('failed', { timeoutMs: checkpointing.flushTimeoutMs }); } catch { /* best effort */ } }
+            try { await checkpointing.close(); } catch { /* best effort */ }
+          }
           if (isContainer) liveRunIds.delete(runId);
           // #205: clear the in-flight job marker now the harness has stopped — the
           // owning lifecycle's finally is the authoritative "job finished" signal,

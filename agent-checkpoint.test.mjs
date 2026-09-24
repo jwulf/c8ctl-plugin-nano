@@ -501,6 +501,27 @@ test('setupWorkspaceCheckpoints: discardAfterAck deletes the ref after the works
   } finally { f.cleanup(); }
 });
 
+test('createGitRunner suppresses configured credential helpers so the token is never persisted', async () => {
+  const dir = mkdtempSync(join(tmpdir(), 'ckpt-cred-'));
+  try {
+    const marker = join(dir, 'helper-invoked');
+    const helper = join(dir, 'cred-helper.sh');
+    // A credential helper that RECORDS every invocation. If git consults it (as a
+    // helper like `store` would), the token could be reused/persisted to disk.
+    writeFileSync(helper, `#!/bin/sh\nprintf '%s\\n' "$1" >> "${marker}"\n`, { mode: 0o755 });
+    const git = createGitRunner({ cwd: dir, env: ENV });
+    assert.equal((await git(['init', '--quiet', '.'])).status, 0);
+    // Configure the helper in repo config (an absolute path is exec'd directly).
+    assert.equal((await git(['config', 'credential.helper', helper])).status, 0);
+    // `git credential fill` consults the helper for a `get`. The runner injects
+    // `-c credential.helper=`, which RESETS the helper list, so it must not run.
+    await git(['credential', 'fill'], { input: 'protocol=https\nhost=example.invalid\n\n' });
+    assert.ok(!existsSync(marker), 'credential helper must be suppressed on checkpoint git ops');
+  } finally {
+    rmSync(dir, { recursive: true, force: true });
+  }
+});
+
 test('job handler wires checkpoints: notify on ACP updates, flush on abort/failure, stop before finalize, discard after the complete ack', () => {
   const src = readFileSync(new URL('./c8ctl-plugin.js', import.meta.url), 'utf8');
   const i = (s) => { const at = src.indexOf(s); assert.ok(at >= 0, `missing: ${s}`); return at; };
@@ -509,10 +530,14 @@ test('job handler wires checkpoints: notify on ACP updates, flush on abort/failu
   const notify = i('checkpointer?.notify(u)');
   const abort = i("await checkpointer.flush('abort'");
   const failed = i("await checkpointer.flush('failed'");
-  const stop = i('if (checkpointer && result.ok) await checkpointer.stop()');
+  const stop = i('if (checkpointer && result.ok) { await checkpointer.stop();');
   const finalize = src.indexOf('gitResult = finalizeGit({', stop);
   const decide = i('discardCheckpointOnAck = Boolean(checkpointing && result.ok');
   assert.ok(setup < note && note < notify && notify < abort && abort < failed && failed < stop && stop < finalize && finalize < decide);
+  // #264 (review): the ref is discarded only when the branch was ACTUALLY pushed,
+  // and the exception path takes a last-chance `failed` flush before close().
+  assert.ok(src.slice(decide, decide + 200).includes('gitResult?.pushed'), 'discard requires a successful branch push');
+  const lastChance = i("if (checkpointer && !checkpointFinalized) { try { await checkpointer.flush('failed'");
   const complete = src.indexOf('const settled = await settleJob.complete({', decide);
   const discard = src.indexOf('if (discardCheckpointOnAck) await checkpointing.discardAfterAck();', complete);
   assert.ok(complete > decide && discard > complete, 'the WIP ref is deleted only after the engine acks job.complete');
@@ -520,5 +545,6 @@ test('job handler wires checkpoints: notify on ACP updates, flush on abort/failu
   assert.equal(src.indexOf('await checkpointing.discard()'), -1, 'no pre-ack delete remains');
   assert.ok(src.indexOf('envelope: effectiveEnvelope', setup) > setup, 'the restored note reaches the harness envelope');
   const close = i('await checkpointing.close()');
+  assert.ok(lastChance > decide && lastChance < close, 'the exception path flushes a failed checkpoint before close()');
   assert.ok(close > decide && close < src.indexOf('rmSync(runDir', close), 'in-flight git work drains before the run dir is reaped');
 });

@@ -84,13 +84,17 @@ export const SECRET_CONTENT_PATTERNS = Object.freeze([
   /\bAIza[0-9A-Za-z_-]{35}\b/,
   /\bnpm_[A-Za-z0-9]{36}\b/,
 ]);
-const MIN_SECRET_VALUE_LEN = 8;
-
 export function normalizeSecretValues(values) {
   const out = new Set();
   for (const v of values || []) {
     const s = typeof v === 'string' ? v.trim() : '';
-    if (s.length >= MIN_SECRET_VALUE_LEN) out.add(s);
+    // Honour EVERY non-empty injected secret value regardless of length. The
+    // documented guarantee excludes any changed file whose content contains an
+    // injected secret from the checkpoint; dropping short values (the old 8-char
+    // floor) would silently let a short `setup.secretRefs` value slip into a WIP
+    // ref. Over-excluding a file that merely contains a short secret substring is
+    // the safe degradation — leaking a secret is not.
+    if (s) out.add(s);
   }
   return [...out];
 }
@@ -186,7 +190,11 @@ export function createGitRunner({ cwd, env = process.env, timeoutMs = DEFAULTS.g
 
 const ok = (r) => r && r.status === 0;
 const out = (r) => (r?.stdout || '').trim();
-const errText = (r) => (r?.stderr || r?.stdout || '').trim().split('\n').slice(-3).join(' | ').slice(0, 400);
+// Redact HTTPS/HTTP URL userinfo (`user:pass@host` → `***@host`) before any git
+// diagnostic reaches a log or result. Git echoes the origin URL in some failure
+// messages, and a provisioned remote can carry the token in its userinfo.
+export const redactUrlUserinfo = (s) => String(s).replace(/(https?:\/\/)[^/@\s]+@/gi, '$1***@');
+const errText = (r) => redactUrlUserinfo((r?.stderr || r?.stdout || '').trim()).split('\n').slice(-3).join(' | ').slice(0, 400);
 
 // Build a shadow commit of the working tree. Never writes the real index/refs.
 // Returns { sha, tree, head, excluded } or { skipped: reason }.
@@ -490,31 +498,42 @@ export function shouldSweep(key, { everyMs = DEFAULTS.gcEveryMs, now = Date.now(
 export async function sweepStaleCheckpoints({ git, ownRef = null, ttlMs = DEFAULTS.ttlMs, graceMs = DEFAULTS.gcGraceMs, isTerminal = null, now = () => Date.now(), maxDeletes = 50, maxLookups = 20, remote = 'origin' }) {
   const ls = await git(['ls-remote', '--refs', remote, `${CHECKPOINT_REF_PREFIX}*`]);
   if (!ok(ls)) return { error: errText(ls), deleted: [] };
-  const refs = out(ls).split('\n').filter(Boolean).map((l) => l.split(/\s+/)[1]).filter((r) => r && r !== ownRef);
-  if (!refs.length) return { scanned: 0, deleted: [] };
+  const entries = out(ls).split('\n').filter(Boolean).map((l) => { const [sha, ref] = l.split(/\s+/); return { sha, ref }; }).filter((e) => e.ref && e.ref !== ownRef);
+  if (!entries.length) return { scanned: 0, deleted: [] };
+  const refs = entries.map((e) => e.ref);
   const local = (r) => `refs/nano-gc/${r.slice(CHECKPOINT_REF_PREFIX.length)}`;
   const fetch = await git(['fetch', '--quiet', '--no-tags', '--no-write-fetch-head', remote, ...refs.map((r) => `+${r}:${local(r)}`)]);
   if (!ok(fetch)) return { error: errText(fetch), deleted: [] };
   const doomed = [];
   let lookups = 0;
   try {
-    for (const ref of refs) {
+    for (const { ref, sha } of entries) {
       if (doomed.length >= maxDeletes) break;
       const at = Number(out(await git(['log', '-1', '--format=%ct', local(ref)]))) * 1000;
       if (!Number.isFinite(at) || at <= 0) continue;
       const age = now() - at;
-      if (ttlMs > 0 && age > ttlMs) { doomed.push({ ref, why: 'ttl' }); continue; }
+      if (ttlMs > 0 && age > ttlMs) { doomed.push({ ref, sha, why: 'ttl' }); continue; }
       if (isTerminal && age > graceMs && lookups < maxLookups) {
         lookups++;
         let terminal = false;
         try { terminal = await isTerminal(ref.slice(CHECKPOINT_REF_PREFIX.length)); } catch { terminal = false; }
-        if (terminal) doomed.push({ ref, why: 'element-terminal' });
+        if (terminal) doomed.push({ ref, sha, why: 'element-terminal' });
       }
     }
     if (!doomed.length) return { scanned: refs.length, deleted: [] };
-    const del = await git(['push', '--quiet', '--no-verify', remote, ...doomed.map((d) => `:${d.ref}`)]);
-    if (!ok(del)) return { scanned: refs.length, deleted: [], error: errText(del) };
-    return { scanned: refs.length, deleted: doomed };
+    // Lease each delete against the SHA we observed at ls-remote time so a newer
+    // checkpoint another activation pushed in the meantime is left intact (a lease
+    // mismatch skips that one ref rather than race-deleting a live recovery point).
+    const deleted = [];
+    let lastError = null;
+    for (const d of doomed) {
+      const r = await deleteCheckpointRef({ git, ref: d.ref, remote, expectSha: d.sha });
+      if (r.ok) deleted.push({ ref: d.ref, why: d.why });
+      else if (r.error) lastError = r.error;
+    }
+    const result = { scanned: refs.length, deleted };
+    if (!deleted.length && lastError) result.error = lastError;
+    return result;
   } finally {
     for (const ref of refs) await git(['update-ref', '-d', local(ref)]);
   }

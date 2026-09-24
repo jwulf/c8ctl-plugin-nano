@@ -6,7 +6,7 @@ import { join } from 'node:path';
 import { spawnSync } from 'node:child_process';
 import {
   checkpointConfig, checkpointRef, checkpointEligibility, classifyPushFailure, containsSecret, normalizeSecretValues, shouldSweep, sweepStaleCheckpoints, isDeniedPath, isCheckpointTrigger, createGitRunner,
-  snapshotWorktree, pushCheckpoint, fetchCheckpoint, restoreCheckpoint, deleteCheckpointRef,
+  snapshotWorktree, pushCheckpoint, fetchCheckpoint, restoreCheckpoint, deleteCheckpointRef, redactUrlUserinfo,
   createWorkspaceCheckpoint, createCheckpointer, withCheckpointNote,
 } from './agent-checkpoint.mjs';
 
@@ -85,8 +85,9 @@ test('push failures are classified, not lumped together as "rejected"', () => {
 
 test('secret content detection: known values and common formats', () => {
   const vals = normalizeSecretValues(['short', '  s3cr3t-value-123  ', null, 's3cr3t-value-123']);
-  assert.deepEqual(vals, ['s3cr3t-value-123']);
+  assert.deepEqual(vals, ['short', 's3cr3t-value-123']);
   assert.ok(containsSecret('token = s3cr3t-value-123', vals));
+  assert.ok(containsSecret('pin is short here', vals), 'short injected secret values are still scanned (no length floor)');
   assert.ok(containsSecret('-----BEGIN OPENSSH PRIVATE KEY-----\nabc'));
   assert.ok(containsSecret(`GH=ghp_${'a'.repeat(36)}`));
   assert.ok(containsSecret('aws AKIAABCDEFGHIJKLMNOP'));
@@ -353,6 +354,50 @@ test('GC deletes TTL-expired and terminal-element refs, keeps own/unknown/fresh 
     assert.equal(shouldSweep('r', { everyMs: 1000, now: 0, registry: reg }), true);
     assert.equal(shouldSweep('r', { everyMs: 1000, now: 500, registry: reg }), false);
     assert.equal(shouldSweep('r', { everyMs: 1000, now: 1500, registry: reg }), true);
+  } finally { f.cleanup(); }
+});
+
+test('git diagnostics redact URL userinfo so a token in the remote never reaches a log', () => {
+  const msg = "fatal: unable to access 'https://x-access-token:ghp_SECRET@github.com/o/r.git/': The requested URL returned error: 403";
+  const red = redactUrlUserinfo(msg);
+  assert.ok(!red.includes('ghp_SECRET'), 'the token is stripped');
+  assert.ok(!red.includes('x-access-token'), 'the username is stripped');
+  assert.ok(red.includes('https://***@github.com/o/r.git'), 'the host/path is preserved');
+  // A non-URL '@' (email, scp-like remote) must be left untouched.
+  assert.equal(redactUrlUserinfo('git@github.com:o/r.git'), 'git@github.com:o/r.git');
+});
+
+test('GC delete is leased: a ref moved after the scan is left intact', async () => {
+  const f = fixture();
+  try {
+    const w = f.clone('w');
+    const base = sh(w.dir, 'rev-parse', 'HEAD');
+    const put = async (key, ageMs, content) => {
+      const date = `${Math.floor((Date.now() - ageMs) / 1000)} +0000`;
+      const git = createGitRunner({ cwd: w.dir, env: { ...ENV, GIT_COMMITTER_DATE: date } });
+      writeFileSync(join(w.dir, 'x.txt'), content);
+      const snap = await snapshotWorktree({ git, baseSha: base });
+      assert.ok((await pushCheckpoint({ git, ref: checkpointRef(key), sha: snap.sha, expectSha: '' })).ok);
+    };
+    const DAY = 86_400_000;
+    await put('9', 8 * DAY, 'old'); // TTL-expired -> doomed for deletion
+    // Prepare a NEWER checkpoint SHA (a different activation's work) but don't push
+    // it yet. The wrapper below force-pushes it onto the ref right before the sweep
+    // tries its leased delete, moving the ref off the SHA the sweep observed.
+    writeFileSync(join(w.dir, 'x.txt'), 'newer');
+    const newer = await snapshotWorktree({ git: w.git, baseSha: base });
+    let moved = false;
+    const git = async (args, opts) => {
+      if (!moved && args[0] === 'push' && args.includes(':refs/nano/wip/9')) {
+        moved = true;
+        await w.git(['push', '--quiet', '--no-verify', '--force', 'origin', `${newer.sha}:refs/nano/wip/9`]);
+      }
+      return w.git(args, opts);
+    };
+    const r = await sweepStaleCheckpoints({ git, ttlMs: 7 * DAY, graceMs: 3_600_000, isTerminal: null });
+    assert.deepEqual(r.deleted, [], 'a ref that moved after the scan is not race-deleted');
+    const left = sh(f.root, '--git-dir', f.remote, 'for-each-ref', '--format=%(refname)', 'refs/nano/wip/');
+    assert.ok(left.split('\n').includes('refs/nano/wip/9'), 'the newer checkpoint survives the race');
   } finally { f.cleanup(); }
 });
 

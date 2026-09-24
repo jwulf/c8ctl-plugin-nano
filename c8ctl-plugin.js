@@ -5452,11 +5452,26 @@ async function setupWorkspaceCheckpoints({ provisioned, envelope = null, token =
     // Orphan GC for this remote, throttled per worker process, in the background.
     let gc = Promise.resolve();
     const gcKey = provisioned.remote || provisioned.workspaceDir;
+    // Bound every checkpoint-path SDK call: the GC sweep and the variable write are
+    // awaited by `stop()`/`close()` (and `onCheckpoint`), so an unbounded engine
+    // call could wedge worker shutdown / the ACP loop. A timed-out call rejects; a
+    // late settle is swallowed so it can never surface as an unhandled rejection.
+    const CP_SDK_TIMEOUT_MS = 10000;
+    const withDeadline = (p, ms, label) => {
+      let timer;
+      const timeout = new Promise((_r, reject) => { timer = setTimeout(() => reject(new Error(`${label} timed out after ${ms}ms`)), ms); });
+      Promise.resolve(p).catch(() => {});
+      return Promise.race([Promise.resolve(p).finally(() => clearTimeout(timer)), timeout]);
+    };
     if (shouldSweep(gcKey, { everyMs: cfg.gcEveryMs, now: now(), registry: deps.sweepRegistry })) {
       const isTerminal = typeof camunda?.getElementInstance === 'function'
         ? async (key) => {
-          const ei = await camunda.getElementInstance({ elementInstanceKey: key }, { consistency: { waitUpToMs: 0 } });
-          return ei?.state === 'COMPLETED' || ei?.state === 'TERMINATED';
+          try {
+            const ei = await withDeadline(
+              camunda.getElementInstance({ elementInstanceKey: key }, { consistency: { waitUpToMs: 0 } }),
+              CP_SDK_TIMEOUT_MS, 'getElementInstance');
+            return ei?.state === 'COMPLETED' || ei?.state === 'TERMINATED';
+          } catch { return false; }
         }
         : null;
       gc = sweep({ git, ownRef: ref, ttlMs: cfg.ttlMs, graceMs: cfg.gcGraceMs, isTerminal, now })
@@ -5475,11 +5490,11 @@ async function setupWorkspaceCheckpoints({ provisioned, envelope = null, token =
     const setVar = typeof camunda?.createElementInstanceVariables === 'function' && job?.elementInstanceKey
       ? async (res) => {
         try {
-          await camunda.createElementInstanceVariables({
+          await withDeadline(camunda.createElementInstanceVariables({
             elementInstanceKey: String(job.elementInstanceKey),
             variables: { agentCheckpoint: { ref, sha: res.sha, head: res.head, at: res.at, reason: res.reason, branch } },
             local: true,
-          });
+          }), CP_SDK_TIMEOUT_MS, 'createElementInstanceVariables');
         } catch (err) {
           if (!varWarned) { varWarned = true; log.warn(`could not set the agentCheckpoint variable — ${oneLineLog(err?.message || err)}; checkpoints still pushed to ${ref}.`); }
         }

@@ -5457,6 +5457,14 @@ async function setupWorkspaceCheckpoints({ provisioned, envelope = null, token =
     // call could wedge worker shutdown / the ACP loop. A timed-out call rejects; a
     // late settle is swallowed so it can never surface as an unhandled rejection.
     const CP_SDK_TIMEOUT_MS = 10000;
+    // A single overall bound on the whole GC sweep. Individual ops are already
+    // bounded (each terminal lookup CP_SDK_TIMEOUT_MS, each git op cfg.gitTimeoutMs),
+    // but a sweep chains up to maxLookups + maxDeletes of them, so a slow/unreachable
+    // remote could otherwise hold `close()`/`discard()` (awaited in job cleanup /
+    // force-stop) for many minutes and starve worker capacity. Cap the total; a
+    // timed-out sweep is abandoned (its late git work settles in the background) and
+    // any refs it did not reach are reclaimed on a future hourly sweep (thread 4099558206).
+    const GC_OVERALL_TIMEOUT_MS = 120000;
     const withDeadline = (p, ms, label) => {
       let timer;
       const timeout = new Promise((_r, reject) => { timer = setTimeout(() => reject(new Error(`${label} timed out after ${ms}ms`)), ms); });
@@ -5474,7 +5482,9 @@ async function setupWorkspaceCheckpoints({ provisioned, envelope = null, token =
           } catch { return false; }
         }
         : null;
-      gc = sweep({ git, ownRef: ref, ttlMs: cfg.ttlMs, graceMs: cfg.gcGraceMs, isTerminal, now })
+      gc = withDeadline(
+        sweep({ git, ownRef: ref, ttlMs: cfg.ttlMs, graceMs: cfg.gcGraceMs, isTerminal, now }),
+        GC_OVERALL_TIMEOUT_MS, 'WIP checkpoint GC')
         .then((r) => {
           if (r?.deleted?.length) logger.info?.(`${prefix} (${corr}): reclaimed ${r.deleted.length} orphaned WIP checkpoint ref(s): ${r.deleted.map((d) => `${d.ref} [${d.why}]`).join(', ')}.`);
           else if (r?.error) log.debug(`WIP checkpoint GC skipped — ${oneLineLog(r.error)}.`);
@@ -5562,7 +5572,16 @@ async function setupWorkspaceCheckpoints({ provisioned, envelope = null, token =
           const scratch = mkGit({ cwd: dir, env: gitEnv, timeoutMs: cfg.gitTimeoutMs });
           const init = await scratch(['init', '--quiet', '.']);
           if (init.status !== 0) throw new Error(`git init failed: ${oneLineLog(init.stderr || init.stdout || '')}`);
-          const r = await deleteCp({ git: scratch, ref, remote: originUrl, expectSha: ownedSha });
+          // Configure origin through the throwaway repo's protected `.git/config`
+          // (a 0700 tmpdir) rather than passing `originUrl` positionally to
+          // `git push`: `authUrl` preserves any userinfo an author embedded in
+          // `repository.url`, and an argv URL would leak those credentials into the
+          // push process's argv / `ps` listing. Writing the config file directly
+          // keeps the URL off argv entirely (a `git remote add` would still expose
+          // it); auth still flows through GIT_ASKPASS (thread 4099558181).
+          const escUrl = originUrl.replace(/\\/g, '\\\\').replace(/"/g, '\\"');
+          appendFileSync(join(dir, '.git', 'config'), `[remote "origin"]\n\turl = "${escUrl}"\n`);
+          const r = await deleteCp({ git: scratch, ref, expectSha: ownedSha });
           if (r?.ok) log.debug(`deleted WIP checkpoint ${ref} after the engine acknowledged completion.`);
           else if (r?.staleLease) log.debug(`WIP checkpoint ${ref} left intact — the ref moved to a newer activation; the orphan GC will reclaim it if needed.`);
           else log.warn(`could not delete WIP checkpoint ${ref} — ${redactToken(r?.error || 'unknown', token)}; the orphan GC will reclaim it.`);
@@ -10708,9 +10727,14 @@ async function workAgent(req, flags, ctx) {
             try { await agentInstanceProducer.complete(result.ok); } catch (err) { logger.warn(`[${jobType}] AgentInstance producer complete() threw (${aiCorr}) — ${oneLineLog(err?.message || err)}; job settlement unaffected.`); }
           }
 
-          // #264: the run is done — stop snapshotting (and wait out an in-flight
-          // one) before finalizeGit touches the workspace.
-          if (checkpointer && result.ok) { await checkpointer.stop(); checkpointFinalized = true; }
+          // #264: the run is done — take a FINAL snapshot (so edits still pending in
+          // the rate-limiter's trailing timer are not lost) and stop snapshotting
+          // before finalizeGit touches the workspace. `flush('final')` forces one
+          // last checkpoint past the post-stop guard, then latches the scheduler
+          // stopped; on a successful run with no branch commit (or a crash before
+          // job.complete is acked) the retained WIP ref then still holds the latest
+          // work rather than only the last periodic checkpoint (advisory 10713).
+          if (checkpointer && result.ok) { await checkpointer.flush('final'); checkpointFinalized = true; }
 
           // Finalize git only when the harness succeeded — never push a
           // half-finished workspace.

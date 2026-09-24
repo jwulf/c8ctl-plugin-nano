@@ -54,8 +54,8 @@ test('config, ref, deny-list, triggers', () => {
   assert.equal(checkpointRef('2251799813685249'), 'refs/nano/wip/2251799813685249');
   assert.equal(checkpointRef('../x'), null);
   assert.equal(checkpointRef(''), null);
-  for (const p of ['.env', 'app/.env.local', 'id_rsa', 'k/server.pem', '.npmrc', 'x/.ssh/config']) assert.ok(isDeniedPath(p), p);
-  for (const p of ['src/env.ts', 'README.md', 'environment.md']) assert.ok(!isDeniedPath(p), p);
+  for (const p of ['.env', 'app/.env.local', '.envrc', 'app/.envlocal', 'id_rsa', 'id_token', 'x/id_ed25519_old', 'id_custom', 'k/server.pem', '.npmrc', 'x/.ssh/config']) assert.ok(isDeniedPath(p), p);
+  for (const p of ['src/env.ts', 'README.md', 'environment.md', 'src/identity.ts']) assert.ok(!isDeniedPath(p), p);
   assert.ok(isCheckpointTrigger({ sessionUpdate: 'tool_call_update', status: 'completed' }));
   assert.ok(isCheckpointTrigger({ sessionUpdate: 'plan', entries: [] }));
   assert.ok(!isCheckpointTrigger({ sessionUpdate: 'tool_call_update', status: 'in_progress' }));
@@ -575,7 +575,7 @@ test('job handler wires checkpoints: notify on ACP updates, flush on abort/failu
   const notify = i('checkpointer?.notify(u)');
   const abort = i("await checkpointer.flush('abort'");
   const failed = i("await checkpointer.flush('failed'");
-  const stop = i('if (checkpointer && result.ok) { await checkpointer.stop();');
+  const stop = i("if (checkpointer && result.ok) { await checkpointer.flush('final');");
   const finalize = src.indexOf('gitResult = finalizeGit({', stop);
   const decide = i('discardCheckpointOnAck = Boolean(checkpointing && result.ok');
   assert.ok(setup < note && note < notify && notify < abort && abort < failed && failed < stop && stop < finalize && finalize < decide);

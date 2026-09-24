@@ -54,11 +54,16 @@ const MIN_INTERVAL_FLOOR_MS = 5_000;
 // Paths that must never leave the worker even if the agent forgot to gitignore
 // them. Matched against the repo-relative path (any directory depth).
 export const DENY_PATTERNS = Object.freeze([
-  /(^|\/)\.env(\..*)?$/i,
+  // Any basename beginning with `.env` (the documented `.env*` policy): `.env`,
+  // `.env.local`, but also `.envrc`, `.envlocal`, … — not just dot-suffixed names.
+  /(^|\/)\.env[^/]*$/i,
   /(^|\/)\.npmrc$/i,
   /(^|\/)\.netrc$/i,
   /(^|\/)\.pypirc$/i,
-  /(^|\/)id_(rsa|dsa|ecdsa|ed25519)(\.pub)?$/i,
+  // The whole `id_` basename family (the documented `id_*` policy): `id_rsa`,
+  // `id_ed25519`, but also `id_token`, `id_ed25519_old`, `id_custom`, … so a
+  // private key the content scanner does not recognise still never leaves the host.
+  /(^|\/)id_[^/]*$/i,
   /\.(pem|key|p12|pfx|jks|keystore)$/i,
   /(^|\/)\.(aws|ssh|gnupg)\//i,
   /(^|\/)credentials(\.json)?$/i,

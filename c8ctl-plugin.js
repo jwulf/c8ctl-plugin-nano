@@ -5428,6 +5428,9 @@ async function setupWorkspaceCheckpoints({ provisioned, envelope = null, token =
       },
       timeoutMs: cfg.gitTimeoutMs,
     });
+    // Captured now: the ref is deleted only after the engine acks completion, by
+    // which time the workspace (and its askpass helper) has been reaped.
+    const originUrl = ((await git(['remote', 'get-url', 'origin'])).stdout || '').trim();
 
     let prior = null;
     let restored = null;
@@ -5516,6 +5519,35 @@ async function setupWorkspaceCheckpoints({ provisioned, envelope = null, token =
           if (!r?.ok) log.warn(`could not delete WIP checkpoint ${ref} — ${r?.error || 'unknown'}.`);
         } catch (err) {
           log.warn(`could not delete WIP checkpoint ${ref} — ${oneLineLog(err?.message || err)}.`);
+        }
+      },
+      // Delete the ref once the engine has acknowledged the job's completion.
+      // Independent of the (by then reaped) workspace: pushes the delete from a
+      // throwaway scratch repo with its own askpass helper. Never throws; a ref left
+      // behind is reclaimed by the orphan GC once the element instance is terminal.
+      async discardAfterAck() {
+        await checkpointer.stop();
+        await gc;
+        if (!originUrl) { log.warn(`could not delete WIP checkpoint ${ref} — workspace had no origin URL; the orphan GC will reclaim it.`); return; }
+        let dir = null;
+        try {
+          dir = mkdtempSync(join(tmpdir(), 'nano-wip-'));
+          const gitEnv = { ...(provisioned.gitEnv || process.env), GIT_TERMINAL_PROMPT: '0' };
+          delete gitEnv.GIT_ASKPASS;
+          delete gitEnv.GIT_TOKEN;
+          const askpass = token ? writeAskpass(dir, token) : null;
+          if (askpass) { gitEnv.GIT_ASKPASS = askpass; gitEnv.GIT_TOKEN = token; }
+          // A plain (non-bare) repo: `safe.bareRepository=explicit` refuses implicit bare dirs.
+          const scratch = mkGit({ cwd: dir, env: gitEnv, timeoutMs: cfg.gitTimeoutMs });
+          const init = await scratch(['init', '--quiet', '.']);
+          if (init.status !== 0) throw new Error(`git init failed: ${oneLineLog(init.stderr || init.stdout || '')}`);
+          const r = await deleteCp({ git: scratch, ref, remote: originUrl });
+          if (r?.ok) log.debug(`deleted WIP checkpoint ${ref} after the engine acknowledged completion.`);
+          else log.warn(`could not delete WIP checkpoint ${ref} — ${redactToken(r?.error || 'unknown', token)}; the orphan GC will reclaim it.`);
+        } catch (err) {
+          log.warn(`could not delete WIP checkpoint ${ref} — ${redactToken(oneLineLog(err?.message || err), token)}; the orphan GC will reclaim it.`);
+        } finally {
+          if (dir) { try { rmSync(dir, { recursive: true, force: true }); } catch { /* best effort */ } }
         }
       },
     };
@@ -10466,6 +10498,7 @@ async function workAgent(req, flags, ctx) {
         // as a `normal` close. This flag flips true only once we reach the end of the
         // try body, so an early throw is correctly reported as `error`.
         let runCompleted = false;
+        let discardCheckpointOnAck = false;
         // The per-job live-terminal relay session (issue #173): streams this job's
         // harness terminal over the single-owner supervisor's ONE multiplexed host
         // connection, keyed by this worker's instance + the jobKey, and accepts
@@ -10710,11 +10743,11 @@ async function workAgent(req, flags, ctx) {
           } else if (provisioned) {
             gitResult = { remote: provisioned.remote, branch: provisioned.workingBranch, baseSha: provisioned.startSha || null, commits: [], pushed: false };
           }
-          // #264: the work is durable on the pushed branch — drop the WIP ref. Kept
-          // when finalization failed so a retry can still restore from it.
-          if (checkpointing && result.ok && !gitFinalizeFailed && !gitResult?.error && !gitResult?.pushFailed && !gitResult?.pushError) {
-            await checkpointing.discard();
-          }
+          // #264: the work is durable on the pushed branch, so the WIP ref goes —
+          // but only once the engine acks job.complete (below): until then a lost
+          // lease or failed settle redelivers the job, and the next activation must
+          // still be able to restore from it. Kept too when finalization failed.
+          discardCheckpointOnAck = Boolean(checkpointing && result.ok && !gitFinalizeFailed && !gitResult?.error && !gitResult?.pushFailed && !gitResult?.pushError);
           // Reached the end of the run + finalization without throwing. A git
           // finalization error keeps this false so the relay close is 'error'.
           runCompleted = !gitFinalizeFailed;
@@ -10855,7 +10888,7 @@ async function workAgent(req, flags, ctx) {
           const resultKeys = Object.keys(resultVars);
           if (resultKeys.length === 0) logger.warn(`[${jobType}] job ${job.jobKey}: agent returned no usable result vars — write a JSON object of result variables to $AGENT_RESULT_FILE (or print a "${RESULT_SENTINEL} {…}" line) so downstream gateways see status/summary/etc.`);
           else logger.info(`[${jobType}] job ${job.jobKey}: merged agent result vars [${resultKeys.join(', ')}]`);
-          return await settleJob.complete({
+          const settled = await settleJob.complete({
             ...resultVars,
             [AGENT_RESULT_KEY]: resultEnvelope,
             output: result.stdout,
@@ -10866,6 +10899,9 @@ async function workAgent(req, flags, ctx) {
               ? { branch: gitResult.branch, commits: gitResult.commits, pushed: gitResult.pushed, pullRequest: gitResult.pr || null }
               : {}),
           });
+          // The engine acknowledged completion: the WIP checkpoint is no longer needed.
+          if (discardCheckpointOnAck) await checkpointing.discardAfterAck();
+          return settled;
         }
         const retries = Math.max(0, (Number(job.retries) || 1) - 1);
         const detail = result.error

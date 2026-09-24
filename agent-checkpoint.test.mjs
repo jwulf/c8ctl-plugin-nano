@@ -426,7 +426,25 @@ test('setupWorkspaceCheckpoints: a variable-write failure warns once and never b
   } finally { f.cleanup(); }
 });
 
-test('job handler wires checkpoints: notify on ACP updates, flush on abort/failure, stop before finalize, discard after', () => {
+test('setupWorkspaceCheckpoints: discardAfterAck deletes the ref after the workspace is reaped', async () => {
+  const f = fixture();
+  try {
+    const { dir } = f.clone('acked');
+    const provisioned = { workspaceDir: dir, gitEnv: ENV, committer: {}, startSha: sh(dir, 'rev-parse', 'HEAD') };
+    const logger = quietLogger();
+    const s = await setupWorkspaceCheckpoints({ provisioned, job: { jobKey: '1', elementInstanceKey: '42' }, jobType: 't', runId: 'r', logger, env: { NANO_AGENT_CHECKPOINT: 'on', NANO_AGENT_CHECKPOINT_INTERVAL_MS: '0' }, deps: { sweepRegistry: new Map() } });
+    writeFileSync(join(dir, 'a.txt'), 'changed\n');
+    assert.ok((await s.checkpointer.flush('final', { timeoutMs: 0 })).sha);
+    await s.close();
+    rmSync(dir, { recursive: true, force: true });
+    assert.ok(sh(f.root, '--git-dir', f.remote, 'rev-parse', 'refs/nano/wip/42'), 'kept until the ack');
+    await s.discardAfterAck();
+    assert.throws(() => sh(f.root, '--git-dir', f.remote, 'rev-parse', '--verify', 'refs/nano/wip/42'));
+    assert.deepEqual(logger.lines.warn, []);
+  } finally { f.cleanup(); }
+});
+
+test('job handler wires checkpoints: notify on ACP updates, flush on abort/failure, stop before finalize, discard after the complete ack', () => {
   const src = readFileSync(new URL('./c8ctl-plugin.js', import.meta.url), 'utf8');
   const i = (s) => { const at = src.indexOf(s); assert.ok(at >= 0, `missing: ${s}`); return at; };
   const setup = i('await setupWorkspaceCheckpoints({ provisioned, envelope, token: repoToken, secretValues: Object.values(resolved');
@@ -436,9 +454,14 @@ test('job handler wires checkpoints: notify on ACP updates, flush on abort/failu
   const failed = i("await checkpointer.flush('failed'");
   const stop = i('if (checkpointer && result.ok) await checkpointer.stop()');
   const finalize = src.indexOf('gitResult = finalizeGit({', stop);
-  const discard = i('await checkpointing.discard()');
-  assert.ok(setup < note && note < notify && notify < abort && abort < failed && failed < stop && stop < finalize && finalize < discard);
+  const decide = i('discardCheckpointOnAck = Boolean(checkpointing && result.ok');
+  assert.ok(setup < note && note < notify && notify < abort && abort < failed && failed < stop && stop < finalize && finalize < decide);
+  const complete = src.indexOf('const settled = await settleJob.complete({', decide);
+  const discard = src.indexOf('if (discardCheckpointOnAck) await checkpointing.discardAfterAck();', complete);
+  assert.ok(complete > decide && discard > complete, 'the WIP ref is deleted only after the engine acks job.complete');
+  assert.ok(discard < src.indexOf('return settled;', discard));
+  assert.equal(src.indexOf('await checkpointing.discard()'), -1, 'no pre-ack delete remains');
   assert.ok(src.indexOf('envelope: effectiveEnvelope', setup) > setup, 'the restored note reaches the harness envelope');
   const close = i('await checkpointing.close()');
-  assert.ok(close > discard && close < src.indexOf('rmSync(runDir', close), 'in-flight git work drains before the run dir is reaped');
+  assert.ok(close > decide && close < src.indexOf('rmSync(runDir', close), 'in-flight git work drains before the run dir is reaped');
 });

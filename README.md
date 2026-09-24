@@ -770,7 +770,9 @@ the job with a decremented retry count. Profiles are stored in the plugin's
 > - **Restore:** a later activation of the same element instance restores the snapshot
 >   into the fresh clone as uncommitted changes (recovering local commits too) and tells
 >   the agent to inspect `git status`/`git diff` first.
-> - **Cleanup:** the ref is deleted after a successful push. Orphans (cancelled instances,
+> - **Cleanup:** the ref is deleted once the engine acknowledges `job.complete` for a run
+>   whose branch push succeeded. Until that ack a lost lease or failed settle redelivers
+>   the job, so the ref stays restorable. Orphans (cancelled instances, failed acks,
 >   exhausted retries) are reclaimed by a background sweep (at most hourly per remote per
 >   worker) that deletes WIP refs older than `NANO_AGENT_CHECKPOINT_TTL_MS` (7 days), or
 >   older than 1h whose element instance the engine reports `COMPLETED`/`TERMINATED`.

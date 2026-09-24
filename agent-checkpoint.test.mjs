@@ -246,6 +246,63 @@ test('ownership: a newer run takes over from a superseded run\'s late write; the
   } finally { f.cleanup(); }
 });
 
+test('deleteCheckpointRef leases the delete so a stale run cannot remove a newer owner\'s WIP', async () => {
+  const f = fixture();
+  try {
+    const ref = checkpointRef('46');
+    const a = f.clone('a');
+    const base = sh(a.dir, 'rev-parse', 'HEAD');
+    writeFileSync(join(a.dir, 'x.txt'), 'v1\n');
+    const s1 = await createWorkspaceCheckpoint({ git: a.git, ref, baseSha: base })('tool');
+    assert.ok(s1.sha);
+    // A newer run takes over and pushes a new sha over the top.
+    const b = f.clone('b');
+    writeFileSync(join(b.dir, 'x.txt'), 'v2\n');
+    const snapB = await snapshotWorktree({ git: b.git, baseSha: base });
+    assert.ok((await pushCheckpoint({ git: b.git, ref, sha: snapB.sha, expectSha: s1.sha })).ok);
+    // The stale run's leased delete (expecting its own old sha) is refused; ref intact.
+    const stale = await deleteCheckpointRef({ git: a.git, ref, expectSha: s1.sha });
+    assert.equal(stale.staleLease, true, JSON.stringify(stale));
+    assert.equal(sh(f.root, '--git-dir', f.remote, 'rev-parse', ref), snapB.sha);
+    // The current owner's leased delete (expecting the live sha) removes it.
+    assert.equal((await deleteCheckpointRef({ git: b.git, ref, expectSha: snapB.sha })).ok, true);
+    assert.equal(await fetchCheckpoint({ git: f.clone('c').git, ref }), null);
+  } finally { f.cleanup(); }
+});
+
+test('coalesces a synchronous burst of triggers into a single trailing checkpoint', async () => {
+  let t = 0;
+  const timers = [];
+  const setTimer = (fn, ms) => { const h = { fn, at: t + ms }; timers.push(h); return h; };
+  const clearTimer = (h) => { const i = timers.indexOf(h); if (i >= 0) timers.splice(i, 1); };
+  const advance = async (ms) => {
+    t += ms;
+    for (;;) {
+      const due = timers.filter((h) => h.at <= t).sort((x, y) => x.at - y.at)[0];
+      if (!due) break;
+      clearTimer(due);
+      due.fn();
+      await new Promise((r) => setImmediate(r));
+    }
+    await new Promise((r) => setImmediate(r));
+  };
+  const calls = [];
+  const cp = createCheckpointer({
+    checkpoint: async (reason) => { calls.push(reason); return { sha: `s${calls.length}`, reason }; },
+    minIntervalMs: 60_000, intervalMs: 0, now: () => t, setTimer, clearTimer,
+  });
+  const done = { sessionUpdate: 'tool_call_update', status: 'completed' };
+  // Four triggers land in ONE synchronous tick, before any checkpoint body runs.
+  // The run slot is reserved synchronously, so the first fires and the rest coalesce
+  // onto a single trailing checkpoint — not one push each.
+  cp.notify(done); cp.notify(done); cp.notify(done); cp.notify(done);
+  await advance(0);
+  assert.deepEqual(calls, ['tool']);
+  await advance(60_000);
+  assert.deepEqual(calls, ['tool', 'tool']);
+  await cp.flush('final', { timeoutMs: 0 });
+});
+
 test('a policy rejection stops checkpointing without the takeover path', async () => {
   const calls = [];
   const git = async (args) => {
@@ -334,7 +391,7 @@ test('checkpointer rate-limits, coalesces triggers and flushes', async () => {
   await advance(240_000); // safety-net timer at 300s
   assert.deepEqual(calls, ['tool', 'tool', 'timer']);
   const final = await cp.flush('abort', { timeoutMs: 0 });
-  assert.equal(final.reason, 'final');
+  assert.equal(final.reason, 'abort');
   assert.deepEqual(seen, ['s1', 's2', 's3', 's4']);
   cp.notify(done);
   await advance(600_000);
@@ -394,7 +451,7 @@ test('setupWorkspaceCheckpoints: checkpoint → variable → restore on the next
     assert.equal(vars.length, 1);
     assert.equal(vars[0].elementInstanceKey, '99');
     assert.equal(vars[0].local, true);
-    assert.deepEqual({ ...vars[0].variables.agentCheckpoint, at: 'x' }, { ref: 'refs/nano/wip/99', sha: res.sha, head: p1.startSha, at: 'x', reason: 'final', branch: 'nano/agent-work/main-x' });
+    assert.deepEqual({ ...vars[0].variables.agentCheckpoint, at: 'x' }, { ref: 'refs/nano/wip/99', sha: res.sha, head: p1.startSha, at: 'x', reason: 'abort', branch: 'nano/agent-work/main-x' });
     assert.equal(sh(f.root, '--git-dir', f.remote, 'log', '-1', '--format=%an', 'refs/nano/wip/99'), 'bot');
 
     const p2 = provision('run2');

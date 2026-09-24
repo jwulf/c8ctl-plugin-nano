@@ -258,10 +258,22 @@ export async function pushCheckpoint({ git, ref, sha, expectSha = '', remote = '
   return { ok: false, kind, rejected: kind === 'lease', error: errText(r) };
 }
 
-export async function deleteCheckpointRef({ git, ref, remote = 'origin' }) {
-  const r = await git(['push', '--quiet', '--no-verify', remote, `:${ref}`]);
+// Delete `ref`. When `expectSha` is a non-null string the delete is FENCED with
+// `--force-with-lease=<ref>:<expectSha>` so it only removes the ref while it still
+// holds the SHA this run owns: an older activation that finishes after a newer one
+// took over the same element-instance ref can no longer delete the newer worker's
+// recoverable WIP. A lease mismatch (the ref moved on) returns `{ staleLease:true }`
+// and leaves the ref intact for its new owner. `expectSha = ''` demands the ref not
+// exist. `expectSha = null` (default) is the legacy unconditional delete.
+export async function deleteCheckpointRef({ git, ref, remote = 'origin', expectSha = null }) {
+  const args = expectSha != null
+    ? ['push', '--quiet', '--no-verify', `--force-with-lease=${ref}:${expectSha}`, remote, `:${ref}`]
+    : ['push', '--quiet', '--no-verify', remote, `:${ref}`];
+  const r = await git(args);
   if (ok(r)) return { ok: true };
-  if (/remote ref does not exist|unable to delete .*not found/i.test(`${r.stderr}${r.stdout}`)) return { ok: true, absent: true };
+  const text = `${r.stderr}${r.stdout}`;
+  if (/remote ref does not exist|unable to delete .*not found/i.test(text)) return { ok: true, absent: true };
+  if (expectSha != null && classifyPushFailure(text) === 'lease') return { ok: false, staleLease: true, error: errText(r) };
   return { ok: false, error: errText(r) };
 }
 
@@ -378,11 +390,15 @@ export function createCheckpointer({ checkpoint, minIntervalMs = DEFAULTS.minInt
   let stopped = false;
   const stats = { taken: 0, skipped: 0, failed: 0 };
 
-  const run = (reason) => {
+  const run = (reason, { force = false } = {}) => {
+    // Reserve the run slot SYNCHRONOUSLY, before the async `chain.then` body runs.
+    // If several ACP updates arrive in one tick, the first `request()` that lands
+    // here flips `running`/`lastRunAt` immediately, so the rest coalesce onto the
+    // trailing timer instead of each enqueueing its own checkpoint.
+    running = true;
+    lastRunAt = now();
     const p = chain.then(async () => {
-      if (stopped && reason !== 'final') return null;
-      running = true;
-      lastRunAt = now();
+      if (stopped && !force) { running = false; return null; }
       try {
         const res = await checkpoint(reason);
         if (res?.sha) {
@@ -432,7 +448,10 @@ export function createCheckpointer({ checkpoint, minIntervalMs = DEFAULTS.minInt
     async flush(reason = 'final', { timeoutMs = DEFAULTS.flushTimeoutMs } = {}) {
       clearAll();
       stopped = true;
-      const p = run('final').then((r) => r, () => null);
+      // Force the run past the post-stop guard AND preserve the caller's reason so
+      // an abort/failure flush records `abort`/`failed` (not `final`) in the commit
+      // message, logs and `agentCheckpoint.reason`.
+      const p = run(reason, { force: true }).then((r) => r, () => null);
       if (!timeoutMs) return p;
       let t;
       const timeout = new Promise((resolve) => { t = setTimer(() => resolve({ skipped: `flush timed out after ${timeoutMs}ms (${reason})` }), timeoutMs); t?.unref?.(); });

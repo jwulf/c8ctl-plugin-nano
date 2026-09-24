@@ -5467,6 +5467,10 @@ async function setupWorkspaceCheckpoints({ provisioned, envelope = null, token =
     }
 
     const branch = provisioned.workingBranch || null;
+    // The SHA this run currently owns on the ref: the checkpoint we restored to
+    // begin with, then each checkpoint we successfully push. `discard()` leases its
+    // delete against it so a stale activation cannot delete a newer owner's WIP.
+    let ownedSha = prior?.sha || '';
     let varWarned = false;
     const setVar = typeof camunda?.createElementInstanceVariables === 'function' && job?.elementInstanceKey
       ? async (res) => {
@@ -5499,6 +5503,7 @@ async function setupWorkspaceCheckpoints({ provisioned, envelope = null, token =
       intervalMs: cfg.intervalMs,
       logger: log,
       onCheckpoint: async (res) => {
+        ownedSha = res.sha;
         log.debug(`WIP checkpoint ${ref}@${res.sha.slice(0, 12)} pushed (${res.reason})${res.excluded?.length ? `; excluded ${res.excluded.map((e) => `${e.path} [${e.why}]`).join(', ')}` : ''}.`);
         if (setVar) await setVar(res);
       },
@@ -5515,8 +5520,9 @@ async function setupWorkspaceCheckpoints({ provisioned, envelope = null, token =
       async discard() {
         await checkpointer.stop();
         try {
-          const r = await deleteCp({ git, ref });
-          if (!r?.ok) log.warn(`could not delete WIP checkpoint ${ref} — ${r?.error || 'unknown'}.`);
+          const r = await deleteCp({ git, ref, expectSha: ownedSha });
+          if (r?.staleLease) log.debug(`WIP checkpoint ${ref} left intact — the ref moved to a newer activation; not deleting another owner's WIP.`);
+          else if (!r?.ok) log.warn(`could not delete WIP checkpoint ${ref} — ${r?.error || 'unknown'}.`);
         } catch (err) {
           log.warn(`could not delete WIP checkpoint ${ref} — ${oneLineLog(err?.message || err)}.`);
         }
@@ -5541,8 +5547,9 @@ async function setupWorkspaceCheckpoints({ provisioned, envelope = null, token =
           const scratch = mkGit({ cwd: dir, env: gitEnv, timeoutMs: cfg.gitTimeoutMs });
           const init = await scratch(['init', '--quiet', '.']);
           if (init.status !== 0) throw new Error(`git init failed: ${oneLineLog(init.stderr || init.stdout || '')}`);
-          const r = await deleteCp({ git: scratch, ref, remote: originUrl });
+          const r = await deleteCp({ git: scratch, ref, remote: originUrl, expectSha: ownedSha });
           if (r?.ok) log.debug(`deleted WIP checkpoint ${ref} after the engine acknowledged completion.`);
+          else if (r?.staleLease) log.debug(`WIP checkpoint ${ref} left intact — the ref moved to a newer activation; the orphan GC will reclaim it if needed.`);
           else log.warn(`could not delete WIP checkpoint ${ref} — ${redactToken(r?.error || 'unknown', token)}; the orphan GC will reclaim it.`);
         } catch (err) {
           log.warn(`could not delete WIP checkpoint ${ref} — ${redactToken(oneLineLog(err?.message || err), token)}; the orphan GC will reclaim it.`);

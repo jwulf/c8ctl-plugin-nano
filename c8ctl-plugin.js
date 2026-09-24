@@ -2739,11 +2739,26 @@ function sanitizeResultVars(obj) {
   return out;
 }
 
+// True when `obj` carries at least one EFFECTIVE result var: a key that survives
+// sanitizeResultVars (reserved / io.nanobpm.* / proto keys stripped) AND whose
+// value is not null/undefined. A key present with a null/undefined value (e.g.
+// `{"status":null}`) is NOT effective — it leaves downstream gateways with no
+// decision value — so it must neither shadow a usable ACP outcome (pickAgentResult)
+// nor suppress the dropped-result nudge (resolveAgentResultWithNudge). Both
+// predicates route through here so they stay consistent.
+function hasEffectiveResultVars(obj) {
+  for (const v of Object.values(sanitizeResultVars(obj))) {
+    if (v !== null && v !== undefined) return true;
+  }
+  return false;
+}
+
 // Choose the agent's structured result from its candidate sources (result file,
 // stdout sentinel, ACP outcome) in priority order. Prefer the first candidate
 // that carries at least one EFFECTIVE var (i.e. survives sanitizeResultVars —
-// the reserved / io.nanobpm.* / proto keys stripped) so an empty `{}` or a
-// reserved-keys-only result file/sentinel does NOT shadow a usable `blocked`
+// the reserved / io.nanobpm.* / proto keys stripped, with a non-null value) so an
+// empty `{}`, a reserved-keys-only, or a null-valued-only result file/sentinel
+// does NOT shadow a usable `blocked`
 // ACP outcome via raw `??` nullish precedence: `??` only falls through on
 // null/undefined, so a present-but-empty object would otherwise win and force
 // the dropped-result nudge even though the ACP outcome already escalates. Falls
@@ -2758,7 +2773,7 @@ function pickAgentResult(...thunks) {
     const candidate = thunk();
     if (candidate == null) continue;
     if (firstPresent === undefined) firstPresent = candidate;
-    if (Object.keys(sanitizeResultVars(candidate)).length > 0) return candidate;
+    if (hasEffectiveResultVars(candidate)) return candidate;
   }
   return firstPresent ?? null;
 }
@@ -2848,10 +2863,11 @@ async function resolveAgentResultWithNudge({ result, resultFile, rerun, logger, 
   const stdout0 = result && typeof result.stdout === 'string' ? result.stdout : '';
   // A parsed result only counts as usable if it still carries at least one
   // *effective* var after sanitizeResultVars strips the reserved / io.nanobpm.* /
-  // proto keys. An empty `{}` or a reserved-keys-only object leaves downstream
+  // proto keys AND ignoring null/undefined values. An empty `{}`, a reserved-keys-
+  // only, or a null-valued-only (e.g. `{"status":null}`) object leaves downstream
   // gateways with no status/decision vars — exactly the dropped-result case the
   // nudge exists to recover — so gate on effective vars, not raw object presence.
-  const hasUsableResult = (parsed) => Object.keys(sanitizeResultVars(parsed)).length > 0;
+  const hasUsableResult = (parsed) => hasEffectiveResultVars(parsed);
   // A `blocked` ACP outcome is a usable result (it escalates), so it needs no nudge.
   const already = pickAgentResult(
     () => readAgentResultFile(resultFile),
@@ -16791,6 +16807,7 @@ export {
   readAgentResultFile,
   parseResultFromStdout,
   sanitizeResultVars,
+  hasEffectiveResultVars,
   pickAgentResult,
   buildResultNudgePrompt,
   resolveAgentResultWithNudge,

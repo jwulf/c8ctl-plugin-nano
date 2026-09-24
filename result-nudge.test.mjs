@@ -109,6 +109,27 @@ test('an empty / reserved-keys-only result file does NOT shadow a blocked ACP ou
   }
 });
 
+test('a null-valued-only result file (no ACP outcome) still triggers the nudge (#263)', async () => {
+  const { dir, file } = tmpResultFile();
+  try {
+    // `{"status":null}` survives sanitizeResultVars key-wise (status is not a
+    // reserved key) but carries NO effective value, so with no ACP outcome to fall
+    // back on it is exactly the dropped-result case the nudge must recover: a
+    // key-count-only predicate would wrongly treat it as usable and skip the nudge.
+    for (const empty of ['{"status":null}', '{"summary":null,"status":null}']) {
+      writeFileSync(file, empty);
+      let reruns = 0;
+      const rerun = async () => { reruns++; return { ok: true, stdout: '::nano:result:: {"status":"addressed"}' }; };
+      const result = { ok: true, stdout: 'did work but only wrote a null-valued result' };
+      const { nudged } = await resolveAgentResultWithNudge({ result, resultFile: file, rerun });
+      assert.equal(nudged, true, `null-valued result ${empty} must not be treated as usable`);
+      assert.equal(reruns, 1);
+    }
+  } finally {
+    rmSync(dir, { recursive: true, force: true });
+  }
+});
+
 test('propagates the rerun turn OWN acpOutcome back to the caller (#263)', async () => {
   const { dir, file } = tmpResultFile();
   try {

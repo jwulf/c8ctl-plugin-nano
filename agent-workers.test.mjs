@@ -818,6 +818,33 @@ test('worker completion: an empty result file does NOT shadow a blocked ACP outc
   }
 });
 
+test('worker completion: a null-valued-only result file does NOT shadow a blocked ACP outcome (#263)', async () => {
+  const dir = mkdtempSync(join(tmpdir(), 'nudge-worker-'));
+  try {
+    const resultFile = join(dir, 'result.json');
+    // `{"status":null}` survives sanitizeResultVars key-wise but carries no
+    // effective value. A key-count-only predicate would let it win over the
+    // blocked outcome; pickAgentResult must ignore null values and prefer the
+    // outcome so the escalation vars survive.
+    writeFileSync(resultFile, '{"status":null}');
+    const outcome = { status: 'blocked', summary: 'need a deploy token' };
+    let rerunCalls = 0;
+    const rerun = async () => { rerunCalls += 1; return { ok: true, stdout: '' }; };
+    const result = { ok: true, stdout: 'work log, null-valued result file', acpOutcome: outcome };
+
+    const { completeVars, nudged } = await assembleWorkerCompletion({ result, resultFile, rerun });
+
+    assert.equal(nudged, false, 'the blocked outcome short-circuits the nudge despite the null-valued file');
+    assert.equal(rerunCalls, 0, 'the rerun harness must not be invoked');
+    assert.equal(completeVars.status, 'blocked');
+    assert.equal(completeVars.summary, 'need a deploy token');
+    assert.equal(completeVars.question, 'need a deploy token');
+    assert.deepEqual(completeVars[AGENT_RESULT_KEY].outcome, outcome);
+  } finally {
+    rmSync(dir, { recursive: true, force: true });
+  }
+});
+
 test('worker completion: a blocked ACP outcome first reported on the re-emit turn still escalates and records the envelope outcome (#263)', async () => {
   const dir = mkdtempSync(join(tmpdir(), 'nudge-worker-'));
   try {

@@ -5,7 +5,7 @@ import { tmpdir } from 'node:os';
 import { join } from 'node:path';
 import { spawnSync } from 'node:child_process';
 import {
-  checkpointConfig, checkpointRef, checkpointEligibility, classifyPushFailure, containsSecret, normalizeSecretValues, credentialsFromUrl, shouldSweep, sweepStaleCheckpoints, isDeniedPath, isCheckpointTrigger, createGitRunner,
+  checkpointConfig, checkpointRef, checkpointEligibility, classifyPushFailure, containsSecret, normalizeSecretValues, credentialsFromUrl, isAuthenticatedRemote, shouldSweep, sweepStaleCheckpoints, isDeniedPath, isCheckpointTrigger, createGitRunner,
   snapshotWorktree, pushCheckpoint, fetchCheckpoint, restoreCheckpoint, deleteCheckpointRef, redactUrlUserinfo,
   createWorkspaceCheckpoint, createCheckpointer, withCheckpointNote,
 } from './agent-checkpoint.mjs';
@@ -73,6 +73,18 @@ test('auto eligibility: only provisioned, authenticated, pushing jobs on a worki
   assert.equal(checkpointEligibility({ mode: 'auto', provisioned: null, envelope, token: 't' }).enabled, false);
   assert.equal(checkpointEligibility({ mode: 'on', provisioned: { workspaceDir: '/w' }, envelope: { branch: { push: false } }, token: null }).enabled, true);
   assert.equal(checkpointEligibility({ mode: 'off', provisioned, envelope, token: 't' }).enabled, false);
+  // Authentication is not synonymous with a token: an SSH remote or an author-
+  // embedded HTTPS-userinfo URL authenticates the push with no token, and
+  // provisioning's stamped `authenticated` result is honoured.
+  assert.equal(isAuthenticatedRemote('git@github.com:o/r.git'), true);
+  assert.equal(isAuthenticatedRemote('ssh://git@github.com/o/r.git'), true);
+  assert.equal(isAuthenticatedRemote('https://user:pw@github.com/o/r.git'), true);
+  assert.equal(isAuthenticatedRemote('https://github.com/o/r.git'), false);
+  assert.equal(isAuthenticatedRemote(''), false);
+  assert.equal(checkpointEligibility({ mode: 'auto', provisioned: { ...provisioned, authenticated: true }, envelope, token: null }).enabled, true);
+  assert.equal(checkpointEligibility({ mode: 'auto', provisioned, envelope: { branch: {}, repository: { url: 'git@github.com:o/r.git' } }, token: null }).enabled, true);
+  assert.equal(checkpointEligibility({ mode: 'auto', provisioned, envelope: { branch: {}, repository: { url: 'https://user:pw@github.com/o/r.git' } }, token: null }).enabled, true);
+  assert.equal(checkpointEligibility({ mode: 'auto', provisioned: { ...provisioned, authenticated: false }, envelope: { branch: {}, repository: { url: 'https://github.com/o/r.git' } }, token: null }).enabled, false);
 });
 
 test('push failures are classified, not lumped together as "rejected"', () => {
@@ -191,6 +203,50 @@ test('restore replays as a patch when the base moved on', async () => {
     assert.equal(readFileSync(join(b.dir, 'feature.txt'), 'utf8'), 'wip\n');
     assert.ok(existsSync(join(b.dir, 'other.txt')));
     assert.equal(sh(b.dir, 'log', '-1', '--format=%s'), 'advance main');
+  } finally { f.cleanup(); }
+});
+
+test('restore refuses to fast-restore a snapshot taken on a different branch', async () => {
+  const f = fixture();
+  try {
+    const ref = checkpointRef('43b');
+    const a = f.clone('a');
+    const base = sh(a.dir, 'rev-parse', 'HEAD');
+    // The agent wandered off the work branch: it checks out a side branch, commits
+    // there (descending from the shared base), and gets interrupted mid-work.
+    sh(a.dir, 'checkout', '-q', '-b', 'sidebranch');
+    writeFileSync(join(a.dir, 'off.txt'), 'off-branch work\n');
+    sh(a.dir, 'add', '-A');
+    sh(a.dir, 'commit', '-q', '-m', 'off-branch commit');
+    writeFileSync(join(a.dir, 'wip.txt'), 'wip\n');
+    const res = await createWorkspaceCheckpoint({ git: a.git, ref, baseSha: base })('tool');
+    assert.ok(res.sha, JSON.stringify(res));
+
+    const fetched = await fetchCheckpoint({ git: f.clone('probe').git, ref });
+    assert.equal(fetched.branch, 'sidebranch');
+
+    // A fresh run whose expected work branch is 'work' must NOT fast-restore the
+    // sidebranch snapshot — that would reset 'work' to the off-branch commit and let
+    // finalizeGit publish it to the wrong branch. Refuse and retain the ref.
+    const b = f.clone('b');
+    const mismatch = await restoreCheckpoint({ git: b.git, checkpoint: fetched, expectedBranch: 'work' });
+    assert.equal(mismatch.restored, false, JSON.stringify(mismatch));
+    assert.equal(mismatch.branchMismatch, true);
+    assert.ok(!existsSync(join(b.dir, 'off.txt')));
+    assert.equal(sh(b.dir, 'log', '-1', '--format=%s'), 'init');
+    // The checkpoint is retained for explicit recovery.
+    assert.equal(sh(f.root, '--git-dir', f.remote, 'rev-parse', ref), res.sha);
+
+    // The matching branch (or a legacy caller passing no expectedBranch) restores.
+    const c = f.clone('c');
+    const match = await restoreCheckpoint({ git: c.git, checkpoint: fetched, expectedBranch: 'sidebranch' });
+    assert.equal(match.restored, true, JSON.stringify(match));
+    assert.equal(match.mode, 'fast-forward');
+    assert.ok(existsSync(join(c.dir, 'off.txt')));
+
+    const d = f.clone('d');
+    const legacy = await restoreCheckpoint({ git: d.git, checkpoint: fetched });
+    assert.equal(legacy.restored, true, JSON.stringify(legacy));
   } finally { f.cleanup(); }
 });
 
@@ -627,6 +683,9 @@ test('setupWorkspaceCheckpoints: checkpoint → variable → restore on the next
     const job = { jobKey: '7', elementInstanceKey: '99' };
     const provision = (name) => {
       const { dir } = f.clone(name);
+      // Real provisioning checks out the working branch; reflect that so the
+      // snapshot records it and the next activation's restore branch matches.
+      sh(dir, 'checkout', '-q', '-b', 'nano/agent-work/main-x');
       return { workspaceDir: dir, gitEnv: ENV, committer: { name: 'bot', email: 'bot@example.com' }, startSha: sh(dir, 'rev-parse', 'HEAD'), workingBranch: 'nano/agent-work/main-x' };
     };
     const vars = [];

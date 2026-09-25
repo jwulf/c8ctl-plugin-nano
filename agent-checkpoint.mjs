@@ -38,6 +38,11 @@ import { join } from 'node:path';
 export const CHECKPOINT_REF_PREFIX = 'refs/nano/wip/';
 export const CHECKPOINT_BASE_TRAILER = 'Nano-Checkpoint-Base';
 export const CHECKPOINT_RUN_TRAILER = 'Nano-Checkpoint-Run';
+// The symbolic branch HEAD was on when the snapshot was taken. Restore refuses to
+// FAST-restore (reset HEAD + recover commits) a snapshot whose branch differs from
+// the run's expected working branch, so off-branch commits can never be reset onto
+// — and later pushed by finalizeGit to — the wrong branch.
+export const CHECKPOINT_BRANCH_TRAILER = 'Nano-Checkpoint-Branch';
 
 const DEFAULTS = Object.freeze({
   minIntervalMs: 60_000,
@@ -166,6 +171,25 @@ export function checkpointConfig(env = process.env) {
   };
 }
 
+// Does this remote URL carry its OWN push authentication, independent of a
+// separately-supplied token? Provisioning preserves author-embedded HTTPS
+// userinfo (`https://user:pass@host/…`, kept by `authUrl`) and an SSH remote
+// (`git@host:path` or `ssh://…`) authenticates through the host SSH agent/config.
+// Either can push with NO `repoToken`, so token presence alone under-detects an
+// authenticated clone and would silently skip default-on checkpointing.
+export function isAuthenticatedRemote(url) {
+  const s = String(url ?? '').trim();
+  if (!s) return false;
+  // scp-like SSH syntax `[user@]host:path` (no URL scheme).
+  if (/^[^/@]+@[^/:]+:/.test(s)) return true;
+  try {
+    const u = new URL(s);
+    if (u.protocol === 'ssh:') return true;
+    if ((u.protocol === 'https:' || u.protocol === 'http:') && (u.username || u.password)) return true;
+  } catch { /* not a parseable URL — no embedded auth we can recognize */ }
+  return false;
+}
+
 // Should this job checkpoint? `auto` only when the job already publishes its work:
 // a provisioned, authenticated clone on a symbolic working branch that pushes.
 export function checkpointEligibility({ mode, provisioned, envelope, token }) {
@@ -174,7 +198,14 @@ export function checkpointEligibility({ mode, provisioned, envelope, token }) {
   if (mode === 'on') return { enabled: true, reason: 'NANO_AGENT_CHECKPOINT=on' };
   const push = envelope?.branch?.push;
   if (push === false || /^(false|0|no|off)$/i.test(String(push ?? ''))) return { enabled: false, reason: 'job does not push (branch.push=false)' };
-  if (!token) return { enabled: false, reason: 'anonymous clone (no push credentials)' };
+  // Authentication is NOT synonymous with a token: provisioning also authenticates
+  // via author-embedded HTTPS userinfo or an SSH remote. Prefer provisioning's own
+  // authentication result when it stamped one; else fall back to token presence or
+  // recognizing an authenticated remote URL form.
+  const authenticated = provisioned?.authenticated === true
+    || !!token
+    || isAuthenticatedRemote(envelope?.repository?.url);
+  if (!authenticated) return { enabled: false, reason: 'anonymous clone (no push credentials)' };
   if (!provisioned.workingBranch) return { enabled: false, reason: 'detached checkout (no working branch)' };
   return { enabled: true, reason: 'auto: job pushes an authenticated working branch' };
 }
@@ -238,6 +269,10 @@ export async function snapshotWorktree({ git, baseSha = '', runId = '', lastTree
   const head = await git(['rev-parse', '--verify', '-q', 'HEAD']);
   if (!ok(head)) return { skipped: 'no-head' };
   const headSha = out(head);
+  // The symbolic branch HEAD is on right now (empty when detached). Recorded so a
+  // later restore can refuse to fast-restore a snapshot taken on a DIFFERENT branch
+  // (which would otherwise reset the work branch to off-branch commits).
+  const symbolicBranch = out(await git(['symbolic-ref', '--short', '-q', 'HEAD']));
   const dir = mkdtempSync(join(tmpdir(), 'nano-ckpt-'));
   const env = { GIT_INDEX_FILE: join(dir, 'index') };
   try {
@@ -282,6 +317,7 @@ export async function snapshotWorktree({ git, baseSha = '', runId = '', lastTree
     const trailers = [
       baseSha ? `${CHECKPOINT_BASE_TRAILER}: ${baseSha}` : '',
       runId ? `${CHECKPOINT_RUN_TRAILER}: ${runId}` : '',
+      symbolicBranch ? `${CHECKPOINT_BRANCH_TRAILER}: ${symbolicBranch}` : '',
     ].filter(Boolean).join('\n');
     const body = `${message}\n\n${trailers}\n`;
     const commit = await git(['commit-tree', treeSha, '-p', headSha], { input: body });
@@ -347,21 +383,31 @@ export async function fetchCheckpoint({ git, ref, remote = 'origin' }) {
   const msg = (await git(['log', '-1', '--format=%B', sha])).stdout || '';
   const trailer = (name) => (msg.match(new RegExp(`^${name}:[ \\t]*(\\S+)[ \\t]*$`, 'mi')) || [])[1] || '';
   const base = trailer(CHECKPOINT_BASE_TRAILER);
-  return { sha, parent, base: /^[0-9a-f]{7,64}$/.test(base) ? base : '', runId: trailer(CHECKPOINT_RUN_TRAILER) };
+  return { sha, parent, base: /^[0-9a-f]{7,64}$/.test(base) ? base : '', runId: trailer(CHECKPOINT_RUN_TRAILER), branch: trailer(CHECKPOINT_BRANCH_TRAILER) };
 }
 
 // Lay a fetched checkpoint down onto the fresh clone. HEAD stays on the current
 // branch; the snapshot's changes become UNCOMMITTED working-tree changes.
-export async function restoreCheckpoint({ git, checkpoint }) {
-  const { sha, parent, base } = checkpoint || {};
+export async function restoreCheckpoint({ git, checkpoint, expectedBranch = null }) {
+  const { sha, parent, base, branch } = checkpoint || {};
   if (!sha || !parent) return { restored: false, reason: 'no-parent' };
   const head = out(await git(['rev-parse', '--verify', '-q', 'HEAD']));
   if (!head) return { restored: false, reason: 'no-head' };
   const status = await git(['status', '--porcelain']);
   if (!ok(status) || out(status)) return { restored: false, reason: 'workspace-dirty' };
 
-  const fast = await git(['merge-base', '--is-ancestor', head, parent]);
-  if (ok(fast)) {
+  // Branch-identity guard: a snapshot records the symbolic branch HEAD was on. If
+  // it was taken on a DIFFERENT branch than this run's expected working branch, its
+  // `parent` may descend from the work-branch tip yet carry off-branch commits.
+  // Fast-restoring would reset the work branch to that off-branch commit and let a
+  // later `finalizeGit` push it to the wrong branch (bypassing branch-mismatch
+  // protection). Refuse fast restoration across branch identities and retain the
+  // checkpoint for explicit recovery. (Legacy snapshots carry no branch trailer —
+  // `branch` empty — and keep the prior ancestry-only behaviour.)
+  const branchMismatch = Boolean(branch) && Boolean(expectedBranch) && branch !== expectedBranch;
+
+  const fast = !branchMismatch && ok(await git(['merge-base', '--is-ancestor', head, parent]));
+  if (fast) {
     let r = await git(['reset', '-q', '--hard', parent]);
     if (!ok(r)) return { restored: false, reason: `reset failed: ${errText(r)}` };
     r = await git(['read-tree', '-u', '--reset', sha]);
@@ -370,6 +416,10 @@ export async function restoreCheckpoint({ git, checkpoint }) {
     if (!ok(r)) { await git(['reset', '-q', '--hard', head]); return { restored: false, reason: `unstage failed: ${errText(r)}` }; }
     return { restored: true, mode: 'fast-forward', head: parent, priorHead: head, commitsRecovered: head !== parent };
   }
+
+  // A branch-mismatched snapshot must NOT be commit-recovered onto this branch; its
+  // work lives only on the ref and is left there for explicit, human recovery.
+  if (branchMismatch) return { restored: false, reason: `branch-mismatch (snapshot on '${branch}', expected '${expectedBranch}')`, branchMismatch: true };
 
   // The fresh clone moved past the prior run's base (e.g. main advanced and the
   // job cuts a per-run fallback branch): replay base→snapshot as a patch.

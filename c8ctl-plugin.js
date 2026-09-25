@@ -90,7 +90,7 @@ import { createAgentInstanceProducer, isExternalAgentJob } from './agent-instanc
 // so the new agent CONTINUES rather than cold-reruns — at-least-once delivery becomes
 // a continuation, not a duplicate. Best-effort; degrades to the legacy cold rerun.
 import { resolveEffectiveEnvelope } from './agent-resume.mjs';
-import { checkpointConfig, checkpointEligibility, checkpointRef, normalizeSecretValues, credentialsFromUrl, shouldSweep, sweepStaleCheckpoints, createGitRunner, fetchCheckpoint, restoreCheckpoint, createWorkspaceCheckpoint, createCheckpointer, deleteCheckpointRef, withCheckpointNote } from './agent-checkpoint.mjs';
+import { checkpointConfig, checkpointEligibility, checkpointRef, normalizeSecretValues, credentialsFromUrl, isAuthenticatedRemote, shouldSweep, sweepStaleCheckpoints, createGitRunner, fetchCheckpoint, restoreCheckpoint, createWorkspaceCheckpoint, createCheckpointer, deleteCheckpointRef, withCheckpointNote } from './agent-checkpoint.mjs';
 
 const requireFromHere = createRequire(import.meta.url);
 const pluginDir = dirname(fileURLToPath(import.meta.url));
@@ -5265,7 +5265,12 @@ function provisionRepo({ envelope, token, runDir, runId, timeoutMs = 120_000, lo
   // exactly when a real work branch was resolved that is not the base itself
   // (false for a read-only base checkout with push disabled, or a detached HEAD).
   const hasPrBranch = !!workingBranch && workingBranch !== effectiveBase;
-  return { workspaceDir, gitEnv, committer, startSha: sha.status === 0 ? (sha.stdout || '').trim() : '', workingBranch, fallbackBranch, hasPrBranch, baseBranch: effectiveBase || null, baseCloneSha, baseBaselineUnknown, detached: !workingBranch, ref: commitSha || branchName || '', base, baseFetchError, remote: redactToken(repo.url, token) };
+  // Authentication is not synonymous with a token: an author-embedded HTTPS
+  // userinfo URL or an SSH remote authenticates the push with no `token`. Stamp
+  // the authoritative result so eligibility (auto checkpointing) doesn't
+  // under-detect an authenticated clone.
+  const authenticated = !!token || isAuthenticatedRemote(repo.url);
+  return { workspaceDir, gitEnv, committer, startSha: sha.status === 0 ? (sha.stdout || '').trim() : '', workingBranch, fallbackBranch, hasPrBranch, authenticated, baseBranch: effectiveBase || null, baseCloneSha, baseBaselineUnknown, detached: !workingBranch, ref: commitSha || branchName || '', base, baseFetchError, remote: redactToken(repo.url, token) };
 }
 
 // Look up a PR for this branch (2a does NOT open it — the harness does, driven
@@ -5442,7 +5447,7 @@ async function setupWorkspaceCheckpoints({ provisioned, envelope = null, token =
       log.warn(`could not fetch WIP checkpoint ${ref} — ${oneLineLog(err?.message || err)}; starting without it.`);
     }
     if (prior) {
-      const r = await restoreCp({ git, checkpoint: prior });
+      const r = await restoreCp({ git, checkpoint: prior, expectedBranch: provisioned.workingBranch || null });
       if (r?.restored) {
         restored = r;
         logger.info?.(`${prefix} (${corr}): restored WIP checkpoint ${ref}@${prior.sha.slice(0, 12)} (${r.mode}${r.commitsRecovered ? ', local commits recovered' : ''}) as uncommitted changes.`);

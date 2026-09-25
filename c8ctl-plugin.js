@@ -90,7 +90,7 @@ import { createAgentInstanceProducer, isExternalAgentJob } from './agent-instanc
 // so the new agent CONTINUES rather than cold-reruns — at-least-once delivery becomes
 // a continuation, not a duplicate. Best-effort; degrades to the legacy cold rerun.
 import { resolveEffectiveEnvelope } from './agent-resume.mjs';
-import { checkpointConfig, checkpointEligibility, checkpointRef, normalizeSecretValues, credentialsFromUrl, isAuthenticatedRemote, shouldSweep, sweepStaleCheckpoints, createGitRunner, fetchCheckpoint, restoreCheckpoint, createWorkspaceCheckpoint, createCheckpointer, deleteCheckpointRef, withCheckpointNote } from './agent-checkpoint.mjs';
+import { checkpointConfig, checkpointEligibility, checkpointRef, normalizeSecretValues, credentialsFromUrl, isAuthenticatedRemote, shouldSweep, sweepStaleCheckpoints, createGitRunner, fetchCheckpoint, restoreCheckpoint, createWorkspaceCheckpoint, createCheckpointer, deleteCheckpointRef, withCheckpointNote, sanitizeBranchSegment } from './agent-checkpoint.mjs';
 
 const requireFromHere = createRequire(import.meta.url);
 const pluginDir = dirname(fileURLToPath(import.meta.url));
@@ -4448,21 +4448,10 @@ function authUrl(url, provider, hasToken) {
 
 class ProvisionError extends Error {}
 
-// Reduce an arbitrary string to a single git-ref-safe path segment: git refname
-// rules forbid spaces and ~^:?*[\, leading/trailing/doubled dots, a trailing
-// ".lock", etc. Used to build the deterministic fallback work branch (issue #231)
-// off the base branch name + run id, so a run with no branch.create still commits
-// on a fresh, always-fast-forwardable branch instead of on the base.
-function sanitizeBranchSegment(s) {
-  const cleaned = String(s == null ? '' : s)
-    .replace(/[^0-9A-Za-z._-]+/g, '-') // collapse anything unusual to a dash
-    .replace(/\.{2,}/g, '.')            // no doubled dots (git forbids "..")
-    .replace(/^[-.]+/, '')              // no leading dot or dash
-    .slice(0, 60)                       // bound the segment BEFORE the trailing
-    .replace(/[-.]+$/g, '')             // checks, so truncating at char 60 can't
-    .replace(/\.lock$/i, 'lock');       // re-introduce a trailing dot/dash or ".lock"
-  return cleaned || 'base';
-}
+// `sanitizeBranchSegment` (the deterministic fallback-work-branch segment builder,
+// issue #231) now lives in ./agent-checkpoint.mjs as the single source of truth: the
+// restore path reconstructs the generated `nano/agent-work/<base>-<runId>` identity to
+// validate a benign per-run rename, so provisioning and restore must share one impl.
 
 // Never let git invoke the host's configured credential helper for our clone/
 // push. Reset the helper list ("") so no helper runs — even when we DO have a

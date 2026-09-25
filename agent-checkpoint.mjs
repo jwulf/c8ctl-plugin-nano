@@ -66,16 +66,35 @@ const FALLBACK_BRANCH_RE = /^nano\/agent-work\//;
 // `nano/agent-work/<base>-<runToken>`, where <runToken> is the run's UUID (production)
 // or a `run-<token>` workspace basename (the direct-call test fallback). Anchored at the
 // END so a <base> that itself contains dashes still parses. Used to validate a benign
-// per-run rename on the generated fallback IDENTITY (its <base>), not merely the
-// `nano/agent-work/` namespace prefix — an unrelated or stable branch that only lives
-// under that namespace must NOT be mistaken for a per-run fallback rename.
-const FALLBACK_UNIQ_RE = /-(?:[0-9a-fA-F]{8}-[0-9a-fA-F]{4}-[0-9a-fA-F]{4}-[0-9a-fA-F]{4}-[0-9a-fA-F]{12}|run-[0-9A-Za-z]+)$/;
-function fallbackBranchBase(name) {
+// per-run rename on the generated fallback IDENTITY (its <base> AND <runToken>), not
+// merely the `nano/agent-work/` namespace prefix — an unrelated or stable branch that
+// only lives under that namespace must NOT be mistaken for a per-run fallback rename.
+const FALLBACK_UNIQ_RE = /-((?:[0-9a-fA-F]{8}-[0-9a-fA-F]{4}-[0-9a-fA-F]{4}-[0-9a-fA-F]{4}-[0-9a-fA-F]{12})|run-[0-9A-Za-z]+)$/;
+// Parse a generated per-run fallback branch into { base, token }, or null when `name`
+// is not a generated fallback (missing namespace prefix, or no trailing run-token).
+function fallbackBranchParts(name) {
   if (typeof name !== 'string' || !FALLBACK_BRANCH_RE.test(name)) return null;
   const m = name.match(FALLBACK_UNIQ_RE);
   if (!m) return null;
   const base = name.slice('nano/agent-work/'.length, name.length - m[0].length);
-  return base || null;
+  if (!base) return null;
+  return { base, token: m[1] };
+}
+
+// Canonical git branch-segment sanitizer. Provisioning builds a per-run fallback
+// branch `nano/agent-work/${sanitizeBranchSegment(base)}-${sanitizeBranchSegment(runId)}`
+// (c8ctl-plugin.js), and the restore path reconstructs that generated run-token to
+// validate a benign per-run rename — so both MUST share ONE implementation to avoid
+// drift. Exported and consumed by the plugin as the single source of truth.
+export function sanitizeBranchSegment(s) {
+  const cleaned = String(s == null ? '' : s)
+    .replace(/[^0-9A-Za-z._-]+/g, '-') // collapse anything unusual to a dash
+    .replace(/\.{2,}/g, '.')            // no doubled dots (git forbids "..")
+    .replace(/^[-.]+/, '')              // no leading dot or dash
+    .slice(0, 60)                       // bound the segment BEFORE the trailing
+    .replace(/[-.]+$/g, '')             // checks, so truncating at char 60 can't
+    .replace(/\.lock$/i, 'lock');       // re-introduce a trailing dot/dash or ".lock"
+  return cleaned || 'base';
 }
 
 const DEFAULTS = Object.freeze({
@@ -327,6 +346,13 @@ export function createGitRunner({ cwd, env = process.env, timeoutMs = DEFAULTS.g
       signal?.removeEventListener?.('abort', onAbort);
       resolve({ status: code, stdout, stderr });
     });
+    // An `AbortSignal` does NOT replay an abort that already fired: one that lands in
+    // the window between the fast-path guard at entry and `addEventListener` above is
+    // never delivered to `onAbort`, so the child would otherwise run to its normal
+    // timeout — holding a workspace the caller is reaping open for up to `timeoutMs`.
+    // Recheck now, with all handlers wired, so a race-landed abort still tears the
+    // child down immediately. (`onAbort` is idempotent with the `once` listener.)
+    if (signal?.aborted) onAbort();
     if (opts.input != null) child.stdin.end(opts.input); else child.stdin.end();
   });
 }
@@ -490,7 +516,7 @@ export async function fetchCheckpoint({ git, ref, remote = 'origin' }) {
 // branch (`nano/agent-work/…-<runId>`), whose name necessarily differs from the
 // snapshot's every activation — a benign rename that must still recover WIP.
 export async function restoreCheckpoint({ git, checkpoint, expectedBranch = null, expectedBranchEphemeral = false }) {
-  const { sha, parent, base, branch } = checkpoint || {};
+  const { sha, parent, base, branch, runId: snapshotRunId = '' } = checkpoint || {};
   if (!sha) return { restored: false, reason: 'no-sha' };
   const head = out(await git(['rev-parse', '--verify', '-q', 'HEAD']));
   const status = await git(['status', '--porcelain']);
@@ -521,14 +547,21 @@ export async function restoreCheckpoint({ git, checkpoint, expectedBranch = null
   const branchMismatch = Boolean(branch) && Boolean(expectedBranch) && branch !== expectedBranch;
   // A per-run fallback branch is re-cut with a fresh runId every activation, so its name
   // never matches the snapshot's trailer even though both are ephemeral fallbacks off the
-  // SAME base. Validate that benign rename on the generated fallback IDENTITY — both names
-  // must parse as `nano/agent-work/<base>-<runToken>` AND share the same <base> — NOT on
-  // the `nano/agent-work/` prefix alone: an unrelated (or stable configured) branch that
-  // merely lives under that namespace must not be treated as a per-run rename and
-  // cross-restored (which `finalizeGit` could then publish on the generated work branch).
-  const fbBase = fallbackBranchBase(branch);
+  // SAME base. Validate that benign rename on the generated fallback IDENTITY — but the
+  // shared `<base>` alone is NOT proof: an agent can `git checkout` a DIFFERENT generated
+  // branch under the same namespace+base (or a base that sanitizes identically), whose
+  // off-branch commits must not be patch-restored onto — and then published on — this
+  // run's work branch. Provisioning names the branch `nano/agent-work/<base>-<sanitize(runId)>`,
+  // so require BOTH the snapshot's <base> to equal this run's fallback <base> AND the
+  // snapshot's branch <runToken> to equal the sanitized run-token of the run that WROTE
+  // the snapshot (its own `runId` trailer, returned by `fetchCheckpoint`). That ties the
+  // branch to the prior activation's own provisioned fallback, not merely the prefix/base.
+  const snapParts = fallbackBranchParts(branch);
+  const expParts = fallbackBranchParts(expectedBranch);
   const fallbackRename = branchMismatch && expectedBranchEphemeral === true
-    && fbBase !== null && fbBase === fallbackBranchBase(expectedBranch);
+    && snapParts !== null && expParts !== null
+    && snapParts.base === expParts.base
+    && snapParts.token === sanitizeBranchSegment(snapshotRunId);
   const branchGuardRefused = branchMismatch && !fallbackRename;
 
   // PARENTFUL snapshot on an UNBORN clone: the prior run made its first local commit(s)

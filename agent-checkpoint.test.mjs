@@ -303,7 +303,7 @@ test('restore recovers WIP across a per-run fallback branch rename via a non-res
     sh(a.dir, 'add', '-A');
     sh(a.dir, 'commit', '-q', '-m', 'run1 commit');
     writeFileSync(join(a.dir, 'wip.txt'), 'uncommitted wip\n');
-    const res = await createWorkspaceCheckpoint({ git: a.git, ref, baseSha: base })('tool');
+    const res = await createWorkspaceCheckpoint({ git: a.git, ref, baseSha: base, runId: '11111111-1111-4111-8111-111111111111' })('tool');
     assert.ok(res.sha, JSON.stringify(res));
 
     const fetched = await fetchCheckpoint({ git: f.clone('probe').git, ref });
@@ -374,7 +374,7 @@ test('restore refuses an UNRELATED branch under the fallback namespace (prefix a
     sh(a2.dir, 'add', '-A'); sh(a2.dir, 'commit', '-q', '-m', 'gen commit');
     writeFileSync(join(a2.dir, 'wip.txt'), 'gen wip\n');
     const ref2 = checkpointRef('43y');
-    const gres = await createWorkspaceCheckpoint({ git: a2.git, ref: ref2, baseSha: base })('tool');
+    const gres = await createWorkspaceCheckpoint({ git: a2.git, ref: ref2, baseSha: base, runId: '55555555-5555-4555-8555-555555555555' })('tool');
     assert.ok(gres.sha, JSON.stringify(gres));
     // Re-activation: a FRESH clone (post-checkpoint) fetches the ref into its own repo,
     // then restores — mirroring the real setup flow (fetch + restore on the same repo).
@@ -384,6 +384,42 @@ test('restore refuses an UNRELATED branch under the fallback namespace (prefix a
     const ok2 = await restoreCheckpoint({ git: c.git, checkpoint: gfetched, expectedBranch: 'nano/agent-work/main-44444444-4444-4444-8444-444444444444', expectedBranchEphemeral: true });
     assert.equal(ok2.restored, true, JSON.stringify(ok2));
     assert.equal(ok2.mode, 'patch');
+  } finally { f.cleanup(); }
+});
+
+test('restore refuses a DIFFERENT same-base generated fallback branch (run-token must match the snapshot writer)', async () => {
+  const f = fixture();
+  try {
+    const ref = checkpointRef('43z');
+    const a = f.clone('a');
+    const base = sh(a.dir, 'rev-parse', 'HEAD');
+    // Run 1's OWN runId is uuidA (it was provisioned onto main-<uuidA>), but the agent
+    // switched HEAD to a DIFFERENT generated-looking fallback branch off the same base
+    // before it was interrupted — so the snapshot's branch trailer records main-<uuidB>
+    // while its run-token trailer is still uuidA. Sharing only the <base> is NOT proof
+    // this is THIS run's fallback rename; those off-branch commits must not be patch-
+    // restored onto (and later published on) run 2's generated work branch.
+    sh(a.dir, 'checkout', '-q', '-b', 'nano/agent-work/main-bbbbbbbb-bbbb-4bbb-8bbb-bbbbbbbbbbbb');
+    writeFileSync(join(a.dir, 'feature.txt'), 'off-branch work\n');
+    sh(a.dir, 'add', '-A');
+    sh(a.dir, 'commit', '-q', '-m', 'off-branch commit');
+    writeFileSync(join(a.dir, 'wip.txt'), 'off-branch wip\n');
+    const res = await createWorkspaceCheckpoint({ git: a.git, ref, baseSha: base, runId: 'aaaaaaaa-aaaa-4aaa-8aaa-aaaaaaaaaaaa' })('tool');
+    assert.ok(res.sha, JSON.stringify(res));
+    const fetched = await fetchCheckpoint({ git: f.clone('probe').git, ref });
+    assert.equal(fetched.branch, 'nano/agent-work/main-bbbbbbbb-bbbb-4bbb-8bbb-bbbbbbbbbbbb');
+    assert.equal(fetched.runId, 'aaaaaaaa-aaaa-4aaa-8aaa-aaaaaaaaaaaa');
+
+    // Run 2's fresh fallback shares base 'main' and the snapshot's branch parses as a
+    // generated fallback too — but its run-token (uuidB) does not match the sanitized
+    // run-token of the run that WROTE the snapshot (uuidA), so it stays a mismatch.
+    const b = f.clone('b');
+    const gen = 'nano/agent-work/main-cccccccc-cccc-4ccc-8ccc-cccccccccccc';
+    sh(b.dir, 'checkout', '-q', '-b', gen);
+    const blocked = await restoreCheckpoint({ git: b.git, checkpoint: fetched, expectedBranch: gen, expectedBranchEphemeral: true });
+    assert.equal(blocked.restored, false, JSON.stringify(blocked));
+    assert.equal(blocked.branchMismatch, true);
+    assert.equal(sh(f.root, '--git-dir', f.remote, 'rev-parse', ref), res.sha);
   } finally { f.cleanup(); }
 });
 
@@ -762,6 +798,31 @@ test('createGitRunner is cancellable: an aborted signal fails ops fast without t
     // task unwinds instead of running git against a workspace being reaped.
     const r = await git(['rev-parse', '--verify', 'HEAD']);
     assert.notEqual(r.status, 0);
+  } finally { f.cleanup(); }
+});
+
+test('createGitRunner rechecks the signal after wiring handlers: a race-landed abort tears the child down (issue: abort race)', async () => {
+  const f = fixture();
+  try {
+    const { dir } = f.clone('c');
+    // A fake signal whose `aborted` reads FALSE at the entry guard but TRUE at the
+    // post-registration recheck — i.e. the abort lands in the window between the
+    // fast-path guard and `addEventListener`, which a real AbortSignal never replays.
+    // Only two `.aborted` reads exist in createGitRunner (entry guard + recheck); the
+    // add/removeEventListener seams never read it, so this drives the race precisely.
+    let reads = 0;
+    const signal = {
+      get aborted() { return (++reads) > 1; },
+      addEventListener() {},
+      removeEventListener() {},
+    };
+    const git = createGitRunner({ cwd: dir, env: ENV, signal });
+    const r = await git(['rev-parse', '--verify', 'HEAD']);
+    // Without the recheck the op would spawn and run to its normal timeout; with it the
+    // child is torn down at once and the result carries the abort marker.
+    assert.match(r.stderr, /\[aborted\]/);
+    assert.notEqual(r.status, 0);
+    assert.equal(reads, 2, 'exactly the entry guard + the post-registration recheck read the signal');
   } finally { f.cleanup(); }
 });
 

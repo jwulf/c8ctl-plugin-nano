@@ -589,6 +589,104 @@ test('parentful snapshot on an UNBORN clone: the prior run\'s first local commit
   } finally { rmSync(root, { recursive: true, force: true }); }
 });
 
+test('unborn HEAD: a PARENTLESS snapshot taken on a DIFFERENT branch is refused (branch-identity guard), a benign per-run fallback rename passes', async () => {
+  const root = mkdtempSync(join(tmpdir(), 'ckpt-unborn-guard-'));
+  try {
+    const remote = join(root, 'remote.git');
+    sh(root, 'init', '-q', '--bare', '-b', 'main', remote);
+    const clone = (name) => {
+      const dir = join(root, name);
+      sh(root, 'clone', '-q', remote, dir);
+      return { dir, git: createGitRunner({ cwd: dir, env: ENV }) };
+    };
+    // Agent switches OFF the provisioned branch BEFORE its first commit, so the parentless
+    // snapshot records 'sidebranch'. Restoring its tree onto a fresh unborn clone of the
+    // expected branch and letting finalizeGit commit+push it there would publish off-branch
+    // WIP — so it must be refused.
+    const ref = checkpointRef('43g');
+    const a = clone('a');
+    sh(a.dir, 'checkout', '-q', '-b', 'sidebranch');
+    writeFileSync(join(a.dir, 'draft.txt'), 'off-branch pre-commit wip\n');
+    const res = await createWorkspaceCheckpoint({ git: a.git, ref })('tool');
+    assert.ok(res.sha, JSON.stringify(res));
+    const fetched = await fetchCheckpoint({ git: clone('probe').git, ref });
+    assert.equal(fetched.parent, '');
+    assert.equal(fetched.branch, 'sidebranch');
+
+    const b = clone('b');
+    const refused = await restoreCheckpoint({ git: b.git, checkpoint: fetched, expectedBranch: 'main' });
+    assert.equal(refused.restored, false, JSON.stringify(refused));
+    assert.equal(refused.branchMismatch, true);
+    assert.equal(existsSync(join(b.dir, 'draft.txt')), false);
+
+    // A benign per-run fallback rename (same base, matching run-token) still restores: the
+    // snapshot's branch is a fallback off 'main' and the expected branch is the same
+    // fallback identity re-cut with a fresh runId.
+    const ref2 = checkpointRef('43h');
+    const runId = '55555555-5555-4555-8555-555555555555';
+    const fb = `nano/agent-work/main-${runId}`;
+    const c = clone('c');
+    sh(c.dir, 'checkout', '-q', '-b', fb);
+    writeFileSync(join(c.dir, 'draft.txt'), 'fallback pre-commit wip\n');
+    const res2 = await createWorkspaceCheckpoint({ git: c.git, ref: ref2, runId, baseRefName: 'main' })('tool');
+    assert.ok(res2.sha, JSON.stringify(res2));
+    const fetched2 = await fetchCheckpoint({ git: clone('probe2').git, ref: ref2 });
+    assert.equal(fetched2.parent, '');
+    const d = clone('d');
+    const gen = 'nano/agent-work/main-66666666-6666-4666-8666-666666666666';
+    const okFb = await restoreCheckpoint({ git: d.git, checkpoint: fetched2, expectedBranch: gen, expectedBranchEphemeral: true, expectedBaseRef: 'main' });
+    assert.equal(okFb.restored, true, JSON.stringify(okFb));
+    assert.equal(okFb.mode, 'unborn');
+    assert.equal(readFileSync(join(d.dir, 'draft.txt'), 'utf8'), 'fallback pre-commit wip\n');
+  } finally { rmSync(root, { recursive: true, force: true }); }
+});
+
+test('empty-base parentful snapshot: after the remote gains its first commit, WIP is recovered via an empty-tree patch (not lost)', async () => {
+  const root = mkdtempSync(join(tmpdir(), 'ckpt-emptybase-patch-'));
+  try {
+    const remote = join(root, 'remote.git');
+    sh(root, 'init', '-q', '--bare', '-b', 'main', remote);
+    const clone = (name) => {
+      const dir = join(root, name);
+      sh(root, 'clone', '-q', remote, dir);
+      return { dir, git: createGitRunner({ cwd: dir, env: ENV }) };
+    };
+    // Prior run: clone of an EMPTY remote, makes its first local commit + WIP, checkpoints.
+    // The snapshot has NO base trailer (no base sha existed at clone).
+    const ref = checkpointRef('43e');
+    const a = clone('a');
+    writeFileSync(join(a.dir, 'first.txt'), 'first commit\n');
+    sh(a.dir, 'add', '-A');
+    sh(a.dir, 'commit', '-q', '-m', 'first');
+    writeFileSync(join(a.dir, 'wip.txt'), 'uncommitted wip\n');
+    const res = await createWorkspaceCheckpoint({ git: a.git, ref, baseSha: '' })('tool');
+    assert.ok(res.sha, JSON.stringify(res));
+    const fetched = await fetchCheckpoint({ git: clone('probe').git, ref });
+    assert.equal(fetched.base, '');
+
+    // The remote gains its FIRST commit before the next activation, so the fresh clone is
+    // now BORN on 'main'. Restoration must recover the WIP as an empty-tree patch rather
+    // than refuse ('diverged') and lose the checkpointed content.
+    const seed = clone('seed');
+    writeFileSync(join(seed.dir, 'remote-first.txt'), 'remote first\n');
+    sh(seed.dir, 'add', '-A');
+    sh(seed.dir, 'commit', '-q', '-m', 'remote first');
+    sh(seed.dir, 'push', '-q', 'origin', 'HEAD:main');
+
+    const b = clone('b');
+    assert.ok(sh(b.dir, 'rev-parse', '--verify', 'HEAD'));
+    const restored = await restoreCheckpoint({ git: b.git, checkpoint: fetched, expectedBranch: 'main' });
+    assert.equal(restored.restored, true, JSON.stringify(restored));
+    assert.equal(restored.mode, 'patch-empty-base');
+    // The snapshot's files (the first commit's content + the WIP) return as uncommitted
+    // changes on top of the remote's first commit; the remote's commit is preserved.
+    assert.equal(readFileSync(join(b.dir, 'first.txt'), 'utf8'), 'first commit\n');
+    assert.equal(readFileSync(join(b.dir, 'wip.txt'), 'utf8'), 'uncommitted wip\n');
+    assert.equal(readFileSync(join(b.dir, 'remote-first.txt'), 'utf8'), 'remote first\n');
+    assert.equal(sh(b.dir, 'rev-parse', 'HEAD'), sh(b.dir, 'rev-parse', 'origin/main'));
+  } finally { rmSync(root, { recursive: true, force: true }); }
+});
+
 test('lease: a stale writer is rejected and stops writing', async () => {
   const f = fixture();
   try {

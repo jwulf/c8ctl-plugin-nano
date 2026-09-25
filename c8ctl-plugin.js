@@ -5448,7 +5448,7 @@ async function setupWorkspaceCheckpoints({ provisioned, envelope = null, token =
         restored = r;
         logger.info?.(`${prefix} (${corr}): restored WIP checkpoint ${ref}@${prior.sha.slice(0, 12)} (${r.mode}${r.commitsRecovered ? ', local commits recovered' : ''}) as uncommitted changes.`);
       } else {
-        log.warn(`found WIP checkpoint ${ref}@${prior.sha.slice(0, 12)} but did not restore it — ${r?.reason || 'unknown'}; it will be superseded by this run's checkpoints.`);
+        log.warn(`found WIP checkpoint ${ref}@${prior.sha.slice(0, 12)} but did not restore it — ${r?.reason || 'unknown'}; the ref is RETAINED (not overwritten) for this activation, so its content can still be recovered explicitly.`);
       }
     }
     // Cancellation recheck: after the startup git work, bail before starting the
@@ -5499,32 +5499,47 @@ async function setupWorkspaceCheckpoints({ provisioned, envelope = null, token =
           } catch { return false; }
         }
         : null;
-      // The sweep gets its OWN cancellable git runner. On the overall deadline we
-      // abort it: the in-flight `git` child is killed and every later op fails fast,
-      // so the sweep promise unwinds instead of running git against a reaped workspace.
+      // Run the sweep in an ISOLATED throwaway scratch repo (its own `.git`), NEVER the
+      // job workspace. The sweep fetches remote WIP refs, writes local throwaway refs and
+      // push-deletes stale ones, while the workspace is concurrently driven by the harness
+      // and later by `finalizeGit` (which fetches the base and reads FETCH_HEAD). Sharing
+      // one `.git` risks ref-lock contention and FETCH_HEAD being clobbered between the
+      // finalizer's fetch and read. A scratch repo with only `origin` configured fully
+      // decouples them; its dir is reaped when the sweep settles. On the overall deadline
+      // we abort the sweep's cancellable git so the promise unwinds instead of hanging.
       const sweepAbort = new AbortController();
-      const sweepGit = mkGit({
-        cwd: provisioned.workspaceDir,
-        env: {
-          ...(provisioned.gitEnv || process.env),
-          ...(committer.name ? { GIT_AUTHOR_NAME: committer.name, GIT_COMMITTER_NAME: committer.name } : {}),
-          ...(committer.email ? { GIT_AUTHOR_EMAIL: committer.email, GIT_COMMITTER_EMAIL: committer.email } : {}),
-        },
-        timeoutMs: cfg.gitTimeoutMs,
-        signal: sweepAbort.signal,
-      });
-      const deadlineTimer = setTimeout(() => sweepAbort.abort(), GC_OVERALL_TIMEOUT_MS);
-      deadlineTimer.unref?.();
-      // `gc` is tied to the sweep's ACTUAL completion (not a race that abandons it),
-      // so `close()`/`discard()` — which await `gc` — never reap the workspace while
-      // the sweep's git is still live. The deadline only bounds it by aborting the git.
-      gc = Promise.resolve(sweep({ git: sweepGit, ownRef: ref, ttlMs: cfg.ttlMs, graceMs: cfg.gcGraceMs, isTerminal, now, signal: sweepAbort.signal }))
-        .then((r) => {
-          if (r?.deleted?.length) logger.info?.(`${prefix} (${corr}): reclaimed ${r.deleted.length} orphaned WIP checkpoint ref(s): ${r.deleted.map((d) => `${d.ref} [${d.why}]`).join(', ')}.`);
-          else if (sweepAbort.signal.aborted) log.debug(`WIP checkpoint GC bounded at ${GC_OVERALL_TIMEOUT_MS}ms — aborted its in-flight git and drained; leftover refs reclaimed on a later sweep.`);
-          else if (r?.error) log.debug(`WIP checkpoint GC skipped — ${oneLineLog(r.error)}.`);
-        }, (err) => log.debug(`WIP checkpoint GC threw — ${oneLineLog(err?.message || err)}.`))
-        .finally(() => clearTimeout(deadlineTimer));
+      let sweepDir = null;
+      try {
+        if (!originUrl) throw new Error('workspace had no origin URL');
+        sweepDir = mkdtempSync(join(tmpdir(), 'nano-wip-gc-'));
+        const sweepEnv = { ...(provisioned.gitEnv || process.env), GIT_TERMINAL_PROMPT: '0' };
+        delete sweepEnv.GIT_ASKPASS;
+        delete sweepEnv.GIT_TOKEN;
+        const askpass = token ? writeAskpass(sweepDir, token) : null;
+        if (askpass) { sweepEnv.GIT_ASKPASS = askpass; sweepEnv.GIT_TOKEN = token; }
+        const sweepGit = mkGit({ cwd: sweepDir, env: sweepEnv, timeoutMs: cfg.gitTimeoutMs, signal: sweepAbort.signal });
+        const init = await sweepGit(['init', '--quiet', '.']);
+        if (init.status !== 0) throw new Error(`git init failed: ${oneLineLog(init.stderr || init.stdout || '')}`);
+        // Configure origin through the protected `.git/config` (0700 tmpdir) rather than
+        // argv, so any userinfo embedded in `originUrl` never lands on `git`'s argv/`ps`.
+        const escUrl = originUrl.replace(/\\/g, '\\\\').replace(/"/g, '\\"');
+        appendFileSync(join(sweepDir, '.git', 'config'), `[remote "origin"]\n\turl = "${escUrl}"\n`);
+        const deadlineTimer = setTimeout(() => sweepAbort.abort(), GC_OVERALL_TIMEOUT_MS);
+        deadlineTimer.unref?.();
+        // `gc` is tied to the sweep's ACTUAL completion (not a race that abandons it),
+        // so `close()`/`discard()` — which await `gc` — never reap the scratch repo while
+        // the sweep's git is still live. The deadline only bounds it by aborting the git.
+        gc = Promise.resolve(sweep({ git: sweepGit, ownRef: ref, ttlMs: cfg.ttlMs, graceMs: cfg.gcGraceMs, isTerminal, now, signal: sweepAbort.signal }))
+          .then((r) => {
+            if (r?.deleted?.length) logger.info?.(`${prefix} (${corr}): reclaimed ${r.deleted.length} orphaned WIP checkpoint ref(s): ${r.deleted.map((d) => `${d.ref} [${d.why}]`).join(', ')}.`);
+            else if (sweepAbort.signal.aborted) log.debug(`WIP checkpoint GC bounded at ${GC_OVERALL_TIMEOUT_MS}ms — aborted its in-flight git and drained; leftover refs reclaimed on a later sweep.`);
+            else if (r?.error) log.debug(`WIP checkpoint GC skipped — ${redactToken(oneLineLog(r.error), token)}.`);
+          }, (err) => log.debug(`WIP checkpoint GC threw — ${redactToken(oneLineLog(err?.message || err), token)}.`))
+          .finally(() => { clearTimeout(deadlineTimer); if (sweepDir) { try { rmSync(sweepDir, { recursive: true, force: true }); } catch { /* best effort */ } } });
+      } catch (err) {
+        if (sweepDir) { try { rmSync(sweepDir, { recursive: true, force: true }); } catch { /* best effort */ } }
+        log.debug(`WIP checkpoint GC not started — ${redactToken(oneLineLog(err?.message || err), token)}.`);
+      }
     }
 
     const branch = provisioned.workingBranch || null;

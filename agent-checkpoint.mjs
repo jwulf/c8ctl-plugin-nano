@@ -534,28 +534,18 @@ export async function restoreCheckpoint({ git, checkpoint, expectedBranch = null
   const status = await git(['status', '--porcelain']);
   if (!ok(status) || out(status)) return { restored: false, reason: 'workspace-dirty' };
 
-  // A PARENTLESS snapshot was taken on an UNBORN HEAD (pre-first-commit WIP). It can
-  // only be laid back onto a still-unborn clone: read its tree into the working tree,
-  // then empty the index so the files return as uncommitted (untracked) changes on the
-  // unborn branch. No branch pointer moves, so the branch-identity guard does not apply.
-  if (!parent) {
-    if (head) return { restored: false, reason: 'unborn snapshot but clone already has commits' };
-    let r = await git(['read-tree', '-u', '--reset', sha]);
-    if (!ok(r)) return { restored: false, reason: `read-tree failed: ${errText(r)}` };
-    r = await git(['read-tree', '--empty']);
-    if (!ok(r)) return { restored: false, reason: `unstage failed: ${errText(r)}` };
-    return { restored: true, mode: 'unborn', head: '', priorHead: '', commitsRecovered: false };
-  }
-
-  // Branch-identity guard (applies to every PARENTFUL restore below — born OR unborn
-  // clone): a snapshot records the symbolic branch HEAD was on (or an explicit detached
-  // marker). If it was taken on a DIFFERENT branch — or DETACHED — relative to this run's
-  // expected working branch, its `parent` may descend from the work-branch tip yet carry
-  // off-branch/detached commits. Recovering it would move the work branch to that commit
-  // and let a later `finalizeGit` push it to the wrong branch (bypassing branch-mismatch
-  // protection). Refuse cross-identity recovery and retain the checkpoint for explicit
-  // recovery. (Legacy snapshots carry no branch trailer — `branch` empty — and keep the
-  // prior ancestry-only behaviour; the detached marker never equals a real branch name.)
+  // Branch-identity guard (applies to EVERY restore below — parentless OR parentful,
+  // born OR unborn clone): a snapshot records the symbolic branch HEAD was on (or an
+  // explicit detached marker). If it was taken on a DIFFERENT branch — or DETACHED —
+  // relative to this run's expected working branch, recovering it would lay off-branch
+  // work into this run's workspace and let a later `finalizeGit` commit/push it to the
+  // wrong branch (bypassing branch-mismatch protection). This is true even for a
+  // PARENTLESS (unborn) snapshot: an agent can `git checkout -b other` before its first
+  // commit, so the snapshot records `other`; restoring its tree onto this run's expected
+  // branch and committing it there publishes off-branch WIP just the same. Refuse
+  // cross-identity recovery and retain the checkpoint for explicit recovery. (Legacy
+  // snapshots carry no branch trailer — `branch` empty — and keep the prior
+  // ancestry-only behaviour; the detached marker never equals a real branch name.)
   const branchMismatch = Boolean(branch) && Boolean(expectedBranch) && branch !== expectedBranch;
   // A per-run fallback branch is re-cut with a fresh runId every activation, so its name
   // never matches the snapshot's trailer even though both are ephemeral fallbacks off the
@@ -583,6 +573,27 @@ export async function restoreCheckpoint({ git, checkpoint, expectedBranch = null
     && snapshotBaseRef === expectedBaseRef
     && snapParts.token === sanitizeBranchSegment(snapshotRunId);
   const branchGuardRefused = branchMismatch && !fallbackRename;
+
+  // A PARENTLESS snapshot was taken on an UNBORN HEAD (pre-first-commit WIP). It can
+  // only be laid back onto a still-unborn clone: read its tree into the working tree,
+  // then empty the index so the files return as uncommitted (untracked) changes on the
+  // unborn branch. No branch pointer moves during the restore, but a later `finalizeGit`
+  // commits+pushes the laid-down tree onto this run's expected branch, so the SAME
+  // branch-identity guard applies: refuse an off-branch/detached snapshot (a benign
+  // per-run fallback rename still passes) so pre-commit off-branch WIP is not published
+  // to the wrong branch.
+  if (!parent) {
+    if (head) return { restored: false, reason: 'unborn snapshot but clone already has commits' };
+    if (branchGuardRefused) {
+      const where = branch === CHECKPOINT_DETACHED_MARKER ? 'a detached HEAD' : `'${branch}'`;
+      return { restored: false, reason: `branch-mismatch (snapshot on ${where}, expected '${expectedBranch}')`, branchMismatch: true };
+    }
+    let r = await git(['read-tree', '-u', '--reset', sha]);
+    if (!ok(r)) return { restored: false, reason: `read-tree failed: ${errText(r)}` };
+    r = await git(['read-tree', '--empty']);
+    if (!ok(r)) return { restored: false, reason: `unstage failed: ${errText(r)}` };
+    return { restored: true, mode: 'unborn', head: '', priorHead: '', commitsRecovered: false };
+  }
 
   // PARENTFUL snapshot on an UNBORN clone: the prior run made its first local commit(s)
   // on a fresh clone of an (empty) remote — never pushed to the base — then checkpointed,
@@ -627,9 +638,22 @@ export async function restoreCheckpoint({ git, checkpoint, expectedBranch = null
   }
 
   // The fresh clone moved past the prior run's base (e.g. main advanced and the
-  // job cuts a per-run fallback branch): replay base→snapshot as a patch.
-  if (!base) return { restored: false, reason: 'diverged (no base trailer)' };
-  const diff = await git(['diff', '--binary', '--full-index', base, sha]);
+  // job cuts a per-run fallback branch): replay base→snapshot as a patch. A snapshot
+  // with NO base trailer was taken on a clone of an EMPTY remote (no base sha existed):
+  // if that remote has since gained its first commit this clone is now born, so rather
+  // than refuse (and lose the checkpointed WIP) diff the snapshot against the empty tree
+  // — the full snapshot tree becomes an additive patch laid onto the current HEAD (any
+  // path the new base commit already introduced is reconciled by `apply --3way`, which
+  // still refuses a genuine conflict). The branch guard above already gated this.
+  let patchBase = base;
+  if (!base) {
+    // Empty tree object id for this repo's hash algo, computed cross-platform via
+    // `mktree` reading empty stdin (avoids the non-portable `hash-object /dev/null`).
+    const mk = await git(['mktree'], { input: '' });
+    if (!ok(mk) || !/^[0-9a-f]{7,64}$/.test(out(mk))) return { restored: false, reason: 'diverged (no base trailer; empty-tree unavailable)' };
+    patchBase = out(mk);
+  }
+  const diff = await git(['diff', '--binary', '--full-index', patchBase, sha]);
   if (!ok(diff)) return { restored: false, reason: `diff failed: ${errText(diff)}` };
   if (!diff.stdout.trim()) return { restored: false, reason: 'empty diff' };
   const apply = await git(['apply', '--3way', '--whitespace=nowarn'], { input: diff.stdout });
@@ -639,7 +663,7 @@ export async function restoreCheckpoint({ git, checkpoint, expectedBranch = null
     return { restored: false, reason: `patch did not apply cleanly: ${errText(apply)}` };
   }
   await git(['reset', '-q']);
-  return { restored: true, mode: 'patch', head, priorHead: head, commitsRecovered: false };
+  return { restored: true, mode: base ? 'patch' : 'patch-empty-base', head, priorHead: head, commitsRecovered: false };
 }
 
 // Stateful "take a checkpoint now" function bound to one workspace + ref.

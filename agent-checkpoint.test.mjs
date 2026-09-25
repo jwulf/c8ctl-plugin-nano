@@ -589,6 +589,50 @@ test('parentful snapshot on an UNBORN clone: the prior run\'s first local commit
   } finally { rmSync(root, { recursive: true, force: true }); }
 });
 
+test('parentful snapshot on an UNBORN clone: a post-reset failure rolls the clone back to its pristine unborn state (recovered commits are NOT left published)', async () => {
+  const root = mkdtempSync(join(tmpdir(), 'ckpt-unborn-rollback-'));
+  try {
+    const remote = join(root, 'remote.git');
+    sh(root, 'init', '-q', '--bare', '-b', 'main', remote);
+    const clone = (name) => {
+      const dir = join(root, name);
+      sh(root, 'clone', '-q', remote, dir);
+      return { dir, git: createGitRunner({ cwd: dir, env: ENV }) };
+    };
+    const ref = checkpointRef('43rb');
+    const a = clone('a');
+    writeFileSync(join(a.dir, 'first.txt'), 'first commit\n');
+    sh(a.dir, 'add', '-A');
+    sh(a.dir, 'commit', '-q', '-m', 'first');
+    writeFileSync(join(a.dir, 'wip.txt'), 'uncommitted wip\n');
+    const res = await createWorkspaceCheckpoint({ git: a.git, ref })('tool');
+    assert.ok(res.sha, JSON.stringify(res));
+    const fetched = await fetchCheckpoint({ git: clone('probe').git, ref });
+
+    // Re-clone the still-empty remote → unborn again. Inject a git wrapper that FAILS the
+    // `read-tree -u --reset <sha>` step, AFTER `reset --hard parent` has already made the
+    // branch born: the restore must fail AND roll the clone back to unborn/empty.
+    const b = clone('b');
+    const realGit = b.git;
+    const failingGit = async (args, opts) => {
+      if (args[0] === 'read-tree' && args.includes('-u') && args.includes('--reset')) {
+        return { status: 1, stdout: '', stderr: 'injected read-tree failure' };
+      }
+      return realGit(args, opts);
+    };
+    const restored = await restoreCheckpoint({ git: failingGit, checkpoint: fetched, expectedBranch: 'main' });
+    assert.equal(restored.restored, false, JSON.stringify(restored));
+    assert.ok(/read-tree failed/.test(restored.reason), restored.reason);
+    assert.notEqual(restored.rollbackFailed, true, JSON.stringify(restored));
+    // Clone is unborn again (no HEAD commit) and the working tree is empty — the
+    // recovered first commit was NOT left on the branch for finalizeGit to publish.
+    assert.equal(spawnSync('git', ['rev-parse', '--verify', '-q', 'HEAD'], { cwd: b.dir, env: ENV }).status, 1);
+    assert.equal(sh(b.dir, 'status', '--porcelain'), '');
+    assert.equal(existsSync(join(b.dir, 'first.txt')), false);
+    assert.equal(existsSync(join(b.dir, 'wip.txt')), false);
+  } finally { rmSync(root, { recursive: true, force: true }); }
+});
+
 test('unborn HEAD: a PARENTLESS snapshot taken on a DIFFERENT branch is refused (branch-identity guard), a benign per-run fallback rename passes', async () => {
   const root = mkdtempSync(join(tmpdir(), 'ckpt-unborn-guard-'));
   try {

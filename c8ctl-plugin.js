@@ -5448,7 +5448,10 @@ async function setupWorkspaceCheckpoints({ provisioned, envelope = null, token =
         restored = r;
         logger.info?.(`${prefix} (${corr}): restored WIP checkpoint ${ref}@${prior.sha.slice(0, 12)} (${r.mode}${r.commitsRecovered ? ', local commits recovered' : ''}) as uncommitted changes.`);
       } else {
-        log.warn(`found WIP checkpoint ${ref}@${prior.sha.slice(0, 12)} but did not restore it — ${r?.reason || 'unknown'}; the ref is RETAINED (not overwritten) for this activation, so its content can still be recovered explicitly.`);
+        const rb = r?.rollbackFailed
+          ? ' — WARNING: the workspace could NOT be rolled back to its pristine state and may hold partially-recovered content'
+          : '';
+        log.warn(`found WIP checkpoint ${ref}@${prior.sha.slice(0, 12)} but did not restore it — ${r?.reason || 'unknown'}${rb}; the ref is RETAINED (not overwritten) for this activation, so its content can still be recovered explicitly.`);
       }
     }
     // Cancellation recheck: after the startup git work, bail before starting the

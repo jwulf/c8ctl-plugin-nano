@@ -608,12 +608,30 @@ export async function restoreCheckpoint({ git, checkpoint, expectedBranch = null
       const where = branch === CHECKPOINT_DETACHED_MARKER ? 'a detached HEAD' : `'${branch}'`;
       return { restored: false, reason: `branch-mismatch (snapshot on ${where}, expected '${expectedBranch}')`, branchMismatch: true };
     }
+    // The clone is UNBORN, so `reset --hard parent` makes the branch BORN — recovering
+    // the prior run's first local commit onto it. A FAILURE in the following tree
+    // operations must therefore roll the clone back to its pristine unborn+empty state:
+    // otherwise a `restored: false` return leaves those recovered commits sitting on the
+    // branch, and the caller (which then degrades to transcript-only) would still publish
+    // them via finalizeGit — exactly the data the "not restored, ref retained" path is
+    // meant to withhold. Capture the unborn branch ref up front so we can detach it again.
+    const unbornRef = out(await git(['symbolic-ref', '-q', 'HEAD']));
+    const rollbackUnborn = async (reason) => {
+      // Detach the (now-born) branch back to unborn and wipe the partially-restored tree.
+      let recovered = true;
+      if (unbornRef) recovered = ok(await git(['update-ref', '-d', unbornRef])) && recovered;
+      recovered = ok(await git(['read-tree', '--empty'])) && recovered;
+      recovered = ok(await git(['clean', '-fdq'])) && recovered;
+      return recovered
+        ? { restored: false, reason }
+        : { restored: false, reason: `${reason}; rollback to the pristine unborn state FAILED`, rollbackFailed: true };
+    };
     let r = await git(['reset', '-q', '--hard', parent]);
-    if (!ok(r)) return { restored: false, reason: `reset failed: ${errText(r)}` };
+    if (!ok(r)) return rollbackUnborn(`reset failed: ${errText(r)}`);
     r = await git(['read-tree', '-u', '--reset', sha]);
-    if (!ok(r)) return { restored: false, reason: `read-tree failed: ${errText(r)}` };
+    if (!ok(r)) return rollbackUnborn(`read-tree failed: ${errText(r)}`);
     r = await git(['reset', '-q', parent]);
-    if (!ok(r)) return { restored: false, reason: `unstage failed: ${errText(r)}` };
+    if (!ok(r)) return rollbackUnborn(`unstage failed: ${errText(r)}`);
     return { restored: true, mode: 'unborn-parentful', head: parent, priorHead: '', commitsRecovered: true };
   }
 

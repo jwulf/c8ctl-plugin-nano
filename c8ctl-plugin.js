@@ -5563,8 +5563,16 @@ async function setupWorkspaceCheckpoints({ provisioned, envelope = null, token =
       ref,
       baseSha: provisioned.startSha || '',
       runId: String(runId || ''),
-      expectSha: prior?.sha || '',
-      priorRunId: prior?.runId || '',
+      // When a prior snapshot EXISTED but could NOT be restored (branch-mismatch /
+      // detached refusal, or a diverged patch that did not apply), its content lives
+      // ONLY on the ref. Do NOT hand this run ownership of it: with `expectSha`/
+      // `priorRunId` set, the first checkpoint would `--force-with-lease` over the
+      // ref and destroy the only copy of that un-restored snapshot. Withholding
+      // ownership makes the first push a create-only that the existing ref rejects,
+      // so checkpointing disables for this activation and the old ref is left intact
+      // for explicit recovery (matching `priorNotRestored` retaining it on discard).
+      expectSha: priorNotRestored ? '' : (prior?.sha || ''),
+      priorRunId: priorNotRestored ? '' : (prior?.runId || ''),
       startupFetchFailed,
       maxFileBytes: cfg.maxFileBytes,
       // Include any credential embedded in the origin URL's userinfo: provisioning

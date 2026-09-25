@@ -716,6 +716,42 @@ test('setupWorkspaceCheckpoints: hasUncommittedChanges / priorNotRestored gate r
   } finally { f.cleanup(); }
 });
 
+test('setupWorkspaceCheckpoints: an un-restored (branch-mismatch) prior ref is NOT clobbered by the next run', async () => {
+  const f = fixture();
+  try {
+    const env = { NANO_AGENT_CHECKPOINT: 'on', NANO_AGENT_CHECKPOINT_INTERVAL_MS: '0' };
+    const job = { jobKey: '8', elementInstanceKey: '808' };
+    const provision = (name, branch) => {
+      const { dir } = f.clone(name);
+      sh(dir, 'checkout', '-q', '-b', branch);
+      return { workspaceDir: dir, gitEnv: ENV, committer: { name: 'bot', email: 'bot@example.com' }, startSha: sh(dir, 'rev-parse', 'HEAD'), workingBranch: branch };
+    };
+    // run1 checkpoints while on 'sidebranch'.
+    const p1 = provision('run1', 'sidebranch');
+    const s1 = await setupWorkspaceCheckpoints({ provisioned: p1, job, jobType: 't', runId: 'run-1', logger: quietLogger(), env, deps: { sweepRegistry: new Map() } });
+    writeFileSync(join(p1.workspaceDir, 'wip.txt'), 'sidebranch wip\n');
+    const res = await s1.checkpointer.flush('abort', { timeoutMs: 0 });
+    assert.ok(res.sha, JSON.stringify(res));
+    await s1.close();
+    const priorSha = sh(f.root, '--git-dir', f.remote, 'rev-parse', 'refs/nano/wip/808');
+    assert.equal(priorSha, res.sha);
+
+    // run2 is on a DIFFERENT working branch, so restore refuses (branch-mismatch):
+    // priorNotRestored. Its checkpointer must NOT be handed prior ownership, so its
+    // push cannot force over the ref — the un-restored snapshot survives intact.
+    const p2 = provision('run2', 'nano/agent-work/main-x');
+    const s2 = await setupWorkspaceCheckpoints({ provisioned: p2, job, jobType: 't', runId: 'run-2', logger: quietLogger(), env, deps: { sweepRegistry: new Map() } });
+    assert.equal(s2.restored, null);
+    assert.equal(s2.priorNotRestored, true);
+    writeFileSync(join(p2.workspaceDir, 'new.txt'), 'run2 work\n');
+    const r2 = await s2.checkpointer.flush('abort', { timeoutMs: 0 });
+    assert.ok(r2.skipped, `run2 must not overwrite the ref: ${JSON.stringify(r2)}`);
+    await s2.close();
+    // The ref still holds run1's snapshot, untouched.
+    assert.equal(sh(f.root, '--git-dir', f.remote, 'rev-parse', 'refs/nano/wip/808'), priorSha);
+  } finally { f.cleanup(); }
+});
+
 test('setupWorkspaceCheckpoints: checkpoint → variable → restore on the next activation → discard', async () => {
   const f = fixture();
   try {

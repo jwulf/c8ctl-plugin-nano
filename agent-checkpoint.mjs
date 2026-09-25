@@ -215,7 +215,11 @@ export async function snapshotWorktree({ git, baseSha = '', runId = '', lastTree
     r = await git(['add', '-A'], { env });
     if (!ok(r)) return { skipped: `add failed: ${errText(r)}` };
 
-    const changed = await git(['diff', '--cached', '--name-only', '--no-renames', '-z', '--diff-filter=AM', 'HEAD'], { env });
+    // AMT (added/modified/type-changed), NOT D: a type change (e.g. a tracked
+    // symlink/submodule replaced by a regular file) is staged by `add -A` and
+    // enters the written tree, so it must be scanned against the deny-list, size
+    // limit and secret-content check too — excluding T would let it bypass them.
+    const changed = await git(['diff', '--cached', '--name-only', '--no-renames', '-z', '--diff-filter=AMT', 'HEAD'], { env });
     if (!ok(changed)) return { skipped: `diff failed: ${errText(changed)}` };
     const excluded = [];
     for (const path of changed.stdout.split('\0').filter(Boolean)) {
@@ -357,8 +361,10 @@ export async function restoreCheckpoint({ git, checkpoint }) {
 // Ownership: `expectSha` is the remote sha this run took over (the restored
 // checkpoint) and `priorRunId` the run that wrote it. On a lease rejection we
 // re-read the ref: if it was moved by that SAME superseded run (a zombie's
-// late abort-flush racing our startup) we take over from it; if it was moved by
-// any other run, a newer owner exists and we stop writing.
+// late abort-flush racing our startup) — or by THIS run itself (a transient
+// push error after the server had already accepted our checkpoint left our
+// `remoteSha` stale) — we take over from it; if it was moved by any other run,
+// a newer owner exists and we stop writing.
 export function createWorkspaceCheckpoint({ git, ref, baseSha = '', runId = '', expectSha = '', priorRunId = '', maxFileBytes, secretValues = [], message, now = () => Date.now() }) {
   let lastTree = null;
   let remoteSha = expectSha;
@@ -371,7 +377,7 @@ export function createWorkspaceCheckpoint({ git, ref, baseSha = '', runId = '', 
     if (!pushed.ok && pushed.kind === 'lease') {
       let current = null;
       try { current = await fetchCheckpoint({ git, ref }); } catch { /* treat as foreign */ }
-      const takeOver = !!(current && priorRunId && current.runId === priorRunId);
+      const takeOver = !!(current && ((priorRunId && current.runId === priorRunId) || (runId && current.runId === runId)));
       if (takeOver) {
         remoteSha = current?.sha || '';
         pushed = await pushCheckpoint({ git, ref, sha: snap.sha, expectSha: remoteSha });

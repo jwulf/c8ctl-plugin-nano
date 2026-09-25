@@ -1,6 +1,6 @@
 import { test } from 'node:test';
 import assert from 'node:assert/strict';
-import { mkdtempSync, writeFileSync, readFileSync, existsSync, rmSync, mkdirSync } from 'node:fs';
+import { mkdtempSync, writeFileSync, readFileSync, existsSync, rmSync, mkdirSync, symlinkSync } from 'node:fs';
 import { tmpdir } from 'node:os';
 import { join } from 'node:path';
 import { spawnSync } from 'node:child_process';
@@ -321,6 +321,69 @@ test('a policy rejection stops checkpointing without the takeover path', async (
   assert.match(res.disabled, /repository rule/);
   assert.ok(!calls.some((c) => c.startsWith('fetch')), 'no takeover fetch on a policy rejection');
   assert.match((await take('tool')).skipped, /^disabled/);
+});
+
+test('a type change (symlink → regular file) is scanned, not bypassed', async () => {
+  const f = fixture();
+  try {
+    const { dir, git } = f.clone('w');
+    sh(dir, 'config', 'core.symlinks', 'true');
+    // Track a symlink at HEAD, then replace it with a regular file carrying a
+    // secret — `add -A` stages this as a TYPE change (mode 120000 → 100644).
+    symlinkSync('a.txt', join(dir, 'link'));
+    sh(dir, 'add', 'link');
+    sh(dir, 'commit', '-q', '-m', 'add symlink');
+    const base = sh(dir, 'rev-parse', 'HEAD');
+    rmSync(join(dir, 'link'));
+    writeFileSync(join(dir, 'link'), 'TOKEN=s3cr3t-value-123\n');
+    writeFileSync(join(dir, 'a.txt'), 'changed\n'); // a benign change so the tree differs
+
+    const snap = await snapshotWorktree({ git, baseSha: base, secretValues: ['s3cr3t-value-123'] });
+    assert.ok(snap.sha, JSON.stringify(snap));
+    // The type-changed path is scanned and excluded; the secret never enters the ref.
+    assert.deepEqual(snap.excluded.map((e) => `${e.path}:${e.why}`), ['link:secret-content']);
+    // The tree keeps the original symlink (reverted to HEAD), not the secret file,
+    // while the benign change is captured.
+    assert.equal(sh(dir, 'ls-tree', snap.sha, 'link').split(/\s+/)[0], '120000');
+    assert.ok(!sh(dir, 'show', `${snap.sha}:link`).includes('s3cr3t-value-123'));
+    assert.equal(sh(dir, 'show', `${snap.sha}:a.txt`), 'changed');
+  } finally { f.cleanup(); }
+});
+
+test('a transient push after the server accepted our checkpoint is recovered via current-run takeover', async () => {
+  let n = 0;
+  let serverSha = 'old';
+  let sawTransient = false;
+  const git = async (args) => {
+    if (args[0] === 'rev-parse' && args[1] === '--verify' && args[3] === 'HEAD') return { status: 0, stdout: 'h\n', stderr: '' };
+    if (args[0] === 'rev-parse' && args.includes('HEAD^{tree}')) return { status: 0, stdout: 'treeHead\n', stderr: '' };
+    if (args[0] === 'rev-parse' && args[1] === '--verify') {
+      if (args.some((a) => a.includes('^{commit}'))) return { status: 0, stdout: `${serverSha}\n`, stderr: '' };
+      return { status: 0, stdout: 'parent\n', stderr: '' };
+    }
+    if (args[0] === 'write-tree') return { status: 0, stdout: `t${++n}\n`, stderr: '' };
+    if (args[0] === 'commit-tree') return { status: 0, stdout: `c${n}\n`, stderr: '' };
+    if (args[0] === 'log') return { status: 0, stdout: `msg\n\nNano-Checkpoint-Run: run-a\n`, stderr: '' };
+    if (args[0] === 'fetch') return { status: 0, stdout: '', stderr: '' };
+    if (args[0] === 'push') {
+      const lease = (args.find((a) => a.startsWith('--force-with-lease=')) || '').split(':').pop();
+      const target = args[args.length - 1].split(':')[0];
+      if (lease !== serverSha) return { status: 1, stdout: '', stderr: ' ! [rejected] (stale info)' };
+      serverSha = target; // the server accepts and moves the ref
+      if (!sawTransient) { sawTransient = true; return { status: 1, stdout: '', stderr: 'fatal: unable to access remote (transient)' }; }
+      return { status: 0, stdout: '', stderr: '' };
+    }
+    return { status: 0, stdout: '', stderr: '' };
+  };
+  const take = createWorkspaceCheckpoint({ git, ref: 'refs/nano/wip/1', baseSha: 'b', runId: 'run-a', expectSha: 'old', priorRunId: 'r0' });
+  // The server accepted our push but returned a transient error → must NOT disable.
+  const r1 = await take('tool');
+  assert.equal(r1.kind, 'transient', JSON.stringify(r1));
+  assert.ok(!r1.disabled, 'a transient push error must not disable checkpointing');
+  // Next push sees a lease mismatch; re-reading shows OUR own run owns the ref,
+  // so we take over and re-push instead of wrongly disabling.
+  const r2 = await take('tool');
+  assert.ok(r2.sha && !r2.skipped, JSON.stringify(r2));
 });
 
 test('GC deletes TTL-expired and terminal-element refs, keeps own/unknown/fresh ones', async () => {

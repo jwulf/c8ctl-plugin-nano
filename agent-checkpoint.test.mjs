@@ -290,6 +290,93 @@ test('restore refuses to fast-restore a snapshot taken on a DETACHED HEAD', asyn
   } finally { f.cleanup(); }
 });
 
+test('restore recovers WIP across a per-run fallback branch rename via a non-reset patch', async () => {
+  const f = fixture();
+  try {
+    const ref = checkpointRef('43f');
+    const a = f.clone('a');
+    const base = sh(a.dir, 'rev-parse', 'HEAD');
+    // Run 1 was provisioned onto a PER-RUN fallback branch (the base moved / no stable
+    // branch.create), committed work on it, then left uncommitted WIP when interrupted.
+    sh(a.dir, 'checkout', '-q', '-b', 'nano/agent-work/main-run1');
+    writeFileSync(join(a.dir, 'feature.txt'), 'committed work\n');
+    sh(a.dir, 'add', '-A');
+    sh(a.dir, 'commit', '-q', '-m', 'run1 commit');
+    writeFileSync(join(a.dir, 'wip.txt'), 'uncommitted wip\n');
+    const res = await createWorkspaceCheckpoint({ git: a.git, ref, baseSha: base })('tool');
+    assert.ok(res.sha, JSON.stringify(res));
+
+    const fetched = await fetchCheckpoint({ git: f.clone('probe').git, ref });
+    assert.equal(fetched.branch, 'nano/agent-work/main-run1');
+
+    // Run 2 re-activates: provisioning cuts a FRESH fallback branch with a new runId,
+    // so its name necessarily differs from the snapshot's. Marked ephemeral, restore
+    // must still refuse the ancestry-RESET fast path but fall through to the non-reset
+    // PATCH restore, recovering the WIP instead of stranding it (issues from round 8).
+    const b = f.clone('b');
+    sh(b.dir, 'checkout', '-q', '-b', 'nano/agent-work/main-run2');
+    const restored = await restoreCheckpoint({ git: b.git, checkpoint: fetched, expectedBranch: 'nano/agent-work/main-run2', expectedBranchEphemeral: true });
+    assert.equal(restored.restored, true, JSON.stringify(restored));
+    assert.equal(restored.mode, 'patch');
+    assert.equal(readFileSync(join(b.dir, 'feature.txt'), 'utf8'), 'committed work\n');
+    assert.equal(readFileSync(join(b.dir, 'wip.txt'), 'utf8'), 'uncommitted wip\n');
+    // No branch pointer moved: HEAD is still 'init' and the recovery is uncommitted.
+    assert.equal(sh(b.dir, 'log', '-1', '--format=%s'), 'init');
+    assert.ok(sh(b.dir, 'status', '--porcelain').length > 0);
+
+    // WITHOUT the ephemeral marker, the same name change is a GENUINE mismatch: a
+    // stable-branch job must not silently recover cross-branch. Refuse and retain.
+    const c = f.clone('c');
+    sh(c.dir, 'checkout', '-q', '-b', 'nano/agent-work/main-run2');
+    const blocked = await restoreCheckpoint({ git: c.git, checkpoint: fetched, expectedBranch: 'nano/agent-work/main-run2' });
+    assert.equal(blocked.restored, false, JSON.stringify(blocked));
+    assert.equal(blocked.branchMismatch, true);
+    assert.equal(sh(f.root, '--git-dir', f.remote, 'rev-parse', ref), res.sha);
+  } finally { f.cleanup(); }
+});
+
+test('unborn HEAD: pre-first-commit WIP is snapshotted parentless and restored onto a fresh unborn clone', async () => {
+  const root = mkdtempSync(join(tmpdir(), 'ckpt-unborn-'));
+  try {
+    const remote = join(root, 'remote.git');
+    sh(root, 'init', '-q', '--bare', '-b', 'main', remote);
+    const clone = (name) => {
+      const dir = join(root, name);
+      sh(root, 'clone', '-q', remote, dir);
+      return { dir, git: createGitRunner({ cwd: dir, env: ENV }) };
+    };
+    const ref = checkpointRef('43u');
+    const a = clone('a');
+    // Fresh clone of an EMPTY repo: HEAD is unborn (no commit yet), yet provisioning
+    // treats such a clone as pushable — so pre-first-commit WIP is checkpoint-eligible.
+    assert.equal(sh(a.dir, 'symbolic-ref', '--short', 'HEAD'), 'main');
+    writeFileSync(join(a.dir, 'draft.txt'), 'pre-commit wip\n');
+    const res = await createWorkspaceCheckpoint({ git: a.git, ref })('tool');
+    assert.ok(res.sha, JSON.stringify(res));
+
+    // The snapshot is PARENTLESS (there is no HEAD to descend from).
+    const fetched = await fetchCheckpoint({ git: clone('probe').git, ref });
+    assert.equal(fetched.parent, '');
+
+    // Restore onto a fresh unborn clone lays the tree back as uncommitted work; HEAD
+    // stays unborn (no commit materialises) and the file returns to the working tree.
+    const b = clone('b');
+    const restored = await restoreCheckpoint({ git: b.git, checkpoint: fetched, expectedBranch: 'main' });
+    assert.equal(restored.restored, true, JSON.stringify(restored));
+    assert.equal(restored.mode, 'unborn');
+    assert.equal(readFileSync(join(b.dir, 'draft.txt'), 'utf8'), 'pre-commit wip\n');
+    assert.equal(spawnSync('git', ['rev-parse', '--verify', '-q', 'HEAD'], { cwd: b.dir, env: ENV }).status, 1);
+
+    // An unborn snapshot must NOT be forced onto a clone that already has commits.
+    const c = clone('c');
+    writeFileSync(join(c.dir, 'x.txt'), 'x\n');
+    sh(c.dir, 'add', '-A');
+    sh(c.dir, 'commit', '-q', '-m', 'first');
+    const refused = await restoreCheckpoint({ git: c.git, checkpoint: fetched, expectedBranch: 'main' });
+    assert.equal(refused.restored, false, JSON.stringify(refused));
+  } finally { rmSync(root, { recursive: true, force: true }); }
+});
+
 test('lease: a stale writer is rejected and stops writing', async () => {
   const f = fixture();
   try {

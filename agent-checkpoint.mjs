@@ -8,8 +8,9 @@
 // index, or branch, and restore that snapshot on the next activation.
 //
 //   - Snapshot: a "shadow commit" built through a TEMPORARY index
-//     (`GIT_INDEX_FILE`): `read-tree HEAD` → `add -A` (honours .gitignore) →
-//     drop deny-listed / oversized paths → `write-tree` → `commit-tree -p HEAD`.
+//     (`GIT_INDEX_FILE`): `read-tree HEAD` (or the empty tree on an UNBORN HEAD) →
+//     `add -A` (honours .gitignore) → drop deny-listed / oversized paths →
+//     `write-tree` → `commit-tree -p HEAD` (parentless when unborn).
 //     The agent's own index and refs are never written.
 //   - Push: `refs/nano/wip/<elementInstanceKey>` with `--force-with-lease` against
 //     the last sha WE pushed, so a zombie prior owner can't clobber a newer run.
@@ -52,6 +53,15 @@ export const CHECKPOINT_BRANCH_TRAILER = 'Nano-Checkpoint-Branch';
 // off-branch commit). Legacy snapshots (created before this trailer existed) carry
 // NO trailer at all and keep the prior ancestry-only behaviour.
 export const CHECKPOINT_DETACHED_MARKER = 'HEAD:detached';
+
+// Per-run fallback branches provisioning cuts when a job supplies no stable working
+// branch: `nano/agent-work/<base>-<runId>`. The `runId` segment makes the name differ
+// on EVERY activation, so a checkpoint's branch trailer can never equal the next run's
+// expected working branch. That rename is BENIGN — both are ephemeral fallbacks off the
+// same base, not a genuine off-branch/detached move — so the restore path treats it
+// specially: it still refuses the ancestry-RESET fast path but falls through to the
+// non-reset PATCH restore, recovering the fallback job's WIP instead of stranding it.
+const FALLBACK_BRANCH_RE = /^nano\/agent-work\//;
 
 const DEFAULTS = Object.freeze({
   minIntervalMs: 60_000,
@@ -276,8 +286,13 @@ const errText = (r) => redactUrlUserinfo((r?.stderr || r?.stdout || '').trim()).
 // Returns { sha, tree, head, excluded } or { skipped: reason }.
 export async function snapshotWorktree({ git, baseSha = '', runId = '', lastTree = null, maxFileBytes = DEFAULTS.maxFileBytes, secretValues = [], message = 'nano: WIP checkpoint' }) {
   const head = await git(['rev-parse', '--verify', '-q', 'HEAD']);
-  if (!ok(head)) return { skipped: 'no-head' };
-  const headSha = out(head);
+  // An UNBORN HEAD (a fresh clone of an empty repo, or before the agent's first
+  // commit) has no HEAD commit, yet provisioning treats such a clone as pushable —
+  // so pre-first-commit WIP is checkpoint-ELIGIBLE and must not be silently dropped.
+  // We snapshot the working tree as a PARENTLESS shadow commit (diffed against the
+  // empty tree) that `restoreCheckpoint` lays back onto a fresh unborn clone.
+  const unborn = !ok(head);
+  const headSha = unborn ? '' : out(head);
   // The symbolic branch HEAD is on right now. When HEAD is DETACHED there is no
   // branch, so we record an explicit detached marker (not an omitted trailer):
   // that distinguishes a genuinely off-branch snapshot from a legacy trailerless
@@ -287,7 +302,13 @@ export async function snapshotWorktree({ git, baseSha = '', runId = '', lastTree
   const dir = mkdtempSync(join(tmpdir(), 'nano-ckpt-'));
   const env = { GIT_INDEX_FILE: join(dir, 'index') };
   try {
-    let r = await git(['read-tree', 'HEAD'], { env });
+    // For an unborn HEAD there is no HEAD tree to seed from / diff against, so use
+    // git's empty tree (computed for the repo's object format). `git read-tree`,
+    // `git diff --cached` and the path-limited `git reset` all accept a tree-ish, so
+    // the same code path serves born and unborn snapshots with only `baseRef` swapped.
+    const emptyTree = out(await git(['hash-object', '-t', 'tree', '--stdin'], { input: '' })) || '4b825dc642cb6eb9a060e54bf8d69288fbee4904';
+    const baseRef = unborn ? emptyTree : 'HEAD';
+    let r = await git(['read-tree', baseRef], { env });
     if (!ok(r)) return { skipped: `read-tree failed: ${errText(r)}` };
     r = await git(['add', '-A'], { env });
     if (!ok(r)) return { skipped: `add failed: ${errText(r)}` };
@@ -296,7 +317,7 @@ export async function snapshotWorktree({ git, baseSha = '', runId = '', lastTree
     // symlink/submodule replaced by a regular file) is staged by `add -A` and
     // enters the written tree, so it must be scanned against the deny-list, size
     // limit and secret-content check too — excluding T would let it bypass them.
-    const changed = await git(['diff', '--cached', '--name-only', '--no-renames', '-z', '--diff-filter=AMT', 'HEAD'], { env });
+    const changed = await git(['diff', '--cached', '--name-only', '--no-renames', '-z', '--diff-filter=AMT', baseRef], { env });
     if (!ok(changed)) return { skipped: `diff failed: ${errText(changed)}` };
     const excluded = [];
     for (const path of changed.stdout.split('\0').filter(Boolean)) {
@@ -313,8 +334,8 @@ export async function snapshotWorktree({ git, baseSha = '', runId = '', lastTree
       if (why) excluded.push({ path, why });
     }
     if (excluded.length) {
-      // Revert excluded paths to their HEAD state in the temp index (drops new ones).
-      r = await git(['reset', '-q', 'HEAD', '--', ...excluded.map((e) => e.path)], { env });
+      // Revert excluded paths to their base state in the temp index (drops new ones).
+      r = await git(['reset', '-q', baseRef, '--', ...excluded.map((e) => e.path)], { env });
       if (!ok(r)) return { skipped: `exclude failed: ${errText(r)}` };
     }
 
@@ -322,7 +343,7 @@ export async function snapshotWorktree({ git, baseSha = '', runId = '', lastTree
     if (!ok(tree)) return { skipped: `write-tree failed: ${errText(tree)}` };
     const treeSha = out(tree);
     if (lastTree && treeSha === lastTree.tree && headSha === lastTree.head) return { skipped: 'unchanged' };
-    const headTree = out(await git(['rev-parse', 'HEAD^{tree}']));
+    const headTree = unborn ? emptyTree : out(await git(['rev-parse', 'HEAD^{tree}']));
     if (treeSha === headTree && (!baseSha || headSha === baseSha)) return { skipped: 'clean' };
 
     const trailers = [
@@ -331,7 +352,9 @@ export async function snapshotWorktree({ git, baseSha = '', runId = '', lastTree
       symbolicBranch ? `${CHECKPOINT_BRANCH_TRAILER}: ${symbolicBranch}` : '',
     ].filter(Boolean).join('\n');
     const body = `${message}\n\n${trailers}\n`;
-    const commit = await git(['commit-tree', treeSha, '-p', headSha], { input: body });
+    // A born snapshot descends from HEAD; an unborn one is PARENTLESS (there is no
+    // HEAD commit) — `restoreCheckpoint` keys the unborn-restore path off that.
+    const commit = await git(unborn ? ['commit-tree', treeSha] : ['commit-tree', treeSha, '-p', headSha], { input: body });
     if (!ok(commit)) return { skipped: `commit-tree failed: ${errText(commit)}` };
     return { sha: out(commit), tree: treeSha, head: headSha, excluded };
   } finally {
@@ -399,13 +422,29 @@ export async function fetchCheckpoint({ git, ref, remote = 'origin' }) {
 
 // Lay a fetched checkpoint down onto the fresh clone. HEAD stays on the current
 // branch; the snapshot's changes become UNCOMMITTED working-tree changes.
-export async function restoreCheckpoint({ git, checkpoint, expectedBranch = null }) {
+// `expectedBranchEphemeral` marks the run's working branch as a per-run fallback
+// branch (`nano/agent-work/…-<runId>`), whose name necessarily differs from the
+// snapshot's every activation — a benign rename that must still recover WIP.
+export async function restoreCheckpoint({ git, checkpoint, expectedBranch = null, expectedBranchEphemeral = false }) {
   const { sha, parent, base, branch } = checkpoint || {};
-  if (!sha || !parent) return { restored: false, reason: 'no-parent' };
+  if (!sha) return { restored: false, reason: 'no-sha' };
   const head = out(await git(['rev-parse', '--verify', '-q', 'HEAD']));
-  if (!head) return { restored: false, reason: 'no-head' };
   const status = await git(['status', '--porcelain']);
   if (!ok(status) || out(status)) return { restored: false, reason: 'workspace-dirty' };
+
+  // A PARENTLESS snapshot was taken on an UNBORN HEAD (pre-first-commit WIP). It can
+  // only be laid back onto a still-unborn clone: read its tree into the working tree,
+  // then empty the index so the files return as uncommitted (untracked) changes on the
+  // unborn branch. No branch pointer moves, so the branch-identity guard does not apply.
+  if (!parent) {
+    if (head) return { restored: false, reason: 'unborn snapshot but clone already has commits' };
+    let r = await git(['read-tree', '-u', '--reset', sha]);
+    if (!ok(r)) return { restored: false, reason: `read-tree failed: ${errText(r)}` };
+    r = await git(['read-tree', '--empty']);
+    if (!ok(r)) return { restored: false, reason: `unstage failed: ${errText(r)}` };
+    return { restored: true, mode: 'unborn', head: '', priorHead: '', commitsRecovered: false };
+  }
+  if (!head) return { restored: false, reason: 'no-head' };
 
   // Branch-identity guard: a snapshot records the symbolic branch HEAD was on (or an
   // explicit detached marker). If it was taken on a DIFFERENT branch — or DETACHED —
@@ -417,6 +456,13 @@ export async function restoreCheckpoint({ git, checkpoint, expectedBranch = null
   // snapshots carry no branch trailer — `branch` empty — and keep the prior
   // ancestry-only behaviour; the detached marker can never equal a real branch name.)
   const branchMismatch = Boolean(branch) && Boolean(expectedBranch) && branch !== expectedBranch;
+  // A per-run fallback branch is re-cut with a fresh runId every activation, so its
+  // name never matches the snapshot's trailer even though both are ephemeral fallbacks
+  // off the same base. That rename is BENIGN — not a genuine off-branch/detached move —
+  // so we still refuse the ancestry-RESET fast path but fall through to the non-reset
+  // PATCH restore below, recovering the fallback job's WIP instead of stranding it.
+  const fallbackRename = branchMismatch && expectedBranchEphemeral === true
+    && FALLBACK_BRANCH_RE.test(branch) && FALLBACK_BRANCH_RE.test(expectedBranch);
 
   const fast = !branchMismatch && ok(await git(['merge-base', '--is-ancestor', head, parent]));
   if (fast) {
@@ -429,9 +475,11 @@ export async function restoreCheckpoint({ git, checkpoint, expectedBranch = null
     return { restored: true, mode: 'fast-forward', head: parent, priorHead: head, commitsRecovered: head !== parent };
   }
 
-  // A branch-mismatched snapshot must NOT be commit-recovered onto this branch; its
-  // work lives only on the ref and is left there for explicit, human recovery.
-  if (branchMismatch) {
+  // A GENUINELY branch-mismatched snapshot (off-branch/detached) must NOT be
+  // commit-recovered onto this branch; its work lives only on the ref and is left
+  // there for explicit, human recovery. A benign per-run fallback rename instead
+  // falls through to the non-reset patch restore below (it never moves the branch).
+  if (branchMismatch && !fallbackRename) {
     const where = branch === CHECKPOINT_DETACHED_MARKER ? 'a detached HEAD' : `'${branch}'`;
     return { restored: false, reason: `branch-mismatch (snapshot on ${where}, expected '${expectedBranch}')`, branchMismatch: true };
   }

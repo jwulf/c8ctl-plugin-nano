@@ -5454,7 +5454,7 @@ async function setupWorkspaceCheckpoints({ provisioned, envelope = null, token =
       log.warn(`could not fetch WIP checkpoint ${ref} — ${oneLineLog(err?.message || err)}; starting without it.`);
     }
     if (prior) {
-      const r = await restoreCp({ git: startupGit, checkpoint: prior, expectedBranch: provisioned.workingBranch || null });
+      const r = await restoreCp({ git: startupGit, checkpoint: prior, expectedBranch: provisioned.workingBranch || null, expectedBranchEphemeral: provisioned.fallbackBranch === true });
       if (r?.restored) {
         restored = r;
         logger.info?.(`${prefix} (${corr}): restored WIP checkpoint ${ref}@${prior.sha.slice(0, 12)} (${r.mode}${r.commitsRecovered ? ', local commits recovered' : ''}) as uncommitted changes.`);

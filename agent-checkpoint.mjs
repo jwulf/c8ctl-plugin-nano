@@ -68,6 +68,10 @@ const DEFAULTS = Object.freeze({
   intervalMs: 300_000,
   maxFileBytes: 5 * 1024 * 1024,
   gitTimeoutMs: 60_000,
+  // Grace window after SIGTERM before escalating to SIGKILL when a git child (or a
+  // transport/credential helper it spawned) ignores the polite terminate on
+  // timeout/abort — bounds how long the runner can stay pending past its deadline.
+  gitKillGraceMs: 5_000,
   flushTimeoutMs: 20_000,
   ttlMs: 7 * 24 * 60 * 60 * 1000,
   gcGraceMs: 60 * 60 * 1000,
@@ -249,7 +253,7 @@ const CRED_SUPPRESS = ['-c', 'credential.helper='];
 // of spawning. This lets a bounded background job (e.g. the GC sweep) be TORN DOWN
 // deterministically rather than abandoned to keep running git against a workspace
 // the caller is about to reap.
-export function createGitRunner({ cwd, env = process.env, timeoutMs = DEFAULTS.gitTimeoutMs, signal } = {}) {
+export function createGitRunner({ cwd, env = process.env, timeoutMs = DEFAULTS.gitTimeoutMs, killGraceMs = DEFAULTS.gitKillGraceMs, signal } = {}) {
   return (args, opts = {}) => new Promise((resolve) => {
     if (signal?.aborted) {
       resolve({ status: null, stdout: '', stderr: '[aborted]' });
@@ -257,19 +261,57 @@ export function createGitRunner({ cwd, env = process.env, timeoutMs = DEFAULTS.g
     }
     let child;
     try {
-      child = spawn('git', [...CRED_SUPPRESS, ...args], { cwd, env: { ...env, ...(opts.env || {}) }, stdio: ['pipe', 'pipe', 'pipe'], signal });
+      // `detached` makes the child a process-group leader on POSIX, so a timeout or
+      // abort can signal the WHOLE group (git plus any transport / credential helper
+      // it spawned) via a negative pid — a transport that ignores git's own SIGTERM
+      // would otherwise keep the stdio pipes open so `close` never fires, stranding
+      // the runner past `gitTimeoutMs`.
+      child = spawn('git', [...CRED_SUPPRESS, ...args], {
+        cwd,
+        env: { ...env, ...(opts.env || {}) },
+        stdio: ['pipe', 'pipe', 'pipe'],
+        detached: process.platform !== 'win32',
+      });
     } catch (err) {
       resolve({ status: null, stdout: '', stderr: String(err?.message || err) });
       return;
     }
     let stdout = '';
     let stderr = '';
-    const timer = setTimeout(() => { try { child.kill('SIGTERM'); } catch { /* gone */ } stderr += '\n[timed out]'; }, opts.timeoutMs ?? timeoutMs);
+    let killTimer = null;
+    // Signal the child's whole PROCESS GROUP (negative pid, where `detached` made it
+    // the leader); fall back to the single pid on Windows or if the group signal
+    // fails (e.g. the child already reaped).
+    const killGroup = (sig) => {
+      const pid = child.pid;
+      if (process.platform !== 'win32' && typeof pid === 'number') {
+        try { process.kill(-pid, sig); return; } catch { /* fall through */ }
+      }
+      try { child.kill(sig); } catch { /* already gone */ }
+    };
+    // Bounded, ESCALATING termination: SIGTERM, then SIGKILL after a grace window if
+    // the group is still alive, so the child is guaranteed to exit and `close` fires
+    // — the runner settles only once all child I/O has closed, never hangs.
+    const terminate = () => {
+      killGroup('SIGTERM');
+      if (!killTimer) {
+        killTimer = setTimeout(() => killGroup('SIGKILL'), opts.killGraceMs ?? killGraceMs);
+        killTimer.unref?.();
+      }
+    };
+    const timer = setTimeout(() => { stderr += '\n[timed out]'; terminate(); }, opts.timeoutMs ?? timeoutMs);
     timer.unref?.();
+    const onAbort = () => { stderr += '\n[aborted]'; terminate(); };
+    signal?.addEventListener?.('abort', onAbort, { once: true });
     child.stdout.on('data', (d) => { stdout += d; });
     child.stderr.on('data', (d) => { stderr += d; });
     child.on('error', (err) => { stderr += String(err?.message || err); });
-    child.on('close', (code) => { clearTimeout(timer); resolve({ status: code, stdout, stderr }); });
+    child.on('close', (code) => {
+      clearTimeout(timer);
+      if (killTimer) clearTimeout(killTimer);
+      signal?.removeEventListener?.('abort', onAbort);
+      resolve({ status: code, stdout, stderr });
+    });
     if (opts.input != null) child.stdin.end(opts.input); else child.stdin.end();
   });
 }
@@ -344,7 +386,14 @@ export async function snapshotWorktree({ git, baseSha = '', runId = '', lastTree
     const treeSha = out(tree);
     if (lastTree && treeSha === lastTree.tree && headSha === lastTree.head) return { skipped: 'unchanged' };
     const headTree = unborn ? emptyTree : out(await git(['rev-parse', 'HEAD^{tree}']));
-    if (treeSha === headTree && (!baseSha || headSha === baseSha)) return { skipped: 'clean' };
+    // "Clean" (nothing worth a WIP ref) means the working tree matches HEAD AND the
+    // committed state is already safe on the remote. With a known base that is
+    // `headSha === baseSha` (HEAD is the base, no local commits). But an EMPTY-base
+    // run (`!baseSha`, a fresh clone of an empty repo) is only clean while HEAD is
+    // still UNBORN: once the agent lands its first local commit, `treeSha === headTree`
+    // again, yet that commit is unpushed — skipping it would lose it if the worker
+    // dies before the branch push, so snapshot it (recoverable via the WIP ref).
+    if (treeSha === headTree && (baseSha ? headSha === baseSha : unborn)) return { skipped: 'clean' };
 
     const trailers = [
       baseSha ? `${CHECKPOINT_BASE_TRAILER}: ${baseSha}` : '',

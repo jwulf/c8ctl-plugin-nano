@@ -377,6 +377,35 @@ test('unborn HEAD: pre-first-commit WIP is snapshotted parentless and restored o
   } finally { rmSync(root, { recursive: true, force: true }); }
 });
 
+test('empty-base run: the first local commit is checkpointed, not skipped as clean', async () => {
+  const root = mkdtempSync(join(tmpdir(), 'ckpt-emptybase-'));
+  try {
+    const remote = join(root, 'remote.git');
+    sh(root, 'init', '-q', '--bare', '-b', 'main', remote);
+    const dir = join(root, 'a');
+    sh(root, 'clone', '-q', remote, dir);
+    const git = createGitRunner({ cwd: dir, env: ENV });
+
+    // Unborn HEAD, no working-tree changes: genuinely clean (nothing to snapshot).
+    assert.deepEqual(await snapshotWorktree({ git, baseSha: '' }), { skipped: 'clean' });
+
+    // The agent lands its FIRST local commit (still unpushed). Even though the working
+    // tree now matches HEAD, an empty-base run MUST snapshot it: skipping as "clean"
+    // would lose that unpushed commit if the worker dies before the branch push.
+    writeFileSync(join(dir, 'first.txt'), 'first commit\n');
+    sh(dir, 'add', '-A');
+    sh(dir, 'commit', '-q', '-m', 'first');
+    const head = sh(dir, 'rev-parse', 'HEAD');
+    const snap = await snapshotWorktree({ git, baseSha: '' });
+    assert.ok(snap.sha, JSON.stringify(snap));
+    assert.equal(snap.head, head);
+    // The snapshot carries the committed file, so pushing the WIP ref preserves the
+    // unpushed commit's content on the remote (recoverable).
+    assert.equal(sh(dir, 'show', `${snap.sha}:first.txt`), 'first commit');
+    assert.equal(sh(dir, 'rev-parse', `${snap.sha}^`), head);
+  } finally { rmSync(root, { recursive: true, force: true }); }
+});
+
 test('lease: a stale writer is rejected and stops writing', async () => {
   const f = fixture();
   try {
@@ -624,6 +653,22 @@ test('createGitRunner is cancellable: an aborted signal fails ops fast without t
     const r = await git(['rev-parse', '--verify', 'HEAD']);
     assert.notEqual(r.status, 0);
   } finally { f.cleanup(); }
+});
+
+test('createGitRunner bounds a hung child: a SIGTERM-ignoring group is escalated to SIGKILL and the runner settles', async () => {
+  const dir = mkdtempSync(join(tmpdir(), 'ckpt-hang-'));
+  try {
+    sh(dir, 'init', '-q', dir);
+    const git = createGitRunner({ cwd: dir, env: ENV });
+    // A `!`-shell git alias that TRAPS (ignores) SIGTERM and sleeps: the sleeping
+    // shell inherits git's stdout pipe, so without a process-group SIGKILL
+    // escalation `close` never fires and the runner hangs forever past its deadline.
+    const started = Date.now();
+    const r = await git(['-c', "alias.hang=!trap '' TERM; sleep 30", 'hang'], { timeoutMs: 200, killGraceMs: 200 });
+    const elapsed = Date.now() - started;
+    assert.match(r.stderr, /\[timed out\]/);
+    assert.ok(elapsed < 10_000, `runner must settle promptly after SIGKILL escalation, took ${elapsed}ms`);
+  } finally { rmSync(dir, { recursive: true, force: true }); }
 });
 
 test('GC deletes TTL-expired and terminal-element refs, keeps own/unknown/fresh ones', async () => {

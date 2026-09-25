@@ -2740,6 +2740,45 @@ function sanitizeResultVars(obj) {
   return out;
 }
 
+// True when `obj` carries at least one EFFECTIVE result var: a key that survives
+// sanitizeResultVars (reserved / io.nanobpm.* / proto keys stripped) AND whose
+// value is not null/undefined. A key present with a null/undefined value (e.g.
+// `{"status":null}`) is NOT effective — it leaves downstream gateways with no
+// decision value — so it must neither shadow a usable ACP outcome (pickAgentResult)
+// nor suppress the dropped-result nudge (resolveAgentResultWithNudge). Both
+// predicates route through here so they stay consistent.
+function hasEffectiveResultVars(obj) {
+  for (const v of Object.values(sanitizeResultVars(obj))) {
+    if (v !== null && v !== undefined) return true;
+  }
+  return false;
+}
+
+// Choose the agent's structured result from its candidate sources (result file,
+// stdout sentinel, ACP outcome) in priority order. Prefer the first candidate
+// that carries at least one EFFECTIVE var (i.e. survives sanitizeResultVars —
+// the reserved / io.nanobpm.* / proto keys stripped, with a non-null value) so an
+// empty `{}`, a reserved-keys-only, or a null-valued-only result file/sentinel
+// does NOT shadow a usable `blocked`
+// ACP outcome via raw `??` nullish precedence: `??` only falls through on
+// null/undefined, so a present-but-empty object would otherwise win and force
+// the dropped-result nudge even though the ACP outcome already escalates. Falls
+// back to the FIRST present-but-empty candidate when none carries effective vars
+// so the raw object is still surfaced to the audit envelope and the
+// dropped-result nudge still fires. Candidates are thunks so a later source is
+// only computed when an earlier one is absent/empty (preserving the previous
+// short-circuit evaluation and never double-reading the result file needlessly).
+function pickAgentResult(...thunks) {
+  let firstPresent;
+  for (const thunk of thunks) {
+    const candidate = thunk();
+    if (candidate == null) continue;
+    if (firstPresent === undefined) firstPresent = candidate;
+    if (hasEffectiveResultVars(candidate)) return candidate;
+  }
+  return firstPresent ?? null;
+}
+
 const SANDBOXES = ['none', 'docker', 'podman'];
 // Only container-based sandboxes need an image / disk hygiene / a runtime bin.
 const CONTAINER_SANDBOXES = new Set(['docker', 'podman']);
@@ -2825,11 +2864,17 @@ async function resolveAgentResultWithNudge({ result, resultFile, rerun, logger, 
   const stdout0 = result && typeof result.stdout === 'string' ? result.stdout : '';
   // A parsed result only counts as usable if it still carries at least one
   // *effective* var after sanitizeResultVars strips the reserved / io.nanobpm.* /
-  // proto keys. An empty `{}` or a reserved-keys-only object leaves downstream
+  // proto keys AND ignoring null/undefined values. An empty `{}`, a reserved-keys-
+  // only, or a null-valued-only (e.g. `{"status":null}`) object leaves downstream
   // gateways with no status/decision vars — exactly the dropped-result case the
   // nudge exists to recover — so gate on effective vars, not raw object presence.
-  const hasUsableResult = (parsed) => Object.keys(sanitizeResultVars(parsed)).length > 0;
-  const already = readAgentResultFile(resultFile) ?? parseResultFromStdout(stdout0);
+  const hasUsableResult = (parsed) => hasEffectiveResultVars(parsed);
+  // A `blocked` ACP outcome is a usable result (it escalates), so it needs no nudge.
+  const already = pickAgentResult(
+    () => readAgentResultFile(resultFile),
+    () => parseResultFromStdout(stdout0),
+    () => resultVarsFromAcpOutcome(result?.acpOutcome),
+  );
   // Only nudge a clean run that produced NO usable result but DID produce output
   // (silence means a crash/hang the idle path already handles, not a dropped result).
   // A null `resultFile` (temp-dir creation failed) is NOT a reason to skip: the
@@ -2841,7 +2886,7 @@ async function resolveAgentResultWithNudge({ result, resultFile, rerun, logger, 
     // `truncated` flag consistent with it — echo the incoming `result.truncated`
     // rather than hardcoding false, so callers that trust the return value don't
     // see an already-truncated stdout reported as untruncated.
-    return { stdout: stdout0, nudged: false, truncated: result?.truncated === true };
+    return { stdout: stdout0, nudged: false, truncated: result?.truncated === true, acpOutcome: result?.acpOutcome ?? null };
   }
   let nudge = null;
   let nudgeError = null;
@@ -2870,7 +2915,13 @@ async function resolveAgentResultWithNudge({ result, resultFile, rerun, logger, 
       ? `${logPrefix} no result on the first turn — recovered it via one re-emit nudge`
       : `${logPrefix} no result on the first turn — re-emit nudge did not recover one`);
   }
-  return { stdout, nudged: true, truncated };
+  // Propagate the rerun turn's OWN validated ACP outcome back to the caller (#263):
+  // the nudge is a continuation, so a fresh `_meta.outcome` it reports (e.g. a
+  // `blocked` that wrote no file/sentinel) is the latest state and must reach
+  // `workAgent` — otherwise the escalation and the recorded envelope outcome would
+  // silently reflect only the first turn's outcome. Fall back to the first result's
+  // outcome when the nudge reported none.
+  return { stdout, nudged: true, truncated, acpOutcome: nudge?.acpOutcome ?? result?.acpOutcome ?? null };
 }
 
 function coerceBool(v, dflt = false) {
@@ -7094,6 +7145,30 @@ export function acpSessionNewParams({ cwd, init, resumePlan }) {
   return params;
 }
 
+// The agent's explicit end-of-task report, when its `session/prompt` result carries
+// `_meta.outcome` (rusty-harness's `report_outcome` tool): `{ status: 'completed' |
+// 'blocked', summary }`. Anything else — no `_meta`, another agent, a malformed
+// value — is `null`, so agents that don't send it are handled exactly as before.
+const ACP_OUTCOME_STATUSES = new Set(['completed', 'blocked']);
+const ACP_OUTCOME_SUMMARY_MAX_CHARS = 8_000;
+export function acpOutcomeFrom(promptResult) {
+  const o = promptResult?._meta?.outcome;
+  if (!isPlainObject(o) || !ACP_OUTCOME_STATUSES.has(o.status)) return null;
+  const summary = typeof o.summary === 'string' ? o.summary.trim().slice(0, ACP_OUTCOME_SUMMARY_MAX_CHARS) : '';
+  if (!summary) return null;
+  return { status: o.status, summary };
+}
+
+// Result vars implied by an ACP outcome, used ONLY when the agent wrote no result
+// file / sentinel of its own. `blocked` maps to the workforce escalation contract
+// (`status: "blocked"` with a non-blank `question`), so the job escalates instead of
+// spending a re-emit nudge turn. `completed` implies no vars: job-specific status
+// values can't be guessed, so the normal result / nudge path still applies.
+export function resultVarsFromAcpOutcome(outcome) {
+  if (outcome?.status !== 'blocked') return null;
+  return { status: 'blocked', summary: outcome.summary, question: outcome.summary };
+}
+
 function spawnCaptureAcp({ command, args = [], cwd, env, stdinData, timeoutMs, idleTimeoutMs, recoveryWindowMs, relayTap = null, stream = false, streamPrefix = '', onStreamOut, onStreamErr, permission = 'yolo', shell = false, onAcpUpdate = null, abortSignal = null, onSpawn = null, resumePlan = null }) {
   return new Promise((resolve) => {
     const logger = getLogger();
@@ -7114,6 +7189,7 @@ function spawnCaptureAcp({ command, args = [], cwd, env, stdinData, timeoutMs, i
     const pending = new Map();
     let childClosed = null; // { code, signal } once the child exits
     let promptResolved = false; // the main session/prompt turn sent + resolved
+    let acpOutcome = null; // the turn's `_meta.outcome`, if the agent reported one
     let settleTimer = null; // post-turn grace before force-reaping a lingering agent
     // One-time warning latch for the reserved escalate/filter policies so the
     // deferral is observable (not silent) but never spams a warning per request.
@@ -7208,7 +7284,7 @@ function spawnCaptureAcp({ command, args = [], cwd, env, stdinData, timeoutMs, i
       if (teeSink) { tee('', true); teeErr('', true); }
       // Reap the child if it is still alive (turn resolved but agent lingering).
       try { if (child && childClosed === null) killTree(child); } catch { /* best effort */ }
-      resolve(result);
+      resolve(acpOutcome ? { ...result, acpOutcome } : result);
     };
 
     // --- JSON-RPC 2.0 plumbing (newline-delimited framing) -------------------
@@ -7663,10 +7739,11 @@ function spawnCaptureAcp({ command, args = [], cwd, env, stdinData, timeoutMs, i
       attachSteerIfAny();
       // Deliver the task envelope as the prompt (from stdinData, matching the
       // pipe/pty paths which write the same payload to stdin).
-      await request('session/prompt', {
+      const prompted = await request('session/prompt', {
         sessionId,
         prompt: [{ type: 'text', text: String(stdinData ?? '') }],
       });
+      acpOutcome = acpOutcomeFrom(prompted);
       // End-of-turn: the main session/prompt request resolved. Mark it so the
       // `close` handler can tell a completed turn from an early/handshake exit.
       promptResolved = true;
@@ -8027,6 +8104,9 @@ function buildResultEnvelope(result, { sandbox, image, git, result: agentResult,
   // shutdown (didn't exit on its own within the post-turn grace) — surfaced so
   // consistently-hanging agents are visible rather than hidden behind a success.
   if (result.forcedReap) env.forcedReap = true;
+  // The agent's explicit ACP end-of-task report (`_meta.outcome`), host-recorded
+  // alongside whatever result vars it returned.
+  if (result.acpOutcome) env.outcome = result.acpOutcome;
   // Audit (issue #63): record which linked-resource key supplied the base prompt.
   // The engine only keeps `latest` per resourceId (no pinning), so recording the
   // resolved key is the only reproducibility handle for which prompt version ran.
@@ -10792,7 +10872,7 @@ async function workAgent(req, flags, ctx) {
           // the result is recoverable only via the stdout `::nano:result::`
           // sentinel, which `resolveAgentResultWithNudge` handles directly.
           if (result.ok) {
-            const { stdout, nudged, truncated } = await resolveAgentResultWithNudge({
+            const { stdout, nudged, truncated, acpOutcome } = await resolveAgentResultWithNudge({
               result,
               resultFile,
               logger,
@@ -10817,6 +10897,9 @@ async function workAgent(req, flags, ctx) {
             if (nudged) {
               result.nudgedForResult = true;
               if (truncated) result.truncated = true;
+              // Adopt the nudge turn's outcome so the escalation / envelope reflect
+              // the latest continuation, not only the first turn (#263).
+              result.acpOutcome = acpOutcome;
             }
           }
 
@@ -11003,7 +11086,13 @@ async function workAgent(req, flags, ctx) {
         // envelope; the sanitized (reserved-key-stripped) vars are merged into the
         // job completion so the model sees `status`/`summary`/… as first-class
         // outputs. Read before deleting the temp dir.
-        const rawResult = readAgentResultFile(resultFile) ?? parseResultFromStdout(result.stdout);
+        // Last resort: vars implied by the agent's ACP `_meta.outcome` (a `blocked`
+        // report → an escalation) when it wrote no result of its own.
+        const rawResult = pickAgentResult(
+          () => readAgentResultFile(resultFile),
+          () => parseResultFromStdout(result.stdout),
+          () => resultVarsFromAcpOutcome(result.acpOutcome),
+        );
         if (resultDir) { try { rmSync(resultDir, { recursive: true, force: true }); } catch { /* best effort */ } liveRunDirs.delete(resultDir); }
         const resultVars = sanitizeResultVars(rawResult);
 
@@ -17103,6 +17192,8 @@ export {
   readAgentResultFile,
   parseResultFromStdout,
   sanitizeResultVars,
+  hasEffectiveResultVars,
+  pickAgentResult,
   buildResultNudgePrompt,
   resolveAgentResultWithNudge,
   parseEnvPairs,

@@ -36,7 +36,10 @@ import {
   parseAgentResultObject,
   readAgentResultFile,
   parseResultFromStdout,
+  pickAgentResult,
   sanitizeResultVars,
+  resultVarsFromAcpOutcome,
+  resolveAgentResultWithNudge,
   parseEnvPairs,
   parseJobTypeFlags,
   derivePollTimeoutMs,
@@ -716,6 +719,155 @@ test('buildResultEnvelope: records the resolved promptResourceKey for audit', ()
   assert.equal(withKey.promptResourceKey, '42');
   const without = buildResultEnvelope({ ok: true, stdout: '' }, { sandbox: 'none' });
   assert.equal('promptResourceKey' in without, false);
+});
+
+test('buildResultEnvelope: records the agent\'s ACP outcome when it reported one', () => {
+  const outcome = { status: 'completed', summary: 'Opened PR #5' };
+  assert.deepEqual(buildResultEnvelope({ ok: true, stdout: '', acpOutcome: outcome }, { sandbox: 'none' }).outcome, outcome);
+  assert.equal('outcome' in buildResultEnvelope({ ok: true, stdout: '' }, { sandbox: 'none' }), false);
+});
+
+// Worker-level integration of the blocked-ACP completion contract (#263). The
+// individual seams (resolveAgentResultWithNudge, the readAgentResultFile ??
+// parseResultFromStdout ?? resultVarsFromAcpOutcome fallback, buildResultEnvelope)
+// are unit-tested elsewhere, but the runner's completion assembly is where they
+// compose — a regression in the wiring (re-emit not skipped, outcome vars not
+// merged into the completion, or the envelope losing `outcome`) would slip past
+// the seam-level tests. `assembleWorkerCompletion` mirrors the runner's exact
+// steps (c8ctl-plugin.js: the nudge call + outcome adoption, then the rawResult
+// fallback + sanitize + envelope + settleJob.complete payload) so this test pins
+// the observable completion contract without exporting the whole workAgent closure.
+async function assembleWorkerCompletion({ result, resultFile, rerun }) {
+  // Mirror the runner: one bounded re-emit nudge, then adopt its outcome/stdout.
+  const { stdout, nudged, truncated, acpOutcome } = await resolveAgentResultWithNudge({ result, resultFile, rerun });
+  result.stdout = stdout;
+  if (nudged) {
+    result.nudgedForResult = true;
+    if (truncated) result.truncated = true;
+    result.acpOutcome = acpOutcome;
+  }
+  // Mirror the runner's result read: file -> stdout sentinel -> ACP outcome vars,
+  // preferring the first candidate with EFFECTIVE vars so an empty result file
+  // does not shadow a usable blocked outcome (#263).
+  const rawResult = pickAgentResult(
+    () => readAgentResultFile(resultFile),
+    () => parseResultFromStdout(result.stdout),
+    () => resultVarsFromAcpOutcome(result.acpOutcome),
+  );
+  const resultVars = sanitizeResultVars(rawResult);
+  const resultEnvelope = buildResultEnvelope(result, { sandbox: 'none' });
+  // Mirror settleJob.complete's variable payload.
+  return {
+    completeVars: { ...resultVars, [AGENT_RESULT_KEY]: resultEnvelope, output: result.stdout, exitCode: 0 },
+    nudged,
+  };
+}
+
+test('worker completion: a blocked ACP outcome with no result file/sentinel escalates and records the envelope outcome (#263)', async () => {
+  const dir = mkdtempSync(join(tmpdir(), 'nudge-worker-'));
+  try {
+    const resultFile = join(dir, 'result.json'); // deliberately never written
+    const outcome = { status: 'blocked', summary: 'need a deploy token' };
+    let rerunCalls = 0;
+    const rerun = async () => { rerunCalls += 1; return { ok: true, stdout: '' }; };
+    const result = { ok: true, stdout: 'work log, no machine-readable result', acpOutcome: outcome };
+
+    const { completeVars, nudged } = await assembleWorkerCompletion({ result, resultFile, rerun });
+
+    // The re-emit turn is SKIPPED: a blocked outcome is already an actionable result.
+    assert.equal(nudged, false, 're-emit nudge must be skipped for a blocked outcome');
+    assert.equal(rerunCalls, 0, 'the rerun harness must not be invoked');
+
+    // settleJob.complete receives the escalation contract vars.
+    assert.equal(completeVars.status, 'blocked');
+    assert.equal(completeVars.summary, 'need a deploy token');
+    assert.equal(completeVars.question, 'need a deploy token');
+
+    // ...and io.nanobpm.agentResult.outcome is still present on the envelope.
+    assert.deepEqual(completeVars[AGENT_RESULT_KEY].outcome, outcome);
+  } finally {
+    rmSync(dir, { recursive: true, force: true });
+  }
+});
+
+test('worker completion: an empty result file does NOT shadow a blocked ACP outcome (#263)', async () => {
+  const dir = mkdtempSync(join(tmpdir(), 'nudge-worker-'));
+  try {
+    const resultFile = join(dir, 'result.json');
+    // The agent wrote a result file, but it carries no effective vars (empty
+    // object). Raw `??` precedence would let this present-but-empty object win
+    // over the blocked outcome, forcing a needless nudge and dropping the
+    // escalation vars from the completion. pickAgentResult must prefer the
+    // blocked outcome instead.
+    writeFileSync(resultFile, '{}');
+    const outcome = { status: 'blocked', summary: 'need a deploy token' };
+    let rerunCalls = 0;
+    const rerun = async () => { rerunCalls += 1; return { ok: true, stdout: '' }; };
+    const result = { ok: true, stdout: 'work log, empty result file', acpOutcome: outcome };
+
+    const { completeVars, nudged } = await assembleWorkerCompletion({ result, resultFile, rerun });
+
+    assert.equal(nudged, false, 'the blocked outcome short-circuits the nudge despite the empty file');
+    assert.equal(rerunCalls, 0, 'the rerun harness must not be invoked');
+    assert.equal(completeVars.status, 'blocked');
+    assert.equal(completeVars.summary, 'need a deploy token');
+    assert.equal(completeVars.question, 'need a deploy token');
+    assert.deepEqual(completeVars[AGENT_RESULT_KEY].outcome, outcome);
+  } finally {
+    rmSync(dir, { recursive: true, force: true });
+  }
+});
+
+test('worker completion: a null-valued-only result file does NOT shadow a blocked ACP outcome (#263)', async () => {
+  const dir = mkdtempSync(join(tmpdir(), 'nudge-worker-'));
+  try {
+    const resultFile = join(dir, 'result.json');
+    // `{"status":null}` survives sanitizeResultVars key-wise but carries no
+    // effective value. A key-count-only predicate would let it win over the
+    // blocked outcome; pickAgentResult must ignore null values and prefer the
+    // outcome so the escalation vars survive.
+    writeFileSync(resultFile, '{"status":null}');
+    const outcome = { status: 'blocked', summary: 'need a deploy token' };
+    let rerunCalls = 0;
+    const rerun = async () => { rerunCalls += 1; return { ok: true, stdout: '' }; };
+    const result = { ok: true, stdout: 'work log, null-valued result file', acpOutcome: outcome };
+
+    const { completeVars, nudged } = await assembleWorkerCompletion({ result, resultFile, rerun });
+
+    assert.equal(nudged, false, 'the blocked outcome short-circuits the nudge despite the null-valued file');
+    assert.equal(rerunCalls, 0, 'the rerun harness must not be invoked');
+    assert.equal(completeVars.status, 'blocked');
+    assert.equal(completeVars.summary, 'need a deploy token');
+    assert.equal(completeVars.question, 'need a deploy token');
+    assert.deepEqual(completeVars[AGENT_RESULT_KEY].outcome, outcome);
+  } finally {
+    rmSync(dir, { recursive: true, force: true });
+  }
+});
+
+test('worker completion: a blocked ACP outcome first reported on the re-emit turn still escalates and records the envelope outcome (#263)', async () => {
+  const dir = mkdtempSync(join(tmpdir(), 'nudge-worker-'));
+  try {
+    const resultFile = join(dir, 'result.json'); // never written by either turn
+    // First turn wrote no result and reported no outcome -> a nudge fires. The
+    // re-emit turn reports `blocked` via _meta.outcome but still writes no
+    // file/sentinel; the runner adopts that outcome.
+    const rerunOutcome = { status: 'blocked', summary: 'still stuck: missing secret' };
+    let rerunCalls = 0;
+    const rerun = async () => { rerunCalls += 1; return { ok: true, stdout: 'still no result', acpOutcome: rerunOutcome }; };
+    const result = { ok: true, stdout: 'first turn, no result', acpOutcome: null };
+
+    const { completeVars, nudged } = await assembleWorkerCompletion({ result, resultFile, rerun });
+
+    assert.equal(nudged, true, 'a first turn with no result/outcome gets one nudge');
+    assert.equal(rerunCalls, 1, 'the rerun harness is invoked exactly once');
+    assert.equal(completeVars.status, 'blocked');
+    assert.equal(completeVars.summary, 'still stuck: missing secret');
+    assert.equal(completeVars.question, 'still stuck: missing secret');
+    assert.deepEqual(completeVars[AGENT_RESULT_KEY].outcome, rerunOutcome);
+  } finally {
+    rmSync(dir, { recursive: true, force: true });
+  }
 });
 
 

@@ -70,6 +70,112 @@ test('nudges once and recovers a dropped result (agent writes the file on the re
   }
 });
 
+test('does NOT nudge a run whose agent reported a blocked ACP outcome (it escalates instead)', async () => {
+  const { dir, file } = tmpResultFile();
+  try {
+    let reruns = 0;
+    const rerun = async () => { reruns++; return { ok: true, stdout: '' }; };
+    const blocked = { ok: true, stdout: 'Blocked: need GH_TOKEN', acpOutcome: { status: 'blocked', summary: 'need GH_TOKEN' } };
+    assert.equal((await resolveAgentResultWithNudge({ result: blocked, resultFile: file, rerun })).nudged, false);
+    assert.equal(reruns, 0);
+    // A `completed` outcome carries no job-specific status, so the nudge still runs.
+    const completed = { ok: true, stdout: 'Opened PR #5', acpOutcome: { status: 'completed', summary: 'Opened PR #5' } };
+    assert.equal((await resolveAgentResultWithNudge({ result: completed, resultFile: file, rerun })).nudged, true);
+    assert.equal(reruns, 1);
+  } finally {
+    rmSync(dir, { recursive: true, force: true });
+  }
+});
+
+test('an empty / reserved-keys-only result file does NOT shadow a blocked ACP outcome (no nudge)', async () => {
+  const { dir, file } = tmpResultFile();
+  try {
+    let reruns = 0;
+    const rerun = async () => { reruns++; return { ok: true, stdout: '' }; };
+    // The agent wrote a result FILE, but it carries no effective vars: an empty
+    // object, or only reserved / io.nanobpm.* keys. Raw `??` precedence would let
+    // this present-but-empty object win over the `blocked` ACP outcome and force a
+    // needless nudge; the outcome must short-circuit it instead.
+    for (const empty of ['{}', '{"io.nanobpm.agentResult":{"x":1}}', '{"status":null}']) {
+      writeFileSync(file, empty);
+      const blocked = { ok: true, stdout: 'Blocked: need GH_TOKEN', acpOutcome: { status: 'blocked', summary: 'need GH_TOKEN' } };
+      const { nudged, acpOutcome } = await resolveAgentResultWithNudge({ result: blocked, resultFile: file, rerun });
+      assert.equal(nudged, false, `empty result ${empty} must not shadow the blocked outcome`);
+      assert.deepEqual(acpOutcome, { status: 'blocked', summary: 'need GH_TOKEN' });
+    }
+    assert.equal(reruns, 0, 'the blocked outcome escalates — never nudged');
+  } finally {
+    rmSync(dir, { recursive: true, force: true });
+  }
+});
+
+test('a null-valued-only result file (no ACP outcome) still triggers the nudge (#263)', async () => {
+  const { dir, file } = tmpResultFile();
+  try {
+    // `{"status":null}` survives sanitizeResultVars key-wise (status is not a
+    // reserved key) but carries NO effective value, so with no ACP outcome to fall
+    // back on it is exactly the dropped-result case the nudge must recover: a
+    // key-count-only predicate would wrongly treat it as usable and skip the nudge.
+    for (const empty of ['{"status":null}', '{"summary":null,"status":null}']) {
+      writeFileSync(file, empty);
+      let reruns = 0;
+      const rerun = async () => { reruns++; return { ok: true, stdout: '::nano:result:: {"status":"addressed"}' }; };
+      const result = { ok: true, stdout: 'did work but only wrote a null-valued result' };
+      const { nudged } = await resolveAgentResultWithNudge({ result, resultFile: file, rerun });
+      assert.equal(nudged, true, `null-valued result ${empty} must not be treated as usable`);
+      assert.equal(reruns, 1);
+    }
+  } finally {
+    rmSync(dir, { recursive: true, force: true });
+  }
+});
+
+test('propagates the rerun turn OWN acpOutcome back to the caller (#263)', async () => {
+  const { dir, file } = tmpResultFile();
+  try {
+    // First turn wrote no result and no outcome; the nudge turn reports a `blocked`
+    // outcome via `_meta.outcome` but writes no file/sentinel. The nudge's outcome
+    // must be surfaced to the caller so workAgent escalates and records it.
+    const result = { ok: true, stdout: 'did work, dropped result, no outcome' };
+    const rerun = async () => ({ ok: true, stdout: 'still no file', acpOutcome: { status: 'blocked', summary: 'need GH_TOKEN on the rerun' } });
+    const { nudged, acpOutcome } = await resolveAgentResultWithNudge({ result, resultFile: file, rerun });
+    assert.equal(nudged, true);
+    assert.deepEqual(acpOutcome, { status: 'blocked', summary: 'need GH_TOKEN on the rerun' },
+      'the rerun turn\'s outcome reaches the caller instead of being discarded');
+  } finally {
+    rmSync(dir, { recursive: true, force: true });
+  }
+});
+
+test('falls back to the first-turn acpOutcome when the rerun reports none (#263)', async () => {
+  const { dir, file } = tmpResultFile();
+  try {
+    // The first turn already carried a `completed` outcome (which does not skip the
+    // nudge). The nudge turn reports no outcome, so the first turn's is preserved.
+    const result = { ok: true, stdout: 'opened PR', acpOutcome: { status: 'completed', summary: 'opened PR #7' } };
+    const rerun = async () => ({ ok: true, stdout: 'still no result' });
+    const { nudged, acpOutcome } = await resolveAgentResultWithNudge({ result, resultFile: file, rerun });
+    assert.equal(nudged, true);
+    assert.deepEqual(acpOutcome, { status: 'completed', summary: 'opened PR #7' },
+      'the first turn\'s outcome is kept when the rerun reports none');
+  } finally {
+    rmSync(dir, { recursive: true, force: true });
+  }
+});
+
+test('the no-nudge early return echoes the incoming acpOutcome (#263)', async () => {
+  const { dir, file } = tmpResultFile();
+  try {
+    const blocked = { ok: true, stdout: 'Blocked: need GH_TOKEN', acpOutcome: { status: 'blocked', summary: 'need GH_TOKEN' } };
+    const { nudged, acpOutcome } = await resolveAgentResultWithNudge({ result: blocked, resultFile: file, rerun: async () => ({ ok: true, stdout: '' }) });
+    assert.equal(nudged, false);
+    assert.deepEqual(acpOutcome, { status: 'blocked', summary: 'need GH_TOKEN' },
+      'the early return still surfaces the outcome the caller relies on');
+  } finally {
+    rmSync(dir, { recursive: true, force: true });
+  }
+});
+
 test('does NOT nudge when the first turn already produced a result', async () => {
   const { dir, file } = tmpResultFile();
   try {

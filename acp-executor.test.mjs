@@ -23,6 +23,8 @@ import {
   readAgentResultFile,
   normalizeTaskEnvelope,
   acpSessionNewParams,
+  acpOutcomeFrom,
+  resultVarsFromAcpOutcome,
 } from './c8ctl-plugin.js';
 import { readFileSync } from 'node:fs';
 import { resolveEffectiveEnvelope } from './agent-resume.mjs';
@@ -112,7 +114,9 @@ function writeResult(extra) {
 }
 function finish(stopReason, extra) {
   writeResult(extra);
-  if (promptId != null) send({ jsonrpc: '2.0', id: promptId, result: { stopReason } });
+  // FAKE_OUTCOME: report an end-of-task outcome in the prompt result (as rusty-harness does).
+  const outcome = process.env.FAKE_OUTCOME ? { _meta: { outcome: JSON.parse(process.env.FAKE_OUTCOME) } } : {};
+  if (promptId != null) send({ jsonrpc: '2.0', id: promptId, result: { stopReason, ...outcome } });
   // FAKE_TAIL: after the turn resolves, leave a non-newline-terminated tail on
   // stdout, then exit 0. stdout is a pure newline-delimited JSON-RPC stream, so
   // the executor must treat this dangling frame as a framing violation (ok:false)
@@ -763,6 +767,33 @@ test('runAgentJob (acp) hands resumePlan to a plan-seeding agent in session/new'
   } finally {
     rmSync(dir, { recursive: true, force: true });
   }
+});
+
+test('acpOutcomeFrom: only a well-formed _meta.outcome is taken', () => {
+  assert.deepEqual(acpOutcomeFrom({ stopReason: 'end_turn', _meta: { outcome: { status: 'blocked', summary: ' need a token ' } } }), { status: 'blocked', summary: 'need a token' });
+  assert.deepEqual(acpOutcomeFrom({ _meta: { outcome: { status: 'completed', summary: 'PR #5', extra: 1 } } }), { status: 'completed', summary: 'PR #5' });
+  for (const bad of [undefined, null, {}, { stopReason: 'end_turn' }, { _meta: {} }, { _meta: { outcome: 'blocked' } },
+    { _meta: { outcome: { status: 'maybe', summary: 'x' } } }, { _meta: { outcome: { status: 'blocked', summary: '  ' } } },
+    { _meta: { outcome: { status: 'blocked' } } }]) {
+    assert.equal(acpOutcomeFrom(bad), null, JSON.stringify(bad));
+  }
+  assert.equal(acpOutcomeFrom({ _meta: { outcome: { status: 'completed', summary: 'x'.repeat(20_000) } } }).summary.length, 8_000);
+});
+
+test('resultVarsFromAcpOutcome: blocked maps to the escalation contract, completed implies nothing', () => {
+  assert.deepEqual(resultVarsFromAcpOutcome({ status: 'blocked', summary: 'need a token' }), { status: 'blocked', summary: 'need a token', question: 'need a token' });
+  assert.equal(resultVarsFromAcpOutcome({ status: 'completed', summary: 'done' }), null);
+  assert.equal(resultVarsFromAcpOutcome(null), null);
+});
+
+test('spawnCaptureAcp surfaces the prompt result _meta.outcome as acpOutcome', async () => {
+  const run = (env) => spawnCaptureAcp({ command: 'node', args: [FAKE_AGENT], cwd: workRoot, env: { ...baseEnv(), ...env }, stdinData: 'go', timeoutMs: 20_000 });
+  const reported = await run({ FAKE_OUTCOME: JSON.stringify({ status: 'blocked', summary: 'need GH_TOKEN' }) });
+  assert.equal(reported.ok, true, reported.error || reported.stderr);
+  assert.deepEqual(reported.acpOutcome, { status: 'blocked', summary: 'need GH_TOKEN' });
+  const plain = await run({});
+  assert.equal(plain.ok, true, plain.error || plain.stderr);
+  assert.equal('acpOutcome' in plain, false, 'no outcome → result shape unchanged');
 });
 
 test('workAgent handoff: resolveEffectiveEnvelope\'s plan feeds acpSessionNewParams as session/new _meta.plan', async () => {

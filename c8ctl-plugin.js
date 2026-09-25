@@ -5529,7 +5529,7 @@ async function setupWorkspaceCheckpoints({ provisioned, envelope = null, token =
       // `gc` is tied to the sweep's ACTUAL completion (not a race that abandons it),
       // so `close()`/`discard()` — which await `gc` — never reap the workspace while
       // the sweep's git is still live. The deadline only bounds it by aborting the git.
-      gc = Promise.resolve(sweep({ git: sweepGit, ownRef: ref, ttlMs: cfg.ttlMs, graceMs: cfg.gcGraceMs, isTerminal, now }))
+      gc = Promise.resolve(sweep({ git: sweepGit, ownRef: ref, ttlMs: cfg.ttlMs, graceMs: cfg.gcGraceMs, isTerminal, now, signal: sweepAbort.signal }))
         .then((r) => {
           if (r?.deleted?.length) logger.info?.(`${prefix} (${corr}): reclaimed ${r.deleted.length} orphaned WIP checkpoint ref(s): ${r.deleted.map((d) => `${d.ref} [${d.why}]`).join(', ')}.`);
           else if (sweepAbort.signal.aborted) log.debug(`WIP checkpoint GC bounded at ${GC_OVERALL_TIMEOUT_MS}ms — aborted its in-flight git and drained; leftover refs reclaimed on a later sweep.`);

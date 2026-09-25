@@ -298,7 +298,7 @@ test('restore recovers WIP across a per-run fallback branch rename via a non-res
     const base = sh(a.dir, 'rev-parse', 'HEAD');
     // Run 1 was provisioned onto a PER-RUN fallback branch (the base moved / no stable
     // branch.create), committed work on it, then left uncommitted WIP when interrupted.
-    sh(a.dir, 'checkout', '-q', '-b', 'nano/agent-work/main-run1');
+    sh(a.dir, 'checkout', '-q', '-b', 'nano/agent-work/main-11111111-1111-4111-8111-111111111111');
     writeFileSync(join(a.dir, 'feature.txt'), 'committed work\n');
     sh(a.dir, 'add', '-A');
     sh(a.dir, 'commit', '-q', '-m', 'run1 commit');
@@ -307,15 +307,15 @@ test('restore recovers WIP across a per-run fallback branch rename via a non-res
     assert.ok(res.sha, JSON.stringify(res));
 
     const fetched = await fetchCheckpoint({ git: f.clone('probe').git, ref });
-    assert.equal(fetched.branch, 'nano/agent-work/main-run1');
+    assert.equal(fetched.branch, 'nano/agent-work/main-11111111-1111-4111-8111-111111111111');
 
     // Run 2 re-activates: provisioning cuts a FRESH fallback branch with a new runId,
     // so its name necessarily differs from the snapshot's. Marked ephemeral, restore
     // must still refuse the ancestry-RESET fast path but fall through to the non-reset
     // PATCH restore, recovering the WIP instead of stranding it (issues from round 8).
     const b = f.clone('b');
-    sh(b.dir, 'checkout', '-q', '-b', 'nano/agent-work/main-run2');
-    const restored = await restoreCheckpoint({ git: b.git, checkpoint: fetched, expectedBranch: 'nano/agent-work/main-run2', expectedBranchEphemeral: true });
+    sh(b.dir, 'checkout', '-q', '-b', 'nano/agent-work/main-22222222-2222-4222-8222-222222222222');
+    const restored = await restoreCheckpoint({ git: b.git, checkpoint: fetched, expectedBranch: 'nano/agent-work/main-22222222-2222-4222-8222-222222222222', expectedBranchEphemeral: true });
     assert.equal(restored.restored, true, JSON.stringify(restored));
     assert.equal(restored.mode, 'patch');
     assert.equal(readFileSync(join(b.dir, 'feature.txt'), 'utf8'), 'committed work\n');
@@ -327,11 +327,63 @@ test('restore recovers WIP across a per-run fallback branch rename via a non-res
     // WITHOUT the ephemeral marker, the same name change is a GENUINE mismatch: a
     // stable-branch job must not silently recover cross-branch. Refuse and retain.
     const c = f.clone('c');
-    sh(c.dir, 'checkout', '-q', '-b', 'nano/agent-work/main-run2');
-    const blocked = await restoreCheckpoint({ git: c.git, checkpoint: fetched, expectedBranch: 'nano/agent-work/main-run2' });
+    sh(c.dir, 'checkout', '-q', '-b', 'nano/agent-work/main-22222222-2222-4222-8222-222222222222');
+    const blocked = await restoreCheckpoint({ git: c.git, checkpoint: fetched, expectedBranch: 'nano/agent-work/main-22222222-2222-4222-8222-222222222222' });
     assert.equal(blocked.restored, false, JSON.stringify(blocked));
     assert.equal(blocked.branchMismatch, true);
     assert.equal(sh(f.root, '--git-dir', f.remote, 'rev-parse', ref), res.sha);
+  } finally { f.cleanup(); }
+});
+
+test('restore refuses an UNRELATED branch under the fallback namespace (prefix alone is not identity)', async () => {
+  const f = fixture();
+  try {
+    const ref = checkpointRef('43x');
+    const a = f.clone('a');
+    const base = sh(a.dir, 'rev-parse', 'HEAD');
+    // The agent checked out its OWN branch that merely happens to live under the
+    // nano/agent-work/ namespace (no generated <base>-<runToken> identity), committed,
+    // and left WIP. Its snapshot must NOT be treated as a benign per-run rename of a
+    // DIFFERENT-base generated fallback and cross-restored onto it.
+    sh(a.dir, 'checkout', '-q', '-b', 'nano/agent-work/my-feature');
+    writeFileSync(join(a.dir, 'feature.txt'), 'off-branch work\n');
+    sh(a.dir, 'add', '-A');
+    sh(a.dir, 'commit', '-q', '-m', 'off-branch commit');
+    writeFileSync(join(a.dir, 'wip.txt'), 'off-branch wip\n');
+    const res = await createWorkspaceCheckpoint({ git: a.git, ref, baseSha: base })('tool');
+    assert.ok(res.sha, JSON.stringify(res));
+    const fetched = await fetchCheckpoint({ git: f.clone('probe').git, ref });
+    assert.equal(fetched.branch, 'nano/agent-work/my-feature');
+
+    // Run 2 is on a GENUINE generated fallback with a UUID run-token off base 'main'.
+    // The snapshot's branch shares the namespace prefix but is NOT a generated fallback
+    // (no run-token) and is a different base, so even marked ephemeral it stays a
+    // branch-mismatch refusal rather than a benign rename.
+    const b = f.clone('b');
+    const gen = 'nano/agent-work/main-33333333-3333-4333-8333-333333333333';
+    sh(b.dir, 'checkout', '-q', '-b', gen);
+    const blocked = await restoreCheckpoint({ git: b.git, checkpoint: fetched, expectedBranch: gen, expectedBranchEphemeral: true });
+    assert.equal(blocked.restored, false, JSON.stringify(blocked));
+    assert.equal(blocked.branchMismatch, true);
+    assert.equal(sh(f.root, '--git-dir', f.remote, 'rev-parse', ref), res.sha);
+
+    // A same-base generated fallback with a DIFFERENT run-token IS a benign rename.
+    const a2 = f.clone('a2');
+    sh(a2.dir, 'checkout', '-q', '-b', 'nano/agent-work/main-55555555-5555-4555-8555-555555555555');
+    writeFileSync(join(a2.dir, 'feature.txt'), 'committed\n');
+    sh(a2.dir, 'add', '-A'); sh(a2.dir, 'commit', '-q', '-m', 'gen commit');
+    writeFileSync(join(a2.dir, 'wip.txt'), 'gen wip\n');
+    const ref2 = checkpointRef('43y');
+    const gres = await createWorkspaceCheckpoint({ git: a2.git, ref: ref2, baseSha: base })('tool');
+    assert.ok(gres.sha, JSON.stringify(gres));
+    // Re-activation: a FRESH clone (post-checkpoint) fetches the ref into its own repo,
+    // then restores — mirroring the real setup flow (fetch + restore on the same repo).
+    const c = f.clone('c');
+    sh(c.dir, 'checkout', '-q', '-b', 'nano/agent-work/main-44444444-4444-4444-8444-444444444444');
+    const gfetched = await fetchCheckpoint({ git: c.git, ref: ref2 });
+    const ok2 = await restoreCheckpoint({ git: c.git, checkpoint: gfetched, expectedBranch: 'nano/agent-work/main-44444444-4444-4444-8444-444444444444', expectedBranchEphemeral: true });
+    assert.equal(ok2.restored, true, JSON.stringify(ok2));
+    assert.equal(ok2.mode, 'patch');
   } finally { f.cleanup(); }
 });
 
@@ -406,6 +458,57 @@ test('empty-base run: the first local commit is checkpointed, not skipped as cle
   } finally { rmSync(root, { recursive: true, force: true }); }
 });
 
+test('parentful snapshot on an UNBORN clone: the prior run\'s first local commit + WIP are recovered, not discarded', async () => {
+  const root = mkdtempSync(join(tmpdir(), 'ckpt-unborn-parentful-'));
+  try {
+    const remote = join(root, 'remote.git');
+    sh(root, 'init', '-q', '--bare', '-b', 'main', remote);
+    const clone = (name) => {
+      const dir = join(root, name);
+      sh(root, 'clone', '-q', remote, dir);
+      return { dir, git: createGitRunner({ cwd: dir, env: ENV }) };
+    };
+    const ref = checkpointRef('43p');
+    // Fresh clone of an EMPTY remote (unborn on 'main'). The agent makes its FIRST local
+    // commit (never pushed), then leaves uncommitted WIP, and checkpoints. The snapshot
+    // is now PARENTFUL (its parent is that first commit).
+    const a = clone('a');
+    assert.equal(sh(a.dir, 'symbolic-ref', '--short', 'HEAD'), 'main');
+    writeFileSync(join(a.dir, 'first.txt'), 'first commit\n');
+    sh(a.dir, 'add', '-A');
+    sh(a.dir, 'commit', '-q', '-m', 'first');
+    const firstSha = sh(a.dir, 'rev-parse', 'HEAD');
+    writeFileSync(join(a.dir, 'wip.txt'), 'uncommitted wip\n');
+    const res = await createWorkspaceCheckpoint({ git: a.git, ref })('tool');
+    assert.ok(res.sha, JSON.stringify(res));
+    const fetched = await fetchCheckpoint({ git: clone('probe').git, ref });
+    assert.equal(fetched.parent, firstSha);
+
+    // Next activation re-clones the STILL-empty remote → unborn again. The parentful WIP
+    // must be recovered (not discarded as no-head): the branch is born at the first
+    // commit and the snapshot's changes return as uncommitted work.
+    const b = clone('b');
+    assert.equal(spawnSync('git', ['rev-parse', '--verify', '-q', 'HEAD'], { cwd: b.dir, env: ENV }).status, 1);
+    const restored = await restoreCheckpoint({ git: b.git, checkpoint: fetched, expectedBranch: 'main' });
+    assert.equal(restored.restored, true, JSON.stringify(restored));
+    assert.equal(restored.mode, 'unborn-parentful');
+    assert.equal(restored.commitsRecovered, true);
+    // The first local commit is recovered (HEAD is born at it) …
+    assert.equal(sh(b.dir, 'rev-parse', 'HEAD'), firstSha);
+    assert.equal(readFileSync(join(b.dir, 'first.txt'), 'utf8'), 'first commit\n');
+    // … and the WIP returns as an uncommitted change, not a commit.
+    assert.equal(readFileSync(join(b.dir, 'wip.txt'), 'utf8'), 'uncommitted wip\n');
+    assert.ok(sh(b.dir, 'status', '--porcelain').includes('wip.txt'));
+
+    // A parentful snapshot taken on a DIFFERENT branch is still refused on an unborn
+    // clone (branch-identity guard applies): no cross-branch commit recovery.
+    const c = clone('c');
+    const blocked = await restoreCheckpoint({ git: c.git, checkpoint: fetched, expectedBranch: 'other' });
+    assert.equal(blocked.restored, false, JSON.stringify(blocked));
+    assert.equal(blocked.branchMismatch, true);
+  } finally { rmSync(root, { recursive: true, force: true }); }
+});
+
 test('lease: a stale writer is rejected and stops writing', async () => {
   const f = fixture();
   try {
@@ -428,7 +531,7 @@ test('lease: a stale writer is rejected and stops writing', async () => {
   } finally { f.cleanup(); }
 });
 
-test('ownership: a newer run takes over from a superseded run\'s late write; the zombie stops', async () => {
+test('ownership: a superseded run\'s late write is PRESERVED, not overwritten by the takeover run', async () => {
   const f = fixture();
   try {
     const ref = checkpointRef('45');
@@ -445,17 +548,24 @@ test('ownership: a newer run takes over from a superseded run\'s late write; the
     assert.equal((await restoreCheckpoint({ git: n.git, checkpoint: prior })).restored, true);
     const takeN = createWorkspaceCheckpoint({ git: n.git, ref, baseSha: base, runId: 'run-n', expectSha: prior.sha, priorRunId: prior.runId });
 
+    // The zombie flushes a NEWER checkpoint (its late abort-flush) AFTER the new run's
+    // startup fetch — independent WIP the new run's divergent workspace does not hold.
     writeFileSync(join(z.dir, 'x.txt'), 'z2 (late abort flush)\n');
-    assert.ok((await takeZ('final')).sha);
+    const z2 = await takeZ('final');
+    assert.ok(z2.sha);
+    assert.equal(sh(f.root, '--git-dir', f.remote, 'rev-parse', ref), z2.sha);
 
+    // The new run's push is lease-rejected; re-reading shows the SUPERSEDED run (run-z)
+    // owns the ref. It must NOT force-push its older snapshot over the zombie's newer
+    // WIP — leave the ref intact and retry (issue: late zombie checkpoints overwritten).
     writeFileSync(join(n.dir, 'x.txt'), 'n1\n');
     const n1 = await takeN('tool');
-    assert.ok(n1.sha, JSON.stringify(n1));
-    assert.equal(sh(f.root, '--git-dir', f.remote, 'rev-parse', ref), n1.sha);
-
-    writeFileSync(join(z.dir, 'x.txt'), 'z3\n');
-    assert.equal((await takeZ('tool')).rejected, true);
-    assert.equal(sh(f.root, '--git-dir', f.remote, 'rev-parse', ref), n1.sha);
+    assert.ok(n1.rejected, JSON.stringify(n1));
+    assert.equal(n1.retryable, true, JSON.stringify(n1));
+    assert.ok(!n1.disabled, 'must not disable — retry on a future trigger');
+    // The ref still holds the zombie's late-flush snapshot, untouched.
+    assert.equal(sh(f.root, '--git-dir', f.remote, 'rev-parse', ref), z2.sha);
+    assert.equal(sh(f.root, '--git-dir', f.remote, 'show', `${ref}:x.txt`), 'z2 (late abort flush)');
   } finally { f.cleanup(); }
 });
 
@@ -702,6 +812,34 @@ test('GC deletes TTL-expired and terminal-element refs, keeps own/unknown/fresh 
     assert.equal(shouldSweep('r', { everyMs: 1000, now: 0, registry: reg }), true);
     assert.equal(shouldSweep('r', { everyMs: 1000, now: 500, registry: reg }), false);
     assert.equal(shouldSweep('r', { everyMs: 1000, now: 1500, registry: reg }), true);
+  } finally { f.cleanup(); }
+});
+
+test('GC stops scheduling engine lookups once the overall-deadline signal fires', async () => {
+  const f = fixture();
+  try {
+    const w = f.clone('w');
+    const base = sh(w.dir, 'rev-parse', 'HEAD');
+    const put = async (key) => {
+      const date = `${Math.floor((Date.now() - 2 * 3_600_000) / 1000)} +0000`;
+      const git = createGitRunner({ cwd: w.dir, env: { ...ENV, GIT_COMMITTER_DATE: date } });
+      writeFileSync(join(w.dir, 'x.txt'), key);
+      const snap = await snapshotWorktree({ git, baseSha: base });
+      assert.ok((await pushCheckpoint({ git, ref: checkpointRef(key), sha: snap.sha })).ok);
+    };
+    for (const k of ['1', '2', '3', '4']) await put(k);
+    // A hung/slow engine: the overall GC deadline aborts mid-sweep. The sweep must then
+    // stop scheduling further per-ref lookups instead of letting up to maxLookups of
+    // them each run their own deadline and blow past the overall budget.
+    const ac = new AbortController();
+    const looked = [];
+    const isTerminal = async (key) => { looked.push(key); ac.abort(); return false; };
+    const r = await sweepStaleCheckpoints({ git: w.git, ttlMs: 0, graceMs: 0, isTerminal, signal: ac.signal });
+    assert.equal(looked.length, 1, `only one lookup before the abort halts the loop: ${JSON.stringify(looked)}`);
+    assert.deepEqual(r.deleted, []);
+    // All four refs are still present — none were force-scanned/deleted after the abort.
+    const left = sh(f.root, '--git-dir', f.remote, 'for-each-ref', '--format=%(refname)', 'refs/nano/wip/').split('\n').sort();
+    assert.deepEqual(left, ['refs/nano/wip/1', 'refs/nano/wip/2', 'refs/nano/wip/3', 'refs/nano/wip/4']);
   } finally { f.cleanup(); }
 });
 

@@ -62,6 +62,21 @@ export const CHECKPOINT_DETACHED_MARKER = 'HEAD:detached';
 // specially: it still refuses the ancestry-RESET fast path but falls through to the
 // non-reset PATCH restore, recovering the fallback job's WIP instead of stranding it.
 const FALLBACK_BRANCH_RE = /^nano\/agent-work\//;
+// The unique run-token provisioning appends to a generated fallback segment:
+// `nano/agent-work/<base>-<runToken>`, where <runToken> is the run's UUID (production)
+// or a `run-<token>` workspace basename (the direct-call test fallback). Anchored at the
+// END so a <base> that itself contains dashes still parses. Used to validate a benign
+// per-run rename on the generated fallback IDENTITY (its <base>), not merely the
+// `nano/agent-work/` namespace prefix — an unrelated or stable branch that only lives
+// under that namespace must NOT be mistaken for a per-run fallback rename.
+const FALLBACK_UNIQ_RE = /-(?:[0-9a-fA-F]{8}-[0-9a-fA-F]{4}-[0-9a-fA-F]{4}-[0-9a-fA-F]{4}-[0-9a-fA-F]{12}|run-[0-9A-Za-z]+)$/;
+function fallbackBranchBase(name) {
+  if (typeof name !== 'string' || !FALLBACK_BRANCH_RE.test(name)) return null;
+  const m = name.match(FALLBACK_UNIQ_RE);
+  if (!m) return null;
+  const base = name.slice('nano/agent-work/'.length, name.length - m[0].length);
+  return base || null;
+}
 
 const DEFAULTS = Object.freeze({
   minIntervalMs: 60_000,
@@ -493,25 +508,50 @@ export async function restoreCheckpoint({ git, checkpoint, expectedBranch = null
     if (!ok(r)) return { restored: false, reason: `unstage failed: ${errText(r)}` };
     return { restored: true, mode: 'unborn', head: '', priorHead: '', commitsRecovered: false };
   }
-  if (!head) return { restored: false, reason: 'no-head' };
 
-  // Branch-identity guard: a snapshot records the symbolic branch HEAD was on (or an
-  // explicit detached marker). If it was taken on a DIFFERENT branch — or DETACHED —
-  // relative to this run's expected working branch, its `parent` may descend from the
-  // work-branch tip yet carry off-branch/detached commits. Fast-restoring would reset
-  // the work branch to that commit and let a later `finalizeGit` push it to the wrong
-  // branch (bypassing branch-mismatch protection). Refuse fast restoration across
-  // branch identities and retain the checkpoint for explicit recovery. (Legacy
-  // snapshots carry no branch trailer — `branch` empty — and keep the prior
-  // ancestry-only behaviour; the detached marker can never equal a real branch name.)
+  // Branch-identity guard (applies to every PARENTFUL restore below — born OR unborn
+  // clone): a snapshot records the symbolic branch HEAD was on (or an explicit detached
+  // marker). If it was taken on a DIFFERENT branch — or DETACHED — relative to this run's
+  // expected working branch, its `parent` may descend from the work-branch tip yet carry
+  // off-branch/detached commits. Recovering it would move the work branch to that commit
+  // and let a later `finalizeGit` push it to the wrong branch (bypassing branch-mismatch
+  // protection). Refuse cross-identity recovery and retain the checkpoint for explicit
+  // recovery. (Legacy snapshots carry no branch trailer — `branch` empty — and keep the
+  // prior ancestry-only behaviour; the detached marker never equals a real branch name.)
   const branchMismatch = Boolean(branch) && Boolean(expectedBranch) && branch !== expectedBranch;
-  // A per-run fallback branch is re-cut with a fresh runId every activation, so its
-  // name never matches the snapshot's trailer even though both are ephemeral fallbacks
-  // off the same base. That rename is BENIGN — not a genuine off-branch/detached move —
-  // so we still refuse the ancestry-RESET fast path but fall through to the non-reset
-  // PATCH restore below, recovering the fallback job's WIP instead of stranding it.
+  // A per-run fallback branch is re-cut with a fresh runId every activation, so its name
+  // never matches the snapshot's trailer even though both are ephemeral fallbacks off the
+  // SAME base. Validate that benign rename on the generated fallback IDENTITY — both names
+  // must parse as `nano/agent-work/<base>-<runToken>` AND share the same <base> — NOT on
+  // the `nano/agent-work/` prefix alone: an unrelated (or stable configured) branch that
+  // merely lives under that namespace must not be treated as a per-run rename and
+  // cross-restored (which `finalizeGit` could then publish on the generated work branch).
+  const fbBase = fallbackBranchBase(branch);
   const fallbackRename = branchMismatch && expectedBranchEphemeral === true
-    && FALLBACK_BRANCH_RE.test(branch) && FALLBACK_BRANCH_RE.test(expectedBranch);
+    && fbBase !== null && fbBase === fallbackBranchBase(expectedBranch);
+  const branchGuardRefused = branchMismatch && !fallbackRename;
+
+  // PARENTFUL snapshot on an UNBORN clone: the prior run made its first local commit(s)
+  // on a fresh clone of an (empty) remote — never pushed to the base — then checkpointed,
+  // so the snapshot is parentful (its parent is that first commit) while a re-clone of the
+  // still-empty remote is unborn again. The fetched WIP ref carries those commits as
+  // `parent`'s ancestry; recover them by pointing the (unborn) branch at `parent`, then
+  // lay the snapshot tree down as uncommitted changes — instead of unconditionally
+  // discarding the fetch as `no-head` and losing the first local commit. Subject to the
+  // same branch-identity guard (a genuine off-branch/detached snapshot is left on the ref).
+  if (!head) {
+    if (branchGuardRefused) {
+      const where = branch === CHECKPOINT_DETACHED_MARKER ? 'a detached HEAD' : `'${branch}'`;
+      return { restored: false, reason: `branch-mismatch (snapshot on ${where}, expected '${expectedBranch}')`, branchMismatch: true };
+    }
+    let r = await git(['reset', '-q', '--hard', parent]);
+    if (!ok(r)) return { restored: false, reason: `reset failed: ${errText(r)}` };
+    r = await git(['read-tree', '-u', '--reset', sha]);
+    if (!ok(r)) return { restored: false, reason: `read-tree failed: ${errText(r)}` };
+    r = await git(['reset', '-q', parent]);
+    if (!ok(r)) return { restored: false, reason: `unstage failed: ${errText(r)}` };
+    return { restored: true, mode: 'unborn-parentful', head: parent, priorHead: '', commitsRecovered: true };
+  }
 
   const fast = !branchMismatch && ok(await git(['merge-base', '--is-ancestor', head, parent]));
   if (fast) {
@@ -553,11 +593,14 @@ export async function restoreCheckpoint({ git, checkpoint, expectedBranch = null
 //
 // Ownership: `expectSha` is the remote sha this run took over (the restored
 // checkpoint) and `priorRunId` the run that wrote it. On a lease rejection we
-// re-read the ref: if it was moved by that SAME superseded run (a zombie's
-// late abort-flush racing our startup) — or by THIS run itself (a transient
-// push error after the server had already accepted our checkpoint left our
-// `remoteSha` stale) — we take over from it; if it was moved by any other run,
-// a newer owner exists and we stop writing.
+// re-read the ref: if it was moved by THIS run itself (a transient push error
+// after the server had already accepted our checkpoint left our `remoteSha`
+// stale) we take over from it and re-push. If it was moved by the SAME
+// superseded run (`priorRunId` — a zombie's late abort-flush racing our startup)
+// we must NOT clobber it: that write is independent, newer WIP our divergent
+// workspace does not hold, so we leave the ref intact and retry rather than
+// overwriting it. If it was moved by any other run, a newer owner exists and we
+// stop writing.
 //
 // `startupFetchFailed` marks a BLIND START: the setup-time `fetchCheckpoint`
 // threw, so we hold no `priorRunId` and could not restore the existing ref. An
@@ -581,10 +624,22 @@ export function createWorkspaceCheckpoint({ git, ref, baseSha = '', runId = '', 
     if (!pushed.ok && pushed.kind === 'lease') {
       let current = null;
       try { current = await fetchCheckpoint({ git, ref }); } catch { /* treat as foreign */ }
-      const takeOver = !!(current && ((priorRunId && current.runId === priorRunId) || (runId && current.runId === runId)));
-      if (takeOver) {
+      // Take over ONLY when the ref moved to a checkpoint THIS run itself wrote: a
+      // transient push error after the server had already accepted our push leaves our
+      // `remoteSha` stale, so re-pushing our own (identical-lineage) snapshot is safe.
+      const selfTakeOver = !!(current && runId && current.runId === runId);
+      if (selfTakeOver) {
         remoteSha = current?.sha || '';
         pushed = await pushCheckpoint({ git, ref, sha: snap.sha, expectSha: remoteSha });
+      } else if (current && priorRunId && current.runId === priorRunId) {
+        // The SUPERSEDED run we took over from wrote a NEWER checkpoint after our startup
+        // fetch (a zombie's late abort-flush). That ref holds independent, uncommitted WIP
+        // (and possibly local commits) our divergent workspace does not contain — a
+        // `--force-with-lease` over it would destroy exactly the work this takeover path
+        // exists to preserve. Leave the newer ref INTACT and retry on a future trigger
+        // rather than overwriting it; never disable (ownership may still legitimately
+        // settle, e.g. the zombie finally exits and a later run reconciles).
+        return { skipped: `push failed (lease): superseded run ${priorRunId} wrote a newer checkpoint — left intact`, kind: 'lease', rejected: true, retryable: true, disabled: null };
       }
     }
     if (!pushed.ok) {
@@ -719,7 +774,7 @@ export function shouldSweep(key, { everyMs = DEFAULTS.gcEveryMs, now = Date.now(
   return true;
 }
 
-export async function sweepStaleCheckpoints({ git, ownRef = null, ttlMs = DEFAULTS.ttlMs, graceMs = DEFAULTS.gcGraceMs, isTerminal = null, now = () => Date.now(), maxDeletes = 50, maxLookups = 20, remote = 'origin' }) {
+export async function sweepStaleCheckpoints({ git, ownRef = null, ttlMs = DEFAULTS.ttlMs, graceMs = DEFAULTS.gcGraceMs, isTerminal = null, now = () => Date.now(), maxDeletes = 50, maxLookups = 20, remote = 'origin', signal = null }) {
   const ls = await git(['ls-remote', '--refs', remote, `${CHECKPOINT_REF_PREFIX}*`]);
   if (!ok(ls)) return { error: errText(ls), deleted: [] };
   const entries = out(ls).split('\n').filter(Boolean).map((l) => { const [sha, ref] = l.split(/\s+/); return { sha, ref }; }).filter((e) => e.ref && e.ref !== ownRef);
@@ -733,11 +788,18 @@ export async function sweepStaleCheckpoints({ git, ownRef = null, ttlMs = DEFAUL
   try {
     for (const { ref, sha } of entries) {
       if (doomed.length >= maxDeletes) break;
+      // The overall GC deadline (the caller's abort signal) bounds the WHOLE sweep, not
+      // just its git ops: each `isTerminal` engine lookup carries its own per-call
+      // deadline, so up to `maxLookups` sequential hung lookups could otherwise outlast
+      // the overall timeout and keep the awaited `close()` (and the job workspace) alive
+      // far past it. Stop scheduling any further lookups/git ops once it fires; unreached
+      // refs are reclaimed on a later sweep.
+      if (signal?.aborted) break;
       const at = Number(out(await git(['log', '-1', '--format=%ct', local(ref)]))) * 1000;
       if (!Number.isFinite(at) || at <= 0) continue;
       const age = now() - at;
       if (ttlMs > 0 && age > ttlMs) { doomed.push({ ref, sha, why: 'ttl' }); continue; }
-      if (isTerminal && age > graceMs && lookups < maxLookups) {
+      if (isTerminal && age > graceMs && lookups < maxLookups && !signal?.aborted) {
         lookups++;
         let terminal = false;
         try { terminal = await isTerminal(ref.slice(CHECKPOINT_REF_PREFIX.length)); } catch { terminal = false; }

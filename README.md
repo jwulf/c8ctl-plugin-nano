@@ -729,12 +729,11 @@ the job with a decremented retry count. Profiles are stored in the plugin's
 >   `repository.sha`-detached checkout likewise recover nothing. For every transcript-only
 >   run the resume preamble points at the transcript (VERIFY-first) rather than promising
 >   a branch to check out.
-> - **Uncommitted working-tree changes are *not* recovered** in this increment —
+> - **Uncommitted working-tree changes are *not* recovered** by default —
 >   the throwaway workspace does not persist across activations, so any delta the
 >   previous run had not committed is lost and the resumed agent re-derives it. The
->   resume preamble states this explicitly. (Persisting the workspace / microVM
->   across activations to recover uncommitted work is a later isolated-context
->   increment.)
+>   resume preamble states this explicitly. **WIP checkpoints** (below, on by default
+>   for pushing jobs) recover them.
 >
 > Resume is **best-effort and gated to external agent jobs** (the only ones with a
 > durable transcript). A read failure, an SDK without an AgentInstance read
@@ -747,6 +746,44 @@ the job with a decremented retry count. Profiles are stored in the plugin's
 > prompt (VERIFY-first, like the transcript), and a harness that advertises
 > `agentCapabilities._meta.planSeed` also receives it in `session/new` `_meta.plan`
 > so it can keep working the same plan. `NANO_AGENT_PLAN=off` disables both.
+>
+> **WIP checkpoints (`NANO_AGENT_CHECKPOINT=auto|on|off`, default `auto`).** The worker
+> periodically snapshots the agent's workspace — uncommitted changes *and* unpushed local
+> commits — to `refs/nano/wip/<elementInstanceKey>` on the job's remote, without touching
+> the agent's HEAD, index or branch (a "shadow commit" built through a temporary index).
+> `auto` enables this only for jobs that already publish their work: a provisioned,
+> **authenticated** clone on a working branch with `branch.push` not `false` (read-only,
+> anonymous, detached and repo-less jobs are skipped). `on` forces it for any provisioned
+> job; `off` disables it.
+>
+> - **What is left out:** `.gitignore`d paths; secret-looking paths (`.env*`, `*.pem`,
+>   `id_*`, `.npmrc`, …); files over `NANO_AGENT_CHECKPOINT_MAX_FILE_BYTES` (5 MiB); and
+>   any changed file whose *content* contains one of the job's own injected secret
+>   values, the repo token, or a common credential format (private keys, GitHub / AWS /
+>   Slack / OpenAI-style tokens).
+> - **When:** after a completed ACP tool call or plan change (at most one per
+>   `NANO_AGENT_CHECKPOINT_MIN_INTERVAL_MS`, default 60s), on a safety-net timer
+>   (`NANO_AGENT_CHECKPOINT_INTERVAL_MS`, default 300s, `0` disables — the only trigger for
+>   pipe/PTY harnesses), and once more when a run fails or is force-stopped. Each
+>   checkpoint also sets a best-effort local `agentCheckpoint {ref, sha, head, at, reason,
+>   branch}` variable on the element instance.
+> - **Restore:** a later activation of the same element instance restores the snapshot
+>   into the fresh clone as uncommitted changes (recovering local commits too) and tells
+>   the agent to inspect `git status`/`git diff` first.
+> - **Cleanup:** the ref is deleted once the engine acknowledges `job.complete` for a run
+>   whose branch push succeeded. Until that ack a lost lease or failed settle redelivers
+>   the job, so the ref stays restorable. Orphans (cancelled instances, failed acks,
+>   exhausted retries) are reclaimed by a background sweep (at most hourly per remote per
+>   worker) that deletes WIP refs older than `NANO_AGENT_CHECKPOINT_TTL_MS` (7 days), or
+>   older than 1h whose element instance the engine reports `COMPLETED`/`TERMINATED`.
+> - **Safety:** pushes use `--force-with-lease`, so a superseded worker can't clobber a
+>   newer run's checkpoint. A remote *policy* refusal (repository rules, secret push
+>   protection) or a permission error stops checkpointing for that job with a warning;
+>   network errors are retried on the next trigger.
+>
+> Caveats: WIP refs are visible to anyone who can read the repo; the worker can't pause
+> the agent, so a snapshot may catch a half-written file. Everything is best-effort — a
+> failure degrades to transcript-only resume.
 
 > **Agent outcomes.** A harness may report an explicit end-of-task outcome in its
 > `session/prompt` result as `_meta.outcome` — `{ "status": "completed" | "blocked",

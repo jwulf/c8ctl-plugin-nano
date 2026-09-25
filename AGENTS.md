@@ -98,9 +98,8 @@ SDK client (job workers) — do **not** add the SDK as a dependency or use raw
   a ref-only job with no matching `create`, a `ref`/`create` that equals (or cannot be
   proven distinct from) the base, or a per-run fallback branch — is NOT
   re-fetched, so such a run is classified **transcript-only** (the recovery
-  preamble points at the transcript, not a branch that isn't there). In every case
-  **uncommitted deltas are lost** (workspace is throwaway — the isolated-context
-  persistence increment is later). Gated to external agent jobs;
+  preamble points at the transcript, not a branch that isn't there). Unless WIP
+  checkpoints (below) restore them, **uncommitted deltas are lost** (workspace is throwaway). Gated to external agent jobs;
   a read failure / no read surface / no prior work / `NANO_AGENT_RESUME=off` falls
   through to the legacy cold rerun (`effectiveEnvelope === envelope`). The prompt
   seed is the only change — repository/setup are untouched, and the AgentInstance
@@ -156,6 +155,35 @@ SDK client (job workers) — do **not** add the SDK as a dependency or use raw
   `agentCapabilities._meta.planSeed === true` (`acpSessionNewParams`) — every other
   agent gets byte-identical params. No plan recorded → prompt byte-unchanged.
   `NANO_AGENT_PLAN=off` disables recording and seeding.
+- **WIP checkpoints (issue #264, `agent-checkpoint.mjs`).** `NANO_AGENT_CHECKPOINT`
+  = `auto` (default) | `on` | `off`; `checkpointEligibility` gates `auto` to provisioned
+  jobs on a **symbolic working branch** that **push** (`branch.push !== false`) an
+  **authenticated** clone — authentication is NOT token-only: a repo token, an
+  author-embedded HTTPS-userinfo remote, or an SSH remote (`isAuthenticatedRemote`,
+  or provisioning's own stamped `authenticated`) each qualify, so a credentialed
+  non-token clone still checkpoints — and every mode
+  needs an `elementInstanceKey`. `setupWorkspaceCheckpoints` (c8ctl-plugin.js) runs after provisioning: it fetches
+  `refs/nano/wip/<elementInstanceKey>`, restores it (`restoreCheckpoint`: fast-forward
+  to the snapshot's parent + lay the tree down UNCOMMITTED when the fresh HEAD is an
+  ancestor; else `git apply --3way` of the `Nano-Checkpoint-Base` → snapshot diff; else
+  skip) and appends `withCheckpointNote` to the effective envelope. Snapshots are
+  shadow commits through a temp `GIT_INDEX_FILE` (the agent's HEAD/index/refs are never
+  written). Paths are reverted to HEAD when deny-listed, oversized, or `containsSecret`
+  (the job's resolved secret values + repo token + `SECRET_CONTENT_PATTERNS`). Pushes use
+  `--force-with-lease` against the last sha this run owns; `classifyPushFailure` →
+  `lease` (take over ONLY if the ref was moved by the run we superseded, per the
+  `Nano-Checkpoint-Run` trailer, else stop), `policy`/`auth` (stop, warn), `transient`
+  (retry next trigger). Git runs async (never `spawnSync`) so pushes don't block the ACP
+  loop. The checkpointer is fed from `onAcpUpdate` (completed/failed
+  `tool_call_update`, `plan`), rate-limited, with a safety-net timer; flushed on abort
+  and on a failed run, stopped before `finalizeGit`, the ref deleted after a clean
+  finalize (kept on any push failure), and `close()` drains in-flight git work before
+  the run dir is reaped. A background `sweepStaleCheckpoints` (throttled per remote by
+  `shouldSweep`) deletes other WIP refs past `NANO_AGENT_CHECKPOINT_TTL_MS` (7d) or >1h old
+  whose element instance `getElementInstance` reports COMPLETED/TERMINATED (an error/404
+  is never treated as terminal). `agentCheckpoint` is written via
+  `camunda.createElementInstanceVariables` (`local:true`), best-effort, warning once.
+  Tests: `agent-checkpoint.test.mjs` (real temp repos + bare remote).
 - **Agent outcomes (`acpOutcomeFrom` / `resultVarsFromAcpOutcome`).** A
   `session/prompt` result may carry `_meta.outcome` `{status:'completed'|'blocked',
   summary}` (rusty-harness's `report_outcome`). `spawnCaptureAcp` surfaces it as

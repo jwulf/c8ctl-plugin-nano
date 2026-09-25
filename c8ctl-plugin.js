@@ -90,6 +90,7 @@ import { createAgentInstanceProducer, isExternalAgentJob } from './agent-instanc
 // so the new agent CONTINUES rather than cold-reruns — at-least-once delivery becomes
 // a continuation, not a duplicate. Best-effort; degrades to the legacy cold rerun.
 import { resolveEffectiveEnvelope } from './agent-resume.mjs';
+import { checkpointConfig, checkpointEligibility, checkpointRef, normalizeSecretValues, credentialsFromUrl, isAuthenticatedRemote, shouldSweep, sweepStaleCheckpoints, createGitRunner, fetchCheckpoint, restoreCheckpoint, createWorkspaceCheckpoint, createCheckpointer, deleteCheckpointRef, withCheckpointNote, sanitizeBranchSegment } from './agent-checkpoint.mjs';
 
 const requireFromHere = createRequire(import.meta.url);
 const pluginDir = dirname(fileURLToPath(import.meta.url));
@@ -4498,21 +4499,10 @@ function authUrl(url, provider, hasToken) {
 
 class ProvisionError extends Error {}
 
-// Reduce an arbitrary string to a single git-ref-safe path segment: git refname
-// rules forbid spaces and ~^:?*[\, leading/trailing/doubled dots, a trailing
-// ".lock", etc. Used to build the deterministic fallback work branch (issue #231)
-// off the base branch name + run id, so a run with no branch.create still commits
-// on a fresh, always-fast-forwardable branch instead of on the base.
-function sanitizeBranchSegment(s) {
-  const cleaned = String(s == null ? '' : s)
-    .replace(/[^0-9A-Za-z._-]+/g, '-') // collapse anything unusual to a dash
-    .replace(/\.{2,}/g, '.')            // no doubled dots (git forbids "..")
-    .replace(/^[-.]+/, '')              // no leading dot or dash
-    .slice(0, 60)                       // bound the segment BEFORE the trailing
-    .replace(/[-.]+$/g, '')             // checks, so truncating at char 60 can't
-    .replace(/\.lock$/i, 'lock');       // re-introduce a trailing dot/dash or ".lock"
-  return cleaned || 'base';
-}
+// `sanitizeBranchSegment` (the deterministic fallback-work-branch segment builder,
+// issue #231) now lives in ./agent-checkpoint.mjs as the single source of truth: the
+// restore path reconstructs the generated `nano/agent-work/<base>-<runId>` identity to
+// validate a benign per-run rename, so provisioning and restore must share one impl.
 
 // Never let git invoke the host's configured credential helper for our clone/
 // push. Reset the helper list ("") so no helper runs — even when we DO have a
@@ -5315,7 +5305,12 @@ function provisionRepo({ envelope, token, runDir, runId, timeoutMs = 120_000, lo
   // exactly when a real work branch was resolved that is not the base itself
   // (false for a read-only base checkout with push disabled, or a detached HEAD).
   const hasPrBranch = !!workingBranch && workingBranch !== effectiveBase;
-  return { workspaceDir, gitEnv, committer, startSha: sha.status === 0 ? (sha.stdout || '').trim() : '', workingBranch, fallbackBranch, hasPrBranch, baseBranch: effectiveBase || null, baseCloneSha, baseBaselineUnknown, detached: !workingBranch, ref: commitSha || branchName || '', base, baseFetchError, remote: redactToken(repo.url, token) };
+  // Authentication is not synonymous with a token: an author-embedded HTTPS
+  // userinfo URL or an SSH remote authenticates the push with no `token`. Stamp
+  // the authoritative result so eligibility (auto checkpointing) doesn't
+  // under-detect an authenticated clone.
+  const authenticated = !!token || isAuthenticatedRemote(repo.url);
+  return { workspaceDir, gitEnv, committer, startSha: sha.status === 0 ? (sha.stdout || '').trim() : '', workingBranch, fallbackBranch, hasPrBranch, authenticated, baseBranch: effectiveBase || null, baseCloneSha, baseBaselineUnknown, detached: !workingBranch, ref: commitSha || branchName || '', base, baseFetchError, remote: redactToken(repo.url, token) };
 }
 
 // Look up a PR for this branch (2a does NOT open it — the harness does, driven
@@ -5437,6 +5432,306 @@ function postAgentAttribution({ workspaceDir, token, number, agentName = AGENT_A
 // #231): the cleanup boundary calls this instead of inlining the predicate.
 function shouldPreserveRunDir(gitResult) {
   return !!gitResult?.pushFailed;
+}
+
+// #264: WIP checkpoint wiring for one host-provisioned job (see agent-checkpoint.mjs).
+// Returns null when disabled/ineligible/unavailable, else `{ checkpointer,
+// restored, flushTimeoutMs, discard(), close() }`. Never throws — best-effort.
+async function setupWorkspaceCheckpoints({ provisioned, envelope = null, token = null, secretValues = [], job, jobType, runId, camunda, logger, corr = '', env = process.env, deps = {}, abortSignal = null }) {
+  const cfg = checkpointConfig(env);
+  const prefix = `[${jobType}] job ${job?.jobKey}`;
+  // Cancellation contract: if the runner was already interrupted (lock loss /
+  // stop --force) before we begin, do no git work — the Effect slot may already be
+  // released and the throwaway workspace is about to be reaped.
+  if (abortSignal?.aborted === true) return null;
+  const eligible = checkpointEligibility({ mode: cfg.mode, provisioned, envelope, token });
+  if (!eligible.enabled) {
+    if (provisioned?.workspaceDir) logger.debug?.(`${prefix}: WIP checkpoints off for this job — ${eligible.reason}.`);
+    return null;
+  }
+  const ref = checkpointRef(job?.elementInstanceKey);
+  if (!ref) {
+    if (cfg.mode === 'on') logger.warn?.(`${prefix}: WIP checkpoints enabled but the job has no usable elementInstanceKey — checkpoints off for this job.`);
+    return null;
+  }
+  const {
+    createGitRunner: mkGit = createGitRunner,
+    fetchCheckpoint: fetchCp = fetchCheckpoint,
+    restoreCheckpoint: restoreCp = restoreCheckpoint,
+    deleteCheckpointRef: deleteCp = deleteCheckpointRef,
+    sweep = sweepStaleCheckpoints,
+    now = () => Date.now(),
+  } = deps;
+  const log = {
+    warn: (m) => logger.warn?.(`${prefix} (${corr}): ${m}`),
+    debug: (m) => logger.debug?.(`${prefix} (${corr}): ${m}`),
+  };
+  try {
+    const committer = provisioned.committer || {};
+    const gitEnv = {
+      ...(provisioned.gitEnv || process.env),
+      ...(committer.name ? { GIT_AUTHOR_NAME: committer.name, GIT_COMMITTER_NAME: committer.name } : {}),
+      ...(committer.email ? { GIT_AUTHOR_EMAIL: committer.email, GIT_COMMITTER_EMAIL: committer.email } : {}),
+    };
+    const git = mkGit({ cwd: provisioned.workspaceDir, env: gitEnv, timeoutMs: cfg.gitTimeoutMs });
+    // The STARTUP git work (origin lookup, checkpoint fetch, restore) is cancellable:
+    // if the runner is interrupted (lock loss / stop --force) mid-setup, the in-flight
+    // git child is killed and later ops fail fast, so setup unwinds instead of holding
+    // a released Effect slot until a git timeout. The checkpointer keeps the UNBOUND
+    // `git` runner above so its abort-flush can still push a final snapshot.
+    const startupGit = mkGit({ cwd: provisioned.workspaceDir, env: gitEnv, timeoutMs: cfg.gitTimeoutMs, signal: abortSignal || undefined });
+    // Captured now: the ref is deleted only after the engine acks completion, by
+    // which time the workspace (and its askpass helper) has been reaped.
+    const originUrl = ((await startupGit(['remote', 'get-url', 'origin'])).stdout || '').trim();
+
+    let prior = null;
+    let restored = null;
+    let startupFetchFailed = false;
+    try {
+      prior = await fetchCp({ git: startupGit, ref });
+    } catch (err) {
+      startupFetchFailed = true;
+      log.warn(`could not fetch WIP checkpoint ${ref} — ${oneLineLog(err?.message || err)}; starting without it.`);
+    }
+    if (prior) {
+      const r = await restoreCp({ git: startupGit, checkpoint: prior, expectedBranch: provisioned.workingBranch || null, expectedBranchEphemeral: provisioned.fallbackBranch === true, expectedBaseRef: provisioned.baseBranch || '' });
+      if (r?.restored) {
+        restored = r;
+        logger.info?.(`${prefix} (${corr}): restored WIP checkpoint ${ref}@${prior.sha.slice(0, 12)} (${r.mode}${r.commitsRecovered ? ', local commits recovered' : ''}) as uncommitted changes.`);
+      } else {
+        const rb = r?.rollbackFailed
+          ? ' — WARNING: the workspace could NOT be rolled back to its pristine state and may hold partially-recovered content'
+          : '';
+        log.warn(`found WIP checkpoint ${ref}@${prior.sha.slice(0, 12)} but did not restore it — ${r?.reason || 'unknown'}${rb}; the ref is RETAINED (not overwritten) for this activation, so its content can still be recovered explicitly.`);
+      }
+    }
+    // Cancellation recheck: after the startup git work, bail before starting the
+    // background GC or the checkpointer if the runner was interrupted — a released
+    // slot must not leave a GC sweep or a live checkpointer overlapping the next
+    // activation on a workspace that is about to be reaped.
+    if (abortSignal?.aborted === true) {
+      log.debug('setup interrupted after restore — not starting GC/checkpointer for this (yielded) job.');
+      return null;
+    }
+    // The ref held a prior checkpoint we could NOT lay into the workspace (restore
+    // skipped): its content lives ONLY on the ref, so discarding it on ack would be
+    // the same data loss as discarding uncommitted content. Keep the ref in that case.
+    const priorNotRestored = Boolean(prior) && !restored;
+
+    // Orphan GC for this remote, throttled per worker process, in the background.
+    let gc = Promise.resolve();
+    const gcKey = provisioned.remote || provisioned.workspaceDir;
+    // Bound every checkpoint-path SDK call: the GC sweep and the variable write are
+    // awaited by `stop()`/`close()` (and `onCheckpoint`), so an unbounded engine
+    // call could wedge worker shutdown / the ACP loop. A timed-out call rejects; a
+    // late settle is swallowed so it can never surface as an unhandled rejection.
+    const CP_SDK_TIMEOUT_MS = 10000;
+    // A single overall bound on the whole GC sweep. Individual ops are already
+    // bounded (each terminal lookup CP_SDK_TIMEOUT_MS, each git op cfg.gitTimeoutMs),
+    // but a sweep chains up to maxLookups + maxDeletes of them, so a slow/unreachable
+    // remote could otherwise hold `close()`/`discard()` (awaited in job cleanup /
+    // force-stop) for many minutes and starve worker capacity. Cap the total; on the
+    // deadline we ABORT the sweep's cancellable git (below) and still AWAIT it to fully
+    // settle — never abandon it to run git against a workspace the job is about to
+    // reap. Any refs it did not reach are reclaimed on a future hourly sweep (thread
+    // 4099558206 / 4099762442).
+    const GC_OVERALL_TIMEOUT_MS = 120000;
+    const withDeadline = (p, ms, label) => {
+      let timer;
+      const timeout = new Promise((_r, reject) => { timer = setTimeout(() => reject(new Error(`${label} timed out after ${ms}ms`)), ms); });
+      Promise.resolve(p).catch(() => {});
+      return Promise.race([Promise.resolve(p).finally(() => clearTimeout(timer)), timeout]);
+    };
+    if (shouldSweep(gcKey, { everyMs: cfg.gcEveryMs, now: now(), registry: deps.sweepRegistry })) {
+      const isTerminal = typeof camunda?.getElementInstance === 'function'
+        ? async (key) => {
+          try {
+            const ei = await withDeadline(
+              camunda.getElementInstance({ elementInstanceKey: key }, { consistency: { waitUpToMs: 0 } }),
+              CP_SDK_TIMEOUT_MS, 'getElementInstance');
+            return ei?.state === 'COMPLETED' || ei?.state === 'TERMINATED';
+          } catch { return false; }
+        }
+        : null;
+      // Run the sweep in an ISOLATED throwaway scratch repo (its own `.git`), NEVER the
+      // job workspace. The sweep fetches remote WIP refs, writes local throwaway refs and
+      // push-deletes stale ones, while the workspace is concurrently driven by the harness
+      // and later by `finalizeGit` (which fetches the base and reads FETCH_HEAD). Sharing
+      // one `.git` risks ref-lock contention and FETCH_HEAD being clobbered between the
+      // finalizer's fetch and read. A scratch repo with only `origin` configured fully
+      // decouples them; its dir is reaped when the sweep settles. On the overall deadline
+      // we abort the sweep's cancellable git so the promise unwinds instead of hanging.
+      const sweepAbort = new AbortController();
+      let sweepDir = null;
+      try {
+        if (!originUrl) throw new Error('workspace had no origin URL');
+        sweepDir = mkdtempSync(join(tmpdir(), 'nano-wip-gc-'));
+        const sweepEnv = { ...(provisioned.gitEnv || process.env), GIT_TERMINAL_PROMPT: '0' };
+        delete sweepEnv.GIT_ASKPASS;
+        delete sweepEnv.GIT_TOKEN;
+        const askpass = token ? writeAskpass(sweepDir, token) : null;
+        if (askpass) { sweepEnv.GIT_ASKPASS = askpass; sweepEnv.GIT_TOKEN = token; }
+        const sweepGit = mkGit({ cwd: sweepDir, env: sweepEnv, timeoutMs: cfg.gitTimeoutMs, signal: sweepAbort.signal });
+        const init = await sweepGit(['init', '--quiet', '.']);
+        if (init.status !== 0) throw new Error(`git init failed: ${oneLineLog(init.stderr || init.stdout || '')}`);
+        // Configure origin through the protected `.git/config` (0700 tmpdir) rather than
+        // argv, so any userinfo embedded in `originUrl` never lands on `git`'s argv/`ps`.
+        const escUrl = originUrl.replace(/\\/g, '\\\\').replace(/"/g, '\\"');
+        appendFileSync(join(sweepDir, '.git', 'config'), `[remote "origin"]\n\turl = "${escUrl}"\n`);
+        const deadlineTimer = setTimeout(() => sweepAbort.abort(), GC_OVERALL_TIMEOUT_MS);
+        deadlineTimer.unref?.();
+        // `gc` is tied to the sweep's ACTUAL completion (not a race that abandons it),
+        // so `close()`/`discard()` — which await `gc` — never reap the scratch repo while
+        // the sweep's git is still live. The deadline only bounds it by aborting the git.
+        gc = Promise.resolve(sweep({ git: sweepGit, ownRef: ref, ttlMs: cfg.ttlMs, graceMs: cfg.gcGraceMs, isTerminal, now, signal: sweepAbort.signal }))
+          .then((r) => {
+            if (r?.deleted?.length) logger.info?.(`${prefix} (${corr}): reclaimed ${r.deleted.length} orphaned WIP checkpoint ref(s): ${r.deleted.map((d) => `${d.ref} [${d.why}]`).join(', ')}.`);
+            else if (sweepAbort.signal.aborted) log.debug(`WIP checkpoint GC bounded at ${GC_OVERALL_TIMEOUT_MS}ms — aborted its in-flight git and drained; leftover refs reclaimed on a later sweep.`);
+            else if (r?.error) log.debug(`WIP checkpoint GC skipped — ${redactToken(oneLineLog(r.error), token)}.`);
+          }, (err) => log.debug(`WIP checkpoint GC threw — ${redactToken(oneLineLog(err?.message || err), token)}.`))
+          .finally(() => { clearTimeout(deadlineTimer); if (sweepDir) { try { rmSync(sweepDir, { recursive: true, force: true }); } catch { /* best effort */ } } });
+      } catch (err) {
+        if (sweepDir) { try { rmSync(sweepDir, { recursive: true, force: true }); } catch { /* best effort */ } }
+        log.debug(`WIP checkpoint GC not started — ${redactToken(oneLineLog(err?.message || err), token)}.`);
+      }
+    }
+
+    const branch = provisioned.workingBranch || null;
+    // The SHA this run currently owns on the ref: the checkpoint we restored to
+    // begin with, then each checkpoint we successfully push. `discard()` leases its
+    // delete against it so a stale activation cannot delete a newer owner's WIP.
+    let ownedSha = prior?.sha || '';
+    let varWarned = false;
+    const setVar = typeof camunda?.createElementInstanceVariables === 'function' && job?.elementInstanceKey
+      ? async (res) => {
+        try {
+          await withDeadline(camunda.createElementInstanceVariables({
+            elementInstanceKey: String(job.elementInstanceKey),
+            variables: { agentCheckpoint: { ref, sha: res.sha, head: res.head, at: res.at, reason: res.reason, branch } },
+            local: true,
+          }), CP_SDK_TIMEOUT_MS, 'createElementInstanceVariables');
+        } catch (err) {
+          if (!varWarned) { varWarned = true; log.warn(`could not set the agentCheckpoint variable — ${oneLineLog(err?.message || err)}; checkpoints still pushed to ${ref}.`); }
+        }
+      }
+      : null;
+
+    const checkpoint = createWorkspaceCheckpoint({
+      git,
+      ref,
+      baseSha: provisioned.startSha || '',
+      // The RAW base ref this run was provisioned against — recorded UNSANITIZED so a
+      // later restore can prove two per-run fallbacks share a base without relying on
+      // the ambiguous sanitized branch segment (see CHECKPOINT_BASEREF_TRAILER).
+      baseRefName: provisioned.baseBranch || '',
+      runId: String(runId || ''),
+      // When a prior snapshot EXISTED but could NOT be restored (branch-mismatch /
+      // detached refusal, or a diverged patch that did not apply), its content lives
+      // ONLY on the ref. Do NOT hand this run ownership of it: with `expectSha`/
+      // `priorRunId` set, the first checkpoint would `--force-with-lease` over the
+      // ref and destroy the only copy of that un-restored snapshot. Withholding
+      // ownership makes the first push a create-only that the existing ref rejects,
+      // so checkpointing disables for this activation and the old ref is left intact
+      // for explicit recovery (matching `priorNotRestored` retaining it on discard).
+      expectSha: priorNotRestored ? '' : (prior?.sha || ''),
+      priorRunId: priorNotRestored ? '' : (prior?.runId || ''),
+      startupFetchFailed,
+      maxFileBytes: cfg.maxFileBytes,
+      // Include any credential embedded in the origin URL's userinfo: provisioning
+      // preserves author-supplied userinfo (authUrl), and for such credential-bearing
+      // URLs `token` is null, so the URL password would otherwise be absent from the
+      // scan set and a changed file echoing it could enter the readable WIP ref.
+      secretValues: normalizeSecretValues([...(secretValues || []), token, ...credentialsFromUrl(originUrl)]),
+      message: `nano: WIP checkpoint for job ${job.jobKey}`,
+    });
+    const checkpointer = createCheckpointer({
+      checkpoint,
+      minIntervalMs: cfg.minIntervalMs,
+      intervalMs: cfg.intervalMs,
+      logger: log,
+      onCheckpoint: async (res) => {
+        ownedSha = res.sha;
+        log.debug(`WIP checkpoint ${ref}@${res.sha.slice(0, 12)} pushed (${res.reason})${res.excluded?.length ? `; excluded ${res.excluded.map((e) => `${e.path} [${e.why}]`).join(', ')}` : ''}.`);
+        if (setVar) await setVar(res);
+      },
+    });
+    return {
+      ref,
+      mode: cfg.mode,
+      checkpointer,
+      restored,
+      priorNotRestored,
+      flushTimeoutMs: cfg.flushTimeoutMs,
+      // True when the workspace still holds checkpoint content NOT captured by a
+      // commit, so the pushed branch does not represent it (an uncommitted restored
+      // or working delta that lives only on the WIP ref). The discard-on-ack gate
+      // uses this: `gitResult.pushed` alone is not proof the WIP is durable — the
+      // agent can push an unrelated commit while restored changes stay uncommitted.
+      // Best-effort; on any git error we report "dirty" so the caller KEEPS the ref.
+      async hasUncommittedChanges() {
+        try {
+          const r = await git(['status', '--porcelain', '--untracked-files=all']);
+          if (r.status !== 0) return true;
+          return (r.stdout || '').trim().length > 0;
+        } catch { return true; }
+      },
+      // Stop snapshotting and wait for in-flight git work (checkpoint + GC) so the
+      // run dir can be reaped safely.
+      async close() { await checkpointer.stop(); await gc; },
+      async discard() {
+        await checkpointer.stop();
+        try {
+          const r = await deleteCp({ git, ref, expectSha: ownedSha });
+          if (r?.staleLease) log.debug(`WIP checkpoint ${ref} left intact — the ref moved to a newer activation; not deleting another owner's WIP.`);
+          else if (!r?.ok) log.warn(`could not delete WIP checkpoint ${ref} — ${r?.error || 'unknown'}.`);
+        } catch (err) {
+          log.warn(`could not delete WIP checkpoint ${ref} — ${oneLineLog(err?.message || err)}.`);
+        }
+      },
+      // Delete the ref once the engine has acknowledged the job's completion.
+      // Independent of the (by then reaped) workspace: pushes the delete from a
+      // throwaway scratch repo with its own askpass helper. Never throws; a ref left
+      // behind is reclaimed by the orphan GC once the element instance is terminal.
+      async discardAfterAck() {
+        await checkpointer.stop();
+        await gc;
+        if (!originUrl) { log.warn(`could not delete WIP checkpoint ${ref} — workspace had no origin URL; the orphan GC will reclaim it.`); return; }
+        let dir = null;
+        try {
+          dir = mkdtempSync(join(tmpdir(), 'nano-wip-'));
+          const gitEnv = { ...(provisioned.gitEnv || process.env), GIT_TERMINAL_PROMPT: '0' };
+          delete gitEnv.GIT_ASKPASS;
+          delete gitEnv.GIT_TOKEN;
+          const askpass = token ? writeAskpass(dir, token) : null;
+          if (askpass) { gitEnv.GIT_ASKPASS = askpass; gitEnv.GIT_TOKEN = token; }
+          // A plain (non-bare) repo: `safe.bareRepository=explicit` refuses implicit bare dirs.
+          const scratch = mkGit({ cwd: dir, env: gitEnv, timeoutMs: cfg.gitTimeoutMs });
+          const init = await scratch(['init', '--quiet', '.']);
+          if (init.status !== 0) throw new Error(`git init failed: ${oneLineLog(init.stderr || init.stdout || '')}`);
+          // Configure origin through the throwaway repo's protected `.git/config`
+          // (a 0700 tmpdir) rather than passing `originUrl` positionally to
+          // `git push`: `authUrl` preserves any userinfo an author embedded in
+          // `repository.url`, and an argv URL would leak those credentials into the
+          // push process's argv / `ps` listing. Writing the config file directly
+          // keeps the URL off argv entirely (a `git remote add` would still expose
+          // it); auth still flows through GIT_ASKPASS (thread 4099558181).
+          const escUrl = originUrl.replace(/\\/g, '\\\\').replace(/"/g, '\\"');
+          appendFileSync(join(dir, '.git', 'config'), `[remote "origin"]\n\turl = "${escUrl}"\n`);
+          const r = await deleteCp({ git: scratch, ref, expectSha: ownedSha });
+          if (r?.ok) log.debug(`deleted WIP checkpoint ${ref} after the engine acknowledged completion.`);
+          else if (r?.staleLease) log.debug(`WIP checkpoint ${ref} left intact — the ref moved to a newer activation; the orphan GC will reclaim it if needed.`);
+          else log.warn(`could not delete WIP checkpoint ${ref} — ${redactToken(r?.error || 'unknown', token)}; the orphan GC will reclaim it.`);
+        } catch (err) {
+          log.warn(`could not delete WIP checkpoint ${ref} — ${redactToken(oneLineLog(err?.message || err), token)}; the orphan GC will reclaim it.`);
+        } finally {
+          if (dir) { try { rmSync(dir, { recursive: true, force: true }); } catch { /* best effort */ } }
+        }
+      },
+    };
+  } catch (err) {
+    log.warn(`WIP checkpoint setup failed — ${oneLineLog(err?.message || err)}; continuing without checkpoints.`);
+    return null;
+  }
 }
 
 // Decide the agentic/transcript relay's close reason (normal / job-killed / error)
@@ -10409,6 +10704,13 @@ async function workAgent(req, flags, ctx) {
         // as a `normal` close. This flag flips true only once we reach the end of the
         // try body, so an early throw is correctly reported as `error`.
         let runCompleted = false;
+        let discardCheckpointOnAck = false;
+        // #264: whether a TERMINAL WIP checkpoint decision (abort/failed flush, or the
+        // success-path stop) was already taken on the normal control flow. If the run
+        // throws before any of those (e.g. runAgentJob rejects), the finally below
+        // performs a last-chance `failed` flush so edits since the last periodic
+        // checkpoint are not lost.
+        let checkpointFinalized = false;
         // The per-job live-terminal relay session (issue #173): streams this job's
         // harness terminal over the single-owner supervisor's ONE multiplexed host
         // connection, keyed by this worker's instance + the jobKey, and accepts
@@ -10432,6 +10734,30 @@ async function workAgent(req, flags, ctx) {
           if (isContainer) liveRunIds.delete(runId);
           return;
         }
+
+        // #264: WIP checkpoints (NANO_AGENT_CHECKPOINT=auto|on|off, default auto). Restore a prior
+        // attempt's snapshot into the fresh clone, then snapshot the workspace to
+        // `refs/nano/wip/<elementInstanceKey>` as the run progresses. Best-effort:
+        // any failure logs and degrades to the transcript-only resume.
+        const checkpointing = await setupWorkspaceCheckpoints({ provisioned, envelope, token: repoToken, secretValues: Object.values(resolved || {}), job, jobType, runId, camunda, logger, corr: aiCorr, abortSignal });
+        // #264 cancellation contract: setup does cancellable git work (fetch/restore)
+        // and may start a background GC + live checkpointer. If a lock-loss/force-stop
+        // won during that await, stop here before opening the relay/harness so a
+        // released slot never proceeds into the runner path or overlaps the next
+        // activation. (setupWorkspaceCheckpoints already declined to start GC/the
+        // checkpointer on an observed abort, so there is nothing to tear down.)
+        if (checkSetupAbort(abortSignal, { jobType, jobKey: job.jobKey, stage: 'relay-open', logger })) {
+          // A checkpointer may have been created just before the abort landed; stop
+          // it (and drain its GC) so no snapshot timer or sweep overlaps the next
+          // activation on the about-to-be-reaped workspace.
+          if (checkpointing?.close) { try { await checkpointing.close(); } catch { /* best effort */ } }
+          await discardAgentInstanceProducer();
+          if (runDir) { try { rmSync(runDir, { recursive: true, force: true }); } catch { /* best effort */ } liveRunDirs.delete(runDir); }
+          if (isContainer) liveRunIds.delete(runId);
+          return;
+        }
+        if (checkpointing?.restored) effectiveEnvelope = withCheckpointNote(effectiveEnvelope, checkpointing.restored);
+        const checkpointer = checkpointing?.checkpointer ?? null;
 
         let relaySession = null;
         if (agenticPlane) {
@@ -10514,7 +10840,11 @@ async function workAgent(req, flags, ctx) {
             // producer so its turn is appended to the engine's AgentHistory. Inert
             // when no producer was minted (non-external job / off / mint failed) and
             // for non-ACP harnesses (no session/updates are emitted). Best-effort.
-            onAcpUpdate: agentInstanceProducer ? (u) => agentInstanceProducer.ingest(u) : undefined,
+            // #264: the same updates pace WIP checkpoints (a completed tool call or a
+            // plan change is a natural snapshot boundary; rate-limited inside).
+            onAcpUpdate: (agentInstanceProducer || checkpointer)
+              ? (u) => { agentInstanceProducer?.ingest(u); checkpointer?.notify(u); }
+              : undefined,
           };
           result = await runAgentJob(profile, job, runOpts);
 
@@ -10526,8 +10856,13 @@ async function workAgent(req, flags, ctx) {
           // cleanup); recordJobEnd fires in the outer finally.
           if (result && result.aborted) {
             logger.warn(`[${jobType}] job ${job.jobKey} aborted (worker force-stop) — harness killed; yielding job for retry.`);
+            // #264: last-chance WIP checkpoint so the retry can pick up the
+            // uncommitted work (bounded; the lease guards a newer owner).
+            if (checkpointer) { await checkpointer.flush('abort', { timeoutMs: checkpointing.flushTimeoutMs }); checkpointFinalized = true; }
             return;
           }
+          // #264: a failed run is retried — checkpoint what it left behind.
+          if (checkpointer && !result.ok) { await checkpointer.flush('failed', { timeoutMs: checkpointing.flushTimeoutMs }); checkpointFinalized = true; }
 
           // Gap 2 (#678): a clean run that emitted no machine-readable result gets
           // ONE bounded re-emit nudge in the same workspace, feeding back its own
@@ -10575,6 +10910,20 @@ async function workAgent(req, flags, ctx) {
           if (agentInstanceProducer) {
             try { await agentInstanceProducer.complete(result.ok); } catch (err) { logger.warn(`[${jobType}] AgentInstance producer complete() threw (${aiCorr}) — ${oneLineLog(err?.message || err)}; job settlement unaffected.`); }
           }
+
+          // #264: the run is done — take a FINAL snapshot (so edits still pending in
+          // the rate-limiter's trailing timer are not lost) and stop snapshotting
+          // before finalizeGit touches the workspace. `flush('final')` forces one
+          // last checkpoint past the post-stop guard, then latches the scheduler
+          // stopped; on a successful run with no branch commit (or a crash before
+          // job.complete is acked) the retained WIP ref then still holds the latest
+          // work rather than only the last periodic checkpoint (advisory 10713).
+          // `flush` is bounded by a timeout, so it can RETURN while its snapshot is
+          // still queued/in-flight; that snapshot reads the same workspace/HEAD that
+          // finalizeGit is about to commit and push. DRAIN the scheduler (stop()
+          // resolves once the in-flight checkpoint chain settles) before finalizeGit
+          // so finalization never races a late snapshot (thread 4099675063).
+          if (checkpointer && result.ok) { await checkpointer.flush('final'); await checkpointer.stop(); checkpointFinalized = true; }
 
           // Finalize git only when the harness succeeded — never push a
           // half-finished workspace.
@@ -10635,10 +10984,43 @@ async function workAgent(req, flags, ctx) {
           } else if (provisioned) {
             gitResult = { remote: provisioned.remote, branch: provisioned.workingBranch, baseSha: provisioned.startSha || null, commits: [], pushed: false };
           }
+          // #264: the work is durable on the pushed branch, so the WIP ref goes —
+          // but only once the engine acks job.complete (below): until then a lost
+          // lease or failed settle redelivers the job, and the next activation must
+          // still be able to restore from it. Kept too when finalization failed.
+          // REQUIRE `gitResult.pushed`: the README/AGENTS contract deletes the ref
+          // only "for a run whose branch push SUCCEEDED". A clean run can restore a
+          // checkpoint as uncommitted changes and make no commit (so finalizeGit
+          // pushes nothing and `pushed` is false while none of the error flags trip)
+          // — discarding then would drop the only durable copy of the recovered WIP.
+          // When not pushed, keep the ref; the orphan GC reclaims it once the element
+          // instance is terminal.
+          //
+          // `pushed` alone is NOT proof the WIP is durable, though: the agent can push
+          // an UNRELATED commit while restored/working checkpoint content stays
+          // uncommitted (or the prior ref was never restored at all). Only discard when
+          // the workspace is clean (everything the checkpointer would snapshot is
+          // committed, hence on the pushed branch) AND no prior checkpoint was left
+          // unrestored — otherwise the WIP ref is the only durable copy, so keep it
+          // (thread 4099856563).
+          let checkpointContentUncommitted = false;
+          if (checkpointing) {
+            try { checkpointContentUncommitted = await checkpointing.hasUncommittedChanges(); } catch { checkpointContentUncommitted = true; }
+          }
+          discardCheckpointOnAck = Boolean(checkpointing && result.ok && gitResult?.pushed && !gitFinalizeFailed && !gitResult?.error && !gitResult?.pushFailed && !gitResult?.pushError && !checkpointContentUncommitted && !checkpointing.priorNotRestored);
           // Reached the end of the run + finalization without throwing. A git
           // finalization error keeps this false so the relay close is 'error'.
           runCompleted = !gitFinalizeFailed;
         } finally {
+          if (checkpointing) {
+            // #264: exception path — if the run threw before any terminal checkpoint
+            // decision was taken (abort/failed flush or the success-path stop), take a
+            // last-chance `failed` flush so the retry can recover edits made since the
+            // last periodic checkpoint. `flush` forces past the post-stop guard and is
+            // bounded; the lease still protects a newer owner. Then close (drain).
+            if (checkpointer && !checkpointFinalized) { try { await checkpointer.flush('failed', { timeoutMs: checkpointing.flushTimeoutMs }); } catch { /* best effort */ } }
+            try { await checkpointing.close(); } catch { /* best effort */ }
+          }
           if (isContainer) liveRunIds.delete(runId);
           // #205: clear the in-flight job marker now the harness has stopped — the
           // owning lifecycle's finally is the authoritative "job finished" signal,
@@ -10780,7 +11162,7 @@ async function workAgent(req, flags, ctx) {
           const resultKeys = Object.keys(resultVars);
           if (resultKeys.length === 0) logger.warn(`[${jobType}] job ${job.jobKey}: agent returned no usable result vars — write a JSON object of result variables to $AGENT_RESULT_FILE (or print a "${RESULT_SENTINEL} {…}" line) so downstream gateways see status/summary/etc.`);
           else logger.info(`[${jobType}] job ${job.jobKey}: merged agent result vars [${resultKeys.join(', ')}]`);
-          return await settleJob.complete({
+          const settled = await settleJob.complete({
             ...resultVars,
             [AGENT_RESULT_KEY]: resultEnvelope,
             output: result.stdout,
@@ -10791,6 +11173,9 @@ async function workAgent(req, flags, ctx) {
               ? { branch: gitResult.branch, commits: gitResult.commits, pushed: gitResult.pushed, pullRequest: gitResult.pr || null }
               : {}),
           });
+          // The engine acknowledged completion: the WIP checkpoint is no longer needed.
+          if (discardCheckpointOnAck) await checkpointing.discardAfterAck();
+          return settled;
         }
         const retries = Math.max(0, (Number(job.retries) || 1) - 1);
         const detail = result.error
@@ -16833,6 +17218,7 @@ export {
   runGit,
   sanitizeBranchSegment,
   shouldPreserveRunDir,
+  setupWorkspaceCheckpoints,
   computeRelayCloseReason,
   describeGitFailure,
   boundGitOutput,

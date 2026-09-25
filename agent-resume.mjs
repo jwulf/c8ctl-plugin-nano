@@ -31,11 +31,12 @@
 //     (which gets an ephemeral `nano/agent-work/<base>-<runId>` fallback that differs
 //     per activation) — all degrade to a transcript-only continuation (a full
 //     prior-branch resolve+checkout is the later increment).
-//   - UNCOMMITTED working-tree state is NOT recoverable unless the workspace/microVM
-//     persists across activations (the isolated-context increment). This increment
+//   - UNCOMMITTED working-tree state is NOT recoverable by this module. This module
 //     resumes from last-pushed commit + transcript and treats uncommitted deltas as
 //     lost. The resume preamble tells the agent this explicitly so it re-derives any
-//     uncommitted work rather than assuming it survived.
+//     uncommitted work rather than assuming it survived. WIP checkpoints
+//     (`agent-checkpoint.mjs`, NANO_AGENT_CHECKPOINT, default auto, #264) restore that state
+//     separately and append a note that supersedes this statement.
 //
 // Everything at the process edge (the SDK read) is injected, so the orchestration is
 // driven deterministically under `node --test` with an in-memory fake client. The

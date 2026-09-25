@@ -39,6 +39,14 @@ import { join } from 'node:path';
 export const CHECKPOINT_REF_PREFIX = 'refs/nano/wip/';
 export const CHECKPOINT_BASE_TRAILER = 'Nano-Checkpoint-Base';
 export const CHECKPOINT_RUN_TRAILER = 'Nano-Checkpoint-Run';
+// The RAW (unsanitized) base ref the run was provisioned against (e.g. `main` or
+// `feature/foo`). The generated per-run fallback branch embeds only the SANITIZED
+// base segment, and distinct real refs can sanitize identically (`feature/foo` and
+// `feature-foo` both become `feature-foo`), so the branch name alone cannot prove
+// two fallbacks share a base. Restore requires this unambiguous raw identity to
+// match before treating a per-run rename as benign; a snapshot that cannot prove
+// it (no trailer) is refused rather than patch-restored onto the wrong branch.
+export const CHECKPOINT_BASEREF_TRAILER = 'Nano-Checkpoint-BaseRef';
 // The symbolic branch HEAD was on when the snapshot was taken. Restore refuses to
 // FAST-restore (reset HEAD + recover commits) a snapshot whose branch differs from
 // the run's expected working branch, so off-branch commits can never be reset onto
@@ -367,7 +375,7 @@ const errText = (r) => redactUrlUserinfo((r?.stderr || r?.stdout || '').trim()).
 
 // Build a shadow commit of the working tree. Never writes the real index/refs.
 // Returns { sha, tree, head, excluded } or { skipped: reason }.
-export async function snapshotWorktree({ git, baseSha = '', runId = '', lastTree = null, maxFileBytes = DEFAULTS.maxFileBytes, secretValues = [], message = 'nano: WIP checkpoint' }) {
+export async function snapshotWorktree({ git, baseSha = '', baseRefName = '', runId = '', lastTree = null, maxFileBytes = DEFAULTS.maxFileBytes, secretValues = [], message = 'nano: WIP checkpoint' }) {
   const head = await git(['rev-parse', '--verify', '-q', 'HEAD']);
   // An UNBORN HEAD (a fresh clone of an empty repo, or before the agent's first
   // commit) has no HEAD commit, yet provisioning treats such a clone as pushable —
@@ -438,6 +446,10 @@ export async function snapshotWorktree({ git, baseSha = '', runId = '', lastTree
 
     const trailers = [
       baseSha ? `${CHECKPOINT_BASE_TRAILER}: ${baseSha}` : '',
+      // A ref name never contains whitespace, so a single-token value is the only
+      // valid shape — guard against anything else so a malformed value can neither
+      // inject an extra trailer line nor be silently truncated on read-back.
+      /^\S+$/.test(baseRefName) ? `${CHECKPOINT_BASEREF_TRAILER}: ${baseRefName}` : '',
       runId ? `${CHECKPOINT_RUN_TRAILER}: ${runId}` : '',
       symbolicBranch ? `${CHECKPOINT_BRANCH_TRAILER}: ${symbolicBranch}` : '',
     ].filter(Boolean).join('\n');
@@ -507,7 +519,7 @@ export async function fetchCheckpoint({ git, ref, remote = 'origin' }) {
   const msg = (await git(['log', '-1', '--format=%B', sha])).stdout || '';
   const trailer = (name) => (msg.match(new RegExp(`^${name}:[ \\t]*(\\S+)[ \\t]*$`, 'mi')) || [])[1] || '';
   const base = trailer(CHECKPOINT_BASE_TRAILER);
-  return { sha, parent, base: /^[0-9a-f]{7,64}$/.test(base) ? base : '', runId: trailer(CHECKPOINT_RUN_TRAILER), branch: trailer(CHECKPOINT_BRANCH_TRAILER) };
+  return { sha, parent, base: /^[0-9a-f]{7,64}$/.test(base) ? base : '', baseRef: trailer(CHECKPOINT_BASEREF_TRAILER), runId: trailer(CHECKPOINT_RUN_TRAILER), branch: trailer(CHECKPOINT_BRANCH_TRAILER) };
 }
 
 // Lay a fetched checkpoint down onto the fresh clone. HEAD stays on the current
@@ -515,8 +527,8 @@ export async function fetchCheckpoint({ git, ref, remote = 'origin' }) {
 // `expectedBranchEphemeral` marks the run's working branch as a per-run fallback
 // branch (`nano/agent-work/…-<runId>`), whose name necessarily differs from the
 // snapshot's every activation — a benign rename that must still recover WIP.
-export async function restoreCheckpoint({ git, checkpoint, expectedBranch = null, expectedBranchEphemeral = false }) {
-  const { sha, parent, base, branch, runId: snapshotRunId = '' } = checkpoint || {};
+export async function restoreCheckpoint({ git, checkpoint, expectedBranch = null, expectedBranchEphemeral = false, expectedBaseRef = '' }) {
+  const { sha, parent, base, branch, runId: snapshotRunId = '', baseRef: snapshotBaseRef = '' } = checkpoint || {};
   if (!sha) return { restored: false, reason: 'no-sha' };
   const head = out(await git(['rev-parse', '--verify', '-q', 'HEAD']));
   const status = await git(['status', '--porcelain']);
@@ -552,15 +564,23 @@ export async function restoreCheckpoint({ git, checkpoint, expectedBranch = null
   // branch under the same namespace+base (or a base that sanitizes identically), whose
   // off-branch commits must not be patch-restored onto — and then published on — this
   // run's work branch. Provisioning names the branch `nano/agent-work/<base>-<sanitize(runId)>`,
-  // so require BOTH the snapshot's <base> to equal this run's fallback <base> AND the
-  // snapshot's branch <runToken> to equal the sanitized run-token of the run that WROTE
-  // the snapshot (its own `runId` trailer, returned by `fetchCheckpoint`). That ties the
-  // branch to the prior activation's own provisioned fallback, not merely the prefix/base.
+  // so require the snapshot's branch <runToken> to equal the sanitized run-token of the run
+  // that WROTE the snapshot (its own `runId` trailer, returned by `fetchCheckpoint`).
+  //
+  // The sanitized `<base>` segment is AMBIGUOUS — distinct real refs (`feature/foo` vs
+  // `feature-foo`) collapse to the same segment — so matching it cannot prove the two
+  // fallbacks share a base and a colliding snapshot could be patch-restored onto the wrong
+  // branch. Require the UNAMBIGUOUS raw base identity instead: the snapshot's recorded raw
+  // `baseRef` trailer must equal this run's `expectedBaseRef`. A snapshot with no baseRef
+  // trailer (identity unprovable) can only satisfy this against an equally-empty base — a
+  // real (non-empty) base ref never matches an empty one, so an unprovable snapshot is
+  // refused rather than restored across a base boundary.
   const snapParts = fallbackBranchParts(branch);
   const expParts = fallbackBranchParts(expectedBranch);
   const fallbackRename = branchMismatch && expectedBranchEphemeral === true
     && snapParts !== null && expParts !== null
     && snapParts.base === expParts.base
+    && snapshotBaseRef === expectedBaseRef
     && snapParts.token === sanitizeBranchSegment(snapshotRunId);
   const branchGuardRefused = branchMismatch && !fallbackRename;
 
@@ -644,14 +664,14 @@ export async function restoreCheckpoint({ git, checkpoint, expectedBranch = null
 // blind-clobbering could overwrite a genuinely newer run's WIP). Once we prove the
 // ref's state (a successful push or a legitimate take-over) the blind window ends
 // and a later lease rejection disables normally.
-export function createWorkspaceCheckpoint({ git, ref, baseSha = '', runId = '', expectSha = '', priorRunId = '', startupFetchFailed = false, maxFileBytes, secretValues = [], message, now = () => Date.now() }) {
+export function createWorkspaceCheckpoint({ git, ref, baseSha = '', baseRefName = '', runId = '', expectSha = '', priorRunId = '', startupFetchFailed = false, maxFileBytes, secretValues = [], message, now = () => Date.now() }) {
   let lastTree = null;
   let remoteSha = expectSha;
   let disabled = null;
   let established = !startupFetchFailed;
   return async function checkpoint(reason = 'manual') {
     if (disabled) return { skipped: `disabled: ${disabled}` };
-    const snap = await snapshotWorktree({ git, baseSha, runId, lastTree, maxFileBytes, secretValues, message: `${message || 'nano: WIP checkpoint'} (${reason})` });
+    const snap = await snapshotWorktree({ git, baseSha, baseRefName, runId, lastTree, maxFileBytes, secretValues, message: `${message || 'nano: WIP checkpoint'} (${reason})` });
     if (!snap.sha) return snap;
     let pushed = await pushCheckpoint({ git, ref, sha: snap.sha, expectSha: remoteSha });
     if (!pushed.ok && pushed.kind === 'lease') {

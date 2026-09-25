@@ -5443,7 +5443,7 @@ async function setupWorkspaceCheckpoints({ provisioned, envelope = null, token =
       log.warn(`could not fetch WIP checkpoint ${ref} — ${oneLineLog(err?.message || err)}; starting without it.`);
     }
     if (prior) {
-      const r = await restoreCp({ git: startupGit, checkpoint: prior, expectedBranch: provisioned.workingBranch || null, expectedBranchEphemeral: provisioned.fallbackBranch === true });
+      const r = await restoreCp({ git: startupGit, checkpoint: prior, expectedBranch: provisioned.workingBranch || null, expectedBranchEphemeral: provisioned.fallbackBranch === true, expectedBaseRef: provisioned.baseBranch || '' });
       if (r?.restored) {
         restored = r;
         logger.info?.(`${prefix} (${corr}): restored WIP checkpoint ${ref}@${prior.sha.slice(0, 12)} (${r.mode}${r.commitsRecovered ? ', local commits recovered' : ''}) as uncommitted changes.`);
@@ -5551,6 +5551,10 @@ async function setupWorkspaceCheckpoints({ provisioned, envelope = null, token =
       git,
       ref,
       baseSha: provisioned.startSha || '',
+      // The RAW base ref this run was provisioned against — recorded UNSANITIZED so a
+      // later restore can prove two per-run fallbacks share a base without relying on
+      // the ambiguous sanitized branch segment (see CHECKPOINT_BASEREF_TRAILER).
+      baseRefName: provisioned.baseBranch || '',
       runId: String(runId || ''),
       // When a prior snapshot EXISTED but could NOT be restored (branch-mismatch /
       // detached refusal, or a diverged patch that did not apply), its content lives

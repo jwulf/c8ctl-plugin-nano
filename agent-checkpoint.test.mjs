@@ -303,7 +303,7 @@ test('restore recovers WIP across a per-run fallback branch rename via a non-res
     sh(a.dir, 'add', '-A');
     sh(a.dir, 'commit', '-q', '-m', 'run1 commit');
     writeFileSync(join(a.dir, 'wip.txt'), 'uncommitted wip\n');
-    const res = await createWorkspaceCheckpoint({ git: a.git, ref, baseSha: base, runId: '11111111-1111-4111-8111-111111111111' })('tool');
+    const res = await createWorkspaceCheckpoint({ git: a.git, ref, baseSha: base, baseRefName: 'main', runId: '11111111-1111-4111-8111-111111111111' })('tool');
     assert.ok(res.sha, JSON.stringify(res));
 
     const fetched = await fetchCheckpoint({ git: f.clone('probe').git, ref });
@@ -315,7 +315,7 @@ test('restore recovers WIP across a per-run fallback branch rename via a non-res
     // PATCH restore, recovering the WIP instead of stranding it (issues from round 8).
     const b = f.clone('b');
     sh(b.dir, 'checkout', '-q', '-b', 'nano/agent-work/main-22222222-2222-4222-8222-222222222222');
-    const restored = await restoreCheckpoint({ git: b.git, checkpoint: fetched, expectedBranch: 'nano/agent-work/main-22222222-2222-4222-8222-222222222222', expectedBranchEphemeral: true });
+    const restored = await restoreCheckpoint({ git: b.git, checkpoint: fetched, expectedBranch: 'nano/agent-work/main-22222222-2222-4222-8222-222222222222', expectedBranchEphemeral: true, expectedBaseRef: 'main' });
     assert.equal(restored.restored, true, JSON.stringify(restored));
     assert.equal(restored.mode, 'patch');
     assert.equal(readFileSync(join(b.dir, 'feature.txt'), 'utf8'), 'committed work\n');
@@ -374,14 +374,14 @@ test('restore refuses an UNRELATED branch under the fallback namespace (prefix a
     sh(a2.dir, 'add', '-A'); sh(a2.dir, 'commit', '-q', '-m', 'gen commit');
     writeFileSync(join(a2.dir, 'wip.txt'), 'gen wip\n');
     const ref2 = checkpointRef('43y');
-    const gres = await createWorkspaceCheckpoint({ git: a2.git, ref: ref2, baseSha: base, runId: '55555555-5555-4555-8555-555555555555' })('tool');
+    const gres = await createWorkspaceCheckpoint({ git: a2.git, ref: ref2, baseSha: base, baseRefName: 'main', runId: '55555555-5555-4555-8555-555555555555' })('tool');
     assert.ok(gres.sha, JSON.stringify(gres));
     // Re-activation: a FRESH clone (post-checkpoint) fetches the ref into its own repo,
     // then restores — mirroring the real setup flow (fetch + restore on the same repo).
     const c = f.clone('c');
     sh(c.dir, 'checkout', '-q', '-b', 'nano/agent-work/main-44444444-4444-4444-8444-444444444444');
     const gfetched = await fetchCheckpoint({ git: c.git, ref: ref2 });
-    const ok2 = await restoreCheckpoint({ git: c.git, checkpoint: gfetched, expectedBranch: 'nano/agent-work/main-44444444-4444-4444-8444-444444444444', expectedBranchEphemeral: true });
+    const ok2 = await restoreCheckpoint({ git: c.git, checkpoint: gfetched, expectedBranch: 'nano/agent-work/main-44444444-4444-4444-8444-444444444444', expectedBranchEphemeral: true, expectedBaseRef: 'main' });
     assert.equal(ok2.restored, true, JSON.stringify(ok2));
     assert.equal(ok2.mode, 'patch');
   } finally { f.cleanup(); }
@@ -420,6 +420,50 @@ test('restore refuses a DIFFERENT same-base generated fallback branch (run-token
     assert.equal(blocked.restored, false, JSON.stringify(blocked));
     assert.equal(blocked.branchMismatch, true);
     assert.equal(sh(f.root, '--git-dir', f.remote, 'rev-parse', ref), res.sha);
+  } finally { f.cleanup(); }
+});
+
+test('restore refuses a fallback whose sanitized base COLLIDES but raw base ref differs', async () => {
+  const f = fixture();
+  try {
+    const ref = checkpointRef('43c');
+    const a = f.clone('a');
+    const base = sh(a.dir, 'rev-parse', 'HEAD');
+    // Run 1 was provisioned off the RAW base `feature/foo`, whose branch segment
+    // sanitizes to `feature-foo`. It committed work on its per-run fallback and left
+    // WIP. The snapshot records baseRef=`feature/foo` and run-token uuidD.
+    sh(a.dir, 'checkout', '-q', '-b', 'nano/agent-work/feature-foo-dddddddd-dddd-4ddd-8ddd-dddddddddddd');
+    writeFileSync(join(a.dir, 'feature.txt'), 'foo-slash work\n');
+    sh(a.dir, 'add', '-A');
+    sh(a.dir, 'commit', '-q', '-m', 'foo/slash commit');
+    writeFileSync(join(a.dir, 'wip.txt'), 'foo-slash wip\n');
+    const res = await createWorkspaceCheckpoint({ git: a.git, ref, baseSha: base, baseRefName: 'feature/foo', runId: 'dddddddd-dddd-4ddd-8ddd-dddddddddddd' })('tool');
+    assert.ok(res.sha, JSON.stringify(res));
+    const fetched = await fetchCheckpoint({ git: f.clone('probe').git, ref });
+    assert.equal(fetched.branch, 'nano/agent-work/feature-foo-dddddddd-dddd-4ddd-8ddd-dddddddddddd');
+    assert.equal(fetched.baseRef, 'feature/foo');
+
+    // Run 2 is a DIFFERENT job off the RAW base `feature-foo` (a genuinely distinct ref
+    // that sanitizes IDENTICALLY to `feature-foo`). The sanitized branch segments and the
+    // run-token both line up, so only the unambiguous raw base identity distinguishes
+    // them — restore must refuse rather than patch the wrong base's WIP onto this branch.
+    const b = f.clone('b');
+    const gen = 'nano/agent-work/feature-foo-eeeeeeee-eeee-4eee-8eee-eeeeeeeeeeee';
+    sh(b.dir, 'checkout', '-q', '-b', gen);
+    const blocked = await restoreCheckpoint({ git: b.git, checkpoint: fetched, expectedBranch: gen, expectedBranchEphemeral: true, expectedBaseRef: 'feature-foo' });
+    assert.equal(blocked.restored, false, JSON.stringify(blocked));
+    assert.equal(blocked.branchMismatch, true);
+    assert.equal(sh(f.root, '--git-dir', f.remote, 'rev-parse', ref), res.sha);
+
+    // Positive control: the SAME raw base ref (`feature/foo`) proves identity, so the
+    // benign per-run rename recovers — confirming the refusal above is the base-ref
+    // mismatch alone, not some unrelated guard.
+    const c = f.clone('c');
+    sh(c.dir, 'checkout', '-q', '-b', gen);
+    const cfetched = await fetchCheckpoint({ git: c.git, ref });
+    const okc = await restoreCheckpoint({ git: c.git, checkpoint: cfetched, expectedBranch: gen, expectedBranchEphemeral: true, expectedBaseRef: 'feature/foo' });
+    assert.equal(okc.restored, true, JSON.stringify(okc));
+    assert.equal(okc.mode, 'patch');
   } finally { f.cleanup(); }
 });
 

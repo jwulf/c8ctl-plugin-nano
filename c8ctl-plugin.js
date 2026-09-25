@@ -10734,7 +10734,12 @@ async function workAgent(req, flags, ctx) {
           // stopped; on a successful run with no branch commit (or a crash before
           // job.complete is acked) the retained WIP ref then still holds the latest
           // work rather than only the last periodic checkpoint (advisory 10713).
-          if (checkpointer && result.ok) { await checkpointer.flush('final'); checkpointFinalized = true; }
+          // `flush` is bounded by a timeout, so it can RETURN while its snapshot is
+          // still queued/in-flight; that snapshot reads the same workspace/HEAD that
+          // finalizeGit is about to commit and push. DRAIN the scheduler (stop()
+          // resolves once the in-flight checkpoint chain settles) before finalizeGit
+          // so finalization never races a late snapshot (thread 4099675063).
+          if (checkpointer && result.ok) { await checkpointer.flush('final'); await checkpointer.stop(); checkpointFinalized = true; }
 
           // Finalize git only when the harness succeeded — never push a
           // half-finished workspace.

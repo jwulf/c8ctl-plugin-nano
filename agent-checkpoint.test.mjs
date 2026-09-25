@@ -579,6 +579,11 @@ test('job handler wires checkpoints: notify on ACP updates, flush on abort/failu
   const finalize = src.indexOf('gitResult = finalizeGit({', stop);
   const decide = i('discardCheckpointOnAck = Boolean(checkpointing && result.ok');
   assert.ok(setup < note && note < notify && notify < abort && abort < failed && failed < stop && stop < finalize && finalize < decide);
+  // #264 (review thread 4099675063): the final flush is timeout-bounded, so the
+  // scheduler must be DRAINED (stop() awaits the in-flight checkpoint chain)
+  // before finalizeGit touches the workspace — otherwise finalization can race a
+  // late snapshot reading the same HEAD/index.
+  assert.ok(src.slice(stop, finalize).includes("flush('final'); await checkpointer.stop();"), 'the checkpointer is drained (stop) after the final flush, before finalizeGit');
   // #264 (review): the ref is discarded only when the branch was ACTUALLY pushed,
   // and the exception path takes a last-chance `failed` flush before close().
   assert.ok(src.slice(decide, decide + 200).includes('gitResult?.pushed'), 'discard requires a successful branch push');

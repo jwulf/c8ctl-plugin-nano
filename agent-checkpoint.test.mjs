@@ -5,7 +5,7 @@ import { tmpdir } from 'node:os';
 import { join } from 'node:path';
 import { spawnSync } from 'node:child_process';
 import {
-  checkpointConfig, checkpointRef, checkpointEligibility, classifyPushFailure, containsSecret, normalizeSecretValues, shouldSweep, sweepStaleCheckpoints, isDeniedPath, isCheckpointTrigger, createGitRunner,
+  checkpointConfig, checkpointRef, checkpointEligibility, classifyPushFailure, containsSecret, normalizeSecretValues, credentialsFromUrl, shouldSweep, sweepStaleCheckpoints, isDeniedPath, isCheckpointTrigger, createGitRunner,
   snapshotWorktree, pushCheckpoint, fetchCheckpoint, restoreCheckpoint, deleteCheckpointRef, redactUrlUserinfo,
   createWorkspaceCheckpoint, createCheckpointer, withCheckpointNote,
 } from './agent-checkpoint.mjs';
@@ -386,6 +386,63 @@ test('a transient push after the server accepted our checkpoint is recovered via
   assert.ok(r2.sha && !r2.skipped, JSON.stringify(r2));
 });
 
+test('blind start (setup fetch failed) does not permanently disable on an initial lease conflict', async () => {
+  const f = fixture();
+  try {
+    const ref = checkpointRef('99');
+    // An earlier activation owns the ref (runId 'run-old').
+    const old = f.clone('old');
+    const base = sh(old.dir, 'rev-parse', 'HEAD');
+    writeFileSync(join(old.dir, 'x.txt'), 'old\n');
+    assert.ok((await createWorkspaceCheckpoint({ git: old.git, ref, baseSha: base, runId: 'run-old' })('tool')).sha);
+    const ownerSha = sh(f.root, '--git-dir', f.remote, 'rev-parse', ref);
+
+    // A new activation whose SETUP fetch threw: it holds no prior identity
+    // (expectSha='' / priorRunId='') and never restored. Its first push is
+    // lease-rejected because the ref already exists, and the re-read shows a
+    // FOREIGN run owns it — but a blind start must NOT permanently disable.
+    const blind = f.clone('blind');
+    writeFileSync(join(blind.dir, 'x.txt'), 'new\n');
+    const take = createWorkspaceCheckpoint({ git: blind.git, ref, baseSha: base, runId: 'run-new', startupFetchFailed: true });
+    const r1 = await take('tool');
+    assert.equal(r1.kind, 'lease', JSON.stringify(r1));
+    assert.equal(r1.rejected, true);
+    assert.equal(r1.retryable, true);
+    assert.ok(!r1.disabled, 'a blind-start lease conflict must not disable checkpointing');
+    // A later trigger retries (still rejected) rather than short-circuiting on a
+    // latched `disabled` — and never clobbers the foreign owner's ref.
+    writeFileSync(join(blind.dir, 'x.txt'), 'new2\n');
+    const r2 = await take('tool');
+    assert.ok(!r2.skipped?.startsWith('disabled'), JSON.stringify(r2));
+    assert.equal(r2.retryable, true);
+    assert.equal(sh(f.root, '--git-dir', f.remote, 'rev-parse', ref), ownerSha);
+  } finally { f.cleanup(); }
+});
+
+test('credentialsFromUrl extracts URL userinfo (raw + decoded), ignores credential-less / non-http URLs', () => {
+  assert.deepEqual(credentialsFromUrl('https://user:p%40ss@github.com/o/r.git').sort(), ['p%40ss', 'p@ss', 'user'].sort());
+  assert.deepEqual(credentialsFromUrl('https://x-access-token:ghp_abc123@github.com/o/r.git').sort(), ['ghp_abc123', 'x-access-token'].sort());
+  assert.deepEqual(credentialsFromUrl('https://github.com/o/r.git'), []);
+  assert.deepEqual(credentialsFromUrl('git@github.com:o/r.git'), []);
+  assert.deepEqual(credentialsFromUrl(''), []);
+  assert.deepEqual(credentialsFromUrl(null), []);
+});
+
+test('createGitRunner is cancellable: an aborted signal fails ops fast without touching the workspace', async () => {
+  const f = fixture();
+  try {
+    const { dir } = f.clone('c');
+    const ac = new AbortController();
+    const git = createGitRunner({ cwd: dir, env: ENV, signal: ac.signal });
+    assert.equal((await git(['rev-parse', '--verify', 'HEAD'])).status, 0);
+    ac.abort();
+    // After abort every op fails fast (never status 0) so a bounded background
+    // task unwinds instead of running git against a workspace being reaped.
+    const r = await git(['rev-parse', '--verify', 'HEAD']);
+    assert.notEqual(r.status, 0);
+  } finally { f.cleanup(); }
+});
+
 test('GC deletes TTL-expired and terminal-element refs, keeps own/unknown/fresh ones', async () => {
   const f = fixture();
   try {
@@ -536,6 +593,31 @@ test('setupWorkspaceCheckpoints: auto skips ineligible jobs; off / no elementIns
   assert.equal(await setupWorkspaceCheckpoints({ provisioned, job: { jobKey: '1' }, jobType: 't', runId: 'r', logger, env: { NANO_AGENT_CHECKPOINT: 'on' } }), null);
   assert.match(logger.lines.warn[0], /no usable elementInstanceKey/);
   assert.equal(await setupWorkspaceCheckpoints({ provisioned: null, job: { jobKey: '1', elementInstanceKey: '2' }, jobType: 't', runId: 'r', logger, env: { NANO_AGENT_CHECKPOINT: 'on' } }), null);
+});
+
+test('setupWorkspaceCheckpoints: hasUncommittedChanges / priorNotRestored gate ref discard', async () => {
+  const f = fixture();
+  try {
+    const env = { NANO_AGENT_CHECKPOINT: 'on', NANO_AGENT_CHECKPOINT_INTERVAL_MS: '0' };
+    const provision = (name) => {
+      const { dir } = f.clone(name);
+      return { workspaceDir: dir, gitEnv: ENV, committer: {}, startSha: sh(dir, 'rev-parse', 'HEAD'), workingBranch: 'nano/agent-work/main-x' };
+    };
+    // No prior ref, clean tree → safe to discard (nothing uncommitted, none unrestored).
+    const clean = provision('clean');
+    const sc = await setupWorkspaceCheckpoints({ provisioned: clean, job: { jobKey: '1', elementInstanceKey: '900' }, jobType: 't', runId: 'r', logger: quietLogger(), env, deps: { sweepRegistry: new Map() } });
+    assert.equal(await sc.hasUncommittedChanges(), false);
+    assert.equal(sc.priorNotRestored, false);
+    await sc.close();
+
+    // An uncommitted (restored-but-not-committed) working delta → NOT safe: the ref
+    // is the only durable copy, so the discard gate must keep it.
+    const dirty = provision('dirty');
+    const sd = await setupWorkspaceCheckpoints({ provisioned: dirty, job: { jobKey: '2', elementInstanceKey: '901' }, jobType: 't', runId: 'r', logger: quietLogger(), env, deps: { sweepRegistry: new Map() } });
+    writeFileSync(join(dirty.workspaceDir, 'restored.txt'), 'recovered but uncommitted\n');
+    assert.equal(await sd.hasUncommittedChanges(), true);
+    await sd.close();
+  } finally { f.cleanup(); }
 });
 
 test('setupWorkspaceCheckpoints: checkpoint → variable → restore on the next activation → discard', async () => {

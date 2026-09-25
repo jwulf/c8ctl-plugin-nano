@@ -111,6 +111,28 @@ export function containsSecret(text, secretValues = []) {
   return SECRET_CONTENT_PATTERNS.some((re) => re.test(t));
 }
 
+// Extract any credentials embedded in a remote URL's userinfo (`user:pass@host`).
+// Provisioning deliberately preserves author-supplied userinfo in the origin URL,
+// and for such credential-bearing URLs no separate repo token exists — so the URL
+// password would otherwise never be in the checkpoint secret-scan set and a changed
+// file echoing it could enter the readable WIP ref. Returns the password (and
+// username), in BOTH raw and percent-decoded forms, so a file containing either the
+// encoded or decoded credential is excluded. Non-HTTP(S) / userinfo-less URLs yield [].
+export function credentialsFromUrl(url) {
+  const s = typeof url === 'string' ? url.trim() : '';
+  if (!s) return [];
+  let u;
+  try { u = new URL(s); } catch { return []; }
+  if (!/^https?:$/i.test(u.protocol)) return [];
+  const out = new Set();
+  for (const raw of [u.password, u.username]) {
+    if (!raw) continue;
+    out.add(raw);
+    try { const dec = decodeURIComponent(raw); if (dec) out.add(dec); } catch { /* leave raw */ }
+  }
+  return [...out];
+}
+
 const truthy = (v) => /^(1|on|true|yes)$/i.test(String(v ?? '').trim());
 const intOr = (v, dflt) => {
   const n = Number.parseInt(String(v ?? ''), 10);
@@ -172,11 +194,20 @@ export function checkpointRef(elementInstanceKey) {
 const CRED_SUPPRESS = ['-c', 'credential.helper='];
 
 // Async git runner: `git(args, { env?, input? })` → { status, stdout, stderr }.
-export function createGitRunner({ cwd, env = process.env, timeoutMs = DEFAULTS.gitTimeoutMs } = {}) {
+// An optional `signal` (AbortSignal) makes the runner CANCELLABLE: once it aborts,
+// any in-flight child is killed and every subsequent invocation fails fast instead
+// of spawning. This lets a bounded background job (e.g. the GC sweep) be TORN DOWN
+// deterministically rather than abandoned to keep running git against a workspace
+// the caller is about to reap.
+export function createGitRunner({ cwd, env = process.env, timeoutMs = DEFAULTS.gitTimeoutMs, signal } = {}) {
   return (args, opts = {}) => new Promise((resolve) => {
+    if (signal?.aborted) {
+      resolve({ status: null, stdout: '', stderr: '[aborted]' });
+      return;
+    }
     let child;
     try {
-      child = spawn('git', [...CRED_SUPPRESS, ...args], { cwd, env: { ...env, ...(opts.env || {}) }, stdio: ['pipe', 'pipe', 'pipe'] });
+      child = spawn('git', [...CRED_SUPPRESS, ...args], { cwd, env: { ...env, ...(opts.env || {}) }, stdio: ['pipe', 'pipe', 'pipe'], signal });
     } catch (err) {
       resolve({ status: null, stdout: '', stderr: String(err?.message || err) });
       return;
@@ -365,10 +396,21 @@ export async function restoreCheckpoint({ git, checkpoint }) {
 // push error after the server had already accepted our checkpoint left our
 // `remoteSha` stale) — we take over from it; if it was moved by any other run,
 // a newer owner exists and we stop writing.
-export function createWorkspaceCheckpoint({ git, ref, baseSha = '', runId = '', expectSha = '', priorRunId = '', maxFileBytes, secretValues = [], message, now = () => Date.now() }) {
+//
+// `startupFetchFailed` marks a BLIND START: the setup-time `fetchCheckpoint`
+// threw, so we hold no `priorRunId` and could not restore the existing ref. An
+// existing ref then rejects our first `--force-with-lease=ref:''` push, but that
+// rejection is NOT proof a newer run owns it — it may simply be the ref we failed
+// to read. Per the documented retry-on-next-trigger contract, treat that initial
+// conflict as RETRYABLE rather than permanently disabling (and never clobber it:
+// blind-clobbering could overwrite a genuinely newer run's WIP). Once we prove the
+// ref's state (a successful push or a legitimate take-over) the blind window ends
+// and a later lease rejection disables normally.
+export function createWorkspaceCheckpoint({ git, ref, baseSha = '', runId = '', expectSha = '', priorRunId = '', startupFetchFailed = false, maxFileBytes, secretValues = [], message, now = () => Date.now() }) {
   let lastTree = null;
   let remoteSha = expectSha;
   let disabled = null;
+  let established = !startupFetchFailed;
   return async function checkpoint(reason = 'manual') {
     if (disabled) return { skipped: `disabled: ${disabled}` };
     const snap = await snapshotWorktree({ git, baseSha, runId, lastTree, maxFileBytes, secretValues, message: `${message || 'nano: WIP checkpoint'} (${reason})` });
@@ -385,13 +427,22 @@ export function createWorkspaceCheckpoint({ git, ref, baseSha = '', runId = '', 
     }
     if (!pushed.ok) {
       // Retrying would fail the same way for everything but a transient error.
-      if (pushed.kind === 'lease') disabled = 'lease rejected (ref moved by a newer run)';
+      if (pushed.kind === 'lease') {
+        if (!established) {
+          // Blind start: a transient setup fetch left us unable to read/own the
+          // ref. Don't disable — retry on the next trigger (the fetch may recover
+          // and a legitimate owner emerge); clobbering could destroy a newer run's WIP.
+          return { skipped: `push failed (lease, blind start): ${pushed.error}`, kind: 'lease', rejected: true, retryable: true, disabled: null };
+        }
+        disabled = 'lease rejected (ref moved by a newer run)';
+      }
       else if (pushed.kind === 'policy') disabled = `remote refused the push (repository rule / push protection): ${pushed.error}`;
       else if (pushed.kind === 'auth') disabled = `no permission to push ${ref}: ${pushed.error}`;
       return { skipped: `push failed (${pushed.kind}): ${pushed.error}`, kind: pushed.kind, rejected: pushed.kind === 'lease', disabled: disabled || null };
     }
     lastTree = { tree: snap.tree, head: snap.head };
     remoteSha = snap.sha;
+    established = true;
     return { ref, sha: snap.sha, head: snap.head, at: new Date(now()).toISOString(), reason, excluded: snap.excluded };
   };
 }

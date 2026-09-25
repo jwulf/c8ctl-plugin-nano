@@ -43,6 +43,15 @@ export const CHECKPOINT_RUN_TRAILER = 'Nano-Checkpoint-Run';
 // the run's expected working branch, so off-branch commits can never be reset onto
 // — and later pushed by finalizeGit to — the wrong branch.
 export const CHECKPOINT_BRANCH_TRAILER = 'Nano-Checkpoint-Branch';
+// Explicit "HEAD was detached" identity, recorded (instead of an OMITTED trailer)
+// when a snapshot is taken off any branch. The `:` makes it an impossible git
+// branch name, so it can never equal a real `expectedBranch` and always trips the
+// branch-identity guard — a detached snapshot's `parent` may still be an ancestor
+// of the run's work-branch tip, so without this it would masquerade as a legacy
+// trailerless snapshot and be fast-restored (resetting the work branch onto the
+// off-branch commit). Legacy snapshots (created before this trailer existed) carry
+// NO trailer at all and keep the prior ancestry-only behaviour.
+export const CHECKPOINT_DETACHED_MARKER = 'HEAD:detached';
 
 const DEFAULTS = Object.freeze({
   minIntervalMs: 60_000,
@@ -269,10 +278,12 @@ export async function snapshotWorktree({ git, baseSha = '', runId = '', lastTree
   const head = await git(['rev-parse', '--verify', '-q', 'HEAD']);
   if (!ok(head)) return { skipped: 'no-head' };
   const headSha = out(head);
-  // The symbolic branch HEAD is on right now (empty when detached). Recorded so a
-  // later restore can refuse to fast-restore a snapshot taken on a DIFFERENT branch
-  // (which would otherwise reset the work branch to off-branch commits).
-  const symbolicBranch = out(await git(['symbolic-ref', '--short', '-q', 'HEAD']));
+  // The symbolic branch HEAD is on right now. When HEAD is DETACHED there is no
+  // branch, so we record an explicit detached marker (not an omitted trailer):
+  // that distinguishes a genuinely off-branch snapshot from a legacy trailerless
+  // one, so a later restore refuses to fast-restore it onto the run's work branch
+  // (which would otherwise reset the work branch to the detached/off-branch commit).
+  const symbolicBranch = out(await git(['symbolic-ref', '--short', '-q', 'HEAD'])) || CHECKPOINT_DETACHED_MARKER;
   const dir = mkdtempSync(join(tmpdir(), 'nano-ckpt-'));
   const env = { GIT_INDEX_FILE: join(dir, 'index') };
   try {
@@ -396,14 +407,15 @@ export async function restoreCheckpoint({ git, checkpoint, expectedBranch = null
   const status = await git(['status', '--porcelain']);
   if (!ok(status) || out(status)) return { restored: false, reason: 'workspace-dirty' };
 
-  // Branch-identity guard: a snapshot records the symbolic branch HEAD was on. If
-  // it was taken on a DIFFERENT branch than this run's expected working branch, its
-  // `parent` may descend from the work-branch tip yet carry off-branch commits.
-  // Fast-restoring would reset the work branch to that off-branch commit and let a
-  // later `finalizeGit` push it to the wrong branch (bypassing branch-mismatch
-  // protection). Refuse fast restoration across branch identities and retain the
-  // checkpoint for explicit recovery. (Legacy snapshots carry no branch trailer —
-  // `branch` empty — and keep the prior ancestry-only behaviour.)
+  // Branch-identity guard: a snapshot records the symbolic branch HEAD was on (or an
+  // explicit detached marker). If it was taken on a DIFFERENT branch — or DETACHED —
+  // relative to this run's expected working branch, its `parent` may descend from the
+  // work-branch tip yet carry off-branch/detached commits. Fast-restoring would reset
+  // the work branch to that commit and let a later `finalizeGit` push it to the wrong
+  // branch (bypassing branch-mismatch protection). Refuse fast restoration across
+  // branch identities and retain the checkpoint for explicit recovery. (Legacy
+  // snapshots carry no branch trailer — `branch` empty — and keep the prior
+  // ancestry-only behaviour; the detached marker can never equal a real branch name.)
   const branchMismatch = Boolean(branch) && Boolean(expectedBranch) && branch !== expectedBranch;
 
   const fast = !branchMismatch && ok(await git(['merge-base', '--is-ancestor', head, parent]));
@@ -419,7 +431,10 @@ export async function restoreCheckpoint({ git, checkpoint, expectedBranch = null
 
   // A branch-mismatched snapshot must NOT be commit-recovered onto this branch; its
   // work lives only on the ref and is left there for explicit, human recovery.
-  if (branchMismatch) return { restored: false, reason: `branch-mismatch (snapshot on '${branch}', expected '${expectedBranch}')`, branchMismatch: true };
+  if (branchMismatch) {
+    const where = branch === CHECKPOINT_DETACHED_MARKER ? 'a detached HEAD' : `'${branch}'`;
+    return { restored: false, reason: `branch-mismatch (snapshot on ${where}, expected '${expectedBranch}')`, branchMismatch: true };
+  }
 
   // The fresh clone moved past the prior run's base (e.g. main advanced and the
   // job cuts a per-run fallback branch): replay base→snapshot as a patch.

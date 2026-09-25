@@ -6,7 +6,7 @@ import { join } from 'node:path';
 import { spawnSync } from 'node:child_process';
 import {
   checkpointConfig, checkpointRef, checkpointEligibility, classifyPushFailure, containsSecret, normalizeSecretValues, credentialsFromUrl, isAuthenticatedRemote, shouldSweep, sweepStaleCheckpoints, isDeniedPath, isCheckpointTrigger, createGitRunner,
-  snapshotWorktree, pushCheckpoint, fetchCheckpoint, restoreCheckpoint, deleteCheckpointRef, redactUrlUserinfo,
+  snapshotWorktree, pushCheckpoint, fetchCheckpoint, restoreCheckpoint, deleteCheckpointRef, redactUrlUserinfo, CHECKPOINT_DETACHED_MARKER,
   createWorkspaceCheckpoint, createCheckpointer, withCheckpointNote,
 } from './agent-checkpoint.mjs';
 
@@ -247,6 +247,46 @@ test('restore refuses to fast-restore a snapshot taken on a different branch', a
     const d = f.clone('d');
     const legacy = await restoreCheckpoint({ git: d.git, checkpoint: fetched });
     assert.equal(legacy.restored, true, JSON.stringify(legacy));
+  } finally { f.cleanup(); }
+});
+
+test('restore refuses to fast-restore a snapshot taken on a DETACHED HEAD', async () => {
+  const f = fixture();
+  try {
+    const ref = checkpointRef('43d');
+    const a = f.clone('a');
+    // The agent wandered off onto a detached HEAD: it detaches, commits there
+    // (descending from the shared base / work-branch tip), and gets interrupted.
+    sh(a.dir, 'checkout', '-q', '--detach');
+    writeFileSync(join(a.dir, 'off.txt'), 'detached work\n');
+    sh(a.dir, 'add', '-A');
+    sh(a.dir, 'commit', '-q', '-m', 'detached commit');
+    const base = sh(a.dir, 'rev-parse', 'HEAD~1');
+    writeFileSync(join(a.dir, 'wip.txt'), 'wip\n');
+    const res = await createWorkspaceCheckpoint({ git: a.git, ref, baseSha: base })('tool');
+    assert.ok(res.sha, JSON.stringify(res));
+
+    // A detached snapshot records an explicit detached marker (NOT an omitted
+    // trailer) so restore can tell it apart from a legacy trailerless snapshot.
+    const fetched = await fetchCheckpoint({ git: f.clone('probe').git, ref });
+    assert.equal(fetched.branch, CHECKPOINT_DETACHED_MARKER);
+
+    // A fresh run on work branch 'main' must NOT fast-restore the detached snapshot
+    // even though its parent is an ancestor of HEAD — that would reset 'main' to the
+    // off-branch/detached commit and let finalizeGit publish it. Refuse and retain.
+    const b = f.clone('b');
+    const mismatch = await restoreCheckpoint({ git: b.git, checkpoint: fetched, expectedBranch: 'main' });
+    assert.equal(mismatch.restored, false, JSON.stringify(mismatch));
+    assert.equal(mismatch.branchMismatch, true);
+    assert.match(mismatch.reason, /detached HEAD/);
+    assert.ok(!existsSync(join(b.dir, 'off.txt')));
+    assert.equal(sh(f.root, '--git-dir', f.remote, 'rev-parse', ref), res.sha);
+
+    // A legacy caller (no expectedBranch) keeps the prior ancestry-only fast path.
+    const c = f.clone('c');
+    const legacy = await restoreCheckpoint({ git: c.git, checkpoint: fetched });
+    assert.equal(legacy.restored, true, JSON.stringify(legacy));
+    assert.equal(legacy.mode, 'fast-forward');
   } finally { f.cleanup(); }
 });
 
@@ -775,7 +815,14 @@ test('job handler wires checkpoints: notify on ACP updates, flush on abort/failu
   const src = readFileSync(new URL('./c8ctl-plugin.js', import.meta.url), 'utf8');
   const i = (s) => { const at = src.indexOf(s); assert.ok(at >= 0, `missing: ${s}`); return at; };
   const setup = i('await setupWorkspaceCheckpoints({ provisioned, envelope, token: repoToken, secretValues: Object.values(resolved');
+  // #264 (review thread 4100... previously-missed): setup does cancellable git work
+  // and may start GC + a checkpointer, so it takes the runner's abortSignal and is
+  // followed by an abort gate before the relay/harness opens.
+  assert.ok(src.slice(setup, setup + 400).includes('abortSignal }'), 'setup receives the runner abortSignal');
+  const cancelGate = src.indexOf("checkSetupAbort(abortSignal, { jobType, jobKey: job.jobKey, stage: 'relay-open', logger }))", setup);
+  assert.ok(cancelGate > setup, 'an abort gate runs after checkpoint setup, before the relay/harness');
   const note = i('effectiveEnvelope = withCheckpointNote(effectiveEnvelope, checkpointing.restored)');
+  assert.ok(cancelGate < note, 'the abort gate precedes wiring the restored note into the envelope');
   const notify = i('checkpointer?.notify(u)');
   const abort = i("await checkpointer.flush('abort'");
   const failed = i("await checkpointer.flush('failed'");
@@ -798,7 +845,8 @@ test('job handler wires checkpoints: notify on ACP updates, flush on abort/failu
   assert.ok(discard < src.indexOf('return settled;', discard));
   assert.equal(src.indexOf('await checkpointing.discard()'), -1, 'no pre-ack delete remains');
   assert.ok(src.indexOf('envelope: effectiveEnvelope', setup) > setup, 'the restored note reaches the harness envelope');
-  const close = i('await checkpointing.close()');
+  const close = src.indexOf('await checkpointing.close()', lastChance);
+  assert.ok(close > lastChance, 'the exception/cleanup path closes the checkpointing');
   assert.ok(lastChance > decide && lastChance < close, 'the exception path flushes a failed checkpoint before close()');
   assert.ok(close > decide && close < src.indexOf('rmSync(runDir', close), 'in-flight git work drains before the run dir is reaped');
 });

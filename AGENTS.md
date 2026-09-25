@@ -157,7 +157,11 @@ SDK client (job workers) — do **not** add the SDK as a dependency or use raw
   `NANO_AGENT_PLAN=off` disables recording and seeding.
 - **WIP checkpoints (issue #264, `agent-checkpoint.mjs`).** `NANO_AGENT_CHECKPOINT`
   = `auto` (default) | `on` | `off`; `checkpointEligibility` gates `auto` to provisioned
-  jobs with a repo token, a `workingBranch` and `branch.push !== false`, and every mode
+  jobs on a **symbolic working branch** that **push** (`branch.push !== false`) an
+  **authenticated** clone — authentication is NOT token-only: a repo token, an
+  author-embedded HTTPS-userinfo remote, or an SSH remote (`isAuthenticatedRemote`,
+  or provisioning's own stamped `authenticated`) each qualify, so a credentialed
+  non-token clone still checkpoints — and every mode
   needs an `elementInstanceKey`. `setupWorkspaceCheckpoints` (c8ctl-plugin.js) runs after provisioning: it fetches
   `refs/nano/wip/<elementInstanceKey>`, restores it (`restoreCheckpoint`: fast-forward
   to the snapshot's parent + lay the tree down UNCOMMITTED when the fresh HEAD is an

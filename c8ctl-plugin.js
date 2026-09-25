@@ -5397,9 +5397,13 @@ function shouldPreserveRunDir(gitResult) {
 // #264: WIP checkpoint wiring for one host-provisioned job (see agent-checkpoint.mjs).
 // Returns null when disabled/ineligible/unavailable, else `{ checkpointer,
 // restored, flushTimeoutMs, discard(), close() }`. Never throws — best-effort.
-async function setupWorkspaceCheckpoints({ provisioned, envelope = null, token = null, secretValues = [], job, jobType, runId, camunda, logger, corr = '', env = process.env, deps = {} }) {
+async function setupWorkspaceCheckpoints({ provisioned, envelope = null, token = null, secretValues = [], job, jobType, runId, camunda, logger, corr = '', env = process.env, deps = {}, abortSignal = null }) {
   const cfg = checkpointConfig(env);
   const prefix = `[${jobType}] job ${job?.jobKey}`;
+  // Cancellation contract: if the runner was already interrupted (lock loss /
+  // stop --force) before we begin, do no git work — the Effect slot may already be
+  // released and the throwaway workspace is about to be reaped.
+  if (abortSignal?.aborted === true) return null;
   const eligible = checkpointEligibility({ mode: cfg.mode, provisioned, envelope, token });
   if (!eligible.enabled) {
     if (provisioned?.workspaceDir) logger.debug?.(`${prefix}: WIP checkpoints off for this job — ${eligible.reason}.`);
@@ -5424,36 +5428,47 @@ async function setupWorkspaceCheckpoints({ provisioned, envelope = null, token =
   };
   try {
     const committer = provisioned.committer || {};
-    const git = mkGit({
-      cwd: provisioned.workspaceDir,
-      env: {
-        ...(provisioned.gitEnv || process.env),
-        ...(committer.name ? { GIT_AUTHOR_NAME: committer.name, GIT_COMMITTER_NAME: committer.name } : {}),
-        ...(committer.email ? { GIT_AUTHOR_EMAIL: committer.email, GIT_COMMITTER_EMAIL: committer.email } : {}),
-      },
-      timeoutMs: cfg.gitTimeoutMs,
-    });
+    const gitEnv = {
+      ...(provisioned.gitEnv || process.env),
+      ...(committer.name ? { GIT_AUTHOR_NAME: committer.name, GIT_COMMITTER_NAME: committer.name } : {}),
+      ...(committer.email ? { GIT_AUTHOR_EMAIL: committer.email, GIT_COMMITTER_EMAIL: committer.email } : {}),
+    };
+    const git = mkGit({ cwd: provisioned.workspaceDir, env: gitEnv, timeoutMs: cfg.gitTimeoutMs });
+    // The STARTUP git work (origin lookup, checkpoint fetch, restore) is cancellable:
+    // if the runner is interrupted (lock loss / stop --force) mid-setup, the in-flight
+    // git child is killed and later ops fail fast, so setup unwinds instead of holding
+    // a released Effect slot until a git timeout. The checkpointer keeps the UNBOUND
+    // `git` runner above so its abort-flush can still push a final snapshot.
+    const startupGit = mkGit({ cwd: provisioned.workspaceDir, env: gitEnv, timeoutMs: cfg.gitTimeoutMs, signal: abortSignal || undefined });
     // Captured now: the ref is deleted only after the engine acks completion, by
     // which time the workspace (and its askpass helper) has been reaped.
-    const originUrl = ((await git(['remote', 'get-url', 'origin'])).stdout || '').trim();
+    const originUrl = ((await startupGit(['remote', 'get-url', 'origin'])).stdout || '').trim();
 
     let prior = null;
     let restored = null;
     let startupFetchFailed = false;
     try {
-      prior = await fetchCp({ git, ref });
+      prior = await fetchCp({ git: startupGit, ref });
     } catch (err) {
       startupFetchFailed = true;
       log.warn(`could not fetch WIP checkpoint ${ref} — ${oneLineLog(err?.message || err)}; starting without it.`);
     }
     if (prior) {
-      const r = await restoreCp({ git, checkpoint: prior, expectedBranch: provisioned.workingBranch || null });
+      const r = await restoreCp({ git: startupGit, checkpoint: prior, expectedBranch: provisioned.workingBranch || null });
       if (r?.restored) {
         restored = r;
         logger.info?.(`${prefix} (${corr}): restored WIP checkpoint ${ref}@${prior.sha.slice(0, 12)} (${r.mode}${r.commitsRecovered ? ', local commits recovered' : ''}) as uncommitted changes.`);
       } else {
         log.warn(`found WIP checkpoint ${ref}@${prior.sha.slice(0, 12)} but did not restore it — ${r?.reason || 'unknown'}; it will be superseded by this run's checkpoints.`);
       }
+    }
+    // Cancellation recheck: after the startup git work, bail before starting the
+    // background GC or the checkpointer if the runner was interrupted — a released
+    // slot must not leave a GC sweep or a live checkpointer overlapping the next
+    // activation on a workspace that is about to be reaped.
+    if (abortSignal?.aborted === true) {
+      log.debug('setup interrupted after restore — not starting GC/checkpointer for this (yielded) job.');
+      return null;
     }
     // The ref held a prior checkpoint we could NOT lay into the workspace (restore
     // skipped): its content lives ONLY on the ref, so discarding it on ack would be
@@ -10625,7 +10640,23 @@ async function workAgent(req, flags, ctx) {
         // attempt's snapshot into the fresh clone, then snapshot the workspace to
         // `refs/nano/wip/<elementInstanceKey>` as the run progresses. Best-effort:
         // any failure logs and degrades to the transcript-only resume.
-        const checkpointing = await setupWorkspaceCheckpoints({ provisioned, envelope, token: repoToken, secretValues: Object.values(resolved || {}), job, jobType, runId, camunda, logger, corr: aiCorr });
+        const checkpointing = await setupWorkspaceCheckpoints({ provisioned, envelope, token: repoToken, secretValues: Object.values(resolved || {}), job, jobType, runId, camunda, logger, corr: aiCorr, abortSignal });
+        // #264 cancellation contract: setup does cancellable git work (fetch/restore)
+        // and may start a background GC + live checkpointer. If a lock-loss/force-stop
+        // won during that await, stop here before opening the relay/harness so a
+        // released slot never proceeds into the runner path or overlaps the next
+        // activation. (setupWorkspaceCheckpoints already declined to start GC/the
+        // checkpointer on an observed abort, so there is nothing to tear down.)
+        if (checkSetupAbort(abortSignal, { jobType, jobKey: job.jobKey, stage: 'relay-open', logger })) {
+          // A checkpointer may have been created just before the abort landed; stop
+          // it (and drain its GC) so no snapshot timer or sweep overlaps the next
+          // activation on the about-to-be-reaped workspace.
+          if (checkpointing?.close) { try { await checkpointing.close(); } catch { /* best effort */ } }
+          await discardAgentInstanceProducer();
+          if (runDir) { try { rmSync(runDir, { recursive: true, force: true }); } catch { /* best effort */ } liveRunDirs.delete(runDir); }
+          if (isContainer) liveRunIds.delete(runId);
+          return;
+        }
         if (checkpointing?.restored) effectiveEnvelope = withCheckpointNote(effectiveEnvelope, checkpointing.restored);
         const checkpointer = checkpointing?.checkpointer ?? null;
 

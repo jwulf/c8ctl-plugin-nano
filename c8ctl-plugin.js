@@ -90,7 +90,7 @@ import { createAgentInstanceProducer, isExternalAgentJob } from './agent-instanc
 // so the new agent CONTINUES rather than cold-reruns — at-least-once delivery becomes
 // a continuation, not a duplicate. Best-effort; degrades to the legacy cold rerun.
 import { resolveEffectiveEnvelope } from './agent-resume.mjs';
-import { checkpointConfig, checkpointEligibility, checkpointRef, normalizeSecretValues, credentialsFromUrl, isAuthenticatedRemote, shouldSweep, sweepStaleCheckpoints, createGitRunner, fetchCheckpoint, restoreCheckpoint, createWorkspaceCheckpoint, createCheckpointer, deleteCheckpointRef, withCheckpointNote, sanitizeBranchSegment } from './agent-checkpoint.mjs';
+import { checkpointConfig, checkpointEligibility, checkpointRef, normalizeSecretValues, credentialsFromUrl, isAuthenticatedRemote, shouldSweep, sweepStaleCheckpoints, sweepStaleAgentWorkBranches, createGitRunner, fetchCheckpoint, restoreCheckpoint, createWorkspaceCheckpoint, createCheckpointer, deleteCheckpointRef, withCheckpointNote, sanitizeBranchSegment } from './agent-checkpoint.mjs';
 
 const requireFromHere = createRequire(import.meta.url);
 const pluginDir = dirname(fileURLToPath(import.meta.url));
@@ -5460,6 +5460,7 @@ async function setupWorkspaceCheckpoints({ provisioned, envelope = null, token =
     restoreCheckpoint: restoreCp = restoreCheckpoint,
     deleteCheckpointRef: deleteCp = deleteCheckpointRef,
     sweep = sweepStaleCheckpoints,
+    sweepAgentWork = sweepStaleAgentWorkBranches,
     now = () => Date.now(),
   } = deps;
   const log = {
@@ -5589,6 +5590,15 @@ async function setupWorkspaceCheckpoints({ provisioned, envelope = null, token =
             else if (sweepAbort.signal.aborted) log.debug(`WIP checkpoint GC bounded at ${GC_OVERALL_TIMEOUT_MS}ms — aborted its in-flight git and drained; leftover refs reclaimed on a later sweep.`);
             else if (r?.error) log.debug(`WIP checkpoint GC skipped — ${redactToken(oneLineLog(r.error), token)}.`);
           }, (err) => log.debug(`WIP checkpoint GC threw — ${redactToken(oneLineLog(err?.message || err), token)}.`))
+          // Reap orphaned `nano/agent-work/*` fallback branches in the SAME scratch repo, sharing
+          // the deadline/abort (issue #231). Chained (not raced) so `close()`/`discard()` await
+          // both sweeps before the scratch dir is reaped. TTL-only; failures stay debug-level.
+          .then(() => sweepAgentWork({ git: sweepGit, ttlMs: cfg.ttlMs, now, signal: sweepAbort.signal }))
+          .then((r) => {
+            if (r?.deleted?.length) logger.info?.(`${prefix} (${corr}): reclaimed ${r.deleted.length} orphaned agent-work branch(es): ${r.deleted.map((d) => `${d.ref} [${d.why}]`).join(', ')}.`);
+            else if (sweepAbort.signal.aborted) log.debug(`agent-work branch GC bounded at ${GC_OVERALL_TIMEOUT_MS}ms — aborted its in-flight git and drained; leftover branches reclaimed on a later sweep.`);
+            else if (r?.error) log.debug(`agent-work branch GC skipped — ${redactToken(oneLineLog(r.error), token)}.`);
+          }, (err) => log.debug(`agent-work branch GC threw — ${redactToken(oneLineLog(err?.message || err), token)}.`))
           .finally(() => { clearTimeout(deadlineTimer); if (sweepDir) { try { rmSync(sweepDir, { recursive: true, force: true }); } catch { /* best effort */ } } });
       } catch (err) {
         if (sweepDir) { try { rmSync(sweepDir, { recursive: true, force: true }); } catch { /* best effort */ } }

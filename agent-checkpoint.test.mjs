@@ -5,7 +5,7 @@ import { tmpdir } from 'node:os';
 import { join } from 'node:path';
 import { spawnSync } from 'node:child_process';
 import {
-  checkpointConfig, checkpointRef, checkpointEligibility, classifyPushFailure, containsSecret, normalizeSecretValues, credentialsFromUrl, isAuthenticatedRemote, shouldSweep, sweepStaleCheckpoints, isDeniedPath, isCheckpointTrigger, createGitRunner,
+  checkpointConfig, checkpointRef, checkpointEligibility, classifyPushFailure, containsSecret, normalizeSecretValues, credentialsFromUrl, isAuthenticatedRemote, shouldSweep, sweepStaleCheckpoints, sweepStaleAgentWorkBranches, isDeniedPath, isCheckpointTrigger, createGitRunner,
   snapshotWorktree, pushCheckpoint, fetchCheckpoint, restoreCheckpoint, deleteCheckpointRef, redactUrlUserinfo, CHECKPOINT_DETACHED_MARKER,
   createWorkspaceCheckpoint, createCheckpointer, withCheckpointNote,
 } from './agent-checkpoint.mjs';
@@ -1059,6 +1059,83 @@ test('GC deletes TTL-expired and terminal-element refs, keeps own/unknown/fresh 
     assert.equal(shouldSweep('r', { everyMs: 1000, now: 0, registry: reg }), true);
     assert.equal(shouldSweep('r', { everyMs: 1000, now: 500, registry: reg }), false);
     assert.equal(shouldSweep('r', { everyMs: 1000, now: 1500, registry: reg }), true);
+  } finally { f.cleanup(); }
+});
+
+test('agent-work GC deletes TTL-expired nano/agent-work branches, keeps fresh ones, cleans temp refs', async () => {
+  const f = fixture();
+  try {
+    const w = f.clone('w');
+    // Push fallback work branches at varying ages via a backdated committer/author date.
+    const putBranch = (uuid, ageMs, content) => {
+      const date = `${Math.floor((Date.now() - ageMs) / 1000)} +0000`;
+      const env = { ...ENV, GIT_COMMITTER_DATE: date, GIT_AUTHOR_DATE: date };
+      const run = (...args) => {
+        const r = spawnSync('git', args, { cwd: w.dir, env, encoding: 'utf8' });
+        if (r.status !== 0) throw new Error(`git ${args.join(' ')}: ${r.stderr}`);
+        return r.stdout.trim();
+      };
+      const ref = `refs/heads/nano/agent-work/main-${uuid}`;
+      run('checkout', '-q', '-B', `nano/agent-work/main-${uuid}`);
+      writeFileSync(join(w.dir, 'x.txt'), content);
+      run('add', '-A');
+      run('commit', '-q', '-m', `work ${uuid}`);
+      const sha = run('rev-parse', 'HEAD');
+      run('push', '-q', '--force', 'origin', `${ref}:${ref}`);
+      return sha;
+    };
+    const DAY = 86_400_000;
+    putBranch('old', 8 * DAY, 'stale'); // TTL-expired -> reaped
+    putBranch('fresh', 60_000, 'recent'); // inside TTL -> kept
+    const r = await sweepStaleAgentWorkBranches({ git: w.git, ttlMs: 7 * DAY });
+    assert.deepEqual(
+      r.deleted.map((d) => `${d.ref}:${d.why}`).sort(),
+      ['refs/heads/nano/agent-work/main-old:ttl'],
+    );
+    const left = sh(f.root, '--git-dir', f.remote, 'for-each-ref', '--format=%(refname)', 'refs/heads/nano/agent-work/').split('\n').sort();
+    assert.deepEqual(left, ['refs/heads/nano/agent-work/main-fresh']);
+    assert.equal(sh(w.dir, 'for-each-ref', 'refs/nano-gc/'), '', 'temporary GC refs are cleaned up');
+  } finally { f.cleanup(); }
+});
+
+test('agent-work GC delete is leased: a branch advanced after the scan is left intact', async () => {
+  const f = fixture();
+  try {
+    const w = f.clone('w');
+    const ref = 'refs/heads/nano/agent-work/main-race';
+    const put = (ageMs, content) => {
+      const date = `${Math.floor((Date.now() - ageMs) / 1000)} +0000`;
+      const env = { ...ENV, GIT_COMMITTER_DATE: date, GIT_AUTHOR_DATE: date };
+      const run = (...args) => {
+        const r = spawnSync('git', args, { cwd: w.dir, env, encoding: 'utf8' });
+        if (r.status !== 0) throw new Error(`git ${args.join(' ')}: ${r.stderr}`);
+        return r.stdout.trim();
+      };
+      run('checkout', '-q', '-B', 'nano/agent-work/main-race');
+      writeFileSync(join(w.dir, 'x.txt'), content);
+      run('add', '-A');
+      run('commit', '-q', '-m', content);
+      const sha = run('rev-parse', 'HEAD');
+      run('push', '-q', '--force', 'origin', `${ref}:${ref}`);
+      return sha;
+    };
+    const DAY = 86_400_000;
+    put(8 * DAY, 'old'); // TTL-expired -> doomed
+    // A newer tip another activation is about to push; the wrapper force-pushes it onto the
+    // ref right before the leased delete, moving it off the SHA the sweep observed.
+    let moved = false;
+    const git = async (args, opts) => {
+      if (!moved && args[0] === 'push' && args.includes(`:${ref}`)) {
+        moved = true;
+        const sha = put(60_000, 'newer');
+        assert.ok(sha);
+      }
+      return w.git(args, opts);
+    };
+    const r = await sweepStaleAgentWorkBranches({ git, ttlMs: 7 * DAY });
+    assert.deepEqual(r.deleted, [], 'a branch advanced after the scan is not race-deleted');
+    const left = sh(f.root, '--git-dir', f.remote, 'for-each-ref', '--format=%(refname)', 'refs/heads/nano/agent-work/');
+    assert.ok(left.split('\n').includes(ref), 'the advanced branch survives the race');
   } finally { f.cleanup(); }
 });
 

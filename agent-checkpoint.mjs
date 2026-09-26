@@ -920,7 +920,56 @@ export async function sweepStaleCheckpoints({ git, ownRef = null, ttlMs = DEFAUL
   }
 }
 
-// Prompt note appended when a checkpoint was restored into the workspace.
+// The fallback work-branch namespace `provisionRepo` cuts when a push-enabled round is
+// provisioned WITHOUT a `branch.create` naming a real (non-base) work branch (issue #231):
+// rather than commit directly on the base, the harness cuts `nano/agent-work/<base>-<runId>`
+// and pushes it so the round's commits are never lost. When the round's work also landed on a
+// real PR branch (the app now emits `branch.create`, jwulf/c8ctl-plugin-nano#231 / nano-workforce
+// service fix), or the run is long dead, these pushed fallbacks are pure orphans that otherwise
+// accumulate forever — the WIP-checkpoint sweep only reclaims `refs/nano/wip/*`.
+export const AGENT_WORK_REF_PREFIX = 'refs/heads/nano/agent-work/';
+
+// Orphan GC for the pushed fallback work branches. TTL-ONLY reclamation: the branch segment is a
+// UUID `runId` (or run-dir basename), NOT an element instance key, so the element-terminal lookup
+// the WIP sweep uses can't map here — age past `ttlMs` is the only safe signal that the run that
+// cut it is gone. Deletes are leased against the SHA observed at ls-remote time, so a fallback a
+// concurrent activation just advanced is left intact (a lease mismatch skips it). Runs in the same
+// isolated scratch repo as `sweepStaleCheckpoints`, so it shares the GC deadline/abort signal.
+export async function sweepStaleAgentWorkBranches({ git, ttlMs = DEFAULTS.ttlMs, now = () => Date.now(), maxDeletes = 50, remote = 'origin', signal = null }) {
+  const ls = await git(['ls-remote', '--refs', remote, `${AGENT_WORK_REF_PREFIX}*`]);
+  if (!ok(ls)) return { error: errText(ls), deleted: [] };
+  const entries = out(ls).split('\n').filter(Boolean).map((l) => { const [sha, ref] = l.split(/\s+/); return { sha, ref }; }).filter((e) => e.ref);
+  if (!entries.length) return { scanned: 0, deleted: [] };
+  const refs = entries.map((e) => e.ref);
+  const local = (r) => `refs/nano-gc/agent-work/${r.slice(AGENT_WORK_REF_PREFIX.length)}`;
+  const fetch = await git(['fetch', '--quiet', '--no-tags', '--no-write-fetch-head', remote, ...refs.map((r) => `+${r}:${local(r)}`)]);
+  if (!ok(fetch)) return { error: errText(fetch), deleted: [] };
+  const doomed = [];
+  try {
+    for (const { ref, sha } of entries) {
+      if (doomed.length >= maxDeletes) break;
+      if (signal?.aborted) break;
+      const at = Number(out(await git(['log', '-1', '--format=%ct', local(ref)]))) * 1000;
+      if (!Number.isFinite(at) || at <= 0) continue;
+      const age = now() - at;
+      if (ttlMs > 0 && age > ttlMs) doomed.push({ ref, sha, why: 'ttl' });
+    }
+    if (!doomed.length) return { scanned: refs.length, deleted: [] };
+    const deleted = [];
+    let lastError = null;
+    for (const d of doomed) {
+      const r = await deleteCheckpointRef({ git, ref: d.ref, remote, expectSha: d.sha });
+      if (r.ok) deleted.push({ ref: d.ref, why: d.why });
+      else if (r.error) lastError = r.error;
+    }
+    const result = { scanned: refs.length, deleted };
+    if (!deleted.length && lastError) result.error = lastError;
+    return result;
+  } finally {
+    for (const ref of refs) await git(['update-ref', '-d', local(ref)]);
+  }
+}
+
 export function checkpointRestoredNote(info) {
   if (!info?.restored) return '';
   const lines = [

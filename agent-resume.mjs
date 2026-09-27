@@ -901,28 +901,41 @@ export function seedResumeEnvelope(envelope, transcriptText, opts = {}) {
 // Does this envelope declare a STABLE branch the prior run pushed its commits ONTO that
 // THIS activation will RE-CHECK-OUT with those commits present, so committed work is
 // durably recoverable? This is the ONLY case that justifies the recovery preamble's
-// "your committed work is on the pushed branch" promise, and it is a SINGLE, exact
-// invariant (issue #241): `repository.ref` names a stable non-base branch AND
-// `branch.create` names that SAME branch (`create === ref`). Why both, and why equal:
+// "your committed work is on the pushed branch" promise. ONE envelope shape qualifies
+// (issue #241): `repository.ref` names a stable non-base branch AND `branch.create` names
+// that SAME branch (`create === ref`). Why:
 //   - the clone checks out `repository.ref`, so only a stable `ref` lands the workspace
 //     on the branch the prior run pushed (with its commits present);
-//   - provisionRepo's honored `git checkout -B <create>` then keeps the workspace on
-//     that branch and pushes it back — but ONLY when `create === ref` is the checkout a
-//     NO-OP that preserves the prior commits. A `create !== ref` does `checkout -B
-//     <create>` off the FRESHLY re-cloned `ref`/base HEAD and never fetches an existing
-//     remote `<create>`, so prior commits on it are ABSENT;
-//   - a `ref` with NO `branch.create` does NOT recover either: provisionRepo's
-//     `checkedOut && wantPush` arm cuts a per-run `nano/agent-work/<base>-<runId>`
-//     FALLBACK branch even for a checked-out PR head (the review/fix-ci/rebase shape,
-//     which `repoEnvelope` emits with no `branch.create`), so the prior commits land on
-//     a run-scoped ref that is NOT `ref`, and the next clone of `ref` lacks them.
+//   - with `create === ref`, provisionRepo's honored `git checkout -B <create>` is a
+//     NO-OP that keeps the workspace on the re-cloned `ref` and pushes it back preserving
+//     the prior commits;
+//   - a `create !== ref` does `checkout -B <create>` off the FRESHLY re-cloned `ref`/base
+//     HEAD and never fetches an existing remote `<create>`, so prior commits on it are
+//     ABSENT → non-recoverable;
 //   - a repo-less job, `branch.push === false`, or a `repository.sha` (which DETACHES
 //     HEAD, leaving no symbolic branch to push) is likewise non-recoverable.
-// A `ref`/`create` equal to the base commits on the base, which provisionRepo ALSO
+// The REF-ONLY shape (no `branch.create`) is deliberately NON-recoverable here, even
+// though provisionRepo's #270 `checkedOut && wantPush` arm often DOES stay on and push
+// the checked-out non-base PR head. The catch: provisionRepo makes that decision AFTER
+// RESOLVING THE REMOTE DEFAULT — a checked-out branch that IS the remote default is
+// base-like and gets fallback-branched — and it FAILS CLOSED (cuts a fallback) whenever
+// that default cannot be resolved. This module runs BEFORE the clone with NO network, so
+// it can never resolve the remote default and thus can never prove a bare `ref` is not
+// the repo's (possibly CUSTOM, e.g. `trunk`) default. A ref-only envelope
+// `{ref:'trunk', baseRef:'main', branch:{push:true}}` is base-like to provisionRepo (it
+// fallback-branches `trunk`) yet neither `main`/`master` nor `=== baseRef` here, so
+// accepting it would OVER-CLAIM recovery for a run whose commits are actually on a per-run
+// fallback (thread 4117276834). So we MIRROR provisionRepo's fail-closed-on-unresolvable-
+// default stance: reject ref-only, requiring the explicit `create === ref` author-declared
+// push target. (A ref-only #270 job still recovers safely — it falls through to the
+// transcript-only preamble, which is VERIFY-first anyway.)
+// A `ref` equal to the base commits on the base, which provisionRepo ALSO
 // fallback-branches → non-recoverable. The base is resolved with provisionRepo's
 // PRECEDENCE (`branch.base` before `repository.baseRef`), and a KNOWN non-blank base is
 // REQUIRED: with no configured base provisionRepo treats the checked-out `ref` as the
-// base and fallback-branches it, so a blank base cannot prove `ref` is non-base.
+// base and fallback-branches it, so a blank base cannot prove `ref` is non-base. A
+// conventional default name (main/master) is likewise treated as base-like (provisionRepo
+// fallback-branches the resolved remote default, which the envelope can't reveal here).
 // (A push *rejected* at runtime is not knowable here; declared intent is the best signal
 // available at seed time; the recovery preamble is VERIFY-first so a not-yet-reconciled
 // branch still degrades safely.)
@@ -934,10 +947,19 @@ function envelopeHasPushedBranch(envelope) {
   if (isNonBlank(repo.sha)) return false;
   const ref = isNonBlank(repo.ref) ? String(repo.ref).trim() : '';
   const create = isNonBlank(branch?.create) ? String(branch.create).trim() : '';
-  // The clone must re-check-out the exact branch the prior run pushed onto: a stable
-  // `ref` AND a `branch.create` naming that SAME branch. Anything else (ref-only →
-  // per-run fallback; create-only / create !== ref → `checkout -B` off base) leaves the
-  // prior commits on a branch this activation does not check out.
+  // The clone must re-check-out the exact branch the prior run pushed onto, and we must be
+  // able to prove — from the ENVELOPE ALONE (no network at seed time) — that provisionRepo
+  // stayed on it rather than cutting a fallback. Only the explicit `create === ref` shape
+  // gives that proof: provisionRepo's honored `checkout -B <create>` is a no-op keeping the
+  // workspace on the re-cloned `ref` with its prior commits. Reject:
+  //   - a blank `ref` (nothing stable to check out), and
+  //   - the ref-only shape (`create === ''`): provisionRepo's push-onto-checked-out-head
+  //     decision hinges on a remote-default resolution we cannot reproduce here, so a bare
+  //     `ref` that is secretly the repo's custom default would over-claim recovery for a
+  //     fallback-branched run (thread 4117276834) — fail closed, and
+  //   - a create naming a DIFFERENT branch (`create !== '' && create !== ref`): its
+  //     `checkout -B <create>` off the freshly re-cloned base HEAD never fetches an existing
+  //     remote `<create>`, so the prior commits on it are ABSENT → non-recoverable.
   if (ref === '' || create === '' || create !== ref) return false;
   // provisionRepo ALSO fallback-branches when `ref`/`create` names the RESOLVED REMOTE
   // DEFAULT branch (base-like), which is not knowable from the envelope here. Conservatively

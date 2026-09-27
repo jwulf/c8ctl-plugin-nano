@@ -2671,6 +2671,16 @@ const RESERVED_RESULT_KEYS = new Set([
   // signal for consumers (the nested envelope is host-built and correct, but the
   // flat completion vars must not be spoofable).
   'pushFailed', 'pushError', 'strandedCommits', 'branchMismatch', 'scanError',
+  // `worldMarker` is the host-authored world-restore marker (buildWorldMarker,
+  // nano-workforce #324): shape `{commitSha, effects}`, emitted ONLY on a real push
+  // with a 40-hex head. It is spread into the completion vars AFTER the agent's
+  // sanitized result, but ONLY when the host actually built one — so without
+  // reserving it here an agent-supplied `worldMarker` survives sanitizeResultVars
+  // and, whenever this round produced no host marker (no push, or an abbreviated
+  // head SHA), leaks through UNSHADOWED into the completion. That forges a world
+  // push-checkpoint / points world-restore at an arbitrary SHA, so reserve it
+  // alongside the other host-owned git-result keys (thread 4117276817).
+  'worldMarker',
 ]);
 
 // Parse `text` as a JSON object, returning it only when it is a plain object.
@@ -4706,6 +4716,15 @@ function githubCloneToken({ provider, authRef, secretResolver, ghAuthToken = ghA
 // Clone repo into <runDir>/workspace and check out / create the working branch.
 // Returns { workspaceDir, gitEnv, startSha, workingBranch, remote }. Throws a
 // ProvisionError (token-redacted) on any git failure so the caller can shed.
+//
+// Conventional default-branch names. provisionRepo resolves the remote's ACTUAL default
+// (origin/HEAD / ls-remote --symref) where it can, but when that resolution fails it
+// conservatively treats these names as base-like so a checked-out branch that is very
+// likely the shared base is fallback-branched rather than pushed onto directly. Kept in
+// lockstep with agent-resume.mjs's CONVENTIONAL_BASE_BRANCHES so the provisioning and
+// resume sides agree on which no-create push targets are recoverable (#270).
+const CONVENTIONAL_BASE_BRANCHES = new Set(['main', 'master']);
+
 function provisionRepo({ envelope, token, runDir, runId, timeoutMs = 120_000, logger = null, corr = '', abortSignal = null, _runGit = null }) {
   // Test-only seam mirroring finalizeGit: route every git call through `runGitFn` so a
   // deterministic test can observe the per-call timeouts drawn from the shared
@@ -5148,7 +5167,17 @@ function provisionRepo({ envelope, token, runDir, runId, timeoutMs = 120_000, lo
   // timeout): an indeterminate probe cannot prove the create is not the default, so
   // honoring it would re-open the fail-OPEN this guard exists to close (thread 4477).
   let defaultUnverified = false;
-  if (explicitCreate && wantPush && explicitCreate !== effectiveBase) {
+  // Resolve the remote default whenever it can change a push-target decision:
+  //  - an explicit branch.create we would otherwise HONOR (push enabled, not the base), OR
+  //  - #270: the no-create decision below that would otherwise STAY ON and push the
+  //    checked-out branch. A checked-out branch that IS the remote default (the
+  //    mismatched shape the reviewer flagged: ref=main + baseRef=develop with no
+  //    branch.create, where effectiveBase='develop' so an effectiveBase compare alone
+  //    misses that 'main' is the shared default) must be recognised as base-like and
+  //    fallback-branched, not pushed onto directly.
+  const resolveDefaultForCreate = explicitCreate && wantPush && explicitCreate !== effectiveBase;
+  const resolveDefaultForCheckedOut = !explicitCreate && wantPush && !!checkedOut && checkedOut !== effectiveBase;
+  if (resolveDefaultForCreate || resolveDefaultForCheckedOut) {
     const dh = runGitFn(['rev-parse', '--abbrev-ref', 'origin/HEAD'], { cwd: workspaceDir, env: gitEnv, timeoutMs: provTimeoutMs() });
     if (dh.status === 0) {
       const def = (dh.stdout || '').trim().replace(/^origin\//, '');
@@ -5161,7 +5190,7 @@ function provisionRepo({ envelope, token, runDir, runId, timeoutMs = 120_000, lo
         if (m && m[1] && !m[1].startsWith('-')) remoteDefaultBranch = m[1];
       }
     }
-    if (!remoteDefaultBranch && !configuredBaseRef && !envelope.branch?.base) {
+    if (resolveDefaultForCreate && !remoteDefaultBranch && !configuredBaseRef && !envelope.branch?.base) {
       // The create could still be the unverified default — but only if it already
       // exists remotely. Probe for it; a genuinely-new branch stays honored.
       // `ls-remote` does NOT reliably accept `--end-of-options` on older git (<2.24),
@@ -5217,9 +5246,40 @@ function provisionRepo({ envelope, token, runDir, runId, timeoutMs = 120_000, lo
     if (workingBranch === effectiveBase) log.warn?.(`provisionRepo${cs}: branch.create='${workingBranch}' IS the effective base and push is disabled → any commits land directly on the base branch (not pushed, but this throwaway workspace is reaped)`);
     else log.debug?.(`provisionRepo${cs}: branch.create=${workingBranch} → cut work branch off base '${baseBranchName || '(unknown)'}'`);
   } else if (checkedOut && wantPush) {
-    // Either no branch.create, OR an explicit create that NAMES the effective base
-    // while pushing — both would otherwise commit on the base, so cut a fallback.
-    cutFallbackBranch(checkedOut);
+    // No branch.create (or a create that named the base, routed here): the clone
+    // landed on a symbolic branch. If that branch IS the shared base/default — or the
+    // base/default could NOT be resolved (fail closed, #231/4444) — committing +
+    // pushing there races the base and a non-ff reject strands the work, so cut a
+    // fallback off it. But when the clone landed on a KNOWN NON-base branch it is the
+    // PR head (the review-round / fix-ci / rebase shape: nano-workforce's repoEnvelope
+    // emits repository.ref=<PR head> with NO branch.create). That branch IS the
+    // intended push target — stay on it so `finalizeGit` advances the PR head. Cutting
+    // a fallback here would strand the agent's commit on a throwaway nano/agent-work/*
+    // ref while the PR head never moves, which nano-workforce's convergence loop then
+    // (correctly) flags as a no-advance escalation despite a genuine "pushed" round
+    // (the divergence that stranded nano-coder#26/#28 — c8ctl-plugin-nano#270).
+    const baseKnown = !!(effectiveBase || remoteDefaultBranch);
+    const createNamedBase = !!explicitCreate && createNamesBase(explicitCreate);
+    // The checked-out branch is base-like — cut a fallback rather than push onto it —
+    // when it equals the effective base or the RESOLVED remote default
+    // (`createNamesBase`), OR when it is a conventional default name (main/master):
+    // provisionRepo also fallback-branches the resolved remote default, and the resume
+    // contract (agent-resume.mjs `envelopeHasPushedBranch`) conservatively treats
+    // main/master as base-like, so mirror it here so a mismatched ref=main + baseRef=develop
+    // shape is fallback-branched on BOTH sides.
+    const checkedOutBaseLike = createNamesBase(checkedOut) || CONVENTIONAL_BASE_BRANCHES.has(String(checkedOut).toLowerCase());
+    // Fail closed (#231/4444): we needed the remote default to clear a checked-out branch
+    // that is NOT the effective base, but could not resolve it (a transient network/auth
+    // failure emptied both origin/HEAD and the ls-remote --symref fallback). We cannot
+    // prove the branch is not the shared default, so cut a fallback rather than risk a
+    // silent fast-forward push directly onto it.
+    const defaultUnresolvedForCheckedOut = !remoteDefaultBranch && checkedOut !== effectiveBase;
+    if (baseKnown && !checkedOutBaseLike && !createNamedBase && !defaultUnresolvedForCheckedOut) {
+      workingBranch = checkedOut;
+      log.debug?.(`provisionRepo${cs}: no base-naming branch.create; clone landed on non-base PR head '${checkedOut}' (base '${effectiveBase || remoteDefaultBranch}') → commit + push there so the PR head advances`);
+    } else {
+      cutFallbackBranch(checkedOut);
+    }
   } else if (unbornBranch && wantPush) {
     // Unborn branch (empty remote clone) with push enabled: the agent's FIRST
     // commit belongs on a pushable work branch, not stranded on the unborn default.
@@ -8086,6 +8146,38 @@ function runAgentJob(profile, job, opts = {}) {
 
 // Shape the io.nanobpm.agentResult output envelope. When a repository was
 // provisioned (increment 2a), the `git` block adds branch/commits/push/PR facts.
+/**
+ * Build the world-restore marker (nano-workforce issue #324 / ADR 0062 Slice 4/5, the WORLD half)
+ * from a finalizeGit result, or `null` when the round pushed nothing durable.
+ *
+ * When a round's work actually LANDED on the remote (`gitResult.pushed`), nano-workforce's
+ * `persist-round` worker records a durable push-checkpoint keyed off the pushed commit SHA so a
+ * REPLACEMENT activation (a fresh worktree after a lease loss) reconstructs the working tree to the
+ * EXACT pushed SHA — inverting this round's `git push` into `git fetch && git checkout <sha>` — and
+ * so its no-advance self-heal has a reachable SHA to reconcile the PR head against. It reads the
+ * reserved top-level `worldMarker` completion variable, shape `{commitSha, effects?}` (see
+ * `workers/persist-round/worker.ts` `worldMarkerOf`). Without this the world store stays empty and
+ * world-restore is dark.
+ *
+ * The marker is emitted ONLY when the push succeeded AND the final head SHA is a well-formed 40-hex
+ * object name — the SAME `isCommitSha` guard the consumer applies, so the emit/consume boundaries
+ * can't drift (an abbreviated SHA or a symbolic ref would fail the exact-tree restore contract).
+ * A single `push` effect carries the pushed SHA as its fence idempotency key (per the contract:
+ * push → commit SHA), so a fence-replay on resume skips an already-landed push.
+ */
+function buildWorldMarker(gitResult) {
+  if (!gitResult || !gitResult.pushed) return null;
+  const commitSha = typeof gitResult.headSha === 'string' ? gitResult.headSha.trim() : '';
+  if (!/^[0-9a-f]{40}$/i.test(commitSha)) return null;
+  const branch = gitResult.branch ? String(gitResult.branch) : null;
+  return {
+    commitSha,
+    effects: [
+      { kind: 'push', idempotencyKey: commitSha, ...(branch ? { description: `push ${branch}@${commitSha.slice(0, 12)}` } : {}) },
+    ],
+  };
+}
+
 function buildResultEnvelope(result, { sandbox, image, git, result: agentResult, promptResourceKey } = {}) {
   const status = result.ok ? 'completed' : (result.timedOut ? 'timedOut' : 'failed');
   const env = {
@@ -11172,6 +11264,7 @@ async function workAgent(req, flags, ctx) {
             ...(gitResult
               ? { branch: gitResult.branch, commits: gitResult.commits, pushed: gitResult.pushed, pullRequest: gitResult.pr || null }
               : {}),
+            ...(buildWorldMarker(gitResult) ? { worldMarker: buildWorldMarker(gitResult) } : {}),
           });
           // The engine acknowledged completion: the WIP checkpoint is no longer needed.
           if (discardCheckpointOnAck) await checkpointing.discardAfterAck();
@@ -17188,6 +17281,7 @@ export {
   buildAgentPayload,
   buildAgentStdin,
   buildResultEnvelope,
+  buildWorldMarker,
   parseAgentResultObject,
   readAgentResultFile,
   parseResultFromStdout,

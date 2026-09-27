@@ -33,6 +33,7 @@ import {
   makeSecretResolver,
   buildAgentPayload,
   buildResultEnvelope,
+  buildWorldMarker,
   parseAgentResultObject,
   readAgentResultFile,
   parseResultFromStdout,
@@ -1331,12 +1332,16 @@ test('sanitizeResultVars strips harness-reserved keys and the io.nanobpm namespa
     strandedCommits: ['deadbeef'],
     branchMismatch: { expected: 'x', actual: 'main' },
     scanError: 'forged incomplete-scan reason',
+    // The world-restore marker is host-authored (buildWorldMarker); an agent must
+    // not be able to inject one as a top-level completion var and forge a world
+    // push-checkpoint / arbitrary restore SHA (thread 4117276817).
+    worldMarker: { commitSha: 'f'.repeat(40), effects: [{ kind: 'push', idempotencyKey: 'f'.repeat(40) }] },
     [AGENT_RESULT_KEY]: { forged: true },
     'io.nanobpm.somethingElse': 1,
   });
   assert.deepEqual({ ...vars }, { status: 'converged', summary: 'ok' });
   for (const k of RESERVED_RESULT_KEYS) assert.equal(k in vars, false, `${k} must be stripped`);
-  for (const k of ['pushFailed', 'pushError', 'strandedCommits', 'branchMismatch', 'scanError']) assert.equal(k in vars, false, `git-contract key ${k} must be stripped`);
+  for (const k of ['pushFailed', 'pushError', 'strandedCommits', 'branchMismatch', 'scanError', 'worldMarker']) assert.equal(k in vars, false, `git-contract key ${k} must be stripped`);
   assert.deepEqual(sanitizeResultVars(null), {});
   assert.deepEqual(sanitizeResultVars('nope'), {});
 });
@@ -1360,6 +1365,35 @@ test('buildResultEnvelope preserves the parsed agent result for audit', () => {
   assert.deepEqual(env.result, { status: 'converged', summary: 'done' });
   const none = buildResultEnvelope({ ok: true, stdout: '', exitCode: 0 }, { sandbox: 'none' });
   assert.equal('result' in none, false, 'no result key when the agent returned nothing');
+});
+
+// buildWorldMarker — the world-restore marker (nano-workforce #324 / #818, #270 Layer 1b). When a
+// round's work actually landed on the remote, the harness must report a top-level `worldMarker`
+// {commitSha, effects:[{kind:'push', idempotencyKey}]} so nano-workforce records a durable
+// push-checkpoint (its no-advance self-heal + world-restore have a reachable SHA). Only a real push
+// with a well-formed 40-hex head SHA yields a marker — the same isCommitSha guard the consumer uses.
+const SHA40 = 'a'.repeat(40);
+test('buildWorldMarker emits {commitSha, push effect} when a round pushed a 40-hex head', () => {
+  const m = buildWorldMarker({ pushed: true, headSha: SHA40, branch: 'feat/x' });
+  assert.equal(m.commitSha, SHA40, 'the pushed head SHA drives the restore checkout target');
+  assert.equal(m.effects.length, 1);
+  assert.equal(m.effects[0].kind, 'push', 'a push effect for the fence-replay ledger');
+  assert.equal(m.effects[0].idempotencyKey, SHA40, 'the push fence key is the pushed SHA');
+});
+
+test('buildWorldMarker returns null when nothing was pushed (a waiting/no-advance round)', () => {
+  assert.equal(buildWorldMarker({ pushed: false, headSha: SHA40, branch: 'feat/x' }), null);
+  assert.equal(buildWorldMarker({ pushed: true, headSha: null, branch: 'feat/x' }), null, 'no head SHA → no marker');
+  assert.equal(buildWorldMarker(null), null, 'no git result → no marker');
+});
+
+test('buildWorldMarker rejects a non-40-hex head SHA (abbreviated/symbolic would break exact-tree restore)', () => {
+  assert.equal(buildWorldMarker({ pushed: true, headSha: 'abc1234', branch: 'feat/x' }), null, 'abbreviated SHA rejected');
+  assert.equal(buildWorldMarker({ pushed: true, headSha: 'main', branch: 'feat/x' }), null, 'symbolic ref rejected');
+  assert.equal(buildWorldMarker({ pushed: true, headSha: `${SHA40}f`, branch: 'feat/x' }), null, '41 chars rejected');
+  // A valid SHA with surrounding whitespace still restores — the consumer trims too.
+  const m = buildWorldMarker({ pushed: true, headSha: `  ${SHA40}\n`, branch: 'feat/x' });
+  assert.equal(m.commitSha, SHA40, 'a whitespace-tainted valid SHA is trimmed, not dropped');
 });
 
 
@@ -1480,6 +1514,90 @@ test('provisionRepo cuts a correlated fallback work branch instead of committing
         && /\[job 1 eik 2 pik 3\]/.test(m)),
       'warns (with correlation) that a fallback branch was cut so commits never land directly on the base',
     );
+  } finally {
+    rmSync(root, { recursive: true, force: true });
+  }
+});
+
+test('provisionRepo commits + pushes on a NON-base PR head branch (ref=<pr head>, no branch.create) rather than stranding on a nano/agent-work fallback (#270)', { skip: !gitOk }, () => {
+  const { root, origin } = makeOriginRepo();
+  // Seed a real, non-base PR head branch on the origin so the clone can land on it.
+  const seed = mkdtempSync(join(root, 'seed-'));
+  g(['clone', '-q', origin, seed], undefined);
+  g(['config', 'user.name', 'seed'], seed);
+  g(['config', 'user.email', 'seed@example.com'], seed);
+  g(['checkout', '-q', '-B', 'feat/pr-head'], seed);
+  writeFileSync(join(seed, 'HEAD.txt'), 'pr head tip\n');
+  g(['add', '-A'], seed);
+  g(['commit', '-q', '-m', 'pr head'], seed);
+  g(['push', '-q', 'origin', 'feat/pr-head'], seed);
+  const runDir = mkdtempSync(join(root, 'run-'));
+  const warnings = [];
+  try {
+    // The review-round / fix-ci / rebase shape: nano-workforce's repoEnvelope emits
+    // repository.ref = <PR head branch> with NO branch.create and push enabled. The
+    // clone lands on that NON-base head — it IS the intended push target, so the agent
+    // must commit + push there so the PR head advances. Cutting a nano/agent-work
+    // fallback here strands the commit off the PR head (the convergence no-advance
+    // divergence that escalated nano-coder#26/#28).
+    const envelope = {
+      schemaVersion: 1,
+      repository: { provider: 'github', url: origin, ref: 'feat/pr-head', submodules: false },
+      branch: { base: 'main', create: '', push: true },
+      setup: { commands: [], env: {}, secretRefs: [] },
+      task: { allowPr: true },
+    };
+    const prov = provisionRepo({
+      envelope,
+      token: null,
+      runDir,
+      logger: { warn: (m) => warnings.push(m), info: () => {} },
+      corr: 'job 1 eik 2 pik 3',
+    });
+    assert.equal(prov.workingBranch, 'feat/pr-head', 'stays on the PR head branch so the push advances the PR head');
+    assert.equal(prov.fallbackBranch, false, 'does NOT cut a nano/agent-work fallback for a non-base PR head');
+    assert.ok(!/^nano\/agent-work\//.test(prov.workingBranch), 'not diverted onto a throwaway fallback ref');
+    assert.equal(prov.hasPrBranch, true, 'a PR head branch distinct from the base IS a PR branch');
+    assert.notEqual(prov.detached, true, 'not detached — a real symbolic PR head branch');
+    assert.equal(g(['rev-parse', '--abbrev-ref', 'HEAD'], prov.workspaceDir), 'feat/pr-head', 'HEAD stays on the PR head branch');
+    assert.ok(
+      !warnings.some((m) => /cut fallback work branch 'nano\/agent-work\//.test(m)),
+      'does not warn about cutting a fallback — none is cut for a non-base head',
+    );
+  } finally {
+    rmSync(root, { recursive: true, force: true });
+  }
+});
+
+test('provisionRepo fallback-branches a checked-out branch that IS the remote default even when baseRef names a DIFFERENT base (ref=main, baseRef=develop, no branch.create) (#270 mismatched-base fail-open)', { skip: !gitOk }, () => {
+  const { root, origin } = makeOriginRepo();
+  const runDir = mkdtempSync(join(root, 'run-'));
+  const warnings = [];
+  try {
+    // The mismatched-base shape the reviewer flagged: the clone lands on 'main' (the
+    // remote DEFAULT), but a stale/mismatched baseRef='develop' makes effectiveBase
+    // 'develop'. An effectiveBase compare alone would miss that 'main' is the shared
+    // default and (wrongly) push straight onto it. provisionRepo must resolve the remote
+    // default (or treat main/master as base-like) for this no-create decision and cut a
+    // fallback — mirroring the resume contract, which treats main/master as base-like.
+    const envelope = {
+      schemaVersion: 1,
+      repository: { provider: 'github', url: origin, ref: 'main', baseRef: 'develop', submodules: false },
+      branch: { create: '', push: true },
+      setup: { commands: [], env: {}, secretRefs: [] },
+      task: { allowPr: true },
+    };
+    const prov = provisionRepo({
+      envelope,
+      token: null,
+      runDir,
+      logger: { warn: (m) => warnings.push(m), info: () => {}, debug: () => {} },
+      corr: 'job 1 eik 2 pik 3',
+    });
+    assert.equal(prov.fallbackBranch, true, 'cuts a fallback rather than pushing onto the remote default');
+    assert.notEqual(prov.workingBranch, 'main', 'never leaves us on the shared default when pushing');
+    assert.match(prov.workingBranch, /^nano\/agent-work\//, 'diverted onto a throwaway fallback ref');
+    assert.equal(g(['rev-parse', '--abbrev-ref', 'HEAD'], prov.workspaceDir), prov.workingBranch, 'HEAD is on the fallback, not the default');
   } finally {
     rmSync(root, { recursive: true, force: true });
   }
@@ -2389,7 +2507,7 @@ test('provisionRepo folds repository.baseRef into effectiveBase so branch.create
   }
 });
 
-test('provisionRepo names the fallback + logs the base from repository.baseRef when branch.create is absent (issue #231, suppressed advisory 4317)', { skip: !gitOk }, () => {
+test('provisionRepo commits + pushes on the checked-out PR head (ref=feat/x, baseRef carries the base, NO branch.create) instead of stranding on a fallback (#270; was #231/4317)', { skip: !gitOk }, () => {
   const { root, origin } = makeOriginRepo();
   // Publish a feature branch so we can clone ref=feat/x while the base rides in
   // repository.baseRef (NOT branch.base) with NO branch.create — the split shape.
@@ -2404,11 +2522,15 @@ test('provisionRepo names the fallback + logs the base from repository.baseRef w
   g(['push', '-q', 'origin', 'feat/x'], wc);
   const runDir = mkdtempSync(join(root, 'run-'));
   try {
-    // ref=feat/x lands the clone on feat/x, baseRef=main carries the real base, and
-    // there is NO branch.create — so the guard cuts a fallback off the checked-out
-    // feat/x. Before folding repository.baseRef into `baseBranchName` the fallback was
-    // named `nano/agent-work/feat-x-…` and the "configured base" log claimed 'feat/x'
-    // even though effectiveBase is 'main'. The name + base must identify the ACTUAL base.
+    // This IS the real review-round / fix-ci / rebase envelope: ref=feat/x is the PR
+    // HEAD (the clone lands on it), baseRef=main is emitted ONLY so the harness fetches
+    // the base tip for the diff (it is NOT the push target), and there is NO
+    // branch.create. feat/x is a per-PR head branch, not the shared base — pushing there
+    // does not race the base, it is the whole point. Cutting a nano/agent-work fallback
+    // here strands the agent's commit off the PR head so the head never advances, which
+    // nano-workforce's convergence loop flags as a spurious no-advance escalation
+    // (the #270 divergence that stranded nano-coder#26/#28). effectiveBase still folds
+    // in baseRef so the pre-push staleness check watches main, not feat/x.
     const envelope = {
       schemaVersion: 1,
       repository: { provider: 'github', url: origin, ref: 'feat/x', baseRef: 'main', submodules: false },
@@ -2417,9 +2539,11 @@ test('provisionRepo names the fallback + logs the base from repository.baseRef w
       task: { allowPr: false },
     };
     const prov = provisionRepo({ envelope, token: null, runDir });
-    assert.equal(prov.fallbackBranch, true, 'a fallback is cut so commits never land on the checked-out ref');
-    assert.equal(prov.baseBranch, 'main', 'effectiveBase resolves the configured base ref');
-    assert.match(prov.workingBranch, /^nano\/agent-work\/main-/, 'the fallback name identifies the real base (main), not the feature ref');
+    assert.equal(prov.workingBranch, 'feat/x', 'stays on the PR head branch so the push advances the PR head');
+    assert.equal(prov.fallbackBranch, false, 'does NOT cut a fallback for a non-base PR head');
+    assert.ok(!/^nano\/agent-work\//.test(prov.workingBranch), 'not diverted onto a throwaway fallback ref');
+    assert.equal(prov.baseBranch, 'main', 'effectiveBase still resolves the configured base ref (baseRef) for the staleness check');
+    assert.equal(g(['rev-parse', '--abbrev-ref', 'HEAD'], prov.workspaceDir), 'feat/x', 'HEAD stays on the PR head branch');
   } finally {
     rmSync(root, { recursive: true, force: true });
   }

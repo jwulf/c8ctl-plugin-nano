@@ -86,17 +86,24 @@ SDK client (job workers) — do **not** add the SDK as a dependency or use raw
   **engine-backed, so cross-machine** — and, when it carries real prior work,
   `seedResumeEnvelope` reframes `envelope.task.prompt` as a continuation (rendered
   transcript + recovery-scope contract). Committed work is recovered from the
-  pushed branch **only when the job targets a stable, existing non-base branch that
-  provisioning keeps the workspace on** — `repository.ref` names a KNOWN non-base branch
+  pushed branch **only when the envelope alone can PROVE this activation re-checks-out
+  the branch the prior run pushed onto** — `repository.ref` names a KNOWN non-base branch
   (base resolved with provisioning's precedence, `branch.base` then `repository.baseRef`,
   required non-blank; a conventional default name `main`/`master` is conservatively
   treated as base-like since provisioning also fallback-branches the resolved remote
-  default) with no pinned `repository.sha` and `branch.push !== false`, AND **either**
-  `branch.create === ref` **or** there is no `branch.create` at all (ref-only — the PR
-  head named by `repository.ref`). Provisioning re-clones `ref` each activation; with
+  default) with no pinned `repository.sha` and `branch.push !== false`, AND
+  `branch.create === ref`. Provisioning re-clones `ref` each activation; with
   `create === ref` its honored `checkout -B <create>` is a no-op keeping the workspace on
-  it, and a ref-only job now **stays on the checked-out non-base head and pushes there**
-  (issue #270 — a known non-base head is no longer diverted onto a per-run fallback).
+  it. The **ref-only** shape (no `branch.create`) is deliberately **transcript-only**
+  even though provisioning's #270 `checkedOut && wantPush` arm often DOES push the
+  checked-out PR head: that push-vs-fallback decision hinges on provisioning
+  **resolving the remote default** (a checked-out branch that IS the default is base-like
+  and fallback-branched; an unresolvable default fails closed), and resume gating runs
+  **before the clone with no network**, so it can never prove a bare `ref` is not the
+  repo's (possibly CUSTOM, e.g. `trunk`) default — it mirrors provisioning's
+  fail-closed stance rather than over-claim recovery for a fallback-branched run (issue
+  #270 follow-up). The #270 provisioning fix (pushing the PR head) is unaffected — only
+  the resume PROMPT wording is conservative.
   Any other shape — a bare-URL / base-only clone, a `branch.create` that names a
   DIFFERENT branch than `ref`, a `ref`/`create` that equals (or cannot be proven distinct
   from) the base, or a per-run fallback branch — is NOT re-fetched, so such a run is

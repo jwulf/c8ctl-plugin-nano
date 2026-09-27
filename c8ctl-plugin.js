@@ -2671,6 +2671,16 @@ const RESERVED_RESULT_KEYS = new Set([
   // signal for consumers (the nested envelope is host-built and correct, but the
   // flat completion vars must not be spoofable).
   'pushFailed', 'pushError', 'strandedCommits', 'branchMismatch', 'scanError',
+  // `worldMarker` is the host-authored world-restore marker (buildWorldMarker,
+  // nano-workforce #324): shape `{commitSha, effects}`, emitted ONLY on a real push
+  // with a 40-hex head. It is spread into the completion vars AFTER the agent's
+  // sanitized result, but ONLY when the host actually built one — so without
+  // reserving it here an agent-supplied `worldMarker` survives sanitizeResultVars
+  // and, whenever this round produced no host marker (no push, or an abbreviated
+  // head SHA), leaks through UNSHADOWED into the completion. That forges a world
+  // push-checkpoint / points world-restore at an arbitrary SHA, so reserve it
+  // alongside the other host-owned git-result keys (thread 4117276817).
+  'worldMarker',
 ]);
 
 // Parse `text` as a JSON object, returning it only when it is a plain object.

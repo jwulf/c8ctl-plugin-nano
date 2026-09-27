@@ -1332,12 +1332,16 @@ test('sanitizeResultVars strips harness-reserved keys and the io.nanobpm namespa
     strandedCommits: ['deadbeef'],
     branchMismatch: { expected: 'x', actual: 'main' },
     scanError: 'forged incomplete-scan reason',
+    // The world-restore marker is host-authored (buildWorldMarker); an agent must
+    // not be able to inject one as a top-level completion var and forge a world
+    // push-checkpoint / arbitrary restore SHA (thread 4117276817).
+    worldMarker: { commitSha: 'f'.repeat(40), effects: [{ kind: 'push', idempotencyKey: 'f'.repeat(40) }] },
     [AGENT_RESULT_KEY]: { forged: true },
     'io.nanobpm.somethingElse': 1,
   });
   assert.deepEqual({ ...vars }, { status: 'converged', summary: 'ok' });
   for (const k of RESERVED_RESULT_KEYS) assert.equal(k in vars, false, `${k} must be stripped`);
-  for (const k of ['pushFailed', 'pushError', 'strandedCommits', 'branchMismatch', 'scanError']) assert.equal(k in vars, false, `git-contract key ${k} must be stripped`);
+  for (const k of ['pushFailed', 'pushError', 'strandedCommits', 'branchMismatch', 'scanError', 'worldMarker']) assert.equal(k in vars, false, `git-contract key ${k} must be stripped`);
   assert.deepEqual(sanitizeResultVars(null), {});
   assert.deepEqual(sanitizeResultVars('nope'), {});
 });

@@ -8103,6 +8103,38 @@ function runAgentJob(profile, job, opts = {}) {
 
 // Shape the io.nanobpm.agentResult output envelope. When a repository was
 // provisioned (increment 2a), the `git` block adds branch/commits/push/PR facts.
+/**
+ * Build the world-restore marker (nano-workforce issue #324 / ADR 0062 Slice 4/5, the WORLD half)
+ * from a finalizeGit result, or `null` when the round pushed nothing durable.
+ *
+ * When a round's work actually LANDED on the remote (`gitResult.pushed`), nano-workforce's
+ * `persist-round` worker records a durable push-checkpoint keyed off the pushed commit SHA so a
+ * REPLACEMENT activation (a fresh worktree after a lease loss) reconstructs the working tree to the
+ * EXACT pushed SHA — inverting this round's `git push` into `git fetch && git checkout <sha>` — and
+ * so its no-advance self-heal has a reachable SHA to reconcile the PR head against. It reads the
+ * reserved top-level `worldMarker` completion variable, shape `{commitSha, effects?}` (see
+ * `workers/persist-round/worker.ts` `worldMarkerOf`). Without this the world store stays empty and
+ * world-restore is dark.
+ *
+ * The marker is emitted ONLY when the push succeeded AND the final head SHA is a well-formed 40-hex
+ * object name — the SAME `isCommitSha` guard the consumer applies, so the emit/consume boundaries
+ * can't drift (an abbreviated SHA or a symbolic ref would fail the exact-tree restore contract).
+ * A single `push` effect carries the pushed SHA as its fence idempotency key (per the contract:
+ * push → commit SHA), so a fence-replay on resume skips an already-landed push.
+ */
+function buildWorldMarker(gitResult) {
+  if (!gitResult || !gitResult.pushed) return null;
+  const commitSha = typeof gitResult.headSha === 'string' ? gitResult.headSha.trim() : '';
+  if (!/^[0-9a-f]{40}$/i.test(commitSha)) return null;
+  const branch = gitResult.branch ? String(gitResult.branch) : null;
+  return {
+    commitSha,
+    effects: [
+      { kind: 'push', idempotencyKey: commitSha, ...(branch ? { description: `push ${branch}@${commitSha.slice(0, 12)}` } : {}) },
+    ],
+  };
+}
+
 function buildResultEnvelope(result, { sandbox, image, git, result: agentResult, promptResourceKey } = {}) {
   const status = result.ok ? 'completed' : (result.timedOut ? 'timedOut' : 'failed');
   const env = {
@@ -11189,6 +11221,7 @@ async function workAgent(req, flags, ctx) {
             ...(gitResult
               ? { branch: gitResult.branch, commits: gitResult.commits, pushed: gitResult.pushed, pullRequest: gitResult.pr || null }
               : {}),
+            ...(buildWorldMarker(gitResult) ? { worldMarker: buildWorldMarker(gitResult) } : {}),
           });
           // The engine acknowledged completion: the WIP checkpoint is no longer needed.
           if (discardCheckpointOnAck) await checkpointing.discardAfterAck();
@@ -17205,6 +17238,7 @@ export {
   buildAgentPayload,
   buildAgentStdin,
   buildResultEnvelope,
+  buildWorldMarker,
   parseAgentResultObject,
   readAgentResultFile,
   parseResultFromStdout,

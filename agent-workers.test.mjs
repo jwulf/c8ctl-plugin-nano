@@ -33,6 +33,7 @@ import {
   makeSecretResolver,
   buildAgentPayload,
   buildResultEnvelope,
+  buildWorldMarker,
   parseAgentResultObject,
   readAgentResultFile,
   parseResultFromStdout,
@@ -1360,6 +1361,35 @@ test('buildResultEnvelope preserves the parsed agent result for audit', () => {
   assert.deepEqual(env.result, { status: 'converged', summary: 'done' });
   const none = buildResultEnvelope({ ok: true, stdout: '', exitCode: 0 }, { sandbox: 'none' });
   assert.equal('result' in none, false, 'no result key when the agent returned nothing');
+});
+
+// buildWorldMarker — the world-restore marker (nano-workforce #324 / #818, #270 Layer 1b). When a
+// round's work actually landed on the remote, the harness must report a top-level `worldMarker`
+// {commitSha, effects:[{kind:'push', idempotencyKey}]} so nano-workforce records a durable
+// push-checkpoint (its no-advance self-heal + world-restore have a reachable SHA). Only a real push
+// with a well-formed 40-hex head SHA yields a marker — the same isCommitSha guard the consumer uses.
+const SHA40 = 'a'.repeat(40);
+test('buildWorldMarker emits {commitSha, push effect} when a round pushed a 40-hex head', () => {
+  const m = buildWorldMarker({ pushed: true, headSha: SHA40, branch: 'feat/x' });
+  assert.equal(m.commitSha, SHA40, 'the pushed head SHA drives the restore checkout target');
+  assert.equal(m.effects.length, 1);
+  assert.equal(m.effects[0].kind, 'push', 'a push effect for the fence-replay ledger');
+  assert.equal(m.effects[0].idempotencyKey, SHA40, 'the push fence key is the pushed SHA');
+});
+
+test('buildWorldMarker returns null when nothing was pushed (a waiting/no-advance round)', () => {
+  assert.equal(buildWorldMarker({ pushed: false, headSha: SHA40, branch: 'feat/x' }), null);
+  assert.equal(buildWorldMarker({ pushed: true, headSha: null, branch: 'feat/x' }), null, 'no head SHA → no marker');
+  assert.equal(buildWorldMarker(null), null, 'no git result → no marker');
+});
+
+test('buildWorldMarker rejects a non-40-hex head SHA (abbreviated/symbolic would break exact-tree restore)', () => {
+  assert.equal(buildWorldMarker({ pushed: true, headSha: 'abc1234', branch: 'feat/x' }), null, 'abbreviated SHA rejected');
+  assert.equal(buildWorldMarker({ pushed: true, headSha: 'main', branch: 'feat/x' }), null, 'symbolic ref rejected');
+  assert.equal(buildWorldMarker({ pushed: true, headSha: `${SHA40}f`, branch: 'feat/x' }), null, '41 chars rejected');
+  // A valid SHA with surrounding whitespace still restores — the consumer trims too.
+  const m = buildWorldMarker({ pushed: true, headSha: `  ${SHA40}\n`, branch: 'feat/x' });
+  assert.equal(m.commitSha, SHA40, 'a whitespace-tainted valid SHA is trimmed, not dropped');
 });
 
 

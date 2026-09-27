@@ -4706,6 +4706,15 @@ function githubCloneToken({ provider, authRef, secretResolver, ghAuthToken = ghA
 // Clone repo into <runDir>/workspace and check out / create the working branch.
 // Returns { workspaceDir, gitEnv, startSha, workingBranch, remote }. Throws a
 // ProvisionError (token-redacted) on any git failure so the caller can shed.
+//
+// Conventional default-branch names. provisionRepo resolves the remote's ACTUAL default
+// (origin/HEAD / ls-remote --symref) where it can, but when that resolution fails it
+// conservatively treats these names as base-like so a checked-out branch that is very
+// likely the shared base is fallback-branched rather than pushed onto directly. Kept in
+// lockstep with agent-resume.mjs's CONVENTIONAL_BASE_BRANCHES so the provisioning and
+// resume sides agree on which no-create push targets are recoverable (#270).
+const CONVENTIONAL_BASE_BRANCHES = new Set(['main', 'master']);
+
 function provisionRepo({ envelope, token, runDir, runId, timeoutMs = 120_000, logger = null, corr = '', abortSignal = null, _runGit = null }) {
   // Test-only seam mirroring finalizeGit: route every git call through `runGitFn` so a
   // deterministic test can observe the per-call timeouts drawn from the shared
@@ -5148,7 +5157,17 @@ function provisionRepo({ envelope, token, runDir, runId, timeoutMs = 120_000, lo
   // timeout): an indeterminate probe cannot prove the create is not the default, so
   // honoring it would re-open the fail-OPEN this guard exists to close (thread 4477).
   let defaultUnverified = false;
-  if (explicitCreate && wantPush && explicitCreate !== effectiveBase) {
+  // Resolve the remote default whenever it can change a push-target decision:
+  //  - an explicit branch.create we would otherwise HONOR (push enabled, not the base), OR
+  //  - #270: the no-create decision below that would otherwise STAY ON and push the
+  //    checked-out branch. A checked-out branch that IS the remote default (the
+  //    mismatched shape the reviewer flagged: ref=main + baseRef=develop with no
+  //    branch.create, where effectiveBase='develop' so an effectiveBase compare alone
+  //    misses that 'main' is the shared default) must be recognised as base-like and
+  //    fallback-branched, not pushed onto directly.
+  const resolveDefaultForCreate = explicitCreate && wantPush && explicitCreate !== effectiveBase;
+  const resolveDefaultForCheckedOut = !explicitCreate && wantPush && !!checkedOut && checkedOut !== effectiveBase;
+  if (resolveDefaultForCreate || resolveDefaultForCheckedOut) {
     const dh = runGitFn(['rev-parse', '--abbrev-ref', 'origin/HEAD'], { cwd: workspaceDir, env: gitEnv, timeoutMs: provTimeoutMs() });
     if (dh.status === 0) {
       const def = (dh.stdout || '').trim().replace(/^origin\//, '');
@@ -5161,7 +5180,7 @@ function provisionRepo({ envelope, token, runDir, runId, timeoutMs = 120_000, lo
         if (m && m[1] && !m[1].startsWith('-')) remoteDefaultBranch = m[1];
       }
     }
-    if (!remoteDefaultBranch && !configuredBaseRef && !envelope.branch?.base) {
+    if (resolveDefaultForCreate && !remoteDefaultBranch && !configuredBaseRef && !envelope.branch?.base) {
       // The create could still be the unverified default — but only if it already
       // exists remotely. Probe for it; a genuinely-new branch stays honored.
       // `ls-remote` does NOT reliably accept `--end-of-options` on older git (<2.24),
@@ -5231,7 +5250,21 @@ function provisionRepo({ envelope, token, runDir, runId, timeoutMs = 120_000, lo
     // (the divergence that stranded nano-coder#26/#28 — c8ctl-plugin-nano#270).
     const baseKnown = !!(effectiveBase || remoteDefaultBranch);
     const createNamedBase = !!explicitCreate && createNamesBase(explicitCreate);
-    if (baseKnown && !createNamesBase(checkedOut) && !createNamedBase) {
+    // The checked-out branch is base-like — cut a fallback rather than push onto it —
+    // when it equals the effective base or the RESOLVED remote default
+    // (`createNamesBase`), OR when it is a conventional default name (main/master):
+    // provisionRepo also fallback-branches the resolved remote default, and the resume
+    // contract (agent-resume.mjs `envelopeHasPushedBranch`) conservatively treats
+    // main/master as base-like, so mirror it here so a mismatched ref=main + baseRef=develop
+    // shape is fallback-branched on BOTH sides.
+    const checkedOutBaseLike = createNamesBase(checkedOut) || CONVENTIONAL_BASE_BRANCHES.has(String(checkedOut).toLowerCase());
+    // Fail closed (#231/4444): we needed the remote default to clear a checked-out branch
+    // that is NOT the effective base, but could not resolve it (a transient network/auth
+    // failure emptied both origin/HEAD and the ls-remote --symref fallback). We cannot
+    // prove the branch is not the shared default, so cut a fallback rather than risk a
+    // silent fast-forward push directly onto it.
+    const defaultUnresolvedForCheckedOut = !remoteDefaultBranch && checkedOut !== effectiveBase;
+    if (baseKnown && !checkedOutBaseLike && !createNamedBase && !defaultUnresolvedForCheckedOut) {
       workingBranch = checkedOut;
       log.debug?.(`provisionRepo${cs}: no base-naming branch.create; clone landed on non-base PR head '${checkedOut}' (base '${effectiveBase || remoteDefaultBranch}') → commit + push there so the PR head advances`);
     } else {

@@ -1565,6 +1565,40 @@ test('provisionRepo commits + pushes on a NON-base PR head branch (ref=<pr head>
   }
 });
 
+test('provisionRepo fallback-branches a checked-out branch that IS the remote default even when baseRef names a DIFFERENT base (ref=main, baseRef=develop, no branch.create) (#270 mismatched-base fail-open)', { skip: !gitOk }, () => {
+  const { root, origin } = makeOriginRepo();
+  const runDir = mkdtempSync(join(root, 'run-'));
+  const warnings = [];
+  try {
+    // The mismatched-base shape the reviewer flagged: the clone lands on 'main' (the
+    // remote DEFAULT), but a stale/mismatched baseRef='develop' makes effectiveBase
+    // 'develop'. An effectiveBase compare alone would miss that 'main' is the shared
+    // default and (wrongly) push straight onto it. provisionRepo must resolve the remote
+    // default (or treat main/master as base-like) for this no-create decision and cut a
+    // fallback — mirroring the resume contract, which treats main/master as base-like.
+    const envelope = {
+      schemaVersion: 1,
+      repository: { provider: 'github', url: origin, ref: 'main', baseRef: 'develop', submodules: false },
+      branch: { create: '', push: true },
+      setup: { commands: [], env: {}, secretRefs: [] },
+      task: { allowPr: true },
+    };
+    const prov = provisionRepo({
+      envelope,
+      token: null,
+      runDir,
+      logger: { warn: (m) => warnings.push(m), info: () => {}, debug: () => {} },
+      corr: 'job 1 eik 2 pik 3',
+    });
+    assert.equal(prov.fallbackBranch, true, 'cuts a fallback rather than pushing onto the remote default');
+    assert.notEqual(prov.workingBranch, 'main', 'never leaves us on the shared default when pushing');
+    assert.match(prov.workingBranch, /^nano\/agent-work\//, 'diverted onto a throwaway fallback ref');
+    assert.equal(g(['rev-parse', '--abbrev-ref', 'HEAD'], prov.workspaceDir), prov.workingBranch, 'HEAD is on the fallback, not the default');
+  } finally {
+    rmSync(root, { recursive: true, force: true });
+  }
+});
+
 test('provisionRepo cuts a correlated fallback branch when branch.create EQUALS the effective base (create===base is no direct-on-base) (#229/#231)', { skip: !gitOk }, () => {
   const { root, origin } = makeOriginRepo();
   const runDir = mkdtempSync(join(root, 'run-'));

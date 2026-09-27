@@ -87,18 +87,21 @@ SDK client (job workers) — do **not** add the SDK as a dependency or use raw
   `seedResumeEnvelope` reframes `envelope.task.prompt` as a continuation (rendered
   transcript + recovery-scope contract). Committed work is recovered from the
   pushed branch **only when the job targets a stable, existing non-base branch that
-  provisioning keeps the workspace on** — the invariant `repository.ref === branch.create`
-  where `ref` names a KNOWN non-base branch (base resolved with provisioning's precedence,
-  `branch.base` then `repository.baseRef`, required non-blank; a conventional default name
-  `main`/`master` is conservatively treated as base-like since provisioning also
-  fallback-branches the resolved remote default) with no pinned
-  `repository.sha` and `branch.push !== false` (e.g. the PR head named by `repository.ref`).
-  Provisioning re-clones `ref` each activation and its honored `checkout -B <create>` is
-  then a no-op keeping the workspace on it. Any other shape — a bare-URL / base-only clone,
-  a ref-only job with no matching `create`, a `ref`/`create` that equals (or cannot be
-  proven distinct from) the base, or a per-run fallback branch — is NOT
-  re-fetched, so such a run is classified **transcript-only** (the recovery
-  preamble points at the transcript, not a branch that isn't there). Unless WIP
+  provisioning keeps the workspace on** — `repository.ref` names a KNOWN non-base branch
+  (base resolved with provisioning's precedence, `branch.base` then `repository.baseRef`,
+  required non-blank; a conventional default name `main`/`master` is conservatively
+  treated as base-like since provisioning also fallback-branches the resolved remote
+  default) with no pinned `repository.sha` and `branch.push !== false`, AND **either**
+  `branch.create === ref` **or** there is no `branch.create` at all (ref-only — the PR
+  head named by `repository.ref`). Provisioning re-clones `ref` each activation; with
+  `create === ref` its honored `checkout -B <create>` is a no-op keeping the workspace on
+  it, and a ref-only job now **stays on the checked-out non-base head and pushes there**
+  (issue #270 — a known non-base head is no longer diverted onto a per-run fallback).
+  Any other shape — a bare-URL / base-only clone, a `branch.create` that names a
+  DIFFERENT branch than `ref`, a `ref`/`create` that equals (or cannot be proven distinct
+  from) the base, or a per-run fallback branch — is NOT re-fetched, so such a run is
+  classified **transcript-only** (the recovery preamble points at the transcript, not a
+  branch that isn't there). Unless WIP
   checkpoints (below) restore them, **uncommitted deltas are lost** (workspace is throwaway). Gated to external agent jobs;
   a read failure / no read surface / no prior work / `NANO_AGENT_RESUME=off` falls
   through to the legacy cold rerun (`effectiveEnvelope === envelope`). The prompt

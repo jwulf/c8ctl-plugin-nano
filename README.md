@@ -714,18 +714,20 @@ the job with a decremented retry count. Profiles are stored in the plugin's
 >
 > **Recovery scope (what survives a re-activation):**
 > - **Committed work is durable *only when this activation re-checks-out the exact
->   branch the prior run pushed onto*** — a single invariant: `repository.ref` names a
->   stable non-base branch **and** `branch.create` names that **same** branch
->   (`create === ref`). The clone lands the workspace on `ref` (prior commits present),
->   and `provisionRepo`'s honored `git checkout -B <create>` is then a no-op that keeps
->   the workspace on it and pushes it back, so the resumed agent can inspect it for the
->   **last pushed commit** (`git log` / the open PR for what landed). Every other shape
->   is **not** durable and is classified **transcript-only**: a `ref`-only job with no
->   `branch.create` (the PR-based review/fix-ci/rebase shape) is committed onto a
->   **per-run `nano/agent-work/<base>-<runId>` fallback branch** the next clone of `ref`
->   never sees; a `branch.create` that differs from `ref` does `checkout -B <create>`
->   off the freshly re-cloned base and never fetches the existing remote `<create>`; and
->   a base-like ref/create, a bare-URL / base-only clone, `branch.push=false`, or a
+>   branch the prior run pushed onto*.** Two envelope shapes qualify: `repository.ref`
+>   names a stable non-base branch **and** *either* `branch.create` names that **same**
+>   branch (`create === ref`) *or* there is **no** `branch.create` at all (ref-only, the
+>   PR-based review/fix-ci/rebase shape). In both, the clone lands the workspace on `ref`
+>   (prior commits present) and `provisionRepo` keeps the workspace there and pushes it
+>   back: with `create === ref` the honored `git checkout -B <create>` is a no-op, and a
+>   ref-only job now **stays on the checked-out non-base head and pushes there** (it no
+>   longer diverts a known non-base head onto a per-run fallback). So the resumed agent
+>   can inspect it for the **last pushed commit** (`git log` / the open PR for what
+>   landed). Every other shape is **not** durable and is classified **transcript-only**: a
+>   `branch.create` that differs from `ref` does `checkout -B <create>` off the freshly
+>   re-cloned base and never fetches the existing remote `<create>`; and a base-like
+>   ref/create (including a conventional `main`/`master` head, or a ref-only job with no
+>   configured base), a bare-URL / base-only clone, `branch.push=false`, or a
 >   `repository.sha`-detached checkout likewise recover nothing. For every transcript-only
 >   run the resume preamble points at the transcript (VERIFY-first) rather than promising
 >   a branch to check out.

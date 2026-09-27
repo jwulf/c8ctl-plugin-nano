@@ -345,10 +345,12 @@ test('seedResumeEnvelope: returns the original when there is no task prompt to s
 });
 
 test('seedResumeEnvelope: recovery text is conditional on a declared pushed branch', () => {
-  // Committed work is recoverable ONLY when this activation re-checks-out the exact branch
-  // the prior run pushed onto: `repository.ref` names a stable non-base branch AND
-  // `branch.create` names that SAME branch (`create === ref`). Every other shape (ref-only
-  // → per-run fallback; create !== ref → `checkout -B` off base; base-like; repo-less;
+  // Committed work is recoverable when this activation re-checks-out the exact branch the
+  // prior run pushed onto. TWO shapes qualify (#241, #270): `repository.ref` names a
+  // stable non-base branch AND EITHER `branch.create` names that SAME branch (`create ===
+  // ref`) OR there is NO `branch.create` (ref-only, the PR review/fix-ci/rebase shape —
+  // provisionRepo now STAYS on the checked-out non-base head and pushes there). Every
+  // other shape (create !== ref → `checkout -B` off base; base-like; repo-less;
   // push=false; sha-detached) is told the throwaway workspace is gone and the transcript
   // is the only recoverable state.
   const pushed = seedResumeEnvelope({ task: { prompt: 'do it' }, repository: { url: 'x', ref: 'feat/thing', baseRef: 'main' }, branch: { create: 'feat/thing', push: true } }, 'T');
@@ -363,12 +365,27 @@ test('seedResumeEnvelope: recovery text is conditional on a declared pushed bran
   assert.ok(noPush.task.prompt.includes('ONLY record'), 'branch.push=false → transcript-only recovery text');
 
   // A `repository.ref`+push job with NO explicit `branch.create` — the PR-based
-  // review/fix-ci/rebase shape (issue #241) — is NOT recoverable: provisionRepo's
-  // `checkedOut && wantPush` arm cuts a per-run `nano/agent-work/<base>-<runId>` fallback
-  // branch even for a checked-out PR head, so the commits land on a run-scoped ref the
-  // next clone of `ref` never sees.
+  // review/fix-ci/rebase shape (issues #241, #270) — IS now recoverable when the ref is a
+  // KNOWN non-base branch: provisionRepo's `checkedOut && wantPush` arm STAYS on the
+  // checked-out non-base PR head and pushes THERE (it no longer cuts a per-run fallback),
+  // so the next clone of `ref` carries the prior commits.
   const refOnly = seedResumeEnvelope({ task: { prompt: 'do it' }, repository: { url: 'x', ref: 'feat/thing', baseRef: 'main' }, branch: { push: true } }, 'T');
-  assert.ok(refOnly.task.prompt.includes('ONLY record'), 'ref+push but no branch.create → transcript-only recovery text');
+  assert.ok(refOnly.task.prompt.includes('pushed branch'), 'ref+push, no branch.create, non-base ref → branch recovery text (#270)');
+
+  // …but a ref-only job with NO configured base is base-like (provisionRepo falls back to
+  // the checked-out ref as the base and fallback-branches it), so it stays transcript-only.
+  const refOnlyNoBase = seedResumeEnvelope({ task: { prompt: 'do it' }, repository: { url: 'x', ref: 'feat/thing' }, branch: { push: true } }, 'T');
+  assert.ok(refOnlyNoBase.task.prompt.includes('ONLY record'), 'ref-only with no configured base → transcript-only recovery text');
+
+  // …and a ref-only job whose ref is a conventional default name (main/master) is
+  // conservatively base-like on BOTH sides → transcript-only, even with a mismatched base.
+  const refOnlyDefault = seedResumeEnvelope({ task: { prompt: 'do it' }, repository: { url: 'x', ref: 'main', baseRef: 'develop' }, branch: { push: true } }, 'T');
+  assert.ok(refOnlyDefault.task.prompt.includes('ONLY record'), 'ref-only main (conventional default) → transcript-only recovery text');
+
+  // …and a ref-only job whose ref EQUALS the configured base commits on the base →
+  // fallback-branched → transcript-only.
+  const refOnlyIsBase = seedResumeEnvelope({ task: { prompt: 'do it' }, repository: { url: 'x', ref: 'release', baseRef: 'release' }, branch: { push: true } }, 'T');
+  assert.ok(refOnlyIsBase.task.prompt.includes('ONLY record'), 'ref-only where ref === base → transcript-only recovery text');
 
   // A `branch.create` that DIFFERS from `repository.ref` is NOT recoverable: provisionRepo
   // does `git checkout -B <create>` off the freshly re-cloned `ref`/base HEAD and never

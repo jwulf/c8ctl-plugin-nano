@@ -1485,6 +1485,56 @@ test('provisionRepo cuts a correlated fallback work branch instead of committing
   }
 });
 
+test('provisionRepo commits + pushes on a NON-base PR head branch (ref=<pr head>, no branch.create) rather than stranding on a nano/agent-work fallback (#270)', { skip: !gitOk }, () => {
+  const { root, origin } = makeOriginRepo();
+  // Seed a real, non-base PR head branch on the origin so the clone can land on it.
+  const seed = mkdtempSync(join(root, 'seed-'));
+  g(['clone', '-q', origin, seed], undefined);
+  g(['config', 'user.name', 'seed'], seed);
+  g(['config', 'user.email', 'seed@example.com'], seed);
+  g(['checkout', '-q', '-B', 'feat/pr-head'], seed);
+  writeFileSync(join(seed, 'HEAD.txt'), 'pr head tip\n');
+  g(['add', '-A'], seed);
+  g(['commit', '-q', '-m', 'pr head'], seed);
+  g(['push', '-q', 'origin', 'feat/pr-head'], seed);
+  const runDir = mkdtempSync(join(root, 'run-'));
+  const warnings = [];
+  try {
+    // The review-round / fix-ci / rebase shape: nano-workforce's repoEnvelope emits
+    // repository.ref = <PR head branch> with NO branch.create and push enabled. The
+    // clone lands on that NON-base head — it IS the intended push target, so the agent
+    // must commit + push there so the PR head advances. Cutting a nano/agent-work
+    // fallback here strands the commit off the PR head (the convergence no-advance
+    // divergence that escalated nano-coder#26/#28).
+    const envelope = {
+      schemaVersion: 1,
+      repository: { provider: 'github', url: origin, ref: 'feat/pr-head', submodules: false },
+      branch: { base: 'main', create: '', push: true },
+      setup: { commands: [], env: {}, secretRefs: [] },
+      task: { allowPr: true },
+    };
+    const prov = provisionRepo({
+      envelope,
+      token: null,
+      runDir,
+      logger: { warn: (m) => warnings.push(m), info: () => {} },
+      corr: 'job 1 eik 2 pik 3',
+    });
+    assert.equal(prov.workingBranch, 'feat/pr-head', 'stays on the PR head branch so the push advances the PR head');
+    assert.equal(prov.fallbackBranch, false, 'does NOT cut a nano/agent-work fallback for a non-base PR head');
+    assert.ok(!/^nano\/agent-work\//.test(prov.workingBranch), 'not diverted onto a throwaway fallback ref');
+    assert.equal(prov.hasPrBranch, true, 'a PR head branch distinct from the base IS a PR branch');
+    assert.notEqual(prov.detached, true, 'not detached — a real symbolic PR head branch');
+    assert.equal(g(['rev-parse', '--abbrev-ref', 'HEAD'], prov.workspaceDir), 'feat/pr-head', 'HEAD stays on the PR head branch');
+    assert.ok(
+      !warnings.some((m) => /cut fallback work branch 'nano\/agent-work\//.test(m)),
+      'does not warn about cutting a fallback — none is cut for a non-base head',
+    );
+  } finally {
+    rmSync(root, { recursive: true, force: true });
+  }
+});
+
 test('provisionRepo cuts a correlated fallback branch when branch.create EQUALS the effective base (create===base is no direct-on-base) (#229/#231)', { skip: !gitOk }, () => {
   const { root, origin } = makeOriginRepo();
   const runDir = mkdtempSync(join(root, 'run-'));
@@ -2389,7 +2439,7 @@ test('provisionRepo folds repository.baseRef into effectiveBase so branch.create
   }
 });
 
-test('provisionRepo names the fallback + logs the base from repository.baseRef when branch.create is absent (issue #231, suppressed advisory 4317)', { skip: !gitOk }, () => {
+test('provisionRepo commits + pushes on the checked-out PR head (ref=feat/x, baseRef carries the base, NO branch.create) instead of stranding on a fallback (#270; was #231/4317)', { skip: !gitOk }, () => {
   const { root, origin } = makeOriginRepo();
   // Publish a feature branch so we can clone ref=feat/x while the base rides in
   // repository.baseRef (NOT branch.base) with NO branch.create — the split shape.
@@ -2404,11 +2454,15 @@ test('provisionRepo names the fallback + logs the base from repository.baseRef w
   g(['push', '-q', 'origin', 'feat/x'], wc);
   const runDir = mkdtempSync(join(root, 'run-'));
   try {
-    // ref=feat/x lands the clone on feat/x, baseRef=main carries the real base, and
-    // there is NO branch.create — so the guard cuts a fallback off the checked-out
-    // feat/x. Before folding repository.baseRef into `baseBranchName` the fallback was
-    // named `nano/agent-work/feat-x-…` and the "configured base" log claimed 'feat/x'
-    // even though effectiveBase is 'main'. The name + base must identify the ACTUAL base.
+    // This IS the real review-round / fix-ci / rebase envelope: ref=feat/x is the PR
+    // HEAD (the clone lands on it), baseRef=main is emitted ONLY so the harness fetches
+    // the base tip for the diff (it is NOT the push target), and there is NO
+    // branch.create. feat/x is a per-PR head branch, not the shared base — pushing there
+    // does not race the base, it is the whole point. Cutting a nano/agent-work fallback
+    // here strands the agent's commit off the PR head so the head never advances, which
+    // nano-workforce's convergence loop flags as a spurious no-advance escalation
+    // (the #270 divergence that stranded nano-coder#26/#28). effectiveBase still folds
+    // in baseRef so the pre-push staleness check watches main, not feat/x.
     const envelope = {
       schemaVersion: 1,
       repository: { provider: 'github', url: origin, ref: 'feat/x', baseRef: 'main', submodules: false },
@@ -2417,9 +2471,11 @@ test('provisionRepo names the fallback + logs the base from repository.baseRef w
       task: { allowPr: false },
     };
     const prov = provisionRepo({ envelope, token: null, runDir });
-    assert.equal(prov.fallbackBranch, true, 'a fallback is cut so commits never land on the checked-out ref');
-    assert.equal(prov.baseBranch, 'main', 'effectiveBase resolves the configured base ref');
-    assert.match(prov.workingBranch, /^nano\/agent-work\/main-/, 'the fallback name identifies the real base (main), not the feature ref');
+    assert.equal(prov.workingBranch, 'feat/x', 'stays on the PR head branch so the push advances the PR head');
+    assert.equal(prov.fallbackBranch, false, 'does NOT cut a fallback for a non-base PR head');
+    assert.ok(!/^nano\/agent-work\//.test(prov.workingBranch), 'not diverted onto a throwaway fallback ref');
+    assert.equal(prov.baseBranch, 'main', 'effectiveBase still resolves the configured base ref (baseRef) for the staleness check');
+    assert.equal(g(['rev-parse', '--abbrev-ref', 'HEAD'], prov.workspaceDir), 'feat/x', 'HEAD stays on the PR head branch');
   } finally {
     rmSync(root, { recursive: true, force: true });
   }

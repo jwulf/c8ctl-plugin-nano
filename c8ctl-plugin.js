@@ -5217,9 +5217,26 @@ function provisionRepo({ envelope, token, runDir, runId, timeoutMs = 120_000, lo
     if (workingBranch === effectiveBase) log.warn?.(`provisionRepo${cs}: branch.create='${workingBranch}' IS the effective base and push is disabled → any commits land directly on the base branch (not pushed, but this throwaway workspace is reaped)`);
     else log.debug?.(`provisionRepo${cs}: branch.create=${workingBranch} → cut work branch off base '${baseBranchName || '(unknown)'}'`);
   } else if (checkedOut && wantPush) {
-    // Either no branch.create, OR an explicit create that NAMES the effective base
-    // while pushing — both would otherwise commit on the base, so cut a fallback.
-    cutFallbackBranch(checkedOut);
+    // No branch.create (or a create that named the base, routed here): the clone
+    // landed on a symbolic branch. If that branch IS the shared base/default — or the
+    // base/default could NOT be resolved (fail closed, #231/4444) — committing +
+    // pushing there races the base and a non-ff reject strands the work, so cut a
+    // fallback off it. But when the clone landed on a KNOWN NON-base branch it is the
+    // PR head (the review-round / fix-ci / rebase shape: nano-workforce's repoEnvelope
+    // emits repository.ref=<PR head> with NO branch.create). That branch IS the
+    // intended push target — stay on it so `finalizeGit` advances the PR head. Cutting
+    // a fallback here would strand the agent's commit on a throwaway nano/agent-work/*
+    // ref while the PR head never moves, which nano-workforce's convergence loop then
+    // (correctly) flags as a no-advance escalation despite a genuine "pushed" round
+    // (the divergence that stranded nano-coder#26/#28 — c8ctl-plugin-nano#270).
+    const baseKnown = !!(effectiveBase || remoteDefaultBranch);
+    const createNamedBase = !!explicitCreate && createNamesBase(explicitCreate);
+    if (baseKnown && !createNamesBase(checkedOut) && !createNamedBase) {
+      workingBranch = checkedOut;
+      log.debug?.(`provisionRepo${cs}: no base-naming branch.create; clone landed on non-base PR head '${checkedOut}' (base '${effectiveBase || remoteDefaultBranch}') → commit + push there so the PR head advances`);
+    } else {
+      cutFallbackBranch(checkedOut);
+    }
   } else if (unbornBranch && wantPush) {
     // Unborn branch (empty remote clone) with push enabled: the agent's FIRST
     // commit belongs on a pushable work branch, not stranded on the unborn default.

@@ -1265,6 +1265,54 @@ test('#137 floor: does NOT fire when the agent already emitted a mappable sessio
   }
 });
 
+test('#275 floor-only: a resolved turn with no session/update flags acpTranscriptFloorOnly (thread 4118913047)', async () => {
+  const resDir = mkdtempSync(join(tmpdir(), 'acp-res-'));
+  const resultFile = join(resDir, 'result.json');
+  const rec = makeTypedTap();
+  try {
+    // No FAKE_EMIT_UPDATE → the turn resolves without any real session/update, so the
+    // ONLY captured stdout is the synthetic floor. That must be flagged so the empty-job
+    // guard does not treat the floor as agent work.
+    const result = await spawnCaptureAcp({
+      command: 'node',
+      args: [FAKE_AGENT],
+      cwd: workRoot,
+      env: { ...baseEnv(), AGENT_RESULT_FILE: resultFile, FAKE_RESULT_JSON: '{}' },
+      stdinData: 'prompt',
+      timeoutMs: 20_000,
+      relayTap: rec.tap,
+      permission: 'yolo',
+    });
+    assert.equal(result.ok, true, result.error || result.stderr);
+    assert.equal(result.acpTranscriptFloorOnly, true, 'a floor-only turn must set acpTranscriptFloorOnly');
+    assert.equal(rec.chunks.length, 1, 'the synthetic floor reached the transcript lane');
+  } finally {
+    rmSync(resDir, { recursive: true, force: true });
+  }
+});
+
+test('#275 floor-only: a turn with a real session/update does NOT flag acpTranscriptFloorOnly', async () => {
+  const resDir = mkdtempSync(join(tmpdir(), 'acp-res-'));
+  const resultFile = join(resDir, 'result.json');
+  const rec = makeTypedTap();
+  try {
+    const result = await spawnCaptureAcp({
+      command: 'node',
+      args: [FAKE_AGENT],
+      cwd: workRoot,
+      env: { ...baseEnv(), AGENT_RESULT_FILE: resultFile, FAKE_EMIT_UPDATE: '1' },
+      stdinData: 'prompt',
+      timeoutMs: 20_000,
+      relayTap: rec.tap,
+      permission: 'yolo',
+    });
+    assert.equal(result.ok, true, result.error || result.stderr);
+    assert.notEqual(result.acpTranscriptFloorOnly, true, 'a turn with real transcript work is not floor-only');
+  } finally {
+    rmSync(resDir, { recursive: true, force: true });
+  }
+});
+
 test('#137 floor: inert (no crash, nothing structured) when the relay exposes no transcript-chunk seam', async () => {
   const resDir = mkdtempSync(join(tmpdir(), 'acp-res-'));
   const resultFile = join(resDir, 'result.json');

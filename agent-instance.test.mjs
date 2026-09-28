@@ -989,6 +989,37 @@ test('a hung terminal COMPLETED update is bounded so it cannot hold the lease an
   );
 });
 
+test('drainBounded returns true when the queue settles and false (bounded out) on a hung append (thread 4118913008)', async () => {
+  // The pre-settlement empty-job guard drains to sample appendedTurns/sawPlan, but the
+  // public drain() awaits the ENTIRE serialized queue — a hung updateAgentInstance would
+  // hold the job past the broker lease and prevent settlement. drainBounded() must
+  // return within the bound, reporting whether the queue actually drained.
+  const timer = makeManualTimer();
+  let hangUpdate = false;
+  const client = {
+    calls: { create: [], update: [] },
+    createAgentInstance: async (req) => { client.calls.create.push(req); return { agentInstanceKey: 'AGENT-D' }; },
+    updateAgentInstance: (req) => {
+      client.calls.update.push(req);
+      if (hangUpdate) return new Promise(() => {}); // hang forever
+      return Promise.resolve({ createdHistory: [{ historyItemId: 'h1' }] });
+    },
+  };
+  const p = makeProducer(client, { finalizeTimeoutMs: 20, setTimer: timer });
+  await p.activate();
+  // A normal append drains fully within the bound.
+  p.ingest({ sessionUpdate: 'agent_message_chunk', messageId: 'm1', content: { type: 'text', text: 'x' } });
+  assert.equal(await p.drainBounded(), true, 'a settled queue drains within the bound (true)');
+  assert.equal(p.appendedTurns, 1, 'the confirmed turn is visible after a full drain');
+  // Now a hung append: drainBounded must STILL return, reporting the bound won (false)
+  // rather than blocking forever on the hung updateAgentInstance.
+  hangUpdate = true;
+  p.ingest({ sessionUpdate: 'agent_message_chunk', messageId: 'm2', content: { type: 'text', text: 'y' } });
+  const boundedPromise = p.drainBounded();
+  await timer.fire(); // fire the finalizeTimeoutMs deadline deterministically
+  assert.equal(await boundedPromise, false, 'a hung append is bounded out (false) instead of blocking forever');
+});
+
 test('a retired create attempt that FAILS late is reported quietly, not as a misleading "will retry" (issue #230)', async () => {
   // A timed-out attempt keeps running and may reject AFTER it was retired and a newer
   // attempt has minted the instance. That late rejection must not emit the ordinary

@@ -1643,6 +1643,25 @@ export function createAgentInstanceProducer(opts = {}) {
     },
 
     /**
+     * Drain queued appends WITHOUT transitioning status, BOUNDED at `timeoutMs`
+     * (defaults to finalizeTimeoutMs). Returns `true` when the queue fully drained
+     * within the window, `false` when the bound won (appends are still in flight in
+     * the background). Unlike `drain()` — which awaits the ENTIRE serialized append
+     * queue and can therefore block for up to N×finalizeTimeoutMs on a large ACP
+     * transcript or during an AgentHistory outage — this never holds its caller past
+     * the bound, so an inspection step (e.g. the pre-settlement empty-job guard) can
+     * sample the `appendedTurns`/`sawPlan` signals without risking the broker lease
+     * (thread 4118913008). A `false` return is itself transcript evidence: turns were
+     * enqueued (real agent activity) but not yet confirmed. The overrun appends keep
+     * draining in the background (each is individually bounded), exactly like the
+     * aggregate-drain overrun in `complete()`. Best-effort; never throws.
+     */
+    async drainBounded(timeoutMs = finalizeTimeoutMs) {
+      flushMessage();
+      return settleWithin(queue, timeoutMs, setTimer);
+    },
+
+    /**
      * Abort/discard teardown for a run ABANDONED during setup (issue #222). Unlike
      * `complete()` this does NOT drive a terminal COMPLETED update and — critically —
      * does NOT make a last-chance create attempt: the run is being yielded for retry,

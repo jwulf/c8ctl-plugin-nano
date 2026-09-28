@@ -102,6 +102,36 @@ test('detectEmptyAgentJob passes a run with ANY evidence of real work', () => {
   );
 });
 
+test('detectEmptyAgentJob ignores a synthetic transcript floor as work (thread 4118913047)', () => {
+  // The ACP path synthesises a transcript FLOOR into stdout when the turn resolved
+  // but no real session/update arrived. That floor is NOT agent work, so a no-op ACP
+  // husk whose ONLY stdout is the floor must still be flagged empty.
+  const floorText = 'Agent completed the turn but published no structured/canonical transcript content, so no transcript messages were produced.';
+  const hit = detectEmptyAgentJob({
+    resultVars: {},
+    stdout: floorText,
+    gitResult: null,
+    hasTurns: false,
+    hasPlan: false,
+    hasOutcome: false,
+    transcriptFloorOnly: true,
+  });
+  assert.ok(hit, 'a run whose only stdout is the synthetic floor is still empty');
+  assert.match(hit.reason, /produced nothing/);
+  // Same stdout WITHOUT the floor-only flag (real agent work) is NOT empty.
+  assert.equal(
+    detectEmptyAgentJob({ resultVars: {}, stdout: floorText, gitResult: null }),
+    null,
+    'real stdout output is still work',
+  );
+  // Floor-only does NOT suppress the other work signals.
+  assert.equal(
+    detectEmptyAgentJob({ resultVars: {}, stdout: floorText, gitResult: null, transcriptFloorOnly: true, hasTurns: true }),
+    null,
+    'real transcript turns are still work even alongside a floor',
+  );
+});
+
 test('detectEmptyAgentJob treats stderr-only diagnostics as NON-work (the husk signature)', () => {
   // A protocol-mismatched harness (an ACP-mode binary fed a pipe payload) rejects
   // stdin and prints an ACP parse error to stderr while producing nothing on

@@ -2902,9 +2902,13 @@ function pickAgentResult(...thunks) {
 // exists to catch (thread 4118471796). `stdoutStrippedOfEmptyResult` removes only
 // those value-less result markers; any other prose survives and still attests work.
 // Pure + exported for tests; the caller folds the result into the settle path.
-function detectEmptyAgentJob({ resultVars, stdout, gitResult, hasTurns, hasPlan, hasOutcome } = {}) {
+function detectEmptyAgentJob({ resultVars, stdout, gitResult, hasTurns, hasPlan, hasOutcome, transcriptFloorOnly } = {}) {
   if (hasEffectiveResultVars(resultVars)) return null;
-  if (typeof stdout === 'string' && stdoutStrippedOfEmptyResult(stdout).trim() !== '') return null;
+  // A synthetic ACP transcript FLOOR (see `maybeEmitTranscriptFloor`) is captured
+  // into stdout even when the harness produced no real work, so when the returned
+  // stdout is ONLY that floor it is NOT evidence of agent work — skip the stdout
+  // check so a no-op ACP husk is still detected as empty (thread 4118913047).
+  if (transcriptFloorOnly !== true && typeof stdout === 'string' && stdoutStrippedOfEmptyResult(stdout).trim() !== '') return null;
   if (hasTurns === true || hasPlan === true || hasOutcome === true) return null;
   if ((gitResult?.commits?.length ?? 0) > 0) return null;
   if (gitResult?.pushed === true) return null;
@@ -3076,7 +3080,7 @@ async function resolveAgentResultWithNudge({ result, resultFile, rerun, logger, 
     // `truncated` flag consistent with it — echo the incoming `result.truncated`
     // rather than hardcoding false, so callers that trust the return value don't
     // see an already-truncated stdout reported as untruncated.
-    return { stdout: stdout0, nudged: false, truncated: result?.truncated === true, acpOutcome: result?.acpOutcome ?? null };
+    return { stdout: stdout0, nudged: false, truncated: result?.truncated === true, acpOutcome: result?.acpOutcome ?? null, transcriptFloorOnly: result?.acpTranscriptFloorOnly === true };
   }
   let nudge = null;
   let nudgeError = null;
@@ -3111,7 +3115,13 @@ async function resolveAgentResultWithNudge({ result, resultFile, rerun, logger, 
   // `workAgent` — otherwise the escalation and the recorded envelope outcome would
   // silently reflect only the first turn's outcome. Fall back to the first result's
   // outcome when the nudge reported none.
-  return { stdout, nudged: true, truncated, acpOutcome: nudge?.acpOutcome ?? result?.acpOutcome ?? null };
+  // The combined stdout is FLOOR-ONLY only when both turns produced no real work:
+  // the first turn was floor-only AND the nudge added nothing real (no output, or
+  // its own turn was floor-only). Any real nudge output makes the stdout genuine
+  // agent work (thread 4118913047).
+  const transcriptFloorOnly = result?.acpTranscriptFloorOnly === true
+    && (!nudgeOut.trim() || nudge?.acpTranscriptFloorOnly === true);
+  return { stdout, nudged: true, truncated, acpOutcome: nudge?.acpOutcome ?? result?.acpOutcome ?? null, transcriptFloorOnly };
 }
 
 function coerceBool(v, dflt = false) {
@@ -7555,6 +7565,12 @@ function spawnCaptureAcp({ command, args = [], cwd, env, stdinData, timeoutMs, i
     // drill-in shows the outcome instead of nothing (see `maybeEmitTranscriptFloor`).
     let transcriptChunksPublished = 0;
     let floorEmitted = false;
+    // #275: did the harness ever send a real `session/update`? The synthetic floor
+    // is captured into stdout even when it did not, so the empty-job guard needs to
+    // tell "stdout carries agent work" from "stdout is ONLY the synthetic floor"
+    // (thread 4118913047). Any session/update — mapped chunk OR fallback text —
+    // flips this; the floor never does.
+    let sawRealTranscript = false;
 
     // Live "spy" tee (--stream), line-buffered, mirroring the other paths.
     // Separate line buffers per lane (stdout-human vs stderr) so a partial line
@@ -7636,7 +7652,14 @@ function spawnCaptureAcp({ command, args = [], cwd, env, stdinData, timeoutMs, i
       if (teeSink) { tee('', true); teeErr('', true); }
       // Reap the child if it is still alive (turn resolved but agent lingering).
       try { if (child && childClosed === null) killTree(child); } catch { /* best effort */ }
-      resolve(acpOutcome ? { ...result, acpOutcome } : result);
+      // #275: flag when the ONLY captured stdout is the synthetic transcript floor
+      // (the turn resolved but no real session/update ever arrived). The empty-job
+      // guard reads this so a no-op ACP husk is not made to look non-empty by its own
+      // floor (thread 4118913047).
+      const floorOnly = floorEmitted && !sawRealTranscript;
+      let resolved = acpOutcome ? { ...result, acpOutcome } : result;
+      if (floorOnly) resolved = { ...resolved, acpTranscriptFloorOnly: true };
+      resolve(resolved);
     };
 
     // --- JSON-RPC 2.0 plumbing (newline-delimited framing) -------------------
@@ -7765,6 +7788,9 @@ function spawnCaptureAcp({ command, args = [], cwd, env, stdinData, timeoutMs, i
     // the update has no canonical mapping OR the relay exposes no transcript seam,
     // so nothing is ever dropped (no regression vs minimal mode).
     const emitTranscript = (update) => {
+      // A real `session/update` reached us — agent work, distinct from the synthetic
+      // floor below (thread 4118913047).
+      sawRealTranscript = true;
       const chunk = encodeTranscriptChunk(update);
       if (chunk && relayTap && typeof relayTap.relayTranscriptChunk === 'function') {
         // Only skip the text fallback when the chunk publish ACTUALLY succeeded.
@@ -11270,7 +11296,7 @@ async function workAgent(req, flags, ctx) {
           // the result is recoverable only via the stdout `::nano:result::`
           // sentinel, which `resolveAgentResultWithNudge` handles directly.
           if (result.ok) {
-            const { stdout, nudged, truncated, acpOutcome } = await resolveAgentResultWithNudge({
+            const { stdout, nudged, truncated, acpOutcome, transcriptFloorOnly } = await resolveAgentResultWithNudge({
               result,
               resultFile,
               logger,
@@ -11292,6 +11318,10 @@ async function workAgent(req, flags, ctx) {
               }),
             });
             result.stdout = stdout;
+            // Recompute the floor-only signal over the COMBINED (first + nudge) stdout
+            // so a nudge that added real output is no longer classed floor-only, and a
+            // still-empty husk stays floor-only for the guard (thread 4118913047).
+            result.acpTranscriptFloorOnly = transcriptFloorOnly;
             if (nudged) {
               result.nudgedForResult = true;
               if (truncated) result.truncated = true;
@@ -11310,9 +11340,17 @@ async function workAgent(req, flags, ctx) {
           // ever sees it: the instance would be stranded COMPLETED, a retry could no
           // longer continue the same non-terminal instance, and the terminal update
           // could hit the same 422 (thread 4118327671). `drain()` transitions no
-          // status. Best-effort — never disturbs job settlement.
+          // status. Best-effort — never disturbs job settlement. BOUNDED (drainBounded):
+          // the public `drain()` awaits the ENTIRE serialized append queue, so a large ACP
+          // transcript or an AgentHistory outage could otherwise hold the job here — past
+          // the broker lease — before settleJob.fail/complete ever runs, preventing the
+          // empty-job guard from settling at all. A bounded-out drain leaves appends still
+          // in flight (they keep draining in the background); that is itself transcript
+          // evidence — turns were produced but not yet confirmed — which the guard below
+          // treats as non-empty via `preGuardDrainTimedOut` (thread 4118913008).
+          let preGuardDrainTimedOut = false;
           if (agentInstanceProducer) {
-            try { await agentInstanceProducer.drain(); } catch (err) { logger.warn(`[${jobType}] AgentInstance producer drain() threw (${aiCorr}) — ${oneLineLog(err?.message || err)}; job settlement unaffected.`); }
+            try { preGuardDrainTimedOut = (await agentInstanceProducer.drainBounded()) === false; } catch (err) { logger.warn(`[${jobType}] AgentInstance producer drainBounded() threw (${aiCorr}) — ${oneLineLog(err?.message || err)}; job settlement unaffected.`); }
           }
 
           // #264: the run is done — take a FINAL snapshot (so edits still pending in
@@ -11581,9 +11619,17 @@ async function workAgent(req, flags, ctx) {
             resultVars,
             stdout: result.stdout,
             gitResult,
-            hasTurns: agentInstanceProducer?.appendedTurns > 0,
+            // A bounded pre-guard drain that timed out left appends in flight — turns
+            // WERE produced (real activity), just not yet confirmed — so treat it as
+            // transcript evidence (thread 4118913008).
+            hasTurns: agentInstanceProducer?.appendedTurns > 0 || preGuardDrainTimedOut,
             hasPlan: agentInstanceProducer?.sawPlan === true,
             hasOutcome: result.acpOutcome != null,
+            // The ACP path synthesises a transcript FLOOR into stdout when the turn
+            // resolved but no session/update arrived (`maybeEmitTranscriptFloor`). That
+            // floor is NOT agent work, so a no-op ACP husk must not look non-empty on
+            // the strength of its own synthetic floor (thread 4118913047).
+            transcriptFloorOnly: result.acpTranscriptFloorOnly === true,
           });
           // #194 + #275: NOW terminalize the AgentInstance, keyed off REAL work — not
           // the bare exit code. A non-empty success drives COMPLETED; an empty husk

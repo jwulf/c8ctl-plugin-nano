@@ -7275,9 +7275,15 @@ const SHELL_WORD_RE = /(?:'(?:[^']|'\\'')*'|"(?:[^"\\]|\\.)*"|[^\s'"]+)+/g;
 // shell/`-c` detection live here ONCE, shared by `shellWrappedScript` (which
 // just reads the inner script) and `ensureAcpFlag` (which rewrites it to inject
 // the ACP flag INSIDE the script) so the two can never drift.
-function locateShellWrapperScript(commandLine) {
-  const tokens = String(commandLine).match(SHELL_WORD_RE) || [];
-  if (tokens.length < 3) return null;
+// Skip a leading `NAME=value` env-assignment run and an optional `env` wrapper
+// (`env` itself, its options `-i`/`--null`/`-u NAME`/bare `-`, and any
+// assignments it carries) to reach the index of the REAL command token. Shared
+// by `locateShellWrapperScript` (to find the wrapping shell past the prefix) and
+// `ensureAcpFlag` (to find the command token for the `*-acp` adapter check) so an
+// `env`-wrapped adapter (`env claude-agent-acp`, `env FOO=1 claude-agent-acp`) is
+// unwrapped identically on both paths — otherwise the adapter check treats `env`
+// as the executable and misses the selector (thread 4118839851).
+function commandStartIndex(tokens) {
   let i = 0;
   // Skip a leading run of `NAME=value` assignments (`FOO=1 sh -c …`).
   while (i < tokens.length && ENV_ASSIGNMENT_RE.test(unquoteShellWord(tokens[i]))) i++;
@@ -7299,6 +7305,12 @@ function locateShellWrapperScript(commandLine) {
       break; // first non-option, non-assignment word is the command env runs
     }
   }
+  return i;
+}
+function locateShellWrapperScript(commandLine) {
+  const tokens = String(commandLine).match(SHELL_WORD_RE) || [];
+  if (tokens.length < 3) return null;
+  const i = commandStartIndex(tokens);
   if (tokens.length - i < 3) return null;
   const base = unquoteShellWord(tokens[i]).replace(/^.*[\\/]/, '');
   if (!WRAPPER_SHELL_BASENAMES.has(base)) return null;
@@ -7324,20 +7336,44 @@ function shellWrappedScript(commandLine) {
 // select ACP, so a native/adapter invocation is never doubled. This mirrors how
 // the pipe path spawns the line under a shell.
 function ensureAcpFlag(commandLine) {
-  // Detection must survive buildAgentCommandLine()'s POSIX single-quoting: a
-  // structured `--arg acp` (or `--arg --acp`) lands here as the quoted token
-  // 'acp' / '--acp', so a naive `\bacp\b` on the raw line would miss it and
-  // wrongly append a second --acp. Tokenise the line, strip the shell quoting
-  // (both POSIX single-quotes from buildAgentCommandLine() AND double-quotes a
-  // legacy `profile.command` may bake in, e.g. `copilot "--acp"`), and match:
+  // A shell wrapper runs the harness INSIDE its `-c <script>`. Tokens AFTER the
+  // script are the shell's positional params ($0, $1, …), NOT arguments to the
+  // wrapped command, and the shell's own options come BEFORE the script — so an
+  // ACP selector is only meaningful INSIDE the script. Handle the wrapper FIRST,
+  // before the outer-token scan, so a trailing `--acp` that is really the `-c`
+  // script's `$0` (`sh -c 'copilot' --acp`) is NOT mistaken for a live selector
+  // (which would leave the harness in pipe mode while an ACP worker sends it ACP
+  // frames, and falsely pass `protocol: pipe` validation — thread 4118839872).
+  // Recurse into the script: a selector already present leaves it unchanged;
+  // otherwise inject `--acp` INTO the script (so it reaches the harness, not the
+  // outer `$0`), rebuilding the `-c` argument. The inner script shrinks each
+  // level, so the mutual recursion with `locateShellWrapperScript` terminates.
+  const wrapperLoc = locateShellWrapperScript(commandLine);
+  if (wrapperLoc) {
+    const inner = unquoteShellWord(wrapperLoc.tokens[wrapperLoc.scriptIndex]);
+    const ensuredInner = ensureAcpFlag(inner);
+    if (ensuredInner === inner) return commandLine; // ACP already selected inside
+    const rebuilt = wrapperLoc.tokens.slice();
+    // Re-quote the rewritten script as one POSIX literal so it survives the
+    // shell as a single `-c` argument; other tokens keep their original quoting.
+    rebuilt[wrapperLoc.scriptIndex] = shQuote(ensuredInner);
+    return rebuilt.join(' ');
+  }
+  // Not a shell wrapper. Detection must survive buildAgentCommandLine()'s POSIX
+  // single-quoting: a structured `--arg acp` (or `--arg --acp`) lands here as the
+  // quoted token 'acp' / '--acp', so a naive `\bacp\b` on the raw line would miss
+  // it and wrongly append a second --acp. Tokenise the line, strip the shell
+  // quoting (both POSIX single-quotes from buildAgentCommandLine() AND
+  // double-quotes a legacy `profile.command` may bake in, e.g. `copilot "--acp"`),
+  // and match:
   //   - a native ACP selector `acp`/`-acp`/`--acp` (subcommand or switch) as a
   //     WHOLE token, in ANY position (it may be the command or an argument), or
   //   - an adapter command whose basename ends in `-acp` (claude-agent-acp,
   //     pi-acp) — but ONLY the command token (the first token past any leading
-  //     env-assignment prefix, see commandIndex below), since an *argument*
-  //     that merely ends in `-acp` (e.g. `--model foo-acp`) is not an ACP
-  //     selector. Matching whole tokens/basenames (not a substring) also avoids
-  //     the false positive of a path that merely contains `/acp/`.
+  //     env-assignment / `env`-wrapper prefix, see commandIndex below), since an
+  //     *argument* that merely ends in `-acp` (e.g. `--model foo-acp`) is not an
+  //     ACP selector. Matching whole tokens/basenames (not a substring) also
+  //     avoids the false positive of a path that merely contains `/acp/`.
   // A shell WORD is a contiguous run of quoted and/or unquoted segments with no
   // whitespace between them, so a `\S+` token boundary is wrong: an env prefix
   // whose value is quoted and contains spaces (e.g. `FOO='a b' claude-code-acp`)
@@ -7351,14 +7387,11 @@ function ensureAcpFlag(commandLine) {
   // The `*-acp` adapter suffix identifies the COMMAND token, but the command is
   // not always token 0: a shell command line may be prefixed with a contiguous
   // run of env assignments (`NAME=value`, e.g. the `ACP=true` in
-  // `ACP=true claude-code-acp`). Skip that leading assignment prefix so the
-  // adapter check lands on the real command token. Only a *leading* run counts —
-  // once a real command token appears, later `FOO=bar` tokens are arguments.
-  let commandIndex = 0;
-  while (commandIndex < tokens.length &&
-         /^[A-Za-z_][A-Za-z0-9_]*=/.test(unquote(tokens[commandIndex]))) {
-    commandIndex++;
-  }
+  // `ACP=true claude-code-acp`) and/or an `env` wrapper (`env claude-agent-acp`).
+  // Skip that leading prefix so the adapter check lands on the real command token
+  // (thread 4118839851). Only a *leading* prefix counts — once a real command
+  // token appears, later `FOO=bar` tokens are arguments.
+  const commandIndex = commandStartIndex(tokens);
   for (let i = 0; i < tokens.length; i++) {
     let tok = unquote(tokens[i]);
     // Normalise a GNU-style `--opt=value` selector to its option-NAME part, so
@@ -7382,25 +7415,8 @@ function ensureAcpFlag(commandLine) {
     if (/^--?[a-z0-9][a-z0-9-]*-acp$/i.test(name)) return commandLine;
     if (i === commandIndex && /-acp$/i.test(base)) return commandLine;
   }
-  // No ACP selector on the OUTER line. If this is a shell wrapper
-  // (`sh -c '<script>'`), the harness runs INSIDE the `-c` script, so appending
-  // `--acp` to the outer line makes it the script's `$0` — it never reaches the
-  // harness and the worker drives a pipe-mode binary as ACP. Inject the flag
-  // INTO the wrapped script instead (thread 4118745067). Recurse so a selector
-  // already inside the script is not doubled (returns the line unchanged) and a
-  // nested wrapper is handled; the inner script shrinks each level, so the
-  // mutual recursion with `locateShellWrapperScript` terminates.
-  const loc = locateShellWrapperScript(commandLine);
-  if (loc) {
-    const inner = unquoteShellWord(loc.tokens[loc.scriptIndex]);
-    const ensuredInner = ensureAcpFlag(inner);
-    if (ensuredInner === inner) return commandLine; // ACP already selected inside
-    const rebuilt = loc.tokens.slice();
-    // Re-quote the rewritten script as one POSIX literal so it survives the
-    // shell as a single `-c` argument; other tokens keep their original quoting.
-    rebuilt[loc.scriptIndex] = shQuote(ensuredInner);
-    return rebuilt.join(' ');
-  }
+  // No ACP selector on the line. This is not a shell wrapper (those are handled
+  // at the top), so the harness runs directly — append the default `--acp`.
   return `${commandLine} --acp`;
 }
 

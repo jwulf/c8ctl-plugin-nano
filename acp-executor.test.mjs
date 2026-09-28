@@ -20,6 +20,7 @@ import {
   spawnCaptureAcp,
   ensureAcpFlag,
   commandLineHasAcpSelector,
+  detectProtocolMismatch,
   runAgentJob,
   readAgentResultFile,
   normalizeTaskEnvelope,
@@ -330,6 +331,45 @@ test('ensureAcpFlag injects --acp INSIDE a shell-wrapped script, not onto the ou
   assert.equal(ensureAcpFlag(nested), nested, 'nested injection is idempotent');
   // A non-shell command that merely takes args is not a wrapper — plain append.
   assert.equal(ensureAcpFlag("node '/x/agent.mjs'"), "node '/x/agent.mjs' --acp");
+});
+
+test('ensureAcpFlag ignores a selector after the -c script ($0), injecting inside instead (thread 4118839872)', () => {
+  // The outer-token scan must NOT accept a selector that appears AFTER the `-c`
+  // script: for `sh -c '<script>' --acp`, the trailing `--acp` is the script's
+  // $0, not an argument to the wrapped harness, so the harness still runs in pipe
+  // mode. Handling the wrapper FIRST injects `--acp` INSIDE the script (the outer
+  // $0 is left untouched) so the flag actually reaches the harness.
+  assert.equal(ensureAcpFlag("sh -c 'copilot' --acp"), "sh -c 'copilot --acp' --acp");
+  assert.equal(ensureAcpFlag("bash -lc 'nano-coder' acp"), "bash -lc 'nano-coder --acp' acp");
+  // A selector that is really $0 is NOT a live ACP selector, so the wrapped
+  // pipe-mode command is (correctly) not seen as ACP-selected.
+  assert.equal(commandLineHasAcpSelector("sh -c 'copilot' --acp"), false, 'trailing --acp is $0, not a selector');
+  // A `protocol: pipe` profile with this shape runs pipe-mode copilot, so it is
+  // consistent — no mismatch is flagged.
+  assert.equal(
+    detectProtocolMismatch({ command: 'sh', args: ['-c', 'copilot', '--acp'], protocol: 'pipe' }),
+    null,
+    'a trailing $0 --acp on a pipe-mode wrapped command is not a mismatch',
+  );
+});
+
+test('ensureAcpFlag / commandLineHasAcpSelector unwrap an env-wrapped adapter (thread 4118839851)', () => {
+  // `commandLineHasAcpSelector` delegates to ensureAcpFlag's command-token scan.
+  // A `*-acp` adapter behind a plain `env` wrapper (`env claude-agent-acp`) must
+  // be recognised: the command-index skip unwraps `env` (and its options /
+  // assignments) so the adapter check lands on the real command token, not `env`.
+  assert.equal(commandLineHasAcpSelector('env claude-agent-acp'), true, 'env + adapter');
+  assert.equal(commandLineHasAcpSelector('env FOO=1 claude-agent-acp'), true, 'env + assignment + adapter');
+  assert.equal(commandLineHasAcpSelector('env -i pi-acp'), true, 'env -i + adapter');
+  assert.equal(commandLineHasAcpSelector('env -u BAR claude-code-acp'), true, 'env -u NAME + adapter');
+  // ensureAcpFlag leaves the env-wrapped adapter unchanged (already ACP), but
+  // still appends `--acp` for an env-wrapped PLAIN command.
+  assert.equal(ensureAcpFlag('env claude-agent-acp'), 'env claude-agent-acp');
+  assert.equal(ensureAcpFlag('env FOO=1 copilot'), 'env FOO=1 copilot --acp');
+  // A `protocol: pipe` profile with an env-wrapped adapter is a mismatch.
+  const hit = detectProtocolMismatch({ command: 'env', args: ['claude-agent-acp'], protocol: 'pipe' });
+  assert.ok(hit, 'env-wrapped adapter on pipe is a mismatch');
+  assert.match(hit.reason, /selects ACP mode/);
 });
 
 test('spawnCaptureAcp completes the ACP handshake and merges the result file', async () => {

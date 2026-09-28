@@ -7264,18 +7264,29 @@ function tokenizeShellWords(commandLine) {
 const WRAPPER_SHELL_BASENAMES = new Set(['sh', 'bash', 'dash', 'zsh', 'ash', 'ksh']);
 // A leading `NAME=value` environment assignment (POSIX name, `=` present).
 const ENV_ASSIGNMENT_RE = /^[A-Za-z_][A-Za-z0-9_]*=/;
-function shellWrappedScript(commandLine) {
-  const words = tokenizeShellWords(commandLine);
-  if (words.length < 3) return null;
+// The shell-word tokenizer regex (a run of quoted/unquoted segments with no
+// whitespace between them). Shared so both the read (`shellWrappedScript`) and
+// the rewrite (`ensureAcpFlag`'s wrapper injection) tokenize identically.
+const SHELL_WORD_RE = /(?:'(?:[^']|'\\'')*'|"(?:[^"\\]|\\.)*"|[^\s'"]+)+/g;
+// Locate the `-c <script>` payload of a shell wrapper. Returns the RAW tokens
+// (quoting preserved) and the index of the `<script>` token — or null when the
+// line is not a recognised `<prefix> <shell> [-opts] -c <script>` wrapper. The
+// prefix-skip (leading `NAME=value` assignments / an `env` wrapper) and the
+// shell/`-c` detection live here ONCE, shared by `shellWrappedScript` (which
+// just reads the inner script) and `ensureAcpFlag` (which rewrites it to inject
+// the ACP flag INSIDE the script) so the two can never drift.
+function locateShellWrapperScript(commandLine) {
+  const tokens = String(commandLine).match(SHELL_WORD_RE) || [];
+  if (tokens.length < 3) return null;
   let i = 0;
   // Skip a leading run of `NAME=value` assignments (`FOO=1 sh -c …`).
-  while (i < words.length && ENV_ASSIGNMENT_RE.test(words[i])) i++;
+  while (i < tokens.length && ENV_ASSIGNMENT_RE.test(unquoteShellWord(tokens[i]))) i++;
   // Skip an `env` wrapper: `env` itself, its options (`-i`, `-u NAME`, `--null`),
   // and any `NAME=value` assignments it carries, up to the command it runs.
-  if (i < words.length && words[i].replace(/^.*[\\/]/, '') === 'env') {
+  if (i < tokens.length && unquoteShellWord(tokens[i]).replace(/^.*[\\/]/, '') === 'env') {
     i++;
-    while (i < words.length) {
-      const w = words[i];
+    while (i < tokens.length) {
+      const w = unquoteShellWord(tokens[i]);
       if (ENV_ASSIGNMENT_RE.test(w)) { i++; continue; }
       // `env` options: a switch that is not yet the command. `-u`/`--unset` take a
       // NAME argument — skip it too. A bare `-` (env's "ignore rest") ends options.
@@ -7288,17 +7299,21 @@ function shellWrappedScript(commandLine) {
       break; // first non-option, non-assignment word is the command env runs
     }
   }
-  if (words.length - i < 3) return null;
-  const base = words[i].replace(/^.*[\\/]/, '');
+  if (tokens.length - i < 3) return null;
+  const base = unquoteShellWord(tokens[i]).replace(/^.*[\\/]/, '');
   if (!WRAPPER_SHELL_BASENAMES.has(base)) return null;
-  for (let j = i + 1; j < words.length; j++) {
-    const w = words[j];
+  for (let j = i + 1; j < tokens.length; j++) {
+    const w = unquoteShellWord(tokens[j]);
     if (!w.startsWith('-')) return null; // reached the command/script without a -c
     // `-c` (possibly combined with other short opts, e.g. `-lc`, `-euxc`) takes
     // the NEXT word as the script to run.
-    if (/^-[a-z]*c$/i.test(w)) return j + 1 < words.length ? words[j + 1] : null;
+    if (/^-[a-z]*c$/i.test(w)) return j + 1 < tokens.length ? { tokens, scriptIndex: j + 1 } : null;
   }
   return null;
+}
+function shellWrappedScript(commandLine) {
+  const loc = locateShellWrapperScript(commandLine);
+  return loc ? unquoteShellWord(loc.tokens[loc.scriptIndex]) : null;
 }
 
 // ---- ACP capture (C3 #110 — the third harness path, "minimal mode") ---------
@@ -7366,6 +7381,25 @@ function ensureAcpFlag(commandLine) {
     // it is not a switch and still (correctly) triggers the append below.
     if (/^--?[a-z0-9][a-z0-9-]*-acp$/i.test(name)) return commandLine;
     if (i === commandIndex && /-acp$/i.test(base)) return commandLine;
+  }
+  // No ACP selector on the OUTER line. If this is a shell wrapper
+  // (`sh -c '<script>'`), the harness runs INSIDE the `-c` script, so appending
+  // `--acp` to the outer line makes it the script's `$0` — it never reaches the
+  // harness and the worker drives a pipe-mode binary as ACP. Inject the flag
+  // INTO the wrapped script instead (thread 4118745067). Recurse so a selector
+  // already inside the script is not doubled (returns the line unchanged) and a
+  // nested wrapper is handled; the inner script shrinks each level, so the
+  // mutual recursion with `locateShellWrapperScript` terminates.
+  const loc = locateShellWrapperScript(commandLine);
+  if (loc) {
+    const inner = unquoteShellWord(loc.tokens[loc.scriptIndex]);
+    const ensuredInner = ensureAcpFlag(inner);
+    if (ensuredInner === inner) return commandLine; // ACP already selected inside
+    const rebuilt = loc.tokens.slice();
+    // Re-quote the rewritten script as one POSIX literal so it survives the
+    // shell as a single `-c` argument; other tokens keep their original quoting.
+    rebuilt[loc.scriptIndex] = shQuote(ensuredInner);
+    return rebuilt.join(' ');
   }
   return `${commandLine} --acp`;
 }
@@ -12641,7 +12675,12 @@ function formatSupervisorStatus(status) {
   const rows = workers.map((w) => ({
     id: String(w.id),
     profile: String(w.profile),
-    state: String(w.state),
+    // A worker the daemon left DOWN because it exited with NANO_EXIT_CONFIG (a
+    // non-restartable configuration failure) is rendered `down (config)` so it is
+    // visibly distinguishable from an ordinary down/crashed worker the daemon is
+    // still restart-backing-off — thread 4118745101. The latch is cleared on any
+    // fresh (re)start, so this only shows while the worker is genuinely down.
+    state: String(w.state) === 'down' && w.configFailed === true ? 'down (config)' : String(w.state),
     engine: supervisorEngineCell(w),
     agentic: supervisorAgenticCell(w),
     job: supervisorJobCell(w),
@@ -12944,7 +12983,7 @@ async function runSupervisorDaemon() {
         workers: [...workers.values()].map((w) => ({
           id: w.id, profile: w.profile, args: w.args, pid: isPidAlive(w.pid) ? w.pid : null,
           startedAt: w.startedAt || null, restarts: w.restarts, lastExit: w.lastExit ?? null,
-          stopping: !!w.stopping, logFile: w.logFile,
+          stopping: !!w.stopping, logFile: w.logFile, configFailed: w.configFailed === true,
         })),
       });
     } catch { /* best effort */ }

@@ -19,6 +19,7 @@ import { join } from 'node:path';
 import {
   spawnCaptureAcp,
   ensureAcpFlag,
+  commandLineHasAcpSelector,
   runAgentJob,
   readAgentResultFile,
   normalizeTaskEnvelope,
@@ -305,6 +306,30 @@ test('ensureAcpFlag appends --acp only when ACP is not already selected', () => 
   // The same quoted-space env prefix in front of a NON-adapter command still
   // appends the flag (the command isn't an ACP selector).
   assert.equal(ensureAcpFlag("FOO='a b' copilot"), "FOO='a b' copilot --acp");
+});
+
+test('ensureAcpFlag injects --acp INSIDE a shell-wrapped script, not onto the outer line', () => {
+  // Regression (thread 4118745067): for a shell wrapper the harness runs inside
+  // the `-c <script>`. Appending `--acp` to the OUTER line makes it the script's
+  // $0 (`sh -c 'copilot' --acp`) so the harness never sees it and the worker
+  // drives a pipe-mode binary as ACP. The flag must go INSIDE the script.
+  assert.equal(ensureAcpFlag("sh -c 'copilot'"), "sh -c 'copilot --acp'");
+  assert.equal(ensureAcpFlag("bash -lc 'nano-coder'"), "bash -lc 'nano-coder --acp'");
+  // A selector ALREADY inside the wrapped script is not doubled — line unchanged.
+  assert.equal(ensureAcpFlag("sh -c 'copilot --acp'"), "sh -c 'copilot --acp'");
+  assert.equal(ensureAcpFlag("sh -c 'claude-code-acp'"), "sh -c 'claude-code-acp'");
+  // The prefix-skip mirrors the selector scan: a leading assignment / env wrapper
+  // in front of the shell still resolves to the inner script for injection.
+  assert.equal(ensureAcpFlag("FOO=1 sh -c 'copilot'"), "FOO=1 sh -c 'copilot --acp'");
+  assert.equal(ensureAcpFlag("env FOO=1 sh -c 'copilot'"), "env FOO=1 sh -c 'copilot --acp'");
+  // A nested wrapper injects at the innermost script; assert the robust
+  // invariants rather than the exact re-quoted string: the result now carries a
+  // selector, and re-running ensureAcpFlag is idempotent (no second --acp).
+  const nested = ensureAcpFlag("sh -c 'bash -c \"copilot\"'");
+  assert.equal(commandLineHasAcpSelector(nested), true, 'nested wrapper now selects ACP');
+  assert.equal(ensureAcpFlag(nested), nested, 'nested injection is idempotent');
+  // A non-shell command that merely takes args is not a wrapper — plain append.
+  assert.equal(ensureAcpFlag("node '/x/agent.mjs'"), "node '/x/agent.mjs' --acp");
 });
 
 test('spawnCaptureAcp completes the ACP handshake and merges the result file', async () => {

@@ -188,6 +188,7 @@ function supplyView(frames) {
       workers.set(f.payload.instance, {
         instance: f.payload.instance,
         host: cap.host,
+        harnessProtocol: cap.harnessProtocol,
         jobs: Array.isArray(cap.jobs) ? cap.jobs : [],
       });
     } else if (f.family === 'deregister') {
@@ -215,7 +216,7 @@ test('the live work runtime: a job activation drives runAgentJob → PTY → rel
     ...BASE,
     instance: 'reviewer-1',
     host: 'ci-box',
-    capability: { cognition: 'senior', family: 'opus', host: 'ci-box' },
+    capability: { cognition: 'senior', family: 'opus', host: 'ci-box', harnessProtocol: 1 },
     listJobKeys: () => [...activeJobs.keys()],
     heartbeatIntervalMs: 0,
     transport: t.factory,
@@ -228,6 +229,7 @@ test('the live work runtime: a job activation drives runAgentJob → PTY → rel
   assert.equal(supply.count, 1, 'the running worker appears in supply before any job');
   assert.equal(supply.workers[0].instance, 'reviewer-1');
   assert.equal(supply.workers[0].host, 'ci-box');
+  assert.equal(supply.workers[0].harnessProtocol, 1, 'the worker advertises its harness-protocol version in supply so nano-workforce does not flag it stale (#272)');
   assert.deepEqual(supply.workers[0].jobs, [], 'no live jobs yet');
 
   // activateJobs delivers a job. The runtime records it (updates the live set)

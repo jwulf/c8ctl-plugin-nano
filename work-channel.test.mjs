@@ -179,6 +179,45 @@ test('connect announces presence with identity, host, and live jobs', async () =
   await ch.stop();
 });
 
+test('connect advertises the harness-protocol version when the capability carries one (issue #272)', async () => {
+  const t = makeTransportDouble();
+  const ch = await createWorkChannel({
+    ...BASE,
+    instance: 'reviewer-xyz',
+    host: 'ci-box',
+    capability: { cognition: 'senior', family: 'opus', harnessProtocol: 1 },
+    listJobKeys: () => [],
+    heartbeatIntervalMs: 0,
+    transport: t.factory,
+  });
+  await tick();
+
+  const regs = t.framesOf('register');
+  assert.equal(regs.length, 1);
+  assert.equal(regs[0].payload.capability.harnessProtocol, 1, 'harnessProtocol is carried on the REGISTER frame so nano-workforce does not flag the worker stale');
+
+  await ch.stop();
+});
+
+test('a capability with no harness-protocol version omits the field (no bogus 0)', async () => {
+  const t = makeTransportDouble();
+  const ch = await createWorkChannel({
+    ...BASE,
+    instance: 'w-noproto',
+    host: 'h1',
+    capability: { cognition: 'senior' },
+    listJobKeys: () => [],
+    heartbeatIntervalMs: 0,
+    transport: t.factory,
+  });
+  await tick();
+
+  const p = t.framesOf('register')[0].payload;
+  assert.equal('harnessProtocol' in p.capability, false, 'absent protocol stays absent rather than being coerced');
+
+  await ch.stop();
+});
+
 test('refreshPresence re-announces the current live job set', async () => {
   const t = makeTransportDouble();
   let jobs = [];

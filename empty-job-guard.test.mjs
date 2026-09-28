@@ -126,6 +126,42 @@ test('detectEmptyAgentJob treats whitespace-only output as empty', () => {
   assert.ok(hit, 'whitespace-only output carries no work signal');
 });
 
+test('detectEmptyAgentJob flags stdout that is ONLY an empty/value-less result sentinel or fence (thread 4118471796)', () => {
+  // `::nano:result:: {}` leaves stdout non-blank but carries no EFFECTIVE vars, so
+  // the job would otherwise complete with no usable result — the husk this guard
+  // exists to catch. resultVars is `{}` because the empty sentinel yields nothing.
+  assert.ok(
+    detectEmptyAgentJob({ resultVars: {}, stdout: '::nano:result:: {}', stderr: '', gitResult: null }),
+    'an empty-object result sentinel is not work',
+  );
+  assert.ok(
+    detectEmptyAgentJob({ resultVars: {}, stdout: '::nano:result:: {"status":null}', stderr: '', gitResult: null }),
+    'a null-valued result sentinel is not work',
+  );
+  assert.ok(
+    detectEmptyAgentJob({ resultVars: {}, stdout: '::nano:result:: {"output":"x"}', stderr: '', gitResult: null }),
+    'a reserved-keys-only result sentinel is not work',
+  );
+  assert.ok(
+    detectEmptyAgentJob({ resultVars: {}, stdout: '```json\n{}\n```', stderr: '', gitResult: null }),
+    'an empty result FENCE is not work',
+  );
+  assert.ok(
+    detectEmptyAgentJob({ resultVars: {}, stdout: 'noise\n::nano:result:: {}\ntrailer\n', stderr: '', gitResult: null }) === null,
+    'substantive prose around an empty sentinel is still work',
+  );
+  assert.equal(
+    detectEmptyAgentJob({ resultVars: { status: 'converged' }, stdout: '::nano:result:: {"status":"converged"}', stderr: '', gitResult: null }),
+    null,
+    'a sentinel carrying real vars is work',
+  );
+  assert.equal(
+    detectEmptyAgentJob({ resultVars: {}, stdout: 'this is not a result marker at all', stderr: '', gitResult: null }),
+    null,
+    'ordinary stdout with no result marker still counts as work',
+  );
+});
+
 // --- 2. detectProtocolMismatch / commandLineHasAcpSelector ------------------
 
 test('commandLineHasAcpSelector detects the ACP selector in its various forms', () => {
@@ -138,6 +174,31 @@ test('commandLineHasAcpSelector detects the ACP selector in its various forms', 
   assert.equal(commandLineHasAcpSelector('copilot'), false, 'plain command');
   assert.equal(commandLineHasAcpSelector('copilot --model foo-acp'), false, 'an argument VALUE ending in -acp is not a selector');
   assert.equal(commandLineHasAcpSelector(''), false, 'empty line');
+});
+
+test('commandLineHasAcpSelector descends into shell-wrapped commands (thread 4118471822)', () => {
+  // A shell wrapper runs its `-c` script through a shell, so an ACP selector
+  // inside that script is live even though the top-level tokenizer sees only the
+  // wrapper. `ensureAcpFlag` would append `--acp` to the wrapper and miss it.
+  assert.equal(commandLineHasAcpSelector("sh -c 'nano-coder --acp'"), true, 'sh -c wrapped --acp');
+  assert.equal(commandLineHasAcpSelector("bash -lc 'nano-coder acp'"), true, 'bash -lc wrapped acp subcommand');
+  assert.equal(commandLineHasAcpSelector("/bin/sh -c 'claude-agent-acp'"), true, 'absolute shell path + wrapped adapter');
+  assert.equal(commandLineHasAcpSelector('bash -c "qwen --experimental-acp"'), true, 'double-quoted wrapped --*-acp switch');
+  // A wrapped PLAIN command is not a false positive.
+  assert.equal(commandLineHasAcpSelector("sh -c 'copilot --model foo'"), false, 'wrapped plain command is not a selector');
+  assert.equal(commandLineHasAcpSelector("sh -c 'copilot --model foo-acp'"), false, 'wrapped -acp VALUE is not a selector');
+});
+
+test('detectProtocolMismatch flags a shell-wrapped ACP command on protocol pipe (thread 4118471822)', () => {
+  const hit = detectProtocolMismatch({ command: 'sh', args: ['-c', 'nano-coder --acp'], protocol: 'pipe' });
+  assert.ok(hit, 'a shell-wrapped ACP selector is detected as a mismatch');
+  assert.match(hit.reason, /selects ACP mode/);
+  // A shell-wrapped plain command is still fine.
+  assert.equal(
+    detectProtocolMismatch({ command: 'sh', args: ['-c', 'copilot --model foo'], protocol: 'pipe' }),
+    null,
+    'a shell-wrapped plain command is not a mismatch',
+  );
 });
 
 test('detectProtocolMismatch flags an ACP-mode command on protocol pipe', () => {
@@ -296,6 +357,8 @@ test('isPermanentTerminalStatus: 4xx is permanent, 5xx/timeout/unknown is transi
   assert.equal(isPermanentTerminalStatus(404), true);
   assert.equal(isPermanentTerminalStatus(429), false, 'a 429 is rate limiting — transient, retried');
   assert.equal(isPermanentTerminalStatus('429'), false, 'a numeric-string 429 is coerced and transient');
+  assert.equal(isPermanentTerminalStatus(408), false, 'a 408 is a request timeout — transient, retried');
+  assert.equal(isPermanentTerminalStatus('408'), false, 'a numeric-string 408 is coerced and transient');
   assert.equal(isPermanentTerminalStatus(500), false, 'a 5xx is transient — retried');
   assert.equal(isPermanentTerminalStatus(503), false);
   assert.equal(isPermanentTerminalStatus(null), false, 'unknown is transient (fail-safe toward recovery)');

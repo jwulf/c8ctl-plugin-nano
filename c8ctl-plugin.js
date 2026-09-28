@@ -2816,6 +2816,33 @@ function hasEffectiveResultVars(obj) {
   return false;
 }
 
+// Remove from `stdout` only the result markers that carry NO effective vars — a
+// `::nano:result:: {…}` sentinel line, or a fenced JSON block, whose parsed object
+// is empty / reserved-keys-only / null-valued (so `hasEffectiveResultVars` is
+// false). A marker that DID carry effective vars, and every other line of ordinary
+// prose, is left intact. Used by the empty-job detector so that a run whose sole
+// stdout is a value-less result sentinel/fence is treated as producing no work
+// (issue #275, thread 4118471796) while substantive stdout still counts as
+// evidence.
+function stdoutStrippedOfEmptyResult(stdout) {
+  if (typeof stdout !== 'string' || stdout === '') return '';
+  const keptLines = stdout.split(/\r?\n/).filter((line) => {
+    const idx = line.indexOf(RESULT_SENTINEL);
+    if (idx === -1) return true;
+    const obj = parseAgentResultObject(line.slice(idx + RESULT_SENTINEL.length).trim());
+    // Drop the sentinel line only when it parsed to a value-less result object;
+    // keep an unparseable sentinel (it isn't a recognised result) or one that
+    // carried real vars.
+    return !(obj && !hasEffectiveResultVars(obj));
+  });
+  return keptLines
+    .join('\n')
+    .replace(/```[^\n]*\r?\n([\s\S]*?)```/g, (whole, inner) => {
+      const obj = parseAgentResultObject(inner.trim());
+      return obj && !hasEffectiveResultVars(obj) ? '' : whole;
+    });
+}
+
 // Choose the agent's structured result from its candidate sources (result file,
 // stdout sentinel, ACP outcome) in priority order. Prefer the first candidate
 // that carries at least one EFFECTIVE var (i.e. survives sanitizeResultVars —
@@ -2858,10 +2885,18 @@ function pickAgentResult(...thunks) {
 // stderr while producing nothing on stdout/result vars/transcript/git, so treating
 // stderr diagnostics as evidence of work would let exactly the run this detector
 // exists to catch slip through. Only a POSITIVE stdout/result/ACP/git signal counts.
+//
+// stdout counts as a work signal only when it carries SUBSTANTIVE content. A run
+// whose ONLY stdout is an empty/reserved/null-valued result sentinel or fence
+// (`::nano:result:: {}`, a `{}`/reserved-keys-only/null-valued JSON fence) did no
+// work: `parseResultFromStdout` accepts it but it yields no EFFECTIVE vars, so the
+// job would otherwise be COMPLETED with no usable result — the husk this detector
+// exists to catch (thread 4118471796). `stdoutStrippedOfEmptyResult` removes only
+// those value-less result markers; any other prose survives and still attests work.
 // Pure + exported for tests; the caller folds the result into the settle path.
 function detectEmptyAgentJob({ resultVars, stdout, gitResult, hasTurns, hasPlan, hasOutcome } = {}) {
   if (hasEffectiveResultVars(resultVars)) return null;
-  if (typeof stdout === 'string' && stdout.trim() !== '') return null;
+  if (typeof stdout === 'string' && stdoutStrippedOfEmptyResult(stdout).trim() !== '') return null;
   if (hasTurns === true || hasPlan === true || hasOutcome === true) return null;
   if ((gitResult?.commits?.length ?? 0) > 0) return null;
   if (gitResult?.pushed === true) return null;
@@ -2885,10 +2920,15 @@ function detectEmptyAgentJob({ resultVars, stdout, gitResult, hasTurns, hasPlan,
 //   - `protocol: acp` with no ACP selector on the line is NOT an error:
 //     `ensureAcpFlag` appends `--acp` at spawn time, so that shape is supported.
 // The selector scan reuses ensureAcpFlag's contract: a line where ensureAcpFlag
-// returns the line UNCHANGED already carries a selector. Pure + exported.
-function commandLineHasAcpSelector(commandLine) {
+// returns the line UNCHANGED already carries a selector. A shell wrapper hides
+// the selector inside its `-c` script (which the pipe executor runs through a
+// shell), so descend into that script too (bounded recursion). Pure + exported.
+function commandLineHasAcpSelector(commandLine, depth = 0) {
   if (typeof commandLine !== 'string' || commandLine.trim() === '') return false;
-  return ensureAcpFlag(commandLine) === commandLine;
+  if (ensureAcpFlag(commandLine) === commandLine) return true;
+  if (depth >= 4) return false; // bound recursion against pathological nesting
+  const script = shellWrappedScript(commandLine);
+  return script != null && commandLineHasAcpSelector(script, depth + 1);
 }
 
 function detectProtocolMismatch({ command, args = [], protocol } = {}) {
@@ -7181,6 +7221,48 @@ function spawnCapturePty({ command, args = [], cwd, env, stdinData, timeoutMs, i
   });
 }
 
+// Split a shell command line into WORDS. A shell WORD is a contiguous run of
+// quoted and/or unquoted segments with no whitespace between them (so `FOO='a b'`
+// is ONE word), which is why a naive `\S+` split is wrong. Returns each word with
+// its shell quoting stripped (POSIX single-quotes AND double-quotes). Shared by
+// ensureAcpFlag (via unquoteShellWord) and the shell-wrapper descent below.
+function unquoteShellWord(tok) {
+  let out = '';
+  const seg = /'((?:[^']|'\\'')*)'|"((?:[^"\\]|\\.)*)"|([^\s'"]+)/g;
+  let m;
+  while ((m = seg.exec(tok)) !== null) {
+    if (m[1] !== undefined) out += m[1].replace(/'\\''/g, "'");
+    else if (m[2] !== undefined) out += m[2].replace(/\\(["\\$`])/g, '$1');
+    else out += m[3];
+  }
+  return out;
+}
+function tokenizeShellWords(commandLine) {
+  const words = commandLine.match(/(?:'(?:[^']|'\\'')*'|"(?:[^"\\]|\\.)*"|[^\s'"]+)+/g) || [];
+  return words.map(unquoteShellWord);
+}
+
+// A shell wrapper runs its `-c <script>` argument through a shell, so an ACP
+// selector INSIDE that script is live even though the top-level tokenizer sees
+// only the wrapper (`sh -c 'nano-coder --acp'`). Return the inner <script> so the
+// selector scan can descend into what the wrapper actually launches; null when the
+// line is not a recognised `<shell> [-opts] -c <script>` wrapper (thread 4118471822).
+const WRAPPER_SHELL_BASENAMES = new Set(['sh', 'bash', 'dash', 'zsh', 'ash', 'ksh']);
+function shellWrappedScript(commandLine) {
+  const words = tokenizeShellWords(commandLine);
+  if (words.length < 3) return null;
+  const base = words[0].replace(/^.*[\\/]/, '');
+  if (!WRAPPER_SHELL_BASENAMES.has(base)) return null;
+  for (let i = 1; i < words.length; i++) {
+    const w = words[i];
+    if (!w.startsWith('-')) return null; // reached the command/script without a -c
+    // `-c` (possibly combined with other short opts, e.g. `-lc`, `-euxc`) takes
+    // the NEXT word as the script to run.
+    if (/^-[a-z]*c$/i.test(w)) return i + 1 < words.length ? words[i + 1] : null;
+  }
+  return null;
+}
+
 // ---- ACP capture (C3 #110 — the third harness path, "minimal mode") ---------
 // Some ACP agents are native (`copilot --acp`, `qwen --experimental-acp`,
 // `opencode acp`), some ride an adapter (`claude-code-acp`, `pi-acp`). In every
@@ -7212,17 +7294,7 @@ function ensureAcpFlag(commandLine) {
   const tokens = commandLine.match(/(?:'(?:[^']|'\\'')*'|"(?:[^"\\]|\\.)*"|[^\s'"]+)+/g) || [];
   // Strip shell quoting across ALL of a word's segments (a word may mix quoted
   // and unquoted runs, e.g. `FOO='a b'`), yielding the logical value.
-  const unquote = (tok) => {
-    let out = '';
-    const seg = /'((?:[^']|'\\'')*)'|"((?:[^"\\]|\\.)*)"|([^\s'"]+)/g;
-    let m;
-    while ((m = seg.exec(tok)) !== null) {
-      if (m[1] !== undefined) out += m[1].replace(/'\\''/g, "'");
-      else if (m[2] !== undefined) out += m[2].replace(/\\(["\\$`])/g, '$1');
-      else out += m[3];
-    }
-    return out;
-  };
+  const unquote = unquoteShellWord;
   // The `*-acp` adapter suffix identifies the COMMAND token, but the command is
   // not always token 0: a shell command line may be prefixed with a contiguous
   // run of env assignments (`NAME=value`, e.g. the `ACP=true` in

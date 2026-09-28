@@ -244,15 +244,20 @@ export function describeSdkError(err) {
  * failures are potentially transient and still retry. `null`/unknown statuses are
  * treated as transient (retry) — fail-safe toward recovery, not toward giving up.
  *
- * HTTP 429 (Too Many Requests) is the one 4xx that is NOT permanent: it is rate
- * limiting, so a retry (after backoff) can succeed. This repository already treats
- * 429 as non-lease-loss/transient elsewhere (supervisor.test.mjs), so classifying
- * it as permanent here would give up after one attempt and strand the instance
- * non-terminal instead of letting it recover.
+ * Two 4xx statuses are the exception — NOT permanent, because a retry can still
+ * succeed:
+ *   - HTTP 429 (Too Many Requests): rate limiting, so a retry (after backoff) can
+ *     succeed. This repository already treats 429 as non-lease-loss/transient
+ *     elsewhere (supervisor.test.mjs), so classifying it as permanent here would
+ *     give up after one attempt and strand the instance non-terminal.
+ *   - HTTP 408 (Request Timeout): a transient server-side timeout of the request,
+ *     not a durable rejection of the transition, so the terminal update can succeed
+ *     when retried. Classifying it as permanent would strand the AgentInstance
+ *     non-terminal after a single attempt over a temporary timeout.
  */
 export function isPermanentTerminalStatus(status) {
   const n = Number(status);
-  if (n === 429) return false;
+  if (n === 429 || n === 408) return false;
   return Number.isFinite(n) && n >= 400 && n < 500;
 }
 

@@ -19,6 +19,7 @@ import { join } from 'node:path';
 import {
   detectEmptyAgentJob,
   detectProtocolMismatch,
+  effectiveHarnessProtocol,
   commandLineHasAcpSelector,
   hireWorker,
 } from './c8ctl-plugin.js';
@@ -163,6 +164,43 @@ test('detectProtocolMismatch allows the consistent shapes', () => {
 test('detectProtocolMismatch treats a missing protocol as pipe (the default)', () => {
   const hit = detectProtocolMismatch({ command: 'nano-coder --acp', args: [], protocol: undefined });
   assert.ok(hit, 'no protocol means pipe — still a mismatch');
+});
+
+// --- effectiveHarnessProtocol (container pipe-only, thread 4118327651) ------
+
+test('effectiveHarnessProtocol reduces a container protocol to pipe', () => {
+  // A container runs pipe-only regardless of the declared protocol (runAgentJob's
+  // `void protocol`), so its effective transport is always pipe.
+  assert.equal(effectiveHarnessProtocol('acp', true), 'pipe', 'container acp -> pipe');
+  assert.equal(effectiveHarnessProtocol('pipe', true), 'pipe', 'container pipe -> pipe');
+  // The host honours the declared protocol (normalized/lower-cased).
+  assert.equal(effectiveHarnessProtocol('acp', false), 'acp', 'host acp stays acp');
+  assert.equal(effectiveHarnessProtocol('  ACP ', false), 'acp', 'host protocol normalized');
+  assert.equal(effectiveHarnessProtocol(undefined, false), 'pipe', 'host default is pipe');
+});
+
+test('a container ACP-selector command is a mismatch under the effective protocol', () => {
+  // The startup refusal composes detectProtocolMismatch with effectiveHarnessProtocol.
+  // A container profile with an ACP selector baked into the command but declaring
+  // protocol acp still pipes plain JSON to the ACP harness — a husk. Under the
+  // container's effective (pipe) protocol the mismatch is detected, so the refusal
+  // now covers the container executor too, not just the host.
+  const containerAcpCmd = detectProtocolMismatch({
+    command: 'nano-coder --acp',
+    args: [],
+    protocol: effectiveHarnessProtocol('acp', true),
+  });
+  assert.ok(containerAcpCmd, 'container + ACP-selector command is refused');
+  assert.match(containerAcpCmd.reason, /selects ACP mode/);
+
+  // But a plain (non-ACP) container command is NOT a false positive, even when the
+  // profile pointlessly declares protocol acp (the container ignores it).
+  const containerPlain = detectProtocolMismatch({
+    command: 'copilot',
+    args: [],
+    protocol: effectiveHarnessProtocol('acp', true),
+  });
+  assert.equal(containerPlain, null, 'a plain container command is not refused');
 });
 
 // --- hire-time refusal (through the real hireWorker) ------------------------

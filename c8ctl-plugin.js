@@ -2901,6 +2901,20 @@ function detectProtocolMismatch({ command, args = [], protocol } = {}) {
   return null;
 }
 
+// The transport protocol a worker will ACTUALLY use, which is what the startup
+// command↔protocol mismatch check must be evaluated against (issue #275
+// follow-up). A container sandbox runs the harness over the pipe path today
+// REGARDLESS of the declared `protocol` (runAgentJob's `void protocol`), so its
+// effective protocol is always `pipe` — an ACP selector baked into a container
+// profile's command (`command: nano-coder --acp`, `protocol: acp`) would still
+// feed plain JSON to an ACP-speaking harness (the same empty-husk mismatch),
+// which the host-only `!isContainer` guard used to miss. Reducing the effective
+// protocol to `pipe` for containers makes detectProtocolMismatch flag exactly
+// that case while still passing a plain (non-ACP) container command.
+function effectiveHarnessProtocol(protocol, isContainer) {
+  return isContainer ? 'pipe' : String(protocol || 'pipe').trim().toLowerCase();
+}
+
 const SANDBOXES = ['none', 'docker', 'podman'];
 // Only container-based sandboxes need an image / disk hygiene / a runtime bin.
 const CONTAINER_SANDBOXES = new Set(['docker', 'podman']);
@@ -10454,14 +10468,19 @@ async function workAgent(req, flags, ctx) {
 
   // Issue #275 (2): refuse to poll with a command/protocol mismatch. A hire
   // predating the hire-time refusal (or one hand-edited into config.json) can
-  // still pair an ACP-mode command (`--acp`) with `protocol: pipe`; starting the
-  // worker would let it silently complete every job it takes with no work done.
-  // Checked against the EFFECTIVE protocol (env override included) and the full
-  // effective args (profile --arg + work-time --arg), before any polling begins.
-  // Container sandboxes run pipe-only today regardless of `protocol` (runAgentJob
-  // ignores it), so the mismatch is only fatal on the host executor.
-  const startupMismatch = detectProtocolMismatch({ command: profile.command, args: effectiveArgs, protocol: roleProtocol });
-  if (startupMismatch && !isContainer) {
+  // still pair an ACP-mode command (`--acp`) with a transport that pipes plain
+  // JSON; starting the worker would let it silently complete every job it takes
+  // with no work done. Checked against the EFFECTIVE protocol (env override
+  // included) and the full effective args (profile --arg + work-time --arg),
+  // before any polling begins. Container sandboxes run pipe-only today regardless
+  // of `protocol` (runAgentJob's `void protocol`), so an ACP selector baked into a
+  // container profile's command STILL pipes plain JSON to an ACP harness — the
+  // same husk. `effectiveHarnessProtocol` reduces a container's protocol to `pipe`
+  // so the refusal covers that pipe-only executor too, not just the host (thread
+  // 4118327651).
+  const effectiveProtocol = effectiveHarnessProtocol(roleProtocol, isContainer);
+  const startupMismatch = detectProtocolMismatch({ command: profile.command, args: effectiveArgs, protocol: effectiveProtocol });
+  if (startupMismatch) {
     logger.error(`Cannot work "${name}": ${startupMismatch.reason}`);
     process.exit(1);
   }
@@ -11118,12 +11137,18 @@ async function workAgent(req, flags, ctx) {
             }
           }
 
-          // #194: end the AgentInstance lifecycle. Flush any pending turn and drain
-          // the append queue, then drive the instance to COMPLETED on a successful
-          // job end (a failed run leaves it non-terminal so a retry/reactivation
-          // continues the same instance). Best-effort — never disturbs job settlement.
+          // #194 + #275: flush any pending turn and DRAIN the append queue now, so
+          // the `appendedTurns`/`sawPlan` signals the empty-job guard reads below
+          // reflect a trailing coalesced message — but DEFER the terminal COMPLETED
+          // transition until AFTER that guard has run. Driving the instance to
+          // COMPLETED here on `result.ok === true` would terminalize an empty husk
+          // (which the guard is about to FAIL, retries preserved) before the guard
+          // ever sees it: the instance would be stranded COMPLETED, a retry could no
+          // longer continue the same non-terminal instance, and the terminal update
+          // could hit the same 422 (thread 4118327671). `drain()` transitions no
+          // status. Best-effort — never disturbs job settlement.
           if (agentInstanceProducer) {
-            try { await agentInstanceProducer.complete(result.ok); } catch (err) { logger.warn(`[${jobType}] AgentInstance producer complete() threw (${aiCorr}) — ${oneLineLog(err?.message || err)}; job settlement unaffected.`); }
+            try { await agentInstanceProducer.drain(); } catch (err) { logger.warn(`[${jobType}] AgentInstance producer drain() threw (${aiCorr}) — ${oneLineLog(err?.message || err)}; job settlement unaffected.`); }
           }
 
           // #264: the run is done — take a FINAL snapshot (so edits still pending in
@@ -11396,6 +11421,15 @@ async function workAgent(req, flags, ctx) {
             hasPlan: agentInstanceProducer?.sawPlan === true,
             hasOutcome: result.acpOutcome != null,
           });
+          // #194 + #275: NOW terminalize the AgentInstance, keyed off REAL work — not
+          // the bare exit code. A non-empty success drives COMPLETED; an empty husk
+          // (about to be FAILED below with retries preserved) passes `false` so the
+          // instance stays non-terminal and a retry/reactivation continues the SAME
+          // instance rather than being stranded COMPLETED (thread 4118327671).
+          // Best-effort — never disturbs job settlement.
+          if (agentInstanceProducer) {
+            try { await agentInstanceProducer.complete(!emptyJob); } catch (err) { logger.warn(`[${jobType}] AgentInstance producer complete() threw (${aiCorr}) — ${oneLineLog(err?.message || err)}; job settlement unaffected.`); }
+          }
           if (emptyJob) {
             const retries = Math.max(0, (Number(job.retries) || 1) - 1);
             logger.error(`[${jobType}] job ${job.jobKey}: FAILING empty agent job — ${emptyJob.reason} (retries left ${retries})`);
@@ -11421,6 +11455,13 @@ async function workAgent(req, flags, ctx) {
           // The engine acknowledged completion: the WIP checkpoint is no longer needed.
           if (discardCheckpointOnAck) await checkpointing.discardAfterAck();
           return settled;
+        }
+        // #194: the run failed (non-zero exit / signal / harness error). Leave the
+        // AgentInstance NON-terminal so a retry/reactivation continues the same
+        // instance; complete(false) drains pending appends without a terminal
+        // transition. Best-effort — never disturbs job settlement.
+        if (agentInstanceProducer) {
+          try { await agentInstanceProducer.complete(false); } catch (err) { logger.warn(`[${jobType}] AgentInstance producer complete() threw (${aiCorr}) — ${oneLineLog(err?.message || err)}; job settlement unaffected.`); }
         }
         const retries = Math.max(0, (Number(job.retries) || 1) - 1);
         const detail = result.error
@@ -17443,6 +17484,7 @@ export {
   pickAgentResult,
   detectEmptyAgentJob,
   detectProtocolMismatch,
+  effectiveHarnessProtocol,
   commandLineHasAcpSelector,
   buildResultNudgePrompt,
   resolveAgentResultWithNudge,

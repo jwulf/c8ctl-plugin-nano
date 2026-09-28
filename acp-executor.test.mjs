@@ -19,6 +19,8 @@ import { join } from 'node:path';
 import {
   spawnCaptureAcp,
   ensureAcpFlag,
+  commandLineHasAcpSelector,
+  detectProtocolMismatch,
   runAgentJob,
   readAgentResultFile,
   normalizeTaskEnvelope,
@@ -305,6 +307,69 @@ test('ensureAcpFlag appends --acp only when ACP is not already selected', () => 
   // The same quoted-space env prefix in front of a NON-adapter command still
   // appends the flag (the command isn't an ACP selector).
   assert.equal(ensureAcpFlag("FOO='a b' copilot"), "FOO='a b' copilot --acp");
+});
+
+test('ensureAcpFlag injects --acp INSIDE a shell-wrapped script, not onto the outer line', () => {
+  // Regression (thread 4118745067): for a shell wrapper the harness runs inside
+  // the `-c <script>`. Appending `--acp` to the OUTER line makes it the script's
+  // $0 (`sh -c 'copilot' --acp`) so the harness never sees it and the worker
+  // drives a pipe-mode binary as ACP. The flag must go INSIDE the script.
+  assert.equal(ensureAcpFlag("sh -c 'copilot'"), "sh -c 'copilot --acp'");
+  assert.equal(ensureAcpFlag("bash -lc 'nano-coder'"), "bash -lc 'nano-coder --acp'");
+  // A selector ALREADY inside the wrapped script is not doubled — line unchanged.
+  assert.equal(ensureAcpFlag("sh -c 'copilot --acp'"), "sh -c 'copilot --acp'");
+  assert.equal(ensureAcpFlag("sh -c 'claude-code-acp'"), "sh -c 'claude-code-acp'");
+  // The prefix-skip mirrors the selector scan: a leading assignment / env wrapper
+  // in front of the shell still resolves to the inner script for injection.
+  assert.equal(ensureAcpFlag("FOO=1 sh -c 'copilot'"), "FOO=1 sh -c 'copilot --acp'");
+  assert.equal(ensureAcpFlag("env FOO=1 sh -c 'copilot'"), "env FOO=1 sh -c 'copilot --acp'");
+  // A nested wrapper injects at the innermost script; assert the robust
+  // invariants rather than the exact re-quoted string: the result now carries a
+  // selector, and re-running ensureAcpFlag is idempotent (no second --acp).
+  const nested = ensureAcpFlag("sh -c 'bash -c \"copilot\"'");
+  assert.equal(commandLineHasAcpSelector(nested), true, 'nested wrapper now selects ACP');
+  assert.equal(ensureAcpFlag(nested), nested, 'nested injection is idempotent');
+  // A non-shell command that merely takes args is not a wrapper — plain append.
+  assert.equal(ensureAcpFlag("node '/x/agent.mjs'"), "node '/x/agent.mjs' --acp");
+});
+
+test('ensureAcpFlag ignores a selector after the -c script ($0), injecting inside instead (thread 4118839872)', () => {
+  // The outer-token scan must NOT accept a selector that appears AFTER the `-c`
+  // script: for `sh -c '<script>' --acp`, the trailing `--acp` is the script's
+  // $0, not an argument to the wrapped harness, so the harness still runs in pipe
+  // mode. Handling the wrapper FIRST injects `--acp` INSIDE the script (the outer
+  // $0 is left untouched) so the flag actually reaches the harness.
+  assert.equal(ensureAcpFlag("sh -c 'copilot' --acp"), "sh -c 'copilot --acp' --acp");
+  assert.equal(ensureAcpFlag("bash -lc 'nano-coder' acp"), "bash -lc 'nano-coder --acp' acp");
+  // A selector that is really $0 is NOT a live ACP selector, so the wrapped
+  // pipe-mode command is (correctly) not seen as ACP-selected.
+  assert.equal(commandLineHasAcpSelector("sh -c 'copilot' --acp"), false, 'trailing --acp is $0, not a selector');
+  // A `protocol: pipe` profile with this shape runs pipe-mode copilot, so it is
+  // consistent — no mismatch is flagged.
+  assert.equal(
+    detectProtocolMismatch({ command: 'sh', args: ['-c', 'copilot', '--acp'], protocol: 'pipe' }),
+    null,
+    'a trailing $0 --acp on a pipe-mode wrapped command is not a mismatch',
+  );
+});
+
+test('ensureAcpFlag / commandLineHasAcpSelector unwrap an env-wrapped adapter (thread 4118839851)', () => {
+  // `commandLineHasAcpSelector` delegates to ensureAcpFlag's command-token scan.
+  // A `*-acp` adapter behind a plain `env` wrapper (`env claude-agent-acp`) must
+  // be recognised: the command-index skip unwraps `env` (and its options /
+  // assignments) so the adapter check lands on the real command token, not `env`.
+  assert.equal(commandLineHasAcpSelector('env claude-agent-acp'), true, 'env + adapter');
+  assert.equal(commandLineHasAcpSelector('env FOO=1 claude-agent-acp'), true, 'env + assignment + adapter');
+  assert.equal(commandLineHasAcpSelector('env -i pi-acp'), true, 'env -i + adapter');
+  assert.equal(commandLineHasAcpSelector('env -u BAR claude-code-acp'), true, 'env -u NAME + adapter');
+  // ensureAcpFlag leaves the env-wrapped adapter unchanged (already ACP), but
+  // still appends `--acp` for an env-wrapped PLAIN command.
+  assert.equal(ensureAcpFlag('env claude-agent-acp'), 'env claude-agent-acp');
+  assert.equal(ensureAcpFlag('env FOO=1 copilot'), 'env FOO=1 copilot --acp');
+  // A `protocol: pipe` profile with an env-wrapped adapter is a mismatch.
+  const hit = detectProtocolMismatch({ command: 'env', args: ['claude-agent-acp'], protocol: 'pipe' });
+  assert.ok(hit, 'env-wrapped adapter on pipe is a mismatch');
+  assert.match(hit.reason, /selects ACP mode/);
 });
 
 test('spawnCaptureAcp completes the ACP handshake and merges the result file', async () => {
@@ -1195,6 +1260,54 @@ test('#137 floor: does NOT fire when the agent already emitted a mappable sessio
     const view = rec.derive();
     assert.equal(view.messages.length, 1);
     assert.equal(view.messages[0].text, 'Hello ACP', 'the real update, not a synthesised floor');
+  } finally {
+    rmSync(resDir, { recursive: true, force: true });
+  }
+});
+
+test('#275 floor-only: a resolved turn with no session/update flags acpTranscriptFloorOnly (thread 4118913047)', async () => {
+  const resDir = mkdtempSync(join(tmpdir(), 'acp-res-'));
+  const resultFile = join(resDir, 'result.json');
+  const rec = makeTypedTap();
+  try {
+    // No FAKE_EMIT_UPDATE → the turn resolves without any real session/update, so the
+    // ONLY captured stdout is the synthetic floor. That must be flagged so the empty-job
+    // guard does not treat the floor as agent work.
+    const result = await spawnCaptureAcp({
+      command: 'node',
+      args: [FAKE_AGENT],
+      cwd: workRoot,
+      env: { ...baseEnv(), AGENT_RESULT_FILE: resultFile, FAKE_RESULT_JSON: '{}' },
+      stdinData: 'prompt',
+      timeoutMs: 20_000,
+      relayTap: rec.tap,
+      permission: 'yolo',
+    });
+    assert.equal(result.ok, true, result.error || result.stderr);
+    assert.equal(result.acpTranscriptFloorOnly, true, 'a floor-only turn must set acpTranscriptFloorOnly');
+    assert.equal(rec.chunks.length, 1, 'the synthetic floor reached the transcript lane');
+  } finally {
+    rmSync(resDir, { recursive: true, force: true });
+  }
+});
+
+test('#275 floor-only: a turn with a real session/update does NOT flag acpTranscriptFloorOnly', async () => {
+  const resDir = mkdtempSync(join(tmpdir(), 'acp-res-'));
+  const resultFile = join(resDir, 'result.json');
+  const rec = makeTypedTap();
+  try {
+    const result = await spawnCaptureAcp({
+      command: 'node',
+      args: [FAKE_AGENT],
+      cwd: workRoot,
+      env: { ...baseEnv(), AGENT_RESULT_FILE: resultFile, FAKE_EMIT_UPDATE: '1' },
+      stdinData: 'prompt',
+      timeoutMs: 20_000,
+      relayTap: rec.tap,
+      permission: 'yolo',
+    });
+    assert.equal(result.ok, true, result.error || result.stderr);
+    assert.notEqual(result.acpTranscriptFloorOnly, true, 'a turn with real transcript work is not floor-only');
   } finally {
     rmSync(resDir, { recursive: true, force: true });
   }

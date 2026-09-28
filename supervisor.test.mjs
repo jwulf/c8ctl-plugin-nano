@@ -596,7 +596,41 @@ test('statusFromState threads the persisted daemon version through the socket-un
   assert.match(formatSupervisorStatus(status), /version:\s+7\.7\.7-fallback/);
 });
 
-// The daemon object embedded in the persisted state (`persist()`), the socket
+// Regression (thread 4118745101): the non-restartable config-failure latch
+// (`configFailed`) is only on the daemon's in-memory worker. `persist()` must
+// carry it into the worker records, or the socket-unreachable fallback
+// (`statusFromState()` over `supervisor.json`) reconstructs the worker with
+// configFailed=false and a stopped config-failed worker becomes visually
+// indistinguishable from an ordinary down worker. This pins both the round-trip
+// (a persisted record's configFailed survives) AND the render (`down (config)`).
+test('statusFromState carries the persisted configFailed latch and renders it distinctly', () => {
+  const running = {
+    pid: process.pid,
+    startedAt: '2026-09-11T00:00:00.000Z',
+    version: '7.7.7-fallback',
+    socket: '/tmp/y.sock',
+    logFile: '/tmp/supervisor-daemon.log',
+    // A persisted worker record as written by persist(): down (pid null) with
+    // the config-failure latch set.
+    workers: [
+      { id: 'bad', profile: 'misconfigured', args: [], pid: null, startedAt: null, restarts: 0, lastExit: 'code 78', stopping: false, logFile: null, configFailed: true },
+      { id: 'crashed', profile: 'coder', args: [], pid: null, startedAt: null, restarts: 3, lastExit: 'code 1', stopping: false, logFile: null, configFailed: false },
+    ],
+  };
+  const status = statusFromState(running);
+  const bad = status.workers.find((w) => w.id === 'bad');
+  const crashed = status.workers.find((w) => w.id === 'crashed');
+  assert.equal(bad.configFailed, true, 'persisted configFailed survives the fallback reconstruction');
+  assert.equal(bad.state, 'down', 'a config-failed worker is down');
+  assert.equal(crashed.configFailed, false, 'an ordinary crashed worker is not config-failed');
+  const text = formatSupervisorStatus(status);
+  assert.match(text, /down \(config\)/, 'the config-failed worker renders down (config)');
+  // The ordinary crashed worker stays a plain `down`, not `down (config)`.
+  const crashedRow = text.split('\n').find((l) => l.includes('crashed'));
+  assert.ok(crashedRow && !crashedRow.includes('(config)'), 'an ordinary down worker is NOT flagged config');
+});
+
+
 // `status` frame (`statusFrame()`), and the socket-unreachable fallback
 // (`statusFromState()`) all build their `daemon` descriptor from the SAME
 // `supervisorDaemonDescriptor` helper, so a field added to one path (e.g.

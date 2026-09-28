@@ -2275,6 +2275,23 @@ async function hireWorker(req, flags) {
     process.exit(1);
   }
 
+  // Issue #275 (2): refuse the exact hire that caused the incident — a command
+  // that runs the harness in ACP mode (`--acp` / `acp` subcommand / `*-acp`
+  // adapter binary) persisted with `protocol: pipe`. The worker would pipe plain
+  // JSON to an ACP-speaking binary that rejects it and exits 0 empty, silently
+  // completing every job it takes. Fail loudly at hire time instead. Checked
+  // against the EFFECTIVE protocol (`effectiveHarnessProtocol`): a container
+  // sandbox runs pipe-only regardless of `--protocol`, so `--sandbox docker
+  // --command 'nano-coder --acp' --protocol acp` is the same empty-husk mismatch
+  // and must be rejected at hire time too — otherwise it persists cleanly here
+  // and only `work` refuses it later (thread 4118414685).
+  const hireEffectiveProtocol = effectiveHarnessProtocol(protocol, CONTAINER_SANDBOXES.has(sandbox));
+  const hireMismatch = detectProtocolMismatch({ command, args: commandArgs, protocol: hireEffectiveProtocol });
+  if (hireMismatch) {
+    logger.error(`Refusing to hire "${name || '(unnamed)'}": ${hireMismatch.reason}`);
+    process.exit(1);
+  }
+
   if (!isValidProfileName(name)) {
     logger.error(`Invalid profile name "${name}". Use letters, digits, dot, dash or underscore.`);
     process.exit(1);
@@ -2799,6 +2816,41 @@ function hasEffectiveResultVars(obj) {
   return false;
 }
 
+// Remove from `stdout` only the result markers that carry NO effective vars — a
+// `::nano:result:: {…}` sentinel, or a fenced JSON block, whose parsed object is
+// empty / reserved-keys-only / null-valued (so `hasEffectiveResultVars` is false).
+// A marker that DID carry effective vars, and every other line of ordinary prose,
+// is left intact. Used by the empty-job detector so that a run whose sole stdout
+// is a value-less result sentinel/fence is treated as producing no work (issue
+// #275, thread 4118471796) while substantive stdout still counts as evidence.
+//
+// Only the marker itself is stripped, NOT the whole line: a sentinel can share a
+// line with substantive prose (`work done ::nano:result:: {}`), and dropping the
+// entire line would mis-classify that run as a husk even though the harness
+// produced real output (thread 4118560562). The sentinel runs to end-of-line, so
+// we cut from the sentinel start to EOL and keep the prefix (trimmed); a line
+// that is ONLY the sentinel reduces to '' and is dropped.
+function stdoutStrippedOfEmptyResult(stdout) {
+  if (typeof stdout !== 'string' || stdout === '') return '';
+  const keptLines = stdout.split(/\r?\n/).map((line) => {
+    const idx = line.indexOf(RESULT_SENTINEL);
+    if (idx === -1) return line;
+    const obj = parseAgentResultObject(line.slice(idx + RESULT_SENTINEL.length).trim());
+    // Strip the sentinel only when it parsed to a value-less result object; keep
+    // an unparseable sentinel (it isn't a recognised result) or one that carried
+    // real vars. Preserve any substantive text BEFORE the sentinel on the same
+    // line (thread 4118560562) rather than dropping the whole line.
+    if (obj && !hasEffectiveResultVars(obj)) return line.slice(0, idx).replace(/\s+$/, '');
+    return line;
+  });
+  return keptLines
+    .join('\n')
+    .replace(/```[^\n]*\r?\n([\s\S]*?)```/g, (whole, inner) => {
+      const obj = parseAgentResultObject(inner.trim());
+      return obj && !hasEffectiveResultVars(obj) ? '' : whole;
+    });
+}
+
 // Choose the agent's structured result from its candidate sources (result file,
 // stdout sentinel, ACP outcome) in priority order. Prefer the first candidate
 // that carries at least one EFFECTIVE var (i.e. survives sanitizeResultVars —
@@ -2822,6 +2874,103 @@ function pickAgentResult(...thunks) {
     if (hasEffectiveResultVars(candidate)) return candidate;
   }
   return firstPresent ?? null;
+}
+
+// Issue #275 (1): the empty-job detector. A harness run that exits 0 yet produced
+// NOTHING — no result vars, no output, no commits, no push — did no work (the
+// canonical case: a protocol-mismatched harness, e.g. an ACP-mode binary fed a
+// pipe payload, rejects stdin and exits 0 empty). COMPLETING such a job silently
+// drops whatever the job carried (an escalation answer, a review verdict) because
+// downstream gateways see no status and fall through to their default — so the
+// worker FAILS the job instead, preserving retries so it reactivates (ideally on
+// a healthy worker) and surfaces as an incident.
+//
+// `hasTurns`/`hasPlan` attest the harness genuinely engaged (a real ACP session
+// emitted updates / a plan); `hasOutcome` attests the agent reported an explicit
+// ACP `_meta.outcome`. Any one of these means the run was real work, not a husk.
+// A non-empty `stderr` is deliberately NOT a work signal: the canonical husk (a
+// protocol-mismatched harness fed a pipe payload) prints an ACP parse error to
+// stderr while producing nothing on stdout/result vars/transcript/git, so treating
+// stderr diagnostics as evidence of work would let exactly the run this detector
+// exists to catch slip through. Only a POSITIVE stdout/result/ACP/git signal counts.
+//
+// stdout counts as a work signal only when it carries SUBSTANTIVE content. A run
+// whose ONLY stdout is an empty/reserved/null-valued result sentinel or fence
+// (`::nano:result:: {}`, a `{}`/reserved-keys-only/null-valued JSON fence) did no
+// work: `parseResultFromStdout` accepts it but it yields no EFFECTIVE vars, so the
+// job would otherwise be COMPLETED with no usable result — the husk this detector
+// exists to catch (thread 4118471796). `stdoutStrippedOfEmptyResult` removes only
+// those value-less result markers; any other prose survives and still attests work.
+// Pure + exported for tests; the caller folds the result into the settle path.
+function detectEmptyAgentJob({ resultVars, stdout, gitResult, hasTurns, hasPlan, hasOutcome, transcriptFloorOnly } = {}) {
+  if (hasEffectiveResultVars(resultVars)) return null;
+  // A synthetic ACP transcript FLOOR (see `maybeEmitTranscriptFloor`) is captured
+  // into stdout even when the harness produced no real work, so when the returned
+  // stdout is ONLY that floor it is NOT evidence of agent work — skip the stdout
+  // check so a no-op ACP husk is still detected as empty (thread 4118913047).
+  if (transcriptFloorOnly !== true && typeof stdout === 'string' && stdoutStrippedOfEmptyResult(stdout).trim() !== '') return null;
+  if (hasTurns === true || hasPlan === true || hasOutcome === true) return null;
+  if ((gitResult?.commits?.length ?? 0) > 0) return null;
+  if (gitResult?.pushed === true) return null;
+  return {
+    reason:
+      'agent exited 0 but produced nothing — no result vars, no output, no transcript turns, ' +
+      'no commits and no push. This is the signature of a protocol-mismatched or no-op harness ' +
+      '(e.g. an ACP-mode binary driven over protocol "pipe"): completing the job would silently ' +
+      'drop what it carried, so it is failed (retries preserved) instead of completed.',
+  };
+}
+
+// Issue #275 (2): command ↔ protocol consistency. The incident behind #275 was a
+// hire whose command ran the harness in ACP mode (`nano-coder --acp`) while the
+// profile protocol stayed `pipe`, so the worker piped plain JSON to an
+// ACP-speaking binary that rejected it and exited 0 empty. Detect the mismatch
+// from the command line itself:
+//   - `protocol: pipe` (or anything else) while the command line carries an ACP
+//     selector (`--acp` / `acp` subcommand / `*-acp` adapter binary) → the
+//     harness will speak JSON-RPC while the worker pipes plain JSON. Refused.
+//   - `protocol: acp` with no ACP selector on the line is NOT an error:
+//     `ensureAcpFlag` appends `--acp` at spawn time, so that shape is supported.
+// The selector scan reuses ensureAcpFlag's contract: a line where ensureAcpFlag
+// returns the line UNCHANGED already carries a selector. A shell wrapper hides
+// the selector inside its `-c` script (which the pipe executor runs through a
+// shell), so descend into that script too (bounded recursion). Pure + exported.
+function commandLineHasAcpSelector(commandLine, depth = 0) {
+  if (typeof commandLine !== 'string' || commandLine.trim() === '') return false;
+  if (ensureAcpFlag(commandLine) === commandLine) return true;
+  if (depth >= 4) return false; // bound recursion against pathological nesting
+  const script = shellWrappedScript(commandLine);
+  return script != null && commandLineHasAcpSelector(script, depth + 1);
+}
+
+function detectProtocolMismatch({ command, args = [], protocol } = {}) {
+  const line = buildAgentCommandLine(String(command || ''), Array.isArray(args) ? args : []);
+  if (!line.trim()) return null;
+  const proto = String(protocol || 'pipe').trim().toLowerCase();
+  if (proto !== 'acp' && commandLineHasAcpSelector(line)) {
+    return {
+      reason:
+        `command "${line}" selects ACP mode (an --acp/acp token or a *-acp adapter binary) but ` +
+        `protocol is "${proto}" — the worker would pipe plain JSON to an ACP-speaking harness that ` +
+        'rejects it and exits 0 empty, silently completing jobs with no work done (issue #275). ' +
+        'Re-hire with --protocol acp (or drop the ACP selector from the command).',
+    };
+  }
+  return null;
+}
+
+// The transport protocol a worker will ACTUALLY use, which is what the startup
+// command↔protocol mismatch check must be evaluated against (issue #275
+// follow-up). A container sandbox runs the harness over the pipe path today
+// REGARDLESS of the declared `protocol` (runAgentJob's `void protocol`), so its
+// effective protocol is always `pipe` — an ACP selector baked into a container
+// profile's command (`command: nano-coder --acp`, `protocol: acp`) would still
+// feed plain JSON to an ACP-speaking harness (the same empty-husk mismatch),
+// which the host-only `!isContainer` guard used to miss. Reducing the effective
+// protocol to `pipe` for containers makes detectProtocolMismatch flag exactly
+// that case while still passing a plain (non-ACP) container command.
+function effectiveHarnessProtocol(protocol, isContainer) {
+  return isContainer ? 'pipe' : String(protocol || 'pipe').trim().toLowerCase();
 }
 
 const SANDBOXES = ['none', 'docker', 'podman'];
@@ -2931,7 +3080,7 @@ async function resolveAgentResultWithNudge({ result, resultFile, rerun, logger, 
     // `truncated` flag consistent with it — echo the incoming `result.truncated`
     // rather than hardcoding false, so callers that trust the return value don't
     // see an already-truncated stdout reported as untruncated.
-    return { stdout: stdout0, nudged: false, truncated: result?.truncated === true, acpOutcome: result?.acpOutcome ?? null };
+    return { stdout: stdout0, nudged: false, truncated: result?.truncated === true, acpOutcome: result?.acpOutcome ?? null, transcriptFloorOnly: result?.acpTranscriptFloorOnly === true };
   }
   let nudge = null;
   let nudgeError = null;
@@ -2966,7 +3115,13 @@ async function resolveAgentResultWithNudge({ result, resultFile, rerun, logger, 
   // `workAgent` — otherwise the escalation and the recorded envelope outcome would
   // silently reflect only the first turn's outcome. Fall back to the first result's
   // outcome when the nudge reported none.
-  return { stdout, nudged: true, truncated, acpOutcome: nudge?.acpOutcome ?? result?.acpOutcome ?? null };
+  // The combined stdout is FLOOR-ONLY only when both turns produced no real work:
+  // the first turn was floor-only AND the nudge added nothing real (no output, or
+  // its own turn was floor-only). Any real nudge output makes the stdout genuine
+  // agent work (thread 4118913047).
+  const transcriptFloorOnly = result?.acpTranscriptFloorOnly === true
+    && (!nudgeOut.trim() || nudge?.acpTranscriptFloorOnly === true);
+  return { stdout, nudged: true, truncated, acpOutcome: nudge?.acpOutcome ?? result?.acpOutcome ?? null, transcriptFloorOnly };
 }
 
 function coerceBool(v, dflt = false) {
@@ -7084,6 +7239,105 @@ function spawnCapturePty({ command, args = [], cwd, env, stdinData, timeoutMs, i
   });
 }
 
+// Split a shell command line into WORDS. A shell WORD is a contiguous run of
+// quoted and/or unquoted segments with no whitespace between them (so `FOO='a b'`
+// is ONE word), which is why a naive `\S+` split is wrong. Returns each word with
+// its shell quoting stripped (POSIX single-quotes AND double-quotes). Shared by
+// ensureAcpFlag (via unquoteShellWord) and the shell-wrapper descent below.
+function unquoteShellWord(tok) {
+  let out = '';
+  const seg = /'((?:[^']|'\\'')*)'|"((?:[^"\\]|\\.)*)"|([^\s'"]+)/g;
+  let m;
+  while ((m = seg.exec(tok)) !== null) {
+    if (m[1] !== undefined) out += m[1].replace(/'\\''/g, "'");
+    else if (m[2] !== undefined) out += m[2].replace(/\\(["\\$`])/g, '$1');
+    else out += m[3];
+  }
+  return out;
+}
+function tokenizeShellWords(commandLine) {
+  const words = commandLine.match(/(?:'(?:[^']|'\\'')*'|"(?:[^"\\]|\\.)*"|[^\s'"]+)+/g) || [];
+  return words.map(unquoteShellWord);
+}
+
+// A shell wrapper runs its `-c <script>` argument through a shell, so an ACP
+// selector INSIDE that script is live even though the top-level tokenizer sees
+// only the wrapper (`sh -c 'nano-coder --acp'`). Return the inner <script> so the
+// selector scan can descend into what the wrapper actually launches; null when the
+// line is not a recognised `<shell> [-opts] -c <script>` wrapper (thread 4118471822).
+//
+// The shell need not be word 0: a profile may prefix it with a run of environment
+// assignments (`FOO=1 sh -c …`) or an `env` wrapper (`env FOO=1 sh -c …`,
+// `env -i sh -c …`). Skip that leading prefix — assignments, the `env` command and
+// its options/assignments — so the shell lookup lands on the real shell token
+// (thread 4118560608). Mirrors the leading-assignment skip in ensureAcpFlag.
+const WRAPPER_SHELL_BASENAMES = new Set(['sh', 'bash', 'dash', 'zsh', 'ash', 'ksh']);
+// A leading `NAME=value` environment assignment (POSIX name, `=` present).
+const ENV_ASSIGNMENT_RE = /^[A-Za-z_][A-Za-z0-9_]*=/;
+// The shell-word tokenizer regex (a run of quoted/unquoted segments with no
+// whitespace between them). Shared so both the read (`shellWrappedScript`) and
+// the rewrite (`ensureAcpFlag`'s wrapper injection) tokenize identically.
+const SHELL_WORD_RE = /(?:'(?:[^']|'\\'')*'|"(?:[^"\\]|\\.)*"|[^\s'"]+)+/g;
+// Locate the `-c <script>` payload of a shell wrapper. Returns the RAW tokens
+// (quoting preserved) and the index of the `<script>` token — or null when the
+// line is not a recognised `<prefix> <shell> [-opts] -c <script>` wrapper. The
+// prefix-skip (leading `NAME=value` assignments / an `env` wrapper) and the
+// shell/`-c` detection live here ONCE, shared by `shellWrappedScript` (which
+// just reads the inner script) and `ensureAcpFlag` (which rewrites it to inject
+// the ACP flag INSIDE the script) so the two can never drift.
+// Skip a leading `NAME=value` env-assignment run and an optional `env` wrapper
+// (`env` itself, its options `-i`/`--null`/`-u NAME`/bare `-`, and any
+// assignments it carries) to reach the index of the REAL command token. Shared
+// by `locateShellWrapperScript` (to find the wrapping shell past the prefix) and
+// `ensureAcpFlag` (to find the command token for the `*-acp` adapter check) so an
+// `env`-wrapped adapter (`env claude-agent-acp`, `env FOO=1 claude-agent-acp`) is
+// unwrapped identically on both paths — otherwise the adapter check treats `env`
+// as the executable and misses the selector (thread 4118839851).
+function commandStartIndex(tokens) {
+  let i = 0;
+  // Skip a leading run of `NAME=value` assignments (`FOO=1 sh -c …`).
+  while (i < tokens.length && ENV_ASSIGNMENT_RE.test(unquoteShellWord(tokens[i]))) i++;
+  // Skip an `env` wrapper: `env` itself, its options (`-i`, `-u NAME`, `--null`),
+  // and any `NAME=value` assignments it carries, up to the command it runs.
+  if (i < tokens.length && unquoteShellWord(tokens[i]).replace(/^.*[\\/]/, '') === 'env') {
+    i++;
+    while (i < tokens.length) {
+      const w = unquoteShellWord(tokens[i]);
+      if (ENV_ASSIGNMENT_RE.test(w)) { i++; continue; }
+      // `env` options: a switch that is not yet the command. `-u`/`--unset` take a
+      // NAME argument — skip it too. A bare `-` (env's "ignore rest") ends options.
+      if (w === '-') { i++; break; }
+      if (w.startsWith('-')) {
+        if (w === '-u' || w === '--unset') { i += 2; continue; }
+        i++;
+        continue;
+      }
+      break; // first non-option, non-assignment word is the command env runs
+    }
+  }
+  return i;
+}
+function locateShellWrapperScript(commandLine) {
+  const tokens = String(commandLine).match(SHELL_WORD_RE) || [];
+  if (tokens.length < 3) return null;
+  const i = commandStartIndex(tokens);
+  if (tokens.length - i < 3) return null;
+  const base = unquoteShellWord(tokens[i]).replace(/^.*[\\/]/, '');
+  if (!WRAPPER_SHELL_BASENAMES.has(base)) return null;
+  for (let j = i + 1; j < tokens.length; j++) {
+    const w = unquoteShellWord(tokens[j]);
+    if (!w.startsWith('-')) return null; // reached the command/script without a -c
+    // `-c` (possibly combined with other short opts, e.g. `-lc`, `-euxc`) takes
+    // the NEXT word as the script to run.
+    if (/^-[a-z]*c$/i.test(w)) return j + 1 < tokens.length ? { tokens, scriptIndex: j + 1 } : null;
+  }
+  return null;
+}
+function shellWrappedScript(commandLine) {
+  const loc = locateShellWrapperScript(commandLine);
+  return loc ? unquoteShellWord(loc.tokens[loc.scriptIndex]) : null;
+}
+
 // ---- ACP capture (C3 #110 — the third harness path, "minimal mode") ---------
 // Some ACP agents are native (`copilot --acp`, `qwen --experimental-acp`,
 // `opencode acp`), some ride an adapter (`claude-code-acp`, `pi-acp`). In every
@@ -7092,20 +7346,44 @@ function spawnCapturePty({ command, args = [], cwd, env, stdinData, timeoutMs, i
 // select ACP, so a native/adapter invocation is never doubled. This mirrors how
 // the pipe path spawns the line under a shell.
 function ensureAcpFlag(commandLine) {
-  // Detection must survive buildAgentCommandLine()'s POSIX single-quoting: a
-  // structured `--arg acp` (or `--arg --acp`) lands here as the quoted token
-  // 'acp' / '--acp', so a naive `\bacp\b` on the raw line would miss it and
-  // wrongly append a second --acp. Tokenise the line, strip the shell quoting
-  // (both POSIX single-quotes from buildAgentCommandLine() AND double-quotes a
-  // legacy `profile.command` may bake in, e.g. `copilot "--acp"`), and match:
+  // A shell wrapper runs the harness INSIDE its `-c <script>`. Tokens AFTER the
+  // script are the shell's positional params ($0, $1, …), NOT arguments to the
+  // wrapped command, and the shell's own options come BEFORE the script — so an
+  // ACP selector is only meaningful INSIDE the script. Handle the wrapper FIRST,
+  // before the outer-token scan, so a trailing `--acp` that is really the `-c`
+  // script's `$0` (`sh -c 'copilot' --acp`) is NOT mistaken for a live selector
+  // (which would leave the harness in pipe mode while an ACP worker sends it ACP
+  // frames, and falsely pass `protocol: pipe` validation — thread 4118839872).
+  // Recurse into the script: a selector already present leaves it unchanged;
+  // otherwise inject `--acp` INTO the script (so it reaches the harness, not the
+  // outer `$0`), rebuilding the `-c` argument. The inner script shrinks each
+  // level, so the mutual recursion with `locateShellWrapperScript` terminates.
+  const wrapperLoc = locateShellWrapperScript(commandLine);
+  if (wrapperLoc) {
+    const inner = unquoteShellWord(wrapperLoc.tokens[wrapperLoc.scriptIndex]);
+    const ensuredInner = ensureAcpFlag(inner);
+    if (ensuredInner === inner) return commandLine; // ACP already selected inside
+    const rebuilt = wrapperLoc.tokens.slice();
+    // Re-quote the rewritten script as one POSIX literal so it survives the
+    // shell as a single `-c` argument; other tokens keep their original quoting.
+    rebuilt[wrapperLoc.scriptIndex] = shQuote(ensuredInner);
+    return rebuilt.join(' ');
+  }
+  // Not a shell wrapper. Detection must survive buildAgentCommandLine()'s POSIX
+  // single-quoting: a structured `--arg acp` (or `--arg --acp`) lands here as the
+  // quoted token 'acp' / '--acp', so a naive `\bacp\b` on the raw line would miss
+  // it and wrongly append a second --acp. Tokenise the line, strip the shell
+  // quoting (both POSIX single-quotes from buildAgentCommandLine() AND
+  // double-quotes a legacy `profile.command` may bake in, e.g. `copilot "--acp"`),
+  // and match:
   //   - a native ACP selector `acp`/`-acp`/`--acp` (subcommand or switch) as a
   //     WHOLE token, in ANY position (it may be the command or an argument), or
   //   - an adapter command whose basename ends in `-acp` (claude-agent-acp,
   //     pi-acp) — but ONLY the command token (the first token past any leading
-  //     env-assignment prefix, see commandIndex below), since an *argument*
-  //     that merely ends in `-acp` (e.g. `--model foo-acp`) is not an ACP
-  //     selector. Matching whole tokens/basenames (not a substring) also avoids
-  //     the false positive of a path that merely contains `/acp/`.
+  //     env-assignment / `env`-wrapper prefix, see commandIndex below), since an
+  //     *argument* that merely ends in `-acp` (e.g. `--model foo-acp`) is not an
+  //     ACP selector. Matching whole tokens/basenames (not a substring) also
+  //     avoids the false positive of a path that merely contains `/acp/`.
   // A shell WORD is a contiguous run of quoted and/or unquoted segments with no
   // whitespace between them, so a `\S+` token boundary is wrong: an env prefix
   // whose value is quoted and contains spaces (e.g. `FOO='a b' claude-code-acp`)
@@ -7115,28 +7393,15 @@ function ensureAcpFlag(commandLine) {
   const tokens = commandLine.match(/(?:'(?:[^']|'\\'')*'|"(?:[^"\\]|\\.)*"|[^\s'"]+)+/g) || [];
   // Strip shell quoting across ALL of a word's segments (a word may mix quoted
   // and unquoted runs, e.g. `FOO='a b'`), yielding the logical value.
-  const unquote = (tok) => {
-    let out = '';
-    const seg = /'((?:[^']|'\\'')*)'|"((?:[^"\\]|\\.)*)"|([^\s'"]+)/g;
-    let m;
-    while ((m = seg.exec(tok)) !== null) {
-      if (m[1] !== undefined) out += m[1].replace(/'\\''/g, "'");
-      else if (m[2] !== undefined) out += m[2].replace(/\\(["\\$`])/g, '$1');
-      else out += m[3];
-    }
-    return out;
-  };
+  const unquote = unquoteShellWord;
   // The `*-acp` adapter suffix identifies the COMMAND token, but the command is
   // not always token 0: a shell command line may be prefixed with a contiguous
   // run of env assignments (`NAME=value`, e.g. the `ACP=true` in
-  // `ACP=true claude-code-acp`). Skip that leading assignment prefix so the
-  // adapter check lands on the real command token. Only a *leading* run counts —
-  // once a real command token appears, later `FOO=bar` tokens are arguments.
-  let commandIndex = 0;
-  while (commandIndex < tokens.length &&
-         /^[A-Za-z_][A-Za-z0-9_]*=/.test(unquote(tokens[commandIndex]))) {
-    commandIndex++;
-  }
+  // `ACP=true claude-code-acp`) and/or an `env` wrapper (`env claude-agent-acp`).
+  // Skip that leading prefix so the adapter check lands on the real command token
+  // (thread 4118839851). Only a *leading* prefix counts — once a real command
+  // token appears, later `FOO=bar` tokens are arguments.
+  const commandIndex = commandStartIndex(tokens);
   for (let i = 0; i < tokens.length; i++) {
     let tok = unquote(tokens[i]);
     // Normalise a GNU-style `--opt=value` selector to its option-NAME part, so
@@ -7160,6 +7425,8 @@ function ensureAcpFlag(commandLine) {
     if (/^--?[a-z0-9][a-z0-9-]*-acp$/i.test(name)) return commandLine;
     if (i === commandIndex && /-acp$/i.test(base)) return commandLine;
   }
+  // No ACP selector on the line. This is not a shell wrapper (those are handled
+  // at the top), so the harness runs directly — append the default `--acp`.
   return `${commandLine} --acp`;
 }
 
@@ -7298,6 +7565,12 @@ function spawnCaptureAcp({ command, args = [], cwd, env, stdinData, timeoutMs, i
     // drill-in shows the outcome instead of nothing (see `maybeEmitTranscriptFloor`).
     let transcriptChunksPublished = 0;
     let floorEmitted = false;
+    // #275: did the harness ever send a real `session/update`? The synthetic floor
+    // is captured into stdout even when it did not, so the empty-job guard needs to
+    // tell "stdout carries agent work" from "stdout is ONLY the synthetic floor"
+    // (thread 4118913047). Any session/update — mapped chunk OR fallback text —
+    // flips this; the floor never does.
+    let sawRealTranscript = false;
 
     // Live "spy" tee (--stream), line-buffered, mirroring the other paths.
     // Separate line buffers per lane (stdout-human vs stderr) so a partial line
@@ -7379,7 +7652,14 @@ function spawnCaptureAcp({ command, args = [], cwd, env, stdinData, timeoutMs, i
       if (teeSink) { tee('', true); teeErr('', true); }
       // Reap the child if it is still alive (turn resolved but agent lingering).
       try { if (child && childClosed === null) killTree(child); } catch { /* best effort */ }
-      resolve(acpOutcome ? { ...result, acpOutcome } : result);
+      // #275: flag when the ONLY captured stdout is the synthetic transcript floor
+      // (the turn resolved but no real session/update ever arrived). The empty-job
+      // guard reads this so a no-op ACP husk is not made to look non-empty by its own
+      // floor (thread 4118913047).
+      const floorOnly = floorEmitted && !sawRealTranscript;
+      let resolved = acpOutcome ? { ...result, acpOutcome } : result;
+      if (floorOnly) resolved = { ...resolved, acpTranscriptFloorOnly: true };
+      resolve(resolved);
     };
 
     // --- JSON-RPC 2.0 plumbing (newline-delimited framing) -------------------
@@ -7508,6 +7788,9 @@ function spawnCaptureAcp({ command, args = [], cwd, env, stdinData, timeoutMs, i
     // the update has no canonical mapping OR the relay exposes no transcript seam,
     // so nothing is ever dropped (no regression vs minimal mode).
     const emitTranscript = (update) => {
+      // A real `session/update` reached us — agent work, distinct from the synthetic
+      // floor below (thread 4118913047).
+      sawRealTranscript = true;
       const chunk = encodeTranscriptChunk(update);
       if (chunk && relayTap && typeof relayTap.relayTranscriptChunk === 'function') {
         // Only skip the text fallback when the chunk publish ACTUALLY succeeded.
@@ -9502,13 +9785,11 @@ async function workAgent(req, flags, ctx) {
 
   const stored = readHires()[name];
   if (!stored) {
-    logger.error(`No hire named "${name}". List profiles with: c8ctl nano hire --list`);
-    process.exit(1);
+    exitConfigError(logger, `No hire named "${name}". List profiles with: c8ctl nano hire --list`);
   }
   const normalized = normalizeStoredProfile(name, stored);
   if (normalized.error) {
-    logger.error(`Cannot work "${name}": ${normalized.error}. Re-create it with: c8ctl nano hire`);
-    process.exit(1);
+    exitConfigError(logger, `Cannot work "${name}": ${normalized.error}. Re-create it with: c8ctl nano hire`);
   }
   const profile = normalized.profile;
 
@@ -9520,8 +9801,7 @@ async function workAgent(req, flags, ctx) {
   // supervisor path); a non-blank one must be a safe worker-name token.
   const explicitName = flags?.name ? String(flags.name).trim() : '';
   if (explicitName !== '' && !isValidWorkerName(explicitName)) {
-    logger.error(`Invalid --name "${flags.name}": use only letters, digits, and . _ -`);
-    process.exit(1);
+    exitConfigError(logger, `Invalid --name "${flags.name}": use only letters, digits, and . _ -`);
   }
   const workerName = explicitName !== '' ? explicitName : autoWorkerName(name);
 
@@ -9535,8 +9815,7 @@ async function workAgent(req, flags, ctx) {
   // config such as permission toggles (e.g. a coder CLI started with tools enabled).
   const { env: workEnv, errors: workEnvErrors } = parseEnvPairs(flags?.env);
   if (workEnvErrors.length > 0) {
-    logger.error(workEnvErrors.join('; '));
-    process.exit(1);
+    exitConfigError(logger, workEnvErrors.join('; '));
   }
   const profileEnv = { ...profile.env, ...workEnv };
 
@@ -10375,6 +10654,27 @@ async function workAgent(req, flags, ctx) {
   const envPermission = (process.env.NANO_AGENTIC_PERMISSION || '').trim().toLowerCase();
   const rolePermission = resolveAgenticSetting(envPermission, profile.permission, PERMISSION_MODES, 'yolo');
 
+  // Issue #275 (2): refuse to poll with a command/protocol mismatch. A hire
+  // predating the hire-time refusal (or one hand-edited into config.json) can
+  // still pair an ACP-mode command (`--acp`) with a transport that pipes plain
+  // JSON; starting the worker would let it silently complete every job it takes
+  // with no work done. Checked against the EFFECTIVE protocol (env override
+  // included) and the full effective args (profile --arg + work-time --arg),
+  // before any polling begins. Container sandboxes run pipe-only today regardless
+  // of `protocol` (runAgentJob's `void protocol`), so an ACP selector baked into a
+  // container profile's command STILL pipes plain JSON to an ACP harness — the
+  // same husk. `effectiveHarnessProtocol` reduces a container's protocol to `pipe`
+  // so the refusal covers that pipe-only executor too, not just the host (thread
+  // 4118327651).
+  const effectiveProtocol = effectiveHarnessProtocol(roleProtocol, isContainer);
+  const startupMismatch = detectProtocolMismatch({ command: profile.command, args: effectiveArgs, protocol: effectiveProtocol });
+  if (startupMismatch) {
+    // Non-restartable config failure: under the supervisor this must exit with
+    // NANO_EXIT_CONFIG so the daemon stops retrying instead of restart-looping the
+    // same refusal (thread 4118560521).
+    exitConfigError(logger, `Cannot work "${name}": ${startupMismatch.reason}`);
+  }
+
   // The agent job runner (issue #172 hot-path flip). The single-owner supervisor
   // runtime dispatches each activated job to this `run(job)`; it executes the
   // harness exactly as the retired per-type SDK jobHandler did, but SETTLES via the
@@ -10996,7 +11296,7 @@ async function workAgent(req, flags, ctx) {
           // the result is recoverable only via the stdout `::nano:result::`
           // sentinel, which `resolveAgentResultWithNudge` handles directly.
           if (result.ok) {
-            const { stdout, nudged, truncated, acpOutcome } = await resolveAgentResultWithNudge({
+            const { stdout, nudged, truncated, acpOutcome, transcriptFloorOnly } = await resolveAgentResultWithNudge({
               result,
               resultFile,
               logger,
@@ -11018,6 +11318,10 @@ async function workAgent(req, flags, ctx) {
               }),
             });
             result.stdout = stdout;
+            // Recompute the floor-only signal over the COMBINED (first + nudge) stdout
+            // so a nudge that added real output is no longer classed floor-only, and a
+            // still-empty husk stays floor-only for the guard (thread 4118913047).
+            result.acpTranscriptFloorOnly = transcriptFloorOnly;
             if (nudged) {
               result.nudgedForResult = true;
               if (truncated) result.truncated = true;
@@ -11027,12 +11331,26 @@ async function workAgent(req, flags, ctx) {
             }
           }
 
-          // #194: end the AgentInstance lifecycle. Flush any pending turn and drain
-          // the append queue, then drive the instance to COMPLETED on a successful
-          // job end (a failed run leaves it non-terminal so a retry/reactivation
-          // continues the same instance). Best-effort — never disturbs job settlement.
+          // #194 + #275: flush any pending turn and DRAIN the append queue now, so
+          // the `appendedTurns`/`sawPlan` signals the empty-job guard reads below
+          // reflect a trailing coalesced message — but DEFER the terminal COMPLETED
+          // transition until AFTER that guard has run. Driving the instance to
+          // COMPLETED here on `result.ok === true` would terminalize an empty husk
+          // (which the guard is about to FAIL, retries preserved) before the guard
+          // ever sees it: the instance would be stranded COMPLETED, a retry could no
+          // longer continue the same non-terminal instance, and the terminal update
+          // could hit the same 422 (thread 4118327671). `drain()` transitions no
+          // status. Best-effort — never disturbs job settlement. BOUNDED (drainBounded):
+          // the public `drain()` awaits the ENTIRE serialized append queue, so a large ACP
+          // transcript or an AgentHistory outage could otherwise hold the job here — past
+          // the broker lease — before settleJob.fail/complete ever runs, preventing the
+          // empty-job guard from settling at all. A bounded-out drain leaves appends still
+          // in flight (they keep draining in the background); that is itself transcript
+          // evidence — turns were produced but not yet confirmed — which the guard below
+          // treats as non-empty via `preGuardDrainTimedOut` (thread 4118913008).
+          let preGuardDrainTimedOut = false;
           if (agentInstanceProducer) {
-            try { await agentInstanceProducer.complete(result.ok); } catch (err) { logger.warn(`[${jobType}] AgentInstance producer complete() threw (${aiCorr}) — ${oneLineLog(err?.message || err)}; job settlement unaffected.`); }
+            try { preGuardDrainTimedOut = (await agentInstanceProducer.drainBounded()) === false; } catch (err) { logger.warn(`[${jobType}] AgentInstance producer drainBounded() threw (${aiCorr}) — ${oneLineLog(err?.message || err)}; job settlement unaffected.`); }
           }
 
           // #264: the run is done — take a FINAL snapshot (so edits still pending in
@@ -11286,6 +11604,52 @@ async function workAgent(req, flags, ctx) {
           const resultKeys = Object.keys(resultVars);
           if (resultKeys.length === 0) logger.warn(`[${jobType}] job ${job.jobKey}: agent returned no usable result vars — write a JSON object of result variables to $AGENT_RESULT_FILE (or print a "${RESULT_SENTINEL} {…}" line) so downstream gateways see status/summary/etc.`);
           else logger.info(`[${jobType}] job ${job.jobKey}: merged agent result vars [${resultKeys.join(', ')}]`);
+
+          // Issue #275 (1): FAIL an empty job instead of completing it. A run
+          // that exited 0 with no result vars, no output, no transcript turns,
+          // no commits and no push did no work (the canonical case is a
+          // protocol-mismatched harness — an ACP-mode binary fed a pipe payload
+          // rejects stdin and exits 0 empty). Completing it silently drops
+          // whatever the job carried (an escalation answer, a review verdict),
+          // so fail it here: retries are preserved, the job reactivates (on a
+          // healthy worker), and it surfaces as an incident. A run with ANY
+          // evidence of real work (output, ACP turns, a plan, an outcome,
+          // commits, a push) is NOT empty and completes as before.
+          const emptyJob = detectEmptyAgentJob({
+            resultVars,
+            stdout: result.stdout,
+            gitResult,
+            // A bounded pre-guard drain that timed out left appends in flight — turns
+            // WERE produced (real activity), just not yet confirmed — so treat it as
+            // transcript evidence (thread 4118913008).
+            hasTurns: agentInstanceProducer?.appendedTurns > 0 || preGuardDrainTimedOut,
+            hasPlan: agentInstanceProducer?.sawPlan === true,
+            hasOutcome: result.acpOutcome != null,
+            // The ACP path synthesises a transcript FLOOR into stdout when the turn
+            // resolved but no session/update arrived (`maybeEmitTranscriptFloor`). That
+            // floor is NOT agent work, so a no-op ACP husk must not look non-empty on
+            // the strength of its own synthetic floor (thread 4118913047).
+            transcriptFloorOnly: result.acpTranscriptFloorOnly === true,
+          });
+          // #194 + #275: NOW terminalize the AgentInstance, keyed off REAL work — not
+          // the bare exit code. A non-empty success drives COMPLETED; an empty husk
+          // (about to be FAILED below with retries preserved) passes `false` so the
+          // instance stays non-terminal and a retry/reactivation continues the SAME
+          // instance rather than being stranded COMPLETED (thread 4118327671).
+          // Best-effort — never disturbs job settlement.
+          if (agentInstanceProducer) {
+            try { await agentInstanceProducer.complete(!emptyJob); } catch (err) { logger.warn(`[${jobType}] AgentInstance producer complete() threw (${aiCorr}) — ${oneLineLog(err?.message || err)}; job settlement unaffected.`); }
+          }
+          if (emptyJob) {
+            const retries = Math.max(0, (Number(job.retries) || 1) - 1);
+            logger.error(`[${jobType}] job ${job.jobKey}: FAILING empty agent job — ${emptyJob.reason} (retries left ${retries})`);
+            return await settleJob.fail({
+              errorMessage: `agent "${profile.name}" produced an empty result: ${emptyJob.reason}`.slice(0, 2000),
+              retries,
+              variables: { [AGENT_RESULT_KEY]: resultEnvelope },
+            });
+          }
+
           const settled = await settleJob.complete({
             ...resultVars,
             [AGENT_RESULT_KEY]: resultEnvelope,
@@ -11301,6 +11665,13 @@ async function workAgent(req, flags, ctx) {
           // The engine acknowledged completion: the WIP checkpoint is no longer needed.
           if (discardCheckpointOnAck) await checkpointing.discardAfterAck();
           return settled;
+        }
+        // #194: the run failed (non-zero exit / signal / harness error). Leave the
+        // AgentInstance NON-terminal so a retry/reactivation continues the same
+        // instance; complete(false) drains pending appends without a terminal
+        // transition. Best-effort — never disturbs job settlement.
+        if (agentInstanceProducer) {
+          try { await agentInstanceProducer.complete(false); } catch (err) { logger.warn(`[${jobType}] AgentInstance producer complete() threw (${aiCorr}) — ${oneLineLog(err?.message || err)}; job settlement unaffected.`); }
         }
         const retries = Math.max(0, (Number(job.retries) || 1) - 1);
         const detail = result.error
@@ -11645,6 +12016,21 @@ const SUPERVISOR_BACKOFF_MAX_MS = 30_000;
 // A child that stayed up at least this long before exiting is not crash-looping,
 // so its restart backoff is reset to zero.
 const SUPERVISOR_HEALTHY_UPTIME_MS = 60_000;
+// sysexits.h EX_CONFIG: a worker that exits with this code refused to start on a
+// NON-RESTARTABLE configuration failure (a missing/invalid/hand-edited profile, a
+// command↔protocol mismatch, bad --env). Restarting it would re-hit the identical
+// refusal forever, re-allocating startup state and re-emitting the same error
+// (thread 4118560521) — so the supervisor's death handler treats this code as
+// terminal and does NOT schedule a restart, surfacing one actionable failure.
+const NANO_EXIT_CONFIG = 78;
+// Log `msg` and exit with NANO_EXIT_CONFIG (EX_CONFIG). Used for the non-restartable
+// configuration failures a worker can hit BEFORE it starts polling — under `nano
+// supervisor` a plain exit(1) is indistinguishable from a crash and the daemon would
+// restart-loop the same refusal forever (thread 4118560521). Pure-ish (exits).
+function exitConfigError(logger, msg) {
+  logger.error(msg);
+  process.exit(NANO_EXIT_CONFIG);
+}
 const SUPERVISOR_CONNECT_TIMEOUT_MS = 6_000;
 // End-to-end deadline for a single request: once connected, a wedged/incompatible
 // daemon that accepts but never sends a `final` frame must not hang the client.
@@ -12046,6 +12432,10 @@ function summarizeSupervisorWorker(w, now = Date.now()) {
     pid: alive ? w.pid : null,
     state: w.stopping ? 'stopping' : alive ? 'running' : 'down',
     restarts: Number(w.restarts) || 0,
+    // True when the worker last exited with NANO_EXIT_CONFIG (a NON-RESTARTABLE
+    // configuration failure) — the daemon left it down rather than restart-looping
+    // (thread 4118560521). Surfaced so `supervisor status` shows WHY it is down.
+    configFailed: w.configFailed === true,
     uptimeMs,
     startedAtMs,
     lastExit: w.lastExit ?? null,
@@ -12347,7 +12737,12 @@ function formatSupervisorStatus(status) {
   const rows = workers.map((w) => ({
     id: String(w.id),
     profile: String(w.profile),
-    state: String(w.state),
+    // A worker the daemon left DOWN because it exited with NANO_EXIT_CONFIG (a
+    // non-restartable configuration failure) is rendered `down (config)` so it is
+    // visibly distinguishable from an ordinary down/crashed worker the daemon is
+    // still restart-backing-off — thread 4118745101. The latch is cleared on any
+    // fresh (re)start, so this only shows while the worker is genuinely down.
+    state: String(w.state) === 'down' && w.configFailed === true ? 'down (config)' : String(w.state),
     engine: supervisorEngineCell(w),
     agentic: supervisorAgenticCell(w),
     job: supervisorJobCell(w),
@@ -12650,7 +13045,7 @@ async function runSupervisorDaemon() {
         workers: [...workers.values()].map((w) => ({
           id: w.id, profile: w.profile, args: w.args, pid: isPidAlive(w.pid) ? w.pid : null,
           startedAt: w.startedAt || null, restarts: w.restarts, lastExit: w.lastExit ?? null,
-          stopping: !!w.stopping, logFile: w.logFile,
+          stopping: !!w.stopping, logFile: w.logFile, configFailed: w.configFailed === true,
         })),
       });
     } catch { /* best effort */ }
@@ -12672,6 +13067,10 @@ async function runSupervisorDaemon() {
   const workerLogMaxBytes = resolveLogMaxBytes(process.env.NANO_SUPERVISOR_LOG_MAX_BYTES);
 
   const startWorker = (w) => {
+    // A fresh (re)start attempts the profile again, so clear any prior
+    // non-restartable config-failure latch — the operator may have fixed the
+    // profile since (thread 4118560521).
+    w.configFailed = false;
     // With a cap we pipe stdout/stderr through the daemon so the ring can bound
     // them; unbounded (opt-out) keeps the legacy direct-fd append. `fd` is only
     // used on the direct-fd path.
@@ -12767,6 +13166,19 @@ async function runSupervisorDaemon() {
         return;
       }
       const delay = supervisorBackoffMs(w.restarts);
+      // A worker that exited with NANO_EXIT_CONFIG refused to start on a
+      // NON-RESTARTABLE configuration failure (bad/mismatched profile, bad --env).
+      // Restarting re-hits the identical refusal forever, so surface ONE actionable
+      // failure and leave the worker down instead of scheduling a restart
+      // (thread 4118560521). The operator fixes the profile and re-adds/restarts.
+      const exitCode = /^code (\d+)$/.exec(reason)?.[1];
+      if (exitCode === String(NANO_EXIT_CONFIG)) {
+        w.configFailed = true;
+        dlog(`worker '${w.id}' refused to start (configuration failure, exit ${NANO_EXIT_CONFIG}); NOT restarting — fix the profile and restart it`);
+        broadcast({ type: 'event', event: 'worker-config-error', worker: workerPublic(w) });
+        persist();
+        return;
+      }
       w.restarts += 1;
       dlog(`worker '${w.id}' down (${reason}); restarting in ${delay}ms (restart #${w.restarts})`);
       broadcast({ type: 'event', event: 'worker-exit', worker: workerPublic(w), restartInMs: delay });
@@ -17321,6 +17733,12 @@ export {
   sanitizeResultVars,
   hasEffectiveResultVars,
   pickAgentResult,
+  stdoutStrippedOfEmptyResult,
+  detectEmptyAgentJob,
+  detectProtocolMismatch,
+  effectiveHarnessProtocol,
+  commandLineHasAcpSelector,
+  shellWrappedScript,
   buildResultNudgePrompt,
   resolveAgentResultWithNudge,
   parseEnvPairs,

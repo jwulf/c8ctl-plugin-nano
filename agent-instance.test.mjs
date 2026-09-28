@@ -989,6 +989,37 @@ test('a hung terminal COMPLETED update is bounded so it cannot hold the lease an
   );
 });
 
+test('drainBounded returns true when the queue settles and false (bounded out) on a hung append (thread 4118913008)', async () => {
+  // The pre-settlement empty-job guard drains to sample appendedTurns/sawPlan, but the
+  // public drain() awaits the ENTIRE serialized queue — a hung updateAgentInstance would
+  // hold the job past the broker lease and prevent settlement. drainBounded() must
+  // return within the bound, reporting whether the queue actually drained.
+  const timer = makeManualTimer();
+  let hangUpdate = false;
+  const client = {
+    calls: { create: [], update: [] },
+    createAgentInstance: async (req) => { client.calls.create.push(req); return { agentInstanceKey: 'AGENT-D' }; },
+    updateAgentInstance: (req) => {
+      client.calls.update.push(req);
+      if (hangUpdate) return new Promise(() => {}); // hang forever
+      return Promise.resolve({ createdHistory: [{ historyItemId: 'h1' }] });
+    },
+  };
+  const p = makeProducer(client, { finalizeTimeoutMs: 20, setTimer: timer });
+  await p.activate();
+  // A normal append drains fully within the bound.
+  p.ingest({ sessionUpdate: 'agent_message_chunk', messageId: 'm1', content: { type: 'text', text: 'x' } });
+  assert.equal(await p.drainBounded(), true, 'a settled queue drains within the bound (true)');
+  assert.equal(p.appendedTurns, 1, 'the confirmed turn is visible after a full drain');
+  // Now a hung append: drainBounded must STILL return, reporting the bound won (false)
+  // rather than blocking forever on the hung updateAgentInstance.
+  hangUpdate = true;
+  p.ingest({ sessionUpdate: 'agent_message_chunk', messageId: 'm2', content: { type: 'text', text: 'y' } });
+  const boundedPromise = p.drainBounded();
+  await timer.fire(); // fire the finalizeTimeoutMs deadline deterministically
+  assert.equal(await boundedPromise, false, 'a hung append is bounded out (false) instead of blocking forever');
+});
+
 test('a retired create attempt that FAILS late is reported quietly, not as a misleading "will retry" (issue #230)', async () => {
   // A timed-out attempt keeps running and may reject AFTER it was retired and a newer
   // attempt has minted the instance. That late rejection must not emit the ordinary
@@ -1541,6 +1572,80 @@ test('complete() does not falsely report status→COMPLETED when the terminal up
     client.calls.update.filter((u) => u.status === 'COMPLETED').length >= 2,
     'the terminal update is retried before reporting manual reconciliation',
   );
+});
+
+test('complete() stops retrying a PERMANENT (422) terminal rejection immediately (issue #275)', async () => {
+  // A 4xx terminal rejection (a stale lease fence, an invalid transition, a 0-turns
+  // husk the engine refuses to terminalize) will not succeed on a blind retry, so the
+  // producer must NOT burn the remaining attempts against a dying lease — it stops
+  // after the FIRST 4xx. This is the stuck-instance case from #275 (HTTP 422).
+  const lines = { info: [], warn: [] };
+  const logger = {
+    info: (m) => lines.info.push(m),
+    warn: (m) => lines.warn.push(m),
+    debug() {},
+  };
+  const client = {
+    calls: { create: [], update: [] },
+    createAgentInstance: async (req) => {
+      client.calls.create.push(req);
+      return { agentInstanceKey: 'AGENT-1' };
+    },
+    updateAgentInstance: async (req) => {
+      client.calls.update.push(req);
+      if (req.status === 'COMPLETED') {
+        throw Object.assign(new Error('Unprocessable Entity'), { statusCode: 422, body: 'invalid transition' });
+      }
+      return { createdHistory: Array.isArray(req.history) ? req.history : [] };
+    },
+  };
+  const p = makeProducer(client, { logger });
+  await p.activate();
+  await p.complete(true);
+  // Exactly ONE terminal attempt — the 422 is permanent, so no blind retry.
+  assert.equal(
+    client.calls.update.filter((u) => u.status === 'COMPLETED').length,
+    1,
+    'a 422 terminal rejection is NOT retried',
+  );
+  const warn = lines.warn.find((m) => /terminal status update to COMPLETED/.test(m));
+  assert.ok(warn, 'the permanent terminal rejection is warned');
+  assert.match(warn, /rejected permanently \(HTTP 422\) — not retried/, 'the warn names the permanent 422');
+  assert.match(warn, /MANUAL RECONCILIATION REQUIRED/, 'manual reconciliation is still flagged');
+  assert.ok(!lines.info.some((m) => /status→COMPLETED/.test(m)), 'the info line does not claim COMPLETED');
+});
+
+test('complete() still retries a TRANSIENT (5xx) terminal rejection (issue #275)', async () => {
+  // A 5xx is potentially transient (an engine outage), so the terminal update IS
+  // retried up to terminalRetryMax before giving up — the permanent-4xx fast-fail
+  // must not also short-circuit a recoverable failure.
+  const lines = { info: [], warn: [] };
+  const logger = {
+    info: (m) => lines.info.push(m),
+    warn: (m) => lines.warn.push(m),
+    debug() {},
+  };
+  const client = {
+    calls: { create: [], update: [] },
+    createAgentInstance: async (req) => {
+      client.calls.create.push(req);
+      return { agentInstanceKey: 'AGENT-1' };
+    },
+    updateAgentInstance: async (req) => {
+      client.calls.update.push(req);
+      if (req.status === 'COMPLETED') throw Object.assign(new Error('Server Error'), { statusCode: 500 });
+      return { createdHistory: [] };
+    },
+  };
+  const p = makeProducer(client, { logger });
+  await p.activate();
+  await p.complete(true);
+  assert.ok(
+    client.calls.update.filter((u) => u.status === 'COMPLETED').length >= 2,
+    'a 5xx terminal rejection IS retried',
+  );
+  const warn = lines.warn.find((m) => /terminal status update to COMPLETED/.test(m));
+  assert.match(warn, /failed after \d+ attempt\(s\)/, 'a transient failure reports the retried attempt count');
 });
 
 test('a create that resolves without an agentInstanceKey stays retryable and mints + replays on a later attempt (issue #230)', async () => {
@@ -2531,6 +2636,23 @@ test('recordPlans:false (NANO_AGENT_PLAN=off) keeps plan updates out of the hist
   p.ingest(PLAN_UPDATE);
   await p.drain();
   assert.equal(client.calls.update.filter((u) => Array.isArray(u.history)).length, 0);
+});
+
+test('the facade exposes appendedTurns + sawPlan for the empty-job detector (issue #275)', async () => {
+  // The worker's empty-job detector reads `producer.appendedTurns` / `producer.sawPlan`
+  // to tell a genuinely-engaged ACP run from a protocol-mismatched husk that appended
+  // nothing. Lock in that surface: a fresh producer reads 0/false; a plan update latches
+  // sawPlan even before any turn persists; an appended message advances appendedTurns.
+  const client = fakeClient();
+  const p = makeProducer(client);
+  assert.equal(p.appendedTurns, 0, 'no turns appended yet');
+  assert.equal(p.sawPlan, false, 'no plan seen yet');
+  await p.activate();
+  p.ingest(PLAN_UPDATE);
+  assert.equal(p.sawPlan, true, 'a plan update latches sawPlan');
+  p.ingest({ sessionUpdate: 'agent_message_chunk', messageId: 'm-1', content: { type: 'text', text: 'hello' } });
+  await p.drain();
+  assert.ok(p.appendedTurns >= 1, 'an appended message turn advances appendedTurns');
 });
 
 test('a plan dropped for a full append backlog does not poison the dedup marker (records on resend)', async () => {

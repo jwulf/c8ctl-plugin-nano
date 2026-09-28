@@ -2654,6 +2654,31 @@ const RESULT_ENVELOPE_SCHEMA_VERSION = 1;
 // `worldMarker` completion variable.
 const HARNESS_PROTOCOL_VERSION = 1;
 
+// The presence-enrolment attributes a worker announces on `register` (ENROLMENT
+// attributes, not routing tokens — jobKeys are carried by the explicit
+// claim/release ownership frames the dispatch lifecycle emits, never smuggled in
+// here). Extracted as a pure builder so the ACTUAL advertised value — including
+// the harness-protocol version nano-workforce (#802) checks for staleness — is
+// unit-testable without standing up the whole `workAgent`/supervisor stack
+// (issue #272). `harnessProtocol` is always advertised so a freshly-registered
+// worker reports `harnessStale: false`; a missing `family` is omitted rather
+// than emitted as `undefined`.
+/**
+ * @param {{ rank?: string, model?: string }} profile the resolved worker profile
+ * @param {string} [host] the announced host (defaults to this machine's hostname)
+ * @returns {{ cognition: string|undefined, family?: string, host: string, harnessProtocol: number }}
+ */
+function buildAgenticCapability(profile, host = hostname()) {
+  const cap = {
+    cognition: profile?.rank,
+    host,
+    harnessProtocol: HARNESS_PROTOCOL_VERSION,
+  };
+  const family = profile?.model || undefined;
+  if (family !== undefined) cap.family = family;
+  return cap;
+}
+
 // Structured result channel (agent → harness). A coding CLI streams a lot of
 // noisy prose/tool output on stdout, so scraping it for the job's structured
 // result is fragile. Instead the harness hands the agent a private file path in
@@ -10084,16 +10109,10 @@ async function workAgent(req, flags, ctx) {
   // The presence attributes this worker announces on `register` (ENROLMENT
   // attributes, not routing tokens — jobKeys are carried by the explicit
   // claim/release ownership frames the dispatch lifecycle emits, never smuggled in
-  // here). Reused for the initial seed and any resync.
-  const agenticCapability = {
-    cognition: profile.rank,
-    family: profile.model || undefined,
-    host: hostname(),
-    // Advertise the harness-protocol version (issue #272) so nano-workforce
-    // (#802) does not flag this worker "stale harness". Absent => stale; min
-    // configurable via NANO_AGENTIC_MIN_HARNESS_PROTOCOL (default 1).
-    harnessProtocol: HARNESS_PROTOCOL_VERSION,
-  };
+  // here). Reused for the initial seed and any resync. Built by the pure
+  // `buildAgenticCapability` so the advertised value (incl. the #272
+  // harness-protocol version) is unit-tested independently of this stack.
+  const agenticCapability = buildAgenticCapability(profile);
   // Maintain `activeJobs` unconditionally: it feeds the supervisor activity file
   // (gated inside writeActivity) so a standalone worker still reports its current
   // jobs. Live presence/ownership jobKeys are now owned by the runtime — the
@@ -17268,7 +17287,7 @@ export {
 };
 export { compareSemver, githubRepoSlug, filterReleasesSince, renderReleaseBody };
 export { probeAgentCliVersion };
-export { HARNESS_PROTOCOL_VERSION };
+export { HARNESS_PROTOCOL_VERSION, buildAgenticCapability };
 export {
   webConsoleUrl,
   consoleLinkLabel,

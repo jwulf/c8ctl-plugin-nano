@@ -235,6 +235,20 @@ export function describeSdkError(err) {
   return { status: status ?? null, body: normalizedBody, message };
 }
 
+/**
+ * True when an HTTP status marks a PERMANENT rejection of the terminal
+ * status→COMPLETED update (issue #275): a 4xx (a stale lease fence, an invalid
+ * transition, a 0-turns husk the engine refuses to terminalize) will not succeed
+ * on a blind retry, so the producer stops retrying it immediately instead of
+ * burning the remaining attempts against a dying lease. 5xx / network / timeout
+ * failures are potentially transient and still retry. `null`/unknown statuses are
+ * treated as transient (retry) — fail-safe toward recovery, not toward giving up.
+ */
+export function isPermanentTerminalStatus(status) {
+  const n = Number(status);
+  return Number.isFinite(n) && n >= 400 && n < 500;
+}
+
 // Redact a lease token down to a presence + short tail so it can be logged for
 // correlation without leaking the opaque fence value. For a short token a last-4
 // tail would reveal most (or all) of the value, so emit a fixed redacted marker
@@ -684,6 +698,10 @@ export function createAgentInstanceProducer(opts = {}) {
   // "created but nothing ingested over a long run", and a deduplicated no-op from a
   // real append (issue #230 / #229 / #232).
   let appendedTurns = 0;
+  // Issue #275: latches true once the harness emits a plan update, so the empty-job
+  // detector can tell a genuinely-engaged ACP run (a plan, even with 0 persisted
+  // turns) from a protocol-mismatched husk.
+  let sawPlan = false;
   // Elevate the FIRST per-turn append failure to `warn` (repeats stay `debug`) so a
   // 400/404 append storm is visible without flooding the log (issue #230 / #229).
   let appendFailureLogged = false;
@@ -919,6 +937,9 @@ export function createAgentInstanceProducer(opts = {}) {
   const onPlan = (rawUpdate, opts) => {
     const content = buildPlanContent(rawUpdate);
     if (!content) return;
+    // Issue #275: note that the harness emitted a plan (real ACP engagement), so a
+    // 0-turn run that still planned is not mistaken for an empty husk.
+    sawPlan = true;
     const id = shortHash(JSON.stringify(content[1].object));
     // Already recorded, or an identical plan is still settling — skip either way so we
     // neither double-record nor enqueue a duplicate in-flight append.
@@ -1532,6 +1553,21 @@ export function createAgentInstanceProducer(opts = {}) {
     get agentInstanceKey() {
       return agentInstanceKey;
     },
+    /**
+     * Count of AgentHistory turns the engine actually created for this instance
+     * (issue #275): read by the worker's empty-job detector to tell a genuinely
+     * engaged ACP run from a protocol-mismatched husk that appended nothing.
+     */
+    get appendedTurns() {
+      return appendedTurns;
+    },
+    /**
+     * True once the harness emitted an ACP `plan` update (issue #275): plan
+     * engagement attests a real session even when no history turn persisted.
+     */
+    get sawPlan() {
+      return sawPlan;
+    },
 
     /**
      * Mint the AgentInstance (lease-gated) with an opening CONFIGURATION turn that
@@ -1812,6 +1848,10 @@ export function createAgentInstanceProducer(opts = {}) {
       let completedOk = false;
       let terminalErr = null;
       let terminalTimedOut = false;
+      // Issue #275: latches when the terminal update was rejected with a PERMANENT
+      // (4xx) status — surfaced in the diagnostics so a fence/validation rejection
+      // (the stuck-instance case) is distinguishable from a transient 5xx/outage.
+      let terminalPermanent = false;
       const terminalAttempts = Math.max(1, terminalRetryMax);
       if (ok) {
         for (let attempt = 1; attempt <= terminalAttempts; attempt += 1) {
@@ -1840,9 +1880,17 @@ export function createAgentInstanceProducer(opts = {}) {
             // A hung endpoint won't recover within the next attempt and each retry
             // burns another finalizeTimeoutMs against the lease, so STOP retrying on a
             // timeout (the underlying call is left to settle in the background). A
-            // plain rejection is potentially transient, so those still retry.
+            // plain rejection is potentially transient, so those still retry — EXCEPT
+            // a permanent 4xx (issue #275): a 422/409/400 terminal rejection (a stale
+            // lease fence, an invalid transition, a 0-turns husk the engine refuses to
+            // terminalize) will not succeed on a blind retry, so break immediately
+            // rather than burn the remaining attempts against a dying lease.
             if (err && err.__nanoTimeout) {
               terminalTimedOut = true;
+              break;
+            }
+            if (isPermanentTerminalStatus(terminalErr?.status)) {
+              terminalPermanent = true;
               break;
             }
           }
@@ -1856,7 +1904,11 @@ export function createAgentInstanceProducer(opts = {}) {
         // that manual reconciliation is required (issue #230).
         logger?.warn?.(
           `AgentInstance ${agentInstanceKey}: terminal status update to COMPLETED ` +
-            `${terminalTimedOut ? `timed out (bounded at ${finalizeTimeoutMs}ms)` : `failed after ${terminalAttempts} attempt(s)`} — ` +
+            `${terminalTimedOut
+              ? `timed out (bounded at ${finalizeTimeoutMs}ms)`
+              : terminalPermanent
+                ? `rejected permanently (HTTP ${terminalErr?.status ?? '4xx'}) — not retried`
+                : `failed after ${terminalAttempts} attempt(s)`} — ` +
             `status=${terminalErr?.status ?? 'n/a'} ` +
             `body=${terminalErr?.body ?? 'n/a'} message=${terminalErr?.message ?? 'n/a'}; ` +
             `MANUAL RECONCILIATION REQUIRED — the job settles now with no reactivation to retry ` +

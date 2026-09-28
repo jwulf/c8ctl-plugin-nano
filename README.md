@@ -521,6 +521,25 @@ NANO_AGENTIC_PERMISSION=escalate c8ctl nano work coder
 - `--permission yolo|escalate|filter` (default `yolo`) selects the ACP permission
   policy. `NANO_AGENTIC_PERMISSION` overrides it at work time.
 
+**Protocol must match the command.** The command and the protocol have to agree:
+a command that runs the harness in ACP mode (an `--acp` / `acp` token or a
+`*-acp` adapter binary) hired with `protocol: pipe` would have plain JSON piped
+to an ACP-speaking binary that rejects it and exits 0 empty — and the worker
+would silently **complete** every job it took with no work done (issue #275). To
+prevent that, `hire` **refuses** an ACP-mode command on `protocol: pipe`, and
+`work` **refuses to start** a host worker with the same mismatch (a pre-existing
+or hand-edited profile). Re-hire with `--protocol acp` (or drop the ACP selector
+from the command). `protocol: acp` with no selector on the command is fine — the
+worker appends `--acp` at spawn time.
+
+**An empty job is failed, not completed.** If a harness exits 0 but produced
+*nothing* — no result vars, no output, no transcript turns, no commits and no
+push — the worker **fails** the job (preserving its retries, so it reactivates
+and surfaces as an incident) instead of completing it. Completing an empty job
+would silently drop whatever it carried (an escalation answer, a review verdict)
+because downstream gateways see no status and fall through to their default. A
+run with *any* evidence of real work completes exactly as before.
+
 **What ACP unlocks.** Because the harness speaks a structured protocol rather than
 a scraped terminal, the ACP path gives you a **structured turn/tool event stream**
 (today serialized to text chunks on the relay lane — a *minimal* mode, not yet

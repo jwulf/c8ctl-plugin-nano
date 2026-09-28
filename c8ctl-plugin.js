@@ -2275,6 +2275,17 @@ async function hireWorker(req, flags) {
     process.exit(1);
   }
 
+  // Issue #275 (2): refuse the exact hire that caused the incident — a command
+  // that runs the harness in ACP mode (`--acp` / `acp` subcommand / `*-acp`
+  // adapter binary) persisted with `protocol: pipe`. The worker would pipe plain
+  // JSON to an ACP-speaking binary that rejects it and exits 0 empty, silently
+  // completing every job it takes. Fail loudly at hire time instead.
+  const hireMismatch = detectProtocolMismatch({ command, args: commandArgs, protocol });
+  if (hireMismatch) {
+    logger.error(`Refusing to hire "${name || '(unnamed)'}": ${hireMismatch.reason}`);
+    process.exit(1);
+  }
+
   if (!isValidProfileName(name)) {
     logger.error(`Invalid profile name "${name}". Use letters, digits, dot, dash or underscore.`);
     process.exit(1);
@@ -2822,6 +2833,68 @@ function pickAgentResult(...thunks) {
     if (hasEffectiveResultVars(candidate)) return candidate;
   }
   return firstPresent ?? null;
+}
+
+// Issue #275 (1): the empty-job detector. A harness run that exits 0 yet produced
+// NOTHING — no result vars, no output, no commits, no push — did no work (the
+// canonical case: a protocol-mismatched harness, e.g. an ACP-mode binary fed a
+// pipe payload, rejects stdin and exits 0 empty). COMPLETING such a job silently
+// drops whatever the job carried (an escalation answer, a review verdict) because
+// downstream gateways see no status and fall through to their default — so the
+// worker FAILS the job instead, preserving retries so it reactivates (ideally on
+// a healthy worker) and surfaces as an incident.
+//
+// `hasTurns`/`hasPlan` attest the harness genuinely engaged (a real ACP session
+// emitted updates / a plan); `hasOutcome` attests the agent reported an explicit
+// ACP `_meta.outcome`. Any one of these means the run was real work, not a husk.
+// Pure + exported for tests; the caller folds the result into the settle path.
+function detectEmptyAgentJob({ resultVars, stdout, stderr, gitResult, hasTurns, hasPlan, hasOutcome } = {}) {
+  if (hasEffectiveResultVars(resultVars)) return null;
+  if (typeof stdout === 'string' && stdout.trim() !== '') return null;
+  if (typeof stderr === 'string' && stderr.trim() !== '') return null;
+  if (hasTurns === true || hasPlan === true || hasOutcome === true) return null;
+  if ((gitResult?.commits?.length ?? 0) > 0) return null;
+  if (gitResult?.pushed === true) return null;
+  return {
+    reason:
+      'agent exited 0 but produced nothing — no result vars, no output, no transcript turns, ' +
+      'no commits and no push. This is the signature of a protocol-mismatched or no-op harness ' +
+      '(e.g. an ACP-mode binary driven over protocol "pipe"): completing the job would silently ' +
+      'drop what it carried, so it is failed (retries preserved) instead of completed.',
+  };
+}
+
+// Issue #275 (2): command ↔ protocol consistency. The incident behind #275 was a
+// hire whose command ran the harness in ACP mode (`nano-coder --acp`) while the
+// profile protocol stayed `pipe`, so the worker piped plain JSON to an
+// ACP-speaking binary that rejected it and exited 0 empty. Detect the mismatch
+// from the command line itself:
+//   - `protocol: pipe` (or anything else) while the command line carries an ACP
+//     selector (`--acp` / `acp` subcommand / `*-acp` adapter binary) → the
+//     harness will speak JSON-RPC while the worker pipes plain JSON. Refused.
+//   - `protocol: acp` with no ACP selector on the line is NOT an error:
+//     `ensureAcpFlag` appends `--acp` at spawn time, so that shape is supported.
+// The selector scan reuses ensureAcpFlag's contract: a line where ensureAcpFlag
+// returns the line UNCHANGED already carries a selector. Pure + exported.
+function commandLineHasAcpSelector(commandLine) {
+  if (typeof commandLine !== 'string' || commandLine.trim() === '') return false;
+  return ensureAcpFlag(commandLine) === commandLine;
+}
+
+function detectProtocolMismatch({ command, args = [], protocol } = {}) {
+  const line = buildAgentCommandLine(String(command || ''), Array.isArray(args) ? args : []);
+  if (!line.trim()) return null;
+  const proto = String(protocol || 'pipe').trim().toLowerCase();
+  if (proto !== 'acp' && commandLineHasAcpSelector(line)) {
+    return {
+      reason:
+        `command "${line}" selects ACP mode (an --acp/acp token or a *-acp adapter binary) but ` +
+        `protocol is "${proto}" — the worker would pipe plain JSON to an ACP-speaking harness that ` +
+        'rejects it and exits 0 empty, silently completing jobs with no work done (issue #275). ' +
+        'Re-hire with --protocol acp (or drop the ACP selector from the command).',
+    };
+  }
+  return null;
 }
 
 const SANDBOXES = ['none', 'docker', 'podman'];
@@ -10375,6 +10448,20 @@ async function workAgent(req, flags, ctx) {
   const envPermission = (process.env.NANO_AGENTIC_PERMISSION || '').trim().toLowerCase();
   const rolePermission = resolveAgenticSetting(envPermission, profile.permission, PERMISSION_MODES, 'yolo');
 
+  // Issue #275 (2): refuse to poll with a command/protocol mismatch. A hire
+  // predating the hire-time refusal (or one hand-edited into config.json) can
+  // still pair an ACP-mode command (`--acp`) with `protocol: pipe`; starting the
+  // worker would let it silently complete every job it takes with no work done.
+  // Checked against the EFFECTIVE protocol (env override included) and the full
+  // effective args (profile --arg + work-time --arg), before any polling begins.
+  // Container sandboxes run pipe-only today regardless of `protocol` (runAgentJob
+  // ignores it), so the mismatch is only fatal on the host executor.
+  const startupMismatch = detectProtocolMismatch({ command: profile.command, args: effectiveArgs, protocol: roleProtocol });
+  if (startupMismatch && !isContainer) {
+    logger.error(`Cannot work "${name}": ${startupMismatch.reason}`);
+    process.exit(1);
+  }
+
   // The agent job runner (issue #172 hot-path flip). The single-owner supervisor
   // runtime dispatches each activated job to this `run(job)`; it executes the
   // harness exactly as the retired per-type SDK jobHandler did, but SETTLES via the
@@ -11286,6 +11373,36 @@ async function workAgent(req, flags, ctx) {
           const resultKeys = Object.keys(resultVars);
           if (resultKeys.length === 0) logger.warn(`[${jobType}] job ${job.jobKey}: agent returned no usable result vars — write a JSON object of result variables to $AGENT_RESULT_FILE (or print a "${RESULT_SENTINEL} {…}" line) so downstream gateways see status/summary/etc.`);
           else logger.info(`[${jobType}] job ${job.jobKey}: merged agent result vars [${resultKeys.join(', ')}]`);
+
+          // Issue #275 (1): FAIL an empty job instead of completing it. A run
+          // that exited 0 with no result vars, no output, no transcript turns,
+          // no commits and no push did no work (the canonical case is a
+          // protocol-mismatched harness — an ACP-mode binary fed a pipe payload
+          // rejects stdin and exits 0 empty). Completing it silently drops
+          // whatever the job carried (an escalation answer, a review verdict),
+          // so fail it here: retries are preserved, the job reactivates (on a
+          // healthy worker), and it surfaces as an incident. A run with ANY
+          // evidence of real work (output, ACP turns, a plan, an outcome,
+          // commits, a push) is NOT empty and completes as before.
+          const emptyJob = detectEmptyAgentJob({
+            resultVars,
+            stdout: result.stdout,
+            stderr: result.stderr,
+            gitResult,
+            hasTurns: agentInstanceProducer?.appendedTurns > 0,
+            hasPlan: agentInstanceProducer?.sawPlan === true,
+            hasOutcome: result.acpOutcome != null,
+          });
+          if (emptyJob) {
+            const retries = Math.max(0, (Number(job.retries) || 1) - 1);
+            logger.error(`[${jobType}] job ${job.jobKey}: FAILING empty agent job — ${emptyJob.reason} (retries left ${retries})`);
+            return await settleJob.fail({
+              errorMessage: `agent "${profile.name}" produced an empty result: ${emptyJob.reason}`.slice(0, 2000),
+              retries,
+              variables: { [AGENT_RESULT_KEY]: resultEnvelope },
+            });
+          }
+
           const settled = await settleJob.complete({
             ...resultVars,
             [AGENT_RESULT_KEY]: resultEnvelope,
@@ -17321,6 +17438,9 @@ export {
   sanitizeResultVars,
   hasEffectiveResultVars,
   pickAgentResult,
+  detectEmptyAgentJob,
+  detectProtocolMismatch,
+  commandLineHasAcpSelector,
   buildResultNudgePrompt,
   resolveAgentResultWithNudge,
   parseEnvPairs,

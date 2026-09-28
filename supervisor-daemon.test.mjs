@@ -84,8 +84,10 @@ function restoreEnv(key, prev) {
 // daemon path.) A fast intervalMs keeps the reap prompt. Options: `recordArgv`
 // also records the child's own argv to `<workArgvDir>/<pid>.json` (so tests can
 // assert on spawn flags); `ignoreSigterm` traps SIGTERM to force the daemon's
-// SIGKILL path on restart; `crash` exits immediately (code 1) with no watchdog.
-function writeShim(shimPath, { recordArgv = false, workArgvDir = null, ignoreSigterm = false, crash = false, busy = null } = {}) {
+// SIGKILL path on restart; `crash` exits immediately (code 1) with no watchdog;
+// `crashCode` exits immediately with a SPECIFIC code (e.g. 78 = EX_CONFIG) so a
+// test can model a non-restartable configuration failure.
+function writeShim(shimPath, { recordArgv = false, workArgvDir = null, ignoreSigterm = false, crash = false, crashCode = null, busy = null } = {}) {
   if (recordArgv && typeof workArgvDir !== 'string') {
     throw new Error('writeShim: recordArgv requires a string workArgvDir path');
   }
@@ -113,6 +115,10 @@ function writeShim(shimPath, { recordArgv = false, workArgvDir = null, ignoreSig
   }
   if (crash) {
     lines.push(`  process.exit(1); // crash immediately`);
+  } else if (crashCode != null) {
+    // Exit immediately with a SPECIFIC code (e.g. 78 = EX_CONFIG) to model a
+    // non-restartable configuration failure the daemon must NOT restart.
+    lines.push(`  process.exit(${Number(crashCode)}); // config-failure exit`);
   } else if (busy) {
     // A "busy" stand-in reports one in-flight job in its activity file (so
     // `supervisor status` counts it), then models the #202 stop contract:
@@ -491,6 +497,55 @@ test('supervisor daemon: restarts a crashing worker', async (t) => {
     await sleep(150);
   }
   assert.ok(restarts >= 1, `crashing worker should be restarted (saw ${restarts})`);
+
+  await mod.supervisorRequest({ op: 'stop' });
+});
+
+test('supervisor daemon: does NOT restart a worker that exits on a config failure (thread 4118560521)', async (t) => {
+  const HOME = mkdtempSync(join(tmpdir(), 'c8ctl-sup-cfg-'));
+  const prevHome = process.env.C8CTL_NANO_HOME;
+  const prevEntry = process.env.C8CTL_NANO_ENTRY;
+  process.env.C8CTL_NANO_HOME = HOME;
+  writeFileSync(join(HOME, 'config.json'), JSON.stringify({
+    hires: { misconfigured: { name: 'misconfigured', rank: 'senior', command: 'true', model: '', capabilities: [] } },
+  }));
+
+  // The `work` stand-in exits with NANO_EXIT_CONFIG (78 = EX_CONFIG): a
+  // NON-RESTARTABLE configuration failure. The daemon must surface ONE actionable
+  // failure and leave the worker down, not restart-loop the identical refusal.
+  const shim = join(HOME, 'fake-entry.mjs');
+  writeShim(shim, { crashCode: 78 });
+  process.env.C8CTL_NANO_ENTRY = shim;
+
+  const mod = await import(pluginUrl);
+  t.after(async () => {
+    try { await mod.supervisorRequest({ op: 'stop' }); } catch { /* ignore */ }
+    const st = mod.runningSupervisor();
+    if (st) { try { process.kill(st.pid, 'SIGKILL'); } catch { /* ignore */ } }
+    mod.clearSupervisorState();
+    restoreEnv('C8CTL_NANO_ENTRY', prevEntry);
+    restoreEnv('C8CTL_NANO_HOME', prevHome);
+    try { rmSync(HOME, { recursive: true, force: true }); } catch { /* ignore */ }
+  });
+
+  await mod.startSupervisorDaemon();
+  await mod.supervisorRequest({ op: 'add', profile: 'misconfigured' });
+
+  // Give the daemon ample time to (wrongly) restart: a crash-looping worker would
+  // bump `restarts` within ~1s (the initial backoff). A config-failed worker must
+  // stay at restarts 0, state down, with the configFailed latch set.
+  let saw = null;
+  for (let i = 0; i < 30; i++) {
+    const s = await mod.supervisorRequest({ op: 'status' });
+    if (s.workers.length === 1) saw = s.workers[0];
+    // Wait past the first backoff window so a restart WOULD have happened.
+    if (i >= 12 && saw) break;
+    await sleep(150);
+  }
+  assert.ok(saw, 'worker present in status');
+  assert.equal(saw.restarts, 0, `config-failed worker must NOT be restarted (saw restarts=${saw.restarts})`);
+  assert.equal(saw.state, 'down', 'config-failed worker is left down');
+  assert.equal(saw.configFailed, true, 'configFailed latch is surfaced in status');
 
   await mod.supervisorRequest({ op: 'stop' });
 });

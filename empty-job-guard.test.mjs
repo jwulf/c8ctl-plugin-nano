@@ -21,6 +21,8 @@ import {
   detectProtocolMismatch,
   effectiveHarnessProtocol,
   commandLineHasAcpSelector,
+  shellWrappedScript,
+  stdoutStrippedOfEmptyResult,
   hireWorker,
 } from './c8ctl-plugin.js';
 import { isPermanentTerminalStatus } from './agent-instance.mjs';
@@ -162,6 +164,35 @@ test('detectEmptyAgentJob flags stdout that is ONLY an empty/value-less result s
   );
 });
 
+test('detectEmptyAgentJob preserves substantive text BEFORE an inline empty-result sentinel (thread 4118560562)', () => {
+  // A sentinel can share a line with substantive prose. Dropping the WHOLE line
+  // would mis-classify the run as a husk even though the harness produced real
+  // output; only the marker itself may be stripped, keeping the prefix.
+  assert.equal(
+    detectEmptyAgentJob({ resultVars: {}, stdout: 'work done ::nano:result:: {}', stderr: '', gitResult: null }),
+    null,
+    'inline prose before an empty sentinel is still work',
+  );
+  assert.equal(
+    stdoutStrippedOfEmptyResult('work done ::nano:result:: {}'),
+    'work done',
+    'strip keeps the inline prefix, drops only the marker',
+  );
+  // A sentinel-only line still reduces to empty (the husk signature).
+  assert.equal(stdoutStrippedOfEmptyResult('::nano:result:: {}'), '', 'sentinel-only line strips to empty');
+  assert.equal(
+    stdoutStrippedOfEmptyResult('did the thing\n::nano:result:: {}').trim(),
+    'did the thing',
+    'a prose line survives a following sentinel-only line',
+  );
+  // A sentinel carrying REAL vars is never stripped.
+  assert.equal(
+    stdoutStrippedOfEmptyResult('::nano:result:: {"status":"converged"}'),
+    '::nano:result:: {"status":"converged"}',
+    'a sentinel with effective vars is left intact',
+  );
+});
+
 // --- 2. detectProtocolMismatch / commandLineHasAcpSelector ------------------
 
 test('commandLineHasAcpSelector detects the ACP selector in its various forms', () => {
@@ -187,6 +218,23 @@ test('commandLineHasAcpSelector descends into shell-wrapped commands (thread 411
   // A wrapped PLAIN command is not a false positive.
   assert.equal(commandLineHasAcpSelector("sh -c 'copilot --model foo'"), false, 'wrapped plain command is not a selector');
   assert.equal(commandLineHasAcpSelector("sh -c 'copilot --model foo-acp'"), false, 'wrapped -acp VALUE is not a selector');
+});
+
+test('commandLineHasAcpSelector descends past leading env assignments and env wrappers (thread 4118560608)', () => {
+  // The shell need not be word 0: a profile may prefix it with env assignments
+  // (`FOO=1 sh -c …`) or an `env` wrapper (`env FOO=1 sh -c …`). The scan must skip
+  // that prefix so the shell lookup lands on the real shell token.
+  assert.equal(commandLineHasAcpSelector("FOO=1 sh -c 'nano-coder --acp'"), true, 'leading assignment + sh -c');
+  assert.equal(commandLineHasAcpSelector("A=1 B=2 bash -lc 'nano-coder acp'"), true, 'multiple leading assignments');
+  assert.equal(commandLineHasAcpSelector("env FOO=1 sh -c 'nano-coder --acp'"), true, 'env wrapper + assignment');
+  assert.equal(commandLineHasAcpSelector("env -i FOO=1 sh -c 'nano-coder --acp'"), true, 'env -i + assignment');
+  assert.equal(commandLineHasAcpSelector("env -u BAR sh -c 'nano-coder --acp'"), true, 'env -u NAME (option with arg)');
+  // shellWrappedScript returns the inner script directly.
+  assert.equal(shellWrappedScript("FOO=1 sh -c 'nano-coder --acp'"), 'nano-coder --acp', 'shellWrappedScript skips the assignment');
+  assert.equal(shellWrappedScript("env FOO=1 sh -c 'copilot'"), 'copilot', 'shellWrappedScript skips the env wrapper');
+  // A leading assignment on a NON-shell command is not a wrapper (no descent).
+  assert.equal(shellWrappedScript('FOO=1 plain-harness'), null, 'assignment + non-shell is not a wrapper');
+  assert.equal(commandLineHasAcpSelector("env FOO=1 sh -c 'copilot --model foo'"), false, 'env-wrapped plain command is not a selector');
 });
 
 test('detectProtocolMismatch flags a shell-wrapped ACP command on protocol pipe (thread 4118471822)', () => {

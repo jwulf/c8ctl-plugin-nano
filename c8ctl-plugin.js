@@ -2817,23 +2817,31 @@ function hasEffectiveResultVars(obj) {
 }
 
 // Remove from `stdout` only the result markers that carry NO effective vars — a
-// `::nano:result:: {…}` sentinel line, or a fenced JSON block, whose parsed object
-// is empty / reserved-keys-only / null-valued (so `hasEffectiveResultVars` is
-// false). A marker that DID carry effective vars, and every other line of ordinary
-// prose, is left intact. Used by the empty-job detector so that a run whose sole
-// stdout is a value-less result sentinel/fence is treated as producing no work
-// (issue #275, thread 4118471796) while substantive stdout still counts as
-// evidence.
+// `::nano:result:: {…}` sentinel, or a fenced JSON block, whose parsed object is
+// empty / reserved-keys-only / null-valued (so `hasEffectiveResultVars` is false).
+// A marker that DID carry effective vars, and every other line of ordinary prose,
+// is left intact. Used by the empty-job detector so that a run whose sole stdout
+// is a value-less result sentinel/fence is treated as producing no work (issue
+// #275, thread 4118471796) while substantive stdout still counts as evidence.
+//
+// Only the marker itself is stripped, NOT the whole line: a sentinel can share a
+// line with substantive prose (`work done ::nano:result:: {}`), and dropping the
+// entire line would mis-classify that run as a husk even though the harness
+// produced real output (thread 4118560562). The sentinel runs to end-of-line, so
+// we cut from the sentinel start to EOL and keep the prefix (trimmed); a line
+// that is ONLY the sentinel reduces to '' and is dropped.
 function stdoutStrippedOfEmptyResult(stdout) {
   if (typeof stdout !== 'string' || stdout === '') return '';
-  const keptLines = stdout.split(/\r?\n/).filter((line) => {
+  const keptLines = stdout.split(/\r?\n/).map((line) => {
     const idx = line.indexOf(RESULT_SENTINEL);
-    if (idx === -1) return true;
+    if (idx === -1) return line;
     const obj = parseAgentResultObject(line.slice(idx + RESULT_SENTINEL.length).trim());
-    // Drop the sentinel line only when it parsed to a value-less result object;
-    // keep an unparseable sentinel (it isn't a recognised result) or one that
-    // carried real vars.
-    return !(obj && !hasEffectiveResultVars(obj));
+    // Strip the sentinel only when it parsed to a value-less result object; keep
+    // an unparseable sentinel (it isn't a recognised result) or one that carried
+    // real vars. Preserve any substantive text BEFORE the sentinel on the same
+    // line (thread 4118560562) rather than dropping the whole line.
+    if (obj && !hasEffectiveResultVars(obj)) return line.slice(0, idx).replace(/\s+$/, '');
+    return line;
   });
   return keptLines
     .join('\n')
@@ -7247,18 +7255,48 @@ function tokenizeShellWords(commandLine) {
 // only the wrapper (`sh -c 'nano-coder --acp'`). Return the inner <script> so the
 // selector scan can descend into what the wrapper actually launches; null when the
 // line is not a recognised `<shell> [-opts] -c <script>` wrapper (thread 4118471822).
+//
+// The shell need not be word 0: a profile may prefix it with a run of environment
+// assignments (`FOO=1 sh -c …`) or an `env` wrapper (`env FOO=1 sh -c …`,
+// `env -i sh -c …`). Skip that leading prefix — assignments, the `env` command and
+// its options/assignments — so the shell lookup lands on the real shell token
+// (thread 4118560608). Mirrors the leading-assignment skip in ensureAcpFlag.
 const WRAPPER_SHELL_BASENAMES = new Set(['sh', 'bash', 'dash', 'zsh', 'ash', 'ksh']);
+// A leading `NAME=value` environment assignment (POSIX name, `=` present).
+const ENV_ASSIGNMENT_RE = /^[A-Za-z_][A-Za-z0-9_]*=/;
 function shellWrappedScript(commandLine) {
   const words = tokenizeShellWords(commandLine);
   if (words.length < 3) return null;
-  const base = words[0].replace(/^.*[\\/]/, '');
+  let i = 0;
+  // Skip a leading run of `NAME=value` assignments (`FOO=1 sh -c …`).
+  while (i < words.length && ENV_ASSIGNMENT_RE.test(words[i])) i++;
+  // Skip an `env` wrapper: `env` itself, its options (`-i`, `-u NAME`, `--null`),
+  // and any `NAME=value` assignments it carries, up to the command it runs.
+  if (i < words.length && words[i].replace(/^.*[\\/]/, '') === 'env') {
+    i++;
+    while (i < words.length) {
+      const w = words[i];
+      if (ENV_ASSIGNMENT_RE.test(w)) { i++; continue; }
+      // `env` options: a switch that is not yet the command. `-u`/`--unset` take a
+      // NAME argument — skip it too. A bare `-` (env's "ignore rest") ends options.
+      if (w === '-') { i++; break; }
+      if (w.startsWith('-')) {
+        if (w === '-u' || w === '--unset') { i += 2; continue; }
+        i++;
+        continue;
+      }
+      break; // first non-option, non-assignment word is the command env runs
+    }
+  }
+  if (words.length - i < 3) return null;
+  const base = words[i].replace(/^.*[\\/]/, '');
   if (!WRAPPER_SHELL_BASENAMES.has(base)) return null;
-  for (let i = 1; i < words.length; i++) {
-    const w = words[i];
+  for (let j = i + 1; j < words.length; j++) {
+    const w = words[j];
     if (!w.startsWith('-')) return null; // reached the command/script without a -c
     // `-c` (possibly combined with other short opts, e.g. `-lc`, `-euxc`) takes
     // the NEXT word as the script to run.
-    if (/^-[a-z]*c$/i.test(w)) return i + 1 < words.length ? words[i + 1] : null;
+    if (/^-[a-z]*c$/i.test(w)) return j + 1 < words.length ? words[j + 1] : null;
   }
   return null;
 }
@@ -9671,13 +9709,11 @@ async function workAgent(req, flags, ctx) {
 
   const stored = readHires()[name];
   if (!stored) {
-    logger.error(`No hire named "${name}". List profiles with: c8ctl nano hire --list`);
-    process.exit(1);
+    exitConfigError(logger, `No hire named "${name}". List profiles with: c8ctl nano hire --list`);
   }
   const normalized = normalizeStoredProfile(name, stored);
   if (normalized.error) {
-    logger.error(`Cannot work "${name}": ${normalized.error}. Re-create it with: c8ctl nano hire`);
-    process.exit(1);
+    exitConfigError(logger, `Cannot work "${name}": ${normalized.error}. Re-create it with: c8ctl nano hire`);
   }
   const profile = normalized.profile;
 
@@ -9689,8 +9725,7 @@ async function workAgent(req, flags, ctx) {
   // supervisor path); a non-blank one must be a safe worker-name token.
   const explicitName = flags?.name ? String(flags.name).trim() : '';
   if (explicitName !== '' && !isValidWorkerName(explicitName)) {
-    logger.error(`Invalid --name "${flags.name}": use only letters, digits, and . _ -`);
-    process.exit(1);
+    exitConfigError(logger, `Invalid --name "${flags.name}": use only letters, digits, and . _ -`);
   }
   const workerName = explicitName !== '' ? explicitName : autoWorkerName(name);
 
@@ -9704,8 +9739,7 @@ async function workAgent(req, flags, ctx) {
   // config such as permission toggles (e.g. a coder CLI started with tools enabled).
   const { env: workEnv, errors: workEnvErrors } = parseEnvPairs(flags?.env);
   if (workEnvErrors.length > 0) {
-    logger.error(workEnvErrors.join('; '));
-    process.exit(1);
+    exitConfigError(logger, workEnvErrors.join('; '));
   }
   const profileEnv = { ...profile.env, ...workEnv };
 
@@ -10559,8 +10593,10 @@ async function workAgent(req, flags, ctx) {
   const effectiveProtocol = effectiveHarnessProtocol(roleProtocol, isContainer);
   const startupMismatch = detectProtocolMismatch({ command: profile.command, args: effectiveArgs, protocol: effectiveProtocol });
   if (startupMismatch) {
-    logger.error(`Cannot work "${name}": ${startupMismatch.reason}`);
-    process.exit(1);
+    // Non-restartable config failure: under the supervisor this must exit with
+    // NANO_EXIT_CONFIG so the daemon stops retrying instead of restart-looping the
+    // same refusal (thread 4118560521).
+    exitConfigError(logger, `Cannot work "${name}": ${startupMismatch.reason}`);
   }
 
   // The agent job runner (issue #172 hot-path flip). The single-owner supervisor
@@ -11884,6 +11920,21 @@ const SUPERVISOR_BACKOFF_MAX_MS = 30_000;
 // A child that stayed up at least this long before exiting is not crash-looping,
 // so its restart backoff is reset to zero.
 const SUPERVISOR_HEALTHY_UPTIME_MS = 60_000;
+// sysexits.h EX_CONFIG: a worker that exits with this code refused to start on a
+// NON-RESTARTABLE configuration failure (a missing/invalid/hand-edited profile, a
+// command↔protocol mismatch, bad --env). Restarting it would re-hit the identical
+// refusal forever, re-allocating startup state and re-emitting the same error
+// (thread 4118560521) — so the supervisor's death handler treats this code as
+// terminal and does NOT schedule a restart, surfacing one actionable failure.
+const NANO_EXIT_CONFIG = 78;
+// Log `msg` and exit with NANO_EXIT_CONFIG (EX_CONFIG). Used for the non-restartable
+// configuration failures a worker can hit BEFORE it starts polling — under `nano
+// supervisor` a plain exit(1) is indistinguishable from a crash and the daemon would
+// restart-loop the same refusal forever (thread 4118560521). Pure-ish (exits).
+function exitConfigError(logger, msg) {
+  logger.error(msg);
+  process.exit(NANO_EXIT_CONFIG);
+}
 const SUPERVISOR_CONNECT_TIMEOUT_MS = 6_000;
 // End-to-end deadline for a single request: once connected, a wedged/incompatible
 // daemon that accepts but never sends a `final` frame must not hang the client.
@@ -12285,6 +12336,10 @@ function summarizeSupervisorWorker(w, now = Date.now()) {
     pid: alive ? w.pid : null,
     state: w.stopping ? 'stopping' : alive ? 'running' : 'down',
     restarts: Number(w.restarts) || 0,
+    // True when the worker last exited with NANO_EXIT_CONFIG (a NON-RESTARTABLE
+    // configuration failure) — the daemon left it down rather than restart-looping
+    // (thread 4118560521). Surfaced so `supervisor status` shows WHY it is down.
+    configFailed: w.configFailed === true,
     uptimeMs,
     startedAtMs,
     lastExit: w.lastExit ?? null,
@@ -12911,6 +12966,10 @@ async function runSupervisorDaemon() {
   const workerLogMaxBytes = resolveLogMaxBytes(process.env.NANO_SUPERVISOR_LOG_MAX_BYTES);
 
   const startWorker = (w) => {
+    // A fresh (re)start attempts the profile again, so clear any prior
+    // non-restartable config-failure latch — the operator may have fixed the
+    // profile since (thread 4118560521).
+    w.configFailed = false;
     // With a cap we pipe stdout/stderr through the daemon so the ring can bound
     // them; unbounded (opt-out) keeps the legacy direct-fd append. `fd` is only
     // used on the direct-fd path.
@@ -13006,6 +13065,19 @@ async function runSupervisorDaemon() {
         return;
       }
       const delay = supervisorBackoffMs(w.restarts);
+      // A worker that exited with NANO_EXIT_CONFIG refused to start on a
+      // NON-RESTARTABLE configuration failure (bad/mismatched profile, bad --env).
+      // Restarting re-hits the identical refusal forever, so surface ONE actionable
+      // failure and leave the worker down instead of scheduling a restart
+      // (thread 4118560521). The operator fixes the profile and re-adds/restarts.
+      const exitCode = /^code (\d+)$/.exec(reason)?.[1];
+      if (exitCode === String(NANO_EXIT_CONFIG)) {
+        w.configFailed = true;
+        dlog(`worker '${w.id}' refused to start (configuration failure, exit ${NANO_EXIT_CONFIG}); NOT restarting — fix the profile and restart it`);
+        broadcast({ type: 'event', event: 'worker-config-error', worker: workerPublic(w) });
+        persist();
+        return;
+      }
       w.restarts += 1;
       dlog(`worker '${w.id}' down (${reason}); restarting in ${delay}ms (restart #${w.restarts})`);
       broadcast({ type: 'event', event: 'worker-exit', worker: workerPublic(w), restartInMs: delay });
@@ -17560,10 +17632,12 @@ export {
   sanitizeResultVars,
   hasEffectiveResultVars,
   pickAgentResult,
+  stdoutStrippedOfEmptyResult,
   detectEmptyAgentJob,
   detectProtocolMismatch,
   effectiveHarnessProtocol,
   commandLineHasAcpSelector,
+  shellWrappedScript,
   buildResultNudgePrompt,
   resolveAgentResultWithNudge,
   parseEnvPairs,

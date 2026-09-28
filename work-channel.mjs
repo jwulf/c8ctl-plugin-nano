@@ -93,7 +93,7 @@ export function redactAgenticUrl(url) {
  * breaking older peers"), so the visibility page can surface `capability.jobs`
  * without any wire-contract change.
  *
- * @param {{ cognition?: string, weight?: number, family?: string, host?: string }} capability
+ * @param {{ cognition?: string, weight?: number, family?: string, host?: string, harnessProtocol?: number }} capability
  * @param {readonly string[]} jobs
  * @returns {object}
  */
@@ -104,6 +104,12 @@ function presenceCapability(capability, jobs) {
     if (typeof capability.weight === 'number' && Number.isFinite(capability.weight)) out.weight = capability.weight;
     if (typeof capability.family === 'string' && capability.family !== '') out.family = capability.family;
     if (typeof capability.host === 'string' && capability.host !== '') out.host = capability.host;
+    // Harness-protocol version (issue #272): nano-workforce (#802) flags a worker
+    // that advertises no protocol as "stale harness". Forward it on the REGISTER
+    // capability frame so the visibility page grades this worker current.
+    if (typeof capability.harnessProtocol === 'number' && Number.isInteger(capability.harnessProtocol)) {
+      out.harnessProtocol = capability.harnessProtocol;
+    }
   }
   out.jobs = Array.isArray(jobs) ? jobs.map(String) : [];
   return out;
@@ -135,7 +141,7 @@ function presenceCapability(capability, jobs) {
  * @param {object} opts
  * @param {string} opts.instance stable worker instance id (the worker name) carried on every presence frame
  * @param {string} opts.host the worker's host label
- * @param {{ cognition?: string, weight?: number, family?: string, host?: string }} [opts.capability] declared enrolment capability
+ * @param {{ cognition?: string, weight?: number, family?: string, host?: string, harnessProtocol?: number }} [opts.capability] declared enrolment capability
  * @param {() => readonly string[]} [opts.listJobKeys] reads the live jobKey set from the worker's activeJobs map
  * @param {string} opts.url the app's HTTP(S) base URL (the channel is served same-port at `/agentic`)
  * @param {string} opts.token ADR 0028 identity token

@@ -247,7 +247,47 @@ test('hire accepts the consistent shapes (no false refusal)', async () => {
   });
 });
 
-// --- 3. isPermanentTerminalStatus -------------------------------------------
+test('hire refuses an ACP-mode command for a container even with protocol acp (thread 4118414685)', async () => {
+  await withHome(async () => {
+    const prevExit = process.exit;
+    let exitCode = null;
+    process.exit = (code) => { exitCode = code; throw new Error(`exit ${code}`); };
+    try {
+      // A container runs pipe-only regardless of --protocol, so an ACP-selector
+      // command is the same empty-husk mismatch even when hired with protocol acp.
+      // Rejected at hire time (via the EFFECTIVE protocol), not only at work time.
+      await hireWorker(
+        { positional: [] },
+        { name: 'c-acp', rank: 'senior', command: 'nano-coder --acp', protocol: 'acp', sandbox: 'docker', image: 'ghcr.io/x/y:latest' },
+      ).catch(() => {});
+    } finally {
+      process.exit = prevExit;
+    }
+    assert.equal(exitCode, 1, 'the container ACP mismatch is refused at hire time');
+    const err = logs.error.find((m) => /Refusing to hire/.test(m));
+    assert.ok(err, 'a loud refusal is logged');
+    assert.match(err, /selects ACP mode/);
+  });
+});
+
+test('hire accepts a plain container command with protocol acp (no false refusal)', async () => {
+  await withHome(async () => {
+    const prevExit = process.exit;
+    let exitCode = null;
+    process.exit = (code) => { exitCode = code; throw new Error(`exit ${code}`); };
+    try {
+      // A plain (non-ACP) container command is fine even with a pointless
+      // --protocol acp — the container ignores the declared protocol.
+      await hireWorker(
+        { positional: [] },
+        { name: 'c-plain', rank: 'senior', command: 'copilot', protocol: 'acp', sandbox: 'docker', image: 'ghcr.io/x/y:latest' },
+      ).catch(() => {});
+      assert.equal(exitCode, null, 'a plain container command is accepted');
+    } finally {
+      process.exit = prevExit;
+    }
+  });
+});
 
 test('isPermanentTerminalStatus: 4xx is permanent, 5xx/timeout/unknown is transient', () => {
   assert.equal(isPermanentTerminalStatus(400), true);

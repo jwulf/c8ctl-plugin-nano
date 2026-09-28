@@ -527,10 +527,18 @@ a command that runs the harness in ACP mode (an `--acp` / `acp` token or a
 to an ACP-speaking binary that rejects it and exits 0 empty — and the worker
 would silently **complete** every job it took with no work done (issue #275). To
 prevent that, `hire` **refuses** an ACP-mode command on `protocol: pipe`, and
-`work` **refuses to start** a host worker with the same mismatch (a pre-existing
+`work` **refuses to start** a worker with the same mismatch (a pre-existing
 or hand-edited profile). Re-hire with `--protocol acp` (or drop the ACP selector
 from the command). `protocol: acp` with no selector on the command is fine — the
 worker appends `--acp` at spawn time.
+
+**Container workers are pipe-only.** A `--sandbox docker|podman` worker runs the
+harness over the pipe transport regardless of `--protocol`, so an ACP-mode
+command is a mismatch there *even with* `--protocol acp` (the container would
+still pipe plain JSON to an ACP-speaking harness). Both `hire` and `work`
+evaluate the **effective** protocol, so such a container profile is rejected at
+hire time and refused at work time — drop the ACP selector from the command for a
+container role.
 
 **An empty job is failed, not completed.** If a harness exits 0 but produced
 *nothing* — no result vars, no output, no transcript turns, no commits and no

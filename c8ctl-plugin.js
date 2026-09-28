@@ -2279,8 +2279,14 @@ async function hireWorker(req, flags) {
   // that runs the harness in ACP mode (`--acp` / `acp` subcommand / `*-acp`
   // adapter binary) persisted with `protocol: pipe`. The worker would pipe plain
   // JSON to an ACP-speaking binary that rejects it and exits 0 empty, silently
-  // completing every job it takes. Fail loudly at hire time instead.
-  const hireMismatch = detectProtocolMismatch({ command, args: commandArgs, protocol });
+  // completing every job it takes. Fail loudly at hire time instead. Checked
+  // against the EFFECTIVE protocol (`effectiveHarnessProtocol`): a container
+  // sandbox runs pipe-only regardless of `--protocol`, so `--sandbox docker
+  // --command 'nano-coder --acp' --protocol acp` is the same empty-husk mismatch
+  // and must be rejected at hire time too — otherwise it persists cleanly here
+  // and only `work` refuses it later (thread 4118414685).
+  const hireEffectiveProtocol = effectiveHarnessProtocol(protocol, CONTAINER_SANDBOXES.has(sandbox));
+  const hireMismatch = detectProtocolMismatch({ command, args: commandArgs, protocol: hireEffectiveProtocol });
   if (hireMismatch) {
     logger.error(`Refusing to hire "${name || '(unnamed)'}": ${hireMismatch.reason}`);
     process.exit(1);

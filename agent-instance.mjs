@@ -243,9 +243,16 @@ export function describeSdkError(err) {
  * burning the remaining attempts against a dying lease. 5xx / network / timeout
  * failures are potentially transient and still retry. `null`/unknown statuses are
  * treated as transient (retry) — fail-safe toward recovery, not toward giving up.
+ *
+ * HTTP 429 (Too Many Requests) is the one 4xx that is NOT permanent: it is rate
+ * limiting, so a retry (after backoff) can succeed. This repository already treats
+ * 429 as non-lease-loss/transient elsewhere (supervisor.test.mjs), so classifying
+ * it as permanent here would give up after one attempt and strand the instance
+ * non-terminal instead of letting it recover.
  */
 export function isPermanentTerminalStatus(status) {
   const n = Number(status);
+  if (n === 429) return false;
   return Number.isFinite(n) && n >= 400 && n < 500;
 }
 

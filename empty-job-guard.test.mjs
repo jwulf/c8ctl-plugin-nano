@@ -84,7 +84,6 @@ test('detectEmptyAgentJob passes a run with ANY evidence of real work', () => {
   const base = { resultVars: {}, stdout: '', stderr: '', gitResult: null };
   assert.equal(detectEmptyAgentJob({ ...base, resultVars: { status: 'opened' } }), null, 'result vars');
   assert.equal(detectEmptyAgentJob({ ...base, stdout: 'did work' }), null, 'stdout output');
-  assert.equal(detectEmptyAgentJob({ ...base, stderr: 'a diagnostic' }), null, 'stderr output');
   assert.equal(detectEmptyAgentJob({ ...base, hasTurns: true }), null, 'transcript turns');
   assert.equal(detectEmptyAgentJob({ ...base, hasPlan: true }), null, 'a plan');
   assert.equal(detectEmptyAgentJob({ ...base, hasOutcome: true }), null, 'an ACP outcome');
@@ -98,6 +97,27 @@ test('detectEmptyAgentJob passes a run with ANY evidence of real work', () => {
     null,
     'a push is still work',
   );
+});
+
+test('detectEmptyAgentJob treats stderr-only diagnostics as NON-work (the husk signature)', () => {
+  // A protocol-mismatched harness (an ACP-mode binary fed a pipe payload) rejects
+  // stdin and prints an ACP parse error to stderr while producing nothing on
+  // stdout/result vars/transcript/git — the exact run this detector must fail.
+  // stderr is diagnostics, not evidence of work, so the guard must still flag it.
+  const acpParseErr = detectEmptyAgentJob({
+    resultVars: {},
+    stdout: '',
+    stderr: 'Error: failed to parse ACP message: unexpected token in JSON at position 0',
+    gitResult: null,
+    hasTurns: false,
+    hasPlan: false,
+    hasOutcome: false,
+  });
+  assert.ok(acpParseErr, 'an ACP parse error on stderr is not work — still an empty job');
+  assert.match(acpParseErr.reason, /produced nothing/);
+
+  const hit = detectEmptyAgentJob({ resultVars: {}, stdout: '', stderr: 'a diagnostic', gitResult: null });
+  assert.ok(hit, 'stderr-only output carries no work signal');
 });
 
 test('detectEmptyAgentJob treats whitespace-only output as empty', () => {
@@ -196,6 +216,8 @@ test('isPermanentTerminalStatus: 4xx is permanent, 5xx/timeout/unknown is transi
   assert.equal(isPermanentTerminalStatus(409), true);
   assert.equal(isPermanentTerminalStatus(422), true);
   assert.equal(isPermanentTerminalStatus(404), true);
+  assert.equal(isPermanentTerminalStatus(429), false, 'a 429 is rate limiting — transient, retried');
+  assert.equal(isPermanentTerminalStatus('429'), false, 'a numeric-string 429 is coerced and transient');
   assert.equal(isPermanentTerminalStatus(500), false, 'a 5xx is transient — retried');
   assert.equal(isPermanentTerminalStatus(503), false);
   assert.equal(isPermanentTerminalStatus(null), false, 'unknown is transient (fail-safe toward recovery)');

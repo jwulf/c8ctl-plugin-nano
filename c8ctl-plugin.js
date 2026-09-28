@@ -2847,11 +2847,15 @@ function pickAgentResult(...thunks) {
 // `hasTurns`/`hasPlan` attest the harness genuinely engaged (a real ACP session
 // emitted updates / a plan); `hasOutcome` attests the agent reported an explicit
 // ACP `_meta.outcome`. Any one of these means the run was real work, not a husk.
+// A non-empty `stderr` is deliberately NOT a work signal: the canonical husk (a
+// protocol-mismatched harness fed a pipe payload) prints an ACP parse error to
+// stderr while producing nothing on stdout/result vars/transcript/git, so treating
+// stderr diagnostics as evidence of work would let exactly the run this detector
+// exists to catch slip through. Only a POSITIVE stdout/result/ACP/git signal counts.
 // Pure + exported for tests; the caller folds the result into the settle path.
-function detectEmptyAgentJob({ resultVars, stdout, stderr, gitResult, hasTurns, hasPlan, hasOutcome } = {}) {
+function detectEmptyAgentJob({ resultVars, stdout, gitResult, hasTurns, hasPlan, hasOutcome } = {}) {
   if (hasEffectiveResultVars(resultVars)) return null;
   if (typeof stdout === 'string' && stdout.trim() !== '') return null;
-  if (typeof stderr === 'string' && stderr.trim() !== '') return null;
   if (hasTurns === true || hasPlan === true || hasOutcome === true) return null;
   if ((gitResult?.commits?.length ?? 0) > 0) return null;
   if (gitResult?.pushed === true) return null;
@@ -11387,7 +11391,6 @@ async function workAgent(req, flags, ctx) {
           const emptyJob = detectEmptyAgentJob({
             resultVars,
             stdout: result.stdout,
-            stderr: result.stderr,
             gitResult,
             hasTurns: agentInstanceProducer?.appendedTurns > 0,
             hasPlan: agentInstanceProducer?.sawPlan === true,

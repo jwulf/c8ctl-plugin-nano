@@ -11129,6 +11129,13 @@ async function workAgent(req, flags, ctx) {
         // try body, so an early throw is correctly reported as `error`.
         let runCompleted = false;
         let discardCheckpointOnAck = false;
+        // #282: settlement-scoped. The empty-job guard reads this AFTER the run
+        // try/finally below has closed, so it must be declared here — declaring it
+        // inside the try left it out of scope at the guard and threw a
+        // ReferenceError that dropped every successful job whose AgentInstance
+        // producer was unavailable (so `appendedTurns` was undefined and the `||`
+        // did not short-circuit). See the drainBounded call site for its meaning.
+        let preGuardDrainTimedOut = false;
         // #264: whether a TERMINAL WIP checkpoint decision (abort/failed flush, or the
         // success-path stop) was already taken on the normal control flow. If the run
         // throws before any of those (e.g. runAgentJob rejects), the finally below
@@ -11348,7 +11355,8 @@ async function workAgent(req, flags, ctx) {
           // in flight (they keep draining in the background); that is itself transcript
           // evidence — turns were produced but not yet confirmed — which the guard below
           // treats as non-empty via `preGuardDrainTimedOut` (thread 4118913008).
-          let preGuardDrainTimedOut = false;
+          // (#282: `preGuardDrainTimedOut` is declared at settlement scope above, not
+          // here — the empty-job guard reads it after this try/finally closes.)
           if (agentInstanceProducer) {
             try { preGuardDrainTimedOut = (await agentInstanceProducer.drainBounded()) === false; } catch (err) { logger.warn(`[${jobType}] AgentInstance producer drainBounded() threw (${aiCorr}) — ${oneLineLog(err?.message || err)}; job settlement unaffected.`); }
           }
@@ -11683,6 +11691,41 @@ async function workAgent(req, flags, ctx) {
           retries,
           variables: { [AGENT_RESULT_KEY]: resultEnvelope },
         });
+      } catch (err) {
+        // #282 (class fix): no settlement-path exception may leave a job UNSETTLED.
+        // The run try/finally above settles on every KNOWN path (complete, empty-job
+        // fail, non-zero-exit fail, and the pre-setup fail sheds). An UNEXPECTED throw
+        // anywhere in that settlement path (e.g. the preGuardDrainTimedOut
+        // ReferenceError this issue fixed) otherwise escaped this handler and surfaced
+        // only as the supervisor's `run failed — …` log (dispatch.ts), leaving the job
+        // to time out and re-activate forever — the work ran, but the job never
+        // settled. Catch it here and FAIL the job instead: retries are preserved (so
+        // it reactivates on a healthy worker) and the error surfaces as an incident
+        // once they exhaust, rather than the job silently looping.
+        //
+        // An ABORTED run (force-stop / lock-loss) must NOT be failed here: its lease
+        // is already being yielded/transferred, so return WITHOUT settling and let the
+        // force-stop yield win — exactly as the setup-abort gates above do.
+        if (abortSignal?.aborted === true) {
+          logger.warn(`[${jobType}] job ${job.jobKey} aborted mid-settlement — lease loss/force-stop won the race; stopping without a settle (the job is being yielded for retry).`);
+          return;
+        }
+        const retries = Math.max(0, (Number(job.retries) || 1) - 1);
+        const errMsg = err instanceof Error ? (err.stack || err.message) : String(err);
+        logger.error(`[${jobType}] job ${job.jobKey}: settlement-path error — failing job rather than leaving it unsettled (retries left ${retries}) — ${oneLineLog(errMsg)}`);
+        try {
+          return await settleJob.fail({
+            errorMessage: `agent "${profile.name}" settlement error: ${oneLineLog(err?.message || err)}`.slice(0, 2000),
+            retries,
+          });
+        } catch (settleErr) {
+          // The fail-settle itself rejected (e.g. the lease already lapsed and the
+          // broker reclaimed the job — a 409/404). There is nothing more this worker
+          // can do: log and return so the error does not propagate as a SECOND,
+          // masking failure. The job is then the broker's to re-deliver.
+          logger.error(`[${jobType}] job ${job.jobKey}: settlement-path fail also failed — job left for the broker to re-deliver — ${oneLineLog(settleErr?.message || settleErr)}`);
+          return;
+        }
       } finally {
         clearSettleInFlight(settleMark);
         recordJobEnd(job);

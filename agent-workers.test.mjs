@@ -4596,6 +4596,56 @@ test('provisionRepo pins GIT_AUTHOR_*/GIT_COMMITTER_* env so a placeholder autho
   }
 });
 
+test('provisionRepo points every git editor at a non-interactive no-op so editor-launching commands return at once (issue #283)', { skip: !gitOk }, () => {
+  const { root, origin } = makeOriginRepo();
+  const runDir = mkdtempSync(join(root, 'run-'));
+  try {
+    const envelope = {
+      schemaVersion: 1,
+      repository: { provider: 'github', url: origin, submodules: false },
+      branch: { base: 'main', create: 'feat/editor', push: false },
+      setup: { commands: [], env: {}, secretRefs: [] },
+      task: { allowPr: false },
+    };
+    const prov = provisionRepo({ envelope, token: null, runDir });
+    // The provisioned git env (the base the harness inherits) must pin every
+    // editor variable to a no-op so a headless agent run can never block on an
+    // editor. `true` is the POSIX builtin that exits 0 immediately.
+    assert.equal(prov.gitEnv.GIT_EDITOR, 'true');
+    assert.equal(prov.gitEnv.GIT_SEQUENCE_EDITOR, 'true');
+    assert.equal(prov.gitEnv.EDITOR, 'true');
+    assert.equal(prov.gitEnv.VISUAL, 'true');
+
+    // Behavioural: `git commit` WITHOUT -m would normally open $GIT_EDITOR and
+    // hang forever on a headless run. With the no-op editor it returns at once
+    // (git aborts the commit because the message buffer is left empty). Bound
+    // the wall time so a regression to a real editor would trip the timeout.
+    const env = { ...prov.gitEnv };
+    writeFileSync(join(prov.workspaceDir, 'C.txt'), 'z\n');
+    spawnSync('git', ['add', '-A'], { cwd: prov.workspaceDir, env, encoding: 'utf8' });
+    const started = Date.now();
+    const commit = spawnSync('git', ['commit'], { cwd: prov.workspaceDir, env, encoding: 'utf8', timeout: 15_000 });
+    const elapsed = Date.now() - started;
+    assert.ok(elapsed < 14_000, `commit without -m returned at once (${elapsed}ms), not after the editor timeout`);
+    assert.notEqual(commit.status, 0, 'an empty commit message aborts the commit (editor no-op left the buffer empty)');
+    assert.match(`${commit.stderr}${commit.stdout}`, /Aborting commit due to empty commit message|empty commit message/i);
+
+    // Behavioural: `git rebase -i` would normally open $GIT_SEQUENCE_EDITOR for
+    // the todo list. With the no-op sequence editor it applies the (unchanged)
+    // todo and returns at once instead of hanging. Add a second commit so the
+    // rebase has a real todo (HEAD~1 → the seed commit).
+    writeFileSync(join(prov.workspaceDir, 'D.txt'), 'w\n');
+    spawnSync('git', ['add', '-A'], { cwd: prov.workspaceDir, env, encoding: 'utf8' });
+    spawnSync('git', ['commit', '-q', '-m', 'second'], { cwd: prov.workspaceDir, env, encoding: 'utf8' });
+    const r1 = spawnSync('git', ['rebase', '-i', 'HEAD~1'], { cwd: prov.workspaceDir, env, encoding: 'utf8', timeout: 15_000 });
+    const elapsed2 = Date.now() - started;
+    assert.ok(elapsed2 < 29_000, `rebase -i returned at once (${elapsed2}ms cumulative), not after the editor timeout`);
+    assert.equal(r1.status, 0, `rebase -i over the unchanged todo succeeds (noop): ${r1.stderr || r1.stdout}`);
+  } finally {
+    rmSync(root, { recursive: true, force: true });
+  }
+});
+
 test('finalizeGit does not push when the harness produced no commits', { skip: !gitOk }, () => {
   const { root, origin } = makeOriginRepo();
   const runDir = mkdtempSync(join(root, 'run-'));

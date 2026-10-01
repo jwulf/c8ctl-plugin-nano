@@ -4949,6 +4949,20 @@ function provisionRepo({ envelope, token, runDir, runId, timeoutMs = 120_000, lo
     ...process.env,
     GIT_TERMINAL_PROMPT: '0',
     GIT_CONFIG_NOSYSTEM: '1',
+    // #283: an agent run is headless, so any git command that launches an
+    // editor would block until the tool timeout kills it (the run then ends
+    // with no result). Point every editor git might spawn at a non-interactive
+    // no-op so `commit` (no -m), `rebase -i`, `merge`/`revert` (no --no-edit)
+    // and `tag -a` (no -m) return at once instead of hanging. `true` is the
+    // POSIX shell builtin that exits 0 immediately; git treats the editor's
+    // exit status as success and proceeds with the on-disk (unchanged) buffer.
+    // Layered onto gitEnv so the harness inherits it (finalizeGit's rebase and
+    // the agent's own git commands both run with this env). An operator can
+    // still override per-run via profile/setup env — those layer on top.
+    GIT_EDITOR: 'true',
+    GIT_SEQUENCE_EDITOR: 'true',
+    EDITOR: 'true',
+    VISUAL: 'true',
   };
   // Drop any inherited askpass helpers so a no-token ("anonymous") clone can't
   // authenticate with host-provided credentials. We re-set GIT_ASKPASS below

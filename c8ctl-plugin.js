@@ -4956,9 +4956,10 @@ function provisionRepo({ envelope, token, runDir, runId, timeoutMs = 120_000, lo
     // and `tag -a` (no -m) return at once instead of hanging. `true` is the
     // POSIX shell builtin that exits 0 immediately; git treats the editor's
     // exit status as success and proceeds with the on-disk (unchanged) buffer.
-    // Layered onto gitEnv so the harness inherits it (finalizeGit's rebase and
-    // the agent's own git commands both run with this env). An operator can
-    // still override per-run via profile/setup env — those layer on top.
+    // Layered onto gitEnv, which the production runner hands to runAgentJob as
+    // the harness env's bottom layer (finalizeGit's rebase and the agent's own
+    // git commands both run with this env). An operator can still override
+    // per-run via profile/setup env — those layer on top of the git base.
     GIT_EDITOR: 'true',
     GIT_SEQUENCE_EDITOR: 'true',
     EDITOR: 'true',
@@ -8251,7 +8252,7 @@ function baseAgentEnv(profile, job) {
  * Both paths resolve to the same result contract.
  */
 function runAgentJob(profile, job, opts = {}) {
-  const { timeoutMs, idleTimeoutMs, recoveryWindowMs, envelope, sandbox = 'none', image, runId, secretEnv = {}, passThroughSecretNames = [], cwd, extraEnv = {}, profileEnv = {}, resultFile, stream = false, streamPrefix = '', onStreamOut, onStreamErr, args: commandArgs, terminal = 'pipe', protocol = 'pipe', permission = 'yolo', relaySession = null, ptyFactory, nudgePayload = null, onAcpUpdate = null, abortSignal = null, onSpawn = null, resumePlan = null } = opts;
+  const { timeoutMs, idleTimeoutMs, recoveryWindowMs, envelope, sandbox = 'none', image, runId, secretEnv = {}, passThroughSecretNames = [], cwd, extraEnv = {}, profileEnv = {}, gitEnv = null, resultFile, stream = false, streamPrefix = '', onStreamOut, onStreamErr, args: commandArgs, terminal = 'pipe', protocol = 'pipe', permission = 'yolo', relaySession = null, ptyFactory, nudgePayload = null, onAcpUpdate = null, abortSignal = null, onSpawn = null, resumePlan = null } = opts;
   // #110: `protocol`/`permission` drive the ACP executor branch below. The
   // pipe/PTY paths are unchanged, so `protocol === 'pipe'` behaviour is identical.
   // A `nudgePayload` (#678) carries the bespoke "re-emit your result" prompt for a
@@ -8272,6 +8273,21 @@ function runAgentJob(profile, job, opts = {}) {
   // (job-specific tuning wins over the profile default). Reserved AGENT_* and
   // resolved secrets are layered on top so user env can never shadow them.
   const staticEnv = { ...normalizeEnvMap(profileEnv), ...normalizeEnvMap(envelope?.setup?.env) };
+  // #283: the provisioning git env (non-interactive editor no-ops,
+  // GIT_TERMINAL_PROMPT=0, GIT_CONFIG_NOSYSTEM=1, …) is the harness env's
+  // BOTTOM layer above process.env — a headless agent's own `git commit` (no
+  // -m) / `git rebase -i` must never open a real editor and hang until the
+  // idle timeout. It sits UNDER staticEnv so an operator's profile/setup.env
+  // override still wins, and under secretEnv/agentEnv/extraEnv so reserved
+  // AGENT_* + the pinned commit identity can never be shadowed by it. The
+  // credential keys are stripped: GIT_ASKPASS/GIT_TOKEN name a worker-private
+  // helper file (and the clone token) that must not leak into the harness,
+  // and GIT_CONFIG_GLOBAL stays provisioning-scoped (the harness keeps the
+  // host's real global git config).
+  const gitBaseEnv = Object.fromEntries(
+    Object.entries(gitEnv || {})
+      .filter(([k]) => k !== 'GIT_ASKPASS' && k !== 'GIT_TOKEN' && k !== 'GIT_CONFIG_GLOBAL'),
+  );
 
   // C3 (#42): when a relay session is present, tap the harness terminal onto the
   // relay lane (framed + tagged with this job's jobKey) and accept steer-in. The
@@ -8310,7 +8326,7 @@ function runAgentJob(profile, job, opts = {}) {
     // (jwulf/c8ctl-plugin-nano#151): the parent's process-wide setDefaultResultOrder
     // can't reach the child, so its own Node runtime must read the flag at startup.
     // Merges (never clobbers) any inherited/operator NODE_OPTIONS.
-    const harnessEnv = withIpv4FirstNodeOptions({ ...process.env, ...staticEnv, ...secretEnv, ...agentEnv, ...extraEnv, ...resultEnv });
+    const harnessEnv = withIpv4FirstNodeOptions({ ...process.env, ...gitBaseEnv, ...staticEnv, ...secretEnv, ...agentEnv, ...extraEnv, ...resultEnv });
 
     // A role opted into ACP (`protocol: acp`) drives its harness over the Agent
     // Client Protocol (JSON-RPC 2.0 over stdio) instead of the stdin/scrape pipe
@@ -8426,7 +8442,7 @@ function runAgentJob(profile, job, opts = {}) {
   // any inherited/operator value. Forwarded by NAME like every other env so the
   // value stays out of argv/`docker inspect`; `-e NODE_OPTIONS` is added only when
   // it wasn't already forwarded via the static env above (avoid a duplicate flag).
-  const containerEnv = withIpv4FirstNodeOptions({ ...process.env, ...staticEnv, ...secretEnv, ...agentEnv, ...extraEnv, ...resultEnv });
+  const containerEnv = withIpv4FirstNodeOptions({ ...process.env, ...gitBaseEnv, ...staticEnv, ...secretEnv, ...agentEnv, ...extraEnv, ...resultEnv });
   if (!Object.prototype.hasOwnProperty.call(staticEnv, 'NODE_OPTIONS')) {
     envArgs.push('-e', 'NODE_OPTIONS');
   }
@@ -11256,6 +11272,12 @@ async function workAgent(req, flags, ctx) {
             cwd,
             extraEnv,
             profileEnv,
+            // #283: the provisioning git env — runAgentJob layers it UNDER
+            // profile/setup env (minus the credential keys) so the harness's
+            // own git commands get the non-interactive editor no-ops while an
+            // operator override still wins. Absent on the repo-less/container
+            // paths (no provisioning ran).
+            gitEnv: provisioned?.gitEnv ?? null,
             resultFile,
             stream,
             streamPrefix: `[${jobType} ${job.jobKey}] `,

@@ -4646,6 +4646,62 @@ test('provisionRepo points every git editor at a non-interactive no-op so editor
   }
 });
 
+test('runAgentJob (host) harness inherits the provisioning git editor no-ops via the production env composition (issue #283)', { skip: !gitOk || process.platform === 'win32' }, async () => {
+  // The finding behind the fix: provisioning pinned GIT_EDITOR et al. in
+  // `provisioned.gitEnv`, but the production runAgentJob call never handed
+  // that env to the harness — so the agent's own git commands inherited a
+  // real editor from process.env and hung. The production runner now passes
+  // `gitEnv: provisioned.gitEnv` and runAgentJob layers it UNDER
+  // profile/setup env. This test drives runAgentJob with that exact opt and
+  // asserts the editor no-ops reach a real harness — and that a setup.env
+  // override still wins (operators keep the last word).
+  const { root, origin } = makeOriginRepo();
+  const runDir = mkdtempSync(join(root, 'run-'));
+  try {
+    const envelope = {
+      schemaVersion: 1,
+      repository: { provider: 'github', url: origin, submodules: false },
+      branch: { base: 'main', create: 'feat/editor-harness', push: false },
+      setup: { commands: [], env: {}, secretRefs: [] },
+      task: { allowPr: false },
+    };
+    const prov = provisionRepo({ envelope, token: null, runDir });
+    const profile = { name: 'p', rank: 'senior', command: 'printf "%s|%s|%s|%s" "$GIT_EDITOR" "$GIT_SEQUENCE_EDITOR" "$EDITOR" "$VISUAL"', model: '', capabilities: [] };
+    const job = { jobKey: 'jk', type: 'senior', variables: {}, customHeaders: {} };
+    const result = await runAgentJob(profile, job, {
+      sandbox: 'none',
+      envelope,
+      cwd: prov.workspaceDir,
+      gitEnv: prov.gitEnv,
+      timeoutMs: 30_000,
+    });
+    assert.equal(result.ok, true, result.error || result.stderr);
+    assert.equal(result.stdout, 'true|true|true|true', 'the harness runs with the no-op editors from the provisioning gitEnv');
+
+    // Operator override: setup.env layers AFTER gitBaseEnv in harnessEnv
+    // ({ ...process.env, ...gitBaseEnv, ...staticEnv, ... }), so a deliberate
+    // per-run editor choice is never clobbered by the provisioning default.
+    const overrideEnvelope = {
+      schemaVersion: 1,
+      repository: { provider: 'github', url: origin, submodules: false },
+      branch: { base: 'main', create: 'feat/editor-harness', push: false },
+      setup: { commands: [], env: { GIT_EDITOR: 'nano' }, secretRefs: [] },
+      task: { allowPr: false },
+    };
+    const overridden = await runAgentJob(profile, job, {
+      sandbox: 'none',
+      envelope: overrideEnvelope,
+      cwd: prov.workspaceDir,
+      gitEnv: prov.gitEnv,
+      timeoutMs: 30_000,
+    });
+    assert.equal(overridden.ok, true, overridden.error || overridden.stderr);
+    assert.equal(overridden.stdout, 'nano|true|true|true', 'profileEnv/setup.env still override the provisioning default');
+  } finally {
+    rmSync(root, { recursive: true, force: true });
+  }
+});
+
 test('finalizeGit does not push when the harness produced no commits', { skip: !gitOk }, () => {
   const { root, origin } = makeOriginRepo();
   const runDir = mkdtempSync(join(root, 'run-'));

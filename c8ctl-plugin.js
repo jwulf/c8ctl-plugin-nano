@@ -4630,6 +4630,40 @@ function boundGitOutput(text, max = 500) {
 // (remote git output is repository-controlled — a log-spoofing/dilution vector).
 const oneLineLog = (v) => String(v ?? '').replace(/[\r\n\t\f\v\u0085\u2028\u2029]+/g, ' ');
 
+// #282 (class fix): settle the runner's OUTER catch — an unexpected throw anywhere
+// on the settlement path (e.g. the preGuardDrainTimedOut ReferenceError this issue
+// fixed) must FAIL the job rather than escape to the supervisor's `run failed` log
+// and leave the job to time out and re-activate forever. Extracted from the runner's
+// catch so the production behavior (abort → no settle; unexpected throw → settleJob.fail
+// with retries preserved; a rejected fallback fail → contained, left for the broker)
+// is exercised directly by tests (empty-job-guard.test.mjs) rather than only scanned
+// in source. Returns the settleJob.fail result on the fail path, and undefined when the
+// run was aborted or the fallback fail itself rejected (matching the runner's `return;`).
+async function settleRunError({ err, abortSignal, settleJob, profileName, jobType, jobKey, retries, logger }) {
+  // An ABORTED run (force-stop / lock-loss) must NOT be failed here: its lease is
+  // already being yielded/transferred, so return WITHOUT settling and let the
+  // force-stop yield win — exactly as the setup-abort gates do.
+  if (abortSignal?.aborted === true) {
+    logger.warn(`[${jobType}] job ${jobKey} aborted mid-settlement — lease loss/force-stop won the race; stopping without a settle (the job is being yielded for retry).`);
+    return undefined;
+  }
+  const errMsg = err instanceof Error ? (err.stack || err.message) : String(err);
+  logger.error(`[${jobType}] job ${jobKey}: settlement-path error — failing job rather than leaving it unsettled (retries left ${retries}) — ${oneLineLog(errMsg)}`);
+  try {
+    return await settleJob.fail({
+      errorMessage: `agent "${profileName}" settlement error: ${oneLineLog(err?.message || err)}`.slice(0, 2000),
+      retries,
+    });
+  } catch (settleErr) {
+    // The fail-settle itself rejected (e.g. the lease already lapsed and the broker
+    // reclaimed the job — a 409/404). There is nothing more this worker can do: log
+    // and return so the error does not propagate as a SECOND, masking failure. The
+    // job is then the broker's to re-deliver.
+    logger.error(`[${jobType}] job ${jobKey}: settlement-path fail also failed — job left for the broker to re-deliver — ${oneLineLog(settleErr?.message || settleErr)}`);
+    return undefined;
+  }
+}
+
 // Build an informative, token-redacted failure reason from a runGit result.
 // Two things the old `stderr || stdout`.slice(0,500) message threw away:
 //   1. On a timeout Node SIGTERM-kills git (status→128, signal='SIGTERM') — say
@@ -11129,6 +11163,13 @@ async function workAgent(req, flags, ctx) {
         // try body, so an early throw is correctly reported as `error`.
         let runCompleted = false;
         let discardCheckpointOnAck = false;
+        // #282: settlement-scoped. The empty-job guard reads this AFTER the run
+        // try/finally below has closed, so it must be declared here — declaring it
+        // inside the try left it out of scope at the guard and threw a
+        // ReferenceError that dropped every successful job whose AgentInstance
+        // producer was unavailable (so `appendedTurns` was undefined and the `||`
+        // did not short-circuit). See the drainBounded call site for its meaning.
+        let preGuardDrainTimedOut = false;
         // #264: whether a TERMINAL WIP checkpoint decision (abort/failed flush, or the
         // success-path stop) was already taken on the normal control flow. If the run
         // throws before any of those (e.g. runAgentJob rejects), the finally below
@@ -11348,7 +11389,8 @@ async function workAgent(req, flags, ctx) {
           // in flight (they keep draining in the background); that is itself transcript
           // evidence — turns were produced but not yet confirmed — which the guard below
           // treats as non-empty via `preGuardDrainTimedOut` (thread 4118913008).
-          let preGuardDrainTimedOut = false;
+          // (#282: `preGuardDrainTimedOut` is declared at settlement scope above, not
+          // here — the empty-job guard reads it after this try/finally closes.)
           if (agentInstanceProducer) {
             try { preGuardDrainTimedOut = (await agentInstanceProducer.drainBounded()) === false; } catch (err) { logger.warn(`[${jobType}] AgentInstance producer drainBounded() threw (${aiCorr}) — ${oneLineLog(err?.message || err)}; job settlement unaffected.`); }
           }
@@ -11682,6 +11724,23 @@ async function workAgent(req, flags, ctx) {
           errorMessage: `agent "${profile.name}" failed: ${detail}`.slice(0, 2000),
           retries,
           variables: { [AGENT_RESULT_KEY]: resultEnvelope },
+        });
+      } catch (err) {
+        // #282 (class fix): no settlement-path exception may leave a job UNSETTLED.
+        // The run try/finally above settles on every KNOWN path (complete, empty-job
+        // fail, non-zero-exit fail, and the pre-setup fail sheds). An UNEXPECTED throw
+        // anywhere in that settlement path (e.g. the preGuardDrainTimedOut
+        // ReferenceError this issue fixed) otherwise escaped this handler and surfaced
+        // only as the supervisor's `run failed — …` log (dispatch.ts), leaving the job
+        // to time out and re-activate forever — the work ran, but the job never
+        // settled. Delegate to settleRunError: it FAILS the job instead (retries
+        // preserved, so it reactivates on a healthy worker), returns WITHOUT settling
+        // on an abort (force-stop/lock-loss is yielding the lease), and contains a
+        // rejected fallback fail. Extracted so this behavior is tested directly.
+        const retries = Math.max(0, (Number(job.retries) || 1) - 1);
+        return await settleRunError({
+          err, abortSignal, settleJob, profileName: profile.name,
+          jobType, jobKey: job.jobKey, retries, logger,
         });
       } finally {
         clearSettleInFlight(settleMark);
@@ -17694,6 +17753,7 @@ export {
 export { compareSemver, githubRepoSlug, filterReleasesSince, renderReleaseBody };
 export { probeAgentCliVersion };
 export { HARNESS_PROTOCOL_VERSION, buildAgenticCapability };
+export { settleRunError };
 export {
   webConsoleUrl,
   consoleLinkLabel,

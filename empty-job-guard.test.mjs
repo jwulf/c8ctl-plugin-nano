@@ -26,6 +26,7 @@ import {
   hireWorker,
   buildResultEnvelope,
   sanitizeResultVars,
+  settleRunError,
   AGENT_RESULT_KEY,
 } from './c8ctl-plugin.js';
 import { isPermanentTerminalStatus } from './agent-instance.mjs';
@@ -557,7 +558,99 @@ test('#282: preGuardDrainTimedOut is hoisted to settlement scope and settlement 
   );
   assert.match(
     src,
-    /settleJob\.fail\(\{\s*errorMessage:\s*`agent "\$\{profile\.name\}" settlement error:/,
-    'the settlement-path catch must route through settleJob.fail',
+    /settleJob\.fail\(\{\s*errorMessage:\s*`agent "\$\{profileName\}" settlement error:/,
+    'the settlement-path handler must route through settleJob.fail',
   );
+  // The runner's outer catch must DELEGATE to the extracted, directly-tested helper
+  // (settleRunError) rather than re-implement the settle inline — that is what lets
+  // the behavioral tests below exercise the real production code path.
+  assert.match(
+    src,
+    /return await settleRunError\(\{/,
+    'the runner catch must delegate to settleRunError',
+  );
+});
+
+// --- #282: behavioral coverage of the production settlement-path handler ----
+// Thread r4161434267: the source guard above pins the hoisted scope + the catch's
+// shape, but only the EXTRACTED settleRunError exercises the real catch behavior —
+// an unexpected throw invokes `fail`, an aborted signal does NOT settle, and a
+// rejected fallback `fail` is contained. These drive the production function.
+
+function fakeSettleJob() {
+  const calls = { fail: [] };
+  return {
+    calls,
+    fail: async (opts) => { calls.fail.push(opts); return { settled: 'failed', ...opts }; },
+    complete: async () => { throw new Error('complete must not be called on the error path'); },
+  };
+}
+
+function captureLogger() {
+  return {
+    info: (m) => logs.info.push(String(m)),
+    warn: (m) => logs.warn.push(String(m)),
+    error: (m) => logs.error.push(String(m)),
+  };
+}
+
+test('#282: an unexpected settlement throw FAILS the job (retries preserved) via settleJob.fail', async () => {
+  resetLogs();
+  const settleJob = fakeSettleJob();
+  const out = await settleRunError({
+    err: new ReferenceError('preGuardDrainTimedOut is not defined'),
+    abortSignal: { aborted: false },
+    settleJob,
+    profileName: 'copilot',
+    jobType: 'senior:pr-review',
+    jobKey: '160516',
+    retries: 2,
+    logger: captureLogger(),
+  });
+  assert.equal(settleJob.calls.fail.length, 1, 'the unexpected throw must route through settleJob.fail exactly once');
+  assert.equal(settleJob.calls.fail[0].retries, 2, 'retries must be preserved so the job reactivates');
+  assert.match(settleJob.calls.fail[0].errorMessage, /settlement error:/, 'the fail message identifies the settlement-path error');
+  assert.match(settleJob.calls.fail[0].errorMessage, /^agent "copilot"/, 'the fail message names the profile');
+  assert.equal(out.settled, 'failed', 'the handler returns the settleJob.fail result on the fail path');
+});
+
+test('#282: an ABORTED run does NOT settle (lease is being yielded/transferred)', async () => {
+  resetLogs();
+  const settleJob = fakeSettleJob();
+  const out = await settleRunError({
+    err: new Error('boom'),
+    abortSignal: { aborted: true },
+    settleJob,
+    profileName: 'copilot',
+    jobType: 'senior:pr-review',
+    jobKey: '160516',
+    retries: 2,
+    logger: captureLogger(),
+  });
+  assert.equal(settleJob.calls.fail.length, 0, 'an aborted run must NOT call settleJob.fail — the force-stop yield wins the race');
+  assert.equal(out, undefined, 'the aborted path returns without a settle (matches the runner `return;`)');
+});
+
+test('#282: a rejected fallback settleJob.fail is CONTAINED (job left for the broker, no second throw)', async () => {
+  resetLogs();
+  const rejectingSettleJob = {
+    calls: { fail: [] },
+    fail: async (opts) => { rejectingSettleJob.calls.fail.push(opts); throw new Error('409 lease already lapsed'); },
+    complete: async () => { throw new Error('unused'); },
+  };
+  let out;
+  await assert.doesNotReject(async () => {
+    out = await settleRunError({
+      err: new Error('boom'),
+      abortSignal: { aborted: false },
+      settleJob: rejectingSettleJob,
+      profileName: 'copilot',
+      jobType: 'senior:pr-review',
+      jobKey: '160516',
+      retries: 1,
+      logger: captureLogger(),
+    });
+  }, 'a rejected fallback fail must be contained, not propagate a second masking failure');
+  assert.equal(rejectingSettleJob.calls.fail.length, 1, 'the fallback fail was attempted once');
+  assert.equal(out, undefined, 'a contained fallback failure returns without re-throwing (job is the broker\'s to re-deliver)');
 });

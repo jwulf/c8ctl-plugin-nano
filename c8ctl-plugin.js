@@ -2706,17 +2706,24 @@ const AGENT_RESULT_FILE_ENV = 'AGENT_RESULT_FILE';
 // would block until the tool timeout kills the run (which then ends with no
 // result). Point every editor git might spawn at a non-interactive no-op so
 // `commit` (no -m), `rebase -i`, `merge`/`revert` (no --no-edit) and `tag -a`
-// (no -m) return at once instead of hanging. `true` is the POSIX builtin that
-// exits 0 immediately; git treats the editor's success exit as "proceed with
-// the on-disk (unchanged) buffer". This is the SINGLE source of truth, applied
+// (no -m) return at once instead of hanging. The no-op value is `:` — the POSIX
+// shell builtin that exits 0 immediately — NOT `true`. Git special-cases `:` to
+// force its SHELL path (it never tries to exec `:` directly), so the editor runs
+// as a shell builtin and needs NO executable on PATH. That keeps the no-op
+// working on supported Windows host runs and in minimal environments where a
+// standalone `true` executable may be absent (a bare `true` could otherwise fail
+// with "cannot run true" when git does not route a single-word editor value
+// through a shell). Git treats the editor's success exit as "proceed with the
+// on-disk (unchanged) buffer". This is the SINGLE source of truth, applied
 // unconditionally at the runAgentJob boundary for EVERY job (repo-provisioned
 // or not) and also folded into provisioning's gitEnv so finalizeGit's own
 // rebase inherits it.
+const EDITOR_NOOP_VALUE = ':';
 const EDITOR_NOOP_ENV = Object.freeze({
-  GIT_EDITOR: 'true',
-  GIT_SEQUENCE_EDITOR: 'true',
-  EDITOR: 'true',
-  VISUAL: 'true',
+  GIT_EDITOR: EDITOR_NOOP_VALUE,
+  GIT_SEQUENCE_EDITOR: EDITOR_NOOP_VALUE,
+  EDITOR: EDITOR_NOOP_VALUE,
+  VISUAL: EDITOR_NOOP_VALUE,
 });
 const RESULT_SENTINEL = '::nano:result::';
 // Completion keys the harness owns — an agent's returned result can never
@@ -4966,7 +4973,7 @@ function provisionRepo({ envelope, token, runDir, runId, timeoutMs = 120_000, lo
     GIT_TERMINAL_PROMPT: '0',
     GIT_CONFIG_NOSYSTEM: '1',
     // #283: the headless editor no-ops (GIT_EDITOR/GIT_SEQUENCE_EDITOR/EDITOR/
-    // VISUAL = `true`). Single source of truth is EDITOR_NOOP_ENV; runAgentJob
+    // VISUAL = `:`). Single source of truth is EDITOR_NOOP_ENV; runAgentJob
     // also applies it unconditionally at its boundary so repo-less host jobs and
     // container jobs get it too. Keeping a copy here means finalizeGit's own
     // rebase (which runs with this gitEnv) stays non-interactive, and an operator
@@ -17901,6 +17908,8 @@ export {
   RESULT_SENTINEL,
   RESERVED_RESULT_KEYS,
   SANDBOXES,
+  EDITOR_NOOP_ENV,
+  EDITOR_NOOP_VALUE,
 };
 export {
   reconstructWorkArgs,

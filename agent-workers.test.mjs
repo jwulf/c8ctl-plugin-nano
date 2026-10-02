@@ -93,6 +93,8 @@ import {
   RESULT_SENTINEL,
   RESERVED_RESULT_KEYS,
   SANDBOXES,
+  EDITOR_NOOP_ENV,
+  EDITOR_NOOP_VALUE,
 } from './c8ctl-plugin.js';
 
 test('coerceBool handles strings, bools, and defaults', () => {
@@ -4593,6 +4595,194 @@ test('provisionRepo pins GIT_AUTHOR_*/GIT_COMMITTER_* env so a placeholder autho
     if (savedCName === undefined) delete process.env.GIT_COMMITTER_NAME; else process.env.GIT_COMMITTER_NAME = savedCName;
     if (savedCEmail === undefined) delete process.env.GIT_COMMITTER_EMAIL; else process.env.GIT_COMMITTER_EMAIL = savedCEmail;
     rmSync(root, { recursive: true, force: true });
+  }
+});
+
+test('provisionRepo points every git editor at a non-interactive no-op so editor-launching commands return at once (issue #283)', { skip: !gitOk }, () => {
+  const { root, origin } = makeOriginRepo();
+  const runDir = mkdtempSync(join(root, 'run-'));
+  try {
+    const envelope = {
+      schemaVersion: 1,
+      repository: { provider: 'github', url: origin, submodules: false },
+      branch: { base: 'main', create: 'feat/editor', push: false },
+      setup: { commands: [], env: {}, secretRefs: [] },
+      task: { allowPr: false },
+    };
+    const prov = provisionRepo({ envelope, token: null, runDir });
+    // The provisioned git env (the base the harness inherits) must pin every
+    // editor variable to a no-op so a headless agent run can never block on an
+    // editor. The no-op is `:`. Git's editor launcher (launch_specified_editor
+    // in editor.c) special-cases the exact value `:` — `strcmp(editor, ":")` is
+    // 0, so it skips launching any child process or shell and accepts the
+    // on-disk (unchanged) buffer. No process is spawned, so unlike a bare
+    // `true` it needs NO executable on PATH and NO shell, staying a working
+    // no-op on Windows hosts and minimal environments (issue #283, thread
+    // r4161790471).
+    assert.equal(prov.gitEnv.GIT_EDITOR, ':');
+    assert.equal(prov.gitEnv.GIT_SEQUENCE_EDITOR, ':');
+    assert.equal(prov.gitEnv.EDITOR, ':');
+    assert.equal(prov.gitEnv.VISUAL, ':');
+
+    // Behavioural: `git commit` WITHOUT -m would normally open $GIT_EDITOR and
+    // hang forever on a headless run. With the no-op editor it returns at once
+    // (git aborts the commit because the message buffer is left empty). Bound
+    // the wall time so a regression to a real editor would trip the timeout.
+    const env = { ...prov.gitEnv };
+    writeFileSync(join(prov.workspaceDir, 'C.txt'), 'z\n');
+    spawnSync('git', ['add', '-A'], { cwd: prov.workspaceDir, env, encoding: 'utf8' });
+    const started = Date.now();
+    const commit = spawnSync('git', ['commit'], { cwd: prov.workspaceDir, env, encoding: 'utf8', timeout: 15_000 });
+    const elapsed = Date.now() - started;
+    assert.ok(elapsed < 14_000, `commit without -m returned at once (${elapsed}ms), not after the editor timeout`);
+    assert.notEqual(commit.status, 0, 'an empty commit message aborts the commit (editor no-op left the buffer empty)');
+    assert.match(`${commit.stderr}${commit.stdout}`, /Aborting commit due to empty commit message|empty commit message/i);
+
+    // Behavioural: `git rebase -i` would normally open $GIT_SEQUENCE_EDITOR for
+    // the todo list. With the no-op sequence editor it applies the (unchanged)
+    // todo and returns at once instead of hanging. Add a second commit so the
+    // rebase has a real todo (HEAD~1 → the seed commit).
+    writeFileSync(join(prov.workspaceDir, 'D.txt'), 'w\n');
+    spawnSync('git', ['add', '-A'], { cwd: prov.workspaceDir, env, encoding: 'utf8' });
+    spawnSync('git', ['commit', '-q', '-m', 'second'], { cwd: prov.workspaceDir, env, encoding: 'utf8' });
+    const r1 = spawnSync('git', ['rebase', '-i', 'HEAD~1'], { cwd: prov.workspaceDir, env, encoding: 'utf8', timeout: 15_000 });
+    const elapsed2 = Date.now() - started;
+    assert.ok(elapsed2 < 29_000, `rebase -i returned at once (${elapsed2}ms cumulative), not after the editor timeout`);
+    assert.equal(r1.status, 0, `rebase -i over the unchanged todo succeeds (noop): ${r1.stderr || r1.stdout}`);
+  } finally {
+    rmSync(root, { recursive: true, force: true });
+  }
+});
+
+test('the editor no-op value is `:` (git special-cases it to skip launching any editor process; no executable or shell needed) (issue #283)', { skip: !gitOk }, () => {
+  // Thread r4161790471: a bare `true` is only a shell builtin/utility, and git
+  // does NOT necessarily invoke a single-word editor value through a shell — on
+  // Windows hosts and minimal environments without a `true` executable on PATH,
+  // git can fail with "cannot run true" instead of running a successful no-op.
+  // The fix value `:` works because git's editor launcher (launch_specified_editor
+  // in editor.c) special-cases the exact value `:`: `strcmp(editor, ":")` is 0, so
+  // it skips launching any child process or shell and accepts the on-disk
+  // (unchanged) buffer. No process is spawned, so the no-op needs NO executable
+  // and NO shell at all. Pin the value and prove it behaves as a no-op for both
+  // editor-launching commands. This test is platform-AGNOSTIC (no win32 skip): it
+  // spawns only git, never a POSIX-only harness, so it provides the Windows
+  // coverage the runAgentJob printf-harness tests cannot.
+  assert.equal(EDITOR_NOOP_VALUE, ':', 'the single source of truth is the git-special-cased `:`, not `true`');
+  for (const k of ['GIT_EDITOR', 'GIT_SEQUENCE_EDITOR', 'EDITOR', 'VISUAL']) {
+    assert.equal(EDITOR_NOOP_ENV[k], ':', `${k} uses the cross-platform no-op`);
+  }
+
+  // Behavioural, on whatever host runs this test (Windows included): with the
+  // no-op editors, `git rebase -i` must apply the unchanged todo and `git
+  // commit` (no -m) must abort on the empty buffer — both returning at once,
+  // never hanging on an editor and never failing "cannot run <editor>".
+  const root = mkdtempSync(join(tmpdir(), 'nano-noop-editor-'));
+  try {
+    const env = { ...process.env, GIT_CONFIG_NOSYSTEM: '1', ...EDITOR_NOOP_ENV };
+    const gg = (args) => spawnSync('git', args, { cwd: root, env, encoding: 'utf8', timeout: 15_000 });
+    gg(['init', '-q']);
+    gg(['config', 'user.name', 't']);
+    gg(['config', 'user.email', 't@example.com']);
+    writeFileSync(join(root, 'a.txt'), 'a\n');
+    gg(['add', '-A']);
+    gg(['commit', '-q', '-m', 'seed']);
+    writeFileSync(join(root, 'b.txt'), 'b\n');
+    gg(['add', '-A']);
+    gg(['commit', '-q', '-m', 'second']);
+
+    const rebase = gg(['rebase', '-i', 'HEAD~1']);
+    assert.equal(rebase.status, 0, `rebase -i over the unchanged todo succeeds via the \`:\` no-op: ${rebase.stderr || rebase.stdout}`);
+    assert.doesNotMatch(`${rebase.stderr}${rebase.stdout}`, /cannot run/i, 'git did not fail to launch the editor');
+
+    writeFileSync(join(root, 'c.txt'), 'c\n');
+    gg(['add', '-A']);
+    const commit = gg(['commit']); // no -m: opens $GIT_EDITOR, which `:` no-ops
+    assert.notEqual(commit.status, 0, 'an empty commit message aborts the commit (editor no-op left the buffer empty)');
+    assert.match(`${commit.stderr}${commit.stdout}`, /empty commit message/i);
+    assert.doesNotMatch(`${commit.stderr}${commit.stdout}`, /cannot run/i, 'git did not fail to launch the editor');
+  } finally {
+    rmSync(root, { recursive: true, force: true });
+  }
+});
+
+test('runAgentJob (host) harness inherits the provisioning git editor no-ops via the production env composition (issue #283)', { skip: !gitOk || process.platform === 'win32' }, async () => {
+  // The finding behind the fix: provisioning pinned GIT_EDITOR et al. in
+  // `provisioned.gitEnv`, but the production runAgentJob call never handed
+  // that env to the harness — so the agent's own git commands inherited a
+  // real editor from process.env and hung. The production runner now passes
+  // `gitEnv: provisioned.gitEnv` and runAgentJob layers it UNDER
+  // profile/setup env. This test drives runAgentJob with that exact opt and
+  // asserts the editor no-ops reach a real harness — and that a setup.env
+  // override still wins (operators keep the last word).
+  const { root, origin } = makeOriginRepo();
+  const runDir = mkdtempSync(join(root, 'run-'));
+  try {
+    const envelope = {
+      schemaVersion: 1,
+      repository: { provider: 'github', url: origin, submodules: false },
+      branch: { base: 'main', create: 'feat/editor-harness', push: false },
+      setup: { commands: [], env: {}, secretRefs: [] },
+      task: { allowPr: false },
+    };
+    const prov = provisionRepo({ envelope, token: null, runDir });
+    const profile = { name: 'p', rank: 'senior', command: 'printf "%s|%s|%s|%s" "$GIT_EDITOR" "$GIT_SEQUENCE_EDITOR" "$EDITOR" "$VISUAL"', model: '', capabilities: [] };
+    const job = { jobKey: 'jk', type: 'senior', variables: {}, customHeaders: {} };
+    const result = await runAgentJob(profile, job, {
+      sandbox: 'none',
+      envelope,
+      cwd: prov.workspaceDir,
+      gitEnv: prov.gitEnv,
+      timeoutMs: 30_000,
+    });
+    assert.equal(result.ok, true, result.error || result.stderr);
+    assert.equal(result.stdout, ':|:|:|:', 'the harness runs with the no-op editors from the provisioning gitEnv');
+
+    // Operator override: setup.env layers AFTER gitBaseEnv in harnessEnv
+    // ({ ...process.env, ...gitBaseEnv, ...staticEnv, ... }), so a deliberate
+    // per-run editor choice is never clobbered by the provisioning default.
+    const overrideEnvelope = {
+      schemaVersion: 1,
+      repository: { provider: 'github', url: origin, submodules: false },
+      branch: { base: 'main', create: 'feat/editor-harness', push: false },
+      setup: { commands: [], env: { GIT_EDITOR: 'nano' }, secretRefs: [] },
+      task: { allowPr: false },
+    };
+    const overridden = await runAgentJob(profile, job, {
+      sandbox: 'none',
+      envelope: overrideEnvelope,
+      cwd: prov.workspaceDir,
+      gitEnv: prov.gitEnv,
+      timeoutMs: 30_000,
+    });
+    assert.equal(overridden.ok, true, overridden.error || overridden.stderr);
+    assert.equal(overridden.stdout, 'nano|:|:|:', 'profileEnv/setup.env still override the provisioning default');
+  } finally {
+    rmSync(root, { recursive: true, force: true });
+  }
+});
+
+test('runAgentJob (host) applies the editor no-ops even for a repo-less job with no gitEnv (issue #283)', { skip: process.platform === 'win32' }, async () => {
+  // Follow-up finding: `provisioned` is null for repo-less host jobs (and all
+  // container jobs), so passing `gitEnv: provisioned.gitEnv` leaves gitEnv null
+  // and — before the fix — the harness inherited a real editor from process.env.
+  // An agent that runs its own `git init`/`clone` then `commit`/`rebase -i`
+  // would still hang. runAgentJob now applies EDITOR_NOOP_ENV unconditionally at
+  // its boundary, so the no-ops reach the harness with NO gitEnv at all. Pin a
+  // real editor in the child's inherited env to prove the boundary default wins.
+  const profile = { name: 'p', rank: 'senior', command: 'printf "%s|%s|%s|%s" "$GIT_EDITOR" "$GIT_SEQUENCE_EDITOR" "$EDITOR" "$VISUAL"', model: '', capabilities: [] };
+  const job = { jobKey: 'jk', type: 'senior', variables: {}, customHeaders: {} };
+  const prevEditor = process.env.GIT_EDITOR;
+  process.env.GIT_EDITOR = 'vim';
+  try {
+    const result = await runAgentJob(profile, job, {
+      sandbox: 'none',
+      envelope: { schemaVersion: 1, setup: { commands: [], env: {}, secretRefs: [] }, task: {} },
+      timeoutMs: 30_000,
+    });
+    assert.equal(result.ok, true, result.error || result.stderr);
+    assert.equal(result.stdout, ':|:|:|:', 'the editor no-ops reach a repo-less harness even with gitEnv null and a real editor inherited from process.env');
+  } finally {
+    if (prevEditor === undefined) delete process.env.GIT_EDITOR; else process.env.GIT_EDITOR = prevEditor;
   }
 });
 

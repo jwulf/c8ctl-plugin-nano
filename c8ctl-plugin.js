@@ -2706,15 +2706,16 @@ const AGENT_RESULT_FILE_ENV = 'AGENT_RESULT_FILE';
 // would block until the tool timeout kills the run (which then ends with no
 // result). Point every editor git might spawn at a non-interactive no-op so
 // `commit` (no -m), `rebase -i`, `merge`/`revert` (no --no-edit) and `tag -a`
-// (no -m) return at once instead of hanging. The no-op value is `:` — the POSIX
-// shell builtin that exits 0 immediately — NOT `true`. Git special-cases `:` to
-// force its SHELL path (it never tries to exec `:` directly), so the editor runs
-// as a shell builtin and needs NO executable on PATH. That keeps the no-op
-// working on supported Windows host runs and in minimal environments where a
-// standalone `true` executable may be absent (a bare `true` could otherwise fail
-// with "cannot run true" when git does not route a single-word editor value
-// through a shell). Git treats the editor's success exit as "proceed with the
-// on-disk (unchanged) buffer". This is the SINGLE source of truth, applied
+// (no -m) return at once instead of hanging. The no-op value is `:` — NOT
+// `true`. Git's editor launcher (launch_specified_editor in editor.c)
+// special-cases the exact value `:`: `strcmp(editor, ":")` is 0, so it skips
+// launching any child process or shell altogether and treats the on-disk
+// (unchanged) buffer as accepted. Because no process is spawned, the no-op
+// needs NO executable on PATH and NO shell — which is what keeps it working on
+// supported Windows host runs and in minimal environments where a standalone
+// `true` executable may be absent (a bare `true` relies on git exec'ing or
+// shelling out to a real `true` binary, and can fail with "cannot run true"
+// where that binary is missing). This is the SINGLE source of truth, applied
 // unconditionally at the runAgentJob boundary for EVERY job (repo-provisioned
 // or not) and also folded into provisioning's gitEnv so finalizeGit's own
 // rebase inherits it.

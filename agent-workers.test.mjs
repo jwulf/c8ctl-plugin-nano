@@ -4612,9 +4612,11 @@ test('provisionRepo points every git editor at a non-interactive no-op so editor
     const prov = provisionRepo({ envelope, token: null, runDir });
     // The provisioned git env (the base the harness inherits) must pin every
     // editor variable to a no-op so a headless agent run can never block on an
-    // editor. The no-op is `:` — the POSIX shell builtin that exits 0 immediately.
-    // Git special-cases `:` to force its SHELL path (it never execs `:` directly),
-    // so unlike a bare `true` it needs NO executable on PATH and stays a working
+    // editor. The no-op is `:`. Git's editor launcher (launch_specified_editor
+    // in editor.c) special-cases the exact value `:` — `strcmp(editor, ":")` is
+    // 0, so it skips launching any child process or shell and accepts the
+    // on-disk (unchanged) buffer. No process is spawned, so unlike a bare
+    // `true` it needs NO executable on PATH and NO shell, staying a working
     // no-op on Windows hosts and minimal environments (issue #283, thread
     // r4161790471).
     assert.equal(prov.gitEnv.GIT_EDITOR, ':');
@@ -4652,18 +4654,20 @@ test('provisionRepo points every git editor at a non-interactive no-op so editor
   }
 });
 
-test('the editor no-op value is the cross-platform shell builtin `:` (forces git shell path; no executable needed) (issue #283)', { skip: !gitOk }, () => {
+test('the editor no-op value is `:` (git special-cases it to skip launching any editor process; no executable or shell needed) (issue #283)', { skip: !gitOk }, () => {
   // Thread r4161790471: a bare `true` is only a shell builtin/utility, and git
   // does NOT necessarily invoke a single-word editor value through a shell — on
   // Windows hosts and minimal environments without a `true` executable on PATH,
   // git can fail with "cannot run true" instead of running a successful no-op.
-  // Git special-cases `:` to force its SHELL path (it never execs `:` directly),
-  // so `:` runs as a shell builtin and needs NO executable at all. Pin the value
-  // and prove it behaves as a no-op for both editor-launching commands. This
-  // test is platform-AGNOSTIC (no win32 skip): it spawns only git, never a
-  // POSIX-only harness, so it provides the Windows coverage the runAgentJob
-  // printf-harness tests cannot.
-  assert.equal(EDITOR_NOOP_VALUE, ':', 'the single source of truth is the shell builtin, not `true`');
+  // The fix value `:` works because git's editor launcher (launch_specified_editor
+  // in editor.c) special-cases the exact value `:`: `strcmp(editor, ":")` is 0, so
+  // it skips launching any child process or shell and accepts the on-disk
+  // (unchanged) buffer. No process is spawned, so the no-op needs NO executable
+  // and NO shell at all. Pin the value and prove it behaves as a no-op for both
+  // editor-launching commands. This test is platform-AGNOSTIC (no win32 skip): it
+  // spawns only git, never a POSIX-only harness, so it provides the Windows
+  // coverage the runAgentJob printf-harness tests cannot.
+  assert.equal(EDITOR_NOOP_VALUE, ':', 'the single source of truth is the git-special-cased `:`, not `true`');
   for (const k of ['GIT_EDITOR', 'GIT_SEQUENCE_EDITOR', 'EDITOR', 'VISUAL']) {
     assert.equal(EDITOR_NOOP_ENV[k], ':', `${k} uses the cross-platform no-op`);
   }

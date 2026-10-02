@@ -4702,6 +4702,31 @@ test('runAgentJob (host) harness inherits the provisioning git editor no-ops via
   }
 });
 
+test('runAgentJob (host) applies the editor no-ops even for a repo-less job with no gitEnv (issue #283)', { skip: process.platform === 'win32' }, async () => {
+  // Follow-up finding: `provisioned` is null for repo-less host jobs (and all
+  // container jobs), so passing `gitEnv: provisioned.gitEnv` leaves gitEnv null
+  // and — before the fix — the harness inherited a real editor from process.env.
+  // An agent that runs its own `git init`/`clone` then `commit`/`rebase -i`
+  // would still hang. runAgentJob now applies EDITOR_NOOP_ENV unconditionally at
+  // its boundary, so the no-ops reach the harness with NO gitEnv at all. Pin a
+  // real editor in the child's inherited env to prove the boundary default wins.
+  const profile = { name: 'p', rank: 'senior', command: 'printf "%s|%s|%s|%s" "$GIT_EDITOR" "$GIT_SEQUENCE_EDITOR" "$EDITOR" "$VISUAL"', model: '', capabilities: [] };
+  const job = { jobKey: 'jk', type: 'senior', variables: {}, customHeaders: {} };
+  const prevEditor = process.env.GIT_EDITOR;
+  process.env.GIT_EDITOR = 'vim';
+  try {
+    const result = await runAgentJob(profile, job, {
+      sandbox: 'none',
+      envelope: { schemaVersion: 1, setup: { commands: [], env: {}, secretRefs: [] }, task: {} },
+      timeoutMs: 30_000,
+    });
+    assert.equal(result.ok, true, result.error || result.stderr);
+    assert.equal(result.stdout, 'true|true|true|true', 'the editor no-ops reach a repo-less harness even with gitEnv null and a real editor inherited from process.env');
+  } finally {
+    if (prevEditor === undefined) delete process.env.GIT_EDITOR; else process.env.GIT_EDITOR = prevEditor;
+  }
+});
+
 test('finalizeGit does not push when the harness produced no commits', { skip: !gitOk }, () => {
   const { root, origin } = makeOriginRepo();
   const runDir = mkdtempSync(join(root, 'run-'));

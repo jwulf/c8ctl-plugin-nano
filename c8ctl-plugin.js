@@ -2702,6 +2702,22 @@ function buildAgenticCapability(profile, host = hostname()) {
 // that cannot write the file. The harness stays app-agnostic: it merges whatever
 // object the agent returns; the *app's prompt* owns the field vocabulary.
 const AGENT_RESULT_FILE_ENV = 'AGENT_RESULT_FILE';
+// #283: an agent run is headless, so any git command that launches an editor
+// would block until the tool timeout kills the run (which then ends with no
+// result). Point every editor git might spawn at a non-interactive no-op so
+// `commit` (no -m), `rebase -i`, `merge`/`revert` (no --no-edit) and `tag -a`
+// (no -m) return at once instead of hanging. `true` is the POSIX builtin that
+// exits 0 immediately; git treats the editor's success exit as "proceed with
+// the on-disk (unchanged) buffer". This is the SINGLE source of truth, applied
+// unconditionally at the runAgentJob boundary for EVERY job (repo-provisioned
+// or not) and also folded into provisioning's gitEnv so finalizeGit's own
+// rebase inherits it.
+const EDITOR_NOOP_ENV = Object.freeze({
+  GIT_EDITOR: 'true',
+  GIT_SEQUENCE_EDITOR: 'true',
+  EDITOR: 'true',
+  VISUAL: 'true',
+});
 const RESULT_SENTINEL = '::nano:result::';
 // Completion keys the harness owns — an agent's returned result can never
 // overwrite these (nor anything in the reserved `io.nanobpm.*` namespace), so a
@@ -4949,21 +4965,14 @@ function provisionRepo({ envelope, token, runDir, runId, timeoutMs = 120_000, lo
     ...process.env,
     GIT_TERMINAL_PROMPT: '0',
     GIT_CONFIG_NOSYSTEM: '1',
-    // #283: an agent run is headless, so any git command that launches an
-    // editor would block until the tool timeout kills it (the run then ends
-    // with no result). Point every editor git might spawn at a non-interactive
-    // no-op so `commit` (no -m), `rebase -i`, `merge`/`revert` (no --no-edit)
-    // and `tag -a` (no -m) return at once instead of hanging. `true` is the
-    // POSIX shell builtin that exits 0 immediately; git treats the editor's
-    // exit status as success and proceeds with the on-disk (unchanged) buffer.
-    // Layered onto gitEnv, which the production runner hands to runAgentJob as
-    // the harness env's bottom layer (finalizeGit's rebase and the agent's own
-    // git commands both run with this env). An operator can still override
-    // per-run via profile/setup env — those layer on top of the git base.
-    GIT_EDITOR: 'true',
-    GIT_SEQUENCE_EDITOR: 'true',
-    EDITOR: 'true',
-    VISUAL: 'true',
+    // #283: the headless editor no-ops (GIT_EDITOR/GIT_SEQUENCE_EDITOR/EDITOR/
+    // VISUAL = `true`). Single source of truth is EDITOR_NOOP_ENV; runAgentJob
+    // also applies it unconditionally at its boundary so repo-less host jobs and
+    // container jobs get it too. Keeping a copy here means finalizeGit's own
+    // rebase (which runs with this gitEnv) stays non-interactive, and an operator
+    // can still override per-run via profile/setup env (those layer on top of the
+    // git base in the harness env).
+    ...EDITOR_NOOP_ENV,
   };
   // Drop any inherited askpass helpers so a no-token ("anonymous") clone can't
   // authenticate with host-provided credentials. We re-set GIT_ASKPASS below
@@ -8284,10 +8293,19 @@ function runAgentJob(profile, job, opts = {}) {
   // helper file (and the clone token) that must not leak into the harness,
   // and GIT_CONFIG_GLOBAL stays provisioning-scoped (the harness keeps the
   // host's real global git config).
-  const gitBaseEnv = Object.fromEntries(
-    Object.entries(gitEnv || {})
-      .filter(([k]) => k !== 'GIT_ASKPASS' && k !== 'GIT_TOKEN' && k !== 'GIT_CONFIG_GLOBAL'),
-  );
+  const gitBaseEnv = {
+    // #283: editor no-ops apply to EVERY agent harness, unconditionally. For a
+    // repo-provisioned job `gitEnv` already carries them (identical values), but
+    // `provisioned` is null for repo-less host jobs AND all container jobs, so
+    // those agents can still run their own `git init`/`clone` then `commit`/
+    // `rebase -i` and hang on an inherited editor — hence the boundary default
+    // here rather than relying solely on provisioning's copy.
+    ...EDITOR_NOOP_ENV,
+    ...Object.fromEntries(
+      Object.entries(gitEnv || {})
+        .filter(([k]) => k !== 'GIT_ASKPASS' && k !== 'GIT_TOKEN' && k !== 'GIT_CONFIG_GLOBAL'),
+    ),
+  };
 
   // C3 (#42): when a relay session is present, tap the harness terminal onto the
   // relay lane (framed + tagged with this job's jobKey) and accept steer-in. The
@@ -8436,6 +8454,18 @@ function runAgentJob(profile, job, opts = {}) {
   for (const k of Object.keys(resultEnv)) envArgs.push('-e', k);
   for (const n of passThroughSecretNames) envArgs.push('-e', n);
   for (const k of Object.keys(staticEnv)) envArgs.push('-e', k);
+  // #283: forward the editor no-ops by NAME so docker actually sets them inside
+  // the container (merely having them in `containerEnv` is inert — docker only
+  // sets vars whose names appear in `-e`). Skipped when an operator already put
+  // the same name in agent/extra/static env (it is forwarded above, with the
+  // operator's overriding value) to avoid a duplicate `-e` flag.
+  for (const k of Object.keys(EDITOR_NOOP_ENV)) {
+    if (!Object.prototype.hasOwnProperty.call(staticEnv, k)
+      && !Object.prototype.hasOwnProperty.call(agentEnv, k)
+      && !Object.prototype.hasOwnProperty.call(extraEnv, k)) {
+      envArgs.push('-e', k);
+    }
+  }
 
   // Propagate IPv4-first DNS ordering into the containerised agent's Node runtime
   // via NODE_OPTIONS (jwulf/c8ctl-plugin-nano#151), merged (never clobbered) with

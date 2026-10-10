@@ -158,7 +158,11 @@ SDK client (job workers) — do **not** add the SDK as a dependency or use raw
   disabled facade and every job silently records nothing. So: (a) `nano work` **fails
   loudly at worker start** on any agentic profile when the host SDK lacks the verbs,
   naming the host `@camunda8/cli` + `@camunda8/orchestration-cluster-api` versions
-  (`probeHostSdkInfo`, resolved from the plugin's module graph == the host install) and
+  (`probeHostSdkInfo`, resolved by walking an ordered resolver chain rooted at the
+  host c8ctl entry (`C8CTL_NANO_ENTRY`/`process.argv[1]`) and the resolved
+  `@camunda8/cli` package before falling back to the plugin's own module graph —
+  the plugin graph alone may not expose the host's nested SDK in a managed
+  install layout) and
   the minimum SDK (`>= 10.0.0-alpha.45`); `NANO_AGENT_INSTANCE=off` silences it. (b) The
   per-job "producer unavailable" line reports WHICH precondition failed via the facade's
   `unavailableReason` getter (SDK create, SDK update, ACP classifier, or not-external)

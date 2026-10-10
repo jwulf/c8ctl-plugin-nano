@@ -159,8 +159,9 @@ SDK client (job workers) — do **not** add the SDK as a dependency or use raw
   loudly at worker start** on any agentic profile when the host SDK lacks the verbs,
   naming the host `@camunda8/cli` + `@camunda8/orchestration-cluster-api` versions
   (`probeHostSdkInfo`, resolved by walking an ordered resolver chain rooted at the
-  host c8ctl entry (`C8CTL_NANO_ENTRY`/`process.argv[1]`) and the resolved
-  `@camunda8/cli` package before falling back to the plugin's own module graph —
+  host c8ctl entry (`C8CTL_NANO_ENTRY`/`process.argv[1]`, canonicalized through its
+  launcher symlink so a globally installed CLI's nested SDK still resolves) and the
+  resolved `@camunda8/cli` package before falling back to the plugin's own module graph —
   the plugin graph alone may not expose the host's nested SDK in a managed
   install layout) and
   the minimum SDK (`>= 10.0.0-alpha.45`); `NANO_AGENT_INSTANCE=off` silences it. (b) The

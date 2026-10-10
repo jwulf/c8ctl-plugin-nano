@@ -4,8 +4,11 @@
 
 import { test } from 'node:test';
 import assert from 'node:assert/strict';
+import { mkdtempSync, mkdirSync, writeFileSync, symlinkSync, rmSync } from 'node:fs';
+import { tmpdir } from 'node:os';
+import { join, dirname } from 'node:path';
 
-import { probeHostSdkInfo, formatHostSdkInfo } from './c8ctl-plugin.js';
+import { probeHostSdkInfo, formatHostSdkInfo, buildHostSdkResolvers } from './c8ctl-plugin.js';
 
 test('probeHostSdkInfo resolves both package versions via the injected require', () => {
   const fakeRequire = (spec) => {
@@ -96,4 +99,45 @@ test('probeHostSdkInfo yields null for both when no chain resolver resolves — 
   const info = probeHostSdkInfo(undefined, [miss, miss]);
   assert.equal(info.cliVersion, null);
   assert.equal(info.sdkVersion, null);
+});
+
+// Regression (issue #289 review): a globally installed CLI is launched through a launcher
+// symlink (e.g. /usr/local/bin/c8ctl -> .../lib/node_modules/@camunda8/cli/bin/run.js),
+// which Node preserves verbatim in process.argv[1]. buildHostSdkResolvers must canonicalize
+// the entry through realpath before rooting createRequire, or resolution starts under the
+// symlink's bin dir and misses the nested host SDK entirely — the exact global layout the
+// probe exists to diagnose.
+test('buildHostSdkResolvers resolves the nested host SDK through a launcher-symlink entry', () => {
+  const root = mkdtempSync(join(tmpdir(), 'nano-hostsdk-'));
+  try {
+    // Real global layout: the CLI package + its nested SDK under <root>/lib/node_modules.
+    const cliDir = join(root, 'lib', 'node_modules', '@camunda8', 'cli');
+    const cliBin = join(cliDir, 'bin', 'run.js');
+    mkdirSync(dirname(cliBin), { recursive: true });
+    writeFileSync(cliBin, '#!/usr/bin/env node\n');
+    writeFileSync(join(cliDir, 'package.json'), JSON.stringify({ name: '@camunda8/cli', version: '4.2.0-alpha.2' }));
+    const sdkDir = join(cliDir, 'node_modules', '@camunda8', 'orchestration-cluster-api');
+    mkdirSync(sdkDir, { recursive: true });
+    writeFileSync(join(sdkDir, 'package.json'), JSON.stringify({ name: '@camunda8/orchestration-cluster-api', version: '9.1.5' }));
+
+    // The launcher symlink Node hands us as process.argv[1].
+    const binDir = join(root, 'bin');
+    mkdirSync(binDir, { recursive: true });
+    const launcher = join(binDir, 'c8ctl');
+    symlinkSync(cliBin, launcher);
+
+    const info = probeHostSdkInfo(undefined, buildHostSdkResolvers(launcher));
+    assert.equal(info.cliVersion, '4.2.0-alpha.2');
+    assert.equal(info.sdkVersion, '9.1.5');
+  } finally {
+    rmSync(root, { recursive: true, force: true });
+  }
+});
+
+test('buildHostSdkResolvers survives a nonexistent entry without throwing', () => {
+  const resolvers = buildHostSdkResolvers(join(tmpdir(), 'nano-does-not-exist', 'c8ctl'));
+  assert.ok(Array.isArray(resolvers));
+  // Never throws, and the probe degrades to null rather than crashing.
+  const info = probeHostSdkInfo(undefined, resolvers.length ? resolvers : [() => { throw new Error('miss'); }]);
+  assert.ok(info && typeof info === 'object');
 });

@@ -104,15 +104,21 @@ const pluginDir = dirname(fileURLToPath(import.meta.url));
  * sibling package's `node_modules`, so a probe rooted only at this module commonly
  * reads `null` for both versions — exactly when it needs to name the old host SDK.
  * Resolve from the host graph instead:
- *   1. a `require` rooted at the real c8ctl entry (`C8CTL_NANO_ENTRY` / `process.argv[1]`)
- *      — the CLI and its nested SDK live in THIS graph;
+ *   1. a `require` rooted at the real c8ctl entry (`C8CTL_NANO_ENTRY` / `process.argv[1]`),
+ *      canonicalized through symlinks — the CLI and its nested SDK live in THIS graph;
  *   2. a `require` rooted at the resolved `@camunda8/cli` package itself, so an SDK
  *      nested beneath the CLI (not hoisted to the entry root) still resolves;
  *   3. this module's own graph as a last-resort fallback (works in a hoisted/global
  *      layout where the SDK is visible from here).
  * Every step is guarded: an unresolvable root is skipped, never thrown.
+ *
+ * The entry is `realpathSync`'d first because a globally installed CLI is launched
+ * through a launcher symlink (e.g. `/usr/local/bin/c8ctl` → `.../lib/node_modules/@camunda8/cli/bin/...`),
+ * which Node preserves verbatim in `process.argv[1]`. Rooting `createRequire` at the
+ * raw symlink would search `/usr/local/bin/node_modules` and miss the nested host SDK
+ * entirely — exactly the global layout this probe exists to diagnose.
  */
-function buildHostSdkResolvers() {
+export function buildHostSdkResolvers(entryArg) {
   const resolvers = [];
   const seen = new Set();
   const push = (rq) => {
@@ -121,7 +127,15 @@ function buildHostSdkResolvers() {
       resolvers.push(rq);
     }
   };
-  const entry = process.env.C8CTL_NANO_ENTRY || process.argv[1];
+  const rawEntry = entryArg !== undefined ? entryArg : (process.env.C8CTL_NANO_ENTRY || process.argv[1]);
+  let entry = rawEntry;
+  if (entry) {
+    try {
+      entry = realpathSync(entry);
+    } catch {
+      /* not a real path yet (or already canonical) — fall back to the raw entry */
+    }
+  }
   let entryRequire = null;
   if (entry) {
     try {

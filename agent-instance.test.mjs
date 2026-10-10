@@ -23,6 +23,8 @@ import {
   buildPlanContent,
   PLAN_KIND,
   PLAN_OBJECT_CAP_CHARS,
+  isPermanentCreateStatus,
+  parseAssociatedInstanceKey,
 } from './agent-instance.mjs';
 
 // A logger that records every line per level so observability assertions (#229)
@@ -2245,6 +2247,54 @@ test('describeSdkError caps an oversized response body so it cannot flood the lo
   assert.equal(small.body, 'short body');
 });
 
+// ---------------------------------------------------------------------------
+// #289 review — cause-wrapped SDK errors must surface their status/body so the
+// 409-adopt and permanent-4xx classification paths see them (a wrapped 409/404
+// otherwise yields status===null and continues the retry loop this change stops).
+// ---------------------------------------------------------------------------
+
+test('describeSdkError walks a bounded cause chain to surface a wrapped status + body (#289)', () => {
+  // A wrapped 409 "already associated" (the adopt path): status + body live only on
+  // the cause, the outer error is a bare wrapper.
+  const inner409 = new Error('element instance 247794 is already associated with agent instance 247990');
+  inner409.status = 409;
+  inner409.body = { detail: 'already associated with agent instance 247990' };
+  const outer409 = new Error('createAgentInstance failed');
+  outer409.cause = inner409;
+  const d409 = describeSdkError(outer409);
+  assert.equal(d409.status, 409, 'a cause-wrapped 409 surfaces its status');
+  assert.match(d409.body, /already associated with agent instance 247990/, 'the cause body is surfaced');
+  // …so the adopt path can parse the associated instance key off the wrapped error.
+  assert.equal(parseAssociatedInstanceKey(d409), '247990', 'a wrapped 409 is adoptable');
+  assert.equal(isPermanentCreateStatus(d409.status), true, 'a wrapped 409 classifies permanent');
+
+  // A wrapped 404 "element instance is not active" (the permanent-stop path).
+  const inner404 = new Error('element instance is not active');
+  inner404.response = { status: 404, data: 'element instance 247794 is not active' };
+  const outer404 = new Error('createAgentInstance failed');
+  outer404.cause = inner404;
+  const d404 = describeSdkError(outer404);
+  assert.equal(d404.status, 404, 'a cause-wrapped 404 surfaces its status');
+  assert.equal(isPermanentCreateStatus(d404.status), true, 'a wrapped 404 classifies permanent');
+
+  // The outermost non-null status wins over a deeper contradictory one (the outermost
+  // shape is the most specific surface), and a cyclic cause cannot loop.
+  const cyclic = { statusCode: 500, message: 'outer' };
+  cyclic.cause = { status: 409, message: 'inner', cause: cyclic };
+  const dCyclic = describeSdkError(cyclic);
+  assert.equal(dCyclic.status, 500, 'the outermost non-null status wins');
+  assert.equal(dCyclic.message, 'outer', 'the outermost message wins');
+});
+
+test('describeSdkError prefers the outer status but falls back to the cause body (#289)', () => {
+  // Status on the outer error, body only on the cause: both are surfaced.
+  const inner = new Error('engine detail'); inner.body = 'element instance is not active';
+  const outer = new Error('createAgentInstance failed'); outer.statusCode = 404; outer.cause = inner;
+  const d = describeSdkError(outer);
+  assert.equal(d.status, 404, 'the outer status is read');
+  assert.equal(d.body, 'element instance is not active', 'the cause body is surfaced');
+});
+
 test('describeSdkError folds newlines and caps the message so a multiline error stays one bounded log line (issue #230)', () => {
   // A multiline body/message would split the single correlatable worker-log line, and a
   // message that embeds a large body would bypass the body cap and flood the log.
@@ -2794,4 +2844,214 @@ test('re-emitting an EARLIER plan (A → B → A) does not enqueue a duplicate a
     .filter((h) => h.historyItemId.includes('plan:'));
   assert.equal(planTurns.length, 2, 'A and B each recorded once; the re-emitted A is deduped');
   assert.notEqual(planTurns[0].historyItemId, planTurns[1].historyItemId);
+});
+
+// ---------------------------------------------------------------------------
+// #289 — create-failure classification: adopt a 409 conflict, stop on permanent 4xx
+// ---------------------------------------------------------------------------
+
+test('parseAssociatedInstanceKey extracts the existing instance key from a 409 body/message', () => {
+  assert.equal(
+    parseAssociatedInstanceKey({ message: 'Conflict', body: 'element instance 247794 is already associated with agent instance 247990' }),
+    '247990',
+  );
+  // From the message too, with quoting and casing tolerance.
+  assert.equal(
+    parseAssociatedInstanceKey({ message: 'Already associated with agent instance "300209"', body: null }),
+    '300209',
+  );
+  // Non-conflict shapes yield null.
+  assert.equal(parseAssociatedInstanceKey({ message: 'element instance is not active', body: null }), null);
+  assert.equal(parseAssociatedInstanceKey(null), null);
+  assert.equal(parseAssociatedInstanceKey({}), null);
+});
+
+test('isPermanentCreateStatus treats 4xx as permanent except 429/408', () => {
+  assert.equal(isPermanentCreateStatus(400), true);
+  assert.equal(isPermanentCreateStatus(404), true);
+  assert.equal(isPermanentCreateStatus(409), true);
+  assert.equal(isPermanentCreateStatus(429), false);
+  assert.equal(isPermanentCreateStatus(408), false);
+  assert.equal(isPermanentCreateStatus(500), false);
+  assert.equal(isPermanentCreateStatus(null), false);
+});
+
+test('#289: a 409 "already associated" ADOPTS the existing instance instead of re-creating', async () => {
+  // The create rejects with a 409 naming an existing agent instance (the retry/
+  // reactivation case). The producer must adopt N, not retry the create.
+  const err409 = Object.assign(new Error('Conflict'), {
+    statusCode: 409,
+    body: 'element instance EIK-7 is already associated with agent instance 999777',
+  });
+  let createCalls = 0;
+  const client = {
+    calls: { create: [], update: [] },
+    createAgentInstance: async (req) => {
+      createCalls += 1;
+      client.calls.create.push(req);
+      throw err409;
+    },
+    updateAgentInstance: async (req) => {
+      client.calls.update.push(req);
+      return { createdHistory: Array.isArray(req.history) ? req.history : [] };
+    },
+  };
+  const logger = recordingLogger();
+  const p = makeProducer(client, { logger });
+  const active = await p.activate();
+  assert.equal(active, true, 'activation reports active after adopting the existing instance');
+  assert.equal(p.agentInstanceKey, '999777', 'the named instance key is adopted');
+  assert.equal(createCalls, 1, 'the create was NOT retried — the 409 conflict is permanent');
+  assert.ok(logger.lines.info.some((l) => /ADOPTED/.test(l) && /999777/.test(l)), 'the adoption is logged');
+
+  // A subsequent append targets the adopted instance key.
+  p.ingest({ sessionUpdate: 'agent_message_chunk', content: { type: 'text', text: 'hello' }, messageId: 'm-1' });
+  await p.drain();
+  assert.ok(client.calls.update.some((u) => u.agentInstanceKey === '999777'), 'appends target the adopted instance');
+});
+
+test('#289: adoption replays the pre-mint buffer against the adopted instance', async () => {
+  const err409 = Object.assign(new Error('Conflict'), {
+    status: 409,
+    body: 'already associated with agent instance 555',
+  });
+  let firstCall = true;
+  const client = {
+    calls: { create: [], update: [] },
+    createAgentInstance: async (req) => {
+      client.calls.create.push(req);
+      // Reject the initial activate() create with a transient error so the instance
+      // stays un-minted while an ACP update buffers, THEN a retry hits the 409 adopt.
+      if (firstCall) { firstCall = false; throw new Error('transient'); }
+      throw err409;
+    },
+    updateAgentInstance: async (req) => {
+      client.calls.update.push(req);
+      return { createdHistory: Array.isArray(req.history) ? req.history : [] };
+    },
+  };
+  // A mutable clock so the hot-path retry clears the exponential-backoff window.
+  let clock = Date.parse('2026-02-03T04:05:06.000Z');
+  const p = makeProducer(client, { logger: nullLogger, now: () => clock });
+  await p.activate(); // transient failure → retryPending, un-minted
+  assert.equal(p.agentInstanceKey, null);
+  // Buffer an update while un-minted, then drive a hot-path retry that adopts.
+  p.ingest({ sessionUpdate: 'agent_message_chunk', content: { type: 'text', text: 'buffered' }, messageId: 'm-9' });
+  clock += 60000; // advance well past the create-retry backoff window
+  await p.activate(); // retry → 409 adopt
+  assert.equal(p.agentInstanceKey, '555');
+  await p.drain();
+  const appended = client.calls.update
+    .filter((u) => Array.isArray(u.history))
+    .flatMap((u) => u.history)
+    .some((h) => (h.content || []).some((c) => c.text === 'buffered'));
+  assert.ok(appended, 'the pre-mint buffered turn is replayed against the adopted instance');
+});
+
+test('#289: a permanent 4xx create rejection (404) STOPS retrying and disables the producer', async () => {
+  const err404 = Object.assign(new Error('Not Found'), {
+    statusCode: 404,
+    body: 'element instance EIK-7 is not active',
+  });
+  let createCalls = 0;
+  const client = {
+    calls: { create: [], update: [] },
+    createAgentInstance: async (req) => {
+      createCalls += 1;
+      client.calls.create.push(req);
+      throw err404;
+    },
+    updateAgentInstance: async (req) => {
+      client.calls.update.push(req);
+      return { createdHistory: [] };
+    },
+  };
+  const logger = recordingLogger();
+  const p = makeProducer(client, { logger });
+  const active = await p.activate();
+  assert.equal(active, false, 'activation is not active after a permanent rejection');
+  assert.equal(p.retryPending, false, 'the producer is disabled, not retry-pending');
+  assert.equal(createCalls, 1, 'a permanent 404 is not retried');
+  assert.ok(logger.lines.warn.some((l) => /not retried — the rejection is permanent/.test(l) && /404/.test(l)), 'the permanent rejection is logged');
+
+  // A further ingest does nothing (disabled) and complete() makes no final attempt.
+  p.ingest({ sessionUpdate: 'agent_message_chunk', content: { type: 'text', text: 'x' }, messageId: 'm-1' });
+  await p.complete(true);
+  assert.equal(createCalls, 1, 'complete() makes no final create attempt for a permanently-disabled producer');
+});
+
+test('#289: unavailableReason reports which precondition failed', () => {
+  // Missing SDK create/update.
+  const noCreate = createAgentInstanceProducer({
+    camunda: { updateAgentInstance() {} },
+    job: EXTERNAL_JOB,
+    profile: PROFILE,
+    envelope: ENVELOPE,
+    logger: nullLogger,
+    now,
+  });
+  assert.match(noCreate.unavailableReason, /SDK lacks createAgentInstance/);
+
+  // Not an external agent job (no lease token).
+  const notExternal = createAgentInstanceProducer({
+    camunda: fakeClient(),
+    job: { jobKey: '1', elementInstanceKey: 'EIK' },
+    profile: PROFILE,
+    envelope: ENVELOPE,
+    logger: nullLogger,
+    now,
+  });
+  assert.match(notExternal.unavailableReason, /not an external agent job/);
+
+  // A fully usable producer reports null.
+  const ok = makeProducer(fakeClient());
+  assert.equal(ok.unavailableReason, null);
+});
+
+test('#289 review: a permanent create rejection reports permanentlyRejected (status), not a construction-time unavailableReason', async () => {
+  // After a permanent 4xx create rejection the producer is `disabled`, but its
+  // construction-time preconditions were VALID — so `unavailableReason` (which reports
+  // only unmet preconditions) stays null. The worker must instead read
+  // `permanentlyRejected` to log "activation attempted but permanently rejected
+  // (HTTP N)", not the misleading "activation not attempted: unknown precondition".
+  const err404 = Object.assign(new Error('Not Found'), {
+    statusCode: 404,
+    body: 'element instance EIK-7 is not active',
+  });
+  const client = {
+    calls: { create: [], update: [] },
+    createAgentInstance: async (req) => { client.calls.create.push(req); throw err404; },
+    updateAgentInstance: async (req) => { client.calls.update.push(req); return { createdHistory: [] }; },
+  };
+  const p = makeProducer(client, { logger: recordingLogger() });
+  // Before activation nothing was rejected.
+  assert.equal(p.permanentlyRejected, null, 'no rejection before activate()');
+  const active = await p.activate();
+  assert.equal(active, false, 'a permanent rejection does not activate');
+  assert.equal(p.retryPending, false, 'a permanently rejected producer is not retry-pending');
+  assert.equal(p.permanentlyRejected, 404, 'the permanent rejection status is surfaced to the worker');
+  assert.equal(
+    p.unavailableReason,
+    null,
+    'unavailableReason stays null — the preconditions were valid, the engine rejected the attempt',
+  );
+});
+
+test('#289 review: permanentlyRejected is null for a usable producer and for an unmet precondition', () => {
+  // A healthy producer: no rejection.
+  const ok = makeProducer(fakeClient());
+  assert.equal(ok.permanentlyRejected, null);
+
+  // A construction-time precondition failure (missing SDK) is reported via
+  // unavailableReason, NOT permanentlyRejected — the two are distinct signals.
+  const noCreate = createAgentInstanceProducer({
+    camunda: { updateAgentInstance() {} },
+    job: EXTERNAL_JOB,
+    profile: PROFILE,
+    envelope: ENVELOPE,
+    logger: nullLogger,
+    now,
+  });
+  assert.equal(noCreate.permanentlyRejected, null, 'an unmet precondition is not a permanent rejection');
+  assert.match(noCreate.unavailableReason, /SDK lacks createAgentInstance/);
 });

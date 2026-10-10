@@ -783,6 +783,21 @@ the job with a decremented retry count. Profiles are stored in the plugin's
 > `agentCapabilities._meta.planSeed` also receives it in `session/new` `_meta.plan`
 > so it can keep working the same plan. `NANO_AGENT_PLAN=off` disables both.
 >
+> **Durable transcripts need an ACP harness *and* a recent host c8ctl.** The
+> engine-native `AgentInstance` transcript is built from the harness's ACP
+> `session/update` stream, so **only a harness running in ACP mode records a body** — a
+> non-ACP harness (e.g. `copilot --allow-all` without `--acp`) emits no update stream,
+> so its instance carries just the opening `CONFIGURATION` turn. Recording also needs the
+> **host c8ctl's** SDK to expose the AgentInstance verbs
+> (`createAgentInstance`/`updateAgentInstance`): `@camunda8/cli` must bundle
+> `@camunda8/orchestration-cluster-api` **>= 10.0.0-alpha.45**. When it doesn't, **every
+> job silently records nothing** — so `nano work` now **fails loudly at startup** on an
+> agentic profile, naming the host SDK versions and the fix (the plugin version is
+> irrelevant; upgrade c8ctl). Set `NANO_AGENT_INSTANCE=off` to disable transcripts
+> intentionally. Note that **token metrics (`inputTokens`/`outputTokens`) are 0 for
+> ACP-mode runs**: ACP reports context-window occupancy, not per-turn token counts (a
+> protocol limitation), so the producer never fabricates them.
+>
 > **WIP checkpoints (`NANO_AGENT_CHECKPOINT=auto|on|off`, default `auto`).** The worker
 > periodically snapshots the agent's workspace — uncommitted changes *and* unpushed local
 > commits — to `refs/nano/wip/<elementInstanceKey>` on the job's remote, without touching

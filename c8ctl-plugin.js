@@ -96,6 +96,110 @@ const requireFromHere = createRequire(import.meta.url);
 const pluginDir = dirname(fileURLToPath(import.meta.url));
 
 /**
+ * Build the ordered list of `require` resolvers used to read the HOST c8ctl / Camunda
+ * SDK package manifests (issue #289 review). The host SDK lives in the host **c8ctl
+ * CLI's** dependency graph, NOT this plugin's. In the managed layout the plugin loads
+ * from `<data>/plugins/node_modules`, a SIBLING of `@camunda8/cli`; in the global
+ * layout the SDK is nested BENEATH the CLI package. Node resolution never searches a
+ * sibling package's `node_modules`, so a probe rooted only at this module commonly
+ * reads `null` for both versions — exactly when it needs to name the old host SDK.
+ * Resolve from the host graph instead:
+ *   1. a `require` rooted at the real c8ctl entry (`C8CTL_NANO_ENTRY` / `process.argv[1]`),
+ *      canonicalized through symlinks — the CLI and its nested SDK live in THIS graph;
+ *   2. a `require` rooted at the resolved `@camunda8/cli` package itself, so an SDK
+ *      nested beneath the CLI (not hoisted to the entry root) still resolves;
+ *   3. this module's own graph as a last-resort fallback (works in a hoisted/global
+ *      layout where the SDK is visible from here).
+ * Every step is guarded: an unresolvable root is skipped, never thrown.
+ *
+ * The entry is `realpathSync`'d first because a globally installed CLI is launched
+ * through a launcher symlink (e.g. `/usr/local/bin/c8ctl` → `.../lib/node_modules/@camunda8/cli/bin/...`),
+ * which Node preserves verbatim in `process.argv[1]`. Rooting `createRequire` at the
+ * raw symlink would search `/usr/local/bin/node_modules` and miss the nested host SDK
+ * entirely — exactly the global layout this probe exists to diagnose.
+ */
+export function buildHostSdkResolvers(entryArg) {
+  const resolvers = [];
+  const seen = new Set();
+  const push = (rq) => {
+    if (typeof rq === 'function' && !seen.has(rq)) {
+      seen.add(rq);
+      resolvers.push(rq);
+    }
+  };
+  const rawEntry = entryArg !== undefined ? entryArg : (process.env.C8CTL_NANO_ENTRY || process.argv[1]);
+  let entry = rawEntry;
+  if (entry) {
+    try {
+      entry = realpathSync(entry);
+    } catch {
+      /* not a real path yet (or already canonical) — fall back to the raw entry */
+    }
+  }
+  let entryRequire = null;
+  if (entry) {
+    try {
+      entryRequire = createRequire(entry);
+      push(entryRequire);
+    } catch {
+      /* unresolvable entry — skip */
+    }
+  }
+  for (const rq of [entryRequire, requireFromHere]) {
+    if (!rq) continue;
+    try {
+      const cliPkg = rq.resolve('@camunda8/cli/package.json');
+      push(createRequire(cliPkg));
+    } catch {
+      /* CLI not resolvable from this root — skip */
+    }
+  }
+  push(requireFromHere);
+  return resolvers;
+}
+
+/**
+ * Best-effort host c8ctl / Camunda SDK versions (issue #289). The host SDK lives in the
+ * host c8ctl CLI's dependency graph, which this plugin's (sibling) `node_modules` cannot
+ * reach, so the probe walks an ordered chain of resolvers rooted at the host CLI entry /
+ * package first and this module only as a fallback (see `buildHostSdkResolvers`) — the
+ * first resolver to yield a version wins. Every read is guarded: an unresolvable package
+ * (hoisting layout, bundling) simply yields null rather than throwing. Tests may inject a
+ * single `requireFn` (used as the sole resolver) or an explicit `resolvers` array.
+ */
+export function probeHostSdkInfo(requireFn, resolvers) {
+  const chain = Array.isArray(resolvers) && resolvers.length > 0
+    ? resolvers
+    : requireFn
+      ? [requireFn]
+      : buildHostSdkResolvers();
+  const read = (spec) => {
+    for (const rq of chain) {
+      try {
+        const v = rq(`${spec}/package.json`)?.version;
+        if (typeof v === 'string' && v.trim() !== '') return String(v);
+      } catch {
+        /* try the next resolver in the chain */
+      }
+    }
+    return null;
+  };
+  return {
+    cliVersion: read('@camunda8/cli'),
+    sdkVersion: read('@camunda8/orchestration-cluster-api'),
+  };
+}
+
+/** Render host SDK versions for a log line (issue #289). Never throws. */
+export function formatHostSdkInfo(info) {
+  const cli = info?.cliVersion ? `@camunda8/cli ${info.cliVersion}` : '@camunda8/cli (version unknown)';
+  const sdk = info?.sdkVersion
+    ? `@camunda8/orchestration-cluster-api ${info.sdkVersion}`
+    : '@camunda8/orchestration-cluster-api (version unknown)';
+  return `${cli}, ${sdk}`;
+}
+
+/**
  * Read the bundled-binary marker (nanobpmn-binary.json) written by the upstream
  * release pipeline. Records which nanobpmn build the shipped binaries came from.
  * Best-effort: returns undefined when absent or unset (e.g. local dev checkout).
@@ -10193,10 +10297,27 @@ async function workAgent(req, flags, ctx) {
   // for why per-job setup.env is deliberately excluded), so PATH resolves a stable
   // representative harness binary.
   const agentInstanceProbeOff = String(process.env.NANO_AGENT_INSTANCE || '').trim().toLowerCase() === 'off';
+  // Harness transport protocol, resolved with env-override-then-profile precedence and
+  // reduced to the EFFECTIVE protocol the worker actually runs (a container sandbox is
+  // pipe-only regardless of `protocol`). Computed here — ahead of the durable-transcript
+  // diagnostic below and the #275 mismatch refusal later — so the startup "ACP note" is
+  // keyed on the transport the worker WILL use, not a brittle reparse of the command
+  // line (issue #289 review).
+  const envProtocol = (process.env.NANO_AGENTIC_PROTOCOL || '').trim().toLowerCase();
+  const roleProtocol = resolveAgenticSetting(envProtocol, profile.protocol, PROTOCOLS, 'pipe');
+  const effectiveProtocol = effectiveHarnessProtocol(roleProtocol, isContainer);
   const sdkSupportsAgentInstance =
     !!camunda &&
     typeof camunda.createAgentInstance === 'function' &&
     typeof camunda.updateAgentInstance === 'function';
+  // #289: best-effort host c8ctl / SDK versions, so the startup warning and the
+  // per-job "producer unavailable" diagnostic can name the package that must be
+  // upgraded (the macbook workers ran @camunda8/cli 4.1.0-alpha.2 bundling
+  // @camunda8/orchestration-cluster-api 9.1.5, which has no AgentInstance verbs).
+  // Resolved from the HOST c8ctl CLI's dependency graph (rooted at the real entry /
+  // CLI package), not this plugin's sibling node_modules, so the nested host SDK
+  // actually resolves (issue #289 review). Null when unresolvable.
+  const hostSdkInfo = probeHostSdkInfo();
   // The producer's `usable` gate also requires the ACP classifier (agent-instance.mjs);
   // without it the producer is inert regardless of SDK support, so exclude the probe too.
   const acpClassifierAvailable = typeof agenticSessionAcp?.classifyUpdate === 'function';
@@ -10267,6 +10388,51 @@ async function workAgent(req, flags, ctx) {
   const extraNote = extraJobTypes.length > 0 ? ` (${extraJobTypes.length} via --job-type)` : '';
   logger.info(`  listening on ${jobTypes.length} job type(s)${extraNote}: ${jobTypes.join('  ')}`);
   logger.info(`  one job per worker (registry capacity 1 across all ${jobTypes.length} job type(s)); recovery window: ${recoveryWindowMs}ms; idle timeout: ${idleTimeoutMs}ms; hard cap: ${hardCapMs > 0 ? `${hardCapMs}ms` : 'off'}; poll timeout: ${pollTimeoutMs}ms`);
+  // #289: fail LOUDLY at worker start — not silently per job — when this worker
+  // cannot record a durable AgentInstance transcript on an agentic profile. Every
+  // `nano work` profile runs an agent harness, so any worker that services external
+  // agent jobs needs the host c8ctl SDK's createAgentInstance/updateAgentInstance
+  // verbs. When the host SDK lacks them (e.g. @camunda8/cli 4.1.0-alpha.2 bundling
+  // @camunda8/orchestration-cluster-api 9.1.5), EVERY job silently records no
+  // transcript — the exact macbook-fleet defect. Name the host versions and the fix so
+  // it is actionable from the startup log alone, rather than a per-job "producer
+  // unavailable" line that merges two causes. NANO_AGENT_INSTANCE=off suppresses the
+  // warning (transcripts were intentionally disabled).
+  if (!agentInstanceProbeOff) {
+    if (!sdkSupportsAgentInstance) {
+      logger.warn(
+        `[${name}] DURABLE AGENT TRANSCRIPTS DISABLED — the host c8ctl SDK lacks ` +
+          `createAgentInstance/updateAgentInstance, so NO AgentInstance transcript will be ` +
+          `recorded for any job this worker runs. Host SDK: ${formatHostSdkInfo(hostSdkInfo)}. ` +
+          `Upgrade the host c8ctl (the plugin version is irrelevant — the SDK ships with c8ctl): ` +
+          `@camunda8/cli must bundle @camunda8/orchestration-cluster-api >= 10.0.0-alpha.45 ` +
+          `(the first with the AgentInstance verbs). Set NANO_AGENT_INSTANCE=off to silence this ` +
+          `if transcripts are intentionally disabled.`,
+      );
+    } else if (!acpClassifierAvailable) {
+      logger.warn(
+        `[${name}] DURABLE AGENT TRANSCRIPTS DISABLED — the ACP classifier ` +
+          `(agenticSessionAcp.classifyUpdate) is unavailable, so no AgentInstance transcript ` +
+          `will be recorded. This is unexpected (it is a static import) — the plugin install may ` +
+          `be corrupt. Host SDK: ${formatHostSdkInfo(hostSdkInfo)}.`,
+      );
+    } else {
+      // Transcripts CAN be recorded, but only for an ACP harness: a non-ACP harness
+      // emits no session/update stream for the producer to classify, so it records
+      // only the opening CONFIGURATION turn (no body). Surface this once at startup so
+      // an operator running e.g. `copilot --allow-all` (no --acp) knows why a run has a
+      // header-only transcript. Key the note on the EFFECTIVE transport the worker will
+      // actually use (`effectiveProtocol === 'acp'`), NOT a reparse of the command line:
+      // a `protocol: acp` profile is driven over ACP even when the command carries no
+      // literal `--acp` (`ensureAcpFlag` appends it at spawn), and a hand-reparse also
+      // misses supported selectors (`acp` subcommand, `*-acp` adapter, `--experimental-acp`)
+      // while a container sandbox runs pipe-only regardless of `protocol` (issue #289 review).
+      const protoNote = effectiveProtocol === 'acp'
+        ? ''
+        : ` NOTE: the harness does not run in ACP mode (effective protocol "${effectiveProtocol}") — a non-ACP harness emits no ACP session/update stream, so only the opening CONFIGURATION turn is recorded (no body). Run the harness in ACP mode (--protocol acp on the host executor) for a full transcript.`;
+      logger.info(`[${name}] Durable agent transcripts enabled (host SDK: ${formatHostSdkInfo(hostSdkInfo)}).${protoNote}`);
+    }
+  }
   // Warm the gh-token cache now, off the job-handling path: githubCloneToken()
   // may consult `gh auth token` (a synchronous spawn, up to 10s) as its default
   // credential fallback, and doing that inside a job handler would block the
@@ -10745,14 +10911,14 @@ async function workAgent(req, flags, ctx) {
     logger.info(`  live terminal: ${roleTerminal === 'pty' ? 'PTY (streamed + steerable)' : 'pipe (streamed)'} on the supervised connection.`);
   }
 
-  // #110: the role's harness protocol (pipe|acp) and ACP permission policy
-  // (yolo|escalate|filter), resolved with the same env-override-then-profile
-  // precedence as terminal. `NANO_AGENTIC_PROTOCOL`/`NANO_AGENTIC_PERMISSION`
-  // override a one-off worker; otherwise the hire profile decides; else the safe
-  // defaults (pipe/yolo). escalate/filter are carried through verbatim — the
-  // acp-executor task enforces yolo and interim-handles the reserved policies.
-  const envProtocol = (process.env.NANO_AGENTIC_PROTOCOL || '').trim().toLowerCase();
-  const roleProtocol = resolveAgenticSetting(envProtocol, profile.protocol, PROTOCOLS, 'pipe');
+  // #110: the role's ACP permission policy (yolo|escalate|filter), resolved with
+  // the same env-override-then-profile precedence as terminal. The harness protocol
+  // (`envProtocol`/`roleProtocol`/`effectiveProtocol`) is resolved earlier, ahead of
+  // the durable-transcript startup diagnostic (issue #289 review).
+  // `NANO_AGENTIC_PERMISSION` overrides a one-off worker; otherwise the hire profile
+  // decides; else the safe default (yolo). escalate/filter are carried through
+  // verbatim — the acp-executor task enforces yolo and interim-handles the reserved
+  // policies.
   const envPermission = (process.env.NANO_AGENTIC_PERMISSION || '').trim().toLowerCase();
   const rolePermission = resolveAgenticSetting(envPermission, profile.permission, PERMISSION_MODES, 'yolo');
 
@@ -10767,8 +10933,7 @@ async function workAgent(req, flags, ctx) {
   // container profile's command STILL pipes plain JSON to an ACP harness — the
   // same husk. `effectiveHarnessProtocol` reduces a container's protocol to `pipe`
   // so the refusal covers that pipe-only executor too, not just the host (thread
-  // 4118327651).
-  const effectiveProtocol = effectiveHarnessProtocol(roleProtocol, isContainer);
+  // 4118327651). `effectiveProtocol` is computed earlier (issue #289 review).
   const startupMismatch = detectProtocolMismatch({ command: profile.command, args: effectiveArgs, protocol: effectiveProtocol });
   if (startupMismatch) {
     // Non-restartable config failure: under the supervisor this must exit with
@@ -10998,7 +11163,21 @@ async function workAgent(req, flags, ctx) {
             } else if (agentInstanceProducer.retryPending) {
               logger.info(`[${jobType}] AgentInstance producer not yet active for external agent job (${aiCorr}) — the initial createAgentInstance did not mint a key in time (transient rejection, no-key response, or bounded-out create), but the create stays armed to retry on the ACP hot path, so a run that recovers can still record a durable transcript (job completion unaffected).`);
             } else {
-              logger.info(`[${jobType}] AgentInstance producer unavailable for external agent job (${aiCorr}) — activation not attempted: the host SDK lacks createAgentInstance/updateAgentInstance or the ACP classifier is unavailable; continuing without a durable transcript (job completion unaffected).`);
+              // #289: report WHICH precondition failed (SDK create, SDK update, ACP
+              // classifier, or not-external) plus the host SDK versions, instead of
+              // merging the causes into one opaque line — so the no-transcript cause is
+              // root-causable from this line alone. A PERMANENT create rejection (a 4xx
+              // the engine will never mint on retry) is NOT a construction-time
+              // precondition failure — activation WAS attempted and permanently
+              // rejected — so report it distinctly rather than as "activation not
+              // attempted: unknown precondition" (issue #289 review).
+              const rejectedStatus = agentInstanceProducer.permanentlyRejected;
+              if (rejectedStatus != null) {
+                logger.info(`[${jobType}] AgentInstance producer unavailable for external agent job (${aiCorr}) — activation attempted but permanently rejected (HTTP ${rejectedStatus}); host SDK: ${formatHostSdkInfo(hostSdkInfo)}; continuing without a durable transcript (job completion unaffected).`);
+              } else {
+                const reason = agentInstanceProducer.unavailableReason || 'unknown precondition';
+                logger.info(`[${jobType}] AgentInstance producer unavailable for external agent job (${aiCorr}) — activation not attempted: ${reason}; host SDK: ${formatHostSdkInfo(hostSdkInfo)}; continuing without a durable transcript (job completion unaffected).`);
+              }
             }
           } catch (err) {
             logger.warn(`[${jobType}] AgentInstance producer activate() threw (${aiCorr}) — ${oneLineLog(err?.message || err)}; continuing without a durable transcript (job completion unaffected).`);

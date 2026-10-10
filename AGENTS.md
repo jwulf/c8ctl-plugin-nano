@@ -150,6 +150,46 @@ SDK client (job workers) — do **not** add the SDK as a dependency or use raw
   diagnostics. All optional: a turn with no substantive identity emits no block, so
   the wire is byte-unchanged for a bare run. A first-class typed field would need a
   **generic** upstream Camunda extension (an `attributes` map), tracked in #243.
+- **AgentInstance preconditions, 409-adopt, permanent-4xx (issue #289,
+  `agent-instance.mjs` + `c8ctl-plugin.js`).** Durable transcripts need the HOST c8ctl
+  SDK to expose `createAgentInstance`/`updateAgentInstance` (the plugin version is
+  irrelevant — the SDK ships with c8ctl). When it doesn't (e.g. `@camunda8/cli`
+  4.1.0-alpha.2 bundling `@camunda8/orchestration-cluster-api` 9.1.5), the producer is a
+  disabled facade and every job silently records nothing. So: (a) `nano work` **fails
+  loudly at worker start** on any agentic profile when the host SDK lacks the verbs,
+  naming the host `@camunda8/cli` + `@camunda8/orchestration-cluster-api` versions
+  (`probeHostSdkInfo`, resolved by walking an ordered resolver chain rooted at the
+  host c8ctl entry (`C8CTL_NANO_ENTRY`/`process.argv[1]`, canonicalized through its
+  launcher symlink so a globally installed CLI's nested SDK still resolves) and the
+  resolved `@camunda8/cli` package before falling back to the plugin's own module graph —
+  the plugin graph alone may not expose the host's nested SDK in a managed
+  install layout) and
+  the minimum SDK (`>= 10.0.0-alpha.45`); `NANO_AGENT_INSTANCE=off` silences it. (b) The
+  per-job "producer unavailable" line reports WHICH precondition failed via the facade's
+  `unavailableReason` getter (SDK create, SDK update, ACP classifier, or not-external)
+  plus the host SDK versions, instead of merging the causes. (c) A createAgentInstance
+  **409 "already associated with agent instance N"** is now **ADOPTED**
+  (`parseAssociatedInstanceKey` → latch N, replay the pre-mint buffer, resume appending)
+  rather than retried — the retry loop was observed burning up to 79 futile attempts and
+  recording no transcript, because a prior interrupted run left the instance open "for a
+  retry to continue" and the retry re-created instead of adopting. (d) A **permanent 4xx**
+  create rejection (`isPermanentCreateStatus`: 4xx except 429/408; 409 is adopted first)
+  now **stops** immediately and disables the producer (a 404 "element instance is not
+  active" from a cancelled job, a 400 "invalid agent history") rather than retrying a
+  rejection that can never succeed. Both the adopt and the permanent-4xx classification
+  read the status/body via `describeSdkError`, which walks a **bounded `cause` chain**
+  (first non-null status / non-empty body from the outermost error inward wins) so a
+  cause-wrapped SDK 409/404 — a shape this repo already treats as supported
+  (`isLeaseLostSettleError`) — is adopted/classified instead of surfacing `status ===
+  null` and continuing the retry loop this change exists to stop. **Token metrics (`metrics.inputTokens/outputTokens`)
+  stay 0 for ACP-mode runs by design**: ACP's `session/update` stream carries
+  context-window occupancy, not per-turn token counts (a documented `@nanobpm/agentic`
+  fidelity gap), so the producer records real counts only when an update actually carries
+  a `usage` block and never fabricates them. **Still open (tracked follow-up):**
+  terminalizing a stuck instance when its job is *cancelled / force-stopped with no
+  retry* (the 409-adopt fix resolves the retry-driven stuck case; the no-retry SLA-cancel
+  residual needs a reliable cancel signal + the engine's cancel terminal-status
+  semantics).
 - **Agent plans (`agent-instance.mjs` + `agent-resume.mjs`).** ACP `plan` updates
   are recorded as an ASSISTANT turn (no tool calls) whose `content[]` is a TEXT
   checklist (what the cockpit renders) plus an OBJECT `kind:'nanobpm.plan/v1'` blob

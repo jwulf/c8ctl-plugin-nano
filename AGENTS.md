@@ -176,7 +176,12 @@ SDK client (job workers) — do **not** add the SDK as a dependency or use raw
   create rejection (`isPermanentCreateStatus`: 4xx except 429/408; 409 is adopted first)
   now **stops** immediately and disables the producer (a 404 "element instance is not
   active" from a cancelled job, a 400 "invalid agent history") rather than retrying a
-  rejection that can never succeed. **Token metrics (`metrics.inputTokens/outputTokens`)
+  rejection that can never succeed. Both the adopt and the permanent-4xx classification
+  read the status/body via `describeSdkError`, which walks a **bounded `cause` chain**
+  (first non-null status / non-empty body from the outermost error inward wins) so a
+  cause-wrapped SDK 409/404 — a shape this repo already treats as supported
+  (`isLeaseLostSettleError`) — is adopted/classified instead of surfacing `status ===
+  null` and continuing the retry loop this change exists to stop. **Token metrics (`metrics.inputTokens/outputTokens`)
   stay 0 for ACP-mode runs by design**: ACP's `session/update` stream carries
   context-window occupancy, not per-turn token counts (a documented `@nanobpm/agentic`
   fidelity gap), so the producer records real counts only when an update actually carries

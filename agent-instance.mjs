@@ -200,23 +200,48 @@ function normalizeSdkText(value, max) {
  * error — an "SDK status 400" message alone is useless. Tolerant of the various
  * error shapes the `@camunda8/orchestration-cluster-api` client and the underlying
  * transport surface (statusCode / status / nested response / body / data).
+ *
+ * Walks a BOUNDED `cause` chain (issue #289 review): the SDK/transport frequently
+ * wraps the real rejection in an outer error whose own `status`/`response` is unset,
+ * leaving the HTTP status only on `err.cause` (this repository already treats
+ * `err.cause` as a supported SDK-status shape — `isLeaseLostSettleError`,
+ * c8ctl-plugin.js). Without the walk a cause-wrapped 409/404 surfaces
+ * `status === null`, so it is neither ADOPTED (`parseAssociatedInstanceKey`) nor
+ * classified PERMANENT (`isPermanentCreateStatus`) and continues the retry loop this
+ * change exists to stop. The first non-null status / non-empty body found from the
+ * outermost error inward wins (the outermost shape is the most specific surface), and
+ * the walk is depth-capped so a cyclic cause can't loop.
  */
 export function describeSdkError(err) {
   if (err == null) return { status: null, body: null, message: String(err) };
-  const status =
-    err.statusCode ??
-    err.status ??
-    err.response?.status ??
-    err.response?.statusCode ??
-    (typeof err.code === 'number' ? err.code : null) ??
-    null;
-  let body =
-    err.body ??
-    err.responseBody ??
-    err.response?.body ??
-    err.response?.data ??
-    err.data ??
-    null;
+  let status = null;
+  let body = null;
+  let message = null;
+  let node = err;
+  for (let depth = 0; node != null && typeof node === 'object' && depth <= 4; depth += 1) {
+    if (status == null) {
+      status =
+        node.statusCode ??
+        node.status ??
+        node.response?.status ??
+        node.response?.statusCode ??
+        (typeof node.code === 'number' ? node.code : null) ??
+        null;
+    }
+    if (body == null) {
+      body =
+        node.body ??
+        node.responseBody ??
+        node.response?.body ??
+        node.response?.data ??
+        node.data ??
+        null;
+    }
+    if (message == null && isNonBlank(node.message)) {
+      message = String(node.message);
+    }
+    node = node.cause;
+  }
   if (body != null && typeof body !== 'string') {
     try {
       body = JSON.stringify(body);
@@ -230,9 +255,9 @@ export function describeSdkError(err) {
   // body must not sneak past the body cap) — issue #230. Matches the raw engine
   // adapter's 500-char cap (supervisor-engine.mjs readErrorBody).
   const normalizedBody = body != null ? normalizeSdkText(body, SDK_ERROR_BODY_MAX) : null;
-  const rawMessage = isNonBlank(err.message) ? String(err.message) : String(err);
-  const message = normalizeSdkText(rawMessage, SDK_ERROR_BODY_MAX);
-  return { status: status ?? null, body: normalizedBody, message };
+  const rawMessage = message != null ? message : String(err);
+  const normalizedMessage = normalizeSdkText(rawMessage, SDK_ERROR_BODY_MAX);
+  return { status: status ?? null, body: normalizedBody, message: normalizedMessage };
 }
 
 /**

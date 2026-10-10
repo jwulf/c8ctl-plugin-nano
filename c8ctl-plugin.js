@@ -96,6 +96,38 @@ const requireFromHere = createRequire(import.meta.url);
 const pluginDir = dirname(fileURLToPath(import.meta.url));
 
 /**
+ * Best-effort host c8ctl / Camunda SDK versions (issue #289). The plugin loads from
+ * inside the host c8ctl's `node_modules`, so resolving these package manifests from
+ * this module's graph yields the HOST's installed versions — exactly what must be
+ * upgraded when the SDK lacks the AgentInstance verbs. Every read is guarded: an
+ * unresolvable package (hoisting layout, bundling) simply yields null rather than
+ * throwing. Accepts the `require` function so tests can inject a fake resolver.
+ */
+export function probeHostSdkInfo(requireFn = requireFromHere) {
+  const read = (spec) => {
+    try {
+      const v = requireFn(`${spec}/package.json`)?.version;
+      return typeof v === 'string' && v.trim() !== '' ? String(v) : null;
+    } catch {
+      return null;
+    }
+  };
+  return {
+    cliVersion: read('@camunda8/cli'),
+    sdkVersion: read('@camunda8/orchestration-cluster-api'),
+  };
+}
+
+/** Render host SDK versions for a log line (issue #289). Never throws. */
+export function formatHostSdkInfo(info) {
+  const cli = info?.cliVersion ? `@camunda8/cli ${info.cliVersion}` : '@camunda8/cli (version unknown)';
+  const sdk = info?.sdkVersion
+    ? `@camunda8/orchestration-cluster-api ${info.sdkVersion}`
+    : '@camunda8/orchestration-cluster-api (version unknown)';
+  return `${cli}, ${sdk}`;
+}
+
+/**
  * Read the bundled-binary marker (nanobpmn-binary.json) written by the upstream
  * release pipeline. Records which nanobpmn build the shipped binaries came from.
  * Best-effort: returns undefined when absent or unset (e.g. local dev checkout).
@@ -10197,6 +10229,13 @@ async function workAgent(req, flags, ctx) {
     !!camunda &&
     typeof camunda.createAgentInstance === 'function' &&
     typeof camunda.updateAgentInstance === 'function';
+  // #289: best-effort host c8ctl / SDK versions, so the startup warning and the
+  // per-job "producer unavailable" diagnostic can name the package that must be
+  // upgraded (the macbook workers ran @camunda8/cli 4.1.0-alpha.2 bundling
+  // @camunda8/orchestration-cluster-api 9.1.5, which has no AgentInstance verbs).
+  // Resolved from THIS plugin's module graph, which lives inside the host c8ctl's
+  // node_modules, so the resolved versions are the host's. Null when unresolvable.
+  const hostSdkInfo = probeHostSdkInfo(requireFromHere);
   // The producer's `usable` gate also requires the ACP classifier (agent-instance.mjs);
   // without it the producer is inert regardless of SDK support, so exclude the probe too.
   const acpClassifierAvailable = typeof agenticSessionAcp?.classifyUpdate === 'function';
@@ -10267,6 +10306,46 @@ async function workAgent(req, flags, ctx) {
   const extraNote = extraJobTypes.length > 0 ? ` (${extraJobTypes.length} via --job-type)` : '';
   logger.info(`  listening on ${jobTypes.length} job type(s)${extraNote}: ${jobTypes.join('  ')}`);
   logger.info(`  one job per worker (registry capacity 1 across all ${jobTypes.length} job type(s)); recovery window: ${recoveryWindowMs}ms; idle timeout: ${idleTimeoutMs}ms; hard cap: ${hardCapMs > 0 ? `${hardCapMs}ms` : 'off'}; poll timeout: ${pollTimeoutMs}ms`);
+  // #289: fail LOUDLY at worker start — not silently per job — when this worker
+  // cannot record a durable AgentInstance transcript on an agentic profile. Every
+  // `nano work` profile runs an agent harness, so any worker that services external
+  // agent jobs needs the host c8ctl SDK's createAgentInstance/updateAgentInstance
+  // verbs. When the host SDK lacks them (e.g. @camunda8/cli 4.1.0-alpha.2 bundling
+  // @camunda8/orchestration-cluster-api 9.1.5), EVERY job silently records no
+  // transcript — the exact macbook-fleet defect. Name the host versions and the fix so
+  // it is actionable from the startup log alone, rather than a per-job "producer
+  // unavailable" line that merges two causes. NANO_AGENT_INSTANCE=off suppresses the
+  // warning (transcripts were intentionally disabled).
+  if (!agentInstanceProbeOff) {
+    if (!sdkSupportsAgentInstance) {
+      logger.warn(
+        `[${name}] DURABLE AGENT TRANSCRIPTS DISABLED — the host c8ctl SDK lacks ` +
+          `createAgentInstance/updateAgentInstance, so NO AgentInstance transcript will be ` +
+          `recorded for any job this worker runs. Host SDK: ${formatHostSdkInfo(hostSdkInfo)}. ` +
+          `Upgrade the host c8ctl (the plugin version is irrelevant — the SDK ships with c8ctl): ` +
+          `@camunda8/cli must bundle @camunda8/orchestration-cluster-api >= 10.0.0-alpha.45 ` +
+          `(the first with the AgentInstance verbs). Set NANO_AGENT_INSTANCE=off to silence this ` +
+          `if transcripts are intentionally disabled.`,
+      );
+    } else if (!acpClassifierAvailable) {
+      logger.warn(
+        `[${name}] DURABLE AGENT TRANSCRIPTS DISABLED — the ACP classifier ` +
+          `(agenticSessionAcp.classifyUpdate) is unavailable, so no AgentInstance transcript ` +
+          `will be recorded. This is unexpected (it is a static import) — the plugin install may ` +
+          `be corrupt. Host SDK: ${formatHostSdkInfo(hostSdkInfo)}.`,
+      );
+    } else {
+      // Transcripts CAN be recorded, but only for an ACP harness: a non-ACP harness
+      // emits no session/update stream for the producer to classify, so it records
+      // only the opening CONFIGURATION turn (no body). Surface this once at startup so
+      // an operator running e.g. `copilot --allow-all` (no --acp) knows why a run has a
+      // header-only transcript.
+      const protoNote = /(^|\s)--acp(\s|$)/.test(` ${effectiveArgs.join(' ')} `) || /(^|\s)--acp(\s|$)/.test(` ${profile.command || ''} `)
+        ? ''
+        : ` NOTE: the harness command does not look like it runs in ACP mode (no --acp) — a non-ACP harness emits no ACP session/update stream, so only the opening CONFIGURATION turn is recorded (no body). Run the harness in ACP mode for a full transcript.`;
+      logger.info(`[${name}] Durable agent transcripts enabled (host SDK: ${formatHostSdkInfo(hostSdkInfo)}).${protoNote}`);
+    }
+  }
   // Warm the gh-token cache now, off the job-handling path: githubCloneToken()
   // may consult `gh auth token` (a synchronous spawn, up to 10s) as its default
   // credential fallback, and doing that inside a job handler would block the
@@ -10998,7 +11077,12 @@ async function workAgent(req, flags, ctx) {
             } else if (agentInstanceProducer.retryPending) {
               logger.info(`[${jobType}] AgentInstance producer not yet active for external agent job (${aiCorr}) — the initial createAgentInstance did not mint a key in time (transient rejection, no-key response, or bounded-out create), but the create stays armed to retry on the ACP hot path, so a run that recovers can still record a durable transcript (job completion unaffected).`);
             } else {
-              logger.info(`[${jobType}] AgentInstance producer unavailable for external agent job (${aiCorr}) — activation not attempted: the host SDK lacks createAgentInstance/updateAgentInstance or the ACP classifier is unavailable; continuing without a durable transcript (job completion unaffected).`);
+              // #289: report WHICH precondition failed (SDK create, SDK update, ACP
+              // classifier, or not-external) plus the host SDK versions, instead of
+              // merging the causes into one opaque line — so the no-transcript cause is
+              // root-causable from this line alone.
+              const reason = agentInstanceProducer.unavailableReason || 'unknown precondition';
+              logger.info(`[${jobType}] AgentInstance producer unavailable for external agent job (${aiCorr}) — activation not attempted: ${reason}; host SDK: ${formatHostSdkInfo(hostSdkInfo)}; continuing without a durable transcript (job completion unaffected).`);
             }
           } catch (err) {
             logger.warn(`[${jobType}] AgentInstance producer activate() threw (${aiCorr}) — ${oneLineLog(err?.message || err)}; continuing without a durable transcript (job completion unaffected).`);

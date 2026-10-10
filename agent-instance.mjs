@@ -261,6 +261,51 @@ export function isPermanentTerminalStatus(status) {
   return Number.isFinite(n) && n >= 400 && n < 500;
 }
 
+/**
+ * True when a createAgentInstance HTTP status is a PERMANENT rejection that a blind
+ * retry can never turn into a mint (issue #289): the retry loop was observed burning
+ * up to 79 attempts against a permanent 4xx (a 409 "already associated", a 404
+ * "element instance is not active", a 400 "invalid agent history"). A 4xx will not
+ * succeed on reissue, so the producer stops retrying immediately and stays inert for
+ * the rest of the run. 5xx / network / timeout / unknown statuses are potentially
+ * transient and still retry — fail-safe toward recovery.
+ *
+ * Mirrors `isPermanentTerminalStatus`'s two carve-outs (429 rate-limit, 408 request
+ * timeout) since those CAN succeed on a later attempt. A 409 is permanent here but is
+ * handled specially by the caller BEFORE this check: a 409 that names an existing
+ * agent instance is ADOPTED (`parseAssociatedInstanceKey`), not abandoned.
+ */
+export function isPermanentCreateStatus(status) {
+  const n = Number(status);
+  if (n === 429 || n === 408) return false;
+  return Number.isFinite(n) && n >= 400 && n < 500;
+}
+
+/**
+ * Extract the already-associated AgentInstance key from a createAgentInstance 409
+ * rejection (issue #289). When an activation's run is interrupted the producer leaves
+ * the instance open so a retry can continue it; the retry then calls
+ * createAgentInstance again and the engine rejects with HTTP 409 and a body/message
+ * like "element instance 247794 is already associated with agent instance 247990".
+ * That conflict is PERMANENT — the element instance already owns instance 247990 — so
+ * the correct response is to ADOPT 247990 (resume appending to it), not to retry the
+ * create 79 times. Returns the associated instance key as a string, or null when the
+ * error is not a parseable "already associated" conflict.
+ *
+ * Reads BOTH the normalized message and body (describeSdkError surfaces either),
+ * tolerant of surrounding text and casing.
+ */
+export function parseAssociatedInstanceKey(desc) {
+  if (!isPlainObject(desc)) return null;
+  const re = /already associated with agent instance\s+["']?(\d+)["']?/i;
+  for (const field of [desc.message, desc.body]) {
+    if (!isNonBlank(field)) continue;
+    const m = re.exec(String(field));
+    if (m && isNonBlank(m[1])) return String(m[1]).trim();
+  }
+  return null;
+}
+
 // Redact a lease token down to a presence + short tail so it can be logged for
 // correlation without leaking the opaque fence value. For a short token a last-4
 // tail would reveal most (or all) of the value, so emit a fixed redacted marker
@@ -505,10 +550,20 @@ export function activationNamespace(job = {}) {
   return token ? shortHash(token) : '';
 }
 
-// Extract per-call metrics from an ACP update when the agent carries them (many
-// ACP agents do not — a documented ACP fidelity gap — so this is usually absent).
-// Reads the common usage locations and maps to the AgentHistory item metric field
-// names. Returns undefined when nothing usable is present.
+// Extract per-call metrics from an ACP update when the agent carries them.
+//
+// Issue #289 — WHY instance token metrics are near-always 0: the ACP `session/update`
+// stream this producer ingests does NOT carry per-turn input/output token counts. ACP's
+// only usage signal is `usage_update`, which reports context-window OCCUPANCY
+// (`{ used, size, cost }`), not `inputTokens`/`outputTokens` — a documented ACP fidelity
+// gap (see `@nanobpm/agentic` ACP_FIDELITY_GAPS, "usage / token accounting"). The
+// classifier deliberately DROPS it rather than mis-attribute occupancy as token counts,
+// so an ACP-mode run records `modelCalls`/`toolCalls` (derived from the turns) but
+// `metrics.inputTokens/outputTokens = 0`. That is a PROTOCOL limitation of ACP, not a
+// producer bug: a native (non-ACP) transcript carries the real accounting. This reader
+// therefore only records real token counts when an update ACTUALLY carries them (some
+// agents attach a `usage`/`_meta.usage` block to a message) and never fabricates them
+// from context-window data. Returns undefined when nothing usable is present.
 function extractMetrics(update) {
   const src =
     (isPlainObject(update?.usage) && update.usage) ||
@@ -1168,6 +1223,41 @@ export function createAgentInstanceProducer(opts = {}) {
         return false;
       }
       const d = describeSdkError(err);
+      // Issue #289 — ADOPT, don't re-create, on a 409 "already associated" conflict.
+      // When a prior activation's run was interrupted the producer left the instance
+      // open for a retry to continue; the retry (same elementInstanceKey) then gets a
+      // 409 naming the existing agent instance. The conflict is PERMANENT, so blindly
+      // retrying the create burns dozens of attempts (observed up to 79) and the run
+      // records no transcript. Instead, adopt the named instance and resume appending
+      // to it — exactly the continuation the engine's open instance was left for.
+      const adoptKey = (Number(d.status) === 409) ? parseAssociatedInstanceKey(d) : null;
+      if (adoptKey) {
+        agentInstanceKey = adoptKey;
+        if (!activatedAt) activatedAt = now();
+        if (loopIteration < 1) loopIteration = 1;
+        logger?.info?.(
+          `AgentInstance ${agentInstanceKey} ADOPTED for element instance ${elementInstanceKey} ` +
+            `(job ${jobKey}, attempt ${attempt}) ${correlation()} — createAgentInstance returned ` +
+            `409 (element instance already associated); resuming appends on the existing instance ` +
+            `instead of retrying the create.`,
+        );
+        replayPreMintBuffer();
+        return true;
+      }
+      // Issue #289 — a PERMANENT 4xx create rejection will never mint on a blind retry
+      // (a 404 "element instance is not active" — the job was cancelled mid-create — or a
+      // 400 "invalid agent history"). STOP retrying immediately and leave the producer
+      // inert for the rest of the run rather than burning attempts against a dying lease
+      // (the retry loop was observed making up to 79 futile attempts). A 409 is permanent
+      // too, but is ADOPTED above when it names an instance; a 409 without a parseable key
+      // falls through here and stops. The canonical shaped diagnostic below still carries
+      // the status/body/lease/model/correlation — only its retry clause changes.
+      const permanent = isPermanentCreateStatus(d.status);
+      if (permanent) disabled = true;
+      const effectiveClause = permanent
+        ? `not retried — the rejection is permanent (HTTP ${d.status}); no durable ` +
+          `transcript will be recorded for this run (job completion unaffected).`
+        : retryClause;
       // ONE canonical create-failure diagnostic (issue #230 / #229): the shaped
       // key=value line carrying the HTTP status + engine body (a lease fence vs a
       // schema error), the masked lease, model/provider, the correlation keys, and
@@ -1177,7 +1267,7 @@ export function createAgentInstanceProducer(opts = {}) {
         `AgentInstance producer: createAgentInstance failed (attempt ${attempt}) — ` +
           `status=${d.status ?? 'n/a'} message=${d.message} body=${d.body ?? 'n/a'} ` +
           `jobLease=${leaseTokenLabel(leaseToken)} model=${oneLine(def.model)} provider=${oneLine(def.provider)} ` +
-          `${correlation()}; ${retryClause}`,
+          `${correlation()}; ${effectiveClause}`,
       );
       return false;
     } finally {
@@ -1549,6 +1639,27 @@ export function createAgentInstanceProducer(opts = {}) {
     /** True once the AgentInstance has been minted. */
     get active() {
       return !!agentInstanceKey && !disabled;
+    },
+    /**
+     * When the producer is PERMANENTLY unavailable (`disabled` at construction — not a
+     * transient create failure), reports WHICH precondition(s) failed so the worker can
+     * log a specific cause instead of merging "SDK lacks create/update" with "classifier
+     * unavailable" (issue #289). Returns a short, comma-joined reason string, or null
+     * when the producer is usable (or was disabled LATER by a permanent create rejection
+     * rather than an unmet precondition). Deterministic — derived only from the
+     * construction-time preconditions.
+     */
+    get unavailableReason() {
+      if (usable) return null;
+      const reasons = [];
+      if (!camunda) reasons.push('no host SDK client');
+      else {
+        if (typeof camunda[SDK_CREATE] !== 'function') reasons.push(`SDK lacks ${SDK_CREATE}`);
+        if (typeof camunda[SDK_UPDATE] !== 'function') reasons.push(`SDK lacks ${SDK_UPDATE}`);
+      }
+      if (!classify) reasons.push('ACP classifier unavailable');
+      if (!isExternalAgentJob(job)) reasons.push('not an external agent job (no lease token / elementInstanceKey)');
+      return reasons.length ? reasons.join('; ') : null;
     },
     /**
      * True when the producer is NOT yet active but its create is still armed to retry

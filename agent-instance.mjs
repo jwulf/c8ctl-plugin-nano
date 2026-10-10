@@ -716,6 +716,13 @@ export function createAgentInstanceProducer(opts = {}) {
   // transient create failure — the latter is RETRIED, never permanently disabled
   // (issue #230).
   let disabled = !usable;
+  // Set when a create attempt was made and PERMANENTLY rejected (a 4xx that will never
+  // mint on a blind retry — see isPermanentCreateStatus). Distinct from a construction-
+  // time unmet precondition (`!usable`): the preconditions were valid, the ENGINE
+  // rejected the create. Holds the HTTP status so the caller can report "activation
+  // attempted but permanently rejected (HTTP N)" rather than "unknown precondition"
+  // (issue #289 review).
+  let permanentCreateStatus = null;
   let agentInstanceKey = null;
   // Create-retry bookkeeping. `creating` dedups a concurrent in-flight attempt;
   // `createAttempts` / `lastCreateAttemptAt` pace the exponential backoff so a
@@ -1253,7 +1260,10 @@ export function createAgentInstanceProducer(opts = {}) {
       // falls through here and stops. The canonical shaped diagnostic below still carries
       // the status/body/lease/model/correlation — only its retry clause changes.
       const permanent = isPermanentCreateStatus(d.status);
-      if (permanent) disabled = true;
+      if (permanent) {
+        disabled = true;
+        permanentCreateStatus = Number(d.status);
+      }
       const effectiveClause = permanent
         ? `not retried — the rejection is permanent (HTTP ${d.status}); no durable ` +
           `transcript will be recorded for this run (job completion unaffected).`
@@ -1660,6 +1670,18 @@ export function createAgentInstanceProducer(opts = {}) {
       if (!classify) reasons.push('ACP classifier unavailable');
       if (!isExternalAgentJob(job)) reasons.push('not an external agent job (no lease token / elementInstanceKey)');
       return reasons.length ? reasons.join('; ') : null;
+    },
+    /**
+     * The HTTP status of a create that was ATTEMPTED and PERMANENTLY rejected by the
+     * engine (a 4xx that will never mint on retry — see isPermanentCreateStatus), or
+     * null when no such rejection occurred. Distinct from `unavailableReason`, which
+     * reports a construction-time unmet precondition: here the preconditions were
+     * valid, the producer activated, and the create was rejected. Lets the worker log
+     * "activation attempted but permanently rejected (HTTP N)" instead of the
+     * misleading "activation not attempted: unknown precondition" (issue #289 review).
+     */
+    get permanentlyRejected() {
+      return permanentCreateStatus;
     },
     /**
      * True when the producer is NOT yet active but its create is still armed to retry

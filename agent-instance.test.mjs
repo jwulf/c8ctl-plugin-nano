@@ -2959,3 +2959,51 @@ test('#289: unavailableReason reports which precondition failed', () => {
   const ok = makeProducer(fakeClient());
   assert.equal(ok.unavailableReason, null);
 });
+
+test('#289 review: a permanent create rejection reports permanentlyRejected (status), not a construction-time unavailableReason', async () => {
+  // After a permanent 4xx create rejection the producer is `disabled`, but its
+  // construction-time preconditions were VALID — so `unavailableReason` (which reports
+  // only unmet preconditions) stays null. The worker must instead read
+  // `permanentlyRejected` to log "activation attempted but permanently rejected
+  // (HTTP N)", not the misleading "activation not attempted: unknown precondition".
+  const err404 = Object.assign(new Error('Not Found'), {
+    statusCode: 404,
+    body: 'element instance EIK-7 is not active',
+  });
+  const client = {
+    calls: { create: [], update: [] },
+    createAgentInstance: async (req) => { client.calls.create.push(req); throw err404; },
+    updateAgentInstance: async (req) => { client.calls.update.push(req); return { createdHistory: [] }; },
+  };
+  const p = makeProducer(client, { logger: recordingLogger() });
+  // Before activation nothing was rejected.
+  assert.equal(p.permanentlyRejected, null, 'no rejection before activate()');
+  const active = await p.activate();
+  assert.equal(active, false, 'a permanent rejection does not activate');
+  assert.equal(p.retryPending, false, 'a permanently rejected producer is not retry-pending');
+  assert.equal(p.permanentlyRejected, 404, 'the permanent rejection status is surfaced to the worker');
+  assert.equal(
+    p.unavailableReason,
+    null,
+    'unavailableReason stays null — the preconditions were valid, the engine rejected the attempt',
+  );
+});
+
+test('#289 review: permanentlyRejected is null for a usable producer and for an unmet precondition', () => {
+  // A healthy producer: no rejection.
+  const ok = makeProducer(fakeClient());
+  assert.equal(ok.permanentlyRejected, null);
+
+  // A construction-time precondition failure (missing SDK) is reported via
+  // unavailableReason, NOT permanentlyRejected — the two are distinct signals.
+  const noCreate = createAgentInstanceProducer({
+    camunda: { updateAgentInstance() {} },
+    job: EXTERNAL_JOB,
+    profile: PROFILE,
+    envelope: ENVELOPE,
+    logger: nullLogger,
+    now,
+  });
+  assert.equal(noCreate.permanentlyRejected, null, 'an unmet precondition is not a permanent rejection');
+  assert.match(noCreate.unavailableReason, /SDK lacks createAgentInstance/);
+});

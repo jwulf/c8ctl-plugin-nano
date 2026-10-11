@@ -4932,6 +4932,27 @@ let ghAuthTokenCache = GH_AUTH_TOKEN_UNSET;
 // It also prevents the timer and the SIGUSR1 handler from racing two concurrent
 // reads: a second async refresh awaits the first instead of spawning again.
 let ghAuthRefreshInFlight = null;
+// Monotonic generation counter bumped on EVERY write to `ghAuthTokenCache`
+// (`writeGhAuthCache` below is the single mutation point). It fences a stale
+// async refresh against a newer forced recovery (Copilot review on #293): the
+// synchronous clone/push auth-failure recovery (`invalidateGhAuthToken()` +
+// `refreshGhAuthToken({ force })`) CANNOT await an already-running async timer
+// refresh (sync code can't await the `ghAuthRefreshInFlight` promise). So an
+// async refresh can read the OLD token, yield across its scopes probe, the sync
+// recovery can adopt the ROTATED token in the meantime, and then the async
+// refresh's late `adoptGhAuthTokenAsync` would overwrite the cache with its
+// now-stale read — resurrecting the revoked credential. `refreshGhAuthTokenAsync`
+// snapshots this generation BEFORE it starts reading and `adoptGhAuthTokenAsync`
+// refuses to commit when the generation has advanced (a newer definitive write
+// landed), so an older read can never clobber a newer forced recovery.
+let ghAuthCacheGeneration = 0;
+// The single mutation point for `ghAuthTokenCache`. Every write (adopt, preserve,
+// invalidate/reset) goes through here so the generation fence above sees them all.
+function writeGhAuthCache(record) {
+  ghAuthTokenCache = record;
+  ghAuthCacheGeneration++;
+  return record;
+}
 // Test-only seam: the `gh auth token` reader `refreshGhAuthToken` consults when
 // no per-call `run` is injected. Production leaves this unset (the real
 // spawnSync of the gh CLI); a test installs a stub so the clone/push
@@ -5025,7 +5046,7 @@ function adoptGhAuthToken(token, { scopesProbe = ghTokenScopes } = {}) {
     // off-path refresh timer retries on its own cadence. With no usable prior
     // token, fall back to anonymous (null) as before.
     if (prev && prev.token != null) {
-      ghAuthTokenCache = { ...prev, lastCheck: now };
+      writeGhAuthCache({ ...prev, lastCheck: now });
       return { token: prev.token, changed: false };
     }
     token = null;
@@ -5035,7 +5056,7 @@ function adoptGhAuthToken(token, { scopesProbe = ghTokenScopes } = {}) {
   // (a TTL re-read that finds the same token must not pay the scopes ping, and
   // must not silently DROP the scopes it already reported).
   const scopes = token ? (changed ? scopesProbe(token) : (prev ? prev.scopes : null)) : null;
-  ghAuthTokenCache = {
+  writeGhAuthCache({
     token,
     fingerprint: ghTokenFingerprint(token),
     scopes: scopes ?? null,
@@ -5044,33 +5065,48 @@ function adoptGhAuthToken(token, { scopesProbe = ghTokenScopes } = {}) {
     // age (when we last asked gh) so the TTL is honoured.
     since: prev && prev.token === token && token != null ? prev.since : now,
     lastCheck: now,
-  };
+  });
   return { token, changed };
 }
 
 // The async twin of adoptGhAuthToken: identical cache semantics, but the scopes
 // probe is awaited so it may return a Promise (the async ghTokenScopesAsync).
-async function adoptGhAuthTokenAsync(token, { scopesProbe } = {}) {
+// `generation` (when provided by refreshGhAuthTokenAsync) is the cache generation
+// snapshotted BEFORE this refresh started reading. If it no longer matches at
+// commit time, a NEWER definitive write (a forced sync clone/push recovery, an
+// invalidate, or another refresh) landed while we were reading/probing — so this
+// read is stale and MUST NOT be committed, or it would resurrect the superseded
+// token (Copilot review on #293). We leave the newer cache in place and report
+// it as superseded.
+async function adoptGhAuthTokenAsync(token, { scopesProbe, generation = null } = {}) {
   const prev = ghAuthTokenCache === GH_AUTH_TOKEN_UNSET ? null : ghAuthTokenCache;
   const now = Date.now();
+  const superseded = () => {
+    const c = ghAuthTokenCache === GH_AUTH_TOKEN_UNSET ? null : ghAuthTokenCache;
+    return { token: c ? c.token : null, changed: false, superseded: true };
+  };
   if (token === GH_AUTH_READ_FAILED) {
     // Transient read failure (see adoptGhAuthToken): preserve the prior token and
     // bump `lastCheck` so the hot path keeps serving it; anonymous only with no prior.
     if (prev && prev.token != null) {
-      ghAuthTokenCache = { ...prev, lastCheck: now };
+      if (generation != null && generation !== ghAuthCacheGeneration) return superseded();
+      writeGhAuthCache({ ...prev, lastCheck: now });
       return { token: prev.token, changed: false };
     }
     token = null;
   }
   const changed = !prev || prev.token !== token;
   const scopes = token ? (changed ? await scopesProbe(token) : (prev ? prev.scopes : null)) : null;
-  ghAuthTokenCache = {
+  // Generation fence: re-check AFTER the (awaited) scopes probe, the last point a
+  // forced recovery could have slipped a newer credential in underneath us.
+  if (generation != null && generation !== ghAuthCacheGeneration) return superseded();
+  writeGhAuthCache({
     token,
     fingerprint: ghTokenFingerprint(token),
     scopes: scopes ?? null,
     since: prev && prev.token === token && token != null ? prev.since : now,
     lastCheck: now,
-  };
+  });
   return { token, changed };
 }
 
@@ -5201,10 +5237,14 @@ async function refreshGhAuthTokenAsync({ force = false, scopesProbe, _spawn } = 
   }
   // Honor the module reader seam when a test installed one (mirroring the sync
   // path) so a stubbed refresh never spawns; production (reader null) spawns.
+  // Snapshot the cache generation BEFORE the read begins: if a forced sync
+  // recovery commits a newer credential while we read/probe, adoptGhAuthTokenAsync
+  // sees the generation advance and refuses to clobber it (Copilot review on #293).
+  const startGen = ghAuthCacheGeneration;
   const run = (async () => {
     const token = ghAuthTokenReader ? ((ghAuthTokenReader() || null)) : await readGhAuthTokenAsync({ _spawn });
     const probe = scopesProbe ?? (ghAuthTokenReader ? (() => null) : ((tok) => ghTokenScopesAsync(tok, { _spawn })));
-    return adoptGhAuthTokenAsync(token, { scopesProbe: probe });
+    return adoptGhAuthTokenAsync(token, { scopesProbe: probe, generation: startGen });
   })();
   // Publish the in-flight marker BEFORE the first await inside `run` has a chance
   // to yield, so a job activated on the very next tick already sees it. The
@@ -5239,7 +5279,7 @@ function ghAuthTokenFromCli() {
 // supervisor's `reload-credentials` broadcast (SIGUSR1) after the operator
 // re-logs in — both need the NEXT job to see a fresh token.
 function invalidateGhAuthToken() {
-  ghAuthTokenCache = GH_AUTH_TOKEN_UNSET;
+  writeGhAuthCache(GH_AUTH_TOKEN_UNSET);
 }
 
 // A snapshot of the cached token's observable identity for logs and the

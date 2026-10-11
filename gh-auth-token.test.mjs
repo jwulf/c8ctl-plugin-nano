@@ -967,3 +967,75 @@ test('finalizeGit verifies the remote tip with the FRESH env after a nonzero ret
     rmSync(root, { recursive: true, force: true });
   }
 });
+
+// Advisory (review 5481943774): a stale async refresh must not overwrite a
+// credential committed by a NEWER forced recovery. The async timer refresh reads
+// the OLD token and yields across its scopes probe; meanwhile a synchronous
+// clone/push auth-failure recovery (which cannot await the in-flight async)
+// adopts the ROTATED token. The async refresh's late commit must be fenced off
+// by the cache generation so it can never resurrect the superseded credential.
+test('a stale async refresh does NOT clobber a newer forced sync recovery (generation fence)', async () => {
+  invalidateGhAuthToken();
+  // No module reader installed → the async refresh uses the `_spawn` seam. Gate
+  // the `gh auth token` read so the refresh stays in flight; the scopes probe
+  // (`api`) resolves immediately once the read releases.
+  let release = null;
+  const _spawn = (cmd, args) => {
+    if (args[0] === 'auth' && args[1] === 'token') return pendingChild((rel) => { release = rel; });
+    if (args[0] === 'api') return fakeChild({ stdout: 'HTTP/2 200\nX-OAuth-Scopes: repo\n\n{}', code: 0 });
+    return fakeChild({ stdout: '', code: 0 });
+  };
+  // Start the async refresh but do NOT await it — it is now reading `gho_old`.
+  const asyncRefresh = refreshGhAuthTokenAsync({ force: true, _spawn });
+  await new Promise((r) => setTimeout(r, 5));
+  // Forced synchronous recovery lands the ROTATED token while the async read is
+  // still gated. `run` injection keeps it hermetic (no real gh, no module reader).
+  invalidateGhAuthToken();
+  const rec = refreshGhAuthToken({ force: true, run: () => ({ status: 0, stdout: 'gho_new\n' }), scopesProbe: () => 'repo' });
+  assert.equal(rec.token, 'gho_new');
+  assert.equal(ghAuthTokenInfo().fingerprint, ghTokenFingerprint('gho_new'));
+  // Release the gated async read: it resolves `gho_old`, probes scopes, then the
+  // generation fence sees the generation advanced and REFUSES to commit.
+  release('gho_old');
+  const r = await asyncRefresh;
+  assert.equal(r.superseded, true, 'the stale async read reports itself superseded');
+  assert.equal(r.token, 'gho_new', 'the superseded refresh returns the newer live token');
+  assert.equal(ghAuthTokenInfo().fingerprint, ghTokenFingerprint('gho_new'), 'the forced recovery credential survived');
+  invalidateGhAuthToken();
+});
+
+// Sibling of the above on the TRANSIENT-failure branch: an async read that comes
+// back GH_AUTH_READ_FAILED would normally preserve the prior token (bumping
+// lastCheck). If a newer forced recovery landed meanwhile, even that benign
+// re-stamp must be fenced so it cannot touch the newer record. A `generation` of
+// -1 can never match the live monotonic counter (it only ever increments from
+// 0), so it deterministically models "a newer write has landed since we read".
+test('a stale async READ_FAILED preserve is fenced against a newer forced recovery', async () => {
+  invalidateGhAuthToken();
+  // A live credential is in the cache (the "newer forced recovery" result).
+  refreshGhAuthToken({ force: true, run: () => ({ status: 0, stdout: 'gho_live\n' }), scopesProbe: () => 'repo' });
+  // An outdated-generation async adopt of READ_FAILED must NOT re-stamp the cache.
+  const r = await adoptGhAuthTokenAsync(GH_AUTH_READ_FAILED, { scopesProbe: () => 'repo', generation: -1 });
+  assert.equal(r.superseded, true, 'a stale READ_FAILED preserve is reported superseded');
+  assert.equal(r.token, 'gho_live', 'the superseded preserve returns the newer live token');
+  assert.equal(ghAuthTokenInfo().fingerprint, ghTokenFingerprint('gho_live'), 'the live record was not re-stamped by the stale preserve');
+  invalidateGhAuthToken();
+});
+
+// The fence is a no-op when no newer write interleaves: an async adopt whose
+// snapshotted generation still matches commits normally.
+test('an async adopt whose generation still matches commits normally (fence no-op)', async () => {
+  invalidateGhAuthToken();
+  // refreshGhAuthTokenAsync snapshots the generation internally; with no
+  // interleaving forced recovery the read must land in the cache.
+  const _spawn = (cmd, args) => {
+    if (args[0] === 'auth' && args[1] === 'token') return fakeChild({ stdout: 'gho_solo\n', code: 0 });
+    if (args[0] === 'api') return fakeChild({ stdout: 'HTTP/2 200\nX-OAuth-Scopes: repo\n\n{}', code: 0 });
+    return fakeChild({ stdout: '', code: 0 });
+  };
+  const r = await refreshGhAuthTokenAsync({ force: true, _spawn });
+  assert.equal(r.token, 'gho_solo');
+  assert.ok(!r.superseded, 'an uncontended refresh is not superseded');
+  assert.equal(ghAuthTokenInfo().fingerprint, ghTokenFingerprint('gho_solo'));
+  invalidateGhAuthToken();
+});

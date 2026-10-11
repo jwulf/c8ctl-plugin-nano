@@ -1068,6 +1068,36 @@ agent command shells out to `gh`. A **container** sandbox is isolated and does
 **not** inherit that host login; provide the token explicitly via
 `setup.secretRefs` / `--secret-resolver host` (see **Secrets** below) instead.
 
+**Refreshing a `gh` login while workers run.** When no `GITHUB_TOKEN` is
+exported, a worker falls back to `gh auth token` and caches it (a synchronous
+CLI read that can't run on the per-job path). The cache is **not**
+process-lifetime: it is re-read on a short TTL (`NANO_GH_TOKEN_TTL_MS`, default
+5 minutes) off the job path — the timer DEFERS a tick while a job is active — and
+a clone/push that fails with an auth or OAuth-scope error (401/403, "refusing to
+allow an OAuth App … without `workflow` scope") forces a fresh re-read and
+retries once before failing — the re-read is **non-destructive** (it does not
+drop the cache first), so a transiently-failing re-read can't erase a still-valid
+(possibly newer) cached credential — so a `gh auth login` / `gh auth refresh` you run
+while the fleet is up is adopted once the worker is idle and the next tick runs
+(bounded by the in-flight job's remaining duration plus up to one interval), and
+a rotated token self-heals mid-flight via the recovery path. Under **sustained**
+back-to-back load a worker is never idle at a tick, so that defer is itself
+bounded (`NANO_GH_TOKEN_MAX_DEFER_MS`, default 4 intervals): once the cached
+token is stale beyond it, the timer re-reads **despite** an active job — the read
+is async (never a blocking `spawnSync`), so it can't stall the job — capping
+staleness at a few intervals instead of the worker's whole busy lifetime. Each worker logs the
+token's **fingerprint + scopes** (never the value) at startup and whenever it
+changes, and `c8ctl nano supervisor status` shows a **GH AUTH** column (token
+age + scopes) per worker, so "this worker has a stale token" is a one-line
+check. To force every worker to re-read `gh auth token` immediately — without
+draining in-flight jobs — run `c8ctl nano supervisor reload-credentials`. It
+does **not** null the cache first: it requests an immediate asynchronous forced
+re-read and swaps the cached token **atomically** only once the new value lands,
+so a worker (including one mid-job) keeps serving the still-valid old token for
+the brief read window rather than handing out null — a job started immediately
+after the command can therefore still receive the old token until the re-read
+settles.
+
 **Secrets.** Secrets are referenced by **name**, never value. `setup.secretRefs`
 (and the repo/PR credential when `task.allowPr` is set — defaulting to
 `GITHUB_TOKEN` for GitHub) are resolved via a pluggable `--secret-resolver`
@@ -1182,6 +1212,7 @@ c8ctl nano supervisor add reviewer --instances 3    # add 3 distinct auto-named 
 c8ctl nano supervisor restart reviewer             # by worker id or profile name
 c8ctl nano supervisor reload                        # adopt new code fleet-wide (rolling drain+respawn, zero downtime)
 c8ctl nano supervisor reload reviewer               # reload just one worker/profile
+c8ctl nano supervisor reload-credentials            # after `gh auth login`/refresh: every worker re-reads its gh token now (async; old token served until the re-read lands; no drain)
 c8ctl nano supervisor remove coder                 # stop + drop a worker (also: `all`)
 c8ctl nano supervisor logs reviewer --follow       # tail a worker's log (or the daemon's)
 c8ctl nano supervisor stop                          # stop the daemon and every worker

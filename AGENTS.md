@@ -63,7 +63,35 @@ SDK client (job workers) — do **not** add the SDK as a dependency or use raw
   run the harness with that workspace as `cwd` → push the branch (`branch.push`)
   → reconcile the **agent-opened** PR (`task.allowPr`, via `gh pr list --head`).
   The repo token is delivered via `GIT_ASKPASS` (env) and **redacted** from all
-  logs/results — never in argv or the remote URL. A push failure is **non-fatal**
+  logs/results — never in argv or the remote URL. When no `GITHUB_TOKEN` is
+  exported the token comes from a cached `gh auth token` read (issue #293): the
+  cache is a record `{ token, fingerprint, scopes, since, lastCheck }` with a
+  TTL (`NANO_GH_TOKEN_TTL_MS`, default 5m), re-read off the job path by a
+  worker-lifetime timer (`startGhAuthTokenRefresh`) that DEFERS a tick while a
+  job is active, so a `gh auth login` / `refresh` while the fleet runs is adopted
+  once the worker is next idle and the following tick runs — bounded by the
+  in-flight job's remaining duration plus up to one interval, never a stale
+  process-lifetime memo. That defer is itself BOUNDED
+  (`NANO_GH_TOKEN_MAX_DEFER_MS`, default 4 intervals): under sustained
+  back-to-back load a worker is never idle at a tick, so once a PRIMED cache is
+  stale beyond the bound the timer re-reads DESPITE an active job (still async,
+  never `spawnSync`, so it can't stall the job), capping staleness at a few
+  intervals instead of the worker's whole busy lifetime (an UNSET cache is never
+  primed mid-job). A clone/push that fails with an auth/OAuth-scope error
+  (`isGitAuthFailure`) forces one re-read and retries once before failing. That
+  re-read is **non-destructive** — it does NOT null the cache first, so a
+  transiently-failing re-read can't erase a still-valid (possibly newer, from a
+  `reload-credentials` swap) cached credential; the retry fires only when the
+  re-read yields a token DIFFERENT from the one that failed. The token's
+  **fingerprint + scopes** (never the value) are logged at
+  startup and on change, ride the activity marker (`ghAuthTokenInfo()`) into a
+  `supervisor status` **GH AUTH** column, and `supervisor reload-credentials`
+  (SIGUSR1) requests an immediate async forced re-read fleet-wide without
+  draining in-flight jobs — it does NOT null the cache first but swaps it
+  atomically when the new token lands, so a worker keeps serving the still-valid
+  old token (and a job started right after the command may still get it) until
+  the re-read settles. A push
+  failure is **non-fatal**
   and sets `pushFailed` (the authoritative "work is stranded / workspace
   preserved" flag) so the worker still completes the job and the process model
   drives the merge; a clone/checkout failure sheds (retryable `ProvisionError`).

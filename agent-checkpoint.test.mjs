@@ -1343,6 +1343,47 @@ test('setupWorkspaceCheckpoints: discardAfterAck deletes the ref after the works
   } finally { f.cleanup(); }
 });
 
+test('setupWorkspaceCheckpoints: updateCredential rebinds the token discardAfterAck authenticates with (#293)', async () => {
+  // A job can ROTATE its gh credential mid-run (finalizeGit's push auth-failure
+  // recovery re-reads a fresh token). The checkpoint cleanup captured the ORIGINAL
+  // token at setup, so without propagation discardAfterAck would push the ref
+  // deletion with the already-rejected credential and leak the remote WIP ref.
+  // updateCredential must rebind the token the post-ack deletion authenticates with.
+  const f = fixture();
+  try {
+    const { dir } = f.clone('rotated');
+    const provisioned = { workspaceDir: dir, gitEnv: ENV, committer: {}, startSha: sh(dir, 'rev-parse', 'HEAD') };
+    const logger = quietLogger();
+    const scratchEnvs = [];
+    const realMk = createGitRunner;
+    // Capture the env of every git runner created OUTSIDE the workspace clone —
+    // discardAfterAck's throwaway scratch repo lives in an OS tmpdir, so its
+    // GIT_TOKEN is the credential the ref-deletion push actually used.
+    const spyMk = (opts) => {
+      if (opts?.cwd && !String(opts.cwd).startsWith(dir)) scratchEnvs.push({ ...(opts.env || {}) });
+      return realMk(opts);
+    };
+    const s = await setupWorkspaceCheckpoints({ provisioned, token: 'tok_stale', job: { jobKey: '1', elementInstanceKey: '77' }, jobType: 't', runId: 'r', logger, env: { NANO_AGENT_CHECKPOINT: 'on', NANO_AGENT_CHECKPOINT_INTERVAL_MS: '0' }, deps: { sweepRegistry: new Map(), createGitRunner: spyMk } });
+    writeFileSync(join(dir, 'a.txt'), 'changed\n');
+    assert.ok((await s.checkpointer.flush('final', { timeoutMs: 0 })).sha);
+    await s.close();
+    rmSync(dir, { recursive: true, force: true });
+    // The job rotated its credential after the setup captured 'tok_stale'.
+    s.updateCredential('tok_fresh');
+    // Only inspect the POST-rotation cleanup push — the live checkpointer
+    // legitimately used 'tok_stale' during the run, before the rotation.
+    scratchEnvs.length = 0;
+    await s.discardAfterAck();
+    assert.throws(() => sh(f.root, '--git-dir', f.remote, 'rev-parse', '--verify', 'refs/nano/wip/77'), 'the ref was deleted after the ack');
+    assert.ok(scratchEnvs.some((e) => e.GIT_TOKEN === 'tok_fresh'), 'discardAfterAck authenticated with the ROTATED token');
+    assert.ok(!scratchEnvs.some((e) => e.GIT_TOKEN === 'tok_stale'), 'the rejected token was not reused by the post-ack deletion');
+    // A no-op rotation (falsy / unchanged) must not disturb the bound credential.
+    s.updateCredential(null);
+    s.updateCredential('tok_fresh');
+    assert.deepEqual(logger.lines.warn, []);
+  } finally { f.cleanup(); }
+});
+
 test('createGitRunner suppresses configured credential helpers so the token is never persisted', async () => {
   const dir = mkdtempSync(join(tmpdir(), 'ckpt-cred-'));
   try {
@@ -1383,6 +1424,11 @@ test('job handler wires checkpoints: notify on ACP updates, flush on abort/failu
   const finalize = src.indexOf('gitResult = finalizeGit({', stop);
   const decide = i('discardCheckpointOnAck = Boolean(checkpointing && result.ok');
   assert.ok(setup < note && note < notify && notify < abort && abort < failed && failed < stop && stop < finalize && finalize < decide);
+  // #293 (previously-missed): a mid-finalize credential rotation must be
+  // propagated to the checkpoint cleanup BEFORE the discard decision, so
+  // discardAfterAck authenticates with the live token, not the rejected one.
+  const propagate = src.indexOf('checkpointing?.updateCredential?.(gitResult.rotatedToken)', finalize);
+  assert.ok(propagate > finalize && propagate < decide, 'the rotated token is propagated to checkpoint cleanup after finalize, before the discard decision');
   // #264 (review thread 4099675063): the final flush is timeout-bounded, so the
   // scheduler must be DRAINED (stop() awaits the in-flight checkpoint chain)
   // before finalizeGit touches the workspace — otherwise finalization can race a

@@ -49,6 +49,7 @@ import {
   bindJobSettle,
   countSupervisorInFlight,
   activityMarkerReadyFor,
+  reloadCredentialsReady,
   waitForChildExit,
   supervisorWorkerActivityFile,
   SETTLEMENT_PENDING_GHOST_TTL_MS,
@@ -1141,6 +1142,10 @@ test('buildActivityPayload carries engine + agentic and derives busy from jobs',
     engine: 'http://localhost:8080',
     agentic: { status: 'connected', mode: 'local' },
     readyAt: null,
+    // #293: the cached gh token's identity (fingerprint/scopes/age — never the
+    // value) rides the marker so `supervisor status` can show it; null when the
+    // producer did not stamp it (an un-primed cache / older worker).
+    ghAuth: null,
   });
 
   // Busy: jobs present → busy:true; the live job list rides through untouched.
@@ -1178,6 +1183,22 @@ test('activityMarkerReadyFor: a marker is ready only with a finite readyAt AND a
   // A non-finite readyAt is never ready; a missing marker is never ready.
   assert.equal(activityMarkerReadyFor({ pid: 4242, readyAt: NaN }, 4242), false);
   assert.equal(activityMarkerReadyFor(null, 4242), false);
+});
+
+test('reloadCredentialsReady: only signal a worker whose reload listener is proven installed (#293)', () => {
+  // Happy path: worker exists, pid alive, marker ready for THIS pid.
+  assert.equal(reloadCredentialsReady({ pid: 4242 }, { pid: 4242, readyAt: 100 }, true), true);
+  // A freshly spawned worker that has NOT yet installed its SIGUSR1 handler
+  // (no readyAt) must be SKIPPED — signalling it would start the inspector
+  // instead of reloading. This is the core of the fix.
+  assert.equal(reloadCredentialsReady({ pid: 4242 }, { pid: 4242, readyAt: null }, true), false);
+  assert.equal(reloadCredentialsReady({ pid: 4242 }, null, true), false);
+  // A stale marker from a previous incarnation (foreign pid) must not satisfy
+  // the gate for the current child.
+  assert.equal(reloadCredentialsReady({ pid: 4242 }, { pid: 111, readyAt: 100 }, true), false);
+  // A dead or absent worker is never signalled regardless of a ready marker.
+  assert.equal(reloadCredentialsReady({ pid: 4242 }, { pid: 4242, readyAt: 100 }, false), false);
+  assert.equal(reloadCredentialsReady(null, { pid: 4242, readyAt: 100 }, true), false);
 });
 
 test('waitForChildExit removes its exit listener on timeout — no listener accumulation across polls (#253)', async () => {

@@ -5299,7 +5299,16 @@ function ghAuthTokenFromCli() {
     return ghAuthTokenCache === GH_AUTH_TOKEN_UNSET ? null : ghAuthTokenCache.token;
   }
   if (ghAuthTokenCache === GH_AUTH_TOKEN_UNSET) return refreshGhAuthToken({ force: true }).token;
-  return refreshGhAuthToken().token;
+  // A PRIMED cache is served verbatim — NEVER a synchronous TTL-triggered
+  // re-read on this per-job hot path (Copilot review on #293). The async timer
+  // DEFERS a tick while a job is active, so a skipped tick can leave the cache
+  // past its TTL when the next job arrives; a `refreshGhAuthToken()` here would
+  // then run `spawnSync('gh auth token')` + the synchronous scopes probe inline,
+  // blocking the event loop (and the lock heartbeat) for up to 15s. Startup
+  // priming, the async maintenance timer, and the clone/push auth-failure
+  // recovery (which force-re-reads if the handed-out token turns out stale) own
+  // every refresh; this path only hands out what they populated.
+  return ghAuthTokenCache.token;
 }
 
 // Drop the cached gh token so the next lookup re-reads the CLI. Called on a git
@@ -6749,6 +6758,17 @@ async function setupWorkspaceCheckpoints({ provisioned, envelope = null, token =
       restored,
       priorNotRestored,
       flushTimeoutMs: cfg.flushTimeoutMs,
+      // Adopt a credential the job ROTATED after this checkpointer was created —
+      // e.g. finalizeGit's push auth-failure recovery re-read a fresh gh token
+      // (its `rotatedToken`). The post-ack ref deletion (`discardAfterAck`) rebuilds
+      // its own askpass purely from `token`, so re-binding `token` here is enough
+      // to make the cleanup push authenticate with the live credential instead of
+      // the one the remote already rejected — otherwise the WIP ref lingers until a
+      // later GC (Copilot review on #293). Ignored when the token is unchanged or
+      // falsy; the live checkpointer has already stopped by the time this is called.
+      updateCredential(nextToken) {
+        if (nextToken && nextToken !== token) token = nextToken;
+      },
       // True when the workspace still holds checkpoint content NOT captured by a
       // commit, so the pushed branch does not represent it (an uncommitted restored
       // or working delta that lives only on the WIP ref). The discard-on-ack gate
@@ -6863,6 +6883,13 @@ function finalizeGit({ workspaceDir, gitEnv, startSha, workingBranch, baseBranch
   const postAttribution = _postAttribution || postAgentAttribution;
   const cs = corr ? ` [${corr}]` : ''; // #229 cross-channel correlation suffix
   const out = { branch: workingBranch, baseSha: startSha || null, headSha: null, commits: [], pushed: false, remote: null, pr: null };
+  // The credential this finalize was HANDED. The push auth-failure recovery below
+  // may rotate `token` to a freshly re-read gh credential mid-finalize; capturing
+  // the original lets the return expose `rotatedToken` so the CALLER can propagate
+  // the rotation to subsystems that captured the pre-rotation credential — notably
+  // the WIP-checkpoint cleanup, whose `discardAfterAck()` would otherwise push a
+  // ref deletion with the already-rejected token (Copilot review on #293).
+  const originalToken = token;
 
   // Bound EVERY finalize git op against ONE shared deadline derived from the recovery
   // window (budgetMs) — the LOCAL graph scans below AND the sequential NETWORK ops
@@ -7497,6 +7524,11 @@ function finalizeGit({ workspaceDir, gitEnv, startSha, workingBranch, baseBranch
       out.attribution = postAttribution({ workspaceDir, token, number: out.pr.number });
     }
   }
+  // Surface a mid-finalize credential rotation (the push auth-failure recovery
+  // re-read a fresh gh token) so the caller can propagate it to subsystems that
+  // captured the pre-rotation credential — the WIP-checkpoint cleanup in
+  // particular (Copilot review on #293). Absent when the token was never rotated.
+  if (token && token !== originalToken) out.rotatedToken = token;
   return out;
 }
 
@@ -12568,6 +12600,17 @@ async function workAgent(req, flags, ctx) {
             }
           } else if (provisioned) {
             gitResult = { remote: provisioned.remote, branch: provisioned.workingBranch, baseSha: provisioned.startSha || null, commits: [], pushed: false };
+          }
+          // Propagate a mid-finalize credential rotation (finalizeGit's push
+          // auth-failure recovery re-read a fresh gh token) to every subsystem that
+          // captured the pre-rotation token: the outer `repoToken` (later redaction /
+          // consumers) and the WIP-checkpoint cleanup, whose post-ack ref deletion
+          // would otherwise authenticate with the credential origin already rejected
+          // and leave the remote WIP ref behind until a GC sweep (Copilot review on
+          // #293). No-op when the token was not rotated.
+          if (gitResult?.rotatedToken) {
+            repoToken = gitResult.rotatedToken;
+            checkpointing?.updateCredential?.(gitResult.rotatedToken);
           }
           // #264: the work is durable on the pushed branch, so the WIP ref goes —
           // but only once the engine acks job.complete (below): until then a lost

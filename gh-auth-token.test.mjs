@@ -798,6 +798,38 @@ test('an in-flight async refresh suppresses the synchronous per-job re-read (#29
   invalidateGhAuthToken();
 });
 
+test('ghAuthTokenFromCli serves a PRIMED cache without a blocking re-read even past the TTL (#293 review)', () => {
+  // The warm-cache per-job hot path must NEVER run `spawnSync('gh auth token')`
+  // + the synchronous scopes probe when the cache is already primed — not even
+  // once its TTL has lapsed (a timer tick deferred while a job was active). A
+  // deferred tick + a job arriving before the next idle tick is exactly the 15s
+  // event-loop/lease stall the fix removes. Drive it in a CHILD with TTL=0 (so a
+  // pre-fix build re-reads on every lookup): prime with one token, rotate the
+  // reader's answer, then prove the per-job lookup still hands out the PRIMED
+  // token and never consults the reader again.
+  const pluginUrl = new URL('./c8ctl-plugin.js', import.meta.url).href;
+  const script = `
+    import { setGhAuthTokenReader, invalidateGhAuthToken, refreshGhAuthToken, ghAuthTokenFromCli } from ${JSON.stringify(pluginUrl)};
+    let served = 'gho_primed';
+    let reads = 0;
+    setGhAuthTokenReader(() => { reads++; return served; });
+    invalidateGhAuthToken();
+    refreshGhAuthToken({ force: true }); // prime (read #1)
+    const afterPrime = reads;
+    served = 'gho_rotated'; // the reader would now answer differently if consulted
+    const a = ghAuthTokenFromCli();
+    const b = ghAuthTokenFromCli();
+    if (a !== 'gho_primed' || b !== 'gho_primed') { console.error('hot path did not serve the cache:', a, b); process.exit(2); }
+    if (reads !== afterPrime) { console.error('hot path re-read gh:', reads, 'vs', afterPrime); process.exit(3); }
+    process.exit(0);
+  `;
+  const r = spawnSync(process.execPath, ['--input-type=module', '-e', script], {
+    env: { ...process.env, NANO_GH_TOKEN_TTL_MS: '0' },
+    encoding: 'utf8',
+  });
+  assert.equal(r.status, 0, `child asserted the hot-path contract: stdout=${r.stdout} stderr=${r.stderr}`);
+});
+
 test('a forced async refresh performs a FRESH read after awaiting an in-flight one (#293 review)', async () => {
   // reload-credentials (SIGUSR1) fires a FORCED refresh while a periodic refresh
   // is already in flight. The in-flight read may have captured the OLD token
@@ -942,6 +974,7 @@ test('finalizeGit retries the push once with a fresh token on an auth failure (#
     assert.equal(pushes, 2, 'the push was retried once after the auth failure');
     assert.equal(out.pushed, true, 'the retry with the fresh token succeeded');
     assert.equal(ghAuthTokenInfo().fingerprint, ghTokenFingerprint('gho_fresh'), 'the rotated token was adopted');
+    assert.equal(out.rotatedToken, 'gho_fresh', 'the rotation is surfaced so the caller can propagate it to checkpoint cleanup (#293)');
   } finally {
     resetGhAuthTokenReader();
     invalidateGhAuthToken();
@@ -961,6 +994,7 @@ test('finalizeGit does NOT retry the push when the re-read token is unchanged (#
     assert.equal(pushes, 1, 'no retry when the re-read token did not change');
     assert.equal(out.pushed, false);
     assert.ok(out.pushFailed, 'the unchanged-token push failure strands the commits');
+    assert.ok(!('rotatedToken' in out), 'no rotation surfaced when the token did not change (#293)');
   } finally {
     resetGhAuthTokenReader();
     invalidateGhAuthToken();

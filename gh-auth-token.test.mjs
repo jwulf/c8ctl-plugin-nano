@@ -20,6 +20,15 @@ import {
   invalidateGhAuthToken,
   setGhAuthTokenReader,
   resetGhAuthTokenReader,
+  classifyGhAuthRead,
+  GH_AUTH_READ_FAILED,
+  adoptGhAuthToken,
+  adoptGhAuthTokenAsync,
+  readGhAuthTokenAsync,
+  ghCredentialEnvName,
+  applyRotatedGhCredential,
+  supervisorStatusSignature,
+  reageSupervisorStatus,
   ghAuthTokenInfo,
   describeGhAuthToken,
   ghTokenFingerprint,
@@ -433,7 +442,7 @@ test('provisionRepo does NOT retry a non-auth clone failure (#293)', { skip: !gi
 // A fake child process for the `_spawn` seam: emits the given stdout on the
 // next tick and closes with the given code, so the async gh readers can be
 // driven deterministically without spawning a real process.
-function fakeChild({ stdout = '', code = 0 } = {}) {
+function fakeChild({ stdout = '', stderr = '', code = 0, emitError = null } = {}) {
   const handlers = { stdout: [], stderr: [], error: [], close: [] };
   const child = {
     stdout: { on: (ev, fn) => { if (ev === 'data') handlers.stdout.push(fn); } },
@@ -443,6 +452,8 @@ function fakeChild({ stdout = '', code = 0 } = {}) {
   };
   queueMicrotask(() => {
     for (const fn of handlers.stdout) fn(Buffer.from(stdout));
+    if (stderr) for (const fn of handlers.stderr) fn(Buffer.from(stderr));
+    if (emitError) { for (const fn of handlers.error) fn(emitError); return; }
     for (const fn of handlers.close) fn(code);
   });
   return child;
@@ -760,6 +771,196 @@ test('finalizeGit does NOT retry a non-auth push failure (#293 review)', { skip:
     const out = finalizeGit({ ...prov, envelope, token: 'gho_cache', logger: { warn: () => {}, error: () => {}, info: () => {}, debug: () => {} }, _pushGit: pushSeam });
     assert.equal(pushes, 1, 'a non-auth push failure is not retried');
     assert.equal(out.pushed, false);
+  } finally {
+    resetGhAuthTokenReader();
+    invalidateGhAuthToken();
+    rmSync(root, { recursive: true, force: true });
+  }
+});
+
+// --- #293 Copilot "Previously missed" advisories (review 5481797344) --------
+
+// Advisory #1: a transient `gh auth token` read failure must NOT be adopted as a
+// real token change — the readers now return a GH_AUTH_READ_FAILED sentinel that
+// `adopt*` treats as "preserve the cached credential".
+
+test('classifyGhAuthRead distinguishes token / logout / transient failure (#293)', () => {
+  // A real token (clean exit, trimmed).
+  assert.equal(classifyGhAuthRead({ status: 0, stdout: 'gho_live\n' }), 'gho_live');
+  // Clean exit, no output → DEFINITIVE no-login (null).
+  assert.equal(classifyGhAuthRead({ status: 0, stdout: '  \n' }), null);
+  // Nonzero with gh's logged-out stderr → DEFINITIVE null.
+  assert.equal(classifyGhAuthRead({ status: 1, stderr: 'no oauth token found for github.com' }), null);
+  assert.equal(classifyGhAuthRead({ status: 1, stderr: 'You are not logged in to any GitHub hosts.' }), null);
+  // Nonzero WITHOUT a logout signal (keychain hiccup) → TRANSIENT sentinel.
+  assert.equal(classifyGhAuthRead({ status: 1, stderr: 'error connecting to keychain' }), GH_AUTH_READ_FAILED);
+  // spawnSync set `.error` (ENOENT / timeout) → TRANSIENT sentinel.
+  assert.equal(classifyGhAuthRead({ error: new Error('spawn ETIMEDOUT') }), GH_AUTH_READ_FAILED);
+});
+
+test('adoptGhAuthToken preserves the cached token on a transient read failure and bumps lastCheck (#293)', () => {
+  invalidateGhAuthToken();
+  setGhAuthTokenReader(() => 'gho_cached');
+  try {
+    refreshGhAuthToken({ force: true }); // cache ← gho_cached
+    assert.equal(ghAuthTokenInfo().fingerprint, ghTokenFingerprint('gho_cached'));
+    const r = adoptGhAuthToken(GH_AUTH_READ_FAILED);
+    assert.equal(r.token, 'gho_cached', 'the cached token is preserved, not wiped');
+    assert.equal(r.changed, false, 'a transient failure is not a credential change');
+    assert.equal(ghAuthTokenInfo().fingerprint, ghTokenFingerprint('gho_cached'));
+    assert.ok(ghAuthTokenInfo().lastCheckAgoMs < 1000, 'lastCheck was bumped so the hot path short-circuits');
+  } finally {
+    resetGhAuthTokenReader();
+    invalidateGhAuthToken();
+  }
+});
+
+test('adoptGhAuthToken falls back to anonymous on a transient failure with NO prior token (#293)', () => {
+  invalidateGhAuthToken();
+  const r = adoptGhAuthToken(GH_AUTH_READ_FAILED);
+  assert.equal(r.token, null, 'no usable prior credential → anonymous');
+  assert.equal(ghAuthTokenInfo().present, false);
+  invalidateGhAuthToken();
+});
+
+test('adoptGhAuthTokenAsync preserves the cached token on a transient read failure (#293)', async () => {
+  invalidateGhAuthToken();
+  setGhAuthTokenReader(() => 'gho_async_cached');
+  try {
+    await refreshGhAuthTokenAsync({ force: true });
+    const r = await adoptGhAuthTokenAsync(GH_AUTH_READ_FAILED, { scopesProbe: () => null });
+    assert.equal(r.token, 'gho_async_cached');
+    assert.equal(r.changed, false);
+    assert.equal(ghAuthTokenInfo().fingerprint, ghTokenFingerprint('gho_async_cached'));
+  } finally {
+    resetGhAuthTokenReader();
+    invalidateGhAuthToken();
+  }
+});
+
+test('readGhAuthTokenAsync maps spawn outcomes to token / null / sentinel (#293)', async () => {
+  const live = await readGhAuthTokenAsync({ _spawn: () => fakeChild({ stdout: 'gho_x\n', code: 0 }) });
+  assert.equal(live, 'gho_x');
+  const loggedOut = await readGhAuthTokenAsync({ _spawn: () => fakeChild({ code: 1, stderr: 'no oauth token found for github.com' }) });
+  assert.equal(loggedOut, null, 'a definitive logout resolves null');
+  const transient = await readGhAuthTokenAsync({ _spawn: () => fakeChild({ code: 1, stderr: 'fatal: keychain locked' }) });
+  assert.equal(transient, GH_AUTH_READ_FAILED, 'an unrecognised nonzero exit resolves the sentinel');
+  const spawnErr = await readGhAuthTokenAsync({ _spawn: () => fakeChild({ emitError: new Error('ENOENT') }) });
+  assert.equal(spawnErr, GH_AUTH_READ_FAILED, 'a spawn error resolves the sentinel');
+  const threw = await readGhAuthTokenAsync({ _spawn: () => { throw new Error('spawn threw'); } });
+  assert.equal(threw, GH_AUTH_READ_FAILED, 'a synchronous spawn throw resolves the sentinel');
+});
+
+test('refreshGhAuthTokenAsync keeps the cached token across a transient failure (no reader) (#293)', async () => {
+  invalidateGhAuthToken();
+  resetGhAuthTokenReader();
+  // Prime the cache with a successful async read.
+  await refreshGhAuthTokenAsync({ force: true, _spawn: (cmd, args) => {
+    if (args[0] === 'auth') return fakeChild({ stdout: 'gho_primed\n', code: 0 });
+    return fakeChild({ stdout: 'HTTP/2 200\nX-OAuth-Scopes: repo\n\n{}', code: 0 });
+  } });
+  assert.equal(ghAuthTokenInfo().fingerprint, ghTokenFingerprint('gho_primed'));
+  // A later transient failure must not wipe it.
+  const r = await refreshGhAuthTokenAsync({ force: true, _spawn: (cmd, args) => {
+    if (args[0] === 'auth') return fakeChild({ code: 1, stderr: 'fatal: transient' });
+    return fakeChild({ stdout: '', code: 0 });
+  } });
+  assert.equal(r.token, 'gho_primed', 'the transient failure preserved the primed token');
+  assert.equal(r.changed, false);
+  // The synchronous hot path still serves it without a blocking re-read.
+  assert.equal(ghAuthTokenFromCli(), 'gho_primed');
+  invalidateGhAuthToken();
+});
+
+// Advisory #3: when clone recovery rotates the gh-cache token, the `resolved`
+// secret map forwarded to the harness must be updated too.
+
+test('ghCredentialEnvName mirrors resolveJobSecrets keying (#293)', () => {
+  assert.equal(ghCredentialEnvName({ provider: 'github' }), 'GITHUB_TOKEN');
+  assert.equal(ghCredentialEnvName({ provider: 'github', authRef: 'MY_PAT' }), 'MY_PAT');
+  assert.equal(ghCredentialEnvName({ provider: 'github', authRef: '   ' }), null, 'a blank authRef forwards no credential');
+  assert.equal(ghCredentialEnvName({ provider: 'gitlab' }), null, 'a non-github default forwards no credential');
+});
+
+test('applyRotatedGhCredential updates ONLY a forwarded gh-cache credential (#293)', () => {
+  // gh-cache + default key present → updated in place.
+  const def = { GITHUB_TOKEN: 'stale' };
+  applyRotatedGhCredential({ resolved: def, provider: 'github', authRef: undefined, source: 'gh-cache', token: 'fresh' });
+  assert.equal(def.GITHUB_TOKEN, 'fresh');
+  // custom authRef key present → updated.
+  const cust = { MY_PAT: 'stale' };
+  applyRotatedGhCredential({ resolved: cust, provider: 'github', authRef: 'MY_PAT', source: 'gh-cache', token: 'fresh' });
+  assert.equal(cust.MY_PAT, 'fresh');
+  // env source is a deliberate identity → never swapped.
+  const envd = { GITHUB_TOKEN: 'explicit' };
+  applyRotatedGhCredential({ resolved: envd, provider: 'github', authRef: undefined, source: 'env', token: 'fresh' });
+  assert.equal(envd.GITHUB_TOKEN, 'explicit');
+  // key not forwarded → never injected.
+  const empty = {};
+  applyRotatedGhCredential({ resolved: empty, provider: 'github', authRef: undefined, source: 'gh-cache', token: 'fresh' });
+  assert.deepEqual(empty, {}, 'a credential the job never forwarded is not injected');
+  // no token → no-op.
+  const keep = { GITHUB_TOKEN: 'stale' };
+  applyRotatedGhCredential({ resolved: keep, provider: 'github', authRef: undefined, source: 'gh-cache', token: null });
+  assert.equal(keep.GITHUB_TOKEN, 'stale');
+});
+
+// Advisory #4: the supervisor status signature must include the gh credential
+// identity, and reageSupervisorStatus must re-age ghAuth.ageMs.
+
+test('supervisorStatusSignature folds in the gh credential IDENTITY but not its ticking age (#293)', () => {
+  const base = { id: 'w1', profile: 'p', state: 'running', pid: 10, restarts: 0, activity: { state: 'idle', jobs: [] }, engine: 'http://x', agentic: { status: 'connected' } };
+  const a = { ...base, ghAuth: { present: true, fingerprint: 'fp-A', scopes: 'repo', since: 1000, ageMs: 5, lastCheckAgoMs: 1 } };
+  const sameIdNewerAge = { ...base, ghAuth: { present: true, fingerprint: 'fp-A', scopes: 'repo', since: 1000, ageMs: 99999, lastCheckAgoMs: 42 } };
+  const rotated = { ...base, ghAuth: { present: true, fingerprint: 'fp-B', scopes: 'repo', since: 2000, ageMs: 5, lastCheckAgoMs: 1 } };
+  assert.equal(supervisorStatusSignature([a]), supervisorStatusSignature([sameIdNewerAge]), 'a mere age tick is not a change');
+  assert.notEqual(supervisorStatusSignature([a]), supervisorStatusSignature([rotated]), 'a fingerprint/since rotation IS a change');
+});
+
+test('reageSupervisorStatus recomputes ghAuth.ageMs from its since epoch (#293)', () => {
+  const now = 1_000_000;
+  const status = { workers: [{ id: 'w1', state: 'running', startedAtMs: now - 60_000, ghAuth: { present: true, fingerprint: 'fp', scopes: 'repo', since: now - 120_000, ageMs: 0, lastCheckAgoMs: 7 } }] };
+  const reaged = reageSupervisorStatus(status, now);
+  assert.equal(reaged.workers[0].ghAuth.ageMs, 120_000, 'the credential age ticks forward from `since`');
+  assert.equal(reaged.workers[0].ghAuth.lastCheckAgoMs, 7, 'the relative lastCheckAgoMs is left untouched');
+  assert.equal(reaged.workers[0].uptimeMs, 60_000);
+});
+
+// Advisory #2: after a nonzero retry push (e.g. a timeout AFTER the server
+// accepted the ref), the remote-tip verification must use the FRESH credential,
+// not the rejected old one — otherwise a landed push is misreported as stranded.
+
+test('finalizeGit verifies the remote tip with the FRESH env after a nonzero retry (#293 review)', { skip: !gitAvailable }, () => {
+  const { root, envelope, prov } = provisionWithCommit({ credentialSource: 'gh-cache', token: 'gho_stale' });
+  try {
+    let served = 'gho_stale';
+    setGhAuthTokenReader(() => served);
+    invalidateGhAuthToken();
+    refreshGhAuthToken({ force: true });
+    served = 'gho_fresh';
+    let pushes = 0;
+    const pushSeam = (args, opts) => {
+      if (args.includes('push')) {
+        pushes++;
+        if (pushes === 1) return authFail(opts); // stale token rejected
+        // The retry carries the rotated token AND really lands the ref, but we
+        // report nonzero to simulate a client-side timeout after acceptance.
+        assert.equal(opts?.env?.GIT_TOKEN, 'gho_fresh', 'the retry runs with the rotated token');
+        const real = runGit(args, opts);
+        return { ...real, status: 1, timedOut: true, timeoutMs: opts?.timeoutMs };
+      }
+      return runGit(args, opts);
+    };
+    let lsRemoteToken;
+    const runSeam = (args, opts) => {
+      if (args.includes('ls-remote')) lsRemoteToken = opts?.env?.GIT_TOKEN;
+      return runGit(args, opts);
+    };
+    const out = finalizeGit({ ...prov, envelope, token: 'gho_stale', logger: { warn: () => {}, error: () => {}, info: () => {}, debug: () => {} }, _pushGit: pushSeam, _runGit: runSeam });
+    assert.equal(pushes, 2, 'the push was retried once');
+    assert.equal(lsRemoteToken, 'gho_fresh', 'remote-tip verification used the FRESH credential, not the rejected one');
+    assert.equal(out.pushed, true, 'the landed ref was detected, not misreported as stranded');
+    assert.ok(!out.pushFailed, 'a landed-but-timed-out push is not a strand');
   } finally {
     resetGhAuthTokenReader();
     invalidateGhAuthToken();

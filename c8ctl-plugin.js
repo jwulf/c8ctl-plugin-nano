@@ -4580,9 +4580,7 @@ function resolveJobSecrets(resolver, envelope, { ghAuthToken = ghAuthTokenFromCl
       // so provisioning sheds rather than silently borrowing the default/gh token.
       if (!missing.includes('repository.authRef')) missing.push('repository.authRef');
     } else {
-      const ghAuthRef = ref.kind === 'custom'
-        ? ref.name
-        : (provider === 'github' ? 'GITHUB_TOKEN' : undefined);
+      const ghAuthRef = ghCredentialEnvName({ provider, authRef });
       if (ghAuthRef) {
         names.add(ghAuthRef);
         const token = githubCloneToken({ provider, authRef, secretResolver: resolver, ghAuthToken });
@@ -4943,14 +4941,45 @@ let ghAuthRefreshInFlight = null;
 let ghAuthTokenReader = null;
 function setGhAuthTokenReader(fn) { ghAuthTokenReader = typeof fn === 'function' ? fn : null; }
 function resetGhAuthTokenReader() { ghAuthTokenReader = null; }
+
+// Sentinel distinguishing a TRANSIENT `gh auth token` read failure from a
+// definitive logout (Copilot review on #293). The readers used to collapse a
+// timeout / spawn error / unrecognised nonzero exit into `null`, which the
+// refresh path then adopted as a real "logged out" change — discarding a
+// previously usable cached token, stamping the cache fresh with `null`, and
+// dropping the worker (and its clone-auth recovery) to anonymous until the next
+// interval. A read that returns this sentinel instead means "could not
+// determine"; `adoptGhAuthToken*` preserves the prior credential rather than
+// wiping it, and only a DEFINITIVE result (a real token, or a confirmed logout)
+// ever changes the cache.
+const GH_AUTH_READ_FAILED = Symbol('gh-auth-read-failed');
+// gh's not-logged-in signatures ("no oauth token found for github.com",
+// "You are not logged into any GitHub hosts"). Matched on stderr ONLY for a
+// nonzero exit, so an unrelated nonzero failure (keychain error, transient
+// network) stays a transient read failure rather than a spurious logout.
+const GH_LOGGED_OUT_RE = /no oauth token|no token found|not logged in/i;
+// Map one completed (or failed) `gh auth token` invocation to:
+//   - a trimmed token string → logged in
+//   - null → the read DEFINITIVELY established no login (clean exit with empty
+//     output, or a nonzero exit whose stderr carries gh's logged-out message)
+//   - GH_AUTH_READ_FAILED → the read could not be completed (spawn error,
+//     timeout — spawnSync sets `.error` — or a nonzero exit WITHOUT a
+//     logged-out signal), so the caller must preserve any prior cached token.
+function classifyGhAuthRead({ error = null, status = null, stdout = '', stderr = '' } = {}) {
+  if (error) return GH_AUTH_READ_FAILED;
+  if (status === 0) return (String(stdout ?? '').trim()) || null;
+  if (GH_LOGGED_OUT_RE.test(String(stderr ?? ''))) return null;
+  return GH_AUTH_READ_FAILED;
+}
+
 function readGhAuthTokenDefault() {
+  let r;
   try {
-    const r = spawnSync('gh', ['auth', 'token'], { encoding: 'utf8', timeout: 10_000, env: GH_NONINTERACTIVE_ENV() });
-    const tok = r.status === 0 ? (r.stdout || '').trim() : '';
-    return tok || null;
+    r = spawnSync('gh', ['auth', 'token'], { encoding: 'utf8', timeout: 10_000, env: GH_NONINTERACTIVE_ENV() });
   } catch {
-    return null;
+    return GH_AUTH_READ_FAILED;
   }
+  return classifyGhAuthRead({ error: r.error, status: r.status, stdout: r.stdout, stderr: r.stderr });
 }
 
 // A short, non-reversible identity for a token so logs/status can show WHEN the
@@ -4989,6 +5018,18 @@ function ghTokenScopes(token, { timeoutMs = 5_000, run = spawnSync } = {}) {
 function adoptGhAuthToken(token, { scopesProbe = ghTokenScopes } = {}) {
   const prev = ghAuthTokenCache === GH_AUTH_TOKEN_UNSET ? null : ghAuthTokenCache;
   const now = Date.now();
+  if (token === GH_AUTH_READ_FAILED) {
+    // Transient read failure: never discard a usable cached credential. Preserve
+    // the prior record but bump `lastCheck` so the per-job hot path keeps serving
+    // it via the TTL short-circuit (no blocking re-read on every lookup); the
+    // off-path refresh timer retries on its own cadence. With no usable prior
+    // token, fall back to anonymous (null) as before.
+    if (prev && prev.token != null) {
+      ghAuthTokenCache = { ...prev, lastCheck: now };
+      return { token: prev.token, changed: false };
+    }
+    token = null;
+  }
   const changed = !prev || prev.token !== token;
   // On a CHANGE re-read the scopes; otherwise carry the previous reading forward
   // (a TTL re-read that finds the same token must not pay the scopes ping, and
@@ -5012,6 +5053,15 @@ function adoptGhAuthToken(token, { scopesProbe = ghTokenScopes } = {}) {
 async function adoptGhAuthTokenAsync(token, { scopesProbe } = {}) {
   const prev = ghAuthTokenCache === GH_AUTH_TOKEN_UNSET ? null : ghAuthTokenCache;
   const now = Date.now();
+  if (token === GH_AUTH_READ_FAILED) {
+    // Transient read failure (see adoptGhAuthToken): preserve the prior token and
+    // bump `lastCheck` so the hot path keeps serving it; anonymous only with no prior.
+    if (prev && prev.token != null) {
+      ghAuthTokenCache = { ...prev, lastCheck: now };
+      return { token: prev.token, changed: false };
+    }
+    token = null;
+  }
   const changed = !prev || prev.token !== token;
   const scopes = token ? (changed ? await scopesProbe(token) : (prev ? prev.scopes : null)) : null;
   ghAuthTokenCache = {
@@ -5041,10 +5091,9 @@ function refreshGhAuthToken({ force = false, run = null, scopesProbe } = {}) {
     // Explicit per-call spawn injection (unit tests of this function in isolation).
     try {
       const r = run('gh', ['auth', 'token'], { encoding: 'utf8', timeout: 10_000, env: GH_NONINTERACTIVE_ENV() });
-      const tok = r.status === 0 ? (r.stdout || '').trim() : '';
-      token = tok || null;
+      token = classifyGhAuthRead({ error: r.error, status: r.status, stdout: r.stdout, stderr: r.stderr });
     } catch {
-      token = null;
+      token = GH_AUTH_READ_FAILED;
     }
   } else {
     // The module reader (production: the real gh CLI; tests: setGhAuthTokenReader).
@@ -5068,10 +5117,11 @@ function readGhAuthTokenAsync({ _spawn = spawn } = {}) {
     try {
       child = _spawn('gh', ['auth', 'token'], { env: GH_NONINTERACTIVE_ENV() });
     } catch {
-      resolve(null);
+      resolve(GH_AUTH_READ_FAILED);
       return;
     }
     let out = '';
+    let err = '';
     let settled = false;
     const finish = (token) => {
       if (settled) return;
@@ -5080,14 +5130,17 @@ function readGhAuthTokenAsync({ _spawn = spawn } = {}) {
       resolve(token);
     };
     // Same 10s bound as the sync reader. On expiry SIGTERM the child (matching
-    // spawnSync's timeout semantics) and resolve null — a wedged gh must never
-    // pin the refresh chain.
-    const timer = setTimeout(() => { try { child.kill('SIGTERM'); } catch { /* best effort */ } finish(null); }, 10_000);
+    // spawnSync's timeout semantics) and resolve the transient sentinel — a
+    // wedged gh must never pin the refresh chain, NOR masquerade as a logout.
+    const timer = setTimeout(() => { try { child.kill('SIGTERM'); } catch { /* best effort */ } finish(GH_AUTH_READ_FAILED); }, 10_000);
     if (typeof timer.unref === 'function') timer.unref();
     child.stdout?.on('data', (d) => { out += d; });
-    child.stderr?.on('data', () => { /* drained so the pipe never fills; never parsed */ });
-    child.on('error', () => finish(null));
-    child.on('close', (code) => finish(code === 0 ? (out.trim() || null) : null));
+    // stderr is now CAPTURED (not just drained) so classifyGhAuthRead can tell a
+    // definitive logout (gh's "no oauth token found" message) from a transient
+    // nonzero failure that must preserve the cached credential.
+    child.stderr?.on('data', (d) => { err += d; });
+    child.on('error', () => finish(GH_AUTH_READ_FAILED));
+    child.on('close', (code) => finish(classifyGhAuthRead({ status: code, stdout: out, stderr: err })));
   });
 }
 
@@ -5430,6 +5483,39 @@ function normalizeAuthRef(authRef) {
   const trimmed = String(authRef).trim();
   if (trimmed === '') return { kind: 'invalid' };
   return { kind: 'custom', name: trimmed };
+}
+
+// The env-var NAME the github clone/push credential is forwarded to the harness
+// under. Single source of truth so `resolveJobSecrets` (which builds the
+// `resolved` secret map) and the clone-recovery rotation glue (which keeps that
+// map in sync when the token rotates) can NEVER drift on the key: a custom
+// authRef uses its own name; the default github credential uses GITHUB_TOKEN.
+// Returns null when no credential is forwarded (a non-github provider with no
+// custom ref, or a blank/invalid authRef).
+function ghCredentialEnvName({ provider, authRef }) {
+  const prov = provider || 'github';
+  const ref = normalizeAuthRef(authRef);
+  if (ref.kind === 'invalid') return null;
+  if (ref.kind === 'custom') return ref.name;
+  return prov === 'github' ? 'GITHUB_TOKEN' : null;
+}
+
+// When clone recovery ROTATES the cache-derived credential during provisioning
+// (a stale gh token re-read after an auth failure), the `resolved` secret map —
+// built BEFORE provisioning and later forwarded to the harness as `secretEnv` —
+// still holds the STALE token, so an allowPr harness's own `gh`/`git` runs would
+// use a credential the clone already proved dead (Copilot review on #293). Sync
+// the map so it hands the harness the SAME credential provisioning just adopted.
+// Guard rails: only a 'gh-cache'-sourced credential may be swapped (an explicit
+// `env`/`custom` identity is deliberate and never silently replaced), only when
+// a token actually exists, and ONLY when that key was already forwarded (never
+// inject a brand-new secret the job did not request). Pure: mutates and returns
+// `resolved`.
+function applyRotatedGhCredential({ resolved, provider, authRef, source, token }) {
+  if (!resolved || source !== 'gh-cache' || !token) return resolved;
+  const key = ghCredentialEnvName({ provider, authRef });
+  if (key && Object.prototype.hasOwnProperty.call(resolved, key)) resolved[key] = token;
+  return resolved;
 }
 
 // Resolve the github clone/push credential AND record where it came from. The
@@ -7061,6 +7147,15 @@ function finalizeGit({ workspaceDir, gitEnv, startSha, workingBranch, baseBranch
         log.info?.(`finalizeGit${cs}: git push auth failed — the cached gh token may be stale; re-read it (${describeGhAuthToken(ghAuthTokenInfo())}) and retrying the push once`);
         const retryEnv = { ...gitEnv, GIT_TOKEN: fresh };
         const retry = pushGit([...credArgs(), 'push', '--set-upstream', 'origin', `refs/heads/${workingBranch}:refs/heads/${workingBranch}`], { cwd: workspaceDir, env: retryEnv, timeoutMs: netTimeoutMs() });
+        // Rebind the git env to the FRESH credential whenever the retry ran —
+        // regardless of its exit code — so the post-push remote-tip verification
+        // below (`ls-remote`/`fetch`, all `env: gitEnv`) queries origin with the
+        // credential the retry used, not the REJECTED old token. A retry that
+        // exits nonzero because the server accepted the ref before a client-side
+        // timeout would otherwise be verified with the stale token, ls-remote
+        // would fail to authenticate, and a landed push would be misreported as
+        // pushFailed/stranded (Copilot review on #293).
+        gitEnv = retryEnv;
         if (retry.status === 0) {
           // Adopt the fresh token for the rest of finalization (the PR reconcile
           // + attribution below read `token`) and record the success.
@@ -7068,7 +7163,9 @@ function finalizeGit({ workspaceDir, gitEnv, startSha, workingBranch, baseBranch
           push = retry;
         } else {
           // Keep the ORIGINAL failure as the reported one (it is the actionable
-          // signal); the retry's detail only confirms the fresh token didn't help.
+          // signal), and keep `token` as the credential that PRODUCED that `push`
+          // so its failure report redacts the right value. `gitEnv` is still
+          // rebound above, so remote-tip verification uses the fresh credential.
           log.warn?.(`finalizeGit${cs}: push still failed with the fresh gh token — ${oneLineLog(describeGitFailure('git push', retry, { token: fresh, timeoutMs: pushTimeout }))}`);
         }
       }
@@ -11908,6 +12005,14 @@ async function workAgent(req, flags, ctx) {
             // token (Copilot review on #293).
             if (provisioned.effectiveToken) repoToken = provisioned.effectiveToken;
             if (provisioned.credentialSource) repoCredentialSource = provisioned.credentialSource;
+            // #293: when the rotation above swapped a gh-cache credential, the
+            // `resolved` secret map (built pre-provisioning, forwarded to the
+            // harness as `secretEnv`) still holds the STALE token — sync it so an
+            // allowPr harness's own gh/git runs use the credential provisioning
+            // just adopted, not the one the clone proved dead (Copilot review on
+            // #293). No-op for an env/custom identity, an unchanged token, or a
+            // key the job never forwarded.
+            applyRotatedGhCredential({ resolved, provider, authRef, source: repoCredentialSource, token: repoToken });
             if (provisioned.baseFetchError) {
               logger.warn(`[${jobType}] job ${job.jobKey} base fetch failed (${aiCorr}) — ${oneLineLog(provisioned.baseFetchError)}; base...head diffs may be unavailable`);
             }
@@ -13398,6 +13503,16 @@ function supervisorStatusSignature(workers) {
       // change is a real transition that must repaint attached consoles (#99).
       w.engine ?? '',
       w.agentic ? (w.agentic.status ?? '') : null,
+      // #293: the gh credential IDENTITY — presence, fingerprint, scopes, and the
+      // token's `since` epoch. A token rotation / scope change / logout on an
+      // otherwise-idle worker is a real transition the attached console must
+      // repaint for (the GH AUTH cell changes), so fold it into the signature.
+      // Deliberately EXCLUDES the ticking durations (ageMs, lastCheckAgoMs) —
+      // those merely elapse and are re-aged locally (see reageSupervisorStatus),
+      // so including them would make every clock tick a spurious "change".
+      w.ghAuth
+        ? `${w.ghAuth.present ? 1 : 0}\u0000${w.ghAuth.fingerprint ?? ''}\u0000${w.ghAuth.scopes ?? ''}\u0000${w.ghAuth.since ?? ''}`
+        : null,
     ]),
   );
 }
@@ -13522,7 +13637,17 @@ function reageSupervisorStatus(status, now = Date.now()) {
         const state = jobs.some((j) => j && typeof j === 'object' && !j.settlementPending) ? 'busy' : 'idle';
         activity = { ...activity, jobs, state };
       }
-      return { ...w, uptimeMs, activity };
+      // #293: re-age the gh credential's AGE from its absolute `since` epoch, the
+      // same way uptime/job-age tick locally — otherwise an attached console that
+      // re-ages the cached snapshot on every tick (never rebuilding it via
+      // summarizeSupervisorWorker) would freeze the GH AUTH cell's age at its
+      // snapshot-time value. `lastCheckAgoMs` is RELATIVE (no absolute base rides
+      // the frame), so it cannot be re-aged here and is left as-is.
+      let ghAuth = w.ghAuth;
+      if (ghAuth && typeof ghAuth === 'object' && Number.isFinite(ghAuth.since)) {
+        ghAuth = { ...ghAuth, ageMs: Math.max(0, now - ghAuth.since) };
+      }
+      return { ...w, uptimeMs, activity, ghAuth };
     }),
   };
 }
@@ -18800,6 +18925,13 @@ export {
   invalidateGhAuthToken,
   setGhAuthTokenReader,
   resetGhAuthTokenReader,
+  classifyGhAuthRead,
+  GH_AUTH_READ_FAILED,
+  adoptGhAuthToken,
+  adoptGhAuthTokenAsync,
+  readGhAuthTokenAsync,
+  ghCredentialEnvName,
+  applyRotatedGhCredential,
   ghAuthTokenInfo,
   describeGhAuthToken,
   ghTokenFingerprint,

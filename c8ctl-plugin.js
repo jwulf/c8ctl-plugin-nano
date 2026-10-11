@@ -4946,19 +4946,29 @@ function credArgs() {
 // scope, a rotation), and nothing told the worker (or the operator) it was now
 // handing every job the OLD token. The cache is therefore a RECORD
 // (`{ token, fingerprint, scopes, since, lastCheck }`) with a TTL:
-//   - `ghAuthTokenFromCli()` returns the cached token while `lastCheck` is
-//     younger than GH_AUTH_TOKEN_TTL_MS; past the TTL it re-runs `gh auth token`
-//     (still synchronous — the safety net for paths that never primed).
+//   - `ghAuthTokenFromCli()` (the per-job hot path) serves the PRIMED cache
+//     record VERBATIM — even once `lastCheck` is older than
+//     GH_AUTH_TOKEN_TTL_MS — and NEVER triggers a synchronous TTL re-read, so a
+//     job never pays `gh auth token`'s spawn cost (Copilot review on #293). The
+//     sole synchronous read is for a still-UNSET cache (a worker that never
+//     primed), and even that defers to any async refresh already in flight. The
+//     off-path refreshers below keep a primed record current.
 //   - `nano work` PRIMES at startup (`primeGhAuthToken()`) AND re-primes on a
 //     timer (`startGhAuthTokenRefresh`) so the TTL re-read happens OFF the job
-//     path and a refreshed login is adopted within one TTL without a restart.
-//     The timer's refresh is ASYNC (spawn, never spawnSync) and DEFERRED while
-//     a job is active, so it can never block the event loop / lock heartbeat
-//     (Copilot review on #293); when the identity changes it republishes the
-//     activity marker via an onChange callback.
+//     path. The timer's refresh is ASYNC (spawn, never spawnSync) and DEFERRED
+//     while a job is active, so it can never block the event loop / lock
+//     heartbeat (Copilot review on #293) — a refreshed login is therefore
+//     adopted within one TTL only when the worker is idle at a tick. Under
+//     sustained back-to-back load the defer is BOUNDED by
+//     GH_AUTH_TOKEN_MAX_DEFER_MS, after which the tick refreshes DESPITE an
+//     active job (still async) to cap staleness at a few intervals. When the
+//     identity changes it republishes the activity marker via an onChange
+//     callback.
 //   - A git/gh auth FAILURE (clone/push/PR-reconcile — see isGitAuthFailure)
-//     forces one re-read (`refreshGhAuthToken({ force })`) and a single retry,
-//     so a rotated token self-heals instead of failing the job. The re-read is
+//     forces one re-read (`refreshGhAuthToken({ force, budgetMs })`, bounded by
+//     the caller's remaining lease budget so the synchronous re-read can't
+//     overrun the lock heartbeat) and a single retry, so a rotated token
+//     self-heals instead of failing the job. The re-read is
 //     NON-destructive (it never invalidates the cache first), so a transient
 //     re-read failure keeps the still-valid cached credential.
 //   - `primeGhAuthToken({ logger })` logs the token's FINGERPRINT (a short sha256
@@ -5070,10 +5080,10 @@ function classifyGhAuthRead({ error = null, status = null, stdout = '', stderr =
   return GH_AUTH_READ_FAILED;
 }
 
-function readGhAuthTokenDefault() {
+function readGhAuthTokenDefault(timeoutMs = 10_000) {
   let r;
   try {
-    r = spawnSync('gh', ['auth', 'token'], { encoding: 'utf8', timeout: 10_000, env: GH_NONINTERACTIVE_ENV() });
+    r = spawnSync('gh', ['auth', 'token'], { encoding: 'utf8', timeout: Math.max(1, timeoutMs), env: GH_NONINTERACTIVE_ENV() });
   } catch {
     return GH_AUTH_READ_FAILED;
   }
@@ -5218,29 +5228,44 @@ async function adoptGhAuthTokenAsync(token, { scopesProbe, generation = null } =
 // recovery, where the caller is already blocked waiting on git) but it blocks
 // the event loop while it runs, so the periodic refresh AND the SIGUSR1
 // reload-credentials handler use refreshGhAuthTokenAsync instead.
-function refreshGhAuthToken({ force = false, run = null, scopesProbe } = {}) {
+function refreshGhAuthToken({ force = false, run = null, scopesProbe, budgetMs = null } = {}) {
   const prev = ghAuthTokenCache === GH_AUTH_TOKEN_UNSET ? null : ghAuthTokenCache;
   const now = Date.now();
   if (!force && prev && now - prev.lastCheck < GH_AUTH_TOKEN_TTL_MS) {
     return { token: prev.token, changed: false, snapshotChanged: false };
   }
+  // When a caller on the ACTIVE-JOB path (the clone/push auth-failure recovery)
+  // threads its remaining lease budget, bound BOTH synchronous gh subprocesses
+  // (the `gh auth token` read AND the scopes probe) to it so this forced
+  // spawnSync re-read can never block the event loop / lock heartbeat past the
+  // caller's lease-safe window — the finalizeGit/clone git ops are already
+  // netDeadline-bounded, and this read must participate in the same budget
+  // (Copilot review on #294). Absent a budget (startup prime, UNSET-cache hot
+  // path, unit tests) the historical 10s read / 5s scopes caps stand.
+  const haveBudget = Number.isFinite(budgetMs) && budgetMs > 0;
+  const deadline = haveBudget ? now + budgetMs : null;
+  const readTimeout = haveBudget ? Math.max(1, Math.min(10_000, budgetMs)) : 10_000;
   let token = null;
   if (run) {
     // Explicit per-call spawn injection (unit tests of this function in isolation).
     try {
-      const r = run('gh', ['auth', 'token'], { encoding: 'utf8', timeout: 10_000, env: GH_NONINTERACTIVE_ENV() });
+      const r = run('gh', ['auth', 'token'], { encoding: 'utf8', timeout: readTimeout, env: GH_NONINTERACTIVE_ENV() });
       token = classifyGhAuthRead({ error: r.error, status: r.status, stdout: r.stdout, stderr: r.stderr });
     } catch {
       token = GH_AUTH_READ_FAILED;
     }
   } else {
     // The module reader (production: the real gh CLI; tests: setGhAuthTokenReader).
-    token = (ghAuthTokenReader || readGhAuthTokenDefault)();
+    token = (ghAuthTokenReader || readGhAuthTokenDefault)(readTimeout);
   }
+  // The scopes probe gets whatever of the budget the read left (still capped at
+  // 5s); a read that consumed the whole budget leaves it ~1ms so the probe fails
+  // fast to null (scopes are best-effort) rather than overrunning the lease.
+  const scopesTimeout = haveBudget ? Math.max(1, Math.min(5_000, deadline - Date.now())) : 5_000;
   // The scopes probe defaults to the live `gh api -i user` ping — but when a
   // test installed a token READER (hermetic, no network) and did not inject a
   // scopesProbe, skip the ping so a stubbed refresh never hits the network.
-  const probe = scopesProbe ?? (ghAuthTokenReader ? (() => null) : ghTokenScopes);
+  const probe = scopesProbe ?? (ghAuthTokenReader ? (() => null) : ((t) => ghTokenScopes(t, { timeoutMs: scopesTimeout })));
   return adoptGhAuthToken(token, { scopesProbe: probe });
 }
 
@@ -5440,8 +5465,13 @@ function invalidateGhAuthToken() {
 // genuine-denial case (the re-read returns the SAME failing token → null → no
 // retry) and the null→fresh recovery (a logged-out worker re-reads a real token
 // after `gh auth login`).
-function recoverGhTokenAfterAuthFailure(failingToken) {
-  const { token: fresh } = refreshGhAuthToken({ force: true });
+// `budgetMs` (threaded by the clone/push recovery call sites from their
+// remaining lease budget — provTimeoutMs()/netTimeoutMs()) bounds the forced
+// synchronous `gh auth token` + scopes probe so this on-the-active-job-path
+// re-read participates in the caller's lease-safe window instead of blocking the
+// event loop / lock heartbeat for the full 15s (Copilot review on #294).
+function recoverGhTokenAfterAuthFailure(failingToken, { budgetMs = null } = {}) {
+  const { token: fresh } = refreshGhAuthToken({ force: true, budgetMs });
   return fresh && fresh !== failingToken ? fresh : null;
 }
 
@@ -5969,7 +5999,7 @@ function provisionRepo({ envelope, token, runDir, runId, timeoutMs = 120_000, lo
     // (the askpass helper, GIT_ASKPASS/GIT_TOKEN, and the username-embedded
     // remote) — a bare GIT_TOKEN swap leaves the clone unauthenticated.
     if (credentialSource === 'gh-cache' && isGitAuthFailure(detail)) {
-      const fresh = recoverGhTokenAfterAuthFailure(token);
+      const fresh = recoverGhTokenAfterAuthFailure(token, { budgetMs: provTimeoutMs() });
       if (fresh) {
         logger?.info?.(`git clone auth failed${cs} — the cached gh token may be stale; re-read it (${describeGhAuthToken(ghAuthTokenInfo())}) and retrying the clone once`);
         throwIfAborted('clone-auth-retry');
@@ -7458,7 +7488,7 @@ function finalizeGit({ workspaceDir, gitEnv, startSha, workingBranch, baseBranch
     // (Copilot review on #293).
     let pushFailureTimeout = pushTimeout;
     if (push.status !== 0 && credentialSource === 'gh-cache' && isGitAuthFailure(describeGitFailure('git push', push, { token, timeoutMs: pushTimeout }))) {
-      const fresh = recoverGhTokenAfterAuthFailure(token);
+      const fresh = recoverGhTokenAfterAuthFailure(token, { budgetMs: netTimeoutMs() });
       if (fresh) {
         log.info?.(`finalizeGit${cs}: git push auth failed — the cached gh token may be stale; re-read it (${describeGhAuthToken(ghAuthTokenInfo())}) and retrying the push once`);
         const retryEnv = { ...gitEnv, GIT_TOKEN: fresh };
@@ -12079,6 +12109,13 @@ async function workAgent(req, flags, ctx) {
         // variables (overrides), then resolve any secrets it references.
         const envelope = normalizeTaskEnvelope(job.customHeaders ?? {}, job.variables ?? {}, { basePromptOverride });
         const { resolved, missing, names } = await resolveJobSecrets(secretResolver, envelope);
+        // #222: recheck after the awaited secret resolution (stage: secrets) —
+        // resolveJobSecrets AWAITS the gh-cache-miss forced refresh, so a
+        // force-stop / lease loss can win DURING that await. Gate BEFORE the
+        // missing-secret settlement below so an abort that landed mid-resolve
+        // returns WITHOUT settling (which would race the force-stop yield),
+        // mirroring the post-prompt-fetch gate above.
+        if (checkSetupAbort(abortSignal, { jobType, jobKey: job.jobKey, stage: 'secrets', logger })) return;
         if (missing.length > 0) {
           const retries = Math.max(0, (Number(job.retries) || 1) - 1);
           const msg = `missing secret(s): ${missing.join(', ')} (resolver: ${secretResolver.kind})`;

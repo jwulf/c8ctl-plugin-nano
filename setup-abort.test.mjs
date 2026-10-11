@@ -385,3 +385,32 @@ test('#222 provisionRepo bails when the abort wins DURING the branch checkout â€
     rmSync(runDir, { recursive: true, force: true });
   }
 });
+
+// ---------------------------------------------------------------------------
+// #294 review (Medium): the secret-resolution await needs a post-await abort
+// gate. `resolveJobSecrets` AWAITS the gh-cache-miss forced refresh (a spawned
+// `gh auth token` read), so a force-stop / lease loss can win DURING that await.
+// Without a recheck, the missing-secret branch calls `settleJob.fail`, racing the
+// force-stop yield. `workAgent` is not unit-testable in isolation here, so assert
+// on the source that a `stage: 'secrets'` gate sits BETWEEN the awaited
+// resolveJobSecrets and the `if (missing.length > 0)` settlement â€” mirroring the
+// stage: 'prompt' gate that already guards the awaited prompt fetch.
+// ---------------------------------------------------------------------------
+test("#294 a post-await 'secrets' abort gate guards the resolveJobSecrets settlement", async () => {
+  const { readFileSync } = await import('node:fs');
+  const { fileURLToPath } = await import('node:url');
+  const src = readFileSync(fileURLToPath(new URL('./c8ctl-plugin.js', import.meta.url)), 'utf8');
+
+  const awaitIdx = src.indexOf('await resolveJobSecrets(secretResolver, envelope)');
+  assert.ok(awaitIdx !== -1, 'the awaited resolveJobSecrets call is present');
+
+  const gateIdx = src.indexOf("checkSetupAbort(abortSignal, { jobType, jobKey: job.jobKey, stage: 'secrets', logger })", awaitIdx);
+  assert.ok(gateIdx !== -1, "a stage: 'secrets' abort gate follows the awaited resolveJobSecrets");
+
+  const settleIdx = src.indexOf('if (missing.length > 0)', awaitIdx);
+  assert.ok(settleIdx !== -1, 'the missing-secret settlement is present');
+
+  // The gate must sit strictly BETWEEN the await and the settlement so an abort
+  // that landed mid-resolve returns WITHOUT settling.
+  assert.ok(gateIdx > awaitIdx && gateIdx < settleIdx, 'the abort gate is positioned between the await and the missing-secret settlement');
+});

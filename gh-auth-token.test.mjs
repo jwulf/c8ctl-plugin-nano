@@ -687,6 +687,55 @@ test('recoverGhTokenAfterAuthFailure recovers a logged-out cache (null → fresh
   }
 });
 
+// --- #294 review: the forced recovery re-read is LEASE-BUDGET BOUNDED ---------
+// recoverGhTokenAfterAuthFailure / refreshGhAuthToken run synchronous `gh auth
+// token` + scopes probes on the ACTIVE-JOB path (clone/push auth-failure
+// recovery). An unbounded 15s spawnSync there can overrun the lock heartbeat, so
+// the clone/push call sites thread their remaining lease budget
+// (provTimeoutMs()/netTimeoutMs()) and the read timeout must shrink to it —
+// without ever WIDENING past the historical 10s cap.
+
+test('refreshGhAuthToken bounds the forced read to the threaded lease budget (#294)', () => {
+  invalidateGhAuthToken();
+  const timeouts = [];
+  const run = (cmd, args, opts) => {
+    if (args[0] === 'auth' && args[1] === 'token') { timeouts.push(opts?.timeout); return { status: 0, stdout: 'gho_b\n', stderr: '' }; }
+    return { status: 0, stdout: '', stderr: '' };
+  };
+  // No budget → the historical 10s read cap.
+  refreshGhAuthToken({ force: true, run, scopesProbe: () => 'repo' });
+  assert.equal(timeouts.at(-1), 10_000, 'no budget → 10s read cap');
+  // A threaded budget shorter than 10s caps the read to it.
+  refreshGhAuthToken({ force: true, run, scopesProbe: () => 'repo', budgetMs: 200 });
+  assert.equal(timeouts.at(-1), 200, 'budget caps the read timeout');
+  // A budget LARGER than 10s never WIDENS the historical cap.
+  refreshGhAuthToken({ force: true, run, scopesProbe: () => 'repo', budgetMs: 60_000 });
+  assert.equal(timeouts.at(-1), 10_000, 'budget never widens past 10s');
+  // A zero / non-finite budget is treated as "no budget" (the historical cap).
+  refreshGhAuthToken({ force: true, run, scopesProbe: () => 'repo', budgetMs: 0 });
+  assert.equal(timeouts.at(-1), 10_000, 'a 0 budget falls back to the 10s cap');
+  invalidateGhAuthToken();
+});
+
+test('recoverGhTokenAfterAuthFailure threads the caller budget into the forced re-read (#294)', () => {
+  invalidateGhAuthToken();
+  try {
+    let lastTimeout = null;
+    setGhAuthTokenReader((timeoutMs) => { lastTimeout = timeoutMs; return 'gho_rot'; });
+    refreshGhAuthToken({ force: true });             // prime (no budget → 10s)
+    assert.equal(lastTimeout, 10_000, 'prime reads with the default cap');
+    const fresh = recoverGhTokenAfterAuthFailure('gho_stale', { budgetMs: 300 });
+    assert.equal(fresh, 'gho_rot', 'the rotated token is returned for the retry');
+    assert.equal(lastTimeout, 300, 'the caller lease budget bounds the recovery re-read');
+    // A budgetless recovery (startup / tests) keeps the historical cap.
+    recoverGhTokenAfterAuthFailure('gho_stale');
+    assert.equal(lastTimeout, 10_000, 'no budget → the historical 10s cap');
+  } finally {
+    resetGhAuthTokenReader();
+    invalidateGhAuthToken();
+  }
+});
+
 test('provisionRepo retries the clone on a NEWER cached token when the recovery re-read fails transiently (#294)', { skip: !gitAvailable }, () => {
   const { root, origin } = makeLocalOrigin();
   const runDir = mkdtempSync(join(root, 'run-'));

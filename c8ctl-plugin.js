@@ -269,6 +269,15 @@ const STOP_GRACE_MS = 8_000;
 // (a child that exits sooner is reaped immediately — this only lengthens the
 // SIGKILL backstop for a worker that is actively preserving recovery).
 const FORCE_STOP_RECOVERY_MS = 20_000;
+// #296: the backstop deadline an OUTER daemon-stop path (the socket-unreachable
+// `stop --force` fallback and `stopSupervisorProcess`) waits for the DAEMON — and
+// its whole process group, which includes the workers — to exit before SIGKILLing
+// the group. It must exceed what the daemon itself allows a worker before ITS
+// SIGKILL backstop (`forceStopWorker` waits STOP_GRACE_MS + FORCE_STOP_RECOVERY_MS),
+// plus a small margin for the daemon to observe the worker's exit and shut down.
+// Otherwise the outer path SIGKILLs the group ~18s early and kills a worker that is
+// still flushing + promoting its GC-proof recovery ref (#295).
+const FORCE_STOP_DAEMON_GRACE_MS = STOP_GRACE_MS + FORCE_STOP_RECOVERY_MS + 2_000;
 // #202: the signal a graceful `supervisor stop`/`workforce stop` sends each
 // `nano work` child to quiesce it — stop leasing new jobs, finish in-flight work,
 // then exit. SIGTERM/SIGINT remain the FORCE abort (kill harness, yield jobs).
@@ -6790,7 +6799,7 @@ async function setupWorkspaceCheckpoints({ provisioned, envelope = null, token =
     const CP_SDK_TIMEOUT_MS = 10000;
     const withDeadline = (p, ms, label) => {
       let timer;
-      const timeout = new Promise((_r, reject) => { timer = setTimeout(() => reject(new Error(`${label} timed out after ${ms}ms`)), ms); });
+      const timeout = new Promise((_r, reject) => { timer = setTimeout(() => reject(new Error(`${label} timed out after ${ms}ms`)), ms); timer?.unref?.(); });
       Promise.resolve(p).catch(() => {});
       return Promise.race([Promise.resolve(p).finally(() => clearTimeout(timer)), timeout]);
     };
@@ -6985,16 +6994,23 @@ async function setupWorkspaceCheckpoints({ provisioned, envelope = null, token =
     let varWarned = false;
     let resumeVarWarned = false;
     const setVar = typeof camunda?.createElementInstanceVariables === 'function' && job?.elementInstanceKey
-      ? async (res) => {
-        try {
-          await withDeadline(camunda.createElementInstanceVariables({
+      ? (res) => {
+        // #296: run the element-scope and process-scope writes CONCURRENTLY, not
+        // sequentially. Each carries its own CP_SDK_TIMEOUT_MS deadline, so a
+        // sequential pair could stall for 2× the timeout (20s) — enough to exhaust
+        // the whole FORCE_STOP_RECOVERY_MS budget during a force-stop flush and
+        // starve the recovery git promotion. Racing them caps the worst case at a
+        // single timeout, and each has an independent try/catch so one failing (or
+        // being absent, e.g. no processInstanceKey) never blocks the other.
+        const writes = [
+          withDeadline(camunda.createElementInstanceVariables({
             elementInstanceKey: String(job.elementInstanceKey),
             variables: { agentCheckpoint: { ref, sha: res.sha, head: res.head, at: res.at, reason: res.reason, branch } },
             local: true,
-          }), CP_SDK_TIMEOUT_MS, 'createElementInstanceVariables');
-        } catch (err) {
-          if (!varWarned) { varWarned = true; log.warn(`could not set the agentCheckpoint variable — ${oneLineLog(err?.message || err)}; checkpoints still pushed to ${ref}.`); }
-        }
+          }), CP_SDK_TIMEOUT_MS, 'createElementInstanceVariables').catch((err) => {
+            if (!varWarned) { varWarned = true; log.warn(`could not set the agentCheckpoint variable — ${oneLineLog(err?.message || err)}; checkpoints still pushed to ${ref}.`); }
+          }),
+        ];
         // #295: also record the ref at the PROCESS instance scope (local on the root
         // scope key = the process instance key). Unlike the local `agentCheckpoint`
         // above, this survives the element re-entry an SLA escalation triggers, so a
@@ -7002,16 +7018,15 @@ async function setupWorkspaceCheckpoints({ provisioned, envelope = null, token =
         // checkpoint via `resumeFromCheckpoint`. Best-effort and independent of the
         // local write; a failure never blocks the push.
         if (job?.processInstanceKey) {
-          try {
-            await withDeadline(camunda.createElementInstanceVariables({
-              elementInstanceKey: String(job.processInstanceKey),
-              variables: { resumeFromCheckpoint: { ref, sha: res.sha, elementInstanceKey: String(job.elementInstanceKey ?? ''), elementId: job.elementId ?? null, branch, at: res.at } },
-              local: true,
-            }), CP_SDK_TIMEOUT_MS, 'createElementInstanceVariables');
-          } catch (err) {
+          writes.push(withDeadline(camunda.createElementInstanceVariables({
+            elementInstanceKey: String(job.processInstanceKey),
+            variables: { resumeFromCheckpoint: { ref, sha: res.sha, elementInstanceKey: String(job.elementInstanceKey ?? ''), elementId: job.elementId ?? null, branch, at: res.at } },
+            local: true,
+          }), CP_SDK_TIMEOUT_MS, 'createElementInstanceVariables').catch((err) => {
             if (!resumeVarWarned) { resumeVarWarned = true; log.warn(`could not set the resumeFromCheckpoint variable — ${oneLineLog(err?.message || err)}; a resumed run may not auto-find ${ref}.`); }
-          }
+          }));
         }
+        return Promise.all(writes);
       }
       : null;
 
@@ -7051,7 +7066,18 @@ async function setupWorkspaceCheckpoints({ provisioned, envelope = null, token =
       onCheckpoint: async (res) => {
         ownedSha = res.sha;
         log.debug(`WIP checkpoint ${ref}@${res.sha.slice(0, 12)} pushed (${res.reason})${res.excluded?.length ? `; excluded ${res.excluded.map((e) => `${e.path} [${e.why}]`).join(', ')}` : ''}.`);
-        if (setVar) await setVar(res);
+        if (!setVar) return;
+        // #296: `ownedSha` (above) is the only state preserveRecovery() needs from
+        // this callback, and it is already set. The best-effort metadata writes must
+        // NOT sit on the serialized flush/promote critical path during a force-stop
+        // or failed flush: awaiting them there lets a hung engine burn the whole
+        // FORCE_STOP_RECOVERY_MS budget before the recovery git promotion can run.
+        // For those reasons fire the writes off the chain (still best-effort — the
+        // GC-proof recovery ref, not these vars, is the durable artifact of a
+        // force-stopped run); on every normal checkpoint await them as before so a
+        // resume can find the ref.
+        if (res.reason === 'abort' || res.reason === 'failed') { setVar(res).catch(() => {}); return; }
+        await setVar(res);
       },
     });
     return {
@@ -16139,9 +16165,11 @@ async function supervisorStopCmd(force = false) {
 
   // Wait for the daemon process itself to exit. A drain waits INDEFINITELY (the
   // operator opted to wait); a force stop applies the grace window + a SIGKILL
-  // backstop so a wedged daemon/worker group can't linger.
+  // backstop so a wedged daemon/worker group can't linger. The window must cover
+  // the daemon's own worker force-stop grace (#296), or the SIGKILL below reaps the
+  // group while a worker is still promoting its GC-proof recovery ref (#295).
   if (force) {
-    const deadline = Date.now() + STOP_GRACE_MS + 2_000;
+    const deadline = Date.now() + FORCE_STOP_DAEMON_GRACE_MS;
     while (Date.now() < deadline) {
       if (!isPidAlive(daemonPid)) break;
       await new Promise((r) => setTimeout(r, 150));
@@ -16619,7 +16647,9 @@ function systemdUserAvailable() {
 async function stopSupervisorProcess(running) {
   try { await supervisorRequest({ op: 'stop' }); }
   catch { try { process.kill(running.pid, 'SIGTERM'); } catch { /* already gone */ } }
-  const deadline = Date.now() + STOP_GRACE_MS + 2_000;
+  // #296: cover the daemon's own worker force-stop grace so the group SIGKILL below
+  // does not reap a worker mid-recovery (promoting its GC-proof recovery ref, #295).
+  const deadline = Date.now() + FORCE_STOP_DAEMON_GRACE_MS;
   while (Date.now() < deadline) {
     if (!isPidAlive(running.pid)) break;
     await new Promise((r) => setTimeout(r, 150));

@@ -1220,12 +1220,14 @@ test('withCheckpointNote appends only for a restored checkpoint', () => {
   assert.equal(withCheckpointNote({ task: {} }, { restored: true }).task.prompt, undefined);
 });
 
-test('#296 (F8) createGitRunner signal aborts an in-flight git op instead of running to timeout', async () => {
-  // The force-stop fix threads the job's abortSignal into the checkpoint git runner so
-  // an abort CANCELS the in-flight push (settling the checkpointer chain promptly)
-  // rather than letting it run to the full gitTimeoutMs while the supervisor's SIGKILL
-  // backstop looms. This drives `signal` directly: an aborted runner must settle fast
-  // (well under the 60s timeout) with a non-zero/aborted result.
+test('#296 (F8/F9) createGitRunner signal aborts an in-flight git op instead of running to timeout', async () => {
+  // The checkpoint git runner is driven by a DEDICATED recovery-deadline signal (NOT
+  // the job's abortSignal, which fires BEFORE force-stop recovery runs and would fail
+  // every recovery command). When that recovery deadline fires — abortRecovery() — it
+  // CANCELS the in-flight push, settling the checkpointer chain promptly rather than
+  // letting it run to the full gitTimeoutMs while the supervisor's SIGKILL backstop
+  // looms. This drives `signal` directly: an aborted runner must settle fast (well
+  // under the 60s timeout) with a non-zero/aborted result.
   const f = fixture();
   try {
     f.clone('abortable');
@@ -1787,6 +1789,37 @@ test('#295 preserveRecovery: promotes the latest snapshot to a GC-proof recovery
     await s.close();
   } finally { f.cleanup(); }
 });
+
+test('#296 force-stop recovery is not blocked by hung metadata writes', async () => {
+  // High finding (r4243653664): the best-effort agentCheckpoint / resumeFromCheckpoint
+  // SDK writes must NOT sit on the serialized flush/promote critical path during a
+  // force-stop (`abort`) flush. A hung engine would otherwise burn up to 2×
+  // CP_SDK_TIMEOUT_MS (20s) inside onCheckpoint and starve the recovery git promotion.
+  // With a camunda whose createElementInstanceVariables NEVER resolves, the abort flush
+  // + preserveRecovery must still land the recovery ref promptly.
+  const f = fixture();
+  try {
+    const env = { NANO_AGENT_CHECKPOINT: 'on', NANO_AGENT_CHECKPOINT_INTERVAL_MS: '0' };
+    const { dir } = f.clone('hung-meta');
+    sh(dir, 'checkout', '-q', '-b', 'nano/agent-work/main-x');
+    const provisioned = { workspaceDir: dir, gitEnv: ENV, committer: { name: 'bot', email: 'bot@example.com' }, startSha: sh(dir, 'rev-parse', 'HEAD'), workingBranch: 'nano/agent-work/main-x' };
+    const logger = quietLogger();
+    // Never-resolving write: if it were awaited on the critical path, the flush below
+    // would hang well past this test's own wall-clock budget.
+    const camunda = { createElementInstanceVariables: () => new Promise(() => {}) };
+    const s = await setupWorkspaceCheckpoints({ provisioned, job: { jobKey: '1', elementInstanceKey: '818', processInstanceKey: '500', elementId: 'review' }, jobType: 't', runId: 'r', camunda, logger, env, deps: { sweepRegistry: new Map() } });
+    writeFileSync(join(dir, 'wip.txt'), 'half done\n');
+    const started = Date.now();
+    const res = await s.checkpointer.flush('abort', { timeoutMs: 20_000 });
+    assert.ok(res.sha, JSON.stringify(res));
+    const rec = await s.preserveRecovery('force-stop');
+    const elapsed = Date.now() - started;
+    assert.deepEqual(rec, { ref: 'refs/nano/recovered/818', sha: res.sha });
+    assert.ok(elapsed < 10_000, `abort flush + recovery completed in ${elapsed}ms despite the hung write (< one SDK timeout)`);
+    await s.close({ timeoutMs: 2000 });
+  } finally { f.cleanup(); }
+});
+
 
 test('#296 (F9) checkpoint git stays usable AFTER the job abort; abortRecovery cancels it', async () => {
   // The round-4 F8 attempt bound the checkpoint git runner to the JOB abortSignal.

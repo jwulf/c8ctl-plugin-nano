@@ -448,6 +448,28 @@ function fakeChild({ stdout = '', code = 0 } = {}) {
   return child;
 }
 
+// A fake child whose completion is GATED: it stays open (keeping the async
+// refresh — and thus `ghAuthRefreshInFlight` — in flight) until the `arm`
+// callback hands back a `release(token)` that the test calls to emit the token
+// and close with exit 0. Used to hold a refresh mid-read while asserting that
+// the synchronous per-job path does NOT start its own blocking re-read.
+function pendingChild(arm) {
+  const handlers = { stdout: [], stderr: [], error: [], close: [] };
+  const child = {
+    stdout: { on: (ev, fn) => { if (ev === 'data') handlers.stdout.push(fn); } },
+    stderr: { on: (ev, fn) => { if (ev === 'data') handlers.stderr.push(fn); } },
+    on: (ev, fn) => { if (handlers[ev]) handlers[ev].push(fn); },
+    kill: () => {},
+  };
+  arm((token) => {
+    queueMicrotask(() => {
+      for (const fn of handlers.stdout) fn(Buffer.from(`${token}\n`));
+      for (const fn of handlers.close) fn(0);
+    });
+  });
+  return child;
+}
+
 test('refreshGhAuthTokenAsync reads the token via spawn and folds it into the cache', async () => {
   invalidateGhAuthToken();
   const spawns = [];
@@ -568,10 +590,179 @@ test('provisionRepo does NOT retry an auth failure for a non-gh-cache credential
 });
 
 // NOTE: finalizeGit's push-retry shares the SAME source gate
-// (`credentialSource === 'gh-cache'`) as provisionRepo's clone-retry above, but
-// its push runs through the module `runGit` (the `_runGit` seam covers only the
-// late remote-scan calls), so a hermetic test cannot force the push itself to
-// fail with an auth error. The gate's behaviour is therefore covered by the
-// provisionRepo source-gate test above plus the githubCloneTokenWithSource unit
-// tests; adding a finalizeGit-specific seam solely for this would churn the
-// function for no behavioural gain.
+// (`credentialSource === 'gh-cache'`) as provisionRepo's clone-retry above; its
+// push + retry now run through the `_pushGit` seam (parallel to the `_runGit`
+// late-scan seam), so the central recovery branches are exercised hermetically
+// by the four `finalizeGit` tests at the end of this file.
+
+test('an in-flight async refresh suppresses the synchronous per-job re-read (#293 review)', async () => {
+  invalidateGhAuthToken();
+  // Prime the cache with a known token (sync reader), then DROP the reader so the
+  // async refresh goes through the SPAWN path — the only path with an in-flight
+  // window — and so the per-job lookup has no reader to fall back on either (its
+  // only non-cache source would be a real blocking `gh` spawnSync, which the
+  // in-flight guard must prevent).
+  setGhAuthTokenReader(() => 'gho_cached');
+  refreshGhAuthToken({ force: true });
+  resetGhAuthTokenReader();
+  assert.equal(ghAuthTokenInfo().fingerprint, ghTokenFingerprint('gho_cached'));
+
+  // A gated `gh auth token` child holds the async refresh (and thus
+  // ghAuthRefreshInFlight) open until we release it.
+  let releaseAuth;
+  const gatedAuth = pendingChild((release) => { releaseAuth = release; });
+  const _spawn = (cmd, args) => {
+    if (args[0] === 'auth' && args[1] === 'token') return gatedAuth;
+    if (args[0] === 'api') return fakeChild({ stdout: 'HTTP/2 200\nX-OAuth-Scopes: repo\n\n{}', code: 0 });
+    return fakeChild({ stdout: '', code: 0 });
+  };
+  // Kick off (do NOT await) the async refresh: its synchronous prologue sets
+  // ghAuthRefreshInFlight before suspending on the gated read.
+  const p = refreshGhAuthTokenAsync({ force: true, _spawn });
+  // While the read is still in flight, the synchronous per-job lookup must hand
+  // out the CACHED token WITHOUT a blocking re-read (Copilot review on #293:
+  // a job activated during the async refresh must not degrade into spawnSync).
+  assert.equal(ghAuthTokenFromCli(), 'gho_cached', 'the per-job path served the cache, not a fresh blocking read');
+  // Release the gh read with a ROTATED token; the async refresh adopts it.
+  releaseAuth('gho_rotated');
+  await p;
+  assert.equal(ghAuthTokenInfo().fingerprint, ghTokenFingerprint('gho_rotated'), 'the async refresh adopted the rotated token once settled');
+  invalidateGhAuthToken();
+});
+
+test('a second async refresh awaits the in-flight one instead of spawning again (#293 review)', async () => {
+  invalidateGhAuthToken();
+  let authReads = 0;
+  let releaseAuth;
+  const gatedAuth = pendingChild((release) => { releaseAuth = release; });
+  const _spawn = (cmd, args) => {
+    if (args[0] === 'auth' && args[1] === 'token') { authReads++; return gatedAuth; }
+    if (args[0] === 'api') return fakeChild({ stdout: 'HTTP/2 200\nX-OAuth-Scopes: repo\n\n{}', code: 0 });
+    return fakeChild({ stdout: '', code: 0 });
+  };
+  const first = refreshGhAuthTokenAsync({ force: true, _spawn });
+  // A concurrent forced refresh must NOT start a second `gh auth token` read.
+  const second = refreshGhAuthTokenAsync({ force: true, _spawn });
+  releaseAuth('gho_once');
+  await Promise.all([first, second]);
+  assert.equal(authReads, 1, 'only ONE gh read happened despite two concurrent forced refreshes');
+  assert.equal(ghAuthTokenInfo().fingerprint, ghTokenFingerprint('gho_once'));
+  invalidateGhAuthToken();
+});
+
+// --- finalizeGit push-recovery (Copilot review on #293): the central
+//     changed-token success path, the unchanged-token guard, the
+//     credential-source gate, and the non-auth no-retry path, all driven
+//     through the `_pushGit` seam against a real local origin. ---------------
+
+// Build a provisioned workspace with ONE agent commit ready to push.
+function provisionWithCommit({ credentialSource = null, token = null } = {}) {
+  const { root, origin } = makeLocalOrigin();
+  const runDir = mkdtempSync(join(root, 'run-'));
+  const envelope = {
+    schemaVersion: 1,
+    repository: { provider: 'github', url: origin, ref: 'main', submodules: false },
+    branch: { base: 'main', create: 'feat/push-recovery', push: true },
+    setup: { commands: [], env: {}, secretRefs: [] },
+    task: { allowPr: false },
+  };
+  const prov = provisionRepo({ envelope, token, runDir, credentialSource });
+  const g = (args) => {
+    const r = spawnSync('git', args, { cwd: prov.workspaceDir, encoding: 'utf8', timeout: 30_000, env: { ...process.env, GIT_CONFIG_NOSYSTEM: '1' } });
+    if (r.status !== 0) throw new Error(`git ${args.join(' ')} failed: ${r.stderr || r.stdout}`);
+  };
+  g(['config', 'user.name', 'agent']);
+  g(['config', 'user.email', 'agent@example.com']);
+  writeFileSync(join(prov.workspaceDir, 'AGENT.txt'), 'agent change\n');
+  g(['add', '-A']);
+  g(['commit', '-q', '-m', 'agent: add AGENT.txt']);
+  return { root, origin, envelope, prov };
+}
+
+const authFail = (opts) => ({ status: 128, stdout: '', stderr: "fatal: could not read Username for 'https://github.com': terminal prompts disabled", signal: null, timedOut: false, timeoutMs: opts?.timeoutMs });
+
+test('finalizeGit retries the push once with a fresh token on an auth failure (#293 review)', { skip: !gitAvailable }, () => {
+  const { root, envelope, prov } = provisionWithCommit({ credentialSource: 'gh-cache', token: 'gho_stale' });
+  try {
+    let served = 'gho_stale';
+    setGhAuthTokenReader(() => served);
+    invalidateGhAuthToken();
+    refreshGhAuthToken({ force: true }); // cache ← stale
+    let pushes = 0;
+    const pushSeam = (args, opts) => {
+      if (args.includes('push')) {
+        pushes++;
+        if (pushes === 1) return authFail(opts); // the stale token's rejection
+        // The retry must carry the ROTATED token in GIT_TOKEN, then really push.
+        assert.equal(opts?.env?.GIT_TOKEN, 'gho_fresh', 'the retry runs with the rotated token');
+        return runGit(args, opts);
+      }
+      return runGit(args, opts);
+    };
+    served = 'gho_fresh'; // operator re-logged in since the worker primed
+    const out = finalizeGit({ ...prov, envelope, token: 'gho_stale', logger: { warn: () => {}, error: () => {}, info: () => {}, debug: () => {} }, _pushGit: pushSeam });
+    assert.equal(pushes, 2, 'the push was retried once after the auth failure');
+    assert.equal(out.pushed, true, 'the retry with the fresh token succeeded');
+    assert.equal(ghAuthTokenInfo().fingerprint, ghTokenFingerprint('gho_fresh'), 'the rotated token was adopted');
+  } finally {
+    resetGhAuthTokenReader();
+    invalidateGhAuthToken();
+    rmSync(root, { recursive: true, force: true });
+  }
+});
+
+test('finalizeGit does NOT retry the push when the re-read token is unchanged (#293 review)', { skip: !gitAvailable }, () => {
+  const { root, envelope, prov } = provisionWithCommit({ credentialSource: 'gh-cache', token: 'gho_same' });
+  try {
+    setGhAuthTokenReader(() => 'gho_same'); // a genuine permission denial, not a stale cache
+    invalidateGhAuthToken();
+    refreshGhAuthToken({ force: true });
+    let pushes = 0;
+    const pushSeam = (args, opts) => (args.includes('push') ? (pushes++, authFail(opts)) : runGit(args, opts));
+    const out = finalizeGit({ ...prov, envelope, token: 'gho_same', logger: { warn: () => {}, error: () => {}, info: () => {}, debug: () => {} }, _pushGit: pushSeam });
+    assert.equal(pushes, 1, 'no retry when the re-read token did not change');
+    assert.equal(out.pushed, false);
+    assert.ok(out.pushFailed, 'the unchanged-token push failure strands the commits');
+  } finally {
+    resetGhAuthTokenReader();
+    invalidateGhAuthToken();
+    rmSync(root, { recursive: true, force: true });
+  }
+});
+
+test('finalizeGit does NOT retry the push for a non-gh-cache credential (#293 review)', { skip: !gitAvailable }, () => {
+  const { root, envelope, prov } = provisionWithCommit({ credentialSource: 'env', token: 'explicit-env-token' });
+  try {
+    // A reader is installed to PROVE it is never consulted: the source gate must
+    // reject the gh-token fallback before any re-read for an 'env' credential.
+    setGhAuthTokenReader(() => { throw new Error('the gh reader must not be consulted for an env credential'); });
+    invalidateGhAuthToken();
+    let pushes = 0;
+    const pushSeam = (args, opts) => (args.includes('push') ? (pushes++, authFail(opts)) : runGit(args, opts));
+    const out = finalizeGit({ ...prov, envelope, token: 'explicit-env-token', logger: { warn: () => {}, error: () => {}, info: () => {}, debug: () => {} }, _pushGit: pushSeam });
+    assert.equal(pushes, 1, 'no gh-token retry for an env-sourced credential');
+    assert.equal(out.pushed, false);
+  } finally {
+    resetGhAuthTokenReader();
+    invalidateGhAuthToken();
+    rmSync(root, { recursive: true, force: true });
+  }
+});
+
+test('finalizeGit does NOT retry a non-auth push failure (#293 review)', { skip: !gitAvailable }, () => {
+  const { root, envelope, prov } = provisionWithCommit({ credentialSource: 'gh-cache', token: 'gho_cache' });
+  try {
+    setGhAuthTokenReader(() => { throw new Error('a non-auth failure must not trigger a token re-read'); });
+    invalidateGhAuthToken();
+    let pushes = 0;
+    const nonFf = (opts) => ({ status: 1, stdout: '', stderr: '! [rejected] feat/push-recovery -> feat/push-recovery (non-fast-forward)', signal: null, timedOut: false, timeoutMs: opts?.timeoutMs });
+    const pushSeam = (args, opts) => (args.includes('push') ? (pushes++, nonFf(opts)) : runGit(args, opts));
+    const out = finalizeGit({ ...prov, envelope, token: 'gho_cache', logger: { warn: () => {}, error: () => {}, info: () => {}, debug: () => {} }, _pushGit: pushSeam });
+    assert.equal(pushes, 1, 'a non-auth push failure is not retried');
+    assert.equal(out.pushed, false);
+  } finally {
+    resetGhAuthTokenReader();
+    invalidateGhAuthToken();
+    rmSync(root, { recursive: true, force: true });
+  }
+});

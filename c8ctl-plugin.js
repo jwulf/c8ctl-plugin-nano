@@ -4923,6 +4923,17 @@ const GH_AUTH_TOKEN_TTL_MS = Math.max(0, coerceInt(process.env.NANO_GH_TOKEN_TTL
 // keeps gh's upgrade check out of the captured output.
 const GH_NONINTERACTIVE_ENV = () => ({ ...process.env, GH_PROMPT_DISABLED: '1', GH_NO_UPDATE_NOTIFIER: '1' });
 let ghAuthTokenCache = GH_AUTH_TOKEN_UNSET;
+// A Promise while an ASYNC gh-token refresh (the periodic timer tick or the
+// `reload-credentials` SIGUSR1 handler) is actually spawning `gh` subprocesses;
+// null otherwise. This is the serialization point that keeps a refresh off the
+// job path (Copilot review on #293): while it is set, the SYNCHRONOUS per-job
+// lookup (`ghAuthTokenFromCli`) must NOT start its own blocking `spawnSync`
+// re-read — it hands out the currently-cached token and lets the in-flight
+// async refresh update the cache, so an async refresh overlapping a freshly
+// activated job can never degrade into a 15s event-loop/lease-heartbeat stall.
+// It also prevents the timer and the SIGUSR1 handler from racing two concurrent
+// reads: a second async refresh awaits the first instead of spawning again.
+let ghAuthRefreshInFlight = null;
 // Test-only seam: the `gh auth token` reader `refreshGhAuthToken` consults when
 // no per-call `run` is injected. Production leaves this unset (the real
 // spawnSync of the gh CLI); a test installs a stub so the clone/push
@@ -5015,9 +5026,10 @@ async function adoptGhAuthTokenAsync(token, { scopesProbe } = {}) {
 
 // One (re)read of `gh auth token`, folding the result into the cache record.
 // Returns { token, changed } (see adoptGhAuthToken). SYNCHRONOUS (spawnSync) —
-// safe off the job path (the startup prime, the clone/push auth-failure
-// recovery, the SIGUSR1 reload) but it blocks the event loop while it runs, so
-// the periodic refresh uses refreshGhAuthTokenAsync instead.
+// safe off the job path (the startup prime and the clone/push auth-failure
+// recovery, where the caller is already blocked waiting on git) but it blocks
+// the event loop while it runs, so the periodic refresh AND the SIGUSR1
+// reload-credentials handler use refreshGhAuthTokenAsync instead.
 function refreshGhAuthToken({ force = false, run = null, scopesProbe } = {}) {
   const prev = ghAuthTokenCache === GH_AUTH_TOKEN_UNSET ? null : ghAuthTokenCache;
   const now = Date.now();
@@ -5124,14 +5136,47 @@ async function refreshGhAuthTokenAsync({ force = false, scopesProbe, _spawn } = 
   if (!force && prev && now - prev.lastCheck < GH_AUTH_TOKEN_TTL_MS) {
     return { token: prev.token, changed: false };
   }
+  // Serialize against any refresh already spawning (another timer tick, or the
+  // reload-credentials SIGUSR1 handler): await IT and report its (already
+  // applied) cache rather than starting a second concurrent `gh` read. This is
+  // what lets the synchronous per-job path safely defer to an in-flight async
+  // refresh instead of blocking (Copilot review on #293).
+  if (ghAuthRefreshInFlight) {
+    try { await ghAuthRefreshInFlight; } catch { /* swallowed — the owner logs/handles it */ }
+    const c = ghAuthTokenCache === GH_AUTH_TOKEN_UNSET ? null : ghAuthTokenCache;
+    return { token: c ? c.token : null, changed: false };
+  }
   // Honor the module reader seam when a test installed one (mirroring the sync
   // path) so a stubbed refresh never spawns; production (reader null) spawns.
-  const token = ghAuthTokenReader ? ((ghAuthTokenReader() || null)) : await readGhAuthTokenAsync({ _spawn });
-  const probe = scopesProbe ?? (ghAuthTokenReader ? (() => null) : ((tok) => ghTokenScopesAsync(tok, { _spawn })));
-  return adoptGhAuthTokenAsync(token, { scopesProbe: probe });
+  const run = (async () => {
+    const token = ghAuthTokenReader ? ((ghAuthTokenReader() || null)) : await readGhAuthTokenAsync({ _spawn });
+    const probe = scopesProbe ?? (ghAuthTokenReader ? (() => null) : ((tok) => ghTokenScopesAsync(tok, { _spawn })));
+    return adoptGhAuthTokenAsync(token, { scopesProbe: probe });
+  })();
+  // Publish the in-flight marker BEFORE the first await inside `run` has a chance
+  // to yield, so a job activated on the very next tick already sees it. The
+  // marker never rejects (so a concurrent awaiter can't throw on it); the real
+  // result/rejection is surfaced to this caller below.
+  ghAuthRefreshInFlight = run.then(() => {}, () => {});
+  try {
+    return await run;
+  } finally {
+    ghAuthRefreshInFlight = null;
+  }
 }
 
 function ghAuthTokenFromCli() {
+  // If an async refresh is already spawning (a timer tick or the
+  // reload-credentials SIGUSR1 handler), do NOT start a blocking synchronous
+  // re-read on this per-job path — that is exactly the 15s event-loop/lease
+  // stall the async refresh exists to avoid (Copilot review on #293). Hand out
+  // the currently-cached token; the in-flight refresh updates the cache for the
+  // next lookup, and the clone/push auth-failure recovery still force-re-reads
+  // if the handed-out token turns out stale. A not-yet-primed cache (UNSET)
+  // yields null — the same anonymous fallback the refresh would briefly produce.
+  if (ghAuthRefreshInFlight) {
+    return ghAuthTokenCache === GH_AUTH_TOKEN_UNSET ? null : ghAuthTokenCache.token;
+  }
   if (ghAuthTokenCache === GH_AUTH_TOKEN_UNSET) return refreshGhAuthToken({ force: true }).token;
   return refreshGhAuthToken().token;
 }
@@ -6592,7 +6637,7 @@ function computeRelayCloseReason(result, runCompleted, gitResult) {
 // branch.push), and reconcile the agent-opened PR (when task.allowPr). A push
 // failure is reported (pushError) rather than thrown — the process model decides
 // what to do next, and re-running the agent would be non-idempotent.
-function finalizeGit({ workspaceDir, gitEnv, startSha, workingBranch, baseBranch: effectiveBase, baseCloneSha = null, baseBaselineUnknown = false, hasPrBranch, envelope, token, logger = null, corr = '', budgetMs = 0, provisioned = false, keepRuns = false, credentialSource = null, _runGit = null }) {
+function finalizeGit({ workspaceDir, gitEnv, startSha, workingBranch, baseBranch: effectiveBase, baseCloneSha = null, baseBaselineUnknown = false, hasPrBranch, envelope, token, logger = null, corr = '', budgetMs = 0, provisioned = false, keepRuns = false, credentialSource = null, _runGit = null, _pushGit = null }) {
   const log = logger || getLogger(); // route observability through the injected logger (tests) or the host logger
   // Test-only seam: the late remote-reachability FILTER scans (movedStray /
   // unpushedBranchCommits / final stranded) AND the remote-tip VERIFICATION calls
@@ -6603,6 +6648,14 @@ function finalizeGit({ workspaceDir, gitEnv, startSha, workingBranch, baseBranch
   // probes cannot be made to fail deterministically. Defaults to the module `runGit`, so
   // production behaviour is unchanged.
   const lateScanGit = _runGit || runGit;
+  // Test-only seam for the branch PUSH itself (the initial push AND the single
+  // post-auth-failure retry). Routed separately from `lateScanGit` so a
+  // hermetic test can drive the central push-recovery branches — changed-token
+  // retry success, the unchanged-token guard, the credential-source gate, and
+  // retry-still-fails — without a live remote, while the local enumeration and
+  // late remote-reachability scans keep their own runner (Copilot review on
+  // #293). Defaults to the module `runGit`, so production behaviour is unchanged.
+  const pushGit = _pushGit || runGit;
   const cs = corr ? ` [${corr}]` : ''; // #229 cross-channel correlation suffix
   const out = { branch: workingBranch, baseSha: startSha || null, headSha: null, commits: [], pushed: false, remote: null, pr: null };
 
@@ -6988,7 +7041,7 @@ function finalizeGit({ workspaceDir, gitEnv, startSha, workingBranch, baseBranch
     // qualified heads ref resolves unambiguously; --set-upstream still tracks the
     // local branch.
     const pushTimeout = netTimeoutMs();
-    let push = runGit([...credArgs(), 'push', '--set-upstream', 'origin', `refs/heads/${workingBranch}:refs/heads/${workingBranch}`], { cwd: workspaceDir, env: gitEnv, timeoutMs: pushTimeout });
+    let push = pushGit([...credArgs(), 'push', '--set-upstream', 'origin', `refs/heads/${workingBranch}:refs/heads/${workingBranch}`], { cwd: workspaceDir, env: gitEnv, timeoutMs: pushTimeout });
     // #293: an AUTH rejection (401/403, or the OAuth `workflow`-scope refusal)
     // usually means the cached gh token went stale mid-run. Drop the cache,
     // re-read once, and retry the push ONCE with the fresh token before
@@ -7007,7 +7060,7 @@ function finalizeGit({ workspaceDir, gitEnv, startSha, workingBranch, baseBranch
       if (changed && fresh && fresh !== token) {
         log.info?.(`finalizeGit${cs}: git push auth failed — the cached gh token may be stale; re-read it (${describeGhAuthToken(ghAuthTokenInfo())}) and retrying the push once`);
         const retryEnv = { ...gitEnv, GIT_TOKEN: fresh };
-        const retry = runGit([...credArgs(), 'push', '--set-upstream', 'origin', `refs/heads/${workingBranch}:refs/heads/${workingBranch}`], { cwd: workspaceDir, env: retryEnv, timeoutMs: netTimeoutMs() });
+        const retry = pushGit([...credArgs(), 'push', '--set-upstream', 'origin', `refs/heads/${workingBranch}:refs/heads/${workingBranch}`], { cwd: workspaceDir, env: retryEnv, timeoutMs: netTimeoutMs() });
         if (retry.status === 0) {
           // Adopt the fresh token for the rest of finalization (the PR reconcile
           // + attribution below read `token`) and record the success.
@@ -10919,20 +10972,34 @@ async function workAgent(req, flags, ctx) {
     isIdle: () => activeJobs.size === 0,
     onChange: () => writeActivity(),
   });
-  // `supervisor reload-credentials` asks every worker to drop its cached gh
-  // token without draining in-flight jobs. The daemon signals SIGUSR1; the next
-  // TTL refresh (or job) re-reads the CLI. Deliberately NOT the SIGUSR2 drain
-  // path — dropping a credential must not park the fleet. Windows cannot deliver
-  // SIGUSR1 (Node terminates the process), so the daemon refuses the op there.
-  // `writeActivityRef` is late-bound to `writeActivity` once it is defined below
-  // so the signal handler can republish the token's age/scopes immediately.
+  // `supervisor reload-credentials` asks every worker to re-read its gh token
+  // without draining in-flight jobs. The daemon signals SIGUSR1; the handler
+  // re-reads the CLI ASYNCHRONOUSLY (spawn, never spawnSync) and serialized
+  // against the TTL timer, so even a worker mid-job keeps its event loop / lock
+  // heartbeat responsive while the new credential is adopted. Deliberately NOT
+  // the SIGUSR2 drain path — dropping a credential must not park the fleet.
+  // Windows cannot deliver SIGUSR1 (Node terminates the process), so the daemon
+  // refuses the op there. `writeActivityRef` is late-bound to `writeActivity`
+  // once it is defined below so the handler can republish the token's
+  // age/scopes once the async re-read settles.
   let writeActivityRef = null;
   if (process.platform !== 'win32') {
     process.on('SIGUSR1', () => {
-      invalidateGhAuthToken();
-      const { changed } = refreshGhAuthToken({ force: true });
-      logger.info(`Credentials reload requested — dropped the cached gh auth token; re-read: ${describeGhAuthToken(ghAuthTokenInfo())}${changed ? ' (token changed)' : ''}`);
-      if (writeActivityRef) writeActivityRef();
+      // Use the ASYNC refresh (spawn, never spawnSync) so dropping/replacing the
+      // cached credential can never pause the event loop / lock heartbeat of a
+      // worker servicing a job — the whole promise of `reload-credentials` is
+      // that it does NOT disrupt in-flight jobs (Copilot review on #293). It is
+      // serialized against the periodic timer via `ghAuthRefreshInFlight`.
+      // Deliberately NOT `invalidateGhAuthToken()` first: the async `force` read
+      // re-reads `gh auth token` regardless of TTL and swaps the cache ATOMICALLY
+      // when the new value lands, so the worker keeps serving the still-valid old
+      // token for the ~10s read window instead of handing out null meanwhile.
+      refreshGhAuthTokenAsync({ force: true })
+        .then(({ changed }) => {
+          logger.info(`Credentials reload requested — re-read the gh auth token: ${describeGhAuthToken(ghAuthTokenInfo())}${changed ? ' (token changed)' : ''}`);
+          if (writeActivityRef) writeActivityRef();
+        })
+        .catch(() => { /* best effort — a wedged gh must not crash the worker */ });
     });
   }
   logger.info('Polling for work — press Ctrl-C to stop.');

@@ -1072,11 +1072,13 @@ agent command shells out to `gh`. A **container** sandbox is isolated and does
 exported, a worker falls back to `gh auth token` and caches it (a synchronous
 CLI read that can't run on the per-job path). The cache is **not**
 process-lifetime: it is re-read on a short TTL (`NANO_GH_TOKEN_TTL_MS`, default
-5 minutes) off the job path, and a clone/push that fails with an auth or
-OAuth-scope error (401/403, "refusing to allow an OAuth App … without `workflow`
-scope") drops the cache, re-reads once, and retries before failing — so a
-`gh auth login` / `gh auth refresh` you run while the fleet is up is adopted
-within one TTL, and a rotated token self-heals mid-flight. Each worker logs the
+5 minutes) off the job path — the timer DEFERS a tick while a job is active — and
+a clone/push that fails with an auth or OAuth-scope error (401/403, "refusing to
+allow an OAuth App … without `workflow` scope") drops the cache, re-reads once,
+and retries before failing — so a `gh auth login` / `gh auth refresh` you run
+while the fleet is up is adopted once the worker is idle and the next tick runs
+(bounded by the in-flight job's remaining duration plus up to one interval), and
+a rotated token self-heals mid-flight via the recovery path. Each worker logs the
 token's **fingerprint + scopes** (never the value) at startup and whenever it
 changes, and `c8ctl nano supervisor status` shows a **GH AUTH** column (token
 age + scopes) per worker, so "this worker has a stale token" is a one-line

@@ -67,8 +67,10 @@ SDK client (job workers) — do **not** add the SDK as a dependency or use raw
   exported the token comes from a cached `gh auth token` read (issue #293): the
   cache is a record `{ token, fingerprint, scopes, since, lastCheck }` with a
   TTL (`NANO_GH_TOKEN_TTL_MS`, default 5m), re-read off the job path by a
-  worker-lifetime timer (`startGhAuthTokenRefresh`), so a `gh auth login` /
-  `refresh` while the fleet runs is adopted within one TTL — never a stale
+  worker-lifetime timer (`startGhAuthTokenRefresh`) that DEFERS a tick while a
+  job is active, so a `gh auth login` / `refresh` while the fleet runs is adopted
+  once the worker is next idle and the following tick runs — bounded by the
+  in-flight job's remaining duration plus up to one interval, never a stale
   process-lifetime memo. A clone/push that fails with an auth/OAuth-scope error
   (`isGitAuthFailure`) drops the cache, re-reads once, and retries once before
   failing. The token's **fingerprint + scopes** (never the value) are logged at

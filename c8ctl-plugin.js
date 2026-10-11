@@ -90,7 +90,7 @@ import { createAgentInstanceProducer, isExternalAgentJob } from './agent-instanc
 // so the new agent CONTINUES rather than cold-reruns — at-least-once delivery becomes
 // a continuation, not a duplicate. Best-effort; degrades to the legacy cold rerun.
 import { resolveEffectiveEnvelope } from './agent-resume.mjs';
-import { checkpointConfig, checkpointEligibility, checkpointRef, recoveredCheckpointRef, predecessorCheckpointRef, pushNamedRef, makeOrphanProbe, normalizeSecretValues, credentialsFromUrl, isAuthenticatedRemote, shouldSweep, sweepStaleCheckpoints, createGitRunner, fetchCheckpoint, restoreCheckpoint, createWorkspaceCheckpoint, createCheckpointer, deleteCheckpointRef, withCheckpointNote, sanitizeBranchSegment } from './agent-checkpoint.mjs';
+import { checkpointConfig, checkpointEligibility, checkpointRef, recoveredCheckpointRef, predecessorCheckpointRef, pushNamedRef, observeRemoteRefSha, makeOrphanProbe, normalizeSecretValues, credentialsFromUrl, isAuthenticatedRemote, shouldSweep, sweepStaleCheckpoints, createGitRunner, fetchCheckpoint, restoreCheckpoint, createWorkspaceCheckpoint, createCheckpointer, deleteCheckpointRef, withCheckpointNote, sanitizeBranchSegment } from './agent-checkpoint.mjs';
 
 const requireFromHere = createRequire(import.meta.url);
 const pluginDir = dirname(fileURLToPath(import.meta.url));
@@ -260,6 +260,15 @@ const READINESS_TIMEOUT_MS = 60_000;
 const READINESS_POLL_MS = 500;
 const HEALTH_TIMEOUT_MS = 1_500;
 const STOP_GRACE_MS = 8_000;
+// #296: a `stop --force` SIGTERMs a `nano work` child, which (on an interrupted
+// agent job) flushes a last WIP checkpoint and promotes it to a GC-proof recovery
+// ref (#295) before exiting. That flush+promote must fit inside the window the
+// supervisor allows before its SIGKILL backstop, or the recovery ref is never
+// written. This is the bounded budget the worker gives that force-stop recovery,
+// and the EXTRA grace `forceStopWorker` waits beyond STOP_GRACE_MS before SIGKILL
+// (a child that exits sooner is reaped immediately — this only lengthens the
+// SIGKILL backstop for a worker that is actively preserving recovery).
+const FORCE_STOP_RECOVERY_MS = 20_000;
 // #202: the signal a graceful `supervisor stop`/`workforce stop` sends each
 // `nano work` child to quiesce it — stop leasing new jobs, finish in-flight work,
 // then exit. SIGTERM/SIGINT remain the FORCE abort (kill harness, yield jobs).
@@ -6784,11 +6793,20 @@ async function setupWorkspaceCheckpoints({ provisioned, envelope = null, token =
         let predCp = null;
         try { predCp = await fetchCp({ git: startupGit, ref: predRef }); } catch (err) { log.debug(`could not fetch predecessor WIP checkpoint ${predRef} — ${oneLineLog(err?.message || err)}.`); }
         if (predCp?.sha) {
+          // Create-only adoption (default expectSha=''): only write our key while it
+          // is ABSENT, so a concurrent same-key retry that already adopted + advanced
+          // the ref is never clobbered (Copilot review on #296).
           const copied = await pushNamedRef({ git: startupGit, ref, sha: predCp.sha });
           if (copied?.ok) {
             try { prior = await fetchCp({ git: startupGit, ref }); } catch { prior = { ...predCp, ref }; }
             if (!prior) prior = { ...predCp, ref };
             logger.info?.(`${prefix} (${corr}): adopted predecessor WIP checkpoint ${predRef}@${predCp.sha.slice(0, 12)} under this run's key ${ref} (SLA-escalation resume); restoring it below.`);
+          } else if (copied?.staleLease) {
+            // A concurrent activation populated this key first — adopt what IS there
+            // rather than force over it; the ref now holds the race winner's state.
+            try { prior = await fetchCp({ git: startupGit, ref }); } catch { prior = null; }
+            if (prior) logger.info?.(`${prefix} (${corr}): a concurrent activation already populated ${ref}; adopting its checkpoint ${prior.sha ? '@' + String(prior.sha).slice(0, 12) : ''} (SLA-escalation resume); restoring it below.`);
+            else log.warn(`found predecessor WIP checkpoint ${predRef}@${predCp.sha.slice(0, 12)} but ${ref} was concurrently moved and could not be re-read — the predecessor ref is retained for explicit recovery.`);
           } else {
             log.warn(`found predecessor WIP checkpoint ${predRef}@${predCp.sha.slice(0, 12)} but could not copy it to ${ref} — ${copied?.error || 'unknown'}; the predecessor ref is retained for explicit recovery.`);
           }
@@ -7023,10 +7041,21 @@ async function setupWorkspaceCheckpoints({ provisioned, envelope = null, token =
         const recRef = recoveredCheckpointRef(job?.elementInstanceKey);
         if (!recRef) return null;
         try {
-          const r = await pushNamedRef({ git, ref: recRef, sha: ownedSha });
+          // Fence the recovery promotion against the sha we OBSERVE on the ref now,
+          // so a slower/stale activation that observed an older/absent value loses
+          // the lease once a newer run moved it, instead of blind-forcing over
+          // whatever is current (Copilot review on #296).
+          const prevRecSha = await observeRemoteRefSha({ git, ref: recRef });
+          const r = await pushNamedRef({ git, ref: recRef, sha: ownedSha, expectSha: prevRecSha });
           if (r?.ok) {
             logger.info?.(`${prefix} (${corr}): preserved a GC-proof recovery checkpoint ${recRef}@${ownedSha.slice(0, 12)} (${reason}) — it survives the orphan GC so the SLA-cancelled/force-stopped run can be recovered and resumed.`);
             return { ref: recRef, sha: ownedSha };
+          }
+          if (r?.staleLease) {
+            // A newer activation already preserved a recovery point on this ref;
+            // keep theirs. Our WIP ref is still retained as a fallback.
+            log.warn(`recovery checkpoint ${recRef} was moved by a newer activation — keeping its recovery point; the WIP ref ${ref} is still retained for recovery.`);
+            return null;
           }
           log.warn(`could not preserve recovery checkpoint ${recRef} — ${redactToken(r?.error || 'unknown', token)}; the WIP ref ${ref} is still retained for recovery.`);
         } catch (err) {
@@ -12758,9 +12787,24 @@ async function workAgent(req, flags, ctx) {
             // force-stopped run produces no outcome envelope by design (Copilot
             // review on #295), so the recovery ref is recoverable from the pushed
             // refs/nano/recovered/<eik> ref itself, not from any job result.
+            // #296: bound the WHOLE flush+promote to FORCE_STOP_RECOVERY_MS so it
+            // reliably finishes (and this worker exits) inside the window the
+            // supervisor's forceStopWorker now waits before its SIGKILL backstop —
+            // otherwise the default flush (20s) + recovery git push (60s) could run
+            // long and be SIGKILLed before refs/nano/recovered/<eik> is written.
+            // Best-effort: if the budget elapses we give up on the recovery ref (the
+            // WIP ref + TTL remain the fallback), never block the yield/exit.
             if (checkpointer) {
-              await checkpointer.flush('abort', { timeoutMs: checkpointing.flushTimeoutMs }); checkpointFinalized = true;
-              try { recoveryRefInfo = await checkpointing.preserveRecovery('force-stop') || recoveryRefInfo; } catch { /* best effort */ }
+              const recoveryDeadline = FORCE_STOP_RECOVERY_MS;
+              const recover = (async () => {
+                await checkpointer.flush('abort', { timeoutMs: recoveryDeadline }); checkpointFinalized = true;
+                try { recoveryRefInfo = await checkpointing.preserveRecovery('force-stop') || recoveryRefInfo; } catch { /* best effort */ }
+              })();
+              let budgetTimer = null;
+              const budget = new Promise((res) => { budgetTimer = setTimeout(res, recoveryDeadline); if (budgetTimer.unref) budgetTimer.unref(); });
+              try { await Promise.race([recover, budget]); } catch { /* best effort */ }
+              finally { if (budgetTimer) clearTimeout(budgetTimer); }
+              checkpointFinalized = true;
             }
             return;
           }
@@ -14813,7 +14857,12 @@ async function runSupervisorDaemon() {
     const pid = w.pid;
     if (w.child && pid) {
       try { process.kill(pid, 'SIGTERM'); } catch { /* already gone */ }
-      await waitForChildExit(w.child, STOP_GRACE_MS);
+      // #296: wait STOP_GRACE_MS for a routine exit PLUS the bounded recovery budget,
+      // so a worker that is flushing + promoting a GC-proof recovery ref (#295) for an
+      // interrupted agent job can finish before the SIGKILL backstop. A worker that
+      // exits sooner is reaped at once — this only lengthens the ceiling for one that
+      // is actively preserving recovery.
+      await waitForChildExit(w.child, STOP_GRACE_MS + FORCE_STOP_RECOVERY_MS);
       if (isPidAlive(pid)) { try { process.kill(pid, 'SIGKILL'); } catch { /* ignore */ } }
     }
   };

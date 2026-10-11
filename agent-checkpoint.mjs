@@ -329,14 +329,47 @@ export function predecessorCheckpointRef(variables, selfRef = null, elementId = 
   return s;
 }
 
-// Push `sha` to `ref` on `remote`, overwriting any existing ref (`+<sha>:<ref>`).
-// Used to ADOPT a predecessor's checkpoint under this run's key (#295) and to
-// promote a snapshot to a GC-proof recovery ref — both write a ref we fully own, so
-// a plain force (not a lease) is correct. Returns { ok } or { ok:false, error }.
-export async function pushNamedRef({ git, ref, sha, remote = 'origin' }) {
+// Push `sha` to `ref` on `remote`, FENCED so a slower/stale activation can never
+// blind-overwrite a newer run's state (Copilot review on #296). A plain `+<sha>:<ref>`
+// force let whichever writer ran LAST win, so a zombie prior activation could clobber
+// the recovery point of the newer run that superseded it — the exact failure the WIP
+// path already guards against with `--force-with-lease`. `expectSha` is the remote sha
+// this run believes `ref` holds and the write is leased against it:
+//   - '' (default) demands the ref be ABSENT — "create-only". Used to ADOPT a
+//     predecessor's checkpoint under THIS run's own key (#295): if a concurrent
+//     activation already populated the key the lease is lost and we keep theirs.
+//   - a non-empty sha only overwrites while `ref` still points at exactly that sha —
+//     used to promote a GC-proof recovery ref over the value we OBSERVED, so a stale
+//     activation that observed an older/absent value loses the lease once a newer run
+//     moved the ref.
+//   - `null` keeps the legacy unconditional force (no caller uses it; kept for tests).
+// A lease mismatch means another writer moved `ref` first: returns
+// { ok:false, staleLease:true, error } and leaves their state intact. Other failures
+// return { ok:false, error }.
+export async function pushNamedRef({ git, ref, sha, remote = 'origin', expectSha = '' }) {
   if (!ref || !sha) return { ok: false, error: 'missing ref or sha' };
-  const r = await git(['push', '--quiet', '--no-verify', remote, `+${sha}:${ref}`]);
-  return ok(r) ? { ok: true } : { ok: false, error: errText(r) };
+  const args = expectSha != null
+    ? ['push', '--quiet', '--no-verify', `--force-with-lease=${ref}:${expectSha}`, remote, `${sha}:${ref}`]
+    : ['push', '--quiet', '--no-verify', remote, `+${sha}:${ref}`];
+  const r = await git(args);
+  if (ok(r)) return { ok: true };
+  const text = `${r.stderr}\n${r.stdout}`;
+  if (expectSha != null && classifyPushFailure(text) === 'lease') {
+    return { ok: false, staleLease: true, error: errText(r) };
+  }
+  return { ok: false, error: errText(r) };
+}
+
+// Observe the sha `ref` currently holds on `remote` ('' when absent/unreadable), so a
+// fenced `pushNamedRef` can lease against it. Best-effort: any ls-remote failure
+// returns '' (create-only semantics — fail closed, never blind-overwrite).
+export async function observeRemoteRefSha({ git, ref, remote = 'origin' }) {
+  try {
+    const r = await git(['ls-remote', '--quiet', remote, ref]);
+    if (!ok(r)) return '';
+    const first = String(r.stdout ?? '').trim().split(/\s+/)[0] || '';
+    return /^[0-9a-f]{7,64}$/i.test(first) ? first : '';
+  } catch { return ''; }
 }
 
 // Build the orphan predicate the GC sweep consults (#295). A WIP ref is an orphan

@@ -8,7 +8,7 @@ import {
   checkpointConfig, checkpointRef, checkpointEligibility, classifyPushFailure, containsSecret, normalizeSecretValues, credentialsFromUrl, isAuthenticatedRemote, shouldSweep, sweepStaleCheckpoints, isDeniedPath, isCheckpointTrigger, createGitRunner,
   snapshotWorktree, pushCheckpoint, fetchCheckpoint, restoreCheckpoint, deleteCheckpointRef, redactUrlUserinfo, CHECKPOINT_DETACHED_MARKER,
   createWorkspaceCheckpoint, createCheckpointer, withCheckpointNote,
-  recoveredCheckpointRef, predecessorCheckpointRef, pushNamedRef, makeOrphanProbe, RECOVERED_REF_PREFIX,
+  recoveredCheckpointRef, predecessorCheckpointRef, pushNamedRef, observeRemoteRefSha, makeOrphanProbe, RECOVERED_REF_PREFIX,
 } from './agent-checkpoint.mjs';
 
 const ENV = {
@@ -1573,16 +1573,47 @@ test('#295 makeOrphanProbe: spares an SLA-cancelled element inside a still-activ
   assert.equal(await canceled('x'), true);
 });
 
-test('#295 pushNamedRef: force-writes an arbitrary ref we own', async () => {
+test('#295/#296 pushNamedRef: fenced writes — create-only adoption + lease-against-observed recovery', async () => {
   const f = fixture();
   try {
     const { dir, git } = f.clone('named');
     const sha = sh(dir, 'rev-parse', 'HEAD');
+    // Default (expectSha='') is CREATE-ONLY: first write of an absent ref succeeds.
     assert.deepEqual(await pushNamedRef({ git, ref: 'refs/nano/recovered/77', sha }), { ok: true });
     assert.equal(sh(f.root, '--git-dir', f.remote, 'rev-parse', 'refs/nano/recovered/77'), sha);
+    // A second create-only write over the now-present ref loses the lease (a stale
+    // activation can never blind-overwrite a newer run's recovery point) — #296.
+    const other = f.clone('named2');
+    sh(other.dir, 'commit', '-q', '--allow-empty', '-m', 'x');
+    const sha2 = sh(other.dir, 'rev-parse', 'HEAD');
+    const stale = await pushNamedRef({ git: other.git, ref: 'refs/nano/recovered/77', sha: sha2 });
+    assert.equal(stale.ok, false);
+    assert.equal(stale.staleLease, true, JSON.stringify(stale));
+    assert.equal(sh(f.root, '--git-dir', f.remote, 'rev-parse', 'refs/nano/recovered/77'), sha, 'ref unchanged after a lost lease');
+    // Leasing against the OBSERVED sha overwrites cleanly (the legitimate newer run).
+    const obs = await observeRemoteRefSha({ git: other.git, ref: 'refs/nano/recovered/77' });
+    assert.equal(obs, sha);
+    assert.deepEqual(await pushNamedRef({ git: other.git, ref: 'refs/nano/recovered/77', sha: sha2, expectSha: obs }), { ok: true });
+    assert.equal(sh(f.root, '--git-dir', f.remote, 'rev-parse', 'refs/nano/recovered/77'), sha2);
     // Missing args → a clean error, no throw.
     assert.equal((await pushNamedRef({ git, ref: '', sha })).ok, false);
     assert.equal((await pushNamedRef({ git, ref: 'refs/x', sha: '' })).ok, false);
+  } finally { f.cleanup(); }
+});
+
+test('#296 observeRemoteRefSha: reports the current sha, empty when absent/unreadable', async () => {
+  const f = fixture();
+  try {
+    const { dir, git } = f.clone('obs');
+    const sha = sh(dir, 'rev-parse', 'HEAD');
+    // Absent ref → '' (create-only / fail-closed semantics).
+    assert.equal(await observeRemoteRefSha({ git, ref: 'refs/nano/recovered/absent' }), '');
+    // Present ref → its sha.
+    sh(dir, 'push', '-q', 'origin', `${sha}:refs/nano/recovered/123`);
+    assert.equal(await observeRemoteRefSha({ git, ref: 'refs/nano/recovered/123' }), sha);
+    // A git failure never throws — it falls back to '' (fail closed).
+    const boom = async () => { throw new Error('ls-remote boom'); };
+    assert.equal(await observeRemoteRefSha({ git: boom, ref: 'refs/nano/recovered/123' }), '');
   } finally { f.cleanup(); }
 });
 

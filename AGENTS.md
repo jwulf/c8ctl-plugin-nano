@@ -287,7 +287,15 @@ SDK client (job workers) — do **not** add the SDK as a dependency or use raw
   (`buildResultEnvelope`); a **force-stopped** run is yielded (`settle.fail`) and
   returns early, so it produces **no outcome envelope** and its recovery ref is
   recoverable from the pushed `refs/nano/recovered/<eik>` ref itself, not from a job
-  result. (d) The GC reclaim log reports `ref@sha [why]`
+  result. All recovery-ref writes are **fenced** (Copilot review on #296): predecessor
+  adoption is create-only and the recovery promotion leases against the sha it observed
+  on `refs/nano/recovered/<eik>`, so a slower/stale activation can never blind-force
+  over a newer run's recovery point (`pushNamedRef`/`observeRemoteRefSha`). The
+  force-stop flush+promote is **bounded** by `FORCE_STOP_RECOVERY_MS` and the
+  supervisor's `forceStopWorker` waits `STOP_GRACE_MS + FORCE_STOP_RECOVERY_MS` before
+  its SIGKILL backstop, so a worker can finish writing the recovery ref before it is
+  killed (a worker that exits sooner is reaped immediately). (d) The GC reclaim log
+  reports `ref@sha [why]`
   (the sweep's `deleted` entries now carry the `sha`). Tests: the `#295 …` cases in
   `agent-checkpoint.test.mjs`.
 - **Agent outcomes (`acpOutcomeFrom` / `resultVarsFromAcpOutcome`).** A

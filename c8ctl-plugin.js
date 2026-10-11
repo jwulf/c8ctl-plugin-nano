@@ -4957,8 +4957,10 @@ function credArgs() {
 //     (Copilot review on #293); when the identity changes it republishes the
 //     activity marker via an onChange callback.
 //   - A git/gh auth FAILURE (clone/push/PR-reconcile — see isGitAuthFailure)
-//     forces one invalidation + re-read (`refreshGhAuthToken({ force })`) and a
-//     single retry, so a rotated token self-heals instead of failing the job.
+//     forces one re-read (`refreshGhAuthToken({ force })`) and a single retry,
+//     so a rotated token self-heals instead of failing the job. The re-read is
+//     NON-destructive (it never invalidates the cache first), so a transient
+//     re-read failure keeps the still-valid cached credential.
 //   - `primeGhAuthToken({ logger })` logs the token's FINGERPRINT (a short sha256
 //     prefix — never the value) and its OAuth scopes at startup and whenever the
 //     token changes, so "this worker has a stale token" is a one-line check; the
@@ -5010,8 +5012,8 @@ let ghAuthRefreshInFlight = null;
 // Monotonic generation counter bumped on EVERY write to `ghAuthTokenCache`
 // (`writeGhAuthCache` below is the single mutation point). It fences a stale
 // async refresh against a newer forced recovery (Copilot review on #293): the
-// synchronous clone/push auth-failure recovery (`invalidateGhAuthToken()` +
-// `refreshGhAuthToken({ force })`) CANNOT await an already-running async timer
+// synchronous clone/push auth-failure recovery (a forced `refreshGhAuthToken({
+// force })`) CANNOT await an already-running async timer
 // refresh (sync code can't await the `ghAuthRefreshInFlight` promise). So an
 // async refresh can read the OLD token, yield across its scopes probe, the sync
 // recovery can adopt the ROTATED token in the meantime, and then the async
@@ -5409,6 +5411,35 @@ function ghAuthTokenFromCli() {
 // re-logs in — both need the NEXT job to see a fresh token.
 function invalidateGhAuthToken() {
   writeGhAuthCache(GH_AUTH_TOKEN_UNSET);
+}
+
+// Recover from a git/gh auth failure on a gh-cache-derived credential: force a
+// fresh `gh auth token` read and return it IFF it differs from the credential
+// that just FAILED (`failingToken`), otherwise null.
+//
+// Deliberately does NOT `invalidateGhAuthToken()` first (Copilot review on
+// #294). An invalidate-before-reread blows the cached record away, so if the
+// forced re-read then fails TRANSIENTLY (gh momentarily unavailable), there is
+// no prior record left for `adoptGhAuthToken` to preserve — it falls back to
+// `{token:null}` and the worker is left "logged out", ERASING a still-usable —
+// and possibly NEWER (a `reload-credentials` SIGUSR1 swap that landed mid-job)
+// — cached credential. `refreshGhAuthToken({ force })` already re-reads past the
+// TTL, and `adoptGhAuthToken` PRESERVES the prior cached token on a transient
+// read failure, so a transient hiccup keeps the good token (and we even retry
+// with a newer cached one) instead of discarding it. This mirrors the SIGUSR1
+// reload-credentials handler, which is likewise deliberately NON-destructive.
+//
+// The retry is gated on `fresh !== failingToken` — NOT on the re-read's
+// `changed` flag (which compares against the CACHE): when the cache already
+// holds the newer token (the `reload-credentials` swap case), a forced re-read
+// returns it with `changed:false`, yet that newer token is exactly the
+// credential we want to retry with. `fresh !== failingToken` also covers the
+// genuine-denial case (the re-read returns the SAME failing token → null → no
+// retry) and the null→fresh recovery (a logged-out worker re-reads a real token
+// after `gh auth login`).
+function recoverGhTokenAfterAuthFailure(failingToken) {
+  const { token: fresh } = refreshGhAuthToken({ force: true });
+  return fresh && fresh !== failingToken ? fresh : null;
 }
 
 // A snapshot of the cached token's observable identity for logs and the
@@ -5908,13 +5939,16 @@ function provisionRepo({ envelope, token, runDir, runId, timeoutMs = 120_000, lo
     }
     const detail = gitErrorDetail(clone, token);
     // #293: an AUTH failure here usually means the cached gh token went stale
-    // (the operator re-logged in / rotated it after this worker primed). Drop the
-    // cache, re-read once, and retry the clone ONCE with the fresh token before
-    // reporting failure — a rotated credential self-heals instead of shedding
-    // the job. Only when the token actually CHANGES (a same-token retry can't
-    // fix a genuine permission denial). The retry re-runs the whole clone with
-    // the new token threaded through the askpass env, re-anchored to the
-    // remaining provisioning budget.
+    // (the operator re-logged in / rotated it after this worker primed). Force a
+    // fresh re-read and retry the clone ONCE with it before reporting failure —
+    // a rotated credential self-heals instead of shedding the job. Only when the
+    // re-read yields a token DIFFERENT from the one that failed (a same-token
+    // retry can't fix a genuine permission denial). The recovery is
+    // NON-DESTRUCTIVE (see recoverGhTokenAfterAuthFailure): it never invalidates
+    // the cache first, so a transiently-failing re-read can't erase a still-valid
+    // — possibly newer — cached credential (Copilot review on #294). The retry
+    // re-runs the whole clone with the new token threaded through the askpass
+    // env, re-anchored to the remaining provisioning budget.
     // GATED on the credential's SOURCE (Copilot review on #293): this fallback
     // replaces the failed token with the operator's `gh auth token`, so it is
     // only legitimate when the failed token CAME from that same gh cache
@@ -5931,9 +5965,8 @@ function provisionRepo({ envelope, token, runDir, runId, timeoutMs = 120_000, lo
     // (the askpass helper, GIT_ASKPASS/GIT_TOKEN, and the username-embedded
     // remote) — a bare GIT_TOKEN swap leaves the clone unauthenticated.
     if (credentialSource === 'gh-cache' && isGitAuthFailure(detail)) {
-      invalidateGhAuthToken();
-      const { token: fresh, changed } = refreshGhAuthToken({ force: true });
-      if (changed && fresh && fresh !== token) {
+      const fresh = recoverGhTokenAfterAuthFailure(token);
+      if (fresh) {
         logger?.info?.(`git clone auth failed${cs} — the cached gh token may be stale; re-read it (${describeGhAuthToken(ghAuthTokenInfo())}) and retrying the clone once`);
         throwIfAborted('clone-auth-retry');
         // Rebuild the credential env for the fresh token. On the null→fresh
@@ -7389,12 +7422,15 @@ function finalizeGit({ workspaceDir, gitEnv, startSha, workingBranch, baseBranch
     const pushTimeout = netTimeoutMs();
     let push = pushGit([...credArgs(), 'push', '--set-upstream', 'origin', `refs/heads/${workingBranch}:refs/heads/${workingBranch}`], { cwd: workspaceDir, env: gitEnv, timeoutMs: pushTimeout });
     // #293: an AUTH rejection (401/403, or the OAuth `workflow`-scope refusal)
-    // usually means the cached gh token went stale mid-run. Drop the cache,
-    // re-read once, and retry the push ONCE with the fresh token before
-    // stranding the commits — a rotated credential self-heals instead of a
-    // `pushFailed`. Only when the token actually CHANGED (a same-token retry
-    // can't fix a genuine permission denial), and the retry runs with the fresh
-    // token in GIT_TOKEN so the askpass hands it to git.
+    // usually means the cached gh token went stale mid-run. Force a fresh
+    // re-read and retry the push ONCE with it before stranding the commits — a
+    // rotated credential self-heals instead of a `pushFailed`. Only when the
+    // re-read yields a token DIFFERENT from the one that failed (a same-token
+    // retry can't fix a genuine permission denial), and the retry runs with the
+    // fresh token in GIT_TOKEN so the askpass hands it to git. The recovery is
+    // NON-DESTRUCTIVE (see recoverGhTokenAfterAuthFailure): it never invalidates
+    // the cache first, so a transiently-failing re-read can't erase a still-valid
+    // — possibly newer — cached credential (Copilot review on #294).
     // GATED on the credential's SOURCE (Copilot review on #293): only a token
     // that CAME from the gh cache ('gh-cache') may be replaced by a fresh
     // `gh auth token` read — an explicit GITHUB_TOKEN ('env') or custom authRef
@@ -7418,9 +7454,8 @@ function finalizeGit({ workspaceDir, gitEnv, startSha, workingBranch, baseBranch
     // (Copilot review on #293).
     let pushFailureTimeout = pushTimeout;
     if (push.status !== 0 && credentialSource === 'gh-cache' && isGitAuthFailure(describeGitFailure('git push', push, { token, timeoutMs: pushTimeout }))) {
-      invalidateGhAuthToken();
-      const { token: fresh, changed } = refreshGhAuthToken({ force: true });
-      if (changed && fresh && fresh !== token) {
+      const fresh = recoverGhTokenAfterAuthFailure(token);
+      if (fresh) {
         log.info?.(`finalizeGit${cs}: git push auth failed — the cached gh token may be stale; re-read it (${describeGhAuthToken(ghAuthTokenInfo())}) and retrying the push once`);
         const retryEnv = { ...gitEnv, GIT_TOKEN: fresh };
         // Reuse the clone-time askpass helper when gitEnv already carries one
@@ -19266,6 +19301,7 @@ export {
   refreshGhAuthToken,
   refreshGhAuthTokenAsync,
   invalidateGhAuthToken,
+  recoverGhTokenAfterAuthFailure,
   setGhAuthTokenReader,
   resetGhAuthTokenReader,
   classifyGhAuthRead,

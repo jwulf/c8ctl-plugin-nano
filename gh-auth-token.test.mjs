@@ -18,6 +18,7 @@ import {
   refreshGhAuthToken,
   refreshGhAuthTokenAsync,
   invalidateGhAuthToken,
+  recoverGhTokenAfterAuthFailure,
   setGhAuthTokenReader,
   resetGhAuthTokenReader,
   classifyGhAuthRead,
@@ -587,7 +588,125 @@ test('provisionRepo does NOT retry a non-auth clone failure (#293)', { skip: !gi
   }
 });
 
-// A fake child process for the `_spawn` seam: emits the given stdout on the
+// --- #294 review: the auth-failure re-read is NON-DESTRUCTIVE -----------------
+// recoverGhTokenAfterAuthFailure must NOT invalidate the cache before the forced
+// re-read: an invalidate-first + a transiently-failing re-read would erase a
+// still-valid (possibly newer) cached credential and leave the worker "logged
+// out". It forces a fresh read and returns it only when it DIFFERS from the
+// token that failed.
+
+test('recoverGhTokenAfterAuthFailure returns a rotated token and retries on it (#294)', () => {
+  invalidateGhAuthToken();
+  try {
+    setGhAuthTokenReader(() => 'gho_stale');
+    refreshGhAuthToken({ force: true });             // cache ← gho_stale
+    setGhAuthTokenReader(() => 'gho_rotated');       // operator re-logged in
+    const fresh = recoverGhTokenAfterAuthFailure('gho_stale');
+    assert.equal(fresh, 'gho_rotated', 'the rotated token is returned for the retry');
+    assert.equal(ghAuthTokenInfo().fingerprint, ghTokenFingerprint('gho_rotated'));
+  } finally {
+    resetGhAuthTokenReader();
+    invalidateGhAuthToken();
+  }
+});
+
+test('recoverGhTokenAfterAuthFailure does not retry on a genuine denial (same token) (#294)', () => {
+  invalidateGhAuthToken();
+  try {
+    setGhAuthTokenReader(() => 'gho_same');
+    refreshGhAuthToken({ force: true });             // cache ← gho_same
+    // The re-read returns the SAME failing token — a retry can't fix a real
+    // permission denial, so recovery declines (null).
+    assert.equal(recoverGhTokenAfterAuthFailure('gho_same'), null, 'same token → no retry');
+    assert.equal(ghAuthTokenInfo().fingerprint, ghTokenFingerprint('gho_same'), 'cache intact');
+  } finally {
+    resetGhAuthTokenReader();
+    invalidateGhAuthToken();
+  }
+});
+
+test('recoverGhTokenAfterAuthFailure preserves a NEWER cached token when the re-read fails transiently (#294)', () => {
+  invalidateGhAuthToken();
+  try {
+    // A reload-credentials swap landed mid-job: the cache now holds gho_newer,
+    // but the job captured the older gho_old before the swap and it just failed.
+    setGhAuthTokenReader(() => 'gho_newer');
+    refreshGhAuthToken({ force: true });             // cache ← gho_newer
+    // The forced recovery re-read now hits a TRANSIENT failure (gh momentarily
+    // unavailable). It must NOT erase gho_newer — it preserves it and (because
+    // gho_newer differs from the failing gho_old) retries on it.
+    setGhAuthTokenReader(() => GH_AUTH_READ_FAILED);
+    const fresh = recoverGhTokenAfterAuthFailure('gho_old');
+    assert.equal(fresh, 'gho_newer', 'the preserved newer token drives the retry');
+    assert.equal(ghAuthTokenInfo().fingerprint, ghTokenFingerprint('gho_newer'), 'the newer cached token was NOT erased by the transient re-read');
+    assert.equal(ghAuthTokenInfo().present, true, 'the worker is not left logged out');
+  } finally {
+    resetGhAuthTokenReader();
+    invalidateGhAuthToken();
+  }
+});
+
+test('recoverGhTokenAfterAuthFailure recovers a logged-out cache (null → fresh) (#294)', () => {
+  invalidateGhAuthToken();
+  try {
+    setGhAuthTokenReader(() => null);
+    refreshGhAuthToken({ force: true });             // cache ← null (logged out)
+    assert.equal(ghAuthTokenInfo().present, false);
+    setGhAuthTokenReader(() => 'gho_fresh');         // operator ran `gh auth login`
+    assert.equal(recoverGhTokenAfterAuthFailure(null), 'gho_fresh', 'null → fresh recovers');
+  } finally {
+    resetGhAuthTokenReader();
+    invalidateGhAuthToken();
+  }
+});
+
+test('provisionRepo retries the clone on a NEWER cached token when the recovery re-read fails transiently (#294)', { skip: !gitAvailable }, () => {
+  const { root, origin } = makeLocalOrigin();
+  const runDir = mkdtempSync(join(root, 'run-'));
+  try {
+    const envelope = {
+      schemaVersion: 1,
+      repository: { provider: 'github', url: origin, ref: 'main', submodules: false },
+      branch: { base: 'main', create: 'feat/x', push: true },
+      setup: { commands: [], env: {}, secretRefs: [] },
+      task: { allowPr: true },
+    };
+    // A reload-credentials swap put gho_newer in the cache after this job had
+    // already captured the older gho_old. The clone fails on gho_old, and the
+    // forced recovery re-read then fails TRANSIENTLY. The old invalidate-first
+    // code would erase gho_newer and leave the cache null (no retry, job shed);
+    // the non-destructive recovery preserves gho_newer and retries on it.
+    setGhAuthTokenReader(() => 'gho_newer');
+    invalidateGhAuthToken();
+    refreshGhAuthToken({ force: true });            // cache ← gho_newer
+    setGhAuthTokenReader(() => GH_AUTH_READ_FAILED); // recovery re-read is transiently broken
+
+    let cloneAttempts = 0;
+    const seam = (args, opts) => {
+      if (args.includes('clone')) {
+        cloneAttempts++;
+        if (cloneAttempts === 1) {
+          return { status: 128, stdout: '', stderr: "fatal: could not read Username for 'https://github.com': terminal prompts disabled", signal: null, timedOut: false, timeoutMs: opts?.timeoutMs };
+        }
+        assert.equal(opts?.env?.GIT_TOKEN, 'gho_newer', 'the retry runs with the preserved newer token');
+      }
+      return runGit(args, opts);
+    };
+    const prov = provisionRepo({ envelope, token: 'gho_old', runDir, credentialSource: 'gh-cache', _runGit: seam });
+    assert.equal(cloneAttempts, 2, 'the clone was retried once on the preserved newer token');
+    assert.ok(prov.workspaceDir, 'the retry produced a workspace');
+    assert.equal(prov.effectiveToken, 'gho_newer', 'the newer token is propagated to the caller');
+    // The transient re-read must NOT have erased the cached credential.
+    assert.equal(ghAuthTokenInfo().present, true, 'cache not erased by the transient re-read');
+    assert.equal(ghAuthTokenInfo().fingerprint, ghTokenFingerprint('gho_newer'));
+  } finally {
+    resetGhAuthTokenReader();
+    invalidateGhAuthToken();
+    rmSync(root, { recursive: true, force: true });
+  }
+});
+
+
 // next tick and closes with the given code, so the async gh readers can be
 // driven deterministically without spawning a real process.
 function fakeChild({ stdout = '', stderr = '', code = 0, emitError = null } = {}) {

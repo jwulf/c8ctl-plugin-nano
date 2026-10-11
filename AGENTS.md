@@ -78,8 +78,12 @@ SDK client (job workers) — do **not** add the SDK as a dependency or use raw
   never `spawnSync`, so it can't stall the job), capping staleness at a few
   intervals instead of the worker's whole busy lifetime (an UNSET cache is never
   primed mid-job). A clone/push that fails with an auth/OAuth-scope error
-  (`isGitAuthFailure`) drops the cache, re-reads once, and retries once before
-  failing. The token's **fingerprint + scopes** (never the value) are logged at
+  (`isGitAuthFailure`) forces one re-read and retries once before failing. That
+  re-read is **non-destructive** — it does NOT null the cache first, so a
+  transiently-failing re-read can't erase a still-valid (possibly newer, from a
+  `reload-credentials` swap) cached credential; the retry fires only when the
+  re-read yields a token DIFFERENT from the one that failed. The token's
+  **fingerprint + scopes** (never the value) are logged at
   startup and on change, ride the activity marker (`ghAuthTokenInfo()`) into a
   `supervisor status` **GH AUTH** column, and `supervisor reload-credentials`
   (SIGUSR1) requests an immediate async forced re-read fleet-wide without

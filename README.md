@@ -1074,8 +1074,10 @@ CLI read that can't run on the per-job path). The cache is **not**
 process-lifetime: it is re-read on a short TTL (`NANO_GH_TOKEN_TTL_MS`, default
 5 minutes) off the job path — the timer DEFERS a tick while a job is active — and
 a clone/push that fails with an auth or OAuth-scope error (401/403, "refusing to
-allow an OAuth App … without `workflow` scope") drops the cache, re-reads once,
-and retries before failing — so a `gh auth login` / `gh auth refresh` you run
+allow an OAuth App … without `workflow` scope") forces a fresh re-read and
+retries once before failing — the re-read is **non-destructive** (it does not
+drop the cache first), so a transiently-failing re-read can't erase a still-valid
+(possibly newer) cached credential — so a `gh auth login` / `gh auth refresh` you run
 while the fleet is up is adopted once the worker is idle and the next tick runs
 (bounded by the in-flight job's remaining duration plus up to one interval), and
 a rotated token self-heals mid-flight via the recovery path. Under **sustained**

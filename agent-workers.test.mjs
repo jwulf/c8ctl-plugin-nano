@@ -1089,12 +1089,14 @@ test('resolveJobSecrets: a custom github authRef does NOT fall back to gh (stays
   assert.deepEqual(missing, ['MY_PAT']);
 });
 
-test('resolveJobSecrets: a default github gh-cache MISS is NOT reported missing (#293)', () => {
-  // The worker cached "logged out" (gh auth token → null) and the operator then
-  // logged back in. The job must NOT fail "missing secret(s): GITHUB_TOKEN"
-  // here: provisionRepo forces a null → fresh re-read, so leaving GITHUB_TOKEN
-  // out of `missing` lets that recovery heal the job. A null gh-cache default is
-  // a 'gh-cache' MISS (recovery-eligible), not a hard-missing credential.
+test('resolveJobSecrets: a default github gh-cache MISS with no fresh token STAYS missing (#294)', () => {
+  // The worker cached "logged out" (gh auth token → null). Round 11 dropped
+  // GITHUB_TOKEN from `missing` unconditionally, trusting provisionRepo's
+  // null → fresh recovery — but that recovery never runs for container jobs or
+  // an anonymous clone of a PUBLIC repo, so the harness reached `allowPr` with
+  // no token. Now the branch FORCE-re-reads `gh auth token`; when that ALSO
+  // yields nothing the credential stays missing so the job fails early with a
+  // clear error instead of silently tokenless (Copilot review on #294).
   const resolver = makeSecretResolver('host');
   const saved = process.env.GITHUB_TOKEN;
   delete process.env.GITHUB_TOKEN;
@@ -1106,19 +1108,51 @@ test('resolveJobSecrets: a default github gh-cache MISS is NOT reported missing 
       },
       {},
     );
-    const { resolved, missing } = resolveJobSecrets(resolver, env, { ghAuthToken: () => null });
-    assert.deepEqual(missing, [], 'a gh-cache miss must not fail the job before provisioning recovers it');
-    assert.equal(resolved.GITHUB_TOKEN, undefined, 'no token is resolved — provisioning re-reads it');
+    const { resolved, missing } = resolveJobSecrets(resolver, env, {
+      ghAuthToken: () => null,
+      forceRefreshGhAuthToken: () => null,
+    });
+    assert.deepEqual(missing, ['GITHUB_TOKEN'], 'a gh-cache miss with no fresh token must fail the job early');
+    assert.equal(resolved.GITHUB_TOKEN, undefined);
   } finally {
     if (saved === undefined) delete process.env.GITHUB_TOKEN;
     else process.env.GITHUB_TOKEN = saved;
   }
 });
 
-test('resolveJobSecrets: a default github gh-cache MISS with GITHUB_TOKEN in secretRefs is still not missing (#293)', () => {
+test('resolveJobSecrets: a default github gh-cache MISS is healed by a forced re-read (#294)', () => {
+  // Same cached-logout miss, but the operator has since run `gh auth login`. The
+  // forced re-read recovers the token AT RESOLVE TIME (before the worker's
+  // refresh timer re-primes), so the credential is populated and NOT missing —
+  // reaching the harness even for a container job / public-repo anonymous clone
+  // where provisionRepo's recovery would never have fired (Copilot review #294).
+  const resolver = makeSecretResolver('host');
+  const saved = process.env.GITHUB_TOKEN;
+  delete process.env.GITHUB_TOKEN;
+  try {
+    const env = normalizeTaskEnvelope(
+      {
+        [`${AGENT_TASK_NS}.repository.url`]: 'https://github.com/o/r.git',
+        [`${AGENT_TASK_NS}.task.allowPr`]: 'true',
+      },
+      {},
+    );
+    const { resolved, missing } = resolveJobSecrets(resolver, env, {
+      ghAuthToken: () => null,
+      forceRefreshGhAuthToken: () => 'fresh-after-login',
+    });
+    assert.deepEqual(missing, []);
+    assert.equal(resolved.GITHUB_TOKEN, 'fresh-after-login', 'the forced re-read populates the credential');
+  } finally {
+    if (saved === undefined) delete process.env.GITHUB_TOKEN;
+    else process.env.GITHUB_TOKEN = saved;
+  }
+});
+
+test('resolveJobSecrets: a default github gh-cache MISS with GITHUB_TOKEN in secretRefs and no fresh token stays missing (#294)', () => {
   // Same recovery-eligible miss, but GITHUB_TOKEN is ALSO an explicit secretRef:
-  // the generic resolver adds it to `missing`, and the gh-cache miss branch must
-  // still drop it so the job reaches provisioning's forced recovery.
+  // the generic resolver adds it to `missing`, and when the forced re-read finds
+  // no token it must REMAIN missing (not silently dropped) so the job fails fast.
   const resolver = makeSecretResolver('host');
   const saved = process.env.GITHUB_TOKEN;
   delete process.env.GITHUB_TOKEN;
@@ -1133,9 +1167,41 @@ test('resolveJobSecrets: a default github gh-cache MISS with GITHUB_TOKEN in sec
       },
       {},
     );
-    const { resolved, missing } = resolveJobSecrets(resolver, env, { ghAuthToken: () => null });
-    assert.deepEqual(missing, []);
+    const { resolved, missing } = resolveJobSecrets(resolver, env, {
+      ghAuthToken: () => null,
+      forceRefreshGhAuthToken: () => null,
+    });
+    assert.deepEqual(missing, ['GITHUB_TOKEN']);
     assert.equal(resolved.GITHUB_TOKEN, undefined);
+  } finally {
+    if (saved === undefined) delete process.env.GITHUB_TOKEN;
+    else process.env.GITHUB_TOKEN = saved;
+  }
+});
+
+test('resolveJobSecrets: a default github gh-cache MISS with GITHUB_TOKEN in secretRefs is healed by a forced re-read (#294)', () => {
+  // Same, but the forced re-read now recovers the token: it is populated and the
+  // explicit secretRef entry is dropped from `missing`.
+  const resolver = makeSecretResolver('host');
+  const saved = process.env.GITHUB_TOKEN;
+  delete process.env.GITHUB_TOKEN;
+  try {
+    const env = normalizeTaskEnvelope(
+      {
+        [AGENT_TASK_NS]: JSON.stringify({
+          repository: { url: 'https://github.com/o/r.git' },
+          task: { allowPr: true },
+          setup: { secretRefs: ['GITHUB_TOKEN'] },
+        }),
+      },
+      {},
+    );
+    const { resolved, missing } = resolveJobSecrets(resolver, env, {
+      ghAuthToken: () => null,
+      forceRefreshGhAuthToken: () => 'fresh-after-login',
+    });
+    assert.deepEqual(missing, []);
+    assert.equal(resolved.GITHUB_TOKEN, 'fresh-after-login');
   } finally {
     if (saved === undefined) delete process.env.GITHUB_TOKEN;
     else process.env.GITHUB_TOKEN = saved;

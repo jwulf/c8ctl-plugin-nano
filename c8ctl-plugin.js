@@ -4571,10 +4571,20 @@ function makeSecretResolver(kind) {
   return null; // unknown → caller reports a clear error
 }
 
+// Force a fresh synchronous `gh auth token` read, bypassing the TTL cache, and
+// return the token (or null). Injectable into resolveJobSecrets so a default
+// github gh-cache MISS re-reads at job-resolve time — catching a `gh auth login`
+// the worker-lifetime refresh timer has not re-primed yet — instead of trusting
+// provisionRepo's (non-universal) auth-failure recovery (Copilot review on #294).
+function defaultForceRefreshGhAuthToken() {
+  const r = refreshGhAuthToken({ force: true });
+  return (r && r.token) || null;
+}
+
 // Resolve the names a job needs (setup.secretRefs, plus the repo/PR credential
 // when allowPr). Returns resolved values + a list of names that were missing so
 // the caller can fail the job with a clear provisioning error.
-function resolveJobSecrets(resolver, envelope, { ghAuthToken = ghAuthTokenFromCli } = {}) {
+function resolveJobSecrets(resolver, envelope, { ghAuthToken = ghAuthTokenFromCli, forceRefreshGhAuthToken = defaultForceRefreshGhAuthToken } = {}) {
   const names = new Set();
   for (const n of envelope.setup?.secretRefs || []) if (n) names.add(n);
   const resolved = {};
@@ -4587,8 +4597,9 @@ function resolveJobSecrets(resolver, envelope, { ghAuthToken = ghAuthTokenFromCl
   // The github clone/push credential is resolved with a gh-CLI fallback so a
   // default GITHUB_TOKEN isn't reported "missing" merely because it isn't in the
   // env when `gh auth login` provides it. A default github credential whose gh
-  // cache is a MISS is ALSO not reported missing (provisioning forces a null →
-  // fresh recovery). A custom authRef stays strict.
+  // cache is a MISS is force-re-read here (bypassing the TTL cache); it is
+  // reported missing only when that forced read ALSO finds no token. A custom
+  // authRef stays strict.
   if (envelope.task?.allowPr) {
     const provider = envelope.repository?.provider || 'github';
     const authRef = envelope.repository?.authRef;
@@ -4607,14 +4618,26 @@ function resolveJobSecrets(resolver, envelope, { ghAuthToken = ghAuthTokenFromCl
           resolved[ghAuthRef] = token;
           if (missingIdx !== -1) missing.splice(missingIdx, 1);
         } else if (source === 'gh-cache') {
-          // A DEFAULT github credential whose gh-CLI cache is a MISS (null) is
-          // NOT reported missing: provisionRepo re-reads `gh auth token` with a
-          // forced recovery (null → fresh), so a worker that cached "logged out"
-          // self-heals once the operator runs `gh auth login` instead of the job
-          // failing anonymous here before provisioning ever runs (Copilot review
-          // on #293). Keep it OUT of `missing` (and drop any stale entry). A
+          // A DEFAULT github credential whose gh-CLI cache is a MISS (null).
+          // provisionRepo's null → fresh auth-failure recovery is NOT universal:
+          // container jobs never call provisionRepo, and an anonymous clone of a
+          // PUBLIC repo SUCCEEDS (no auth failure → no forced re-read), so the
+          // harness would otherwise reach an `allowPr` job with GITHUB_TOKEN
+          // ABSENT instead of failing early. FORCE a fresh `gh auth token` read
+          // HERE (catching a `gh auth login` the worker-lifetime refresh timer
+          // has not re-primed yet): populate + drop from `missing` only if a
+          // token now exists; otherwise KEEP it missing so the job fails with a
+          // clear provisioning error rather than silently handing the harness no
+          // credential (Copilot review on #294). Priming the cache here also
+          // feeds provisioning's own re-resolve the same fresh token. A
           // custom/invalid authRef reports source 'none' and still fails strict.
-          if (missingIdx !== -1) missing.splice(missingIdx, 1);
+          const fresh = forceRefreshGhAuthToken();
+          if (fresh) {
+            resolved[ghAuthRef] = fresh;
+            if (missingIdx !== -1) missing.splice(missingIdx, 1);
+          } else if (missingIdx === -1) {
+            missing.push(ghAuthRef);
+          }
         } else if (missingIdx === -1) {
           missing.push(ghAuthRef);
         }
@@ -7356,13 +7379,22 @@ function finalizeGit({ workspaceDir, gitEnv, startSha, workingBranch, baseBranch
       if (changed && fresh && fresh !== token) {
         log.info?.(`finalizeGit${cs}: git push auth failed — the cached gh token may be stale; re-read it (${describeGhAuthToken(ghAuthTokenInfo())}) and retrying the push once`);
         const retryEnv = { ...gitEnv, GIT_TOKEN: fresh };
+        // Reuse the clone-time askpass helper when gitEnv already carries one
+        // (the token-backed path): the helper emits GIT_TOKEN at runtime, so
+        // pointing GIT_TOKEN at the fresh credential is enough — no rewrite.
         // On the null→fresh recovery the original gitEnv was the ANONYMOUS one
-        // (no askpass helper, GIT_CONFIG_GLOBAL neutralized) — re-mint the
-        // askpass helper and restore global config so the push can authenticate.
-        const retryAskpass = writeAskpass(workspaceDir, fresh);
-        if (retryAskpass) {
-          retryEnv.GIT_ASKPASS = retryAskpass;
-          delete retryEnv.GIT_CONFIG_GLOBAL;
+        // (no askpass helper, GIT_CONFIG_GLOBAL neutralized), so mint one and
+        // restore global config. Mint it in the PARENT run directory
+        // (dirname(workspaceDir) === runDir), NEVER inside workspaceDir: writing
+        // askpass.js/.sh into the checked-out repo after the final commits leaves
+        // untracked files that make hasUncommittedChanges() retain the WIP
+        // checkpoint and pollute a preserved workspace (Copilot review on #294).
+        if (!retryEnv.GIT_ASKPASS) {
+          const retryAskpass = writeAskpass(dirname(workspaceDir), fresh);
+          if (retryAskpass) {
+            retryEnv.GIT_ASKPASS = retryAskpass;
+            delete retryEnv.GIT_CONFIG_GLOBAL;
+          }
         }
         const retryTimeout = netTimeoutMs();
         const retry = pushGit([...credArgs(), 'push', '--set-upstream', 'origin', `refs/heads/${workingBranch}:refs/heads/${workingBranch}`], { cwd: workspaceDir, env: retryEnv, timeoutMs: retryTimeout });

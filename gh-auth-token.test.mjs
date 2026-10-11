@@ -8,9 +8,9 @@ import { test } from 'node:test';
 import assert from 'node:assert/strict';
 import { spawnSync } from 'node:child_process';
 
-import { mkdtempSync, writeFileSync, rmSync } from 'node:fs';
+import { mkdtempSync, writeFileSync, rmSync, readdirSync } from 'node:fs';
 import { tmpdir } from 'node:os';
-import { join } from 'node:path';
+import { join, dirname } from 'node:path';
 
 import {
   ghAuthTokenFromCli,
@@ -1015,6 +1015,43 @@ test('finalizeGit retries the push once with a fresh token on an auth failure (#
     assert.equal(out.pushed, true, 'the retry with the fresh token succeeded');
     assert.equal(ghAuthTokenInfo().fingerprint, ghTokenFingerprint('gho_fresh'), 'the rotated token was adopted');
     assert.equal(out.rotatedToken, 'gho_fresh', 'the rotation is surfaced so the caller can propagate it to checkpoint cleanup (#293)');
+  } finally {
+    resetGhAuthTokenReader();
+    invalidateGhAuthToken();
+    rmSync(root, { recursive: true, force: true });
+  }
+});
+
+test('finalizeGit mints the push-retry askpass in the PARENT run dir, never inside the checked-out repo (#294 review)', { skip: !gitAvailable }, () => {
+  // The null → fresh recovery starts from an ANONYMOUS clone (no GIT_ASKPASS),
+  // so the retry mints an askpass helper. It must NOT land in workspaceDir: the
+  // final commits are already made, so stray askpass.js/.sh files would be
+  // untracked and make hasUncommittedChanges() retain the WIP checkpoint and
+  // pollute a preserved workspace. Assert workspaceDir stays askpass-free.
+  const { root, envelope, prov } = provisionWithCommit({ credentialSource: 'gh-cache', token: null });
+  try {
+    let served = null;
+    setGhAuthTokenReader(() => served);
+    invalidateGhAuthToken();
+    refreshGhAuthToken({ force: true }); // cache ← null (anonymous)
+    let pushes = 0;
+    const pushSeam = (args, opts) => {
+      if (args.includes('push')) {
+        pushes++;
+        if (pushes === 1) return authFail(opts);
+        assert.equal(opts?.env?.GIT_TOKEN, 'gho_fresh', 'the retry runs with the recovered token');
+        return runGit(args, opts);
+      }
+      return runGit(args, opts);
+    };
+    served = 'gho_fresh'; // operator logged in after the anonymous clone
+    const out = finalizeGit({ ...prov, envelope, token: null, logger: { warn: () => {}, error: () => {}, info: () => {}, debug: () => {} }, _pushGit: pushSeam });
+    assert.equal(pushes, 2, 'the anonymous push was retried once with the recovered token');
+    assert.equal(out.pushed, true);
+    const stray = readdirSync(prov.workspaceDir).filter((f) => /^askpass\./.test(f));
+    assert.deepEqual(stray, [], 'no askpass files were written into the checked-out repo');
+    const inRunDir = readdirSync(dirname(prov.workspaceDir)).filter((f) => /^askpass\./.test(f));
+    assert.ok(inRunDir.length > 0, 'the retry askpass helper lives in the parent run dir');
   } finally {
     resetGhAuthTokenReader();
     invalidateGhAuthToken();

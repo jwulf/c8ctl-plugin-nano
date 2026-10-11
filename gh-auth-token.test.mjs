@@ -322,6 +322,33 @@ test('supervisorGhAuthCell renders age + scopes, never the token', () => {
   assert.match(supervisorGhAuthCell(running({ present: true, ageMs: 5000 })), /^5s \[.\]$/);
 });
 
+test('supervisorGhAuthCell does not throw on malformed (non-string) marker scopes (#294)', () => {
+  const running = (ghAuth) => ({ state: 'running', activity: { state: 'idle', jobs: [] }, ghAuth });
+  // A corrupt/older/tampered activity marker could carry a non-string `scopes`
+  // (a number, array, object). The render must degrade to '?' — never throw and
+  // crash the whole `supervisor status` table.
+  for (const bad of [42, ['repo', 'gist'], { a: 1 }, true]) {
+    const cell = supervisorGhAuthCell(running({ present: true, fingerprint: 'ab12cd34ef56', scopes: bad, ageMs: 5000 }));
+    assert.match(cell, /^5s \[\?\]$/, `scopes=${JSON.stringify(bad)} -> ${cell}`);
+  }
+});
+
+test('summarizeSupervisorWorker coerces non-string marker scopes/fingerprint to null (#294)', () => {
+  const now = Date.now();
+  const w = {
+    id: 'w1', profile: 'p', pid: process.pid, state: 'running', restarts: 0,
+    startedAt: new Date(now - 60_000).toISOString(),
+  };
+  // Inject a marker carrying malformed (non-string) identity fields.
+  const s = summarizeSupervisorWorker(w, now, {
+    readActivity: () => ({ pid: process.pid, updatedAt: now, jobs: [], ghAuth: { present: true, fingerprint: ['x'], scopes: 42, since: now - 5000 } }),
+  });
+  assert.equal(s.ghAuth.scopes, null, 'a non-string scopes is dropped at the marker boundary');
+  assert.equal(s.ghAuth.fingerprint, null, 'a non-string fingerprint is dropped at the marker boundary');
+  // …and the render is safe end-to-end.
+  assert.doesNotThrow(() => supervisorGhAuthCell(s));
+});
+
 test('formatSupervisorStatus includes a GH AUTH column', () => {
   const now = Date.now();
   const status = {

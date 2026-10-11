@@ -5405,10 +5405,13 @@ function ghAuthTokenFromCli() {
   return ghAuthTokenCache.token;
 }
 
-// Drop the cached gh token so the next lookup re-reads the CLI. Called on a git
-// auth failure (the token may have been rotated/revoked mid-flight) and by the
-// supervisor's `reload-credentials` broadcast (SIGUSR1) after the operator
-// re-logs in — both need the NEXT job to see a fresh token.
+// Drop the cached gh token so the next lookup re-reads the CLI. A cache-reset
+// primitive — exported and used by the tests to reset state between cases. NO
+// production path calls it anymore: both the git clone/push auth-failure
+// recovery (recoverGhTokenAfterAuthFailure) and the supervisor's
+// `reload-credentials` broadcast (SIGUSR1) were made deliberately
+// NON-destructive (a forced re-read that preserves/atomically-swaps the cached
+// record), so neither drops the cache first (Copilot review on #294).
 function invalidateGhAuthToken() {
   writeGhAuthCache(GH_AUTH_TOKEN_UNSET);
 }
@@ -5759,7 +5762,8 @@ function applyRotatedGhCredential({ resolved, provider, authRef, source, token }
 // misconfiguration and yields no token (never the gh fallback). `ghAuthToken`
 // is injectable for testing.
 // The returned `source` matters downstream: the #293 auth-failure recovery
-// (drop the cache, re-read `gh auth token`, retry once) is only legitimate when
+// (force-re-read `gh auth token`, retry once — NON-destructive, never drops the
+// cache first) is only legitimate when
 // the token CAME from that cache ('gh-cache'). Retrying an explicit
 // GITHUB_TOKEN ('env') or a custom authRef ('custom') failure with the
 // operator's unrelated gh login would silently swap the configured identity
@@ -11405,7 +11409,8 @@ async function workAgent(req, flags, ctx) {
   // review on #293). When the cached identity actually changes, `onChange`
   // republishes the activity marker so `supervisor status` shows the adopted
   // credential even while the worker sits idle. The supervisor's
-  // `reload-credentials` broadcast (SIGUSR1) forces the same drop on demand.
+  // `reload-credentials` broadcast (SIGUSR1) forces the same re-read on demand
+  // (non-destructive — an atomic swap, never a drop).
   // `activeJobs`/`writeActivity` are declared below this point but are only
   // dereferenced when a tick fires (≥1s later) or a change lands — long after
   // the whole module body has run — so the closures capture the initialized
@@ -11423,7 +11428,7 @@ async function workAgent(req, flags, ctx) {
   // re-reads the CLI ASYNCHRONOUSLY (spawn, never spawnSync) and serialized
   // against the TTL timer, so even a worker mid-job keeps its event loop / lock
   // heartbeat responsive while the new credential is adopted. Deliberately NOT
-  // the SIGUSR2 drain path — dropping a credential must not park the fleet.
+  // the SIGUSR2 drain path — reloading a credential must not park the fleet.
   // Windows cannot deliver SIGUSR1 (Node terminates the process), so the daemon
   // refuses the op there. `writeActivityRef` is late-bound to `writeActivity`
   // once it is defined below so the handler can republish the token's
@@ -11431,8 +11436,8 @@ async function workAgent(req, flags, ctx) {
   let writeActivityRef = null;
   if (process.platform !== 'win32') {
     process.on('SIGUSR1', () => {
-      // Use the ASYNC refresh (spawn, never spawnSync) so dropping/replacing the
-      // cached credential can never pause the event loop / lock heartbeat of a
+      // Use the ASYNC refresh (spawn, never spawnSync) so re-reading/replacing
+      // the cached credential can never pause the event loop / lock heartbeat of a
       // worker servicing a job — the whole promise of `reload-credentials` is
       // that it does NOT disrupt in-flight jobs (Copilot review on #293). It is
       // serialized against the periodic timer via `ghAuthRefreshInFlight`.
@@ -13743,8 +13748,9 @@ function formatDuration(ms) {
   return `${d}d${h % 24}h`;
 }
 
-/** Project a live/stored worker record to a status row (pure w.r.t. `now`). */
-function summarizeSupervisorWorker(w, now = Date.now()) {
+/** Project a live/stored worker record to a status row (pure w.r.t. `now`).
+ * `readActivity` is an injectable seam over readWorkerActivity (testing). */
+function summarizeSupervisorWorker(w, now = Date.now(), { readActivity = readWorkerActivity } = {}) {
   const alive = isPidAlive(w.pid);
   // Absolute base epoch (ms) the worker started, so an attached console can
   // re-age `uptimeMs` locally on each tick (see reageSupervisorStatus) without
@@ -13760,7 +13766,7 @@ function summarizeSupervisorWorker(w, now = Date.now()) {
   let agentic = null; // { status, mode, url, discovered } agentic-channel state (#99)
   let ghAuth = null; // #293: { present, fingerprint, scopes, since, ageMs, lastCheckAgoMs } — never the token
   if (alive) {
-    const act = readWorkerActivity(w.id);
+    const act = readActivity(w.id);
     if (act && act.pid === w.pid) {
       const jobs = Array.isArray(act.jobs)
         ? act.jobs
@@ -13802,7 +13808,13 @@ function summarizeSupervisorWorker(w, now = Date.now()) {
         const lastCheckAgoMs = Number.isFinite(act.updatedAt) && Number.isFinite(g.lastCheckAgoMs)
           ? Math.max(0, now - act.updatedAt + g.lastCheckAgoMs)
           : (Number.isFinite(g.lastCheckAgoMs) ? g.lastCheckAgoMs : null);
-        ghAuth = { present: g.present === true, fingerprint: g.fingerprint ?? null, scopes: g.scopes ?? null, since: Number.isFinite(g.since) ? g.since : null, ageMs, lastCheckAgoMs };
+        // Coerce the identity strings at the (untrusted) marker boundary: a
+        // malformed/tampered/older marker could carry a non-string `scopes` or
+        // `fingerprint` (a number, array, object), and a downstream string op
+        // (e.g. `scopes.split(',')` in supervisorGhAuthCell) would THROW and
+        // crash `supervisor status` (Copilot review on #294). Keep only real
+        // strings; anything else degrades to null (rendered as `?`/unknown).
+        ghAuth = { present: g.present === true, fingerprint: typeof g.fingerprint === 'string' ? g.fingerprint : null, scopes: typeof g.scopes === 'string' ? g.scopes : null, since: Number.isFinite(g.since) ? g.since : null, ageMs, lastCheckAgoMs };
       }
     }
     // No marker (or a stale-pid one): leave activity null → rendered as unknown.
@@ -13951,7 +13963,13 @@ function supervisorGhAuthCell(w) {
   if (!g) return '?'; // marker predates the ghAuth field
   if (!g.present) return 'none';
   const age = g.ageMs != null ? formatDuration(g.ageMs) : '?';
-  const scopes = g.scopes ? g.scopes.split(',').map((s) => s.trim()).filter(Boolean).join(',') : '?';
+  // Defensive against a malformed activity marker (untrusted JSON): only call
+  // string ops on a real string, so a non-string `scopes` (a corrupt/older/
+  // tampered marker) renders `?` instead of throwing and crashing the whole
+  // status table (Copilot review on #294). statusFromActivity already coerces at
+  // the marker boundary; this is the belt-and-braces at the render edge, which
+  // also runs on frames built elsewhere (e.g. reageSupervisorStatus passthrough).
+  const scopes = typeof g.scopes === 'string' && g.scopes ? g.scopes.split(',').map((s) => s.trim()).filter(Boolean).join(',') : '?';
   return `${age} [${scopes}]`;
 }
 
@@ -15630,9 +15648,11 @@ async function supervisorReloadCmd(req) {
 }
 
 /**
- * Drop every supervised worker's cached gh auth token WITHOUT draining in-flight
- * jobs (issue #293). The daemon signals each worker (SIGUSR1); the worker
- * invalidates its cache, re-reads `gh auth token`, and logs the new fingerprint/
+ * Re-read every supervised worker's cached gh auth token WITHOUT draining
+ * in-flight jobs (issue #293). The daemon signals each worker (SIGUSR1); the
+ * worker re-reads `gh auth token` NON-DESTRUCTIVELY (a forced async re-read that
+ * swaps the cache atomically when the new value lands — the still-valid old
+ * token is served meanwhile, never dropped), and logs the new fingerprint/
  * scopes. Use after a `gh auth login`/`refresh` so the fleet picks up the fresh
  * credential immediately instead of waiting for the TTL refresh or a restart.
  */
@@ -15661,7 +15681,7 @@ async function supervisorReloadCredentialsCmd(req) {
   if (res.ok === false && !hasStructured) { logger.error(res.error || 'reload-credentials failed'); process.exit(1); }
   const signaled = Array.isArray(res.signaled) ? res.signaled : [];
   const failed = Array.isArray(res.failed) ? res.failed : [];
-  if (signaled.length > 0) logger.info(`Told ${signaled.length} worker(s) to drop their cached gh token: ${signaled.join(', ')}. Each re-reads \`gh auth token\` and logs the new fingerprint/scopes.`);
+  if (signaled.length > 0) logger.info(`Told ${signaled.length} worker(s) to re-read their gh auth token: ${signaled.join(', ')}. Each re-reads \`gh auth token\` (non-destructively — the still-valid old token is served until the new one lands) and logs the new fingerprint/scopes.`);
   else logger.warn('No running workers matched — nothing to reload.');
   if (failed.length > 0) { logger.error(`Could not signal: ${failed.join(', ')} (down or gone).`); process.exit(1); }
 }

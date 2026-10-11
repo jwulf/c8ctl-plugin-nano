@@ -1078,7 +1078,12 @@ allow an OAuth App … without `workflow` scope") drops the cache, re-reads once
 and retries before failing — so a `gh auth login` / `gh auth refresh` you run
 while the fleet is up is adopted once the worker is idle and the next tick runs
 (bounded by the in-flight job's remaining duration plus up to one interval), and
-a rotated token self-heals mid-flight via the recovery path. Each worker logs the
+a rotated token self-heals mid-flight via the recovery path. Under **sustained**
+back-to-back load a worker is never idle at a tick, so that defer is itself
+bounded (`NANO_GH_TOKEN_MAX_DEFER_MS`, default 4 intervals): once the cached
+token is stale beyond it, the timer re-reads **despite** an active job — the read
+is async (never a blocking `spawnSync`), so it can't stall the job — capping
+staleness at a few intervals instead of the worker's whole busy lifetime. Each worker logs the
 token's **fingerprint + scopes** (never the value) at startup and whenever it
 changes, and `c8ctl nano supervisor status` shows a **GH AUTH** column (token
 age + scopes) per worker, so "this worker has a stale token" is a one-line

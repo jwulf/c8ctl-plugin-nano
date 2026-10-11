@@ -700,6 +700,67 @@ test('startGhAuthTokenRefresh defers while a job is active and refreshes when id
   }
 });
 
+test('startGhAuthTokenRefresh BOUNDS the busy defer: a primed cache stale beyond maxStaleMs refreshes even while a job is active (#294 review)', () => {
+  // Under SUSTAINED saturation the worker is never idle at a tick, so an
+  // unbounded isIdle defer would serve an expired non-null cache to every
+  // subsequent job for the worker's whole busy lifetime (Copilot review on #294).
+  // The bound makes the tick refresh anyway once the PRIMED cache is stale past
+  // maxStaleMs — still async, never blocking. Driven in a CHILD with a tiny TTL
+  // so the inner (non-forced) re-read isn't short-circuited by the module TTL.
+  const pluginUrl = new URL('./c8ctl-plugin.js', import.meta.url).href;
+  const script = `
+    import { setGhAuthTokenReader, invalidateGhAuthToken, refreshGhAuthToken, startGhAuthTokenRefresh, ghAuthTokenInfo, ghTokenFingerprint } from ${JSON.stringify(pluginUrl)};
+    (async () => {
+      let served = 'gho_one';
+      let reads = 0;
+      setGhAuthTokenReader(() => { reads++; return served; });
+      invalidateGhAuthToken();
+      refreshGhAuthToken({ force: true }); // prime (read #1)
+      const afterPrime = reads;
+      served = 'gho_two'; // the login rotated; a refresh must pick this up
+      // ALWAYS busy; a tiny maxStaleMs so the primed cache is immediately "stale
+      // beyond bound". intervalMs 0 -> clamped to the 1s floor.
+      const t = startGhAuthTokenRefresh({ intervalMs: 0, isIdle: () => false, maxStaleMs: 1 });
+      await new Promise((r) => setTimeout(r, 2600));
+      t.stop();
+      if (reads <= afterPrime) { console.error('busy tick never refreshed past the bound:', reads, afterPrime); process.exit(2); }
+      const fp = ghAuthTokenInfo()?.fingerprint;
+      if (fp !== ghTokenFingerprint('gho_two')) { console.error('bounded refresh did not adopt the rotated token:', fp); process.exit(3); }
+      process.exit(0);
+    })();
+  `;
+  const r = spawnSync(process.execPath, ['--input-type=module', '-e', script], {
+    env: { ...process.env, NANO_GH_TOKEN_TTL_MS: '1' },
+    encoding: 'utf8',
+  });
+  assert.equal(r.status, 0, `child asserted the bounded-defer contract: stdout=${r.stdout} stderr=${r.stderr}`);
+});
+
+test('startGhAuthTokenRefresh still DEFERS a within-bound primed cache while a job is active (#294 review)', async () => {
+  // The bound must not over-trigger: a PRIMED cache that is NOT yet stale beyond
+  // maxStaleMs still defers while busy (no mid-job gh read), exactly as before.
+  invalidateGhAuthToken();
+  let served = 'gho_fresh';
+  setGhAuthTokenReader(() => served);
+  try {
+    refreshGhAuthToken({ force: true }); // prime
+    const before = ghAuthTokenInfo().fingerprint;
+    served = 'gho_rotated'; // would be adopted ONLY if the tick refreshed
+    // Busy, but a HUGE maxStaleMs so the bound never fires: the tick defers as
+    // before and the rotated token is NOT adopted while busy.
+    const t = startGhAuthTokenRefresh({ intervalMs: 0, isIdle: () => false, maxStaleMs: 60 * 60 * 1000 });
+    try {
+      await new Promise((r) => setTimeout(r, 2600));
+      assert.equal(ghAuthTokenInfo().fingerprint, before, 'a within-bound primed cache is not refreshed while busy');
+    } finally {
+      t.stop();
+    }
+  } finally {
+    resetGhAuthTokenReader();
+    invalidateGhAuthToken();
+  }
+});
+
 test('startGhAuthTokenRefresh never overlaps ticks and swallows a tick failure', async () => {
   invalidateGhAuthToken();
   // A reader that throws models a wedged gh; the tick must swallow it and the

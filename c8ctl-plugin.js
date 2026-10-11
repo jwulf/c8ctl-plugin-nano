@@ -4973,6 +4973,22 @@ const GH_AUTH_TOKEN_UNSET = Symbol('gh-auth-token-unset');
 // token` (a cheap keychain read) off the per-job path. Override with
 // NANO_GH_TOKEN_TTL_MS (0 = re-read on every lookup, honouring the spawn cost).
 const GH_AUTH_TOKEN_TTL_MS = Math.max(0, coerceInt(process.env.NANO_GH_TOKEN_TTL_MS, 5 * 60_000));
+// Upper bound on how long the maintenance timer may KEEP DEFERRING its refresh
+// while jobs run back-to-back. The tick normally defers while a job is active
+// (`isIdle`) so it never even spawns `gh` mid-job — but that defer is only an
+// optimization, because the refresh is async (spawn, never spawnSync) and so
+// cannot block the event loop / lock heartbeat even when it DOES run mid-job.
+// Under SUSTAINED saturation the worker is never idle at a tick, so an unbounded
+// defer would leave an expired, non-null cache reaching every subsequent job for
+// the worker's whole busy lifetime — defeating issue #293's "keep the token
+// fresh for the worker's lifetime" goal (Copilot review on #294). Bound it: once
+// a PRIMED cache is stale beyond this window, the tick refreshes DESPITE an
+// active job (still async/non-blocking), capping staleness at a few intervals
+// instead of the busy lifetime. Derived from the TTL (4 intervals) and overridable
+// via NANO_GH_TOKEN_MAX_DEFER_MS. Priming an UNSET cache is NEVER forced mid-job
+// (the defer there still holds), so a worker that starts logged-out stays anonymous
+// until it goes idle, exactly as before.
+const GH_AUTH_TOKEN_MAX_DEFER_MS = Math.max(0, coerceInt(process.env.NANO_GH_TOKEN_MAX_DEFER_MS, 4 * GH_AUTH_TOKEN_TTL_MS));
 // The gh subprocesses below must never block on an interactive prompt inside a
 // worker (a missing/expired login would otherwise hang the event loop for the
 // full timeout). GH_PROMPT_DISABLED fails fast instead; GH_NO_UPDATE_NOTIFIER
@@ -5449,7 +5465,13 @@ function primeGhAuthToken({ logger = null } = {}) {
 //   2. `isIdle` (optional) lets the worker DEFER a tick while a job is active:
 //      the refresh is then simply adopted by the next idle tick (staleness is
 //      bounded by the job length + one interval, and the sync per-job paths —
-//      TTL lookup, auth-failure recovery — remain as the safety net).
+//      TTL lookup, auth-failure recovery — remain as the safety net). That defer
+//      is itself BOUNDED (`maxStaleMs`): once a PRIMED cache is stale beyond the
+//      bound, the tick refreshes DESPITE an active job (still async/non-blocking),
+//      so sustained back-to-back jobs can't keep deferring the refresh for the
+//      worker's whole busy lifetime and serve an expired non-null cache to every
+//      job (Copilot review on #294). An UNSET cache is never primed mid-job — the
+//      defer there still holds — so a logged-out worker stays anonymous until idle.
 // Ticks never overlap (a slow gh can't stack refreshes), a tick failure is
 // swallowed (the next tick retries), and the change log fires from here so a
 // rotation is visible even when no job runs. `onChange` (optional) fires on a
@@ -5474,15 +5496,28 @@ function primeGhAuthToken({ logger = null } = {}) {
 // poll timer is deliberately the opposite — ref'd — because it IS a serving
 // handle that must keep a 0-poller worker alive to retry.) The returned handle
 // carries a `stop()` (clearInterval) so tests can halt it deterministically.
-function startGhAuthTokenRefresh({ logger = null, intervalMs = GH_AUTH_TOKEN_TTL_MS, isIdle = null, onChange = null, _spawn } = {}) {
+function startGhAuthTokenRefresh({ logger = null, intervalMs = GH_AUTH_TOKEN_TTL_MS, isIdle = null, onChange = null, maxStaleMs = GH_AUTH_TOKEN_MAX_DEFER_MS, _spawn } = {}) {
   // Clamp to a 1s floor so a test can pass a tiny interval; an explicit 0 is
   // honoured (→ the floor), not treated as "use the default".
   const raw = Number.isFinite(Number(intervalMs)) ? Number(intervalMs) : GH_AUTH_TOKEN_TTL_MS;
   const every = Math.max(1000, raw || 1000);
+  // The bounded-defer ceiling: a non-finite/negative value disables the bound
+  // (pure defer-while-busy, the pre-#294 behaviour).
+  const staleBound = Number.isFinite(Number(maxStaleMs)) && Number(maxStaleMs) >= 0 ? Number(maxStaleMs) : Infinity;
   let inFlight = false;
   const tick = async () => {
     if (inFlight) return; // a slow gh must not stack overlapping refreshes
-    if (isIdle && !isIdle()) return; // a job is active — defer to the next idle tick
+    if (isIdle && !isIdle()) {
+      // A job is active — normally defer so we don't even spawn gh mid-job. But
+      // bound that defer: a PRIMED cache stale beyond `staleBound` must refresh
+      // anyway (still async/non-blocking) rather than reach every subsequent job
+      // for the worker's whole busy lifetime under sustained saturation (Copilot
+      // review on #294). An UNSET cache is never primed mid-job (no bound applies),
+      // so a logged-out worker stays anonymous until it goes idle, as before.
+      const cached = ghAuthTokenCache === GH_AUTH_TOKEN_UNSET ? null : ghAuthTokenCache;
+      const staleBeyondBound = cached && (Date.now() - cached.lastCheck) >= staleBound;
+      if (!staleBeyondBound) return; // defer to the next idle tick
+    }
     inFlight = true;
     try {
       const { snapshotChanged } = await refreshGhAuthTokenAsync({ _spawn });

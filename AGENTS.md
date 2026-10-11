@@ -71,7 +71,13 @@ SDK client (job workers) — do **not** add the SDK as a dependency or use raw
   job is active, so a `gh auth login` / `refresh` while the fleet runs is adopted
   once the worker is next idle and the following tick runs — bounded by the
   in-flight job's remaining duration plus up to one interval, never a stale
-  process-lifetime memo. A clone/push that fails with an auth/OAuth-scope error
+  process-lifetime memo. That defer is itself BOUNDED
+  (`NANO_GH_TOKEN_MAX_DEFER_MS`, default 4 intervals): under sustained
+  back-to-back load a worker is never idle at a tick, so once a PRIMED cache is
+  stale beyond the bound the timer re-reads DESPITE an active job (still async,
+  never `spawnSync`, so it can't stall the job), capping staleness at a few
+  intervals instead of the worker's whole busy lifetime (an UNSET cache is never
+  primed mid-job). A clone/push that fails with an auth/OAuth-scope error
   (`isGitAuthFailure`) drops the cache, re-reads once, and retries once before
   failing. The token's **fingerprint + scopes** (never the value) are logged at
   startup and on change, ride the activity marker (`ghAuthTokenInfo()`) into a

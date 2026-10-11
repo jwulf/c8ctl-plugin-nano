@@ -578,6 +578,21 @@ test('startGhAuthTokenRefresh never overlaps ticks and swallows a tick failure',
   }
 });
 
+test('startGhAuthTokenRefresh unrefs the maintenance timer so a dead worker can exit (#293 review)', () => {
+  // The credential refresh is a background maintenance timer, NOT a serving
+  // handle: a REF'd timer would keep the PID alive after the worker runtime has
+  // died, masking the dead worker so the daemon never restarts it. It must be
+  // unref'd (Node's hasRef() reports the ref state) — unlike the serving --auto
+  // poll timer, which stays ref'd.
+  const t = startGhAuthTokenRefresh({ intervalMs: 1000 });
+  try {
+    assert.equal(typeof t.hasRef, 'function', 'the handle should be a real Node Timeout');
+    assert.equal(t.hasRef(), false, 'the maintenance refresh timer must be unref\'d');
+  } finally {
+    t.stop();
+  }
+});
+
 test('provisionRepo does NOT retry an auth failure for a non-gh-cache credential (#293 review)', { skip: !gitAvailable }, () => {
   const { root, origin } = makeLocalOrigin();
   const runDir = mkdtempSync(join(root, 'run-'));

@@ -5364,13 +5364,21 @@ function primeGhAuthToken({ logger = null } = {}) {
 // marker — an idle worker otherwise keeps reporting the pre-refresh
 // fingerprint/scopes indefinitely (Copilot review on #293).
 //
-// The timer is deliberately NOT unref'd: an unref'd interval is starved under a
-// continuously-busy event loop (the worker's poll/heartbeat fibers keep the
-// loop non-empty, so the low-priority unref'd timer can be deferred
-// indefinitely and never fire), whereas this refresh must actually run on its
-// cadence. The worker is a long-lived process that never clears the handle, so
-// the ref'd timer does not change its lifetime. The returned handle carries a
-// `stop()` (clearInterval) so tests can halt it deterministically.
+// The timer is UNREF'd (like the other maintenance/watchdog intervals): this is
+// a background credential refresh, NOT a serving handle, so it must never be the
+// thing that keeps the process alive. `unref()` does not starve the cadence —
+// contrary to a common misconception, it does not deprioritise or defer the
+// timer; it only drops the timer's claim on the event loop's "keep the process
+// alive" accounting. A busy worker's poll/heartbeat fibers keep the loop running,
+// so an unref'd interval still fires exactly on cadence. The one case where
+// unref matters is the dangerous one: if the worker's supervisor runtime has
+// unexpectedly terminated (its serving handles gone), a REF'd refresh timer
+// would keep the PID alive forever, masking the dead worker so the daemon never
+// observes the exit and never restarts the non-serving worker — whereas an
+// unref'd timer lets the now-idle process exit and be restarted. (The `--auto`
+// poll timer is deliberately the opposite — ref'd — because it IS a serving
+// handle that must keep a 0-poller worker alive to retry.) The returned handle
+// carries a `stop()` (clearInterval) so tests can halt it deterministically.
 function startGhAuthTokenRefresh({ logger = null, intervalMs = GH_AUTH_TOKEN_TTL_MS, isIdle = null, onChange = null, _spawn } = {}) {
   // Clamp to a 1s floor so a test can pass a tiny interval; an explicit 0 is
   // honoured (→ the floor), not treated as "use the default".
@@ -5397,8 +5405,10 @@ function startGhAuthTokenRefresh({ logger = null, intervalMs = GH_AUTH_TOKEN_TTL
     }
   };
   const t = setInterval(() => { tick(); }, every);
-  // Do NOT unref (see the header comment): the refresh must fire on cadence even
-  // when the worker's event loop stays busy.
+  // Unref so a dead worker runtime (serving handles gone) can exit and be
+  // restarted — this maintenance refresh must not keep a non-serving PID alive
+  // (see the header comment). Guarded for fake-timer test harnesses.
+  if (typeof t.unref === 'function') t.unref();
   t.stop = () => clearInterval(t);
   return t;
 }
@@ -15367,7 +15377,16 @@ async function supervisorReloadCredentialsCmd(req) {
     logger.error(`Could not reach the supervisor control socket to reload credentials: ${err?.message || err}`);
     process.exit(1);
   }
-  if (!res || res.ok === false) { logger.error(res?.error || 'reload-credentials failed'); process.exit(1); }
+  // A structured credentials-reloaded result carries `signaled`/`failed` arrays
+  // even on a PARTIAL failure (daemon returns `ok:false` with no `error` when
+  // some workers were down). Report those lists BEFORE the generic failure guard
+  // — exactly as the rolling-reload client does — so an operator can see which
+  // workers picked up the new token and which are down, instead of a bare
+  // "reload-credentials failed". The generic guard then only catches a truly
+  // unstructured failure (unreachable socket, the Windows refusal with `error`).
+  if (!res) { logger.error('reload-credentials failed'); process.exit(1); }
+  const hasStructured = Array.isArray(res.signaled) || Array.isArray(res.failed);
+  if (res.ok === false && !hasStructured) { logger.error(res.error || 'reload-credentials failed'); process.exit(1); }
   const signaled = Array.isArray(res.signaled) ? res.signaled : [];
   const failed = Array.isArray(res.failed) ? res.failed : [];
   if (signaled.length > 0) logger.info(`Told ${signaled.length} worker(s) to drop their cached gh token: ${signaled.join(', ')}. Each re-reads \`gh auth token\` and logs the new fingerprint/scopes.`);

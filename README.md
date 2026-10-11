@@ -1087,8 +1087,14 @@ staleness at a few intervals instead of the worker's whole busy lifetime. Each w
 token's **fingerprint + scopes** (never the value) at startup and whenever it
 changes, and `c8ctl nano supervisor status` shows a **GH AUTH** column (token
 age + scopes) per worker, so "this worker has a stale token" is a one-line
-check. To force every worker to drop the cache immediately — without draining
-in-flight jobs — run `c8ctl nano supervisor reload-credentials`.
+check. To force every worker to re-read `gh auth token` immediately — without
+draining in-flight jobs — run `c8ctl nano supervisor reload-credentials`. It
+does **not** null the cache first: it requests an immediate asynchronous forced
+re-read and swaps the cached token **atomically** only once the new value lands,
+so a worker (including one mid-job) keeps serving the still-valid old token for
+the brief read window rather than handing out null — a job started immediately
+after the command can therefore still receive the old token until the re-read
+settles.
 
 **Secrets.** Secrets are referenced by **name**, never value. `setup.secretRefs`
 (and the repo/PR credential when `task.allowPr` is set — defaulting to
@@ -1204,7 +1210,7 @@ c8ctl nano supervisor add reviewer --instances 3    # add 3 distinct auto-named 
 c8ctl nano supervisor restart reviewer             # by worker id or profile name
 c8ctl nano supervisor reload                        # adopt new code fleet-wide (rolling drain+respawn, zero downtime)
 c8ctl nano supervisor reload reviewer               # reload just one worker/profile
-c8ctl nano supervisor reload-credentials            # after `gh auth login`/refresh: every worker drops its cached gh token now (no drain)
+c8ctl nano supervisor reload-credentials            # after `gh auth login`/refresh: every worker re-reads its gh token now (async; old token served until the re-read lands; no drain)
 c8ctl nano supervisor remove coder                 # stop + drop a worker (also: `all`)
 c8ctl nano supervisor logs reviewer --follow       # tail a worker's log (or the daemon's)
 c8ctl nano supervisor stop                          # stop the daemon and every worker

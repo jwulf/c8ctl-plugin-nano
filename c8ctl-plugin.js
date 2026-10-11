@@ -4963,8 +4963,9 @@ function credArgs() {
 //     prefix — never the value) and its OAuth scopes at startup and whenever the
 //     token changes, so "this worker has a stale token" is a one-line check; the
 //     same record rides the supervisor activity marker (`ghAuthTokenInfo()`) into
-//     `supervisor status`, and `supervisor reload-credentials` drops the cache
-//     fleet-wide without restarting workers.
+//     `supervisor status`, and `supervisor reload-credentials` re-reads it
+//     fleet-wide (async; the old token is served until the new one lands)
+//     without restarting workers.
 // A sentinel distinguishes "not yet computed" from a cached null (gh missing /
 // not logged in).
 const GH_AUTH_TOKEN_UNSET = Symbol('gh-auth-token-unset');
@@ -15055,8 +15056,10 @@ async function runSupervisorDaemon() {
           sock.write(encodeFrame(statusFrame(false)));
           break;
         case 'reload-credentials': {
-          // #293: tell every worker to drop its cached gh auth token (SIGUSR1)
-          // WITHOUT draining in-flight jobs — the operator re-logged in and wants
+          // #293: tell every worker to re-read its gh auth token (SIGUSR1,
+          // async — the still-valid old token is served until the new one
+          // atomically lands) WITHOUT draining in-flight jobs — the operator
+          // re-logged in and wants
           // the fleet to pick up the fresh credential now, not after a restart.
           // Windows cannot deliver SIGUSR1 (Node terminates the process), so
           // refuse there; the TTL refresh still adopts a rotated token.
@@ -19486,7 +19489,7 @@ export const metadata = {
         { command: 'c8ctl nano supervisor add reviewer --instances 3', description: 'Add 3 distinct auto-named instances of a profile in one call' },
         { command: 'c8ctl nano supervisor restart reviewer', description: 'Restart a supervised worker by id or profile' },
         { command: 'c8ctl nano supervisor reload', description: 'Adopt updated harness code with zero downtime: after `nano update`, roll through the fleet draining in-flight jobs and respawning each worker so it re-reads the new plugin (workers only; restart the daemon for new supervisor code)' },
-        { command: 'c8ctl nano supervisor reload-credentials', description: 'After a `gh auth login`/`refresh`, tell every worker to drop its cached gh token and re-read the CLI now (no drain, in-flight jobs keep running) — status shows each worker\'s token age/scopes' },
+        { command: 'c8ctl nano supervisor reload-credentials', description: 'After a `gh auth login`/`refresh`, tell every worker to re-read its gh token from the CLI now (async; the still-valid old token is served until the new one lands; no drain, in-flight jobs keep running) — status shows each worker\'s token age/scopes' },
         { command: 'c8ctl nano supervisor stop', description: 'Stop the supervisor daemon and all its workers' },
         { command: 'c8ctl nano workforce add copilot --instances 5 --auto', description: 'Compose a reusable fleet: 5 copilot workers serving every deployed agent job type (--auto)' },
         { command: 'c8ctl nano workforce add qwen --instances 2 --roles pr-review,feature', description: "Add an entry mapped to explicit job types (<rank>:pr-review, <rank>:feature, where <rank> is the qwen hire's rank at start) — does not mutate the hired profile" },

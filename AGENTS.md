@@ -82,7 +82,11 @@ SDK client (job workers) — do **not** add the SDK as a dependency or use raw
   failing. The token's **fingerprint + scopes** (never the value) are logged at
   startup and on change, ride the activity marker (`ghAuthTokenInfo()`) into a
   `supervisor status` **GH AUTH** column, and `supervisor reload-credentials`
-  (SIGUSR1) drops the cache fleet-wide without draining in-flight jobs. A push
+  (SIGUSR1) requests an immediate async forced re-read fleet-wide without
+  draining in-flight jobs — it does NOT null the cache first but swaps it
+  atomically when the new token lands, so a worker keeps serving the still-valid
+  old token (and a job started right after the command may still get it) until
+  the re-read settles. A push
   failure is **non-fatal**
   and sets `pushFailed` (the authoritative "work is stranded / workspace
   preserved" flag) so the worker still completes the job and the process model

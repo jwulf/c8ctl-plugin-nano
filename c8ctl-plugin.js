@@ -5054,8 +5054,13 @@ function adoptGhAuthToken(token, { scopesProbe = ghTokenScopes } = {}) {
   const changed = !prev || prev.token !== token;
   // On a CHANGE re-read the scopes; otherwise carry the previous reading forward
   // (a TTL re-read that finds the same token must not pay the scopes ping, and
-  // must not silently DROP the scopes it already reported).
-  const scopes = token ? (changed ? scopesProbe(token) : (prev ? prev.scopes : null)) : null;
+  // must not silently DROP the scopes it already reported). BUT a prior probe
+  // that failed transiently stored `scopes: null` — carrying that null forward
+  // would leave the GH AUTH visibility unrepaired until the token rotates or the
+  // worker restarts (Copilot review on #293). Re-probe when the cached scope
+  // value is MISSING (null) while a token is present; reuse only a SUCCESSFUL
+  // (non-null) prior reading.
+  const scopes = token ? ((changed || !(prev && prev.scopes)) ? scopesProbe(token) : prev.scopes) : null;
   writeGhAuthCache({
     token,
     fingerprint: ghTokenFingerprint(token),
@@ -5096,7 +5101,10 @@ async function adoptGhAuthTokenAsync(token, { scopesProbe, generation = null } =
     token = null;
   }
   const changed = !prev || prev.token !== token;
-  const scopes = token ? (changed ? await scopesProbe(token) : (prev ? prev.scopes : null)) : null;
+  // Same re-probe-on-missing rule as the sync twin: a same-token refresh reuses a
+  // successful prior scope reading but RE-PROBES when the cached value is null
+  // (a prior transient probe failure), so the GH AUTH visibility self-repairs.
+  const scopes = token ? ((changed || !(prev && prev.scopes)) ? await scopesProbe(token) : prev.scopes) : null;
   // Generation fence: re-check AFTER the (awaited) scopes probe, the last point a
   // forced recovery could have slipped a newer credential in underneath us.
   if (generation != null && generation !== ghAuthCacheGeneration) return superseded();
@@ -5602,6 +5610,15 @@ function applyRotatedGhCredential({ resolved, provider, authRef, source, token }
 // GITHUB_TOKEN ('env') or a custom authRef ('custom') failure with the
 // operator's unrelated gh login would silently swap the configured identity
 // mid-job (Copilot review on #293), so those sources never take the fallback.
+// A DEFAULT github lookup that found NO cached gh token ALSO reports
+// 'gh-cache' (with `token: null`) rather than 'none': it is still the gh-cache
+// credential path, merely a cache MISS. Tagging it 'gh-cache' keeps the
+// clone/push auth-failure recovery ELIGIBLE so a worker that cached
+// "logged out" can still self-heal (a forced re-read recovers null → fresh
+// token after the operator runs `gh auth login`) instead of failing the job
+// anonymous and waiting for the periodic TTL refresh (Copilot review on #293).
+// 'none' is reserved for a non-github provider and an invalid/blank authRef —
+// neither may borrow the gh login.
 // Returns { token, source: 'env' | 'custom' | 'gh-cache' | 'none' }.
 function githubCloneTokenWithSource({ provider, authRef, secretResolver, ghAuthToken = ghAuthTokenFromCli }) {
   const prov = provider || 'github';
@@ -5613,7 +5630,10 @@ function githubCloneTokenWithSource({ provider, authRef, secretResolver, ghAuthT
   if (resolved) return { token: resolved, source: ref.kind === 'custom' ? 'custom' : 'env' };
   if (!resolved && usesDefault) {
     const token = ghAuthToken() || null;
-    if (token) return { token, source: 'gh-cache' };
+    // A hit AND a miss both report 'gh-cache' (see the header): the miss keeps
+    // the auth-failure recovery eligible so a post-`gh auth login` forced
+    // re-read can still recover this job.
+    return { token, source: 'gh-cache' };
   }
   return { token: null, source: 'none' };
 }
@@ -5780,14 +5800,41 @@ function provisionRepo({ envelope, token, runDir, runId, timeoutMs = 120_000, lo
     // for the operator's gh login would violate githubCloneToken's documented
     // precedence and could act as a different identity, so those sources fail
     // without the gh retry.
-    if (token && credentialSource === 'gh-cache' && isGitAuthFailure(detail)) {
+    // The `token` guard is deliberately ABSENT (Copilot review on #293): a
+    // default gh-cache MISS (token null, source 'gh-cache') is eligible too, so
+    // a worker that cached "logged out" recovers null → fresh token after the
+    // operator runs `gh auth login` instead of failing the job anonymous. That
+    // recovery must REBUILD the credential plumbing the anonymous path omitted
+    // (the askpass helper, GIT_ASKPASS/GIT_TOKEN, and the username-embedded
+    // remote) — a bare GIT_TOKEN swap leaves the clone unauthenticated.
+    if (credentialSource === 'gh-cache' && isGitAuthFailure(detail)) {
       invalidateGhAuthToken();
       const { token: fresh, changed } = refreshGhAuthToken({ force: true });
       if (changed && fresh && fresh !== token) {
         logger?.info?.(`git clone auth failed${cs} — the cached gh token may be stale; re-read it (${describeGhAuthToken(ghAuthTokenInfo())}) and retrying the clone once`);
         throwIfAborted('clone-auth-retry');
+        // Rebuild the credential env for the fresh token. On the null→fresh
+        // recovery the original env was the ANONYMOUS one (no askpass helper,
+        // GIT_CONFIG_GLOBAL neutralized), so re-mint the askpass helper and
+        // restore global config; on a stale-token rotation this is a no-op
+        // re-point of the same GIT_TOKEN.
         const retryEnv = { ...gitEnv, GIT_TOKEN: fresh };
-        const retry = runGitFn(cloneArgs, { env: retryEnv, timeoutMs: provTimeoutMs() });
+        const retryAskpass = writeAskpass(runDir, fresh);
+        if (retryAskpass) {
+          retryEnv.GIT_ASKPASS = retryAskpass;
+          // The anonymous path set GIT_CONFIG_GLOBAL=/dev/null so a no-token
+          // clone can't inherit operator credentials; the fresh token is ours,
+          // so global config (e.g. http.proxy) may apply again.
+          delete retryEnv.GIT_CONFIG_GLOBAL;
+        }
+        // Rebuild the clone argv so the remote carries the fresh credential's
+        // username (authUrl embeds x-access-token only when a token is present);
+        // the anonymous remote had no username, so git would never consult the
+        // askpass helper for it. `workspaceDir` stays last; the remote is the
+        // argument immediately before it (cloneArgs.push(remote, workspaceDir)).
+        const retryCloneArgs = cloneArgs.slice();
+        retryCloneArgs[retryCloneArgs.length - 2] = authUrl(repo.url, repo.provider || 'github', true);
+        const retry = runGitFn(retryCloneArgs, { env: retryEnv, timeoutMs: provTimeoutMs() });
         if (retry.status === 0) {
           // Adopt the fresh token for the REST of provisioning + the returned
           // gitEnv (finalizeGit pushes with it) so the whole job runs on the
@@ -7212,6 +7259,13 @@ function finalizeGit({ workspaceDir, gitEnv, startSha, workingBranch, baseBranch
     // `gh auth token` read — an explicit GITHUB_TOKEN ('env') or custom authRef
     // ('custom') is a deliberately configured identity that must fail as
     // configured, never be silently swapped for the operator's gh login.
+    // The `token` guard is deliberately ABSENT (Copilot review on #293): a
+    // default gh-cache MISS (token null, source 'gh-cache') is eligible too, so
+    // a worker that cached "logged out" recovers null → fresh token after the
+    // operator runs `gh auth login` instead of stranding the commits. That
+    // recovery must REBUILD the credential plumbing the anonymous gitEnv lacked
+    // (the askpass helper + GIT_ASKPASS, and global git config) — a bare
+    // GIT_TOKEN swap leaves the push unauthenticated.
     // The credential that PRODUCED the ORIGINAL `push` — preserved separately so
     // the failure report below redacts the value that actually appeared in that
     // push's output, even once `token` is swapped to the fresh credential for
@@ -7222,12 +7276,20 @@ function finalizeGit({ workspaceDir, gitEnv, startSha, workingBranch, baseBranch
     // describeGitFailure attributes the RETRY's timeout, not the original push's
     // (Copilot review on #293).
     let pushFailureTimeout = pushTimeout;
-    if (push.status !== 0 && token && credentialSource === 'gh-cache' && isGitAuthFailure(describeGitFailure('git push', push, { token, timeoutMs: pushTimeout }))) {
+    if (push.status !== 0 && credentialSource === 'gh-cache' && isGitAuthFailure(describeGitFailure('git push', push, { token, timeoutMs: pushTimeout }))) {
       invalidateGhAuthToken();
       const { token: fresh, changed } = refreshGhAuthToken({ force: true });
       if (changed && fresh && fresh !== token) {
         log.info?.(`finalizeGit${cs}: git push auth failed — the cached gh token may be stale; re-read it (${describeGhAuthToken(ghAuthTokenInfo())}) and retrying the push once`);
         const retryEnv = { ...gitEnv, GIT_TOKEN: fresh };
+        // On the null→fresh recovery the original gitEnv was the ANONYMOUS one
+        // (no askpass helper, GIT_CONFIG_GLOBAL neutralized) — re-mint the
+        // askpass helper and restore global config so the push can authenticate.
+        const retryAskpass = writeAskpass(workspaceDir, fresh);
+        if (retryAskpass) {
+          retryEnv.GIT_ASKPASS = retryAskpass;
+          delete retryEnv.GIT_CONFIG_GLOBAL;
+        }
         const retryTimeout = netTimeoutMs();
         const retry = pushGit([...credArgs(), 'push', '--set-upstream', 'origin', `refs/heads/${workingBranch}:refs/heads/${workingBranch}`], { cwd: workspaceDir, env: retryEnv, timeoutMs: retryTimeout });
         // Rebind the git env to the FRESH credential whenever the retry ran —

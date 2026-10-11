@@ -114,6 +114,48 @@ test('refreshGhAuthToken reports a token change and re-reads scopes only on chan
   invalidateGhAuthToken();
 });
 
+test('refreshGhAuthToken re-probes scopes when the cached reading is missing (#293)', () => {
+  invalidateGhAuthToken();
+  const run = ghStub({ token: 'gho_scope' });
+  // First populate: the scopes probe FAILS transiently → scopes cached as null.
+  let scopeReads = 0;
+  const failingProbe = () => { scopeReads++; return null; };
+  refreshGhAuthToken({ force: true, run, scopesProbe: failingProbe });
+  assert.equal(scopeReads, 1, 'scopes probed on first populate');
+  assert.equal(ghAuthTokenInfo().scopes, null, 'a transient probe failure caches scopes:null');
+  // A same-token refresh must RE-PROBE (not carry the null forward forever) so
+  // the GH AUTH visibility self-repairs once the probe recovers.
+  const healingProbe = () => { scopeReads++; return 'repo, workflow'; };
+  const r = refreshGhAuthToken({ force: true, run, scopesProbe: healingProbe });
+  assert.equal(r.changed, false, 'same token — not a credential change');
+  assert.equal(scopeReads, 2, 're-probed because the cached scope value was missing');
+  assert.equal(ghAuthTokenInfo().scopes, 'repo, workflow', 'the healed scopes are now reported');
+  // Once a NON-NULL reading is cached, a same-token refresh reuses it (no ping).
+  const r2 = refreshGhAuthToken({ force: true, run, scopesProbe: healingProbe });
+  assert.equal(r2.changed, false);
+  assert.equal(scopeReads, 2, 'a successful cached reading is reused, not re-pinged');
+  invalidateGhAuthToken();
+});
+
+test('adoptGhAuthTokenAsync re-probes scopes when the cached reading is missing (#293)', async () => {
+  invalidateGhAuthToken();
+  setGhAuthTokenReader(() => 'gho_async_scope');
+  try {
+    // Prime with a failing scopes probe → null cached.
+    await refreshGhAuthTokenAsync({ force: true, scopesProbe: () => null });
+    assert.equal(ghAuthTokenInfo().scopes, null);
+    // Same token, probe now heals → must re-probe and record the scopes.
+    let reads = 0;
+    const r = await adoptGhAuthTokenAsync('gho_async_scope', { scopesProbe: () => { reads++; return 'repo'; } });
+    assert.equal(r.changed, false);
+    assert.equal(reads, 1, 're-probed on a missing cached scope value');
+    assert.equal(ghAuthTokenInfo().scopes, 'repo');
+  } finally {
+    resetGhAuthTokenReader();
+    invalidateGhAuthToken();
+  }
+});
+
 test('ghAuthTokenInfo exposes fingerprint/scopes/age but never the token value', () => {
   invalidateGhAuthToken();
   const run = ghStub({ token: 'gho_visible' });
@@ -284,15 +326,21 @@ test('githubCloneTokenWithSource reports the credential source', () => {
     delete process.env.GITHUB_TOKEN;
     r = githubCloneTokenWithSource({ provider: 'github', authRef: undefined, secretResolver: resolver, ghAuthToken: () => 'gho_cached' });
     assert.deepEqual(r, { token: 'gho_cached', source: 'gh-cache' });
-    // No env token AND no gh token → anonymous.
+    // No env token AND no gh token → a default gh-cache MISS. The source stays
+    // 'gh-cache' (token null) so the clone/push auth-failure recovery remains
+    // eligible and can still self-heal after `gh auth login` (Copilot review on
+    // #293) — it is NOT 'none' (which would make the guards ineligible).
     r = githubCloneTokenWithSource({ provider: 'github', authRef: undefined, secretResolver: resolver, ghAuthToken: () => null });
-    assert.deepEqual(r, { token: null, source: 'none' });
+    assert.deepEqual(r, { token: null, source: 'gh-cache' });
     // A custom authRef resolves strictly from the secret resolver → 'custom'.
     process.env.MY_TOKEN = 'custom-tok';
     r = githubCloneTokenWithSource({ provider: 'github', authRef: 'MY_TOKEN', secretResolver: resolver, ghAuthToken: () => { throw new Error('must not be called'); } });
     assert.deepEqual(r, { token: 'custom-tok', source: 'custom' });
     // A blank authRef is a misconfiguration → no token, never the gh fallback.
     r = githubCloneTokenWithSource({ provider: 'github', authRef: '   ', secretResolver: resolver, ghAuthToken: () => { throw new Error('must not be called'); } });
+    assert.deepEqual(r, { token: null, source: 'none' });
+    // A non-github provider with no custom ref never borrows the gh login → 'none'.
+    r = githubCloneTokenWithSource({ provider: 'gitlab', authRef: undefined, secretResolver: resolver, ghAuthToken: () => { throw new Error('must not be called'); } });
     assert.deepEqual(r, { token: null, source: 'none' });
   } finally {
     if (saved === undefined) delete process.env.GITHUB_TOKEN;
@@ -377,6 +425,60 @@ test('provisionRepo retries the clone once with a fresh token on an auth failure
     // using the stale one (Copilot review on #293).
     assert.equal(ghAuthTokenInfo().fingerprint, ghTokenFingerprint('gho_fresh'));
     assert.equal(prov.effectiveToken, 'gho_fresh', 'the rotated token is propagated to the caller');
+    assert.equal(prov.credentialSource, 'gh-cache');
+  } finally {
+    resetGhAuthTokenReader();
+    invalidateGhAuthToken();
+    rmSync(root, { recursive: true, force: true });
+  }
+});
+
+test('provisionRepo recovers a default gh-cache MISS (null → fresh token) on an auth failure (#293)', { skip: !gitAvailable }, () => {
+  const { root, origin } = makeLocalOrigin();
+  const runDir = mkdtempSync(join(root, 'run-'));
+  try {
+    const envelope = {
+      schemaVersion: 1,
+      repository: { provider: 'github', url: origin, ref: 'main', submodules: false },
+      branch: { base: 'main', create: 'feat/x', push: true },
+      setup: { commands: [], env: {}, secretRefs: [] },
+      task: { allowPr: true },
+    };
+    // The worker cached "logged out" (no token) at prime time; the operator has
+    // since run `gh auth login`, so the forced re-read after the auth failure
+    // returns a FRESH token. Reader seam: null first, then fresh.
+    let served = null;
+    setGhAuthTokenReader(() => served);
+    invalidateGhAuthToken();
+    refreshGhAuthToken({ force: true }); // cache ← null (logged out)
+    assert.equal(ghAuthTokenInfo().present, false);
+
+    let cloneAttempts = 0;
+    const seam = (args, opts) => {
+      if (args.includes('clone')) {
+        cloneAttempts++;
+        if (cloneAttempts === 1) {
+          // First attempt (anonymous, no token): an auth rejection.
+          return { status: 128, stdout: '', stderr: "fatal: could not read Username for 'https://github.com': terminal prompts disabled", signal: null, timedOut: false, timeoutMs: opts?.timeoutMs };
+        }
+        // The null→fresh recovery must REBUILD the credential plumbing the
+        // anonymous path omitted: GIT_TOKEN + a GIT_ASKPASS helper, global git
+        // config restored, and the remote re-anchored through authUrl. (The
+        // local origin is a file:// URL, which authUrl deliberately leaves
+        // username-less — the username embed only applies to https remotes.)
+        assert.equal(opts?.env?.GIT_TOKEN, 'gho_fresh', 'the retry runs with the recovered token');
+        assert.ok(opts?.env?.GIT_ASKPASS, 'an askpass helper was minted for the fresh token');
+        assert.equal(opts?.env?.GIT_CONFIG_GLOBAL, undefined, 'global git config is restored once a token exists');
+      }
+      return runGit(args, opts);
+    };
+    // The job resolves NO token (gh-cache MISS) but the source is 'gh-cache', so
+    // the auth-failure recovery is eligible and self-heals null → fresh.
+    served = 'gho_fresh';
+    const prov = provisionRepo({ envelope, token: null, runDir, credentialSource: 'gh-cache', _runGit: seam });
+    assert.equal(cloneAttempts, 2, 'the clone was retried once after the auth failure');
+    assert.ok(prov.workspaceDir, 'the retry produced a workspace');
+    assert.equal(prov.effectiveToken, 'gho_fresh', 'the recovered token is propagated to the caller');
     assert.equal(prov.credentialSource, 'gh-cache');
   } finally {
     resetGhAuthTokenReader();
@@ -617,6 +719,40 @@ test('provisionRepo does NOT retry an auth failure for a non-gh-cache credential
     assert.throws(() => provisionRepo({ envelope, token: 'explicit-env-token', runDir, credentialSource: 'env', _runGit: seam }), /git clone failed/);
     assert.equal(cloneAttempts, 1, 'no gh-token retry for an env-sourced credential');
   } finally {
+    rmSync(root, { recursive: true, force: true });
+  }
+});
+
+test('provisionRepo does NOT retry a gh-cache MISS when the re-read is still logged out (#293)', { skip: !gitAvailable }, () => {
+  const { root, origin } = makeLocalOrigin();
+  const runDir = mkdtempSync(join(root, 'run-'));
+  try {
+    const envelope = {
+      schemaVersion: 1,
+      repository: { provider: 'github', url: origin, ref: 'main', submodules: false },
+      branch: { base: 'main', create: 'feat/x', push: true },
+      setup: { commands: [], env: {}, secretRefs: [] },
+      task: { allowPr: true },
+    };
+    // The worker cached "logged out" AND the forced re-read STILL finds no token
+    // (the operator has not run `gh auth login`). There is nothing to recover —
+    // the clone must fail WITHOUT a retry (a null → null read is not a change).
+    setGhAuthTokenReader(() => null);
+    invalidateGhAuthToken();
+    refreshGhAuthToken({ force: true }); // cache ← null
+    let cloneAttempts = 0;
+    const seam = (args, opts) => {
+      if (args.includes('clone')) {
+        cloneAttempts++;
+        return { status: 128, stdout: '', stderr: "fatal: could not read Username for 'https://github.com': terminal prompts disabled", signal: null, timedOut: false, timeoutMs: opts?.timeoutMs };
+      }
+      return runGit(args, opts);
+    };
+    assert.throws(() => provisionRepo({ envelope, token: null, runDir, credentialSource: 'gh-cache', _runGit: seam }), /git clone failed/);
+    assert.equal(cloneAttempts, 1, 'no retry when the forced re-read still finds no token');
+  } finally {
+    resetGhAuthTokenReader();
+    invalidateGhAuthToken();
     rmSync(root, { recursive: true, force: true });
   }
 });

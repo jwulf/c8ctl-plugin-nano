@@ -1089,6 +1089,59 @@ test('resolveJobSecrets: a custom github authRef does NOT fall back to gh (stays
   assert.deepEqual(missing, ['MY_PAT']);
 });
 
+test('resolveJobSecrets: a default github gh-cache MISS is NOT reported missing (#293)', () => {
+  // The worker cached "logged out" (gh auth token → null) and the operator then
+  // logged back in. The job must NOT fail "missing secret(s): GITHUB_TOKEN"
+  // here: provisionRepo forces a null → fresh re-read, so leaving GITHUB_TOKEN
+  // out of `missing` lets that recovery heal the job. A null gh-cache default is
+  // a 'gh-cache' MISS (recovery-eligible), not a hard-missing credential.
+  const resolver = makeSecretResolver('host');
+  const saved = process.env.GITHUB_TOKEN;
+  delete process.env.GITHUB_TOKEN;
+  try {
+    const env = normalizeTaskEnvelope(
+      {
+        [`${AGENT_TASK_NS}.repository.url`]: 'https://github.com/o/r.git',
+        [`${AGENT_TASK_NS}.task.allowPr`]: 'true',
+      },
+      {},
+    );
+    const { resolved, missing } = resolveJobSecrets(resolver, env, { ghAuthToken: () => null });
+    assert.deepEqual(missing, [], 'a gh-cache miss must not fail the job before provisioning recovers it');
+    assert.equal(resolved.GITHUB_TOKEN, undefined, 'no token is resolved — provisioning re-reads it');
+  } finally {
+    if (saved === undefined) delete process.env.GITHUB_TOKEN;
+    else process.env.GITHUB_TOKEN = saved;
+  }
+});
+
+test('resolveJobSecrets: a default github gh-cache MISS with GITHUB_TOKEN in secretRefs is still not missing (#293)', () => {
+  // Same recovery-eligible miss, but GITHUB_TOKEN is ALSO an explicit secretRef:
+  // the generic resolver adds it to `missing`, and the gh-cache miss branch must
+  // still drop it so the job reaches provisioning's forced recovery.
+  const resolver = makeSecretResolver('host');
+  const saved = process.env.GITHUB_TOKEN;
+  delete process.env.GITHUB_TOKEN;
+  try {
+    const env = normalizeTaskEnvelope(
+      {
+        [AGENT_TASK_NS]: JSON.stringify({
+          repository: { url: 'https://github.com/o/r.git' },
+          task: { allowPr: true },
+          setup: { secretRefs: ['GITHUB_TOKEN'] },
+        }),
+      },
+      {},
+    );
+    const { resolved, missing } = resolveJobSecrets(resolver, env, { ghAuthToken: () => null });
+    assert.deepEqual(missing, []);
+    assert.equal(resolved.GITHUB_TOKEN, undefined);
+  } finally {
+    if (saved === undefined) delete process.env.GITHUB_TOKEN;
+    else process.env.GITHUB_TOKEN = saved;
+  }
+});
+
 test('resolveJobSecrets: a present-but-blank authRef is missing, never borrows gh/default', () => {
   const resolver = makeSecretResolver('host');
   const saved = process.env.GITHUB_TOKEN;

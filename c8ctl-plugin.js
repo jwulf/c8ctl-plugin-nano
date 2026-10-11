@@ -457,6 +457,22 @@ function activityMarkerReadyFor(act, pid) {
 }
 
 /**
+ * Whether a worker should receive a `reload-credentials` SIGUSR1 this round.
+ * All three must hold (#293): the worker exists, its PID is alive, AND its
+ * activity marker proves its SIGUSR1 reload listener is installed (a finite
+ * `readyAt` + matching pid, via activityMarkerReadyFor). workAgent installs that
+ * listener only once its activation loop is up, which is the same handshake that
+ * stamps `readyAt`. Signalling a freshly spawned worker BEFORE it installs the
+ * handler delivers SIGUSR1 to Node's DEFAULT action — starting the inspector
+ * instead of reloading — so a not-yet-ready worker is skipped (it re-reads the
+ * fresh token at its own startup prime anyway). Pure so it can be unit-tested.
+ */
+function reloadCredentialsReady(worker, activity, pidAlive) {
+  if (!worker || !pidAlive) return false;
+  return activityMarkerReadyFor(activity, worker.pid);
+}
+
+/**
  * Deterministic control-socket path shared by the daemon and every client.
  * Derived from a hash of the (possibly overridden) state home so distinct
  * C8CTL_NANO_HOME instances get distinct sockets, and kept SHORT to stay under
@@ -4570,7 +4586,9 @@ function resolveJobSecrets(resolver, envelope, { ghAuthToken = ghAuthTokenFromCl
   }
   // The github clone/push credential is resolved with a gh-CLI fallback so a
   // default GITHUB_TOKEN isn't reported "missing" merely because it isn't in the
-  // env when `gh auth login` provides it. A custom authRef stays strict.
+  // env when `gh auth login` provides it. A default github credential whose gh
+  // cache is a MISS is ALSO not reported missing (provisioning forces a null →
+  // fresh recovery). A custom authRef stays strict.
   if (envelope.task?.allowPr) {
     const provider = envelope.repository?.provider || 'github';
     const authRef = envelope.repository?.authRef;
@@ -4583,10 +4601,19 @@ function resolveJobSecrets(resolver, envelope, { ghAuthToken = ghAuthTokenFromCl
       const ghAuthRef = ghCredentialEnvName({ provider, authRef });
       if (ghAuthRef) {
         names.add(ghAuthRef);
-        const token = githubCloneToken({ provider, authRef, secretResolver: resolver, ghAuthToken });
+        const { token, source } = githubCloneTokenWithSource({ provider, authRef, secretResolver: resolver, ghAuthToken });
         const missingIdx = missing.indexOf(ghAuthRef);
         if (token) {
           resolved[ghAuthRef] = token;
+          if (missingIdx !== -1) missing.splice(missingIdx, 1);
+        } else if (source === 'gh-cache') {
+          // A DEFAULT github credential whose gh-CLI cache is a MISS (null) is
+          // NOT reported missing: provisionRepo re-reads `gh auth token` with a
+          // forced recovery (null → fresh), so a worker that cached "logged out"
+          // self-heals once the operator runs `gh auth login` instead of the job
+          // failing anonymous here before provisioning ever runs (Copilot review
+          // on #293). Keep it OUT of `missing` (and drop any stale entry). A
+          // custom/invalid authRef reports source 'none' and still fails strict.
           if (missingIdx !== -1) missing.splice(missingIdx, 1);
         } else if (missingIdx === -1) {
           missing.push(ghAuthRef);
@@ -5030,12 +5057,16 @@ function ghTokenScopes(token, { timeoutMs = 5_000, run = spawnSync } = {}) {
 
 // Fold one (re)read result into the cache record. Shared by the sync and async
 // refresh paths so both maintain identical cache semantics. Returns
-// { token, changed } — `changed` is true when the token VALUE differs from what
-// the cache previously held (including null → token and token → null), so the
-// caller logs/fires exactly when the credential the worker hands out actually
-// rotates. `scopes` is read only when the token changed (or on the first
-// populate): it costs a network ping, and a same-token refresh can't have
-// changed scopes without the token value changing too.
+// { token, changed, snapshotChanged } — `changed` is true when the token VALUE
+// differs from what the cache previously held (including null → token and token
+// → null), so a caller doing credential-rotation recovery fires exactly when the
+// credential the worker hands out actually rotates. `snapshotChanged` is the
+// broader "did the OBSERVABLE snapshot move" flag: `changed` OR a same-token
+// scopes self-repair (a prior null scopes reading re-probed to a real value) —
+// both of which change what `supervisor status`/the activity marker should show,
+// so the log + republish paths gate on IT, not on `changed` (Copilot review on
+// #293). `scopes` is read only when the token changed, on the first populate, or
+// to re-probe a cached null reading.
 function adoptGhAuthToken(token, { scopesProbe = ghTokenScopes } = {}) {
   const prev = ghAuthTokenCache === GH_AUTH_TOKEN_UNSET ? null : ghAuthTokenCache;
   const now = Date.now();
@@ -5047,7 +5078,7 @@ function adoptGhAuthToken(token, { scopesProbe = ghTokenScopes } = {}) {
     // token, fall back to anonymous (null) as before.
     if (prev && prev.token != null) {
       writeGhAuthCache({ ...prev, lastCheck: now });
-      return { token: prev.token, changed: false };
+      return { token: prev.token, changed: false, snapshotChanged: false };
     }
     token = null;
   }
@@ -5061,6 +5092,15 @@ function adoptGhAuthToken(token, { scopesProbe = ghTokenScopes } = {}) {
   // value is MISSING (null) while a token is present; reuse only a SUCCESSFUL
   // (non-null) prior reading.
   const scopes = token ? ((changed || !(prev && prev.scopes)) ? scopesProbe(token) : prev.scopes) : null;
+  // `snapshotChanged` is true when the OBSERVABLE identity (the token-free
+  // fingerprint + scopes that ghAuthTokenInfo/describeGhAuthToken surface) moved
+  // — not only when the token VALUE rotated. A scopes self-repair (a prior
+  // transient probe cached `scopes:null`, now re-probed to a real value) leaves
+  // the token unchanged yet DOES change what `supervisor status` should show, so
+  // the republish/log path must fire on it too; gating republishing on `changed`
+  // alone leaves an idle worker reporting `?` scopes indefinitely (Copilot review
+  // on #293).
+  const snapshotChanged = changed || (!!prev && (prev.scopes ?? null) !== (scopes ?? null));
   writeGhAuthCache({
     token,
     fingerprint: ghTokenFingerprint(token),
@@ -5071,7 +5111,7 @@ function adoptGhAuthToken(token, { scopesProbe = ghTokenScopes } = {}) {
     since: prev && prev.token === token && token != null ? prev.since : now,
     lastCheck: now,
   });
-  return { token, changed };
+  return { token, changed, snapshotChanged };
 }
 
 // The async twin of adoptGhAuthToken: identical cache semantics, but the scopes
@@ -5088,7 +5128,7 @@ async function adoptGhAuthTokenAsync(token, { scopesProbe, generation = null } =
   const now = Date.now();
   const superseded = () => {
     const c = ghAuthTokenCache === GH_AUTH_TOKEN_UNSET ? null : ghAuthTokenCache;
-    return { token: c ? c.token : null, changed: false, superseded: true };
+    return { token: c ? c.token : null, changed: false, snapshotChanged: false, superseded: true };
   };
   if (token === GH_AUTH_READ_FAILED) {
     // Transient read failure (see adoptGhAuthToken): preserve the prior token and
@@ -5096,7 +5136,7 @@ async function adoptGhAuthTokenAsync(token, { scopesProbe, generation = null } =
     if (prev && prev.token != null) {
       if (generation != null && generation !== ghAuthCacheGeneration) return superseded();
       writeGhAuthCache({ ...prev, lastCheck: now });
-      return { token: prev.token, changed: false };
+      return { token: prev.token, changed: false, snapshotChanged: false };
     }
     token = null;
   }
@@ -5105,6 +5145,10 @@ async function adoptGhAuthTokenAsync(token, { scopesProbe, generation = null } =
   // successful prior scope reading but RE-PROBES when the cached value is null
   // (a prior transient probe failure), so the GH AUTH visibility self-repairs.
   const scopes = token ? ((changed || !(prev && prev.scopes)) ? await scopesProbe(token) : prev.scopes) : null;
+  // See adoptGhAuthToken: publish when the observable snapshot (fingerprint +
+  // scopes) moved, not only when the token value rotated, so a same-token scopes
+  // self-repair still republishes the activity marker (Copilot review on #293).
+  const snapshotChanged = changed || (!!prev && (prev.scopes ?? null) !== (scopes ?? null));
   // Generation fence: re-check AFTER the (awaited) scopes probe, the last point a
   // forced recovery could have slipped a newer credential in underneath us.
   if (generation != null && generation !== ghAuthCacheGeneration) return superseded();
@@ -5115,7 +5159,7 @@ async function adoptGhAuthTokenAsync(token, { scopesProbe, generation = null } =
     since: prev && prev.token === token && token != null ? prev.since : now,
     lastCheck: now,
   });
-  return { token, changed };
+  return { token, changed, snapshotChanged };
 }
 
 // One (re)read of `gh auth token`, folding the result into the cache record.
@@ -5128,7 +5172,7 @@ function refreshGhAuthToken({ force = false, run = null, scopesProbe } = {}) {
   const prev = ghAuthTokenCache === GH_AUTH_TOKEN_UNSET ? null : ghAuthTokenCache;
   const now = Date.now();
   if (!force && prev && now - prev.lastCheck < GH_AUTH_TOKEN_TTL_MS) {
-    return { token: prev.token, changed: false };
+    return { token: prev.token, changed: false, snapshotChanged: false };
   }
   let token = null;
   if (run) {
@@ -5231,7 +5275,7 @@ async function refreshGhAuthTokenAsync({ force = false, scopesProbe, _spawn } = 
   const prev = ghAuthTokenCache === GH_AUTH_TOKEN_UNSET ? null : ghAuthTokenCache;
   const now = Date.now();
   if (!force && prev && now - prev.lastCheck < GH_AUTH_TOKEN_TTL_MS) {
-    return { token: prev.token, changed: false };
+    return { token: prev.token, changed: false, snapshotChanged: false };
   }
   // Serialize against any refresh already spawning (another timer tick, or the
   // reload-credentials SIGUSR1 handler): await IT and report its (already
@@ -5260,7 +5304,7 @@ async function refreshGhAuthTokenAsync({ force = false, scopesProbe, _spawn } = 
     // flight, fall through to start a fresh forced read AFTER the signal.
     if (!force) {
       const c = ghAuthTokenCache === GH_AUTH_TOKEN_UNSET ? null : ghAuthTokenCache;
-      return { token: c ? c.token : null, changed: false };
+      return { token: c ? c.token : null, changed: false, snapshotChanged: false };
     }
   }
   // Honor the module reader seam when a test installed one (mirroring the sync
@@ -5352,12 +5396,13 @@ function describeGhAuthToken(info) {
 // Warm the gh-token cache, off the job-handling path. Safe to call any number of
 // times: within the TTL it is a no-op cache hit; past it (or after an
 // invalidation) it re-reads the CLI. With a `logger` it reports the token's
-// fingerprint + scopes on the FIRST populate and whenever the token changes —
-// the "which credential is this worker holding?" line from issue #293. Returns
-// true once the cache is populated.
+// fingerprint + scopes on the FIRST populate and whenever the observable
+// snapshot moves — a rotated token OR a scopes self-repair (a prior null reading
+// re-probed to a real value) — the "which credential is this worker holding?"
+// line from issue #293. Returns true once the cache is populated.
 function primeGhAuthToken({ logger = null } = {}) {
-  const { changed } = refreshGhAuthToken();
-  if (logger && (changed || ghAuthTokenCache === GH_AUTH_TOKEN_UNSET)) {
+  const { snapshotChanged } = refreshGhAuthToken();
+  if (logger && (snapshotChanged || ghAuthTokenCache === GH_AUTH_TOKEN_UNSET)) {
     logger.info(describeGhAuthToken(ghAuthTokenInfo()));
   }
   return ghAuthTokenCache !== GH_AUTH_TOKEN_UNSET;
@@ -5377,9 +5422,11 @@ function primeGhAuthToken({ logger = null } = {}) {
 // Ticks never overlap (a slow gh can't stack refreshes), a tick failure is
 // swallowed (the next tick retries), and the change log fires from here so a
 // rotation is visible even when no job runs. `onChange` (optional) fires on a
-// genuine identity change so the caller can republish the supervisor activity
-// marker — an idle worker otherwise keeps reporting the pre-refresh
-// fingerprint/scopes indefinitely (Copilot review on #293).
+// genuine observable-snapshot change — a rotated token OR a scopes self-repair
+// (a prior null scopes reading re-probed to a real value), both of which move
+// what `supervisor status` should show — so the caller can republish the
+// supervisor activity marker; an idle worker otherwise keeps reporting the
+// pre-refresh fingerprint/scopes indefinitely (Copilot review on #293).
 //
 // The timer is UNREF'd (like the other maintenance/watchdog intervals): this is
 // a background credential refresh, NOT a serving handle, so it must never be the
@@ -5407,11 +5454,11 @@ function startGhAuthTokenRefresh({ logger = null, intervalMs = GH_AUTH_TOKEN_TTL
     if (isIdle && !isIdle()) return; // a job is active — defer to the next idle tick
     inFlight = true;
     try {
-      const { changed } = await refreshGhAuthTokenAsync({ _spawn });
-      if (logger && (changed || ghAuthTokenCache === GH_AUTH_TOKEN_UNSET)) {
+      const { snapshotChanged } = await refreshGhAuthTokenAsync({ _spawn });
+      if (logger && (snapshotChanged || ghAuthTokenCache === GH_AUTH_TOKEN_UNSET)) {
         logger.info(describeGhAuthToken(ghAuthTokenInfo()));
       }
-      if (changed && onChange) {
+      if (snapshotChanged && onChange) {
         try { onChange(); } catch { /* best effort — republishing is advisory */ }
       }
     } catch {
@@ -14950,7 +14997,14 @@ async function runSupervisorDaemon() {
           const failed = [];
           for (const id of credIds) {
             const w = workers.get(id);
-            if (!w || !isPidAlive(w.pid)) { failed.push(id); continue; }
+            const alive = !!(w && isPidAlive(w.pid));
+            // #293: only signal a worker whose SIGUSR1 (reload) listener is
+            // PROVEN installed (reloadCredentialsReady) — otherwise the signal
+            // hits Node's default action (start the inspector) and the daemon
+            // would wrongly record "reloaded". Skipped workers land in `failed`
+            // so `ok` stays honest; they pick up the fresh token at their own
+            // startup prime.
+            if (!reloadCredentialsReady(w, alive ? readWorkerActivity(id) : null, alive)) { failed.push(id); continue; }
             try { process.kill(w.pid, 'SIGUSR1'); signaled.push(id); }
             catch { failed.push(id); }
           }
@@ -19236,6 +19290,7 @@ export {
   normalizeAgenticMessage,
   buildActivityPayload,
   activityMarkerReadyFor,
+  reloadCredentialsReady,
   waitForChildExit,
   supervisorWorkerActivityFile,
   SETTLEMENT_PENDING_GHOST_TTL_MS,

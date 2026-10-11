@@ -156,6 +156,46 @@ test('adoptGhAuthTokenAsync re-probes scopes when the cached reading is missing 
   }
 });
 
+test('a same-token scopes self-repair reports snapshotChanged so the marker republishes (#293)', () => {
+  invalidateGhAuthToken();
+  const run = ghStub({ token: 'gho_snap' });
+  // First populate with a failing scopes probe → scopes cached null.
+  const first = refreshGhAuthToken({ force: true, run, scopesProbe: () => null });
+  assert.equal(first.changed, true, 'first populate is a token change');
+  assert.equal(first.snapshotChanged, true, 'first populate always moves the snapshot');
+  assert.equal(ghAuthTokenInfo().scopes, null);
+  // Same token, probe heals → NOT a token change, but the observable snapshot
+  // (scopes null → real) DID move: snapshotChanged must be true so the timer's
+  // onChange/log fires and an idle worker stops reporting `?` scopes forever.
+  // Gating republishing on `changed` alone (the pre-fix bug) would skip this.
+  const healed = refreshGhAuthToken({ force: true, run, scopesProbe: () => 'repo, workflow' });
+  assert.equal(healed.changed, false, 'token value unchanged');
+  assert.equal(healed.snapshotChanged, true, 'a scopes self-repair moves the observable snapshot');
+  assert.equal(ghAuthTokenInfo().scopes, 'repo, workflow');
+  // A subsequent same-token, same-scopes refresh is a genuine no-op on both axes.
+  const quiet = refreshGhAuthToken({ force: true, run, scopesProbe: () => 'repo, workflow' });
+  assert.equal(quiet.changed, false);
+  assert.equal(quiet.snapshotChanged, false, 'no token/scope movement → nothing to republish');
+  invalidateGhAuthToken();
+});
+
+test('adoptGhAuthTokenAsync reports snapshotChanged on a same-token scopes self-repair (#293)', async () => {
+  invalidateGhAuthToken();
+  setGhAuthTokenReader(() => 'gho_async_snap');
+  try {
+    await refreshGhAuthTokenAsync({ force: true, scopesProbe: () => null });
+    assert.equal(ghAuthTokenInfo().scopes, null);
+    const r = await adoptGhAuthTokenAsync('gho_async_snap', { scopesProbe: () => 'repo' });
+    assert.equal(r.changed, false, 'same token — not a credential change');
+    assert.equal(r.snapshotChanged, true, 'the healed scopes moved the observable snapshot');
+    const r2 = await adoptGhAuthTokenAsync('gho_async_snap', { scopesProbe: () => 'repo' });
+    assert.equal(r2.snapshotChanged, false, 'a steady-state re-adopt is a no-op on both axes');
+  } finally {
+    resetGhAuthTokenReader();
+    invalidateGhAuthToken();
+  }
+});
+
 test('ghAuthTokenInfo exposes fingerprint/scopes/age but never the token value', () => {
   invalidateGhAuthToken();
   const run = ghStub({ token: 'gho_visible' });

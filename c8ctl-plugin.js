@@ -6759,15 +6759,21 @@ async function setupWorkspaceCheckpoints({ provisioned, envelope = null, token =
       ...(committer.name ? { GIT_AUTHOR_NAME: committer.name, GIT_COMMITTER_NAME: committer.name } : {}),
       ...(committer.email ? { GIT_AUTHOR_EMAIL: committer.email, GIT_COMMITTER_EMAIL: committer.email } : {}),
     };
-    // #296 (F8): pass the job's `abortSignal` to the checkpoint-path git runner, so a
-    // worker force-stop (which aborts that signal) CANCELS an in-flight checkpoint
-    // push instead of letting it run to the full `gitTimeoutMs`. Without this the
-    // force-stop recovery's `Promise.race` only bounds the AWAIT — the underlying
-    // checkpoint keeps running uncancelled, `stop()`/`close()` re-wait that same
-    // chain, and the worker can still reach the supervisor's SIGKILL backstop with
-    // recovery unfinished. With the signal wired, the abort tears the git child down
-    // (SIGTERM→SIGKILL) so the chain settles promptly and `close()` drains fast.
-    const git = mkGit({ cwd: provisioned.workspaceDir, env: gitEnv, timeoutMs: cfg.gitTimeoutMs, signal: abortSignal || undefined });
+    // #296 (F9): the checkpoint-path git runner must stay USABLE after the harness
+    // abort. The force-stop RECOVERY path (flush + preserveRecovery, promoting the
+    // GC-proof recovery ref #295) runs only once `result.aborted` is observed — i.e.
+    // AFTER the job's `abortSignal` has already fired. Binding this runner to
+    // `abortSignal` (the round-4 F8 attempt) made `createGitRunner` fail every
+    // recovery command (`[aborted]`), so the abort flush could not push its snapshot
+    // and preserveRecovery could not even observe/create the recovery ref — recovery
+    // was self-defeating. Instead drive it from a DEDICATED recovery-deadline
+    // controller that is NEVER aborted by the harness stop, only when the recovery
+    // budget (FORCE_STOP_RECOVERY_MS) expires. That still delivers F8's goal — an
+    // in-flight push is torn down at the deadline so the chain settles and `close()`
+    // drains inside the supervisor's SIGKILL window — without killing the recovery
+    // before it can write the ref.
+    const recoveryController = new AbortController();
+    const git = mkGit({ cwd: provisioned.workspaceDir, env: gitEnv, timeoutMs: cfg.gitTimeoutMs, signal: recoveryController.signal });
     // The STARTUP git work (origin lookup, checkpoint fetch, restore) is cancellable:
     // if the runner is interrupted (lock loss / stop --force) mid-setup, the in-flight
     // git child is killed and later ops fail fast, so setup unwinds instead of holding
@@ -7016,6 +7022,12 @@ async function setupWorkspaceCheckpoints({ provisioned, envelope = null, token =
       restored,
       priorNotRestored,
       flushTimeoutMs: cfg.flushTimeoutMs,
+      // #296 (F9): abort the recovery-deadline controller — tears down an in-flight
+      // checkpoint/recovery git push so `stop()`/`close()` settle promptly. Driven by
+      // the force-stop path once the recovery budget expires (NOT by the job's
+      // abortSignal, which fires BEFORE recovery runs and would fail every recovery
+      // command). Idempotent / best-effort; a no-op once already aborted.
+      abortRecovery() { try { recoveryController.abort(); } catch { /* best effort */ } },
       // Adopt a credential the job ROTATED after this checkpointer was created —
       // e.g. finalizeGit's push auth-failure recovery re-read a fresh gh token
       // (its `rotatedToken`). The post-ack ref deletion (`discardAfterAck`) rebuilds
@@ -7054,22 +7066,28 @@ async function setupWorkspaceCheckpoints({ provisioned, envelope = null, token =
           // the lease once a newer run moved it, instead of blind-forcing over
           // whatever is current (Copilot review on #296).
           const prevRecSha = await observeRemoteRefSha({ git, ref: recRef });
-          // #296 (F7): a bare CAS against the just-observed value is NOT ownership —
-          // a superseded activation can observe the newer run's `shaB` here and still
-          // overwrite it with its older `ownedShaA`. Mirror the WIP path's
+          // #296 (F7/F10): a bare CAS against the just-observed value is NOT ownership
+          // — a superseded activation can observe the newer run's `shaB` here and
+          // still overwrite it with its older `ownedShaA`. Mirror the WIP path's
           // `Nano-Checkpoint-Run` ownership check: only overwrite an EXISTING recovery
-          // ref when it is either ours (a re-preservation by this same run) or the
-          // run we explicitly superseded (`prior?.runId`). An absent ref is a
-          // create-only write. A ref owned by any OTHER (newer, concurrent) run is
-          // left intact — we keep its (newer) recovery point.
+          // ref when it is POSITIVELY identified as either ours (a re-preservation by
+          // this same run) or the run we explicitly superseded (`prior?.runId`). An
+          // absent ref is a create-only write. FAIL CLOSED: if the owner cannot be
+          // positively identified — the ownership fetch THREW/failed, or the ref
+          // carries no `runId` trailer — refuse the overwrite rather than fall through
+          // to the CAS, so a transient read failure can never let a stale activation
+          // clobber a newer (or unknown) run's recovery point (F10). The WIP ref +
+          // TTL remain the fallback in every refused case.
           if (prevRecSha) {
             let ownerRunId = '';
-            try { ownerRunId = (await fetchCheckpoint({ git, ref: recRef }))?.runId || ''; } catch { ownerRunId = ''; }
+            let ownerKnown = false;
+            try { ownerRunId = (await fetchCheckpoint({ git, ref: recRef }))?.runId || ''; ownerKnown = true; } catch { ownerKnown = false; }
             const myRun = String(runId || '');
             const supersededRun = String(prior?.runId || '');
-            const foreign = ownerRunId && ownerRunId !== myRun && !(supersededRun && ownerRunId === supersededRun);
-            if (foreign) {
-              log.warn(`recovery checkpoint ${recRef} is owned by a newer run (${ownerRunId}) — keeping its recovery point; the WIP ref ${ref} is still retained for recovery.`);
+            const mine = ownerKnown && ownerRunId && (ownerRunId === myRun || (supersededRun && ownerRunId === supersededRun));
+            if (!mine) {
+              const who = !ownerKnown ? 'could not be read (transient)' : (ownerRunId ? `owned by another run (${ownerRunId})` : 'carries no run identity');
+              log.warn(`recovery checkpoint ${recRef} ${who} — refusing to overwrite it; the WIP ref ${ref} is still retained for recovery.`);
               return null;
             }
           }
@@ -7107,9 +7125,9 @@ async function setupWorkspaceCheckpoints({ provisioned, envelope = null, token =
       // run dir can be reaped safely. `close()` is bounded by `closeTimeoutMs` so a
       // force-stopped worker is never held past the supervisor's SIGKILL backstop by
       // the (up to 120s) GC sweep: on the deadline we stop awaiting and let the
-      // caller proceed (the in-flight checkpoint git is already cancelled via the
-      // job's abortSignal, so the chain settles on its own; the GC sweep is aborted
-      // by its own controller). Default 0 = unbounded (normal/failed paths drain
+      // caller proceed (the in-flight checkpoint git is cancelled by the recovery
+      // DEADLINE — abortRecovery() — so the chain settles on its own; the GC sweep is
+      // aborted by its own controller). Default 0 = unbounded (normal/failed paths
       // fully); the force-stop path passes FORCE_STOP_RECOVERY_MS.
       async close({ timeoutMs = 0 } = {}) {
         const drain = (async () => { await checkpointer.stop(); await gc; })();
@@ -12659,11 +12677,13 @@ async function workAgent(req, flags, ctx) {
         // performs a last-chance `failed` flush so edits since the last periodic
         // checkpoint are not lost.
         let checkpointFinalized = false;
-        // #296 (F8): set on the worker force-stop path so the `finally` below bounds
+        // #296 (F8/F9): set on the worker force-stop path so the `finally` below bounds
         // its `close()` drain to the same FORCE_STOP_RECOVERY_MS budget — a force-stop
         // must never be held past the supervisor's SIGKILL backstop by the (up to
-        // 120s) GC sweep. The in-flight checkpoint git is already cancelled via the
-        // job's abortSignal, so the chain settles on its own after we stop awaiting.
+        // 120s) GC sweep. The in-flight checkpoint git is cancelled by the recovery
+        // DEADLINE (checkpointing.abortRecovery(), fired from the force-stop block),
+        // not the job's abortSignal, so the chain settles on its own after we stop
+        // awaiting while recovery can still run after the harness abort.
         let forceStopping = false;
         // #295: the GC-proof recovery ref (and SHA) a preserveRecovery() pushed on an
         // SLA cancellation / failed run, surfaced in the job outcome (io.nanobpm.agentResult)
@@ -12842,6 +12862,15 @@ async function workAgent(req, flags, ctx) {
             if (checkpointer) {
               forceStopping = true;
               const recoveryDeadline = FORCE_STOP_RECOVERY_MS;
+              // #296 (F9): arm the recovery-deadline. When the budget expires, abort
+              // the DEDICATED recovery git runner (not the job's abortSignal, which
+              // has already fired and would fail every recovery command) so an
+              // in-flight flush/preserveRecovery push is torn down and the chain
+              // settles — letting the `finally`'s bounded `close()` drain inside the
+              // supervisor's SIGKILL window. Left to fire for the whole flush +
+              // promote + drain; unref'd so it never keeps the process alive.
+              let deadlineTimer = setTimeout(() => { try { checkpointing.abortRecovery(); } catch { /* best effort */ } }, recoveryDeadline);
+              deadlineTimer?.unref?.();
               const recover = (async () => {
                 await checkpointer.flush('abort', { timeoutMs: recoveryDeadline }); checkpointFinalized = true;
                 try { recoveryRefInfo = await checkpointing.preserveRecovery('force-stop') || recoveryRefInfo; } catch { /* best effort */ }

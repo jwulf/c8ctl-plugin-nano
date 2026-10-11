@@ -1680,8 +1680,7 @@ test('#296 (F7) recovery-ref overwrite is fenced by run identity, not just a CAS
   } finally { f.cleanup(); }
 });
 
-test('#295 sweepStaleCheckpoints: deleted entries carry the sha (for the GC log)', async () => {
-  const f = fixture();
+test('#295 sweepStaleCheckpoints: deleted entries carry the sha (for the GC log)', async () => {  const f = fixture();
   try {
     const { dir, git } = f.clone('sweep');
     const sha = sh(dir, 'rev-parse', 'HEAD');
@@ -1731,6 +1730,112 @@ test('#295 preserveRecovery: promotes the latest snapshot to a GC-proof recovery
     assert.equal(sh(f.root, '--git-dir', f.remote, 'rev-parse', 'refs/nano/wip/808'), res.sha);
     await s.close();
   } finally { f.cleanup(); }
+});
+
+test('#296 (F9) checkpoint git stays usable AFTER the job abort; abortRecovery cancels it', async () => {
+  // The round-4 F8 attempt bound the checkpoint git runner to the JOB abortSignal.
+  // But the force-stop recovery path (flush + preserveRecovery) runs only once
+  // `result.aborted` is observed — i.e. AFTER that signal has fired — so every
+  // recovery command failed `[aborted]` and the recovery ref could never be written
+  // (the whole #295 goal). The fix drives the checkpoint git from a DEDICATED
+  // recovery-deadline controller instead: it survives the harness abort, and is
+  // cancelled only by abortRecovery() when the budget expires.
+  const f = fixture();
+  try {
+    const env = { NANO_AGENT_CHECKPOINT: 'on', NANO_AGENT_CHECKPOINT_INTERVAL_MS: '0' };
+    const { dir } = f.clone('f9');
+    sh(dir, 'checkout', '-q', '-b', 'nano/agent-work/main-x');
+    const provisioned = { workspaceDir: dir, gitEnv: ENV, committer: { name: 'bot', email: 'bot@example.com' }, startSha: sh(dir, 'rev-parse', 'HEAD'), workingBranch: 'nano/agent-work/main-x' };
+    const ac = new AbortController();
+    const s = await setupWorkspaceCheckpoints({ provisioned, job: { jobKey: '1', elementInstanceKey: '909' }, jobType: 't', runId: 'r', logger: quietLogger(), env, abortSignal: ac.signal });
+    assert.ok(s, 'checkpointing is set up while the abortSignal is still live');
+    assert.equal(typeof s.abortRecovery, 'function', 'exposes abortRecovery()');
+    writeFileSync(join(dir, 'wip.txt'), 'half done\n');
+    const res = await s.checkpointer.flush('abort', { timeoutMs: 0 });
+    assert.ok(res.sha, JSON.stringify(res));
+    // Simulate the worker force-stop: the JOB abort fires BEFORE recovery runs.
+    ac.abort();
+    const rec = await s.preserveRecovery('force-stop');
+    assert.deepEqual(rec, { ref: 'refs/nano/recovered/909', sha: res.sha }, 'recovery still lands after the job abort');
+    assert.equal(sh(f.root, '--git-dir', f.remote, 'rev-parse', 'refs/nano/recovered/909'), res.sha);
+    // Now the recovery DEADLINE fires: abortRecovery() cancels the recovery git runner
+    // so no further push can run (bounded cleanup — the chain settles, close() drains).
+    s.abortRecovery();
+    writeFileSync(join(dir, 'wip2.txt'), 'more\n');
+    assert.equal(await s.preserveRecovery('force-stop'), null, 'after abortRecovery the checkpoint git is cancelled');
+    await s.close({ timeoutMs: 2000 });
+  } finally { f.cleanup(); }
+});
+
+test('#296 (F10) preserveRecovery fails CLOSED when the recovery ref owner is unknown/foreign', async () => {
+  // The round-4 F7 fence read the existing ref's runId but fell THROUGH to the CAS
+  // whenever ownership could not be positively established — a thrown/empty ownership
+  // fetch, or a ref with no run trailer — so a transient read failure could still let
+  // a stale activation clobber a newer recovery point. The fix fails CLOSED: an
+  // existing recovery ref is overwritten ONLY when positively identified as this run
+  // or the run it explicitly superseded; every other case refuses.
+  const env = { NANO_AGENT_CHECKPOINT: 'on', NANO_AGENT_CHECKPOINT_INTERVAL_MS: '0' };
+
+  // (a) FOREIGN owner: a newer run B already holds the recovery ref → run A refuses.
+  const fa = fixture();
+  try {
+    const recRef = recoveredCheckpointRef('717');
+    const { dir } = fa.clone('f10a');
+    sh(dir, 'checkout', '-q', '-b', 'nano/agent-work/main-x');
+    writeFileSync(join(dir, 'foreign-b.txt'), 'B work\n');
+    const bSnap = await snapshotWorktree({ git: createGitRunner({ cwd: dir, env: ENV }), baseSha: sh(dir, 'rev-parse', 'HEAD'), runId: 'run-B', message: 'B' });
+    assert.ok(bSnap.sha, 'foreign snapshot built');
+    sh(dir, 'push', '-q', 'origin', `${bSnap.sha}:${recRef}`);
+    const provisioned = { workspaceDir: dir, gitEnv: ENV, committer: { name: 'bot', email: 'bot@example.com' }, startSha: sh(dir, 'rev-parse', 'HEAD'), workingBranch: 'nano/agent-work/main-x' };
+    const logger = quietLogger();
+    const s = await setupWorkspaceCheckpoints({ provisioned, job: { jobKey: '1', elementInstanceKey: '717' }, jobType: 't', runId: 'run-A', logger, env });
+    writeFileSync(join(dir, 'wip.txt'), 'A work\n');
+    await s.checkpointer.flush('abort', { timeoutMs: 0 });
+    assert.equal(await s.preserveRecovery('force-stop'), null, 'run-A must NOT overwrite the foreign run-B ref');
+    assert.equal(sh(fa.root, '--git-dir', fa.remote, 'rev-parse', recRef), bSnap.sha, 'the foreign recovery ref is unchanged');
+    assert.match(logger.lines.warn.join('\n'), /owned by another run/);
+    await s.close();
+  } finally { fa.cleanup(); }
+
+  // (b) NO run identity: the existing ref points at a commit without a run trailer →
+  // the owner cannot be established → fail closed (refuse the overwrite).
+  const fb = fixture();
+  try {
+    const recRef = recoveredCheckpointRef('717');
+    const { dir } = fb.clone('f10b');
+    sh(dir, 'checkout', '-q', '-b', 'nano/agent-work/main-x');
+    const plain = sh(dir, 'rev-parse', 'HEAD'); // the init commit: no Nano-Checkpoint-Run trailer
+    sh(dir, 'push', '-q', 'origin', `${plain}:${recRef}`);
+    const provisioned = { workspaceDir: dir, gitEnv: ENV, committer: { name: 'bot', email: 'bot@example.com' }, startSha: sh(dir, 'rev-parse', 'HEAD'), workingBranch: 'nano/agent-work/main-x' };
+    const logger = quietLogger();
+    const s = await setupWorkspaceCheckpoints({ provisioned, job: { jobKey: '1', elementInstanceKey: '717' }, jobType: 't', runId: 'run-A', logger, env });
+    writeFileSync(join(dir, 'wip.txt'), 'A work\n');
+    await s.checkpointer.flush('abort', { timeoutMs: 0 });
+    assert.equal(await s.preserveRecovery('force-stop'), null, 'an un-owned ref is not overwritten');
+    assert.equal(sh(fb.root, '--git-dir', fb.remote, 'rev-parse', recRef), plain, 'the un-owned recovery ref is unchanged');
+    assert.match(logger.lines.warn.join('\n'), /carries no run identity/);
+    await s.close();
+  } finally { fb.cleanup(); }
+
+  // (c) OWNERSHIP-based, not a blanket refusal: a re-preservation by the SAME run that
+  // created the ref IS allowed (it overwrites its own earlier recovery point).
+  const fc = fixture();
+  try {
+    const { dir } = fc.clone('f10c');
+    sh(dir, 'checkout', '-q', '-b', 'nano/agent-work/main-x');
+    const provisioned = { workspaceDir: dir, gitEnv: ENV, committer: { name: 'bot', email: 'bot@example.com' }, startSha: sh(dir, 'rev-parse', 'HEAD'), workingBranch: 'nano/agent-work/main-x' };
+    const s = await setupWorkspaceCheckpoints({ provisioned, job: { jobKey: '1', elementInstanceKey: '717' }, jobType: 't', runId: 'run-A', logger: quietLogger(), env });
+    writeFileSync(join(dir, 'wip.txt'), 'first\n');
+    await s.checkpointer.flush('abort', { timeoutMs: 0 });
+    const r1 = await s.preserveRecovery('force-stop');
+    assert.ok(r1?.sha, 'first create-only preserve lands');
+    writeFileSync(join(dir, 'wip.txt'), 'second\n');
+    const r2res = await s.checkpointer.flush('abort', { timeoutMs: 0 });
+    const r2 = await s.preserveRecovery('force-stop');
+    assert.deepEqual(r2, { ref: recoveredCheckpointRef('717'), sha: r2res.sha }, 'same-run re-preserve overwrites its own ref');
+    assert.notEqual(r2.sha, r1.sha, 'the ref advanced to the newer snapshot');
+    await s.close();
+  } finally { fc.cleanup(); }
 });
 
 test('#295 setupWorkspaceCheckpoints: a resumed run adopts its predecessor via resumeFromCheckpoint', async () => {
@@ -1795,4 +1900,12 @@ test('#295 job handler wires preserveRecovery on abort/failed and surfaces recov
   assert.ok(i('getProcessInstance: typeof camunda?.getProcessInstance === \'function\'') > 0);
   // The GC reclaim log reports ref@sha [why].
   assert.ok(i('reclaimed ${r.deleted.length} orphaned WIP checkpoint ref(s)') > 0);
+  // #296 (F9): the checkpoint git runner is driven by a DEDICATED recovery-deadline
+  // controller (so recovery survives the harness abort), and the force-stop block arms
+  // the deadline that cancels it via abortRecovery() once the budget expires.
+  assert.ok(i('const recoveryController = new AbortController();') > 0, 'checkpoint git uses a dedicated recovery controller');
+  assert.ok(i('signal: recoveryController.signal') > 0, 'the checkpoint git runner is bound to the recovery signal, not the job abortSignal');
+  const deadline = i('try { checkpointing.abortRecovery(); } catch');
+  const flushAbort = i("await checkpointer.flush('abort'");
+  assert.ok(deadline > 0 && deadline < flushAbort, 'the recovery deadline (abortRecovery) is armed before the force-stop flush');
 });

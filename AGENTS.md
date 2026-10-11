@@ -291,14 +291,25 @@ SDK client (job workers) — do **not** add the SDK as a dependency or use raw
   adoption is create-only and the recovery promotion leases against the sha it observed
   on `refs/nano/recovered/<eik>`, so a slower/stale activation can never blind-force
   over a newer run's recovery point (`pushNamedRef`/`observeRemoteRefSha`). That lease
-  is only a compare-and-swap, so it is **reinforced by run identity**: an existing
-  recovery ref is overwritten only when its `Nano-Checkpoint-Run` trailer names this
-  run or the run it explicitly superseded (`prior.runId`) — a foreign (newer/concurrent)
-  run's recovery point is kept, never replaced by an older snapshot. The
+  is only a compare-and-swap, so it is **reinforced by run identity** and **fails
+  closed** (Copilot review on #296, F7/F10): an existing recovery ref is overwritten
+  only when its `Nano-Checkpoint-Run` trailer **positively identifies** it as this run
+  or the run it explicitly superseded (`prior.runId`); a foreign (newer/concurrent)
+  run's point is kept, and any case where ownership **cannot be established** — the
+  ownership fetch threw/failed, or the ref carries no run trailer — **refuses** the
+  overwrite rather than falling through to the CAS, so a transient read failure can't
+  let a stale activation clobber a newer recovery point. The
   force-stop flush+promote is **bounded** by `FORCE_STOP_RECOVERY_MS` and made genuinely
-  **cancellable**: the checkpoint-path git runner carries the job's `abortSignal`, so a
-  force-stop abort tears the in-flight push down (SIGTERM→SIGKILL) instead of letting it
-  run to `gitTimeoutMs`, and the post-abort `close()` drain is itself capped at
+  **cancellable**: the checkpoint-path git runner is driven by a **dedicated
+  recovery-deadline `AbortController`** — NOT the job's `abortSignal` (Copilot review on
+  #296, F9). The recovery path (flush + `preserveRecovery`) runs only once
+  `result.aborted` is observed, i.e. AFTER the job signal has fired, so binding git to
+  that signal made `createGitRunner` fail every recovery command (`[aborted]`) and
+  defeated the whole #295 recovery; the dedicated controller keeps git usable after the
+  harness abort and is cancelled (`checkpointing.abortRecovery()`, armed from the
+  force-stop block) only when the recovery budget expires — tearing the in-flight push
+  down (SIGTERM→SIGKILL) so the chain settles promptly instead of running to
+  `gitTimeoutMs`. The post-abort `close()` drain is itself capped at
   `FORCE_STOP_RECOVERY_MS` so the (up to 120s) GC sweep can't hold the worker past the
   supervisor's SIGKILL backstop. The supervisor's `forceStopWorker` waits
   `STOP_GRACE_MS + FORCE_STOP_RECOVERY_MS` before

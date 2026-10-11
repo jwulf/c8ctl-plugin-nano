@@ -6854,6 +6854,11 @@ async function setupWorkspaceCheckpoints({ provisioned, envelope = null, token =
 
     // Orphan GC for this remote, throttled per worker process, in the background.
     let gc = Promise.resolve();
+    // #296: the GC sweep's abort controller, hoisted so the force-stop recovery
+    // DEADLINE (abortRecovery) can tear the (up to 120s) sweep down too — otherwise
+    // the single shared force-stop budget would bound only the recovery git, and a
+    // still-running GC could hold close()'s drain past the supervisor's SIGKILL window.
+    let gcAbort = null;
     const gcKey = provisioned.remote || provisioned.workspaceDir;
     // Bound every checkpoint-path SDK call: the GC sweep and the variable write are
     // awaited by `stop()`/`close()` (and `onCheckpoint`), so an unbounded engine
@@ -6904,6 +6909,7 @@ async function setupWorkspaceCheckpoints({ provisioned, envelope = null, token =
       // decouples them; its dir is reaped when the sweep settles. On the overall deadline
       // we abort the sweep's cancellable git so the promise unwinds instead of hanging.
       const sweepAbort = new AbortController();
+      gcAbort = sweepAbort;
       let sweepDir = null;
       try {
         if (!originUrl) throw new Error('workspace had no origin URL');
@@ -7026,8 +7032,15 @@ async function setupWorkspaceCheckpoints({ provisioned, envelope = null, token =
       // checkpoint/recovery git push so `stop()`/`close()` settle promptly. Driven by
       // the force-stop path once the recovery budget expires (NOT by the job's
       // abortSignal, which fires BEFORE recovery runs and would fail every recovery
-      // command). Idempotent / best-effort; a no-op once already aborted.
-      abortRecovery() { try { recoveryController.abort(); } catch { /* best effort */ } },
+      // command). Also aborts the background GC sweep so the ONE shared force-stop
+      // deadline bounds recovery AND cleanup together — otherwise a still-running
+      // (up to 120s) sweep could hold close()'s drain past the supervisor's SIGKILL
+      // window even after recovery settled. Idempotent / best-effort; a no-op once
+      // already aborted.
+      abortRecovery() {
+        try { recoveryController.abort(); } catch { /* best effort */ }
+        try { gcAbort?.abort(); } catch { /* best effort */ }
+      },
       // Adopt a credential the job ROTATED after this checkpointer was created —
       // e.g. finalizeGit's push auth-failure recovery re-read a fresh gh token
       // (its `rotatedToken`). The post-ack ref deletion (`discardAfterAck`) rebuilds
@@ -7125,10 +7138,11 @@ async function setupWorkspaceCheckpoints({ provisioned, envelope = null, token =
       // run dir can be reaped safely. `close()` is bounded by `closeTimeoutMs` so a
       // force-stopped worker is never held past the supervisor's SIGKILL backstop by
       // the (up to 120s) GC sweep: on the deadline we stop awaiting and let the
-      // caller proceed (the in-flight checkpoint git is cancelled by the recovery
-      // DEADLINE — abortRecovery() — so the chain settles on its own; the GC sweep is
-      // aborted by its own controller). Default 0 = unbounded (normal/failed paths
-      // fully); the force-stop path passes FORCE_STOP_RECOVERY_MS.
+      // caller proceed (the in-flight checkpoint git AND the GC sweep are both
+      // cancelled by the recovery DEADLINE — abortRecovery() — so the chain settles on
+      // its own). The force-stop caller passes only the REMAINING of the one shared
+      // force-stop budget, so recovery + this drain never exceed it together. Default
+      // 0 = unbounded (normal/failed paths fully drain).
       async close({ timeoutMs = 0 } = {}) {
         const drain = (async () => { await checkpointer.stop(); await gc; })();
         if (!timeoutMs) return drain;
@@ -12685,6 +12699,13 @@ async function workAgent(req, flags, ctx) {
         // not the job's abortSignal, so the chain settles on its own after we stop
         // awaiting while recovery can still run after the harness abort.
         let forceStopping = false;
+        // #296: the SINGLE absolute force-stop deadline (set when the force-stop
+        // recovery block begins). The recover race AND the `finally`'s close() drain
+        // BOTH bound against it, so recovery + cleanup together fit inside ONE
+        // FORCE_STOP_RECOVERY_MS window rather than consuming it twice (recovery race,
+        // then an independent close() wait) and risking a SIGKILL during cleanup
+        // (Copilot review on #296). 0 until a force-stop begins.
+        let forceStopDeadline = 0;
         // #295: the GC-proof recovery ref (and SHA) a preserveRecovery() pushed on an
         // SLA cancellation / failed run, surfaced in the job outcome (io.nanobpm.agentResult)
         // — but ONLY on the failed/SLA-cancel path, which settles normally and so reaches
@@ -12862,6 +12883,11 @@ async function workAgent(req, flags, ctx) {
             if (checkpointer) {
               forceStopping = true;
               const recoveryDeadline = FORCE_STOP_RECOVERY_MS;
+              // #296: anchor the ONE shared force-stop deadline here. The recover race
+              // below and the `finally`'s close() both bound against it, so the TOTAL
+              // force-stop window is a single FORCE_STOP_RECOVERY_MS (not 2x), fitting
+              // inside the supervisor's STOP_GRACE_MS + FORCE_STOP_RECOVERY_MS backstop.
+              forceStopDeadline = Date.now() + recoveryDeadline;
               // #296 (F9): arm the recovery-deadline. When the budget expires, abort
               // the DEDICATED recovery git runner (not the job's abortSignal, which
               // has already fired and would fail every recovery command) so an
@@ -13081,10 +13107,19 @@ async function workAgent(req, flags, ctx) {
             // last periodic checkpoint. `flush` forces past the post-stop guard and is
             // bounded; the lease still protects a newer owner. Then close (drain).
             if (checkpointer && !checkpointFinalized) { try { await checkpointer.flush('failed', { timeoutMs: checkpointing.flushTimeoutMs }); } catch { /* best effort */ } }
-            // #296 (F8): on a force-stop, bound the drain to the recovery budget so the
-            // worker exits inside the supervisor's SIGKILL window even if the GC sweep
-            // (up to 120s) is still running; the cancelled checkpoint git settles alone.
-            try { await checkpointing.close(forceStopping ? { timeoutMs: FORCE_STOP_RECOVERY_MS } : undefined); } catch { /* best effort */ }
+            // #296 (F8): on a force-stop, bound the drain to the REMAINING of the ONE
+            // shared force-stop deadline (set when the recovery block began) — NOT a
+            // fresh full FORCE_STOP_RECOVERY_MS. The recovery race may already have
+            // consumed most of the budget, so a fresh window here could run the total
+            // (recovery + cleanup) to ~2x the budget and be SIGKILLed mid-cleanup
+            // (Copilot review on #296). The recovery DEADLINE (abortRecovery) tears down
+            // both the checkpoint git AND the GC sweep at that same absolute instant, so
+            // the drain settles on its own; `Math.max(1, …)` keeps it a BOUNDED cap even
+            // when the budget is already spent (close() treats 0 as unbounded).
+            const closeOpts = forceStopping
+              ? { timeoutMs: Math.max(1, forceStopDeadline - Date.now()) }
+              : undefined;
+            try { await checkpointing.close(closeOpts); } catch { /* best effort */ }
           }
           if (isContainer) liveRunIds.delete(runId);
           // #205: clear the in-flight job marker now the harness has stopped — the

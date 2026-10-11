@@ -1502,10 +1502,20 @@ test('job handler wires checkpoints: notify on ACP updates, flush on abort/failu
   assert.ok(src.indexOf('envelope: effectiveEnvelope', setup) > setup, 'the restored note reaches the harness envelope');
   const close = src.indexOf('await checkpointing.close(', lastChance);
   assert.ok(close > lastChance, 'the exception/cleanup path closes the checkpointing');
-  // #296 (F8): the cleanup-path close() is bounded to FORCE_STOP_RECOVERY_MS on the
-  // force-stop path (so the GC sweep can't hold the worker past the SIGKILL backstop),
-  // and unbounded (undefined) otherwise.
-  assert.ok(src.slice(close, close + 120).includes('forceStopping ? { timeoutMs: FORCE_STOP_RECOVERY_MS } : undefined'), 'close() is budget-bounded on the force-stop path');
+  // #296 (Copilot review): the cleanup-path close() is bounded on the force-stop path
+  // by the REMAINING of the ONE shared force-stop deadline (forceStopDeadline), NOT a
+  // fresh full FORCE_STOP_RECOVERY_MS — so recovery + cleanup together fit inside a
+  // single budget and can't be SIGKILLed mid-cleanup. Unbounded (undefined) otherwise.
+  const closeOpts = src.indexOf('const closeOpts = forceStopping', lastChance);
+  assert.ok(closeOpts > lastChance && closeOpts < close, 'close() opts computed on the force-stop path before close()');
+  assert.ok(src.slice(closeOpts, close).includes('Math.max(1, forceStopDeadline - Date.now())'), 'force-stop close() uses the REMAINING shared deadline (never a fresh full budget, never 0)');
+  assert.ok(src.slice(closeOpts, close).includes(': undefined'), 'close() is unbounded off the force-stop path');
+  // The one shared deadline is anchored once when the force-stop recovery block begins.
+  assert.ok(src.includes('forceStopDeadline = Date.now() + recoveryDeadline'), 'the shared force-stop deadline is set once at the start of the recovery block');
+  // #296 (Copilot review): abortRecovery() tears down the GC sweep too, so the single
+  // deadline bounds recovery AND the (up to 120s) GC cleanup together.
+  const ar = src.indexOf('abortRecovery() {');
+  assert.ok(ar > 0 && src.slice(ar, ar + 160).includes('gcAbort?.abort()'), 'abortRecovery() also aborts the GC sweep so the shared deadline bounds cleanup');
   assert.ok(lastChance > decide && lastChance < close, 'the exception path flushes a failed checkpoint before close()');
   assert.ok(close > decide && close < src.indexOf('rmSync(runDir', close), 'in-flight git work drains before the run dir is reaped');
 });

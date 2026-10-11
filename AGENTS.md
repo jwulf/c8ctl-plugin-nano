@@ -309,9 +309,14 @@ SDK client (job workers) — do **not** add the SDK as a dependency or use raw
   harness abort and is cancelled (`checkpointing.abortRecovery()`, armed from the
   force-stop block) only when the recovery budget expires — tearing the in-flight push
   down (SIGTERM→SIGKILL) so the chain settles promptly instead of running to
-  `gitTimeoutMs`. The post-abort `close()` drain is itself capped at
-  `FORCE_STOP_RECOVERY_MS` so the (up to 120s) GC sweep can't hold the worker past the
-  supervisor's SIGKILL backstop. The supervisor's `forceStopWorker` waits
+  `gitTimeoutMs`. That `abortRecovery()` also aborts the background **GC sweep**, and the
+  force-stop path anchors **ONE shared absolute deadline** (`forceStopDeadline`) when the
+  recovery block begins: the recover race and the post-abort `close()` drain BOTH bound
+  against the *same* deadline (`close()` gets only the REMAINING budget,
+  `Math.max(1, forceStopDeadline - Date.now())`, never a fresh full one and never 0),
+  so recovery **and** the (up to 120s) GC cleanup together fit inside a single
+  `FORCE_STOP_RECOVERY_MS` window instead of consuming it twice and being SIGKILLed
+  mid-cleanup (Copilot review on #296). The supervisor's `forceStopWorker` waits
   `STOP_GRACE_MS + FORCE_STOP_RECOVERY_MS` before
   its SIGKILL backstop, so a worker can finish writing the recovery ref before it is
   killed (a worker that exits sooner is reaped immediately). (d) The GC reclaim log

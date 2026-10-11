@@ -282,8 +282,12 @@ SDK client (job workers) — do **not** add the SDK as a dependency or use raw
   recovery refs**: on a force-stop/abort or failed (SLA-cancelled) run,
   `preserveRecovery` promotes the latest snapshot to `refs/nano/recovered/<eik>`
   (`recoveredCheckpointRef`) — **outside** the `refs/nano/wip/*` namespace the sweep
-  enumerates, so it is never GC-reclaimed — and surfaces `recoveryRef`/`recoverySha` in
-  the job outcome (`buildResultEnvelope`). (d) The GC reclaim log reports `ref@sha [why]`
+  enumerates, so it is never GC-reclaimed. On the failed/SLA-cancelled path (which
+  settles normally) it surfaces `recoveryRef`/`recoverySha` in the job outcome
+  (`buildResultEnvelope`); a **force-stopped** run is yielded (`settle.fail`) and
+  returns early, so it produces **no outcome envelope** and its recovery ref is
+  recoverable from the pushed `refs/nano/recovered/<eik>` ref itself, not from a job
+  result. (d) The GC reclaim log reports `ref@sha [why]`
   (the sweep's `deleted` entries now carry the `sha`). Tests: the `#295 …` cases in
   `agent-checkpoint.test.mjs`.
 - **Agent outcomes (`acpOutcomeFrom` / `resultVarsFromAcpOutcome`).** A

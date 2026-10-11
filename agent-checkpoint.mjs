@@ -297,14 +297,36 @@ export function recoveredCheckpointRef(elementInstanceKey) {
 // resume the new run reads it here, fetches that ref and adopts it under the new
 // key. Returns the predecessor WIP ref, or null when absent / malformed / the same
 // ref this run already owns.
-export function predecessorCheckpointRef(variables, selfRef = null) {
+//
+// `resumeFromCheckpoint` is ONE process-scoped slot shared by every agent task in
+// the process, so it must be correlated to THIS task before adoption (Copilot
+// review on #295): in a process with parallel/sequential agent tasks, whichever
+// task checkpointed last overwrites the slot, and an un-correlated read could adopt
+// ANOTHER task's repository state. The writer stamps the producing task's
+// `elementId`; when the current job's `elementId` is supplied here, a recorded
+// `elementId` that DIFFERS is refused (returns null). A recorded `elementId` that
+// is absent/null (an older writer, or a writer whose job carried no elementId) is
+// still adopted — refusing it would break the very resume #295 exists to support —
+// and when the caller passes no `elementId` the correlation is simply skipped
+// (legacy callers/tests). Task identity is `elementId`, NOT the recorded
+// `elementInstanceKey`: a resume re-enters as a NEW element instance, so the
+// instance key always differs and can never correlate.
+export function predecessorCheckpointRef(variables, selfRef = null, elementId = null) {
   const v = variables && typeof variables === 'object' ? variables.resumeFromCheckpoint : null;
   const ref = typeof v === 'string' ? v : (v && typeof v === 'object' ? v.ref : null);
   const s = typeof ref === 'string' ? ref.trim() : '';
   if (!s || !s.startsWith(CHECKPOINT_REF_PREFIX)) return null;
   const key = s.slice(CHECKPOINT_REF_PREFIX.length);
   if (!/^[0-9A-Za-z_-]{1,128}$/.test(key)) return null;
-  return s === selfRef ? null : s;
+  if (s === selfRef) return null;
+  // Correlation gate: only a POSITIVE mismatch on a present recorded elementId
+  // refuses adoption. A missing recorded elementId (legacy/elementId-less writer)
+  // or a missing caller elementId (correlation unavailable) both fall through.
+  if (elementId != null && v && typeof v === 'object') {
+    const recorded = typeof v.elementId === 'string' ? v.elementId : null;
+    if (recorded != null && recorded !== elementId) return null;
+  }
+  return s;
 }
 
 // Push `sha` to `ref` on `remote`, overwriting any existing ref (`+<sha>:<ref>`).

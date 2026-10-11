@@ -6776,7 +6776,10 @@ async function setupWorkspaceCheckpoints({ provisioned, envelope = null, token =
     // re-entry); adopt it under THIS run's key so the restore/ownership/discard paths
     // below operate unchanged and no GC can reclaim it between activations.
     if (!prior && !startupFetchFailed) {
-      const predRef = predecessorCheckpointRef(job?.variables, ref);
+      // Correlate the shared process-scoped slot to THIS task by elementId (Copilot
+      // review on #295): a different task's recorded ref is refused, so a process
+      // with parallel/sequential agent tasks never adopts another task's state.
+      const predRef = predecessorCheckpointRef(job?.variables, ref, job?.elementId ?? null);
       if (predRef) {
         let predCp = null;
         try { predCp = await fetchCp({ git: startupGit, ref: predRef }); } catch (err) { log.debug(`could not fetch predecessor WIP checkpoint ${predRef} — ${oneLineLog(err?.message || err)}.`); }
@@ -7006,6 +7009,16 @@ async function setupWorkspaceCheckpoints({ provisioned, envelope = null, token =
       // null when there is nothing durable to preserve / the push failed. Best-effort;
       // never throws. The live WIP ref is kept too (this is an additional durable copy).
       async preserveRecovery(reason = 'recovery') {
+        // Copilot review on #295: the caller invokes this right after a BOUNDED
+        // `flush()`, which can RETURN while its forced checkpoint is still in flight
+        // — and `ownedSha` is only updated later, by `onCheckpoint`, once that
+        // checkpoint's push resolves. Reading `ownedSha` immediately could therefore
+        // see `null`/the pre-flush SHA and promote an older snapshot (or nothing).
+        // DRAIN the checkpoint chain first (`stop()` resolves once the in-flight
+        // chain settles, letting `onCheckpoint` record the latest SHA) so the SHA
+        // selected below is the newest snapshot this run actually pushed. This
+        // mirrors the success path, which already `stop()`s before finalizeGit.
+        try { await checkpointer.stop(); } catch { /* best effort — fall through to the last recorded ownedSha */ }
         if (!ownedSha) return null;
         const recRef = recoveredCheckpointRef(job?.elementInstanceKey);
         if (!recRef) return null;
@@ -9815,7 +9828,7 @@ function buildResultEnvelope(result, { sandbox, image, git, result: agentResult,
     if (git.branchMismatch) env.branchMismatch = git.branchMismatch;
     if (git.pr) env.pr = git.pr;
     if (git.error) env.gitError = git.error;
-    // #295: a GC-proof recovery ref (refs/nano/recovered/<eik>) a SLA-cancelled or
+    // #295: a GC-proof recovery ref (refs/nano/recovered/<eik>) an SLA-cancelled or
     // force-stopped run left behind — carried in the outcome so the escalation /
     // resume can recover the snapshot from it even after the workspace is reaped.
     if (git.recoveryRef) env.recoveryRef = git.recoveryRef;
@@ -12579,7 +12592,11 @@ async function workAgent(req, flags, ctx) {
         // checkpoint are not lost.
         let checkpointFinalized = false;
         // #295: the GC-proof recovery ref (and SHA) a preserveRecovery() pushed on an
-        // SLA cancellation / failed run, surfaced in the job outcome (io.nanobpm.agentResult).
+        // SLA cancellation / failed run, surfaced in the job outcome (io.nanobpm.agentResult)
+        // — but ONLY on the failed/SLA-cancel path, which settles normally and so reaches
+        // buildResultEnvelope. A FORCE-STOPPED run is yielded (settle.fail, retries
+        // preserved) and returns early below WITHOUT an outcome envelope, so its
+        // recoveryRefInfo is intentionally NOT reported there (Copilot review on #295).
         let recoveryRefInfo = null;
         // The per-job live-terminal relay session (issue #173): streams this job's
         // harness terminal over the single-owner supervisor's ONE multiplexed host
@@ -12735,7 +12752,12 @@ async function workAgent(req, flags, ctx) {
             // #264: last-chance WIP checkpoint so the retry can pick up the
             // uncommitted work (bounded; the lease guards a newer owner).
             // #295: then promote it to a GC-proof recovery ref so a force-stopped run
-            // is never reclaimed as an orphan before it can be resumed.
+            // is never reclaimed as an orphan before it can be resumed. The ref is
+            // pushed here, but it is NOT surfaced in a job outcome: this path yields
+            // the job and returns early, never reaching buildResultEnvelope — a
+            // force-stopped run produces no outcome envelope by design (Copilot
+            // review on #295), so the recovery ref is recoverable from the pushed
+            // refs/nano/recovered/<eik> ref itself, not from any job result.
             if (checkpointer) {
               await checkpointer.flush('abort', { timeoutMs: checkpointing.flushTimeoutMs }); checkpointFinalized = true;
               try { recoveryRefInfo = await checkpointing.preserveRecovery('force-stop') || recoveryRefInfo; } catch { /* best effort */ }

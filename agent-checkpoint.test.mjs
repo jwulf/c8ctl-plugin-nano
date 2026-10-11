@@ -1177,6 +1177,39 @@ test('checkpointer rate-limits, coalesces triggers and flushes', async () => {
   assert.equal(calls.length, 4);
 });
 
+test('#295 checkpointer: stop() drains a flush that returned early so a late onCheckpoint SHA is observed', async () => {
+  // Models the preserveRecovery race (Copilot review on #295): a BOUNDED flush can
+  // RETURN while its forced checkpoint is still in flight, and `onCheckpoint` (which
+  // records the SHA a recovery ref would promote) only fires once that checkpoint's
+  // push resolves. Awaiting `stop()` after the flush must drain the chain so the
+  // late SHA is observed — reading it synchronously after the flush would miss it.
+  // Injected timers make the flush-timeout beat deterministic (no real-clock race).
+  const timers = [];
+  const setTimer = (fn, ms) => { const h = { fn, ms }; timers.push(h); return h; };
+  const clearTimer = (h) => { const i = timers.indexOf(h); if (i >= 0) timers.splice(i, 1); };
+  let release;
+  const gate = new Promise((r) => { release = r; });
+  let ownedSha = null;
+  const cp = createCheckpointer({
+    // The checkpoint's push hangs until `release()` fires, so the flush timeout
+    // (fired below) wins the race and flush returns BEFORE onCheckpoint records the SHA.
+    checkpoint: async () => { await gate; return { sha: 'newsha' }; },
+    onCheckpoint: (r) => { ownedSha = r.sha; },
+    minIntervalMs: 0, intervalMs: 0, setTimer, clearTimer,
+  });
+  const flushPromise = cp.flush('abort', { timeoutMs: 5 });
+  // Fire the pending flush-timeout timer so the flush resolves early (checkpoint hung).
+  for (const h of timers.splice(0)) h.fn();
+  const flushed = await flushPromise;
+  assert.equal(flushed.skipped && /timed out/.test(flushed.skipped), true, 'flush must return early (bounded) while the push is still in flight');
+  assert.equal(ownedSha, null, 'onCheckpoint has not fired yet — a synchronous read here would see no SHA');
+  // preserveRecovery drains the chain (stop()) before selecting the recovery SHA.
+  const drained = cp.stop();
+  release();
+  await drained;
+  assert.equal(ownedSha, 'newsha', 'after the drain, the in-flight checkpoint\'s SHA is observed');
+});
+
 test('withCheckpointNote appends only for a restored checkpoint', () => {
   const env = { task: { prompt: 'do it' }, repository: {} };
   assert.equal(withCheckpointNote(env, { restored: false }), env);
@@ -1481,6 +1514,25 @@ test('#295 predecessorCheckpointRef: reads resumeFromCheckpoint; rejects self/ma
   assert.equal(predecessorCheckpointRef({ resumeFromCheckpoint: '' }), null);
   assert.equal(predecessorCheckpointRef({ resumeFromCheckpoint: 'refs/heads/main' }), null);
   assert.equal(predecessorCheckpointRef({ resumeFromCheckpoint: 'refs/nano/wip/bad/key' }), null);
+});
+
+test('#295 predecessorCheckpointRef: correlates the shared process slot to THIS task by elementId', () => {
+  const wip = (elementId) => ({ resumeFromCheckpoint: { ref: 'refs/nano/wip/10', sha: 'abc', elementInstanceKey: '999', elementId } });
+  // A recorded elementId that MATCHES the current job's is adopted.
+  assert.equal(predecessorCheckpointRef(wip('review-round'), 'refs/nano/wip/20', 'review-round'), 'refs/nano/wip/10');
+  // A recorded elementId that DIFFERS is refused: in a process with parallel /
+  // sequential agent tasks, the shared slot must never adopt another task's state.
+  assert.equal(predecessorCheckpointRef(wip('implement'), 'refs/nano/wip/20', 'review-round'), null);
+  // A recorded elementId that is absent/null (legacy or elementId-less writer) is
+  // still adopted — refusing it would break the resume #295 exists to support.
+  assert.equal(predecessorCheckpointRef({ resumeFromCheckpoint: { ref: 'refs/nano/wip/10' } }, 'refs/nano/wip/20', 'review-round'), 'refs/nano/wip/10');
+  assert.equal(predecessorCheckpointRef(wip(null), 'refs/nano/wip/20', 'review-round'), 'refs/nano/wip/10');
+  // String form carries no elementId, so it stays adoptable under correlation.
+  assert.equal(predecessorCheckpointRef({ resumeFromCheckpoint: 'refs/nano/wip/10' }, 'refs/nano/wip/20', 'review-round'), 'refs/nano/wip/10');
+  // When the caller passes no elementId the correlation is skipped (legacy callers).
+  assert.equal(predecessorCheckpointRef(wip('implement'), 'refs/nano/wip/20'), 'refs/nano/wip/10');
+  // The correlation gate never resurrects a self-ref / malformed ref.
+  assert.equal(predecessorCheckpointRef(wip('review-round'), 'refs/nano/wip/10', 'review-round'), null);
 });
 
 test('#295 makeOrphanProbe: spares an SLA-cancelled element inside a still-active process', async () => {

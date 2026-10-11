@@ -4896,6 +4896,10 @@ function credArgs() {
 //   - `nano work` PRIMES at startup (`primeGhAuthToken()`) AND re-primes on a
 //     timer (`startGhAuthTokenRefresh`) so the TTL re-read happens OFF the job
 //     path and a refreshed login is adopted within one TTL without a restart.
+//     The timer's refresh is ASYNC (spawn, never spawnSync) and DEFERRED while
+//     a job is active, so it can never block the event loop / lock heartbeat
+//     (Copilot review on #293); when the identity changes it republishes the
+//     activity marker via an onChange callback.
 //   - A git/gh auth FAILURE (clone/push/PR-reconcile — see isGitAuthFailure)
 //     forces one invalidation + re-read (`refreshGhAuthToken({ force })`) and a
 //     single retry, so a rotated token self-heals instead of failing the job.
@@ -4963,13 +4967,57 @@ function ghTokenScopes(token, { timeoutMs = 5_000, run = spawnSync } = {}) {
   }
 }
 
-// One (re)read of `gh auth token`, folding the result into the cache record.
-// Returns { token, changed } — `changed` is true when the token VALUE differs
-// from what the cache previously held (including null → token and token → null),
-// so the caller logs a line exactly when the credential the worker hands out
-// actually rotates. `scopes` is read only when the token changed (or on the
-// first populate): it costs a network ping, and a same-token refresh can't have
+// Fold one (re)read result into the cache record. Shared by the sync and async
+// refresh paths so both maintain identical cache semantics. Returns
+// { token, changed } — `changed` is true when the token VALUE differs from what
+// the cache previously held (including null → token and token → null), so the
+// caller logs/fires exactly when the credential the worker hands out actually
+// rotates. `scopes` is read only when the token changed (or on the first
+// populate): it costs a network ping, and a same-token refresh can't have
 // changed scopes without the token value changing too.
+function adoptGhAuthToken(token, { scopesProbe = ghTokenScopes } = {}) {
+  const prev = ghAuthTokenCache === GH_AUTH_TOKEN_UNSET ? null : ghAuthTokenCache;
+  const now = Date.now();
+  const changed = !prev || prev.token !== token;
+  // On a CHANGE re-read the scopes; otherwise carry the previous reading forward
+  // (a TTL re-read that finds the same token must not pay the scopes ping, and
+  // must not silently DROP the scopes it already reported).
+  const scopes = token ? (changed ? scopesProbe(token) : (prev ? prev.scopes : null)) : null;
+  ghAuthTokenCache = {
+    token,
+    fingerprint: ghTokenFingerprint(token),
+    scopes: scopes ?? null,
+    // `since` tracks the TOKEN's age (when THIS value was first seen) so status
+    // can answer "how stale is the credential"; `lastCheck` tracks the CACHE's
+    // age (when we last asked gh) so the TTL is honoured.
+    since: prev && prev.token === token && token != null ? prev.since : now,
+    lastCheck: now,
+  };
+  return { token, changed };
+}
+
+// The async twin of adoptGhAuthToken: identical cache semantics, but the scopes
+// probe is awaited so it may return a Promise (the async ghTokenScopesAsync).
+async function adoptGhAuthTokenAsync(token, { scopesProbe } = {}) {
+  const prev = ghAuthTokenCache === GH_AUTH_TOKEN_UNSET ? null : ghAuthTokenCache;
+  const now = Date.now();
+  const changed = !prev || prev.token !== token;
+  const scopes = token ? (changed ? await scopesProbe(token) : (prev ? prev.scopes : null)) : null;
+  ghAuthTokenCache = {
+    token,
+    fingerprint: ghTokenFingerprint(token),
+    scopes: scopes ?? null,
+    since: prev && prev.token === token && token != null ? prev.since : now,
+    lastCheck: now,
+  };
+  return { token, changed };
+}
+
+// One (re)read of `gh auth token`, folding the result into the cache record.
+// Returns { token, changed } (see adoptGhAuthToken). SYNCHRONOUS (spawnSync) —
+// safe off the job path (the startup prime, the clone/push auth-failure
+// recovery, the SIGUSR1 reload) but it blocks the event loop while it runs, so
+// the periodic refresh uses refreshGhAuthTokenAsync instead.
 function refreshGhAuthToken({ force = false, run = null, scopesProbe } = {}) {
   const prev = ghAuthTokenCache === GH_AUTH_TOKEN_UNSET ? null : ghAuthTokenCache;
   const now = Date.now();
@@ -4994,22 +5042,93 @@ function refreshGhAuthToken({ force = false, run = null, scopesProbe } = {}) {
   // test installed a token READER (hermetic, no network) and did not inject a
   // scopesProbe, skip the ping so a stubbed refresh never hits the network.
   const probe = scopesProbe ?? (ghAuthTokenReader ? (() => null) : ghTokenScopes);
-  const changed = !prev || prev.token !== token;
-  // On a CHANGE re-read the scopes; otherwise carry the previous reading forward
-  // (a TTL re-read that finds the same token must not pay the scopes ping, and
-  // must not silently DROP the scopes it already reported).
-  const scopes = token ? (changed ? probe(token) : (prev ? prev.scopes : null)) : null;
-  ghAuthTokenCache = {
-    token,
-    fingerprint: ghTokenFingerprint(token),
-    scopes: scopes ?? null,
-    // `since` tracks the TOKEN's age (when THIS value was first seen) so status
-    // can answer "how stale is the credential"; `lastCheck` tracks the CACHE's
-    // age (when we last asked gh) so the TTL is honoured.
-    since: prev && prev.token === token && token != null ? prev.since : now,
-    lastCheck: now,
-  };
-  return { token, changed };
+  return adoptGhAuthToken(token, { scopesProbe: probe });
+}
+
+// Async `gh auth token` read (spawn, never spawnSync) for the periodic refresh
+// path — the whole point of the timer is that it must NOT block the worker's
+// event loop (and with it the lock heartbeat) while a job runs. Same 10s bound
+// and non-interactive env as the sync reader; resolves a trimmed token-or-null.
+// `_spawn` is a test-only seam (production uses node:child_process.spawn).
+function readGhAuthTokenAsync({ _spawn = spawn } = {}) {
+  return new Promise((resolve) => {
+    let child;
+    try {
+      child = _spawn('gh', ['auth', 'token'], { env: GH_NONINTERACTIVE_ENV() });
+    } catch {
+      resolve(null);
+      return;
+    }
+    let out = '';
+    let settled = false;
+    const finish = (token) => {
+      if (settled) return;
+      settled = true;
+      clearTimeout(timer);
+      resolve(token);
+    };
+    // Same 10s bound as the sync reader. On expiry SIGTERM the child (matching
+    // spawnSync's timeout semantics) and resolve null — a wedged gh must never
+    // pin the refresh chain.
+    const timer = setTimeout(() => { try { child.kill('SIGTERM'); } catch { /* best effort */ } finish(null); }, 10_000);
+    if (typeof timer.unref === 'function') timer.unref();
+    child.stdout?.on('data', (d) => { out += d; });
+    child.stderr?.on('data', () => { /* drained so the pipe never fills; never parsed */ });
+    child.on('error', () => finish(null));
+    child.on('close', (code) => finish(code === 0 ? (out.trim() || null) : null));
+  });
+}
+
+// Async scopes probe mirroring ghTokenScopes (same 5s default bound, same
+// header parse, same GH_TOKEN-in-env delivery so the token never touches argv).
+// `_spawn` is a test-only seam.
+function ghTokenScopesAsync(token, { timeoutMs = 5_000, _spawn = spawn } = {}) {
+  if (!token) return Promise.resolve(null);
+  return new Promise((resolve) => {
+    let child;
+    try {
+      child = _spawn('gh', ['api', '-i', '--include', 'user'], { env: { ...GH_NONINTERACTIVE_ENV(), GH_TOKEN: token } });
+    } catch {
+      resolve(null);
+      return;
+    }
+    let out = '';
+    let settled = false;
+    const finish = (scopes) => {
+      if (settled) return;
+      settled = true;
+      clearTimeout(timer);
+      resolve(scopes);
+    };
+    const timer = setTimeout(() => { try { child.kill('SIGTERM'); } catch { /* best effort */ } finish(null); }, timeoutMs);
+    if (typeof timer.unref === 'function') timer.unref();
+    child.stdout?.on('data', (d) => { out += d; });
+    child.stderr?.on('data', (d) => { out += d; });
+    child.on('error', () => finish(null));
+    child.on('close', () => {
+      const m = out.match(/^x-oauth-scopes:\s*(.+)$/im);
+      finish(m ? m[1].trim() : null);
+    });
+  });
+}
+
+// The async twin of refreshGhAuthToken for the periodic timer: same TTL
+// short-circuit and the same cache record, but the gh subprocesses are spawned
+// (never spawnSync) so a refresh that DOES run while a job is active yields the
+// event loop instead of blocking the lock heartbeat (Copilot review on #293).
+// When a test installed a token READER (hermetic, no network) and did not
+// inject a scopesProbe, the scopes ping is skipped — mirroring the sync path.
+async function refreshGhAuthTokenAsync({ force = false, scopesProbe, _spawn } = {}) {
+  const prev = ghAuthTokenCache === GH_AUTH_TOKEN_UNSET ? null : ghAuthTokenCache;
+  const now = Date.now();
+  if (!force && prev && now - prev.lastCheck < GH_AUTH_TOKEN_TTL_MS) {
+    return { token: prev.token, changed: false };
+  }
+  // Honor the module reader seam when a test installed one (mirroring the sync
+  // path) so a stubbed refresh never spawns; production (reader null) spawns.
+  const token = ghAuthTokenReader ? ((ghAuthTokenReader() || null)) : await readGhAuthTokenAsync({ _spawn });
+  const probe = scopesProbe ?? (ghAuthTokenReader ? (() => null) : ((tok) => ghTokenScopesAsync(tok, { _spawn })));
+  return adoptGhAuthTokenAsync(token, { scopesProbe: probe });
 }
 
 function ghAuthTokenFromCli() {
@@ -5071,15 +5190,58 @@ function primeGhAuthToken({ logger = null } = {}) {
 
 // Keep the cache fresh for the worker's lifetime: re-prime on a TTL cadence so
 // a `gh auth login`/`refresh` the operator runs while the fleet is up is adopted
-// within one interval — off the job path (the refresh timer fires between jobs),
-// never blocking a handler. The timer is unref'd so it never keeps a worker
-// alive, and the change log fires from here so a rotation is visible even when
-// no job runs. Returns the interval handle (tests; the worker never clears it —
-// it lives exactly as long as the process).
-function startGhAuthTokenRefresh({ logger = null, intervalMs = GH_AUTH_TOKEN_TTL_MS } = {}) {
-  const every = Math.max(1000, Number(intervalMs) || GH_AUTH_TOKEN_TTL_MS || 60_000);
-  const t = setInterval(() => { primeGhAuthToken({ logger }); }, every);
-  if (typeof t.unref === 'function') t.unref();
+// within one interval — WITHOUT ever blocking the job path (Copilot review on
+// #293). Two guards make that true:
+//   1. The refresh itself is ASYNC (refreshGhAuthTokenAsync — spawn, never
+//      spawnSync), so even when a tick fires mid-job the gh subprocesses yield
+//      the event loop instead of freezing the lock heartbeat for up to 15s.
+//   2. `isIdle` (optional) lets the worker DEFER a tick while a job is active:
+//      the refresh is then simply adopted by the next idle tick (staleness is
+//      bounded by the job length + one interval, and the sync per-job paths —
+//      TTL lookup, auth-failure recovery — remain as the safety net).
+// Ticks never overlap (a slow gh can't stack refreshes), a tick failure is
+// swallowed (the next tick retries), and the change log fires from here so a
+// rotation is visible even when no job runs. `onChange` (optional) fires on a
+// genuine identity change so the caller can republish the supervisor activity
+// marker — an idle worker otherwise keeps reporting the pre-refresh
+// fingerprint/scopes indefinitely (Copilot review on #293).
+//
+// The timer is deliberately NOT unref'd: an unref'd interval is starved under a
+// continuously-busy event loop (the worker's poll/heartbeat fibers keep the
+// loop non-empty, so the low-priority unref'd timer can be deferred
+// indefinitely and never fire), whereas this refresh must actually run on its
+// cadence. The worker is a long-lived process that never clears the handle, so
+// the ref'd timer does not change its lifetime. The returned handle carries a
+// `stop()` (clearInterval) so tests can halt it deterministically.
+function startGhAuthTokenRefresh({ logger = null, intervalMs = GH_AUTH_TOKEN_TTL_MS, isIdle = null, onChange = null, _spawn } = {}) {
+  // Clamp to a 1s floor so a test can pass a tiny interval; an explicit 0 is
+  // honoured (→ the floor), not treated as "use the default".
+  const raw = Number.isFinite(Number(intervalMs)) ? Number(intervalMs) : GH_AUTH_TOKEN_TTL_MS;
+  const every = Math.max(1000, raw || 1000);
+  let inFlight = false;
+  const tick = async () => {
+    if (inFlight) return; // a slow gh must not stack overlapping refreshes
+    if (isIdle && !isIdle()) return; // a job is active — defer to the next idle tick
+    inFlight = true;
+    try {
+      const { changed } = await refreshGhAuthTokenAsync({ _spawn });
+      if (logger && (changed || ghAuthTokenCache === GH_AUTH_TOKEN_UNSET)) {
+        logger.info(describeGhAuthToken(ghAuthTokenInfo()));
+      }
+      if (changed && onChange) {
+        try { onChange(); } catch { /* best effort — republishing is advisory */ }
+      }
+    } catch {
+      // A failed tick (gh wedged, spawn error) must never crash the worker or
+      // surface as an unhandled rejection — the next tick retries.
+    } finally {
+      inFlight = false;
+    }
+  };
+  const t = setInterval(() => { tick(); }, every);
+  // Do NOT unref (see the header comment): the refresh must fire on cadence even
+  // when the worker's event loop stays busy.
+  t.stop = () => clearInterval(t);
   return t;
 }
 
@@ -5225,6 +5387,36 @@ function normalizeAuthRef(authRef) {
   return { kind: 'custom', name: trimmed };
 }
 
+// Resolve the github clone/push credential AND record where it came from. The
+// default credential (env GITHUB_TOKEN) falls back to the gh CLI's stored token
+// so `gh auth login` setups work without exporting GITHUB_TOKEN. A custom
+// `authRef` is honored strictly (env/secret resolver only, no gh fallback) so a
+// misconfigured named secret surfaces as missing rather than silently borrowing
+// the operator's gh login. An authRef that is present but blank is a
+// misconfiguration and yields no token (never the gh fallback). `ghAuthToken`
+// is injectable for testing.
+// The returned `source` matters downstream: the #293 auth-failure recovery
+// (drop the cache, re-read `gh auth token`, retry once) is only legitimate when
+// the token CAME from that cache ('gh-cache'). Retrying an explicit
+// GITHUB_TOKEN ('env') or a custom authRef ('custom') failure with the
+// operator's unrelated gh login would silently swap the configured identity
+// mid-job (Copilot review on #293), so those sources never take the fallback.
+// Returns { token, source: 'env' | 'custom' | 'gh-cache' | 'none' }.
+function githubCloneTokenWithSource({ provider, authRef, secretResolver, ghAuthToken = ghAuthTokenFromCli }) {
+  const prov = provider || 'github';
+  const ref = normalizeAuthRef(authRef);
+  if (ref.kind === 'invalid') return { token: null, source: 'none' };
+  const usesDefault = prov === 'github' && ref.kind === 'default';
+  const name = ref.kind === 'custom' ? ref.name : (prov === 'github' ? 'GITHUB_TOKEN' : null);
+  const resolved = name ? (secretResolver.resolve(name) || null) : null;
+  if (resolved) return { token: resolved, source: ref.kind === 'custom' ? 'custom' : 'env' };
+  if (!resolved && usesDefault) {
+    const token = ghAuthToken() || null;
+    if (token) return { token, source: 'gh-cache' };
+  }
+  return { token: null, source: 'none' };
+}
+
 // Resolve the github clone/push credential. The default credential (env
 // GITHUB_TOKEN) falls back to the gh CLI's stored token so `gh auth login`
 // setups work without exporting GITHUB_TOKEN. A custom `authRef` is honored
@@ -5232,16 +5424,10 @@ function normalizeAuthRef(authRef) {
 // secret surfaces as missing rather than silently borrowing the operator's gh
 // login. An authRef that is present but blank is a misconfiguration and yields no
 // token (never the gh fallback). `ghAuthToken` is injectable for testing.
-// Returns a token or null.
+// Returns a token or null. (Callers that need the credential's SOURCE — e.g. to
+// gate the #293 gh-token auth-failure retry — use githubCloneTokenWithSource.)
 function githubCloneToken({ provider, authRef, secretResolver, ghAuthToken = ghAuthTokenFromCli }) {
-  const prov = provider || 'github';
-  const ref = normalizeAuthRef(authRef);
-  if (ref.kind === 'invalid') return null;
-  const usesDefault = prov === 'github' && ref.kind === 'default';
-  const name = ref.kind === 'custom' ? ref.name : (prov === 'github' ? 'GITHUB_TOKEN' : null);
-  let token = name ? (secretResolver.resolve(name) || null) : null;
-  if (!token && usesDefault) token = ghAuthToken() || null;
-  return token;
+  return githubCloneTokenWithSource({ provider, authRef, secretResolver, ghAuthToken }).token;
 }
 
 // Clone repo into <runDir>/workspace and check out / create the working branch.
@@ -5256,7 +5442,7 @@ function githubCloneToken({ provider, authRef, secretResolver, ghAuthToken = ghA
 // resume sides agree on which no-create push targets are recoverable (#270).
 const CONVENTIONAL_BASE_BRANCHES = new Set(['main', 'master']);
 
-function provisionRepo({ envelope, token, runDir, runId, timeoutMs = 120_000, logger = null, corr = '', abortSignal = null, _runGit = null }) {
+function provisionRepo({ envelope, token, runDir, runId, timeoutMs = 120_000, logger = null, corr = '', abortSignal = null, credentialSource = null, _runGit = null }) {
   // Test-only seam mirroring finalizeGit: route every git call through `runGitFn` so a
   // deterministic test can observe the per-call timeouts drawn from the shared
   // provisioning budget below. Defaults to the module `runGit` (production unchanged).
@@ -5385,7 +5571,15 @@ function provisionRepo({ envelope, token, runDir, runId, timeoutMs = 120_000, lo
     // fix a genuine permission denial). The retry re-runs the whole clone with
     // the new token threaded through the askpass env, re-anchored to the
     // remaining provisioning budget.
-    if (token && isGitAuthFailure(detail)) {
+    // GATED on the credential's SOURCE (Copilot review on #293): this fallback
+    // replaces the failed token with the operator's `gh auth token`, so it is
+    // only legitimate when the failed token CAME from that same gh cache
+    // ('gh-cache'). An explicit GITHUB_TOKEN ('env') or custom authRef
+    // ('custom') is a deliberately configured identity — silently swapping it
+    // for the operator's gh login would violate githubCloneToken's documented
+    // precedence and could act as a different identity, so those sources fail
+    // without the gh retry.
+    if (token && credentialSource === 'gh-cache' && isGitAuthFailure(detail)) {
       invalidateGhAuthToken();
       const { token: fresh, changed } = refreshGhAuthToken({ force: true });
       if (changed && fresh && fresh !== token) {
@@ -5946,7 +6140,15 @@ function provisionRepo({ envelope, token, runDir, runId, timeoutMs = 120_000, lo
   // the authoritative result so eligibility (auto checkpointing) doesn't
   // under-detect an authenticated clone.
   const authenticated = !!token || isAuthenticatedRemote(repo.url);
-  return { workspaceDir, gitEnv, committer, startSha: sha.status === 0 ? (sha.stdout || '').trim() : '', workingBranch, fallbackBranch, hasPrBranch, authenticated, baseBranch: effectiveBase || null, baseCloneSha, baseBaselineUnknown, detached: !workingBranch, ref: commitSha || branchName || '', base, baseFetchError, remote: redactToken(repo.url, token) };
+  // `effectiveToken` is the credential the workspace ACTUALLY runs on after any
+  // #293 auth-failure retry rotated it mid-provisioning (the local `token` is
+  // reassigned on adoption). The caller (workAgent) must use THIS — not its own
+  // pre-provisioning resolution — for the post-provisioning credential users
+  // (finalizeGit's PR reconcile/push, the checkpoint GC/ref-delete askpass), or
+  // a recovered clone would keep failing with the stale credential (Copilot
+  // review on #293). `credentialSource` is echoed back so finalizeGit can gate
+  // its own push-retry on the same source rule.
+  return { workspaceDir, gitEnv, committer, startSha: sha.status === 0 ? (sha.stdout || '').trim() : '', workingBranch, fallbackBranch, hasPrBranch, authenticated, effectiveToken: token || null, credentialSource, baseBranch: effectiveBase || null, baseCloneSha, baseBaselineUnknown, detached: !workingBranch, ref: commitSha || branchName || '', base, baseFetchError, remote: redactToken(repo.url, token) };
   } // end provisionRepoAfterClone
 }
 
@@ -6390,7 +6592,7 @@ function computeRelayCloseReason(result, runCompleted, gitResult) {
 // branch.push), and reconcile the agent-opened PR (when task.allowPr). A push
 // failure is reported (pushError) rather than thrown — the process model decides
 // what to do next, and re-running the agent would be non-idempotent.
-function finalizeGit({ workspaceDir, gitEnv, startSha, workingBranch, baseBranch: effectiveBase, baseCloneSha = null, baseBaselineUnknown = false, hasPrBranch, envelope, token, logger = null, corr = '', budgetMs = 0, provisioned = false, keepRuns = false, _runGit = null }) {
+function finalizeGit({ workspaceDir, gitEnv, startSha, workingBranch, baseBranch: effectiveBase, baseCloneSha = null, baseBaselineUnknown = false, hasPrBranch, envelope, token, logger = null, corr = '', budgetMs = 0, provisioned = false, keepRuns = false, credentialSource = null, _runGit = null }) {
   const log = logger || getLogger(); // route observability through the injected logger (tests) or the host logger
   // Test-only seam: the late remote-reachability FILTER scans (movedStray /
   // unpushedBranchCommits / final stranded) AND the remote-tip VERIFICATION calls
@@ -6794,7 +6996,12 @@ function finalizeGit({ workspaceDir, gitEnv, startSha, workingBranch, baseBranch
     // `pushFailed`. Only when the token actually CHANGED (a same-token retry
     // can't fix a genuine permission denial), and the retry runs with the fresh
     // token in GIT_TOKEN so the askpass hands it to git.
-    if (push.status !== 0 && token && isGitAuthFailure(describeGitFailure('git push', push, { token, timeoutMs: pushTimeout }))) {
+    // GATED on the credential's SOURCE (Copilot review on #293): only a token
+    // that CAME from the gh cache ('gh-cache') may be replaced by a fresh
+    // `gh auth token` read — an explicit GITHUB_TOKEN ('env') or custom authRef
+    // ('custom') is a deliberately configured identity that must fail as
+    // configured, never be silently swapped for the operator's gh login.
+    if (push.status !== 0 && token && credentialSource === 'gh-cache' && isGitAuthFailure(describeGitFailure('git push', push, { token, timeoutMs: pushTimeout }))) {
       invalidateGhAuthToken();
       const { token: fresh, changed } = refreshGhAuthToken({ force: true });
       if (changed && fresh && fresh !== token) {
@@ -10693,11 +10900,25 @@ async function workAgent(req, flags, ctx) {
   // …and keep it fresh for the worker's lifetime (issue #293): a process-lifetime
   // memo went silently stale the moment the operator refreshed the gh login, and
   // every job kept getting the OLD token until a restart. The TTL timer re-reads
-  // `gh auth token` off the job path (and logs when the token actually changes),
-  // so a refreshed login is adopted within one TTL without a restart. The
-  // supervisor's `reload-credentials` broadcast (SIGUSR1) forces the same drop
-  // on demand.
-  startGhAuthTokenRefresh({ logger });
+  // `gh auth token` — ASYNCHRONOUSLY (spawn, never spawnSync) and DEFERRED while
+  // a job is active (`isIdle`) — so the refresh can never block the event loop /
+  // lock heartbeat the way a synchronous prime on the interval could (Copilot
+  // review on #293). When the cached identity actually changes, `onChange`
+  // republishes the activity marker so `supervisor status` shows the adopted
+  // credential even while the worker sits idle. The supervisor's
+  // `reload-credentials` broadcast (SIGUSR1) forces the same drop on demand.
+  // `activeJobs`/`writeActivity` are declared below this point but are only
+  // dereferenced when a tick fires (≥1s later) or a change lands — long after
+  // the whole module body has run — so the closures capture the initialized
+  // bindings (TDZ-safe). The handle is tracked so the stop-signal teardown can
+  // clear it (a ref'd interval would otherwise keep the process alive past
+  // SIGTERM/SIGINT — the --auto liveness test relies on the poll timer being
+  // the sole keepalive).
+  const ghRefreshTimer = startGhAuthTokenRefresh({
+    logger,
+    isIdle: () => activeJobs.size === 0,
+    onChange: () => writeActivity(),
+  });
   // `supervisor reload-credentials` asks every worker to drop its cached gh
   // token without draining in-flight jobs. The daemon signals SIGUSR1; the next
   // TTL refresh (or job) re-reads the CLI. Deliberately NOT the SIGUSR2 drain
@@ -11596,15 +11817,30 @@ async function workAgent(req, flags, ctx) {
         let cwd;
         let extraEnv;
         let repoToken = null;
+        let repoCredentialSource = null;
         if (hasRepo) {
           const provider = envelope.repository.provider || 'github';
           const authRef = envelope.repository.authRef;
-          repoToken = githubCloneToken({ provider, authRef, secretResolver }); // absent → anonymous clone
+          // Resolve the credential AND its source once: the source gates whether
+          // a later auth failure may fall back to the operator's `gh auth token`
+          // (only a 'gh-cache' token may — never an explicit GITHUB_TOKEN or a
+          // custom authRef; Copilot review on #293).
+          const cred = githubCloneTokenWithSource({ provider, authRef, secretResolver });
+          repoToken = cred.token; // absent → anonymous clone
+          repoCredentialSource = cred.source;
           try {
             mkdirSync(workerNsDir, { recursive: true });
             runDir = mkdtempSync(join(workerNsDir, 'run-'));
             liveRunDirs.add(runDir);
-            provisioned = provisionRepo({ envelope, token: repoToken, runDir, runId, timeoutMs: cloneTimeoutMs, logger, corr: aiCorr, abortSignal });
+            provisioned = provisionRepo({ envelope, token: repoToken, runDir, runId, timeoutMs: cloneTimeoutMs, logger, corr: aiCorr, abortSignal, credentialSource: repoCredentialSource });
+            // #293: provisioning's clone auth-retry may have ROTATED the token
+            // (adopting the fresh gh token into the workspace's askpass env).
+            // Adopt that effective credential for the rest of the job —
+            // finalizeGit's push/PR-reconcile and the checkpoint GC/ref-delete
+            // askpass — so they don't keep failing with the stale pre-provision
+            // token (Copilot review on #293).
+            if (provisioned.effectiveToken) repoToken = provisioned.effectiveToken;
+            if (provisioned.credentialSource) repoCredentialSource = provisioned.credentialSource;
             if (provisioned.baseFetchError) {
               logger.warn(`[${jobType}] job ${job.jobKey} base fetch failed (${aiCorr}) — ${oneLineLog(provisioned.baseFetchError)}; base...head diffs may be unavailable`);
             }
@@ -11957,6 +12193,7 @@ async function workAgent(req, flags, ctx) {
                 hasPrBranch: provisioned.hasPrBranch,
                 envelope,
                 token: repoToken,
+                credentialSource: repoCredentialSource,
                 logger,
                 corr: aiCorr,
                 keepRuns,
@@ -12497,6 +12734,7 @@ async function workAgent(req, flags, ctx) {
       if (finished) return;
       finished = true;
       if (!autoMode) { try { unwatchFile(configFile); } catch { /* best effort */ } }
+      if (ghRefreshTimer) clearInterval(ghRefreshTimer);
       if (reaperTimer) clearInterval(reaperTimer);
       if (runDirTimer) clearInterval(runDirTimer);
       if (agenticPlane) {
@@ -12527,6 +12765,7 @@ async function workAgent(req, flags, ctx) {
       aborting = true;
       draining = true;
       if (!autoMode) { try { unwatchFile(configFile); } catch { /* best effort */ } }
+      if (ghRefreshTimer) clearInterval(ghRefreshTimer);
       logger.info(`Received ${signal} — aborting in-flight work and stopping worker...`);
       // Snapshot in-flight jobs (with their retry budget) BEFORE the interrupt
       // clears the ownership registry, so we can yield each one afterwards.
@@ -12572,6 +12811,11 @@ async function workAgent(req, flags, ctx) {
       if (!autoMode) { try { unwatchFile(configFile); } catch { /* best effort */ } }
       const n0 = inFlightCount();
       logger.info(`Received ${signal} — draining: polling stopped; waiting on ${n0} in-flight job(s) to finish (send SIGTERM to abort).`);
+      // The refresh timer is ref'd (so it fires on cadence even under a busy
+      // loop) and there may be NO in-flight job during a drain — clear it now
+      // so it can't keep the process alive once the drain completes and the
+      // runtime is interrupted.
+      if (ghRefreshTimer) clearInterval(ghRefreshTimer);
       // Poll until every in-flight job has settled and released its slot, then
       // interrupt the now-idle runtime and exit. Wait INDEFINITELY — a force
       // abort (SIGTERM) is the only escape hatch.
@@ -18481,9 +18725,11 @@ export {
   namespaceHasLiveHarness,
   authUrl,
   githubCloneToken,
+  githubCloneTokenWithSource,
   ghAuthTokenFromCli,
   primeGhAuthToken,
   refreshGhAuthToken,
+  refreshGhAuthTokenAsync,
   invalidateGhAuthToken,
   setGhAuthTokenReader,
   resetGhAuthTokenReader,
@@ -18491,6 +18737,7 @@ export {
   describeGhAuthToken,
   ghTokenFingerprint,
   ghTokenScopes,
+  ghTokenScopesAsync,
   isGitAuthFailure,
   startGhAuthTokenRefresh,
   GH_AUTH_TOKEN_TTL_MS,

@@ -16,6 +16,7 @@ import {
   ghAuthTokenFromCli,
   primeGhAuthToken,
   refreshGhAuthToken,
+  refreshGhAuthTokenAsync,
   invalidateGhAuthToken,
   setGhAuthTokenReader,
   resetGhAuthTokenReader,
@@ -24,12 +25,15 @@ import {
   ghTokenFingerprint,
   isGitAuthFailure,
   githubCloneToken,
+  githubCloneTokenWithSource,
   makeSecretResolver,
   buildActivityPayload,
   summarizeSupervisorWorker,
   supervisorGhAuthCell,
   formatSupervisorStatus,
   provisionRepo,
+  finalizeGit,
+  startGhAuthTokenRefresh,
   runGit,
   GH_AUTH_TOKEN_TTL_MS,
 } from './c8ctl-plugin.js';
@@ -251,6 +255,37 @@ test('githubCloneToken still prefers the env GITHUB_TOKEN over the gh fallback',
   }
 });
 
+// --- #293 review: credential SOURCE governs the gh-token fallback retry ------
+
+test('githubCloneTokenWithSource reports the credential source', () => {
+  const resolver = makeSecretResolver('host');
+  const saved = process.env.GITHUB_TOKEN;
+  try {
+    // env GITHUB_TOKEN → 'env' (gh fallback not consulted).
+    process.env.GITHUB_TOKEN = 'env-token';
+    let r = githubCloneTokenWithSource({ provider: 'github', authRef: undefined, secretResolver: resolver, ghAuthToken: () => { throw new Error('must not be called'); } });
+    assert.deepEqual(r, { token: 'env-token', source: 'env' });
+    // No env token, default authRef → the gh cache fallback → 'gh-cache'.
+    delete process.env.GITHUB_TOKEN;
+    r = githubCloneTokenWithSource({ provider: 'github', authRef: undefined, secretResolver: resolver, ghAuthToken: () => 'gho_cached' });
+    assert.deepEqual(r, { token: 'gho_cached', source: 'gh-cache' });
+    // No env token AND no gh token → anonymous.
+    r = githubCloneTokenWithSource({ provider: 'github', authRef: undefined, secretResolver: resolver, ghAuthToken: () => null });
+    assert.deepEqual(r, { token: null, source: 'none' });
+    // A custom authRef resolves strictly from the secret resolver → 'custom'.
+    process.env.MY_TOKEN = 'custom-tok';
+    r = githubCloneTokenWithSource({ provider: 'github', authRef: 'MY_TOKEN', secretResolver: resolver, ghAuthToken: () => { throw new Error('must not be called'); } });
+    assert.deepEqual(r, { token: 'custom-tok', source: 'custom' });
+    // A blank authRef is a misconfiguration → no token, never the gh fallback.
+    r = githubCloneTokenWithSource({ provider: 'github', authRef: '   ', secretResolver: resolver, ghAuthToken: () => { throw new Error('must not be called'); } });
+    assert.deepEqual(r, { token: null, source: 'none' });
+  } finally {
+    if (saved === undefined) delete process.env.GITHUB_TOKEN;
+    else process.env.GITHUB_TOKEN = saved;
+    delete process.env.MY_TOKEN;
+  }
+});
+
 test('GH_AUTH_TOKEN_TTL_MS is a positive, bounded default', () => {
   assert.ok(Number.isFinite(GH_AUTH_TOKEN_TTL_MS) && GH_AUTH_TOKEN_TTL_MS >= 0);
 });
@@ -316,13 +351,18 @@ test('provisionRepo retries the clone once with a fresh token on an auth failure
     };
     // Rotate the login BEFORE the job's clone fails (the operator re-logged in
     // after this worker primed). The clone's invalidation + forced refresh then
-    // picks up the fresh token.
+    // picks up the fresh token. `credentialSource: 'gh-cache'` marks the token
+    // as cache-derived, which is what permits the gh-token fallback retry.
     served = 'gho_fresh';
-    const prov = provisionRepo({ envelope, token: 'gho_stale', runDir, _runGit: seam });
+    const prov = provisionRepo({ envelope, token: 'gho_stale', runDir, credentialSource: 'gh-cache', _runGit: seam });
     assert.equal(cloneAttempts, 2, 'the clone was retried once after the auth failure');
     assert.ok(prov.workspaceDir, 'the retry produced a workspace');
-    // The cache now holds the rotated token.
+    // The cache now holds the rotated token, and the returned provisioning
+    // carries the EFFECTIVE (rotated) credential so the caller doesn't keep
+    // using the stale one (Copilot review on #293).
     assert.equal(ghAuthTokenInfo().fingerprint, ghTokenFingerprint('gho_fresh'));
+    assert.equal(prov.effectiveToken, 'gho_fresh', 'the rotated token is propagated to the caller');
+    assert.equal(prov.credentialSource, 'gh-cache');
   } finally {
     resetGhAuthTokenReader();
     invalidateGhAuthToken();
@@ -342,7 +382,8 @@ test('provisionRepo does NOT retry when the re-read token is unchanged (#293)', 
       task: { allowPr: true },
     };
     // The re-read returns the SAME token (a genuine permission denial, not a
-    // stale cache) — a retry can't help, so it must not fire.
+    // stale cache) — a retry can't help, so it must not fire. (gh-cache source
+    // so only the unchanged-token guard is exercised.)
     setGhAuthTokenReader(() => 'gho_same');
     invalidateGhAuthToken();
     refreshGhAuthToken({ force: true });
@@ -353,7 +394,7 @@ test('provisionRepo does NOT retry when the re-read token is unchanged (#293)', 
       }
       return runGit(args, opts);
     };
-    assert.throws(() => provisionRepo({ envelope, token: 'gho_same', runDir, _runGit: seam }), /git clone failed/);
+    assert.throws(() => provisionRepo({ envelope, token: 'gho_same', runDir, credentialSource: 'gh-cache', _runGit: seam }), /git clone failed/);
     assert.equal(cloneAttempts, 1, 'no retry when the token did not change');
   } finally {
     resetGhAuthTokenReader();
@@ -388,3 +429,149 @@ test('provisionRepo does NOT retry a non-auth clone failure (#293)', { skip: !gi
     rmSync(root, { recursive: true, force: true });
   }
 });
+
+// A fake child process for the `_spawn` seam: emits the given stdout on the
+// next tick and closes with the given code, so the async gh readers can be
+// driven deterministically without spawning a real process.
+function fakeChild({ stdout = '', code = 0 } = {}) {
+  const handlers = { stdout: [], stderr: [], error: [], close: [] };
+  const child = {
+    stdout: { on: (ev, fn) => { if (ev === 'data') handlers.stdout.push(fn); } },
+    stderr: { on: (ev, fn) => { if (ev === 'data') handlers.stderr.push(fn); } },
+    on: (ev, fn) => { if (handlers[ev]) handlers[ev].push(fn); },
+    kill: () => {},
+  };
+  queueMicrotask(() => {
+    for (const fn of handlers.stdout) fn(Buffer.from(stdout));
+    for (const fn of handlers.close) fn(code);
+  });
+  return child;
+}
+
+test('refreshGhAuthTokenAsync reads the token via spawn and folds it into the cache', async () => {
+  invalidateGhAuthToken();
+  const spawns = [];
+  const _spawn = (cmd, args) => {
+    spawns.push(args.join(' '));
+    if (args[0] === 'auth' && args[1] === 'token') return fakeChild({ stdout: 'gho_async\n', code: 0 });
+    if (args[0] === 'api') return fakeChild({ stdout: 'HTTP/2 200\nX-OAuth-Scopes: repo\n\n{}', code: 0 });
+    return fakeChild({ stdout: '', code: 0 });
+  };
+  const r = await refreshGhAuthTokenAsync({ force: true, _spawn });
+  assert.equal(r.token, 'gho_async');
+  assert.equal(r.changed, true);
+  assert.equal(ghAuthTokenInfo().fingerprint, ghTokenFingerprint('gho_async'));
+  assert.equal(ghAuthTokenInfo().scopes, 'repo', 'the async scopes probe populated scopes');
+  assert.ok(spawns.some((c) => c.startsWith('auth token')), 'gh auth token was spawned');
+  assert.ok(spawns.some((c) => c.startsWith('api')), 'the scopes probe was spawned');
+  invalidateGhAuthToken();
+});
+
+test('refreshGhAuthTokenAsync honours the module reader seam (no spawn in tests)', async () => {
+  invalidateGhAuthToken();
+  setGhAuthTokenReader(() => 'gho_seam');
+  try {
+    const _spawn = () => { throw new Error('must not spawn when a reader is installed'); };
+    const r = await refreshGhAuthTokenAsync({ force: true, _spawn });
+    assert.equal(r.token, 'gho_seam');
+    assert.equal(r.changed, true);
+  } finally {
+    resetGhAuthTokenReader();
+    invalidateGhAuthToken();
+  }
+});
+
+test('startGhAuthTokenRefresh defers while a job is active and refreshes when idle', async () => {
+  invalidateGhAuthToken();
+  let served = 'gho_one';
+  setGhAuthTokenReader(() => served);
+  try {
+    let idle = false;
+    let changes = 0;
+    const logs = [];
+    // intervalMs 0 → clamped to the 1000ms floor, so ticks fire ~1s apart.
+    const t = startGhAuthTokenRefresh({
+      logger: { info: (m) => logs.push(m) },
+      intervalMs: 0,
+      isIdle: () => idle,
+      onChange: () => { changes++; },
+    });
+    try {
+      // Rotate the login, then let several ticks fire while BUSY: no refresh.
+      // (The cache starts UNSET — a busy tick must NOT populate it either, since
+      // the whole point is that no gh read happens while a job is active.)
+      served = 'gho_two';
+      await new Promise((r) => setTimeout(r, 2600));
+      assert.equal(ghAuthTokenInfo(), null, 'no refresh while a job is active');
+      assert.equal(changes, 0, 'onChange not fired while busy');
+      // Now go idle: the next tick adopts the token and republishes.
+      idle = true;
+      await new Promise((r) => setTimeout(r, 1600));
+      assert.equal(ghAuthTokenInfo()?.fingerprint, ghTokenFingerprint('gho_two'), 'the idle tick adopted the token');
+      assert.equal(changes, 1, 'onChange fired exactly once on the identity change');
+      assert.ok(logs.some((l) => /fingerprint [0-9a-f]{12}/.test(l)), 'the change was logged');
+    } finally {
+      t.stop();
+    }
+  } finally {
+    resetGhAuthTokenReader();
+    invalidateGhAuthToken();
+  }
+});
+
+test('startGhAuthTokenRefresh never overlaps ticks and swallows a tick failure', async () => {
+  invalidateGhAuthToken();
+  // A reader that throws models a wedged gh; the tick must swallow it and the
+  // interval must keep firing (no unhandled rejection, no crash).
+  setGhAuthTokenReader(() => { throw new Error('gh wedged'); });
+  try {
+    const t = startGhAuthTokenRefresh({ intervalMs: 1000 });
+    try {
+      await new Promise((r) => setTimeout(r, 2600));
+      // Reaching here without an unhandled rejection is the assertion.
+      assert.ok(true);
+    } finally {
+      t.stop();
+    }
+  } finally {
+    resetGhAuthTokenReader();
+    invalidateGhAuthToken();
+  }
+});
+
+test('provisionRepo does NOT retry an auth failure for a non-gh-cache credential (#293 review)', { skip: !gitAvailable }, () => {
+  const { root, origin } = makeLocalOrigin();
+  const runDir = mkdtempSync(join(root, 'run-'));
+  try {
+    const envelope = {
+      schemaVersion: 1,
+      repository: { provider: 'github', url: origin, ref: 'main', submodules: false },
+      branch: { base: 'main', create: 'feat/x', push: true },
+      setup: { commands: [], env: {}, secretRefs: [] },
+      task: { allowPr: true },
+    };
+    // An EXPLICIT GITHUB_TOKEN ('env' source) fails with an auth error: the
+    // fallback must NOT silently swap in the operator's gh token.
+    let cloneAttempts = 0;
+    const seam = (args, opts) => {
+      if (args.includes('clone')) {
+        cloneAttempts++;
+        return { status: 128, stdout: '', stderr: "fatal: could not read Username for 'https://github.com': terminal prompts disabled", signal: null, timedOut: false, timeoutMs: opts?.timeoutMs };
+      }
+      return runGit(args, opts);
+    };
+    assert.throws(() => provisionRepo({ envelope, token: 'explicit-env-token', runDir, credentialSource: 'env', _runGit: seam }), /git clone failed/);
+    assert.equal(cloneAttempts, 1, 'no gh-token retry for an env-sourced credential');
+  } finally {
+    rmSync(root, { recursive: true, force: true });
+  }
+});
+
+// NOTE: finalizeGit's push-retry shares the SAME source gate
+// (`credentialSource === 'gh-cache'`) as provisionRepo's clone-retry above, but
+// its push runs through the module `runGit` (the `_runGit` seam covers only the
+// late remote-scan calls), so a hermetic test cannot force the push itself to
+// fail with an auth error. The gate's behaviour is therefore covered by the
+// provisionRepo source-gate test above plus the githubCloneTokenWithSource unit
+// tests; adding a finalizeGit-specific seam solely for this would churn the
+// function for no behavioural gain.

@@ -5232,8 +5232,17 @@ async function refreshGhAuthTokenAsync({ force = false, scopesProbe, _spawn } = 
   // refresh instead of blocking (Copilot review on #293).
   if (ghAuthRefreshInFlight) {
     try { await ghAuthRefreshInFlight; } catch { /* swallowed — the owner logs/handles it */ }
-    const c = ghAuthTokenCache === GH_AUTH_TOKEN_UNSET ? null : ghAuthTokenCache;
-    return { token: c ? c.token : null, changed: false };
+    // A NON-forced caller (a periodic timer tick) is happy with whatever the
+    // in-flight refresh just applied. A FORCED caller (the reload-credentials
+    // SIGUSR1 handler) must NOT be: the in-flight read may have captured the OLD
+    // token microseconds before the operator's `gh auth refresh`/`login` landed,
+    // so returning its result would report "reloaded" while leaving the stale
+    // credential cached until the next TTL. Fall through to start a fresh forced
+    // read now so a reload always re-reads AFTER the signal (Copilot review on #293).
+    if (!force) {
+      const c = ghAuthTokenCache === GH_AUTH_TOKEN_UNSET ? null : ghAuthTokenCache;
+      return { token: c ? c.token : null, changed: false };
+    }
   }
   // Honor the module reader seam when a test installed one (mirroring the sync
   // path) so a stubbed refresh never spawns; production (reader null) spawns.
@@ -5395,7 +5404,7 @@ function startGhAuthTokenRefresh({ logger = null, intervalMs = GH_AUTH_TOKEN_TTL
 function isGitAuthFailure(detail) {
   const s = String(detail ?? '');
   if (!s) return false;
-  return /HTTP\s*40[13]\b|\b40[13]\s*\((Unauthorized|Forbidden)\)|could not read (Username|Password)|Authentication failed|authentication required|Permission to .+ denied|refusing to allow an OAuth App|without .?workflow.? scope|Bad credentials|Resource not accessible by (integration|personal access token)/i.test(s);
+  return /HTTP\s*40[13]\b|\b40[13]\s*\((Unauthorized|Forbidden)\)|returned error:\s*40[13]\b|could not read (Username|Password)|Authentication failed|authentication required|Permission to .+ denied|refusing to allow an OAuth App|without .?workflow.? scope|Bad credentials|Resource not accessible by (integration|personal access token)/i.test(s);
 }
 
 // Read the operator's own git identity from their GLOBAL config, using the real
@@ -6763,7 +6772,7 @@ function computeRelayCloseReason(result, runCompleted, gitResult) {
 // branch.push), and reconcile the agent-opened PR (when task.allowPr). A push
 // failure is reported (pushError) rather than thrown — the process model decides
 // what to do next, and re-running the agent would be non-idempotent.
-function finalizeGit({ workspaceDir, gitEnv, startSha, workingBranch, baseBranch: effectiveBase, baseCloneSha = null, baseBaselineUnknown = false, hasPrBranch, envelope, token, logger = null, corr = '', budgetMs = 0, provisioned = false, keepRuns = false, credentialSource = null, _runGit = null, _pushGit = null }) {
+function finalizeGit({ workspaceDir, gitEnv, startSha, workingBranch, baseBranch: effectiveBase, baseCloneSha = null, baseBaselineUnknown = false, hasPrBranch, envelope, token, logger = null, corr = '', budgetMs = 0, provisioned = false, keepRuns = false, credentialSource = null, _runGit = null, _pushGit = null, _reconcilePr = null, _postAttribution = null }) {
   const log = logger || getLogger(); // route observability through the injected logger (tests) or the host logger
   // Test-only seam: the late remote-reachability FILTER scans (movedStray /
   // unpushedBranchCommits / final stranded) AND the remote-tip VERIFICATION calls
@@ -6782,6 +6791,8 @@ function finalizeGit({ workspaceDir, gitEnv, startSha, workingBranch, baseBranch
   // late remote-reachability scans keep their own runner (Copilot review on
   // #293). Defaults to the module `runGit`, so production behaviour is unchanged.
   const pushGit = _pushGit || runGit;
+  const reconcilePr = _reconcilePr || reconcileAgentPr;
+  const postAttribution = _postAttribution || postAgentAttribution;
   const cs = corr ? ` [${corr}]` : ''; // #229 cross-channel correlation suffix
   const out = { branch: workingBranch, baseSha: startSha || null, headSha: null, commits: [], pushed: false, remote: null, pr: null };
 
@@ -7180,6 +7191,11 @@ function finalizeGit({ workspaceDir, gitEnv, startSha, workingBranch, baseBranch
     // `gh auth token` read — an explicit GITHUB_TOKEN ('env') or custom authRef
     // ('custom') is a deliberately configured identity that must fail as
     // configured, never be silently swapped for the operator's gh login.
+    // The credential that PRODUCED the ORIGINAL `push` — preserved separately so
+    // the failure report below redacts the value that actually appeared in that
+    // push's output, even once `token` is swapped to the fresh credential for
+    // subsequent authenticated operations after a retry (Copilot review on #293).
+    let pushFailureToken = token;
     if (push.status !== 0 && token && credentialSource === 'gh-cache' && isGitAuthFailure(describeGitFailure('git push', push, { token, timeoutMs: pushTimeout }))) {
       invalidateGhAuthToken();
       const { token: fresh, changed } = refreshGhAuthToken({ force: true });
@@ -7202,10 +7218,19 @@ function finalizeGit({ workspaceDir, gitEnv, startSha, workingBranch, baseBranch
           token = fresh;
           push = retry;
         } else {
+          // The retry still exited nonzero, but it may have LANDED the ref before
+          // a client-side timeout (the transport-hiccup case verified below). The
+          // ORIGINAL rejected token must NOT be carried into the subsequent
+          // authenticated operations (PR reconcile + attribution read `token`):
+          // those run against a push the FRESH credential authenticated, so a
+          // landed retry would otherwise reconcile/attribute with the rejected old
+          // token and fail despite the successful push. Adopt `fresh` for all
+          // later ops; `pushFailureToken` still redacts the original failure, and
+          // `gitEnv` is already rebound above (Copilot review on #293).
+          pushFailureToken = token;
+          token = fresh;
           // Keep the ORIGINAL failure as the reported one (it is the actionable
-          // signal), and keep `token` as the credential that PRODUCED that `push`
-          // so its failure report redacts the right value. `gitEnv` is still
-          // rebound above, so remote-tip verification uses the fresh credential.
+          // signal); redact it against the credential that produced it.
           log.warn?.(`finalizeGit${cs}: push still failed with the fresh gh token — ${oneLineLog(describeGitFailure('git push', retry, { token: fresh, timeoutMs: pushTimeout }))}`);
         }
       }
@@ -7291,7 +7316,7 @@ function finalizeGit({ workspaceDir, gitEnv, startSha, workingBranch, baseBranch
         // new commit in this throwaway workspace. Surface the at-risk SHAs explicitly
         // (issue #231, defense #2) so the failure is a hard, actionable signal with
         // the commits to recover — not a soft pushError that reads as "completed".
-        out.pushError = describeGitFailure('git push', push, { token, timeoutMs: pushTimeout });
+        out.pushError = describeGitFailure('git push', push, { token: pushFailureToken, timeoutMs: pushTimeout });
         out.pushFailed = true;
         // Union the work-branch commit list into the stranded set: out.commits is now
         // the promoted branchCommits, but if HEAD sat off the branch and promotion
@@ -7371,11 +7396,11 @@ function finalizeGit({ workspaceDir, gitEnv, startSha, workingBranch, baseBranch
   // envelope + completion note carry only the `pushFailed`/`strandedCommits`
   // recovery signal, not a misleading PR reference.
   if (workingBranch && envelope.task?.allowPr && !out.pushFailed) {
-    out.pr = reconcileAgentPr({ workspaceDir, token, branch: workingBranch, provider: envelope.repository?.provider || 'github' });
+    out.pr = reconcilePr({ workspaceDir, token, branch: workingBranch, provider: envelope.repository?.provider || 'github' });
     // Record the agent's authorship on the PR (commits carry the operator's
     // identity now, so this preserves the machine-generated provenance).
     if (out.pr?.found && out.pr.number && (envelope.repository?.provider || 'github') === 'github') {
-      out.attribution = postAgentAttribution({ workspaceDir, token, number: out.pr.number });
+      out.attribution = postAttribution({ workspaceDir, token, number: out.pr.number });
     }
   }
   return out;

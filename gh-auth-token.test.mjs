@@ -188,11 +188,17 @@ test('isGitAuthFailure matches auth/scope failures, not ordinary git failures', 
   assert.equal(isGitAuthFailure('fatal: Authentication failed for \'https://github.com/o/r.git/\''), true);
   assert.equal(isGitAuthFailure('remote: Permission to o/r.git denied to bot.'), true);
   assert.equal(isGitAuthFailure('HTTP 401 Unauthorized'), true);
+  // Standard git HTTPS smart-transport rejection form (what the git CLI prints,
+  // and the exact shape agent-checkpoint.test.mjs uses as an auth example).
+  assert.equal(isGitAuthFailure('fatal: unable to access \'https://github.com/o/r.git/\': The requested URL returned error: 403'), true);
+  assert.equal(isGitAuthFailure('fatal: unable to access \'https://github.com/o/r.git/\': The requested URL returned error: 401'), true);
   assert.equal(isGitAuthFailure('{"message":"Bad credentials"}'), true);
   assert.equal(isGitAuthFailure('{"message":"Resource not accessible by personal access token"}'), true);
   // NOT auth failures — must not trigger a token drop + retry.
   assert.equal(isGitAuthFailure('error: failed to push some refs (non-fast-forward)'), false);
   assert.equal(isGitAuthFailure('fatal: repository \'https://github.com/o/missing\' not found (404)'), false);
+  // A 404 in the same transport form is NOT an auth failure (fail-closed boundary).
+  assert.equal(isGitAuthFailure('fatal: unable to access \'https://github.com/o/r.git/\': The requested URL returned error: 404'), false);
   assert.equal(isGitAuthFailure('git push timed out after 30s (SIGTERM)'), false);
   assert.equal(isGitAuthFailure(''), false);
   assert.equal(isGitAuthFailure(null), false);
@@ -641,7 +647,40 @@ test('an in-flight async refresh suppresses the synchronous per-job re-read (#29
   invalidateGhAuthToken();
 });
 
-test('a second async refresh awaits the in-flight one instead of spawning again (#293 review)', async () => {
+test('a forced async refresh performs a FRESH read after awaiting an in-flight one (#293 review)', async () => {
+  // reload-credentials (SIGUSR1) fires a FORCED refresh while a periodic refresh
+  // is already in flight. The in-flight read may have captured the OLD token
+  // microseconds before the operator ran `gh auth refresh`; a forced caller that
+  // merely awaited and returned it would report "reloaded" while caching the
+  // stale credential. So after awaiting the in-flight read, a forced caller must
+  // start ONE new forced read that reflects the post-signal state.
+  invalidateGhAuthToken();
+  let authReads = 0;
+  let releaseAuth;
+  const gatedAuth = pendingChild((release) => { releaseAuth = release; });
+  const _spawn = (cmd, args) => {
+    if (args[0] === 'auth' && args[1] === 'token') {
+      authReads++;
+      // First read is gated (the in-flight periodic refresh, capturing the OLD
+      // token); the forced caller's fresh read sees the ROTATED token.
+      return authReads === 1 ? gatedAuth : fakeChild({ stdout: 'gho_rotated\n', code: 0 });
+    }
+    if (args[0] === 'api') return fakeChild({ stdout: 'HTTP/2 200\nX-OAuth-Scopes: repo\n\n{}', code: 0 });
+    return fakeChild({ stdout: '', code: 0 });
+  };
+  const inflight = refreshGhAuthTokenAsync({ _spawn });              // periodic (non-forced), gated
+  const forced = refreshGhAuthTokenAsync({ force: true, _spawn });   // SIGUSR1: awaits, then re-reads
+  releaseAuth('gho_old');                                           // the in-flight read completes with the OLD token
+  const [, r] = await Promise.all([inflight, forced]);
+  assert.equal(authReads, 2, 'the forced caller performed its OWN fresh read after the in-flight one settled');
+  assert.equal(r.token, 'gho_rotated');
+  assert.equal(ghAuthTokenInfo().fingerprint, ghTokenFingerprint('gho_rotated'), 'the reload reflects the rotation that landed after the in-flight read started');
+  invalidateGhAuthToken();
+});
+
+test('a non-forced async refresh still coalesces onto the in-flight read (no second spawn)', async () => {
+  // The periodic-timer path must NOT multiply reads: a non-forced caller that
+  // finds a refresh already spawning awaits it and returns its result.
   invalidateGhAuthToken();
   let authReads = 0;
   let releaseAuth;
@@ -651,12 +690,11 @@ test('a second async refresh awaits the in-flight one instead of spawning again 
     if (args[0] === 'api') return fakeChild({ stdout: 'HTTP/2 200\nX-OAuth-Scopes: repo\n\n{}', code: 0 });
     return fakeChild({ stdout: '', code: 0 });
   };
-  const first = refreshGhAuthTokenAsync({ force: true, _spawn });
-  // A concurrent forced refresh must NOT start a second `gh auth token` read.
-  const second = refreshGhAuthTokenAsync({ force: true, _spawn });
+  const first = refreshGhAuthTokenAsync({ force: true, _spawn });   // the in-flight read
+  const second = refreshGhAuthTokenAsync({ _spawn });              // non-forced: must coalesce
   releaseAuth('gho_once');
   await Promise.all([first, second]);
-  assert.equal(authReads, 1, 'only ONE gh read happened despite two concurrent forced refreshes');
+  assert.equal(authReads, 1, 'only ONE gh read happened — the non-forced caller coalesced');
   assert.equal(ghAuthTokenInfo().fingerprint, ghTokenFingerprint('gho_once'));
   invalidateGhAuthToken();
 });
@@ -968,11 +1006,54 @@ test('finalizeGit verifies the remote tip with the FRESH env after a nonzero ret
   }
 });
 
-// Advisory (review 5481943774): a stale async refresh must not overwrite a
-// credential committed by a NEWER forced recovery. The async timer refresh reads
-// the OLD token and yields across its scopes probe; meanwhile a synchronous
-// clone/push auth-failure recovery (which cannot await the in-flight async)
-// adopts the ROTATED token. The async refresh's late commit must be fenced off
+// Advisory (review 5481985995): when the fresh-token retry exits nonzero but the
+// server already ACCEPTED the ref (a client-side timeout after acceptance), the
+// landed push is verified and `out.pushed` is set — so PR reconciliation and
+// attribution run. Those must use the FRESH credential the retry authenticated
+// with, not the REJECTED old token; otherwise they fail despite the successful
+// push. The original token is preserved only for failure redaction.
+test('finalizeGit adopts the FRESH token for PR reconcile/attribution after a nonzero-but-landed retry (#293 review)', { skip: !gitAvailable }, () => {
+  const { root, envelope, prov } = provisionWithCommit({ credentialSource: 'gh-cache', token: 'gho_stale' });
+  try {
+    envelope.task.allowPr = true;
+    let served = 'gho_stale';
+    setGhAuthTokenReader(() => served);
+    invalidateGhAuthToken();
+    refreshGhAuthToken({ force: true });
+    served = 'gho_fresh';
+    let pushes = 0;
+    const pushSeam = (args, opts) => {
+      if (args.includes('push')) {
+        pushes++;
+        if (pushes === 1) return authFail(opts); // stale token rejected
+        // The retry carries the rotated token and lands the ref, but reports
+        // nonzero to simulate a client-side timeout after acceptance.
+        const real = runGit(args, opts);
+        return { ...real, status: 1, timedOut: true, timeoutMs: opts?.timeoutMs };
+      }
+      return runGit(args, opts);
+    };
+    let reconcileToken;
+    let attributionToken;
+    const reconcileSeam = ({ token }) => { reconcileToken = token; return { found: true, number: 7 }; };
+    const attributionSeam = ({ token }) => { attributionToken = token; return { ok: true }; };
+    const out = finalizeGit({
+      ...prov, envelope, token: 'gho_stale',
+      logger: { warn: () => {}, error: () => {}, info: () => {}, debug: () => {} },
+      _pushGit: pushSeam, _runGit: runGit, _reconcilePr: reconcileSeam, _postAttribution: attributionSeam,
+    });
+    assert.equal(pushes, 2, 'the push was retried once');
+    assert.equal(out.pushed, true, 'the landed ref was detected');
+    assert.equal(reconcileToken, 'gho_fresh', 'PR reconcile used the FRESH credential, not the rejected old token');
+    assert.equal(attributionToken, 'gho_fresh', 'attribution used the FRESH credential, not the rejected old token');
+  } finally {
+    resetGhAuthTokenReader();
+    invalidateGhAuthToken();
+    rmSync(root, { recursive: true, force: true });
+  }
+});
+
+
 // by the cache generation so it can never resurrect the superseded credential.
 test('a stale async refresh does NOT clobber a newer forced sync recovery (generation fence)', async () => {
   invalidateGhAuthToken();

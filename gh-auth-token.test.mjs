@@ -678,6 +678,44 @@ test('a forced async refresh performs a FRESH read after awaiting an in-flight o
   invalidateGhAuthToken();
 });
 
+test('concurrent forced async refreshes serialize — no overlapping reads clobber the in-flight marker (#293 review)', async () => {
+  // Two forced callers (e.g. two reload-credentials SIGUSR1 signals) can both
+  // await the SAME in-flight periodic refresh. They must NOT fall through together
+  // and start overlapping reads: the first to settle would clear ghAuthRefreshInFlight
+  // while the other read is still active, re-opening the blocking synchronous hot-path
+  // read the marker exists to suppress. Re-checking the marker in a loop keeps at
+  // most ONE forced read active at a time, so the reads run strictly sequentially.
+  invalidateGhAuthToken();
+  let authReads = 0;
+  const gates = [];                    // release() for each gated read, in start order
+  const _spawn = (cmd, args) => {
+    if (args[0] === 'auth' && args[1] === 'token') {
+      authReads++;
+      return pendingChild((release) => { gates.push(release); });
+    }
+    if (args[0] === 'api') return fakeChild({ stdout: 'HTTP/2 200\nX-OAuth-Scopes: repo\n\n{}', code: 0 });
+    return fakeChild({ stdout: '', code: 0 });
+  };
+  const inflight = refreshGhAuthTokenAsync({ _spawn });              // periodic, gated (read #1)
+  const f1 = refreshGhAuthTokenAsync({ force: true, _spawn });       // forced A: awaits read #1
+  const f2 = refreshGhAuthTokenAsync({ force: true, _spawn });       // forced B: awaits read #1
+  await new Promise((r) => setTimeout(r, 0));
+  assert.equal(authReads, 1, 'only the in-flight periodic read has started; both forced callers await it');
+  // Release read #1. Both forced callers fall through — but serialized: exactly ONE
+  // starts its fresh read, the other re-checks the marker and awaits THAT read.
+  gates[0]('gho_1');
+  await new Promise((r) => setTimeout(r, 0));
+  assert.equal(authReads, 2, 'exactly one forced read started after the in-flight settled — the other is awaiting it, not overlapping');
+  // Release read #2 → the second forced caller only now starts read #3.
+  gates[1]('gho_2');
+  await new Promise((r) => setTimeout(r, 0));
+  assert.equal(authReads, 3, 'the second forced caller performed its OWN read only after the first completed');
+  gates[2]('gho_3');
+  await Promise.all([inflight, f1, f2]);
+  assert.equal(ghAuthTokenInfo().fingerprint, ghTokenFingerprint('gho_3'), 'the last forced read wins the cache');
+  invalidateGhAuthToken();
+});
+
 test('a non-forced async refresh still coalesces onto the in-flight read (no second spawn)', async () => {
   // The periodic-timer path must NOT multiply reads: a non-forced caller that
   // finds a refresh already spawning awaits it and returns its result.
@@ -1053,8 +1091,45 @@ test('finalizeGit adopts the FRESH token for PR reconcile/attribution after a no
   }
 });
 
+// Advisory (review 5482090625): when the fresh-token retry ALSO fails and the ref
+// did NOT land, the original stale-token rejection is already RECOVERED — it is no
+// longer the actionable cause. out.pushError must report the RETRY's failure (the
+// one that actually stranded the commits), redacted against the credential the
+// retry used (`fresh`), not the original rejection.
+test('finalizeGit reports the RETRY failure (not the recovered original) when the retry also fails and does not land (#293 review)', { skip: !gitAvailable }, () => {
+  const { root, envelope, prov } = provisionWithCommit({ credentialSource: 'gh-cache', token: 'gho_stale' });
+  try {
+    let served = 'gho_stale';
+    setGhAuthTokenReader(() => served);
+    invalidateGhAuthToken();
+    refreshGhAuthToken({ force: true });
+    served = 'gho_fresh';
+    let pushes = 0;
+    const pushSeam = (args, opts) => {
+      if (args.includes('push')) {
+        pushes++;
+        // #1: the stale token is rejected (auth failure → triggers the re-read+retry).
+        if (pushes === 1) return { status: 128, stdout: '', stderr: "ORIGINAL-FAILURE: could not read Username for 'https://github.com': terminal prompts disabled", signal: null, timedOut: false, timeoutMs: opts?.timeoutMs };
+        // #2: the retry with the FRESH token ALSO fails and never lands the ref.
+        // Its stderr carries the fresh token value so we can assert redaction.
+        return { status: 128, stdout: '', stderr: 'RETRY-FAILURE token=gho_fresh\nfatal: unable to access: The requested URL returned error: 403', signal: null, timedOut: false, timeoutMs: opts?.timeoutMs };
+      }
+      return runGit(args, opts); // ls-remote/fetch run for real → ref is NOT on origin
+    };
+    const out = finalizeGit({ ...prov, envelope, token: 'gho_stale', logger: { warn: () => {}, error: () => {}, info: () => {}, debug: () => {} }, _pushGit: pushSeam, _runGit: runGit });
+    assert.equal(pushes, 2, 'the push was retried once');
+    assert.equal(out.pushFailed, true, 'the unlanded retry strands the commits');
+    assert.ok(/RETRY-FAILURE/.test(out.pushError), 'out.pushError reports the RETRY failure that actually stranded the commits');
+    assert.ok(!/ORIGINAL-FAILURE/.test(out.pushError), 'the already-recovered original rejection is NOT the reported failure');
+    assert.ok(!/gho_fresh/.test(out.pushError), 'the retry credential is redacted from the reported failure');
+  } finally {
+    resetGhAuthTokenReader();
+    invalidateGhAuthToken();
+    rmSync(root, { recursive: true, force: true });
+  }
+});
 
-// by the cache generation so it can never resurrect the superseded credential.
+
 test('a stale async refresh does NOT clobber a newer forced sync recovery (generation fence)', async () => {
   invalidateGhAuthToken();
   // No module reader installed → the async refresh uses the `_spawn` seam. Gate

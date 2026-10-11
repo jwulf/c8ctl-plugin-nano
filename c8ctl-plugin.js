@@ -5230,15 +5230,26 @@ async function refreshGhAuthTokenAsync({ force = false, scopesProbe, _spawn } = 
   // applied) cache rather than starting a second concurrent `gh` read. This is
   // what lets the synchronous per-job path safely defer to an in-flight async
   // refresh instead of blocking (Copilot review on #293).
-  if (ghAuthRefreshInFlight) {
+  // LOOP (not a one-shot `if`): re-check the marker after EVERY await so forced
+  // refreshes stay serialized. A plain `if` let multiple forced callers all await
+  // the SAME in-flight promise and then fall through together, each overwriting
+  // ghAuthRefreshInFlight with its own read; the first to settle then clears the
+  // marker (its `finally` nulls it) while another forced read is still active, so
+  // the hot path (ghAuthTokenFromCli) sees no marker and resumes a blocking
+  // synchronous re-read — the very stall the marker exists to prevent. Re-checking
+  // in a loop means a forced caller that finds a NEW refresh in flight (started by
+  // another forced caller that fell through first) awaits THAT one too, so at most
+  // one forced read runs at a time and the marker is never cleared out from under
+  // an active read (Copilot review on #293).
+  while (ghAuthRefreshInFlight) {
     try { await ghAuthRefreshInFlight; } catch { /* swallowed — the owner logs/handles it */ }
     // A NON-forced caller (a periodic timer tick) is happy with whatever the
     // in-flight refresh just applied. A FORCED caller (the reload-credentials
     // SIGUSR1 handler) must NOT be: the in-flight read may have captured the OLD
     // token microseconds before the operator's `gh auth refresh`/`login` landed,
     // so returning its result would report "reloaded" while leaving the stale
-    // credential cached until the next TTL. Fall through to start a fresh forced
-    // read now so a reload always re-reads AFTER the signal (Copilot review on #293).
+    // credential cached until the next TTL. Loop back: once no refresh is in
+    // flight, fall through to start a fresh forced read AFTER the signal.
     if (!force) {
       const c = ghAuthTokenCache === GH_AUTH_TOKEN_UNSET ? null : ghAuthTokenCache;
       return { token: c ? c.token : null, changed: false };
@@ -7196,13 +7207,19 @@ function finalizeGit({ workspaceDir, gitEnv, startSha, workingBranch, baseBranch
     // push's output, even once `token` is swapped to the fresh credential for
     // subsequent authenticated operations after a retry (Copilot review on #293).
     let pushFailureToken = token;
+    // The timeout that bounded the reported `push` — promoted alongside
+    // pushFailureToken when a failed retry is promoted to the reported result, so
+    // describeGitFailure attributes the RETRY's timeout, not the original push's
+    // (Copilot review on #293).
+    let pushFailureTimeout = pushTimeout;
     if (push.status !== 0 && token && credentialSource === 'gh-cache' && isGitAuthFailure(describeGitFailure('git push', push, { token, timeoutMs: pushTimeout }))) {
       invalidateGhAuthToken();
       const { token: fresh, changed } = refreshGhAuthToken({ force: true });
       if (changed && fresh && fresh !== token) {
         log.info?.(`finalizeGit${cs}: git push auth failed — the cached gh token may be stale; re-read it (${describeGhAuthToken(ghAuthTokenInfo())}) and retrying the push once`);
         const retryEnv = { ...gitEnv, GIT_TOKEN: fresh };
-        const retry = pushGit([...credArgs(), 'push', '--set-upstream', 'origin', `refs/heads/${workingBranch}:refs/heads/${workingBranch}`], { cwd: workspaceDir, env: retryEnv, timeoutMs: netTimeoutMs() });
+        const retryTimeout = netTimeoutMs();
+        const retry = pushGit([...credArgs(), 'push', '--set-upstream', 'origin', `refs/heads/${workingBranch}:refs/heads/${workingBranch}`], { cwd: workspaceDir, env: retryEnv, timeoutMs: retryTimeout });
         // Rebind the git env to the FRESH credential whenever the retry ran —
         // regardless of its exit code — so the post-push remote-tip verification
         // below (`ls-remote`/`fetch`, all `env: gitEnv`) queries origin with the
@@ -7218,20 +7235,25 @@ function finalizeGit({ workspaceDir, gitEnv, startSha, workingBranch, baseBranch
           token = fresh;
           push = retry;
         } else {
-          // The retry still exited nonzero, but it may have LANDED the ref before
-          // a client-side timeout (the transport-hiccup case verified below). The
-          // ORIGINAL rejected token must NOT be carried into the subsequent
-          // authenticated operations (PR reconcile + attribution read `token`):
-          // those run against a push the FRESH credential authenticated, so a
-          // landed retry would otherwise reconcile/attribute with the rejected old
-          // token and fail despite the successful push. Adopt `fresh` for all
-          // later ops; `pushFailureToken` still redacts the original failure, and
-          // `gitEnv` is already rebound above (Copilot review on #293).
-          pushFailureToken = token;
+          // The retry ALSO exited nonzero. It may still have LANDED the ref before
+          // a client-side timeout (the transport-hiccup case verified below); if it
+          // did, `landed` flips on and pushError is never reported. But if it did
+          // NOT land, the RETRY — not the original stale-token rejection — is the
+          // failure that actually stranded the commits: the original failure is
+          // already RECOVERED (we re-read the token and retried), so reporting it
+          // would point at a resolved cause instead of the real one. Promote `retry`
+          // to the reported push result and carry ITS redaction credential (`fresh`,
+          // which appeared in the retry's output) and ITS timeout into the final
+          // error. The ORIGINAL rejected token must NOT be carried into the
+          // subsequent authenticated operations (PR reconcile + attribution read
+          // `token`): a landed retry would otherwise reconcile/attribute with the
+          // rejected old token and fail despite the push. Adopt `fresh` for all
+          // later ops; `gitEnv` is already rebound above (Copilot review on #293).
+          push = retry;
+          pushFailureToken = fresh;
+          pushFailureTimeout = retryTimeout;
           token = fresh;
-          // Keep the ORIGINAL failure as the reported one (it is the actionable
-          // signal); redact it against the credential that produced it.
-          log.warn?.(`finalizeGit${cs}: push still failed with the fresh gh token — ${oneLineLog(describeGitFailure('git push', retry, { token: fresh, timeoutMs: pushTimeout }))}`);
+          log.warn?.(`finalizeGit${cs}: push still failed with the fresh gh token — ${oneLineLog(describeGitFailure('git push', retry, { token: fresh, timeoutMs: retryTimeout }))}`);
         }
       }
     }
@@ -7316,7 +7338,7 @@ function finalizeGit({ workspaceDir, gitEnv, startSha, workingBranch, baseBranch
         // new commit in this throwaway workspace. Surface the at-risk SHAs explicitly
         // (issue #231, defense #2) so the failure is a hard, actionable signal with
         // the commits to recover — not a soft pushError that reads as "completed".
-        out.pushError = describeGitFailure('git push', push, { token: pushFailureToken, timeoutMs: pushTimeout });
+        out.pushError = describeGitFailure('git push', push, { token: pushFailureToken, timeoutMs: pushFailureTimeout });
         out.pushFailed = true;
         // Union the work-branch commit list into the stranded set: out.commits is now
         // the promoted branchCommits, but if HEAD sat off the branch and promotion

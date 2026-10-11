@@ -403,6 +403,63 @@ export function makeOrphanProbe({ getElementInstance, getProcessInstance = null 
   };
 }
 
+// #295 ambiguity guard (scope decided on nanobpmn/nano-workforce#891). The
+// predecessor checkpoint is correlated to THIS task by its STATIC `elementId`, which
+// is NOT unique when one agent-task element runs as PARALLEL multi-instance within a
+// single process instance: N concurrent occurrences share the elementId AND the one
+// process-scoped `resumeFromCheckpoint` slot, so a last-writer-wins read could make a
+// resumed occurrence adopt a SIBLING occurrence's repository state. Parallel MI of a
+// single agent-task element is OUT OF SCOPE for resume (no nano-workforce process fans
+// one agent-task element out in parallel within a single instance — plan-fanout's
+// parallel `implement` MI calls a separate CHILD process, delivery graphs fan out to
+// DISTINCT elementIds, and review rounds / retries are sequential). This guard makes a
+// wrong adoption IMPOSSIBLE rather than merely unlikely: before adopting, it asks the
+// engine how many element instances of this `elementId` are ACTIVE in the process
+// instance. More than one active occurrence ⇒ genuine parallel MI ⇒ the correlation is
+// ambiguous ⇒ FAIL CLOSED (no restore; a clean start is the acceptable worst case).
+// Returns `null` when the host SDK exposes no `searchElementInstances` (then the caller
+// also fails closed — it cannot prove uniqueness). The returned probe resolves
+// `{ safe, candidates, reason }`; `safe:false` on >1 occurrence OR any lookup error.
+export function makeOccurrenceGuard({ searchElementInstances } = {}) {
+  if (typeof searchElementInstances !== 'function') return null;
+  return async (processInstanceKey, elementId) => {
+    const pik = processInstanceKey == null ? '' : String(processInstanceKey).trim();
+    const eid = typeof elementId === 'string' ? elementId.trim() : '';
+    if (!pik || !eid) return { safe: false, candidates: [], reason: 'missing processInstanceKey/elementId' };
+    let res;
+    try {
+      res = await searchElementInstances({ filter: { processInstanceKey: pik, elementId: eid, state: 'ACTIVE' } });
+    } catch (err) {
+      return { safe: false, candidates: [], reason: `lookup failed: ${err?.message || err}` };
+    }
+    const items = Array.isArray(res?.items) ? res.items : (Array.isArray(res) ? res : []);
+    const candidates = items
+      .map((it) => String(it?.elementInstanceKey ?? it?.elementInstanceId ?? it?.key ?? '').trim())
+      .filter(Boolean);
+    // >1 ACTIVE occurrence of the same element in one instance ⇒ parallel MI ⇒ fail
+    // closed. 0 or 1 ⇒ no concurrent sibling ⇒ safe (the lone active occurrence is
+    // this resumed run itself, or the index has not yet caught up — either way there
+    // is no sibling to confuse it with).
+    if (items.length > 1) return { safe: false, candidates, reason: `${items.length} active occurrences` };
+    return { safe: true, candidates, reason: 'unique' };
+  };
+}
+
+// The resume slot carries EITHER the predecessor's self-stamped record (a structured
+// object `{ ref, elementId, ... }` the plugin writes at the process scope) OR — once
+// the process delivers it (nanobpmn/nano-workforce#891, option 2) — an EXPLICIT,
+// occurrence-authoritative ref as a bare STRING. An explicit ref is the process's exact
+// choice of predecessor for THIS occurrence, so it bypasses the elementId correlation
+// AND the ambiguity guard (which exist only because a self-record cannot identify the
+// occurrence). A self-record (object) is correlated by elementId and gated by the
+// guard. This lets #891 plug in with NO further plugin change: deliver a bare ref string
+// and the restore path trusts it; until then the elementId-correlated self-record path
+// (with the guard) is used. Returns true only for a bare, well-formed WIP-ref string.
+export function resumeRefIsExplicit(variables) {
+  const v = variables && typeof variables === 'object' ? variables.resumeFromCheckpoint : null;
+  return typeof v === 'string' && v.trim().startsWith(CHECKPOINT_REF_PREFIX);
+}
+
 // Never let git invoke the host's configured credential helper for our remote
 // checkpoint ops. The job token is delivered ONLY via GIT_ASKPASS; a configured
 // helper such as `store` would otherwise reuse or PERSIST that token to disk on a

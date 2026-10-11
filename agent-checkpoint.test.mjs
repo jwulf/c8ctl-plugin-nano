@@ -8,7 +8,7 @@ import {
   checkpointConfig, checkpointRef, checkpointEligibility, classifyPushFailure, containsSecret, normalizeSecretValues, credentialsFromUrl, isAuthenticatedRemote, shouldSweep, sweepStaleCheckpoints, isDeniedPath, isCheckpointTrigger, createGitRunner,
   snapshotWorktree, pushCheckpoint, fetchCheckpoint, restoreCheckpoint, deleteCheckpointRef, redactUrlUserinfo, CHECKPOINT_DETACHED_MARKER,
   createWorkspaceCheckpoint, createCheckpointer, withCheckpointNote,
-  recoveredCheckpointRef, predecessorCheckpointRef, pushNamedRef, observeRemoteRefSha, makeOrphanProbe, RECOVERED_REF_PREFIX,
+  recoveredCheckpointRef, predecessorCheckpointRef, makeOccurrenceGuard, resumeRefIsExplicit, pushNamedRef, observeRemoteRefSha, makeOrphanProbe, RECOVERED_REF_PREFIX,
 } from './agent-checkpoint.mjs';
 
 const ENV = {
@@ -1571,6 +1571,52 @@ test('#295 predecessorCheckpointRef: correlates the shared process slot to THIS 
   assert.equal(predecessorCheckpointRef(wip('review-round'), 'refs/nano/wip/10', 'review-round'), null);
 });
 
+test('#296 makeOccurrenceGuard: fails closed on ambiguous parallel MI; safe on a unique occurrence', async () => {
+  // No search method ⇒ the guard cannot prove uniqueness ⇒ null (caller fails closed).
+  assert.equal(makeOccurrenceGuard({}), null);
+  assert.equal(makeOccurrenceGuard(), null);
+
+  // A UNIQUE active occurrence ⇒ safe (the lone occurrence is this resumed run itself).
+  const one = makeOccurrenceGuard({ searchElementInstances: async () => ({ items: [{ elementInstanceKey: '20' }] }) });
+  assert.deepEqual(await one('500', 'review-round'), { safe: true, candidates: ['20'], reason: 'unique' });
+  // Zero active (index lag) is also safe — no sibling to confuse it with.
+  const none = makeOccurrenceGuard({ searchElementInstances: async () => ({ items: [] }) });
+  assert.equal((await none('500', 'review-round')).safe, true);
+
+  // >1 ACTIVE occurrence of the same elementId ⇒ genuine parallel MI ⇒ FAIL CLOSED.
+  const many = makeOccurrenceGuard({ searchElementInstances: async () => ({ items: [{ elementInstanceKey: '20' }, { elementInstanceKey: '21' }] }) });
+  const v = await many('500', 'review-round');
+  assert.equal(v.safe, false);
+  assert.deepEqual(v.candidates, ['20', '21']);
+  assert.match(v.reason, /2 active occurrences/);
+
+  // A lookup error ⇒ fail closed (we cannot prove uniqueness).
+  const boom = makeOccurrenceGuard({ searchElementInstances: async () => { throw new Error('engine down'); } });
+  const e = await boom('500', 'review-round');
+  assert.equal(e.safe, false);
+  assert.match(e.reason, /lookup failed: engine down/);
+
+  // Missing process/element ids ⇒ fail closed (cannot correlate).
+  assert.equal((await one('', 'review-round')).safe, false);
+  assert.equal((await one('500', '')).safe, false);
+
+  // Tolerates a bare-array response and alternate key fields.
+  const arr = makeOccurrenceGuard({ searchElementInstances: async () => [{ key: '20' }] });
+  assert.deepEqual(await arr('500', 'review-round'), { safe: true, candidates: ['20'], reason: 'unique' });
+});
+
+test('#296 resumeRefIsExplicit: only a bare WIP-ref string is occurrence-authoritative', () => {
+  // A bare string ref is the process's explicit choice (nano-workforce#891, option 2):
+  // trusted as-is, bypassing elementId correlation AND the ambiguity guard.
+  assert.equal(resumeRefIsExplicit({ resumeFromCheckpoint: 'refs/nano/wip/10' }), true);
+  // The self-stamped object record is NOT explicit (it is correlated + guarded).
+  assert.equal(resumeRefIsExplicit({ resumeFromCheckpoint: { ref: 'refs/nano/wip/10' } }), false);
+  assert.equal(resumeRefIsExplicit({ resumeFromCheckpoint: 'refs/heads/main' }), false);
+  assert.equal(resumeRefIsExplicit({ resumeFromCheckpoint: '' }), false);
+  assert.equal(resumeRefIsExplicit({}), false);
+  assert.equal(resumeRefIsExplicit(undefined), false);
+});
+
 test('#295 makeOrphanProbe: spares an SLA-cancelled element inside a still-active process', async () => {
   // No reader at all → null (sweep then reclaims purely by TTL).
   assert.equal(makeOrphanProbe({}), null);
@@ -1858,12 +1904,16 @@ test('#295 setupWorkspaceCheckpoints: a resumed run adopts its predecessor via r
       return { workspaceDir: dir, gitEnv: ENV, committer: { name: 'bot', email: 'bot@example.com' }, startSha: sh(dir, 'rev-parse', 'HEAD'), workingBranch: 'nano/agent-work/main-x' };
     };
     const vars = [];
-    const camunda = { createElementInstanceVariables: async (input) => { vars.push(input); } };
+    const camunda = {
+      createElementInstanceVariables: async (input) => { vars.push(input); },
+      // #295 ambiguity guard: a UNIQUE active occurrence of this elementId ⇒ safe to adopt.
+      searchElementInstances: async () => ({ items: [{ elementInstanceKey: '20' }] }),
+    };
 
     // run1 is element 10 in process 500; it checkpoints and records resumeFromCheckpoint
     // at the PROCESS scope.
     const p1 = provision('run1');
-    const s1 = await setupWorkspaceCheckpoints({ provisioned: p1, job: { jobKey: '1', elementInstanceKey: '10', processInstanceKey: '500' }, jobType: 't', runId: 'run-1', camunda, logger: quietLogger(), env, deps: { sweepRegistry: new Map() } });
+    const s1 = await setupWorkspaceCheckpoints({ provisioned: p1, job: { jobKey: '1', elementInstanceKey: '10', processInstanceKey: '500', elementId: 'review-round' }, jobType: 't', runId: 'run-1', camunda, logger: quietLogger(), env, deps: { sweepRegistry: new Map() } });
     writeFileSync(join(p1.workspaceDir, 'wip.txt'), 'half done\n');
     const res = await s1.checkpointer.flush('abort', { timeoutMs: 0 });
     await s1.close();
@@ -1880,12 +1930,86 @@ test('#295 setupWorkspaceCheckpoints: a resumed run adopts its predecessor via r
     // refs/nano/wip/10 under refs/nano/wip/20 and RESTORES it.
     const p2 = provision('run2');
     const logger = quietLogger();
-    const job2 = { jobKey: '2', elementInstanceKey: '20', processInstanceKey: '500', variables: { resumeFromCheckpoint: resumeVar.variables.resumeFromCheckpoint } };
+    const job2 = { jobKey: '2', elementInstanceKey: '20', processInstanceKey: '500', elementId: 'review-round', variables: { resumeFromCheckpoint: resumeVar.variables.resumeFromCheckpoint } };
     const s2 = await setupWorkspaceCheckpoints({ provisioned: p2, job: job2, jobType: 't', runId: 'run-2', camunda, logger, env, deps: { sweepRegistry: new Map() } });
     assert.equal(s2.restored?.restored, true);
     assert.match(logger.lines.info.join('\n'), /adopted predecessor WIP checkpoint refs\/nano\/wip\/10/);
     assert.equal(readFileSync(join(p2.workspaceDir, 'wip.txt'), 'utf8'), 'half done\n');
     // The predecessor's content is now also under this run's own key.
+    assert.equal(sh(f.root, '--git-dir', f.remote, 'rev-parse', 'refs/nano/wip/20'), res.sha);
+    await s2.close();
+  } finally { f.cleanup(); }
+});
+
+test('#296 setupWorkspaceCheckpoints: refuses predecessor adoption when >1 occurrence is active (parallel MI)', async () => {
+  const f = fixture();
+  try {
+    const env = { NANO_AGENT_CHECKPOINT: 'on', NANO_AGENT_CHECKPOINT_INTERVAL_MS: '0' };
+    const provision = (name) => {
+      const { dir } = f.clone(name);
+      sh(dir, 'checkout', '-q', '-b', 'nano/agent-work/main-x');
+      return { workspaceDir: dir, gitEnv: ENV, committer: { name: 'bot', email: 'bot@example.com' }, startSha: sh(dir, 'rev-parse', 'HEAD'), workingBranch: 'nano/agent-work/main-x' };
+    };
+    const vars = [];
+    // Two active occurrences of the elementId in the process ⇒ ambiguous ⇒ fail closed.
+    const camunda = {
+      createElementInstanceVariables: async (input) => { vars.push(input); },
+      searchElementInstances: async () => ({ items: [{ elementInstanceKey: '20' }, { elementInstanceKey: '21' }] }),
+    };
+
+    const p1 = provision('run1');
+    const s1 = await setupWorkspaceCheckpoints({ provisioned: p1, job: { jobKey: '1', elementInstanceKey: '10', processInstanceKey: '500', elementId: 'review-round' }, jobType: 't', runId: 'run-1', camunda, logger: quietLogger(), env, deps: { sweepRegistry: new Map() } });
+    writeFileSync(join(p1.workspaceDir, 'wip.txt'), 'half done\n');
+    await s1.checkpointer.flush('abort', { timeoutMs: 0 });
+    await s1.close();
+    const resumeVar = vars.find((v) => v.variables.resumeFromCheckpoint);
+
+    const p2 = provision('run2');
+    const logger = quietLogger();
+    const job2 = { jobKey: '2', elementInstanceKey: '20', processInstanceKey: '500', elementId: 'review-round', variables: { resumeFromCheckpoint: resumeVar.variables.resumeFromCheckpoint } };
+    const s2 = await setupWorkspaceCheckpoints({ provisioned: p2, job: job2, jobType: 't', runId: 'run-2', camunda, logger, env, deps: { sweepRegistry: new Map() } });
+    // Ambiguous ⇒ NOT restored; the worktree stays pristine (no wip.txt laid down).
+    assert.equal(s2.restored, null);
+    assert.ok(!existsSync(join(p2.workspaceDir, 'wip.txt')), 'no sibling occurrence state is restored');
+    assert.match(logger.lines.warn.join('\n'), /not adopting predecessor WIP checkpoint .*ambiguous.*2 active occurrences/);
+    // This run never claimed the predecessor ref under its own key.
+    assert.throws(() => sh(f.root, '--git-dir', f.remote, 'rev-parse', '--verify', 'refs/nano/wip/20'));
+    await s2.close();
+  } finally { f.cleanup(); }
+});
+
+test('#296 setupWorkspaceCheckpoints: an EXPLICIT (string) predecessor ref bypasses the ambiguity guard', async () => {
+  const f = fixture();
+  try {
+    const env = { NANO_AGENT_CHECKPOINT: 'on', NANO_AGENT_CHECKPOINT_INTERVAL_MS: '0' };
+    const provision = (name) => {
+      const { dir } = f.clone(name);
+      sh(dir, 'checkout', '-q', '-b', 'nano/agent-work/main-x');
+      return { workspaceDir: dir, gitEnv: ENV, committer: { name: 'bot', email: 'bot@example.com' }, startSha: sh(dir, 'rev-parse', 'HEAD'), workingBranch: 'nano/agent-work/main-x' };
+    };
+    const vars = [];
+    // searchElementInstances WOULD report ambiguity, but an explicit string ref is
+    // occurrence-authoritative (the process chose it) ⇒ the guard is bypassed.
+    let searched = false;
+    const camunda = {
+      createElementInstanceVariables: async (input) => { vars.push(input); },
+      searchElementInstances: async () => { searched = true; return { items: [{ elementInstanceKey: '20' }, { elementInstanceKey: '21' }] }; },
+    };
+
+    const p1 = provision('run1');
+    const s1 = await setupWorkspaceCheckpoints({ provisioned: p1, job: { jobKey: '1', elementInstanceKey: '10', processInstanceKey: '500', elementId: 'review-round' }, jobType: 't', runId: 'run-1', camunda, logger: quietLogger(), env, deps: { sweepRegistry: new Map() } });
+    writeFileSync(join(p1.workspaceDir, 'wip.txt'), 'half done\n');
+    const res = await s1.checkpointer.flush('abort', { timeoutMs: 0 });
+    await s1.close();
+
+    const p2 = provision('run2');
+    const logger = quietLogger();
+    // The process delivers a BARE string ref (option 2) — trusted as-is.
+    const job2 = { jobKey: '2', elementInstanceKey: '20', processInstanceKey: '500', elementId: 'review-round', variables: { resumeFromCheckpoint: 'refs/nano/wip/10' } };
+    const s2 = await setupWorkspaceCheckpoints({ provisioned: p2, job: job2, jobType: 't', runId: 'run-2', camunda, logger, env, deps: { sweepRegistry: new Map() } });
+    assert.equal(s2.restored?.restored, true);
+    assert.equal(searched, false, 'the ambiguity guard is NOT consulted for an explicit ref');
+    assert.equal(readFileSync(join(p2.workspaceDir, 'wip.txt'), 'utf8'), 'half done\n');
     assert.equal(sh(f.root, '--git-dir', f.remote, 'rev-parse', 'refs/nano/wip/20'), res.sha);
     await s2.close();
   } finally { f.cleanup(); }

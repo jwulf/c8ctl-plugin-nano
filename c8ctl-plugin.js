@@ -90,7 +90,7 @@ import { createAgentInstanceProducer, isExternalAgentJob } from './agent-instanc
 // so the new agent CONTINUES rather than cold-reruns — at-least-once delivery becomes
 // a continuation, not a duplicate. Best-effort; degrades to the legacy cold rerun.
 import { resolveEffectiveEnvelope } from './agent-resume.mjs';
-import { checkpointConfig, checkpointEligibility, checkpointRef, recoveredCheckpointRef, predecessorCheckpointRef, pushNamedRef, observeRemoteRefSha, makeOrphanProbe, normalizeSecretValues, credentialsFromUrl, isAuthenticatedRemote, shouldSweep, sweepStaleCheckpoints, createGitRunner, fetchCheckpoint, restoreCheckpoint, createWorkspaceCheckpoint, createCheckpointer, deleteCheckpointRef, withCheckpointNote, sanitizeBranchSegment } from './agent-checkpoint.mjs';
+import { checkpointConfig, checkpointEligibility, checkpointRef, recoveredCheckpointRef, predecessorCheckpointRef, makeOccurrenceGuard, resumeRefIsExplicit, pushNamedRef, observeRemoteRefSha, makeOrphanProbe, normalizeSecretValues, credentialsFromUrl, isAuthenticatedRemote, shouldSweep, sweepStaleCheckpoints, createGitRunner, fetchCheckpoint, restoreCheckpoint, createWorkspaceCheckpoint, createCheckpointer, deleteCheckpointRef, withCheckpointNote, sanitizeBranchSegment } from './agent-checkpoint.mjs';
 
 const requireFromHere = createRequire(import.meta.url);
 const pluginDir = dirname(fileURLToPath(import.meta.url));
@@ -6784,6 +6784,17 @@ async function setupWorkspaceCheckpoints({ provisioned, envelope = null, token =
     // which time the workspace (and its askpass helper) has been reaped.
     const originUrl = ((await startupGit(['remote', 'get-url', 'origin'])).stdout || '').trim();
 
+    // Bound every checkpoint-path SDK call: a timed-out call rejects; a late settle is
+    // swallowed so it can never surface as an unhandled rejection. Hoisted here (ahead
+    // of the GC block, which reuses them) so the #295 ambiguity guard below is bounded.
+    const CP_SDK_TIMEOUT_MS = 10000;
+    const withDeadline = (p, ms, label) => {
+      let timer;
+      const timeout = new Promise((_r, reject) => { timer = setTimeout(() => reject(new Error(`${label} timed out after ${ms}ms`)), ms); });
+      Promise.resolve(p).catch(() => {});
+      return Promise.race([Promise.resolve(p).finally(() => clearTimeout(timer)), timeout]);
+    };
+
     let prior = null;
     let restored = null;
     let startupFetchFailed = false;
@@ -6804,8 +6815,41 @@ async function setupWorkspaceCheckpoints({ provisioned, envelope = null, token =
       // with parallel/sequential agent tasks never adopts another task's state.
       const predRef = predecessorCheckpointRef(job?.variables, ref, job?.elementId ?? null);
       if (predRef) {
+        // #295 ambiguity guard (nano-workforce#891). A self-recorded predecessor is
+        // correlated only by the STATIC elementId, which is NOT unique under parallel
+        // multi-instance of one agent-task element (N occurrences share the elementId
+        // AND the one process-scoped resume slot). Parallel MI of a single agent-task
+        // element is OUT OF SCOPE for resume, but we make a wrong adoption IMPOSSIBLE
+        // rather than merely unlikely: unless the process delivered an EXPLICIT
+        // occurrence-authoritative ref (a bare string — then it is trusted as-is), ask
+        // the engine whether >1 occurrence of this elementId is ACTIVE in the process
+        // instance. More than one ⇒ ambiguous correlation ⇒ FAIL CLOSED (skip adoption,
+        // start clean) rather than risk restoring a sibling occurrence's state. The
+        // guard also fails closed when the host SDK can't answer (no search method, or
+        // the lookup errors) — we cannot prove uniqueness, so we do not adopt.
+        let adoptAllowed = true;
+        if (!resumeRefIsExplicit(job?.variables)) {
+          const guard = makeOccurrenceGuard({
+            searchElementInstances: typeof camunda?.searchElementInstances === 'function'
+              ? (q) => withDeadline(camunda.searchElementInstances(q, { consistency: { waitUpToMs: 0 } }), CP_SDK_TIMEOUT_MS, 'searchElementInstances')
+              : undefined,
+          });
+          if (!guard) {
+            adoptAllowed = false;
+            log.warn(`not adopting predecessor WIP checkpoint ${predRef} — the host SDK exposes no element-instance search, so the elementId correlation for element ${job?.elementId ?? '?'} cannot be proven unambiguous; starting clean. (Parallel multi-instance of one agent-task element is unsupported for resume.)`);
+          } else {
+            let verdict = null;
+            try { verdict = await guard(job?.processInstanceKey ?? null, job?.elementId ?? null); } catch (err) { verdict = { safe: false, candidates: [], reason: `guard failed: ${oneLineLog(err?.message || err)}` }; }
+            if (!verdict?.safe) {
+              adoptAllowed = false;
+              log.warn(`not adopting predecessor WIP checkpoint ${predRef} — ambiguous elementId correlation for element ${job?.elementId ?? '?'} in process ${job?.processInstanceKey ?? '?'} (${verdict?.reason || 'unknown'}${verdict?.candidates?.length ? `; active occurrences: ${verdict.candidates.join(', ')}` : ''}); starting clean. (Parallel multi-instance of one agent-task element is unsupported for resume.)`);
+            }
+          }
+        }
         let predCp = null;
-        try { predCp = await fetchCp({ git: startupGit, ref: predRef }); } catch (err) { log.debug(`could not fetch predecessor WIP checkpoint ${predRef} — ${oneLineLog(err?.message || err)}.`); }
+        if (adoptAllowed) {
+          try { predCp = await fetchCp({ git: startupGit, ref: predRef }); } catch (err) { log.debug(`could not fetch predecessor WIP checkpoint ${predRef} — ${oneLineLog(err?.message || err)}.`); }
+        }
         if (predCp?.sha) {
           // Create-only adoption (default expectSha=''): only write our key while it
           // is ABSENT, so a concurrent same-key retry that already adopted + advanced
@@ -6860,11 +6904,6 @@ async function setupWorkspaceCheckpoints({ provisioned, envelope = null, token =
     // still-running GC could hold close()'s drain past the supervisor's SIGKILL window.
     let gcAbort = null;
     const gcKey = provisioned.remote || provisioned.workspaceDir;
-    // Bound every checkpoint-path SDK call: the GC sweep and the variable write are
-    // awaited by `stop()`/`close()` (and `onCheckpoint`), so an unbounded engine
-    // call could wedge worker shutdown / the ACP loop. A timed-out call rejects; a
-    // late settle is swallowed so it can never surface as an unhandled rejection.
-    const CP_SDK_TIMEOUT_MS = 10000;
     // A single overall bound on the whole GC sweep. Individual ops are already
     // bounded (each terminal lookup CP_SDK_TIMEOUT_MS, each git op cfg.gitTimeoutMs),
     // but a sweep chains up to maxLookups + maxDeletes of them, so a slow/unreachable
@@ -6875,12 +6914,6 @@ async function setupWorkspaceCheckpoints({ provisioned, envelope = null, token =
     // reap. Any refs it did not reach are reclaimed on a future hourly sweep (thread
     // 4099558206 / 4099762442).
     const GC_OVERALL_TIMEOUT_MS = 120000;
-    const withDeadline = (p, ms, label) => {
-      let timer;
-      const timeout = new Promise((_r, reject) => { timer = setTimeout(() => reject(new Error(`${label} timed out after ${ms}ms`)), ms); });
-      Promise.resolve(p).catch(() => {});
-      return Promise.race([Promise.resolve(p).finally(() => clearTimeout(timer)), timeout]);
-    };
     if (shouldSweep(gcKey, { everyMs: cfg.gcEveryMs, now: now(), registry: deps.sweepRegistry })) {
       // #295: a WIP ref is an orphan only when its element is terminal AND its
       // PROCESS instance is finished too. An element cancelled by an SLA boundary

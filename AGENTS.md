@@ -278,7 +278,18 @@ SDK client (job workers) — do **not** add the SDK as a dependency or use raw
   **process-scoped** `resumeFromCheckpoint` variable (written at `processInstanceKey`
   with `local:true`, so it survives element re-entry); on resume
   `predecessorCheckpointRef` reads it and `pushNamedRef` copies the predecessor ref
-  under this run's key so restore/ownership/discard run unchanged. (c) **GC-proof
+  under this run's key so restore/ownership/discard run unchanged. Because that
+  correlation keys on the **static `elementId`** (not an occurrence id), it is
+  AMBIGUOUS under parallel multi-instance of one agent-task element in a single process
+  instance — which is **out of scope for resume** (no nano-workforce process fans one
+  agent-task element out that way). `makeOccurrenceGuard` enforces it: before adopting,
+  it asks the engine (`searchElementInstances`, `state:'ACTIVE'`) how many occurrences of
+  the `elementId` are active in the process instance and **fails closed to a clean start**
+  on >1 (or when the host SDK can't answer / the lookup errors) rather than risk
+  restoring a sibling occurrence's state. `resumeRefIsExplicit` bypasses both the
+  correlation and the guard when the process delivers an explicit occurrence-authoritative
+  predecessor ref as a bare **string** (nano-workforce#891 plugs in with no further plugin
+  change). (c) **GC-proof
   recovery refs**: on a force-stop/abort or failed (SLA-cancelled) run,
   `preserveRecovery` promotes the latest snapshot to `refs/nano/recovered/<eik>`
   (`recoveredCheckpointRef`) — **outside** the `refs/nano/wip/*` namespace the sweep

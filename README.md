@@ -835,6 +835,23 @@ the job with a decremented retry count. Profiles are stored in the plugin's
 > Caveats: WIP refs are visible to anyone who can read the repo; the worker can't pause
 > the agent, so a snapshot may catch a half-written file. Everything is best-effort — a
 > failure degrades to transcript-only resume.
+>
+> - **SLA-cancel resume + its one constraint.** When a human answers an SLA escalation
+>   the task re-enters as a *new* element instance (new key), so the predecessor's
+>   checkpoint is correlated to this task by the element's **static `elementId`** within
+>   the process instance. That id is **not unique if one agent-task element runs as
+>   parallel multi-instance within a single process instance** (the concurrent
+>   occurrences share both the id and the one process-scoped resume slot). **Parallel
+>   multi-instance of a single agent-task element is therefore unsupported for resume**
+>   (no nano-workforce process fans one agent-task element out that way — parallel
+>   fan-out uses distinct child processes or distinct element ids, and rounds/retries are
+>   sequential). To make a wrong adoption *impossible* rather than merely unlikely, the
+>   restore path asks the engine how many occurrences of the `elementId` are **active**
+>   before adopting a predecessor checkpoint: more than one — or an engine that can't
+>   answer — **fails closed to a clean start** (a fresh clone, no restored state) instead
+>   of risking a sibling occurrence's work. When the process delivers an explicit,
+>   occurrence-authoritative predecessor ref (a bare ref string) that ref is trusted
+>   as-is and the ambiguity check is skipped.
 
 > **Agent outcomes.** A harness may report an explicit end-of-task outcome in its
 > `session/prompt` result as `_meta.outcome` — `{ "status": "completed" | "blocked",

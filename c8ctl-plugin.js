@@ -7068,15 +7068,19 @@ async function setupWorkspaceCheckpoints({ provisioned, envelope = null, token =
         log.debug(`WIP checkpoint ${ref}@${res.sha.slice(0, 12)} pushed (${res.reason})${res.excluded?.length ? `; excluded ${res.excluded.map((e) => `${e.path} [${e.why}]`).join(', ')}` : ''}.`);
         if (!setVar) return;
         // #296: `ownedSha` (above) is the only state preserveRecovery() needs from
-        // this callback, and it is already set. The best-effort metadata writes must
-        // NOT sit on the serialized flush/promote critical path during a force-stop
-        // or failed flush: awaiting them there lets a hung engine burn the whole
-        // FORCE_STOP_RECOVERY_MS budget before the recovery git promotion can run.
-        // For those reasons fire the writes off the chain (still best-effort — the
-        // GC-proof recovery ref, not these vars, is the durable artifact of a
-        // force-stopped run); on every normal checkpoint await them as before so a
-        // resume can find the ref.
-        if (res.reason === 'abort' || res.reason === 'failed') { setVar(res).catch(() => {}); return; }
+        // this callback, and it is already set. Only a FORCE-STOP (`abort`) flush
+        // fires the metadata writes off the serialized flush/promote chain: that path
+        // is bounded by FORCE_STOP_RECOVERY_MS and the worker returns early (no
+        // settle), so awaiting a hung engine there could burn the whole recovery
+        // budget before the recovery git promotion runs — and the GC-proof recovery
+        // ref, not these vars, is the durable artifact of a force-stopped run.
+        // A `failed` flush is DIFFERENT: the job settles (settleJob.fail) right after
+        // the flush returns, and a retry/reactivation can read variables before a
+        // fire-and-forget `resumeFromCheckpoint` write is durable — worse, a delayed
+        // process-scoped write could overwrite a NEWER activation's pointer. So the
+        // failed path (and every normal checkpoint) AWAITS the write before
+        // settlement, keeping the predecessor pointer durable before the job settles.
+        if (res.reason === 'abort') { setVar(res).catch(() => {}); return; }
         await setVar(res);
       },
     });

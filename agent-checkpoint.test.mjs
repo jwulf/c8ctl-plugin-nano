@@ -1820,6 +1820,37 @@ test('#296 force-stop recovery is not blocked by hung metadata writes', async ()
   } finally { f.cleanup(); }
 });
 
+test('#296 failed flush AWAITS the metadata write so the resume pointer is durable before settlement', async () => {
+  // High finding (r4243737447): on the SLA-failure path the job settles
+  // (settleJob.fail) immediately after `flush('failed')` returns, and a resumed
+  // activation reads `resumeFromCheckpoint` to find its predecessor. If that write
+  // were fired off the chain (as the force-stop `abort` path deliberately does), the
+  // job could settle — and the retry could read variables — BEFORE the pointer is
+  // durable; a delayed process-scoped write could even overwrite a NEWER activation's
+  // pointer. So the `failed` flush must AWAIT the write: by the time it resolves, the
+  // process-scoped resumeFromCheckpoint variable has been recorded.
+  const f = fixture();
+  try {
+    const env = { NANO_AGENT_CHECKPOINT: 'on', NANO_AGENT_CHECKPOINT_INTERVAL_MS: '0' };
+    const { dir } = f.clone('failed-await');
+    sh(dir, 'checkout', '-q', '-b', 'nano/agent-work/main-x');
+    const provisioned = { workspaceDir: dir, gitEnv: ENV, committer: { name: 'bot', email: 'bot@example.com' }, startSha: sh(dir, 'rev-parse', 'HEAD'), workingBranch: 'nano/agent-work/main-x' };
+    const vars = [];
+    const camunda = { createElementInstanceVariables: async (input) => { vars.push(input); } };
+    const s = await setupWorkspaceCheckpoints({ provisioned, job: { jobKey: '1', elementInstanceKey: '819', processInstanceKey: '500', elementId: 'review' }, jobType: 't', runId: 'r', camunda, logger: quietLogger(), env, deps: { sweepRegistry: new Map() } });
+    writeFileSync(join(dir, 'wip.txt'), 'half done\n');
+    const res = await s.checkpointer.flush('failed', { timeoutMs: 20_000 });
+    assert.ok(res.sha, JSON.stringify(res));
+    // By the time the failed flush resolves, BOTH the element-scope agentCheckpoint
+    // and the process-scope resumeFromCheckpoint writes have landed (awaited).
+    const resume = vars.find((v) => v.elementInstanceKey === '500' && v.variables?.resumeFromCheckpoint);
+    assert.ok(resume, 'the process-scoped resumeFromCheckpoint write completed before the failed flush returned');
+    assert.equal(resume.variables.resumeFromCheckpoint.ref, 'refs/nano/wip/819');
+    assert.equal(resume.variables.resumeFromCheckpoint.sha, res.sha);
+    await s.close({ timeoutMs: 2000 });
+  } finally { f.cleanup(); }
+});
+
 
 test('#296 (F9) checkpoint git stays usable AFTER the job abort; abortRecovery cancels it', async () => {
   // The round-4 F8 attempt bound the checkpoint git runner to the JOB abortSignal.

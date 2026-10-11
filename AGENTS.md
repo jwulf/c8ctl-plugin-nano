@@ -63,7 +63,19 @@ SDK client (job workers) — do **not** add the SDK as a dependency or use raw
   run the harness with that workspace as `cwd` → push the branch (`branch.push`)
   → reconcile the **agent-opened** PR (`task.allowPr`, via `gh pr list --head`).
   The repo token is delivered via `GIT_ASKPASS` (env) and **redacted** from all
-  logs/results — never in argv or the remote URL. A push failure is **non-fatal**
+  logs/results — never in argv or the remote URL. When no `GITHUB_TOKEN` is
+  exported the token comes from a cached `gh auth token` read (issue #293): the
+  cache is a record `{ token, fingerprint, scopes, since, lastCheck }` with a
+  TTL (`NANO_GH_TOKEN_TTL_MS`, default 5m), re-read off the job path by a
+  worker-lifetime timer (`startGhAuthTokenRefresh`), so a `gh auth login` /
+  `refresh` while the fleet runs is adopted within one TTL — never a stale
+  process-lifetime memo. A clone/push that fails with an auth/OAuth-scope error
+  (`isGitAuthFailure`) drops the cache, re-reads once, and retries once before
+  failing. The token's **fingerprint + scopes** (never the value) are logged at
+  startup and on change, ride the activity marker (`ghAuthTokenInfo()`) into a
+  `supervisor status` **GH AUTH** column, and `supervisor reload-credentials`
+  (SIGUSR1) drops the cache fleet-wide without draining in-flight jobs. A push
+  failure is **non-fatal**
   and sets `pushFailed` (the authoritative "work is stranded / workspace
   preserved" flag) so the worker still completes the job and the process model
   drives the merge; a clone/checkout failure sheds (retryable `ProvisionError`).

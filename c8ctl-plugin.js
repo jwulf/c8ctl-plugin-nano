@@ -6759,7 +6759,15 @@ async function setupWorkspaceCheckpoints({ provisioned, envelope = null, token =
       ...(committer.name ? { GIT_AUTHOR_NAME: committer.name, GIT_COMMITTER_NAME: committer.name } : {}),
       ...(committer.email ? { GIT_AUTHOR_EMAIL: committer.email, GIT_COMMITTER_EMAIL: committer.email } : {}),
     };
-    const git = mkGit({ cwd: provisioned.workspaceDir, env: gitEnv, timeoutMs: cfg.gitTimeoutMs });
+    // #296 (F8): pass the job's `abortSignal` to the checkpoint-path git runner, so a
+    // worker force-stop (which aborts that signal) CANCELS an in-flight checkpoint
+    // push instead of letting it run to the full `gitTimeoutMs`. Without this the
+    // force-stop recovery's `Promise.race` only bounds the AWAIT — the underlying
+    // checkpoint keeps running uncancelled, `stop()`/`close()` re-wait that same
+    // chain, and the worker can still reach the supervisor's SIGKILL backstop with
+    // recovery unfinished. With the signal wired, the abort tears the git child down
+    // (SIGTERM→SIGKILL) so the chain settles promptly and `close()` drains fast.
+    const git = mkGit({ cwd: provisioned.workspaceDir, env: gitEnv, timeoutMs: cfg.gitTimeoutMs, signal: abortSignal || undefined });
     // The STARTUP git work (origin lookup, checkpoint fetch, restore) is cancellable:
     // if the runner is interrupted (lock loss / stop --force) mid-setup, the in-flight
     // git child is killed and later ops fail fast, so setup unwinds instead of holding
@@ -7046,6 +7054,25 @@ async function setupWorkspaceCheckpoints({ provisioned, envelope = null, token =
           // the lease once a newer run moved it, instead of blind-forcing over
           // whatever is current (Copilot review on #296).
           const prevRecSha = await observeRemoteRefSha({ git, ref: recRef });
+          // #296 (F7): a bare CAS against the just-observed value is NOT ownership —
+          // a superseded activation can observe the newer run's `shaB` here and still
+          // overwrite it with its older `ownedShaA`. Mirror the WIP path's
+          // `Nano-Checkpoint-Run` ownership check: only overwrite an EXISTING recovery
+          // ref when it is either ours (a re-preservation by this same run) or the
+          // run we explicitly superseded (`prior?.runId`). An absent ref is a
+          // create-only write. A ref owned by any OTHER (newer, concurrent) run is
+          // left intact — we keep its (newer) recovery point.
+          if (prevRecSha) {
+            let ownerRunId = '';
+            try { ownerRunId = (await fetchCheckpoint({ git, ref: recRef }))?.runId || ''; } catch { ownerRunId = ''; }
+            const myRun = String(runId || '');
+            const supersededRun = String(prior?.runId || '');
+            const foreign = ownerRunId && ownerRunId !== myRun && !(supersededRun && ownerRunId === supersededRun);
+            if (foreign) {
+              log.warn(`recovery checkpoint ${recRef} is owned by a newer run (${ownerRunId}) — keeping its recovery point; the WIP ref ${ref} is still retained for recovery.`);
+              return null;
+            }
+          }
           const r = await pushNamedRef({ git, ref: recRef, sha: ownedSha, expectSha: prevRecSha });
           if (r?.ok) {
             logger.info?.(`${prefix} (${corr}): preserved a GC-proof recovery checkpoint ${recRef}@${ownedSha.slice(0, 12)} (${reason}) — it survives the orphan GC so the SLA-cancelled/force-stopped run can be recovered and resumed.`);
@@ -7077,8 +7104,20 @@ async function setupWorkspaceCheckpoints({ provisioned, envelope = null, token =
         } catch { return true; }
       },
       // Stop snapshotting and wait for in-flight git work (checkpoint + GC) so the
-      // run dir can be reaped safely.
-      async close() { await checkpointer.stop(); await gc; },
+      // run dir can be reaped safely. `close()` is bounded by `closeTimeoutMs` so a
+      // force-stopped worker is never held past the supervisor's SIGKILL backstop by
+      // the (up to 120s) GC sweep: on the deadline we stop awaiting and let the
+      // caller proceed (the in-flight checkpoint git is already cancelled via the
+      // job's abortSignal, so the chain settles on its own; the GC sweep is aborted
+      // by its own controller). Default 0 = unbounded (normal/failed paths drain
+      // fully); the force-stop path passes FORCE_STOP_RECOVERY_MS.
+      async close({ timeoutMs = 0 } = {}) {
+        const drain = (async () => { await checkpointer.stop(); await gc; })();
+        if (!timeoutMs) return drain;
+        let t;
+        const cap = new Promise((resolve) => { t = setTimeout(resolve, timeoutMs); t?.unref?.(); });
+        try { return await Promise.race([drain, cap]); } finally { clearTimeout(t); }
+      },
       async discard() {
         await checkpointer.stop();
         try {
@@ -12620,6 +12659,12 @@ async function workAgent(req, flags, ctx) {
         // performs a last-chance `failed` flush so edits since the last periodic
         // checkpoint are not lost.
         let checkpointFinalized = false;
+        // #296 (F8): set on the worker force-stop path so the `finally` below bounds
+        // its `close()` drain to the same FORCE_STOP_RECOVERY_MS budget — a force-stop
+        // must never be held past the supervisor's SIGKILL backstop by the (up to
+        // 120s) GC sweep. The in-flight checkpoint git is already cancelled via the
+        // job's abortSignal, so the chain settles on its own after we stop awaiting.
+        let forceStopping = false;
         // #295: the GC-proof recovery ref (and SHA) a preserveRecovery() pushed on an
         // SLA cancellation / failed run, surfaced in the job outcome (io.nanobpm.agentResult)
         // — but ONLY on the failed/SLA-cancel path, which settles normally and so reaches
@@ -12795,6 +12840,7 @@ async function workAgent(req, flags, ctx) {
             // Best-effort: if the budget elapses we give up on the recovery ref (the
             // WIP ref + TTL remain the fallback), never block the yield/exit.
             if (checkpointer) {
+              forceStopping = true;
               const recoveryDeadline = FORCE_STOP_RECOVERY_MS;
               const recover = (async () => {
                 await checkpointer.flush('abort', { timeoutMs: recoveryDeadline }); checkpointFinalized = true;
@@ -13006,7 +13052,10 @@ async function workAgent(req, flags, ctx) {
             // last periodic checkpoint. `flush` forces past the post-stop guard and is
             // bounded; the lease still protects a newer owner. Then close (drain).
             if (checkpointer && !checkpointFinalized) { try { await checkpointer.flush('failed', { timeoutMs: checkpointing.flushTimeoutMs }); } catch { /* best effort */ } }
-            try { await checkpointing.close(); } catch { /* best effort */ }
+            // #296 (F8): on a force-stop, bound the drain to the recovery budget so the
+            // worker exits inside the supervisor's SIGKILL window even if the GC sweep
+            // (up to 120s) is still running; the cancelled checkpoint git settles alone.
+            try { await checkpointing.close(forceStopping ? { timeoutMs: FORCE_STOP_RECOVERY_MS } : undefined); } catch { /* best effort */ }
           }
           if (isContainer) liveRunIds.delete(runId);
           // #205: clear the in-flight job marker now the harness has stopped — the

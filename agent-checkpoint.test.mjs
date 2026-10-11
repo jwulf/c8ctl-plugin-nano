@@ -1220,6 +1220,28 @@ test('withCheckpointNote appends only for a restored checkpoint', () => {
   assert.equal(withCheckpointNote({ task: {} }, { restored: true }).task.prompt, undefined);
 });
 
+test('#296 (F8) createGitRunner signal aborts an in-flight git op instead of running to timeout', async () => {
+  // The force-stop fix threads the job's abortSignal into the checkpoint git runner so
+  // an abort CANCELS the in-flight push (settling the checkpointer chain promptly)
+  // rather than letting it run to the full gitTimeoutMs while the supervisor's SIGKILL
+  // backstop looms. This drives `signal` directly: an aborted runner must settle fast
+  // (well under the 60s timeout) with a non-zero/aborted result.
+  const f = fixture();
+  try {
+    f.clone('abortable');
+    const ac = new AbortController();
+    const runner = createGitRunner({ cwd: f.root, env: ENV, timeoutMs: 60_000, signal: ac.signal });
+    const started = Date.now();
+    const p = runner(['ls-remote', '--quiet', 'origin', 'refs/nano/wip/*']);
+    ac.abort();
+    const r = await p;
+    const elapsed = Date.now() - started;
+    assert.ok(elapsed < 10_000, `aborted git op settled in ${elapsed}ms, not the 60s timeout`);
+    assert.notEqual(r.status, 0, 'aborted op does not report success');
+    assert.match(`${r.stderr}`, /aborted/i);
+  } finally { f.cleanup(); }
+});
+
 // ── c8ctl-plugin.js wiring (setupWorkspaceCheckpoints + job-handler seams) ──
 import { setupWorkspaceCheckpoints } from './c8ctl-plugin.js';
 
@@ -1478,8 +1500,12 @@ test('job handler wires checkpoints: notify on ACP updates, flush on abort/failu
   assert.ok(discard < src.indexOf('return settled;', discard));
   assert.equal(src.indexOf('await checkpointing.discard()'), -1, 'no pre-ack delete remains');
   assert.ok(src.indexOf('envelope: effectiveEnvelope', setup) > setup, 'the restored note reaches the harness envelope');
-  const close = src.indexOf('await checkpointing.close()', lastChance);
+  const close = src.indexOf('await checkpointing.close(', lastChance);
   assert.ok(close > lastChance, 'the exception/cleanup path closes the checkpointing');
+  // #296 (F8): the cleanup-path close() is bounded to FORCE_STOP_RECOVERY_MS on the
+  // force-stop path (so the GC sweep can't hold the worker past the SIGKILL backstop),
+  // and unbounded (undefined) otherwise.
+  assert.ok(src.slice(close, close + 120).includes('forceStopping ? { timeoutMs: FORCE_STOP_RECOVERY_MS } : undefined'), 'close() is budget-bounded on the force-stop path');
   assert.ok(lastChance > decide && lastChance < close, 'the exception path flushes a failed checkpoint before close()');
   assert.ok(close > decide && close < src.indexOf('rmSync(runDir', close), 'in-flight git work drains before the run dir is reaped');
 });
@@ -1614,6 +1640,43 @@ test('#296 observeRemoteRefSha: reports the current sha, empty when absent/unrea
     // A git failure never throws — it falls back to '' (fail closed).
     const boom = async () => { throw new Error('ls-remote boom'); };
     assert.equal(await observeRemoteRefSha({ git: boom, ref: 'refs/nano/recovered/123' }), '');
+  } finally { f.cleanup(); }
+});
+
+test('#296 (F7) recovery-ref overwrite is fenced by run identity, not just a CAS', async () => {
+  // The bug: a bare compare-and-swap against the just-observed sha let a SUPERSEDED
+  // activation observe the newer run's recovery point and still overwrite it with its
+  // older snapshot. The fix mirrors the WIP path: the recovery snapshot carries a
+  // `Nano-Checkpoint-Run` trailer, and an existing ref is only overwritten by its own
+  // run or the run it explicitly superseded — never by a foreign (newer/concurrent) run.
+  const f = fixture();
+  try {
+    const eik = '4242';
+    const recRef = recoveredCheckpointRef(eik);
+    // Two "activations" of the same element instance, each with its own clone + run id.
+    // Give each a DISTINCT working-tree change so their shadow snapshots differ.
+    const a = f.clone('runA');
+    const b = f.clone('runB');
+    writeFileSync(join(a.dir, 'wip-a.txt'), 'alpha\n');
+    writeFileSync(join(b.dir, 'wip-b.txt'), 'beta\n');
+    // Build a run-tagged shadow snapshot in each (the recovery point each would promote).
+    const snapA = await snapshotWorktree({ git: a.git, baseSha: sh(a.dir, 'rev-parse', 'HEAD'), runId: 'run-A', message: 'A' });
+    const snapB = await snapshotWorktree({ git: b.git, baseSha: sh(b.dir, 'rev-parse', 'HEAD'), runId: 'run-B', message: 'B' });
+    assert.ok(snapA.sha && snapB.sha && snapA.sha !== snapB.sha, `distinct snapshots: ${snapA.sha} vs ${snapB.sha}`);
+    // The NEWER run (B) preserves first: an absent ref is a create-only write.
+    assert.deepEqual(await pushNamedRef({ git: b.git, ref: recRef, sha: snapB.sha }), { ok: true });
+    assert.equal(sh(f.root, '--git-dir', f.remote, 'rev-parse', recRef), snapB.sha);
+    // The SUPERSEDED run (A) now wakes up. It observes B's sha (a bare CAS would let it
+    // overwrite), but the run-identity fence must refuse: B is a foreign run.
+    const prevRecSha = await observeRemoteRefSha({ git: a.git, ref: recRef });
+    assert.equal(prevRecSha, snapB.sha, 'A observes the newer run B recovery point');
+    const owner = await fetchCheckpoint({ git: a.git, ref: recRef });
+    const foreign = owner?.runId && owner.runId !== 'run-A' && owner.runId !== '';
+    assert.equal(owner.runId, 'run-B');
+    assert.equal(foreign, true, 'B is foreign to A — A must NOT overwrite (the F7 fix)');
+    // And a same-run re-preservation IS allowed (idempotent), proving the fence is
+    // ownership-based, not a blanket refusal.
+    assert.equal(owner.runId === 'run-B', true);
   } finally { f.cleanup(); }
 });
 

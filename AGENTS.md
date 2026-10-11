@@ -290,9 +290,18 @@ SDK client (job workers) — do **not** add the SDK as a dependency or use raw
   result. All recovery-ref writes are **fenced** (Copilot review on #296): predecessor
   adoption is create-only and the recovery promotion leases against the sha it observed
   on `refs/nano/recovered/<eik>`, so a slower/stale activation can never blind-force
-  over a newer run's recovery point (`pushNamedRef`/`observeRemoteRefSha`). The
-  force-stop flush+promote is **bounded** by `FORCE_STOP_RECOVERY_MS` and the
-  supervisor's `forceStopWorker` waits `STOP_GRACE_MS + FORCE_STOP_RECOVERY_MS` before
+  over a newer run's recovery point (`pushNamedRef`/`observeRemoteRefSha`). That lease
+  is only a compare-and-swap, so it is **reinforced by run identity**: an existing
+  recovery ref is overwritten only when its `Nano-Checkpoint-Run` trailer names this
+  run or the run it explicitly superseded (`prior.runId`) — a foreign (newer/concurrent)
+  run's recovery point is kept, never replaced by an older snapshot. The
+  force-stop flush+promote is **bounded** by `FORCE_STOP_RECOVERY_MS` and made genuinely
+  **cancellable**: the checkpoint-path git runner carries the job's `abortSignal`, so a
+  force-stop abort tears the in-flight push down (SIGTERM→SIGKILL) instead of letting it
+  run to `gitTimeoutMs`, and the post-abort `close()` drain is itself capped at
+  `FORCE_STOP_RECOVERY_MS` so the (up to 120s) GC sweep can't hold the worker past the
+  supervisor's SIGKILL backstop. The supervisor's `forceStopWorker` waits
+  `STOP_GRACE_MS + FORCE_STOP_RECOVERY_MS` before
   its SIGKILL backstop, so a worker can finish writing the recovery ref before it is
   killed (a worker that exits sooner is reaped immediately). (d) The GC reclaim log
   reports `ref@sha [why]`

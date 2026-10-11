@@ -8,6 +8,7 @@ import {
   checkpointConfig, checkpointRef, checkpointEligibility, classifyPushFailure, containsSecret, normalizeSecretValues, credentialsFromUrl, isAuthenticatedRemote, shouldSweep, sweepStaleCheckpoints, isDeniedPath, isCheckpointTrigger, createGitRunner,
   snapshotWorktree, pushCheckpoint, fetchCheckpoint, restoreCheckpoint, deleteCheckpointRef, redactUrlUserinfo, CHECKPOINT_DETACHED_MARKER,
   createWorkspaceCheckpoint, createCheckpointer, withCheckpointNote,
+  recoveredCheckpointRef, predecessorCheckpointRef, pushNamedRef, makeOrphanProbe, RECOVERED_REF_PREFIX,
 } from './agent-checkpoint.mjs';
 
 const ENV = {
@@ -1448,4 +1449,204 @@ test('job handler wires checkpoints: notify on ACP updates, flush on abort/failu
   assert.ok(close > lastChance, 'the exception/cleanup path closes the checkpointing');
   assert.ok(lastChance > decide && lastChance < close, 'the exception path flushes a failed checkpoint before close()');
   assert.ok(close > decide && close < src.indexOf('rmSync(runDir', close), 'in-flight git work drains before the run dir is reaped');
+});
+
+// ── #295: orphan GC must spare SLA-cancelled runs; recovery/predecessor refs ──
+
+test('#295 recoveredCheckpointRef / RECOVERED_REF_PREFIX: outside the WIP (swept) namespace', () => {
+  assert.equal(RECOVERED_REF_PREFIX, 'refs/nano/recovered/');
+  assert.equal(recoveredCheckpointRef('808'), 'refs/nano/recovered/808');
+  assert.equal(recoveredCheckpointRef('a-b_C'), 'refs/nano/recovered/a-b_C');
+  assert.equal(recoveredCheckpointRef(''), null);
+  assert.equal(recoveredCheckpointRef('bad/key'), null);
+  assert.equal(recoveredCheckpointRef(null), null);
+  // A recovery ref is NOT in the WIP namespace the sweep enumerates, so the GC can
+  // never reclaim it — the whole point of #295.
+  assert.ok(!recoveredCheckpointRef('808').startsWith('refs/nano/wip/'));
+});
+
+test('#295 predecessorCheckpointRef: reads resumeFromCheckpoint; rejects self/malformed/foreign', () => {
+  // String form.
+  assert.equal(predecessorCheckpointRef({ resumeFromCheckpoint: 'refs/nano/wip/10' }), 'refs/nano/wip/10');
+  // Object form (what the plugin actually writes).
+  assert.equal(predecessorCheckpointRef({ resumeFromCheckpoint: { ref: 'refs/nano/wip/10', sha: 'abc' } }), 'refs/nano/wip/10');
+  // The same ref this run already owns is not a predecessor.
+  assert.equal(predecessorCheckpointRef({ resumeFromCheckpoint: 'refs/nano/wip/20' }, 'refs/nano/wip/20'), null);
+  assert.equal(predecessorCheckpointRef({ resumeFromCheckpoint: { ref: 'refs/nano/wip/20' } }, 'refs/nano/wip/20'), null);
+  // A different run's ref IS adopted.
+  assert.equal(predecessorCheckpointRef({ resumeFromCheckpoint: 'refs/nano/wip/10' }, 'refs/nano/wip/20'), 'refs/nano/wip/10');
+  // Missing / malformed / foreign-namespace are all ignored.
+  assert.equal(predecessorCheckpointRef(undefined), null);
+  assert.equal(predecessorCheckpointRef({}), null);
+  assert.equal(predecessorCheckpointRef({ resumeFromCheckpoint: '' }), null);
+  assert.equal(predecessorCheckpointRef({ resumeFromCheckpoint: 'refs/heads/main' }), null);
+  assert.equal(predecessorCheckpointRef({ resumeFromCheckpoint: 'refs/nano/wip/bad/key' }), null);
+});
+
+test('#295 makeOrphanProbe: spares an SLA-cancelled element inside a still-active process', async () => {
+  // No reader at all → null (sweep then reclaims purely by TTL).
+  assert.equal(makeOrphanProbe({}), null);
+  assert.equal(makeOrphanProbe({ getElementInstance: null }), null);
+
+  // Element-only (host SDK without getProcessInstance) keeps the legacy behaviour.
+  const elemOnly = makeOrphanProbe({ getElementInstance: async (k) => ({ state: k === 'done' ? 'TERMINATED' : 'ACTIVE' }) });
+  assert.equal(await elemOnly('done'), true);
+  assert.equal(await elemOnly('live'), false);
+
+  // Process-aware: the #295 case. Element TERMINATED by an SLA boundary timer, but
+  // its PROCESS is still ACTIVE (human escalation pending) → NOT an orphan.
+  const probe = makeOrphanProbe({
+    getElementInstance: async (k) => ({ state: 'TERMINATED', processInstanceKey: `pi-${k}` }),
+    getProcessInstance: async (pik) => ({ state: pik === 'pi-stuck' ? 'ACTIVE' : 'COMPLETED' }),
+  });
+  assert.equal(await probe('stuck'), false, 'SLA-cancelled element in an ACTIVE process must be spared');
+  assert.equal(await probe('finished'), true, 'element + process both terminal → orphan');
+
+  // Element still running → never an orphan (process not even consulted).
+  const running = makeOrphanProbe({
+    getElementInstance: async () => ({ state: 'ACTIVE', processInstanceKey: 'pi-x' }),
+    getProcessInstance: async () => { throw new Error('should not be called'); },
+  });
+  assert.equal(await running('x'), false);
+
+  // Unknown / unreachable lookups fail CLOSED (spare the ref; TTL is the backstop).
+  const noPik = makeOrphanProbe({ getElementInstance: async () => ({ state: 'TERMINATED' }), getProcessInstance: async () => ({ state: 'COMPLETED' }) });
+  assert.equal(await noPik('x'), false, 'no process key → cannot prove finished → spare');
+  const elemThrows = makeOrphanProbe({ getElementInstance: async () => { throw new Error('404'); }, getProcessInstance: async () => ({ state: 'COMPLETED' }) });
+  assert.equal(await elemThrows('x'), false);
+  const procThrows = makeOrphanProbe({ getElementInstance: async () => ({ state: 'TERMINATED', processInstanceKey: 'p' }), getProcessInstance: async () => { throw new Error('boom'); } });
+  assert.equal(await procThrows('x'), false);
+  // CANCELED counts as a terminal process state too.
+  const canceled = makeOrphanProbe({ getElementInstance: async () => ({ state: 'TERMINATED', processInstanceKey: 'p' }), getProcessInstance: async () => ({ state: 'CANCELED' }) });
+  assert.equal(await canceled('x'), true);
+});
+
+test('#295 pushNamedRef: force-writes an arbitrary ref we own', async () => {
+  const f = fixture();
+  try {
+    const { dir, git } = f.clone('named');
+    const sha = sh(dir, 'rev-parse', 'HEAD');
+    assert.deepEqual(await pushNamedRef({ git, ref: 'refs/nano/recovered/77', sha }), { ok: true });
+    assert.equal(sh(f.root, '--git-dir', f.remote, 'rev-parse', 'refs/nano/recovered/77'), sha);
+    // Missing args → a clean error, no throw.
+    assert.equal((await pushNamedRef({ git, ref: '', sha })).ok, false);
+    assert.equal((await pushNamedRef({ git, ref: 'refs/x', sha: '' })).ok, false);
+  } finally { f.cleanup(); }
+});
+
+test('#295 sweepStaleCheckpoints: deleted entries carry the sha (for the GC log)', async () => {
+  const f = fixture();
+  try {
+    const { dir, git } = f.clone('sweep');
+    const sha = sh(dir, 'rev-parse', 'HEAD');
+    // Seed a WIP ref and age it beyond the grace window so the probe is consulted.
+    sh(dir, 'push', '-q', 'origin', `${sha}:refs/nano/wip/555`);
+    const isTerminal = async () => true;
+    const r = await sweepStaleCheckpoints({ git, ttlMs: 0, graceMs: 0, isTerminal, now: () => Date.now() + 10_000 });
+    assert.equal(r.deleted.length, 1);
+    assert.deepEqual(r.deleted[0], { ref: 'refs/nano/wip/555', sha, why: 'element-terminal' });
+    assert.throws(() => sh(f.root, '--git-dir', f.remote, 'rev-parse', '--verify', 'refs/nano/wip/555'));
+  } finally { f.cleanup(); }
+});
+
+test('#295 sweepStaleCheckpoints: NEVER lists or deletes recovery refs', async () => {
+  const f = fixture();
+  try {
+    const { dir, git } = f.clone('rec');
+    const sha = sh(dir, 'rev-parse', 'HEAD');
+    sh(dir, 'push', '-q', 'origin', `${sha}:refs/nano/recovered/999`);
+    // Even an always-terminal probe + zero TTL cannot reach a recovered ref: the
+    // sweep enumerates only refs/nano/wip/*.
+    const r = await sweepStaleCheckpoints({ git, ttlMs: 0, graceMs: 0, isTerminal: async () => true, now: () => Date.now() + 10_000 });
+    assert.equal(r.deleted.length, 0);
+    assert.equal(sh(f.root, '--git-dir', f.remote, 'rev-parse', 'refs/nano/recovered/999'), sha);
+  } finally { f.cleanup(); }
+});
+
+test('#295 preserveRecovery: promotes the latest snapshot to a GC-proof recovery ref', async () => {
+  const f = fixture();
+  try {
+    const env = { NANO_AGENT_CHECKPOINT: 'on', NANO_AGENT_CHECKPOINT_INTERVAL_MS: '0' };
+    const { dir } = f.clone('preserve');
+    sh(dir, 'checkout', '-q', '-b', 'nano/agent-work/main-x');
+    const provisioned = { workspaceDir: dir, gitEnv: ENV, committer: { name: 'bot', email: 'bot@example.com' }, startSha: sh(dir, 'rev-parse', 'HEAD'), workingBranch: 'nano/agent-work/main-x' };
+    const logger = quietLogger();
+    const s = await setupWorkspaceCheckpoints({ provisioned, job: { jobKey: '1', elementInstanceKey: '808' }, jobType: 't', runId: 'r', logger, env, deps: { sweepRegistry: new Map() } });
+    // Nothing durable yet → null.
+    assert.equal(await s.preserveRecovery('force-stop'), null);
+    writeFileSync(join(dir, 'wip.txt'), 'half done\n');
+    const res = await s.checkpointer.flush('abort', { timeoutMs: 0 });
+    assert.ok(res.sha, JSON.stringify(res));
+    const rec = await s.preserveRecovery('force-stop');
+    assert.deepEqual(rec, { ref: 'refs/nano/recovered/808', sha: res.sha });
+    assert.equal(sh(f.root, '--git-dir', f.remote, 'rev-parse', 'refs/nano/recovered/808'), res.sha);
+    assert.match(logger.lines.info.join('\n'), /preserved a GC-proof recovery checkpoint refs\/nano\/recovered\/808/);
+    // The WIP ref is retained too (an additional durable copy).
+    assert.equal(sh(f.root, '--git-dir', f.remote, 'rev-parse', 'refs/nano/wip/808'), res.sha);
+    await s.close();
+  } finally { f.cleanup(); }
+});
+
+test('#295 setupWorkspaceCheckpoints: a resumed run adopts its predecessor via resumeFromCheckpoint', async () => {
+  const f = fixture();
+  try {
+    const env = { NANO_AGENT_CHECKPOINT: 'on', NANO_AGENT_CHECKPOINT_INTERVAL_MS: '0' };
+    const provision = (name) => {
+      const { dir } = f.clone(name);
+      sh(dir, 'checkout', '-q', '-b', 'nano/agent-work/main-x');
+      return { workspaceDir: dir, gitEnv: ENV, committer: { name: 'bot', email: 'bot@example.com' }, startSha: sh(dir, 'rev-parse', 'HEAD'), workingBranch: 'nano/agent-work/main-x' };
+    };
+    const vars = [];
+    const camunda = { createElementInstanceVariables: async (input) => { vars.push(input); } };
+
+    // run1 is element 10 in process 500; it checkpoints and records resumeFromCheckpoint
+    // at the PROCESS scope.
+    const p1 = provision('run1');
+    const s1 = await setupWorkspaceCheckpoints({ provisioned: p1, job: { jobKey: '1', elementInstanceKey: '10', processInstanceKey: '500' }, jobType: 't', runId: 'run-1', camunda, logger: quietLogger(), env, deps: { sweepRegistry: new Map() } });
+    writeFileSync(join(p1.workspaceDir, 'wip.txt'), 'half done\n');
+    const res = await s1.checkpointer.flush('abort', { timeoutMs: 0 });
+    await s1.close();
+    // Two writes: agentCheckpoint @ element 10, resumeFromCheckpoint @ process 500.
+    const resumeVar = vars.find((v) => v.variables.resumeFromCheckpoint);
+    assert.ok(resumeVar, 'a resumeFromCheckpoint var is written at the process scope');
+    assert.equal(resumeVar.elementInstanceKey, '500');
+    assert.equal(resumeVar.local, true);
+    assert.equal(resumeVar.variables.resumeFromCheckpoint.ref, 'refs/nano/wip/10');
+    assert.equal(resumeVar.variables.resumeFromCheckpoint.sha, res.sha);
+
+    // The SLA escalation re-enters the task as a NEW element (20) in the SAME process;
+    // its variables carry the predecessor ref. setupWorkspaceCheckpoints adopts
+    // refs/nano/wip/10 under refs/nano/wip/20 and RESTORES it.
+    const p2 = provision('run2');
+    const logger = quietLogger();
+    const job2 = { jobKey: '2', elementInstanceKey: '20', processInstanceKey: '500', variables: { resumeFromCheckpoint: resumeVar.variables.resumeFromCheckpoint } };
+    const s2 = await setupWorkspaceCheckpoints({ provisioned: p2, job: job2, jobType: 't', runId: 'run-2', camunda, logger, env, deps: { sweepRegistry: new Map() } });
+    assert.equal(s2.restored?.restored, true);
+    assert.match(logger.lines.info.join('\n'), /adopted predecessor WIP checkpoint refs\/nano\/wip\/10/);
+    assert.equal(readFileSync(join(p2.workspaceDir, 'wip.txt'), 'utf8'), 'half done\n');
+    // The predecessor's content is now also under this run's own key.
+    assert.equal(sh(f.root, '--git-dir', f.remote, 'rev-parse', 'refs/nano/wip/20'), res.sha);
+    await s2.close();
+  } finally { f.cleanup(); }
+});
+
+test('#295 job handler wires preserveRecovery on abort/failed and surfaces recoveryRef in the outcome', () => {
+  const src = readFileSync(new URL('./c8ctl-plugin.js', import.meta.url), 'utf8');
+  const i = (s) => { const at = src.indexOf(s); assert.ok(at >= 0, `missing: ${s}`); return at; };
+  const abortFlush = i("await checkpointer.flush('abort'");
+  const abortPreserve = i("recoveryRefInfo = await checkpointing.preserveRecovery('force-stop')");
+  const failedFlush = i("await checkpointer.flush('failed', { timeoutMs: checkpointing.flushTimeoutMs })");
+  const failedPreserve = i("recoveryRefInfo = await checkpointing.preserveRecovery('failed')");
+  // preserveRecovery runs AFTER each flush (the snapshot must exist first).
+  assert.ok(abortFlush < abortPreserve, 'abort preserve follows the abort flush');
+  assert.ok(failedFlush < failedPreserve, 'failed preserve follows the failed flush');
+  // The recovery ref is attached to the git result and surfaced in the outcome envelope.
+  assert.ok(i('if (recoveryRefInfo && gitResult) { gitResult.recoveryRef = recoveryRefInfo.ref; gitResult.recoverySha = recoveryRefInfo.sha; }') > 0);
+  assert.ok(i('if (git.recoveryRef) env.recoveryRef = git.recoveryRef;') > 0);
+  assert.ok(i('if (git.recoverySha) env.recoverySha = git.recoverySha;') > 0);
+  // The orphan probe is process-instance-aware (the core #295 fix).
+  assert.ok(i('const isTerminal = makeOrphanProbe({') > 0);
+  assert.ok(i('getProcessInstance: typeof camunda?.getProcessInstance === \'function\'') > 0);
+  // The GC reclaim log reports ref@sha [why].
+  assert.ok(i('reclaimed ${r.deleted.length} orphaned WIP checkpoint ref(s)') > 0);
 });

@@ -90,7 +90,7 @@ import { createAgentInstanceProducer, isExternalAgentJob } from './agent-instanc
 // so the new agent CONTINUES rather than cold-reruns — at-least-once delivery becomes
 // a continuation, not a duplicate. Best-effort; degrades to the legacy cold rerun.
 import { resolveEffectiveEnvelope } from './agent-resume.mjs';
-import { checkpointConfig, checkpointEligibility, checkpointRef, normalizeSecretValues, credentialsFromUrl, isAuthenticatedRemote, shouldSweep, sweepStaleCheckpoints, createGitRunner, fetchCheckpoint, restoreCheckpoint, createWorkspaceCheckpoint, createCheckpointer, deleteCheckpointRef, withCheckpointNote, sanitizeBranchSegment } from './agent-checkpoint.mjs';
+import { checkpointConfig, checkpointEligibility, checkpointRef, recoveredCheckpointRef, predecessorCheckpointRef, pushNamedRef, makeOrphanProbe, normalizeSecretValues, credentialsFromUrl, isAuthenticatedRemote, shouldSweep, sweepStaleCheckpoints, createGitRunner, fetchCheckpoint, restoreCheckpoint, createWorkspaceCheckpoint, createCheckpointer, deleteCheckpointRef, withCheckpointNote, sanitizeBranchSegment } from './agent-checkpoint.mjs';
 
 const requireFromHere = createRequire(import.meta.url);
 const pluginDir = dirname(fileURLToPath(import.meta.url));
@@ -6770,6 +6770,28 @@ async function setupWorkspaceCheckpoints({ provisioned, envelope = null, token =
       startupFetchFailed = true;
       log.warn(`could not fetch WIP checkpoint ${ref} — ${oneLineLog(err?.message || err)}; starting without it.`);
     }
+    // #295: nothing at this run's deterministic ref, but a human may have answered an
+    // SLA escalation and re-entered the task as a NEW element instance. The predecessor
+    // recorded its ref in a process-scoped `resumeFromCheckpoint` variable (survives
+    // re-entry); adopt it under THIS run's key so the restore/ownership/discard paths
+    // below operate unchanged and no GC can reclaim it between activations.
+    if (!prior && !startupFetchFailed) {
+      const predRef = predecessorCheckpointRef(job?.variables, ref);
+      if (predRef) {
+        let predCp = null;
+        try { predCp = await fetchCp({ git: startupGit, ref: predRef }); } catch (err) { log.debug(`could not fetch predecessor WIP checkpoint ${predRef} — ${oneLineLog(err?.message || err)}.`); }
+        if (predCp?.sha) {
+          const copied = await pushNamedRef({ git: startupGit, ref, sha: predCp.sha });
+          if (copied?.ok) {
+            try { prior = await fetchCp({ git: startupGit, ref }); } catch { prior = { ...predCp, ref }; }
+            if (!prior) prior = { ...predCp, ref };
+            logger.info?.(`${prefix} (${corr}): adopted predecessor WIP checkpoint ${predRef}@${predCp.sha.slice(0, 12)} under this run's key ${ref} (SLA-escalation resume); restoring it below.`);
+          } else {
+            log.warn(`found predecessor WIP checkpoint ${predRef}@${predCp.sha.slice(0, 12)} but could not copy it to ${ref} — ${copied?.error || 'unknown'}; the predecessor ref is retained for explicit recovery.`);
+          }
+        }
+      }
+    }
     if (prior) {
       const r = await restoreCp({ git: startupGit, checkpoint: prior, expectedBranch: provisioned.workingBranch || null, expectedBranchEphemeral: provisioned.fallbackBranch === true, expectedBaseRef: provisioned.baseBranch || '' });
       if (r?.restored) {
@@ -6820,16 +6842,24 @@ async function setupWorkspaceCheckpoints({ provisioned, envelope = null, token =
       return Promise.race([Promise.resolve(p).finally(() => clearTimeout(timer)), timeout]);
     };
     if (shouldSweep(gcKey, { everyMs: cfg.gcEveryMs, now: now(), registry: deps.sweepRegistry })) {
-      const isTerminal = typeof camunda?.getElementInstance === 'function'
-        ? async (key) => {
-          try {
-            const ei = await withDeadline(
+      // #295: a WIP ref is an orphan only when its element is terminal AND its
+      // PROCESS instance is finished too. An element cancelled by an SLA boundary
+      // timer, inside a process that is still active (human escalation pending),
+      // must NOT be reclaimed — the TTL is the final backstop. `makeOrphanProbe`
+      // encodes that; it degrades to the legacy element-only check when the host
+      // SDK exposes no `getProcessInstance`.
+      const isTerminal = makeOrphanProbe({
+        getElementInstance: typeof camunda?.getElementInstance === 'function'
+          ? (key) => withDeadline(
               camunda.getElementInstance({ elementInstanceKey: key }, { consistency: { waitUpToMs: 0 } }),
-              CP_SDK_TIMEOUT_MS, 'getElementInstance');
-            return ei?.state === 'COMPLETED' || ei?.state === 'TERMINATED';
-          } catch { return false; }
-        }
-        : null;
+              CP_SDK_TIMEOUT_MS, 'getElementInstance')
+          : undefined,
+        getProcessInstance: typeof camunda?.getProcessInstance === 'function'
+          ? (pik) => withDeadline(
+              camunda.getProcessInstance({ processInstanceKey: String(pik) }, { consistency: { waitUpToMs: 0 } }),
+              CP_SDK_TIMEOUT_MS, 'getProcessInstance')
+          : null,
+      });
       // Run the sweep in an ISOLATED throwaway scratch repo (its own `.git`), NEVER the
       // job workspace. The sweep fetches remote WIP refs, writes local throwaway refs and
       // push-deletes stale ones, while the workspace is concurrently driven by the harness
@@ -6862,7 +6892,7 @@ async function setupWorkspaceCheckpoints({ provisioned, envelope = null, token =
         // the sweep's git is still live. The deadline only bounds it by aborting the git.
         gc = Promise.resolve(sweep({ git: sweepGit, ownRef: ref, ttlMs: cfg.ttlMs, graceMs: cfg.gcGraceMs, isTerminal, now, signal: sweepAbort.signal }))
           .then((r) => {
-            if (r?.deleted?.length) logger.info?.(`${prefix} (${corr}): reclaimed ${r.deleted.length} orphaned WIP checkpoint ref(s): ${r.deleted.map((d) => `${d.ref} [${d.why}]`).join(', ')}.`);
+            if (r?.deleted?.length) logger.info?.(`${prefix} (${corr}): reclaimed ${r.deleted.length} orphaned WIP checkpoint ref(s): ${r.deleted.map((d) => `${d.ref}@${String(d.sha || '').slice(0, 12) || '?'} [${d.why}]`).join(', ')}.`);
             else if (sweepAbort.signal.aborted) log.debug(`WIP checkpoint GC bounded at ${GC_OVERALL_TIMEOUT_MS}ms — aborted its in-flight git and drained; leftover refs reclaimed on a later sweep.`);
             else if (r?.error) log.debug(`WIP checkpoint GC skipped — ${redactToken(oneLineLog(r.error), token)}.`);
           }, (err) => log.debug(`WIP checkpoint GC threw — ${redactToken(oneLineLog(err?.message || err), token)}.`))
@@ -6879,6 +6909,7 @@ async function setupWorkspaceCheckpoints({ provisioned, envelope = null, token =
     // delete against it so a stale activation cannot delete a newer owner's WIP.
     let ownedSha = prior?.sha || '';
     let varWarned = false;
+    let resumeVarWarned = false;
     const setVar = typeof camunda?.createElementInstanceVariables === 'function' && job?.elementInstanceKey
       ? async (res) => {
         try {
@@ -6889,6 +6920,23 @@ async function setupWorkspaceCheckpoints({ provisioned, envelope = null, token =
           }), CP_SDK_TIMEOUT_MS, 'createElementInstanceVariables');
         } catch (err) {
           if (!varWarned) { varWarned = true; log.warn(`could not set the agentCheckpoint variable — ${oneLineLog(err?.message || err)}; checkpoints still pushed to ${ref}.`); }
+        }
+        // #295: also record the ref at the PROCESS instance scope (local on the root
+        // scope key = the process instance key). Unlike the local `agentCheckpoint`
+        // above, this survives the element re-entry an SLA escalation triggers, so a
+        // resumed run (a NEW element instance) can find and adopt its predecessor's
+        // checkpoint via `resumeFromCheckpoint`. Best-effort and independent of the
+        // local write; a failure never blocks the push.
+        if (job?.processInstanceKey) {
+          try {
+            await withDeadline(camunda.createElementInstanceVariables({
+              elementInstanceKey: String(job.processInstanceKey),
+              variables: { resumeFromCheckpoint: { ref, sha: res.sha, elementInstanceKey: String(job.elementInstanceKey ?? ''), elementId: job.elementId ?? null, branch, at: res.at } },
+              local: true,
+            }), CP_SDK_TIMEOUT_MS, 'createElementInstanceVariables');
+          } catch (err) {
+            if (!resumeVarWarned) { resumeVarWarned = true; log.warn(`could not set the resumeFromCheckpoint variable — ${oneLineLog(err?.message || err)}; a resumed run may not auto-find ${ref}.`); }
+          }
         }
       }
       : null;
@@ -6949,6 +6997,29 @@ async function setupWorkspaceCheckpoints({ provisioned, envelope = null, token =
       // falsy; the live checkpointer has already stopped by the time this is called.
       updateCredential(nextToken) {
         if (nextToken && nextToken !== token) token = nextToken;
+      },
+      // #295: promote the latest snapshot to a GC-PROOF recovery ref on an SLA
+      // cancellation or a force-stop. `refs/nano/recovered/<elementInstanceKey>`
+      // lives OUTSIDE the WIP namespace the orphan GC sweeps, so it survives until an
+      // operator reclaims it — long enough for the human escalation to be answered and
+      // the work recovered. Returns `{ ref, sha }` (surfaced in the job outcome) or
+      // null when there is nothing durable to preserve / the push failed. Best-effort;
+      // never throws. The live WIP ref is kept too (this is an additional durable copy).
+      async preserveRecovery(reason = 'recovery') {
+        if (!ownedSha) return null;
+        const recRef = recoveredCheckpointRef(job?.elementInstanceKey);
+        if (!recRef) return null;
+        try {
+          const r = await pushNamedRef({ git, ref: recRef, sha: ownedSha });
+          if (r?.ok) {
+            logger.info?.(`${prefix} (${corr}): preserved a GC-proof recovery checkpoint ${recRef}@${ownedSha.slice(0, 12)} (${reason}) — it survives the orphan GC so the SLA-cancelled/force-stopped run can be recovered and resumed.`);
+            return { ref: recRef, sha: ownedSha };
+          }
+          log.warn(`could not preserve recovery checkpoint ${recRef} — ${redactToken(r?.error || 'unknown', token)}; the WIP ref ${ref} is still retained for recovery.`);
+        } catch (err) {
+          log.warn(`could not preserve recovery checkpoint ${recRef} — ${redactToken(oneLineLog(err?.message || err), token)}; the WIP ref ${ref} is still retained for recovery.`);
+        }
+        return null;
       },
       // True when the workspace still holds checkpoint content NOT captured by a
       // commit, so the pushed branch does not represent it (an uncommitted restored
@@ -9744,6 +9815,11 @@ function buildResultEnvelope(result, { sandbox, image, git, result: agentResult,
     if (git.branchMismatch) env.branchMismatch = git.branchMismatch;
     if (git.pr) env.pr = git.pr;
     if (git.error) env.gitError = git.error;
+    // #295: a GC-proof recovery ref (refs/nano/recovered/<eik>) a SLA-cancelled or
+    // force-stopped run left behind — carried in the outcome so the escalation /
+    // resume can recover the snapshot from it even after the workspace is reaped.
+    if (git.recoveryRef) env.recoveryRef = git.recoveryRef;
+    if (git.recoverySha) env.recoverySha = git.recoverySha;
   }
   return env;
 }
@@ -12502,6 +12578,9 @@ async function workAgent(req, flags, ctx) {
         // performs a last-chance `failed` flush so edits since the last periodic
         // checkpoint are not lost.
         let checkpointFinalized = false;
+        // #295: the GC-proof recovery ref (and SHA) a preserveRecovery() pushed on an
+        // SLA cancellation / failed run, surfaced in the job outcome (io.nanobpm.agentResult).
+        let recoveryRefInfo = null;
         // The per-job live-terminal relay session (issue #173): streams this job's
         // harness terminal over the single-owner supervisor's ONE multiplexed host
         // connection, keyed by this worker's instance + the jobKey, and accepts
@@ -12655,11 +12734,21 @@ async function workAgent(req, flags, ctx) {
             logger.warn(`[${jobType}] job ${job.jobKey} aborted (worker force-stop) — harness killed; yielding job for retry.`);
             // #264: last-chance WIP checkpoint so the retry can pick up the
             // uncommitted work (bounded; the lease guards a newer owner).
-            if (checkpointer) { await checkpointer.flush('abort', { timeoutMs: checkpointing.flushTimeoutMs }); checkpointFinalized = true; }
+            // #295: then promote it to a GC-proof recovery ref so a force-stopped run
+            // is never reclaimed as an orphan before it can be resumed.
+            if (checkpointer) {
+              await checkpointer.flush('abort', { timeoutMs: checkpointing.flushTimeoutMs }); checkpointFinalized = true;
+              try { recoveryRefInfo = await checkpointing.preserveRecovery('force-stop') || recoveryRefInfo; } catch { /* best effort */ }
+            }
             return;
           }
           // #264: a failed run is retried — checkpoint what it left behind.
-          if (checkpointer && !result.ok) { await checkpointer.flush('failed', { timeoutMs: checkpointing.flushTimeoutMs }); checkpointFinalized = true; }
+          // #295: an SLA-cancelled run surfaces here as a non-ok (timed-out) result;
+          // preserve a GC-proof recovery ref and report it in the job outcome below.
+          if (checkpointer && !result.ok) {
+            await checkpointer.flush('failed', { timeoutMs: checkpointing.flushTimeoutMs }); checkpointFinalized = true;
+            try { recoveryRefInfo = await checkpointing.preserveRecovery('failed') || recoveryRefInfo; } catch { /* best effort */ }
+          }
 
           // Gap 2 (#678): a clean run that emitted no machine-readable result gets
           // ONE bounded re-emit nudge in the same workspace, feeding back its own
@@ -12801,6 +12890,10 @@ async function workAgent(req, flags, ctx) {
           } else if (provisioned) {
             gitResult = { remote: provisioned.remote, branch: provisioned.workingBranch, baseSha: provisioned.startSha || null, commits: [], pushed: false };
           }
+          // #295: surface the GC-proof recovery ref (pushed on an SLA cancellation /
+          // failed run above) in the job outcome so the escalation can point a resume
+          // at it. Attach to whatever gitResult was built for this (provisioned) job.
+          if (recoveryRefInfo && gitResult) { gitResult.recoveryRef = recoveryRefInfo.ref; gitResult.recoverySha = recoveryRefInfo.sha; }
           // Propagate a mid-finalize credential rotation (finalizeGit's push
           // auth-failure recovery re-read a fresh gh token) to every subsystem that
           // captured the pre-rotation token: the outer `repoToken` (later redaction /

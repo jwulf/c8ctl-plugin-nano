@@ -262,6 +262,30 @@ SDK client (job workers) — do **not** add the SDK as a dependency or use raw
   is never treated as terminal). `agentCheckpoint` is written via
   `camunda.createElementInstanceVariables` (`local:true`), best-effort, warning once.
   Tests: `agent-checkpoint.test.mjs` (real temp repos + bare remote).
+- **SLA-cancel-safe checkpoints (issue #295, `agent-checkpoint.mjs`).** The #264 GC
+  treated an element-terminal WIP ref as an orphan, but an SLA **boundary timer**
+  cancels the *element* (→ TERMINATED) while its *process* keeps waiting for a human
+  to answer the escalation — so the sweep deleted the exact checkpoint a resume needs.
+  Four changes close that: (a) **process-instance-aware orphan probe**
+  (`makeOrphanProbe`): a WIP ref is an orphan only when its element is terminal **AND**,
+  when the host SDK exposes `getProcessInstance`, its process is also
+  COMPLETED/TERMINATED/CANCELED; an element terminal inside a still-ACTIVE process is
+  **spared** (fail-closed — any missing key / unreachable / thrown lookup spares the ref;
+  the 7d TTL stays the backstop). Degrades to the legacy element-only check when the SDK
+  lacks `getProcessInstance`. (b) **Predecessor adoption on resume**: a resumed run
+  re-enters the task as a NEW element instance (new key), so its deterministic
+  `refs/nano/wip/<newKey>` is empty. The interrupted run records its ref in a
+  **process-scoped** `resumeFromCheckpoint` variable (written at `processInstanceKey`
+  with `local:true`, so it survives element re-entry); on resume
+  `predecessorCheckpointRef` reads it and `pushNamedRef` copies the predecessor ref
+  under this run's key so restore/ownership/discard run unchanged. (c) **GC-proof
+  recovery refs**: on a force-stop/abort or failed (SLA-cancelled) run,
+  `preserveRecovery` promotes the latest snapshot to `refs/nano/recovered/<eik>`
+  (`recoveredCheckpointRef`) — **outside** the `refs/nano/wip/*` namespace the sweep
+  enumerates, so it is never GC-reclaimed — and surfaces `recoveryRef`/`recoverySha` in
+  the job outcome (`buildResultEnvelope`). (d) The GC reclaim log reports `ref@sha [why]`
+  (the sweep's `deleted` entries now carry the `sha`). Tests: the `#295 …` cases in
+  `agent-checkpoint.test.mjs`.
 - **Agent outcomes (`acpOutcomeFrom` / `resultVarsFromAcpOutcome`).** A
   `session/prompt` result may carry `_meta.outcome` `{status:'completed'|'blocked',
   summary}` (rusty-harness's `report_outcome`). `spawnCaptureAcp` surfaces it as

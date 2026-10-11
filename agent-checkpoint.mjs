@@ -280,6 +280,74 @@ export function checkpointRef(elementInstanceKey) {
   return /^[0-9A-Za-z_-]{1,128}$/.test(key) ? `${CHECKPOINT_REF_PREFIX}${key}` : null;
 }
 
+// Durable "recovery" refs (#295) live OUTSIDE the WIP namespace the orphan GC
+// sweeps (`CHECKPOINT_REF_PREFIX`), so a snapshot promoted here on an SLA-cancel or
+// force-stop is GC-PROOF — it survives until an operator reclaims it manually, long
+// enough for the human escalation to be answered and the run resumed.
+export const RECOVERED_REF_PREFIX = 'refs/nano/recovered/';
+export function recoveredCheckpointRef(elementInstanceKey) {
+  const key = String(elementInstanceKey ?? '').trim();
+  return /^[0-9A-Za-z_-]{1,128}$/.test(key) ? `${RECOVERED_REF_PREFIX}${key}` : null;
+}
+
+// A resumed run re-enters the task as a NEW element instance with a new key, so the
+// deterministic `refs/nano/wip/<newKey>` is empty even though the interrupted run
+// pushed `refs/nano/wip/<oldKey>` (#295). The predecessor writes its ref into a
+// PROCESS-scoped `resumeFromCheckpoint` variable (survives element re-entry); on
+// resume the new run reads it here, fetches that ref and adopts it under the new
+// key. Returns the predecessor WIP ref, or null when absent / malformed / the same
+// ref this run already owns.
+export function predecessorCheckpointRef(variables, selfRef = null) {
+  const v = variables && typeof variables === 'object' ? variables.resumeFromCheckpoint : null;
+  const ref = typeof v === 'string' ? v : (v && typeof v === 'object' ? v.ref : null);
+  const s = typeof ref === 'string' ? ref.trim() : '';
+  if (!s || !s.startsWith(CHECKPOINT_REF_PREFIX)) return null;
+  const key = s.slice(CHECKPOINT_REF_PREFIX.length);
+  if (!/^[0-9A-Za-z_-]{1,128}$/.test(key)) return null;
+  return s === selfRef ? null : s;
+}
+
+// Push `sha` to `ref` on `remote`, overwriting any existing ref (`+<sha>:<ref>`).
+// Used to ADOPT a predecessor's checkpoint under this run's key (#295) and to
+// promote a snapshot to a GC-proof recovery ref — both write a ref we fully own, so
+// a plain force (not a lease) is correct. Returns { ok } or { ok:false, error }.
+export async function pushNamedRef({ git, ref, sha, remote = 'origin' }) {
+  if (!ref || !sha) return { ok: false, error: 'missing ref or sha' };
+  const r = await git(['push', '--quiet', '--no-verify', remote, `+${sha}:${ref}`]);
+  return ok(r) ? { ok: true } : { ok: false, error: errText(r) };
+}
+
+// Build the orphan predicate the GC sweep consults (#295). A WIP ref is an orphan
+// ONLY when its element instance is terminal AND — when a process-instance reader is
+// available — its PROCESS instance is also finished. An element cancelled by an SLA
+// boundary timer inside a STILL-ACTIVE process is pending human escalation/resume,
+// NOT an orphan, so it must be spared (the TTL stays the final backstop). Any
+// unknown / unreachable lookup (404, a foreign engine, a missing field, a thrown
+// error) returns false so only the TTL reclaims it — losing a recoverable checkpoint
+// is never worth an eager delete. `getElementInstance`/`getProcessInstance` are
+// injected (key → instance object with a `state`), so this is deterministically
+// unit-testable without the SDK. Returns null when element lookups are unavailable
+// (the sweep then reclaims purely by TTL).
+export function makeOrphanProbe({ getElementInstance, getProcessInstance = null } = {}) {
+  if (typeof getElementInstance !== 'function') return null;
+  const terminal = (s) => s === 'COMPLETED' || s === 'TERMINATED' || s === 'CANCELED';
+  return async (key) => {
+    let ei;
+    try { ei = await getElementInstance(key); } catch { return false; }
+    if (!(ei?.state === 'COMPLETED' || ei?.state === 'TERMINATED')) return false;
+    // Element is terminal. Without a process reader, keep the legacy element-only
+    // behaviour; with one, require the process to be finished too.
+    if (typeof getProcessInstance !== 'function') return true;
+    const pik = ei?.processInstanceKey ?? ei?.processInstanceId ?? null;
+    // Can't identify / reach the process → cannot PROVE it is finished, so spare the
+    // ref (recoverable until the TTL) rather than delete a possibly-active run's WIP.
+    if (pik == null) return false;
+    let pi;
+    try { pi = await getProcessInstance(pik); } catch { return false; }
+    return terminal(pi?.state);
+  };
+}
+
 // Never let git invoke the host's configured credential helper for our remote
 // checkpoint ops. The job token is delivered ONLY via GIT_ASKPASS; a configured
 // helper such as `store` would otherwise reuse or PERSIST that token to disk on a
@@ -909,7 +977,7 @@ export async function sweepStaleCheckpoints({ git, ownRef = null, ttlMs = DEFAUL
     let lastError = null;
     for (const d of doomed) {
       const r = await deleteCheckpointRef({ git, ref: d.ref, remote, expectSha: d.sha });
-      if (r.ok) deleted.push({ ref: d.ref, why: d.why });
+      if (r.ok) deleted.push({ ref: d.ref, sha: d.sha, why: d.why });
       else if (r.error) lastError = r.error;
     }
     const result = { scanned: refs.length, deleted };

@@ -994,7 +994,7 @@ test('normalizeTaskEnvelope: provider is lowercased so downstream comparisons wo
   assert.equal(env.repository.provider, 'github');
 });
 
-test('resolveJobSecrets: host resolver reads env, reports missing', () => {
+test('resolveJobSecrets: host resolver reads env, reports missing', async () => {
   const resolver = makeSecretResolver('host');
   process.env.__NANO_TEST_SECRET = 'shhh';
   try {
@@ -1003,7 +1003,7 @@ test('resolveJobSecrets: host resolver reads env, reports missing', () => {
       {},
     );
     env.setup.secretRefs = ['__NANO_TEST_SECRET', '__NANO_MISSING_SECRET'];
-    const { resolved, missing } = resolveJobSecrets(resolver, env);
+    const { resolved, missing } = await resolveJobSecrets(resolver, env);
     assert.equal(resolved.__NANO_TEST_SECRET, 'shhh');
     assert.deepEqual(missing, ['__NANO_MISSING_SECRET']);
   } finally {
@@ -1011,7 +1011,7 @@ test('resolveJobSecrets: host resolver reads env, reports missing', () => {
   }
 });
 
-test('resolveJobSecrets: allowPr pulls the github default credential', () => {
+test('resolveJobSecrets: allowPr pulls the github default credential', async () => {
   const resolver = makeSecretResolver('host');
   process.env.GITHUB_TOKEN = 'ght';
   try {
@@ -1022,7 +1022,7 @@ test('resolveJobSecrets: allowPr pulls the github default credential', () => {
       },
       {},
     );
-    const { resolved, names } = resolveJobSecrets(resolver, env);
+    const { resolved, names } = await resolveJobSecrets(resolver, env);
     assert.ok(names.includes('GITHUB_TOKEN'));
     assert.equal(resolved.GITHUB_TOKEN, 'ght');
   } finally {
@@ -1030,7 +1030,7 @@ test('resolveJobSecrets: allowPr pulls the github default credential', () => {
   }
 });
 
-test('resolveJobSecrets: allowPr pulls the github default credential from gh when GITHUB_TOKEN is absent', () => {
+test('resolveJobSecrets: allowPr pulls the github default credential from gh when GITHUB_TOKEN is absent', async () => {
   const resolver = makeSecretResolver('host');
   const saved = process.env.GITHUB_TOKEN;
   delete process.env.GITHUB_TOKEN;
@@ -1042,7 +1042,7 @@ test('resolveJobSecrets: allowPr pulls the github default credential from gh whe
       },
       {},
     );
-    const { resolved, missing } = resolveJobSecrets(resolver, env, { ghAuthToken: () => 'gh-cli-tok' });
+    const { resolved, missing } = await resolveJobSecrets(resolver, env, { ghAuthToken: () => 'gh-cli-tok' });
     assert.equal(resolved.GITHUB_TOKEN, 'gh-cli-tok');
     assert.deepEqual(missing, []);
   } finally {
@@ -1051,7 +1051,7 @@ test('resolveJobSecrets: allowPr pulls the github default credential from gh whe
   }
 });
 
-test('resolveJobSecrets: GITHUB_TOKEN in secretRefs is not left in missing when gh fallback resolves it', () => {
+test('resolveJobSecrets: GITHUB_TOKEN in secretRefs is not left in missing when gh fallback resolves it', async () => {
   const resolver = makeSecretResolver('host');
   const saved = process.env.GITHUB_TOKEN;
   delete process.env.GITHUB_TOKEN;
@@ -1066,7 +1066,7 @@ test('resolveJobSecrets: GITHUB_TOKEN in secretRefs is not left in missing when 
       },
       {},
     );
-    const { resolved, missing } = resolveJobSecrets(resolver, env, { ghAuthToken: () => 'gh-cli-tok' });
+    const { resolved, missing } = await resolveJobSecrets(resolver, env, { ghAuthToken: () => 'gh-cli-tok' });
     assert.equal(resolved.GITHUB_TOKEN, 'gh-cli-tok');
     assert.deepEqual(missing, []);
   } finally {
@@ -1075,7 +1075,7 @@ test('resolveJobSecrets: GITHUB_TOKEN in secretRefs is not left in missing when 
   }
 });
 
-test('resolveJobSecrets: a custom github authRef does NOT fall back to gh (stays missing)', () => {
+test('resolveJobSecrets: a custom github authRef does NOT fall back to gh (stays missing)', async () => {
   const resolver = makeSecretResolver('host');
   const env = normalizeTaskEnvelope(
     {
@@ -1085,11 +1085,11 @@ test('resolveJobSecrets: a custom github authRef does NOT fall back to gh (stays
     },
     {},
   );
-  const { missing } = resolveJobSecrets(resolver, env, { ghAuthToken: () => 'gh-cli-tok' });
+  const { missing } = await resolveJobSecrets(resolver, env, { ghAuthToken: () => 'gh-cli-tok' });
   assert.deepEqual(missing, ['MY_PAT']);
 });
 
-test('resolveJobSecrets: a default github gh-cache MISS with no fresh token STAYS missing (#294)', () => {
+test('resolveJobSecrets: a default github gh-cache MISS with no fresh token STAYS missing (#294)', async () => {
   // The worker cached "logged out" (gh auth token → null). Round 11 dropped
   // GITHUB_TOKEN from `missing` unconditionally, trusting provisionRepo's
   // null → fresh recovery — but that recovery never runs for container jobs or
@@ -1108,7 +1108,7 @@ test('resolveJobSecrets: a default github gh-cache MISS with no fresh token STAY
       },
       {},
     );
-    const { resolved, missing } = resolveJobSecrets(resolver, env, {
+    const { resolved, missing } = await resolveJobSecrets(resolver, env, {
       ghAuthToken: () => null,
       forceRefreshGhAuthToken: () => null,
     });
@@ -1120,7 +1120,7 @@ test('resolveJobSecrets: a default github gh-cache MISS with no fresh token STAY
   }
 });
 
-test('resolveJobSecrets: a default github gh-cache MISS is healed by a forced re-read (#294)', () => {
+test('resolveJobSecrets: a default github gh-cache MISS is healed by a forced re-read (#294)', async () => {
   // Same cached-logout miss, but the operator has since run `gh auth login`. The
   // forced re-read recovers the token AT RESOLVE TIME (before the worker's
   // refresh timer re-primes), so the credential is populated and NOT missing —
@@ -1137,7 +1137,7 @@ test('resolveJobSecrets: a default github gh-cache MISS is healed by a forced re
       },
       {},
     );
-    const { resolved, missing } = resolveJobSecrets(resolver, env, {
+    const { resolved, missing } = await resolveJobSecrets(resolver, env, {
       ghAuthToken: () => null,
       forceRefreshGhAuthToken: () => 'fresh-after-login',
     });
@@ -1149,7 +1149,7 @@ test('resolveJobSecrets: a default github gh-cache MISS is healed by a forced re
   }
 });
 
-test('resolveJobSecrets: a default github gh-cache MISS with GITHUB_TOKEN in secretRefs and no fresh token stays missing (#294)', () => {
+test('resolveJobSecrets: a default github gh-cache MISS with GITHUB_TOKEN in secretRefs and no fresh token stays missing (#294)', async () => {
   // Same recovery-eligible miss, but GITHUB_TOKEN is ALSO an explicit secretRef:
   // the generic resolver adds it to `missing`, and when the forced re-read finds
   // no token it must REMAIN missing (not silently dropped) so the job fails fast.
@@ -1167,7 +1167,7 @@ test('resolveJobSecrets: a default github gh-cache MISS with GITHUB_TOKEN in sec
       },
       {},
     );
-    const { resolved, missing } = resolveJobSecrets(resolver, env, {
+    const { resolved, missing } = await resolveJobSecrets(resolver, env, {
       ghAuthToken: () => null,
       forceRefreshGhAuthToken: () => null,
     });
@@ -1179,7 +1179,7 @@ test('resolveJobSecrets: a default github gh-cache MISS with GITHUB_TOKEN in sec
   }
 });
 
-test('resolveJobSecrets: a default github gh-cache MISS with GITHUB_TOKEN in secretRefs is healed by a forced re-read (#294)', () => {
+test('resolveJobSecrets: a default github gh-cache MISS with GITHUB_TOKEN in secretRefs is healed by a forced re-read (#294)', async () => {
   // Same, but the forced re-read now recovers the token: it is populated and the
   // explicit secretRef entry is dropped from `missing`.
   const resolver = makeSecretResolver('host');
@@ -1196,7 +1196,7 @@ test('resolveJobSecrets: a default github gh-cache MISS with GITHUB_TOKEN in sec
       },
       {},
     );
-    const { resolved, missing } = resolveJobSecrets(resolver, env, {
+    const { resolved, missing } = await resolveJobSecrets(resolver, env, {
       ghAuthToken: () => null,
       forceRefreshGhAuthToken: () => 'fresh-after-login',
     });
@@ -1208,7 +1208,7 @@ test('resolveJobSecrets: a default github gh-cache MISS with GITHUB_TOKEN in sec
   }
 });
 
-test('resolveJobSecrets: a present-but-blank authRef is missing, never borrows gh/default', () => {
+test('resolveJobSecrets: a present-but-blank authRef is missing, never borrows gh/default', async () => {
   const resolver = makeSecretResolver('host');
   const saved = process.env.GITHUB_TOKEN;
   process.env.GITHUB_TOKEN = 'env-tok';
@@ -1221,7 +1221,7 @@ test('resolveJobSecrets: a present-but-blank authRef is missing, never borrows g
       },
       {},
     );
-    const { resolved, missing } = resolveJobSecrets(resolver, env, { ghAuthToken: () => 'gh-cli-tok' });
+    const { resolved, missing } = await resolveJobSecrets(resolver, env, { ghAuthToken: () => 'gh-cli-tok' });
     assert.deepEqual(missing, ['repository.authRef']);
     assert.equal(resolved.GITHUB_TOKEN, undefined);
   } finally {

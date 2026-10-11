@@ -4571,20 +4571,28 @@ function makeSecretResolver(kind) {
   return null; // unknown → caller reports a clear error
 }
 
-// Force a fresh synchronous `gh auth token` read, bypassing the TTL cache, and
+// Force a fresh `gh auth token` read, bypassing the TTL cache, and
 // return the token (or null). Injectable into resolveJobSecrets so a default
 // github gh-cache MISS re-reads at job-resolve time — catching a `gh auth login`
 // the worker-lifetime refresh timer has not re-primed yet — instead of trusting
 // provisionRepo's (non-universal) auth-failure recovery (Copilot review on #294).
-function defaultForceRefreshGhAuthToken() {
-  const r = refreshGhAuthToken({ force: true });
+// ASYNC (spawn, never spawnSync): resolveJobSecrets runs on the activated-job
+// path after recordJobStart, so a SYNCHRONOUS `gh auth token` + scopes probe
+// here would block the shared event loop (and the lock-extension heartbeat) for
+// up to ~15s — the very hot-path stall the async refresh exists to prevent
+// (Copilot review on #294). refreshGhAuthTokenAsync also defers to any refresh
+// already in flight instead of starting a second concurrent read.
+async function defaultForceRefreshGhAuthToken() {
+  const r = await refreshGhAuthTokenAsync({ force: true });
   return (r && r.token) || null;
 }
 
 // Resolve the names a job needs (setup.secretRefs, plus the repo/PR credential
 // when allowPr). Returns resolved values + a list of names that were missing so
-// the caller can fail the job with a clear provisioning error.
-function resolveJobSecrets(resolver, envelope, { ghAuthToken = ghAuthTokenFromCli, forceRefreshGhAuthToken = defaultForceRefreshGhAuthToken } = {}) {
+// the caller can fail the job with a clear provisioning error. ASYNC: the
+// gh-cache-miss force-refresh awaits a spawned (non-blocking) gh read, so the
+// caller must `await` this (the workAgent job runner already is async).
+async function resolveJobSecrets(resolver, envelope, { ghAuthToken = ghAuthTokenFromCli, forceRefreshGhAuthToken = defaultForceRefreshGhAuthToken } = {}) {
   const names = new Set();
   for (const n of envelope.setup?.secretRefs || []) if (n) names.add(n);
   const resolved = {};
@@ -4631,7 +4639,7 @@ function resolveJobSecrets(resolver, envelope, { ghAuthToken = ghAuthTokenFromCl
           // credential (Copilot review on #294). Priming the cache here also
           // feeds provisioning's own re-resolve the same fresh token. A
           // custom/invalid authRef reports source 'none' and still fails strict.
-          const fresh = forceRefreshGhAuthToken();
+          const fresh = await forceRefreshGhAuthToken();
           if (fresh) {
             resolved[ghAuthRef] = fresh;
             if (missingIdx !== -1) missing.splice(missingIdx, 1);
@@ -11994,7 +12002,7 @@ async function workAgent(req, flags, ctx) {
         // Assemble + normalize the task envelope from headers (defaults) and
         // variables (overrides), then resolve any secrets it references.
         const envelope = normalizeTaskEnvelope(job.customHeaders ?? {}, job.variables ?? {}, { basePromptOverride });
-        const { resolved, missing, names } = resolveJobSecrets(secretResolver, envelope);
+        const { resolved, missing, names } = await resolveJobSecrets(secretResolver, envelope);
         if (missing.length > 0) {
           const retries = Math.max(0, (Number(job.retries) || 1) - 1);
           const msg = `missing secret(s): ${missing.join(', ')} (resolver: ${secretResolver.kind})`;

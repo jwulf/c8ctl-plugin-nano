@@ -1782,6 +1782,30 @@ test('#296 (r4245146247) the setup-path predecessor-pointer advance write is abo
   assert.ok(/CP_SDK_TIMEOUT_MS, 'createElementInstanceVariables', abortSignal/.test(advBody), 'the advance write passes abortSignal to withDeadline so a mid-write lease loss cancels it');
 });
 
+test('#296 (r4245278256) the non-abort checkpointer setVar write is bound to the job abort signal', () => {
+  const src = readFileSync(new URL('./c8ctl-plugin.js', import.meta.url), 'utf8');
+  // Same bug class as r4245146247, now for the checkpointer's SHARED process-scoped
+  // write: a periodic/`failed` checkpoint can be AWAITING setVar's `resumeFromCheckpoint`
+  // mutation when heartbeat lease loss interrupts the raw runner and releases the slot.
+  // A replacement activation can then publish a newer pointer that this stale call
+  // overwrites; the post-flush signal recheck cannot undo a write that already landed.
+  // So (a) setVar must accept an optional signal and thread it to BOTH withDeadline
+  // calls, (b) the non-abort onCheckpoint path must pass abortSignal, and (c) the
+  // `abort` path must pass NO signal (it stays owned by settleAbortMetaWrite's
+  // recovery-deadline flow, which must fire AFTER the job abort).
+  const sv = src.indexOf('const setVar = typeof camunda?.createElementInstanceVariables');
+  assert.ok(sv > 0, 'setVar is defined');
+  const svBody = src.slice(sv, src.indexOf('const checkpoint = createWorkspaceCheckpoint', sv));
+  assert.ok(/\?\s*\(res, signal = null\) =>/.test(svBody), 'setVar accepts an optional abort signal (default null, so callers that omit it are unchanged)');
+  // BOTH the element-scoped and process-scoped writes thread the signal through.
+  const bound = svBody.match(/CP_SDK_TIMEOUT_MS, 'createElementInstanceVariables', signal \|\| undefined/g) || [];
+  assert.equal(bound.length, 2, 'both setVar writes pass the signal to withDeadline');
+  // The non-abort onCheckpoint path AWAITS the write WITH abortSignal; the abort path
+  // captures a fire-and-forget write WITHOUT a signal (settleAbortMetaWrite owns it).
+  assert.ok(src.includes('await setVar(res, abortSignal || undefined).promise;'), 'the non-abort checkpoint path binds the setVar write to the job abort signal');
+  assert.ok(/if \(res\.reason === 'abort'\) \{ const w = setVar\(res\);/.test(src), 'the abort path calls setVar with NO signal, leaving the recovery-deadline flow in charge');
+});
+
 // ── #295: orphan GC must spare SLA-cancelled runs; recovery/predecessor refs ──
 
 test('#295 recoveredCheckpointRef / RECOVERED_REF_PREFIX: outside the WIP (swept) namespace', () => {

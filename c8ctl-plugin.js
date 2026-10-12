@@ -7063,7 +7063,19 @@ async function setupWorkspaceCheckpoints({ provisioned, envelope = null, token =
     // promotion fails (the fallback is retained); we only serialize the ordering.
     let abortMetaWrite = null;
     const setVar = typeof camunda?.createElementInstanceVariables === 'function' && job?.elementInstanceKey
-      ? (res) => {
+      ? (res, signal = null) => {
+        // #296 (review r4245278256): bind these shared process-scoped writes to the
+        // job abort signal for NON-`abort` checkpoints (periodic/`failed`). A periodic
+        // or failed checkpoint can be AWAITING this mutation (`await setVar(res).promise`
+        // below) when heartbeat lease loss interrupts the raw runner and releases the
+        // slot; a replacement activation may then publish a newer `resumeFromCheckpoint`
+        // pointer before this stale call completes and overwrites it — and the later
+        // post-flush signal recheck cannot undo a write that already landed. Passing
+        // `abortSignal` makes `withDeadline` cancel the in-flight SDK call the instant
+        // the lease is lost, so the stale write is torn down and can never land late.
+        // The `abort`-reason path deliberately passes NO signal: that write is owned by
+        // the dedicated `settleAbortMetaWrite` flow (recovery-deadline governed), which
+        // must still fire AFTER the job abort during the force-stop recovery window.
         // #296: run the element-scope and process-scope writes CONCURRENTLY, not
         // sequentially. Each carries its own CP_SDK_TIMEOUT_MS deadline, so a
         // sequential pair could stall for 2× the timeout (20s) — enough to exhaust
@@ -7086,7 +7098,7 @@ async function setupWorkspaceCheckpoints({ provisioned, envelope = null, token =
           }),
         ];
         const writes = [
-          withDeadline(rawWrites[0], CP_SDK_TIMEOUT_MS, 'createElementInstanceVariables').catch((err) => {
+          withDeadline(rawWrites[0], CP_SDK_TIMEOUT_MS, 'createElementInstanceVariables', signal || undefined).catch((err) => {
             if (!varWarned) { varWarned = true; log.warn(`could not set the agentCheckpoint variable — ${oneLineLog(err?.message || err)}; checkpoints still pushed to ${ref}.`); }
           }),
         ];
@@ -7103,7 +7115,7 @@ async function setupWorkspaceCheckpoints({ provisioned, envelope = null, token =
             local: true,
           });
           rawWrites.push(rawProcess);
-          writes.push(withDeadline(rawProcess, CP_SDK_TIMEOUT_MS, 'createElementInstanceVariables').catch((err) => {
+          writes.push(withDeadline(rawProcess, CP_SDK_TIMEOUT_MS, 'createElementInstanceVariables', signal || undefined).catch((err) => {
             if (!resumeVarWarned) { resumeVarWarned = true; log.warn(`could not set the resumeFromCheckpoint variable — ${oneLineLog(err?.message || err)}; a resumed run may not auto-find ${ref}.`); }
           }));
         }
@@ -7165,15 +7177,21 @@ async function setupWorkspaceCheckpoints({ provisioned, envelope = null, token =
         // process-scoped write could overwrite a NEWER activation's pointer. So the
         // failed path (and every normal checkpoint) AWAITS the write before
         // settlement, keeping the predecessor pointer durable before the job settles.
+        // #296 (review r4245278256): and it passes `abortSignal`, so if heartbeat lease
+        // loss fires DURING this awaited write the in-flight SDK call is cancelled — a
+        // replacement activation then owns the slot and this run's now-stale pointer can
+        // never land late over its newer value.
         // #296 (review): on the abort path, CAPTURE the fire-and-forget write (promise +
         // cancel) so the force-stop recovery path can await it before writing the
         // recovery pointer to the same slot — otherwise a slow WIP write lands after and
         // clobbers the recovery ref. `.promise.catch(() => {})` keeps it fire-and-forget
         // for the flush; the settled/rejected result is irrelevant to the caller. The
         // retained `cancel` lets settleAbortMetaWrite tear down the in-flight SDK call
-        // when the recovery deadline fires (r4244281967), so it can never land late.
+        // when the recovery deadline fires (r4244281967), so it can never land late. This
+        // path deliberately passes NO abortSignal to setVar: the abort write is owned by
+        // settleAbortMetaWrite's recovery-deadline flow and must outlive the job abort.
         if (res.reason === 'abort') { const w = setVar(res); abortMetaWrite = { promise: w.promise.catch(() => {}), cancel: w.cancel }; return; }
-        await setVar(res).promise;
+        await setVar(res, abortSignal || undefined).promise;
       },
     });
     return {

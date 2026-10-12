@@ -479,12 +479,20 @@ export function makeOccurrenceGuard() {
 // pointer an SLA-cancelled run leaves). Both are occurrence-authoritative when delivered
 // as a bare string, so both bypass the guard; restricting this to the WIP prefix would
 // route a recovered pointer through the ambiguity guard and reject it whenever the host
-// SDK can't prove uniqueness (Copilot review on #296).
+// SDK can't prove uniqueness (Copilot review on #296). The suffix is validated against
+// the same elementInstanceKey shape `checkpointRef`/`recoveredCheckpointRef` enforce
+// (`/^[0-9A-Za-z_-]{1,128}$/`), so a malformed ref such as `refs/nano/wip/bad/key` is
+// NOT occurrence-authoritative — this predicate is an authorization boundary (it decides
+// whether the ambiguity guard is bypassed), so it must not trust a ref the canonical
+// builders would never mint (Copilot review on #296).
 export function resumeRefIsExplicit(variables) {
   const v = variables && typeof variables === 'object' ? variables.resumeFromCheckpoint : null;
   if (typeof v !== 'string') return false;
   const s = v.trim();
-  return s.startsWith(CHECKPOINT_REF_PREFIX) || s.startsWith(RECOVERED_REF_PREFIX);
+  const prefix = s.startsWith(CHECKPOINT_REF_PREFIX) ? CHECKPOINT_REF_PREFIX
+    : (s.startsWith(RECOVERED_REF_PREFIX) ? RECOVERED_REF_PREFIX : null);
+  if (!prefix) return false;
+  return /^[0-9A-Za-z_-]{1,128}$/.test(s.slice(prefix.length));
 }
 
 // Never let git invoke the host's configured credential helper for our remote

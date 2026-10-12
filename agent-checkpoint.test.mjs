@@ -1678,6 +1678,15 @@ test('#296 resumeRefIsExplicit: a bare ref string in EITHER checkpoint namespace
   assert.equal(resumeRefIsExplicit({ resumeFromCheckpoint: '' }), false);
   assert.equal(resumeRefIsExplicit({}), false);
   assert.equal(resumeRefIsExplicit(undefined), false);
+  // #296 (review): the suffix must be a well-formed elementInstanceKey — a bare prefix
+  // match must NOT accept a malformed ref (e.g. an extra path segment), since this
+  // predicate is the authorization boundary that bypasses the ambiguity guard.
+  assert.equal(resumeRefIsExplicit({ resumeFromCheckpoint: 'refs/nano/wip/bad/key' }), false);
+  assert.equal(resumeRefIsExplicit({ resumeFromCheckpoint: 'refs/nano/recovered/bad/key' }), false);
+  assert.equal(resumeRefIsExplicit({ resumeFromCheckpoint: 'refs/nano/wip/' }), false);
+  assert.equal(resumeRefIsExplicit({ resumeFromCheckpoint: 'refs/nano/recovered/' }), false);
+  assert.equal(resumeRefIsExplicit({ resumeFromCheckpoint: 'refs/nano/wip/has space' }), false);
+  assert.equal(resumeRefIsExplicit({ resumeFromCheckpoint: 'refs/nano/wip/' + 'a'.repeat(129) }), false);
 });
 
 test('#295 makeOrphanProbe: spares an SLA-cancelled element inside a still-active process', async () => {

@@ -1397,6 +1397,46 @@ test('setupWorkspaceCheckpoints: an un-restored (branch-mismatch) prior ref is N
   } finally { f.cleanup(); }
 });
 
+test('#296 (r4244827082) verifyRecoveryOwnership: true only while THIS run owns the preserved recovery ref', async () => {
+  const f = fixture();
+  try {
+    const env = { NANO_AGENT_CHECKPOINT: 'on', NANO_AGENT_CHECKPOINT_INTERVAL_MS: '0' };
+    const job = { jobKey: '9', elementInstanceKey: '909' };
+    const provision = (name) => {
+      const { dir } = f.clone(name);
+      sh(dir, 'checkout', '-q', '-b', 'nano/agent-work/main-x');
+      return { workspaceDir: dir, gitEnv: ENV, committer: { name: 'bot', email: 'bot@example.com' }, startSha: sh(dir, 'rev-parse', 'HEAD'), workingBranch: 'nano/agent-work/main-x' };
+    };
+    // run-1 checkpoints and preserves a durable recovery ref.
+    const p1 = provision('run1');
+    const s1 = await setupWorkspaceCheckpoints({ provisioned: p1, job, jobType: 't', runId: 'run-1', logger: quietLogger(), env, deps: { sweepRegistry: new Map() } });
+    writeFileSync(join(p1.workspaceDir, 'wip.txt'), 'run-1 wip\n');
+    await s1.checkpointer.flush('abort', { timeoutMs: 0 });
+    const rec = await s1.preserveRecovery('force-stop');
+    assert.ok(rec?.sha, `run-1 preserved a recovery ref: ${JSON.stringify(rec)}`);
+    // The preserving run positively owns its own recovery ref.
+    assert.equal(await s1.verifyRecoveryOwnership(rec.sha), true, 'the preserving run owns its just-preserved recovery ref');
+    // A sha this run did NOT preserve (the ref has moved) fails closed.
+    assert.equal(await s1.verifyRecoveryOwnership('0'.repeat(40)), false, 'a moved/absent recovery ref fails closed');
+    await s1.close();
+
+    // A NEWER activation (run-2) supersedes: it adopts run-1's checkpoint as its
+    // prior, preserves its OWN recovery point over the same ref, and now owns it.
+    const p2 = provision('run2');
+    const s2 = await setupWorkspaceCheckpoints({ provisioned: p2, job, jobType: 't', runId: 'run-2', logger: quietLogger(), env, deps: { sweepRegistry: new Map() } });
+    writeFileSync(join(p2.workspaceDir, 'wip2.txt'), 'run-2 wip\n');
+    await s2.checkpointer.flush('abort', { timeoutMs: 0 });
+    const rec2 = await s2.preserveRecovery('force-stop');
+    assert.ok(rec2?.sha, `run-2 preserved its recovery ref: ${JSON.stringify(rec2)}`);
+    assert.equal(await s2.verifyRecoveryOwnership(rec2.sha), true, 'the newer run owns its recovery ref');
+    // The SUPERSEDED run-1's stale handle no longer owns the ref: its preserved sha
+    // has been moved off, so its re-verify fails closed and its process-scoped write
+    // would be skipped (the newer run's pointer stays authoritative).
+    assert.equal(await s1.verifyRecoveryOwnership(rec.sha), false, 'a superseded run no longer owns the moved recovery ref — its stale pointer write is refused');
+    await s2.close();
+  } finally { f.cleanup(); }
+});
+
 test('setupWorkspaceCheckpoints: checkpoint → variable → restore on the next activation → discard', async () => {
   const f = fixture();
   try {
@@ -1629,6 +1669,19 @@ test('job handler wires checkpoints: notify on ACP updates, flush on abort/failu
   assert.ok(deadlineAborts > sdkAc, 'the recovery deadline also aborts the SDK signal (not just git/GC)');
   const gateBeforeWrite = src.indexOf('if (recoverySdkAbort.signal.aborted) return;');
   assert.ok(gateBeforeWrite > sdkAc && gateBeforeWrite < recWrite, 'the recovery-pointer write is SKIPPED once the recovery deadline fired (no stale late write)');
+  // #296 (Copilot review, r4244827082): the process-scoped resumeFromCheckpoint write is
+  // last-writer-wins, so a SUPERSEDED activation could land its stale pointer after a
+  // newer activation published its own. The write must be GATED on a fresh ownership
+  // re-verify (verifyRecoveryOwnership) that fails closed when the recovery ref has
+  // moved to another run — the same ownership rule the GIT fence applies.
+  const verifyHook = src.indexOf('async verifyRecoveryOwnership(expectedSha)');
+  assert.ok(verifyHook > 0, 'setupWorkspaceCheckpoints exposes verifyRecoveryOwnership(expectedSha)');
+  const verifyBody = src.slice(verifyHook, src.indexOf('hasUncommittedChanges', verifyHook));
+  assert.ok(verifyBody.includes('curSha !== expectedSha'), 'verifyRecoveryOwnership fails closed when the recovery ref moved off the sha this run preserved');
+  assert.ok(verifyBody.includes('ownerRunId === myRun || (supersededRun && ownerRunId === supersededRun)'), 'verifyRecoveryOwnership applies the same Nano-Checkpoint-Run ownership rule as the GIT fence');
+  const ownGate = src.indexOf('stillOwns = await Promise.race([');
+  assert.ok(ownGate > gateBeforeWrite && ownGate < recWrite, 'the recovery-pointer write is gated on a fresh verifyRecoveryOwnership re-check (after the deadline gate, before the write)');
+  assert.ok(src.indexOf('if (!stillOwns)', ownGate) > ownGate && src.indexOf('if (!stillOwns)', ownGate) < recWrite, 'a failed ownership re-verify SKIPS the process-scoped write (leaves the newer pointer authoritative)');
   const race = src.indexOf('await Promise.race([recover, budget])');
   const awaitRecover = src.indexOf('try { await recover; } catch { /* best effort */ }');
   assert.ok(awaitRecover > race, 'recover is AWAITED after the race so it is settled/cancelled before the job yields');

@@ -7277,7 +7277,7 @@ async function setupWorkspaceCheckpoints({ provisioned, envelope = null, token =
           }
           const r = await pushNamedRef({ git, ref: recRef, sha: ownedSha, expectSha: prevRecSha });
           if (r?.ok) {
-            logger.info?.(`${prefix} (${corr}): preserved a durable recovery checkpoint ${recRef}@${ownedSha.slice(0, 12)} (${reason}) — it survives the per-checkpoint WIP cleanup and workspace reaping (the orphan GC spares it while its process stays active) so the SLA-cancelled/force-stopped run can be recovered and resumed.`);
+            logger.info?.(`${prefix} (${corr}): preserved a durable recovery checkpoint ${recRef}@${ownedSha.slice(0, 12)} (${reason}) — it survives the per-checkpoint WIP cleanup and workspace reaping (the orphan GC spares it while its process stays active, up to the ${Math.round(cfg.ttlMs / 86400000)}d TTL backstop, which reclaims it regardless of process state) so the SLA-cancelled/force-stopped run can be recovered and resumed.`);
             return { ref: recRef, sha: ownedSha };
           }
           if (r?.staleLease) {
@@ -7291,6 +7291,33 @@ async function setupWorkspaceCheckpoints({ provisioned, envelope = null, token =
           log.warn(`could not preserve recovery checkpoint ${recRef} — ${redactToken(oneLineLog(err?.message || err), token)}; the WIP ref ${ref} is still retained for recovery.`);
         }
         return null;
+      },
+      // #296 (review, r4244827082): re-verify, IMMEDIATELY before the process-scoped
+      // `resumeFromCheckpoint` recovery-pointer write, that THIS run still owns the
+      // durable recovery ref it just preserved. `preserveRecovery` fences the GIT ref
+      // (CAS + `Nano-Checkpoint-Run` ownership), but the subsequent process-scoped
+      // variable write is unconditional last-writer-wins: a superseded activation that
+      // won its ref earlier can still land its stale pointer AFTER a newer activation
+      // (which re-activated the job on lease loss) published its own. Close that
+      // residual race by re-observing the recovery ref now and confirming it still
+      // resolves to the sha this run preserved AND is still owned by this run (or the
+      // run it explicitly superseded) — the same ownership rule the GIT fence applies.
+      // FAIL CLOSED: any read failure, a moved/absent ref, or an owner that is not
+      // positively this run returns false, so the caller SKIPS the variable write and
+      // leaves the newer activation's pointer intact (the pushed ref stays the durable
+      // fallback). `expectedSha` is the sha this run's preserveRecovery returned.
+      async verifyRecoveryOwnership(expectedSha) {
+        try {
+          const recRef = recoveredCheckpointRef(job?.elementInstanceKey);
+          if (!recRef || !expectedSha) return false;
+          const curSha = await observeRemoteRefSha({ git, ref: recRef });
+          if (!curSha || curSha !== expectedSha) return false;
+          let ownerRunId = '';
+          try { ownerRunId = (await fetchCheckpoint({ git, ref: recRef }))?.runId || ''; } catch { return false; }
+          const myRun = String(runId || '');
+          const supersededRun = String(prior?.runId || '');
+          return Boolean(ownerRunId) && (ownerRunId === myRun || (supersededRun && ownerRunId === supersededRun));
+        } catch { return false; }
       },
       // True when the workspace still holds checkpoint content NOT captured by a
       // commit, so the pushed branch does not represent it (an uncommitted restored
@@ -13125,6 +13152,28 @@ async function workAgent(req, flags, ctx) {
                 if (recoverySdkAbort.signal.aborted) return;
                 if (recoveryRefInfo && typeof camunda?.createElementInstanceVariables === 'function' && job?.processInstanceKey) {
                   try {
+                    // #296 (review, r4244827082): gate the process-scoped pointer write on
+                    // PROVEN current ownership of the recovery ref. preserveRecovery only
+                    // fences the GIT ref; this variable write is last-writer-wins, so a
+                    // superseded activation could otherwise land its stale pointer after a
+                    // newer activation (which re-activated the job on lease loss) published
+                    // its own. Re-verify the ref still resolves to the sha THIS run
+                    // preserved and is still owned by this run; skip the write when it has
+                    // moved (a newer activation's pointer stays authoritative). Bounded by
+                    // the recovery deadline; a failed/aborted verify fails closed (skip).
+                    let stillOwns = false;
+                    try {
+                      let vt; let vOnAbort = null;
+                      stillOwns = await Promise.race([
+                        Promise.resolve(checkpointing.verifyRecoveryOwnership?.(recoveryRefInfo.sha)).then((v) => v === true),
+                        new Promise((res) => { vt = setTimeout(() => res(false), 5000); vt?.unref?.(); }),
+                        new Promise((res) => { vOnAbort = () => res(false); recoverySdkAbort.signal.addEventListener('abort', vOnAbort, { once: true }); }),
+                      ]).finally(() => { clearTimeout(vt); if (vOnAbort) recoverySdkAbort.signal.removeEventListener('abort', vOnAbort); });
+                    } catch { stillOwns = false; }
+                    if (!stillOwns) {
+                      logger.warn?.(`[${jobType}] job ${job.jobKey}: recovery ref ${recoveryRefInfo.ref} is no longer owned by this run (a newer activation superseded it) — skipping the process-scoped resumeFromCheckpoint write so the newer pointer stays authoritative.`);
+                      return;
+                    }
                     const w = camunda.createElementInstanceVariables({
                       elementInstanceKey: String(job.processInstanceKey),
                       variables: { resumeFromCheckpoint: { ref: recoveryRefInfo.ref, sha: recoveryRefInfo.sha, elementInstanceKey: String(job.elementInstanceKey ?? ''), elementId: job.elementId ?? null, recovered: true, at: Date.now() } },

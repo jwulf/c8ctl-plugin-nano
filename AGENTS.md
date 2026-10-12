@@ -282,14 +282,19 @@ SDK client (job workers) — do **not** add the SDK as a dependency or use raw
   correlation keys on the **static `elementId`** (not an occurrence id), it is
   AMBIGUOUS under parallel multi-instance of one agent-task element in a single process
   instance — which is **out of scope for resume** (no nano-workforce process fans one
-  agent-task element out that way). `makeOccurrenceGuard` enforces it: before adopting,
-  it asks the engine (`searchElementInstances`, `state:'ACTIVE'`) how many occurrences of
-  the `elementId` are active in the process instance and **fails closed to a clean start**
-  on >1 (or when the host SDK can't answer / the lookup errors) rather than risk
-  restoring a sibling occurrence's state. `resumeRefIsExplicit` bypasses both the
-  correlation and the guard when the process delivers an explicit occurrence-authoritative
-  predecessor ref as a bare **string** (nano-workforce#891 plugs in with no further plugin
-  change). (c) **GC-proof
+  agent-task element out that way). Because counting ACTIVE occurrences cannot establish
+  occurrence identity (index lag can hide a live sibling, and a terminal sibling drops
+  out of the ACTIVE result yet may have been the slot's last writer), NO engine query
+  makes an elementId-correlated self-record adoption provably safe. So a self-recorded
+  (object) predecessor is **never auto-adopted** — `makeOccurrenceGuard` fails closed by
+  construction and the restore path starts clean (transcript-only) rather than risk
+  restoring a sibling occurrence's state. The ONLY predecessor trusted is the explicit,
+  occurrence-authoritative ref the process delivers as a bare **string**:
+  `resumeRefIsExplicit` bypasses the correlation when that string is present
+  (nano-workforce#891 plugs in with no further plugin change). After a successful
+  adoption the process-scoped pointer is **advanced** to this run's newly-copied ref, so
+  a no-new-checkpoint completion can't leave a stale predecessor pointer for the next
+  activation. (c) **GC-proof
   recovery refs**: on a force-stop/abort or failed (SLA-cancelled) run,
   `preserveRecovery` promotes the latest snapshot to `refs/nano/recovered/<eik>`
   (`recoveredCheckpointRef`) — **outside** the `refs/nano/wip/*` namespace the sweep

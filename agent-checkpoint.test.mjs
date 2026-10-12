@@ -1635,38 +1635,24 @@ test('#296 predecessorCheckpointRef: accepts a GC-proof RECOVERY ref (AC3 — SL
   assert.equal(predecessorCheckpointRef({ resumeFromCheckpoint: 'refs/nano/recovered/' }), null);
 });
 
-test('#296 makeOccurrenceGuard: fails closed on ambiguous parallel MI; safe on a unique occurrence', async () => {
-  // No search method ⇒ the guard cannot prove uniqueness ⇒ null (caller fails closed).
-  assert.equal(makeOccurrenceGuard({}), null);
-  assert.equal(makeOccurrenceGuard(), null);
-
-  // A UNIQUE active occurrence ⇒ safe (the lone occurrence is this resumed run itself).
-  const one = makeOccurrenceGuard({ searchElementInstances: async () => ({ items: [{ elementInstanceKey: '20' }] }) });
-  assert.deepEqual(await one('500', 'review-round'), { safe: true, candidates: ['20'], reason: 'unique' });
-  // Zero active (index lag) is also safe — no sibling to confuse it with.
-  const none = makeOccurrenceGuard({ searchElementInstances: async () => ({ items: [] }) });
-  assert.equal((await none('500', 'review-round')).safe, true);
-
-  // >1 ACTIVE occurrence of the same elementId ⇒ genuine parallel MI ⇒ FAIL CLOSED.
-  const many = makeOccurrenceGuard({ searchElementInstances: async () => ({ items: [{ elementInstanceKey: '20' }, { elementInstanceKey: '21' }] }) });
-  const v = await many('500', 'review-round');
-  assert.equal(v.safe, false);
-  assert.deepEqual(v.candidates, ['20', '21']);
-  assert.match(v.reason, /2 active occurrences/);
-
-  // A lookup error ⇒ fail closed (we cannot prove uniqueness).
-  const boom = makeOccurrenceGuard({ searchElementInstances: async () => { throw new Error('engine down'); } });
-  const e = await boom('500', 'review-round');
-  assert.equal(e.safe, false);
-  assert.match(e.reason, /lookup failed: engine down/);
-
-  // Missing process/element ids ⇒ fail closed (cannot correlate).
-  assert.equal((await one('', 'review-round')).safe, false);
-  assert.equal((await one('500', '')).safe, false);
-
-  // Tolerates a bare-array response and alternate key fields.
+test('#296 makeOccurrenceGuard: fails closed by construction — a self-record can never prove occurrence identity', async () => {
+  // Copilot review r4244212483: counting ACTIVE occurrences cannot establish occurrence
+  // identity (index lag hides a live sibling; a terminal sibling drops out of the ACTIVE
+  // set yet may have been the resume slot's last writer), so NO engine query makes an
+  // elementId-correlated self-record adoption provably safe. The guard therefore fails
+  // closed BY CONSTRUCTION: it always reports safe:false regardless of what the engine
+  // would return, and never even consults the search method.
+  let searched = false;
+  const guard = makeOccurrenceGuard({
+    searchElementInstances: async () => { searched = true; return { items: [{ elementInstanceKey: '20' }] }; },
+  });
+  const v = await guard('500', 'review-round');
+  assert.equal(v.safe, false, 'a self-record is never auto-adopted — even a "unique" active occurrence is not proof of identity');
+  assert.equal(searched, false, 'the guard no longer consults the engine');
+  assert.match(v.reason, /cannot establish occurrence identity/);
+  // A bare-array / alternate-key engine response is irrelevant — still unsafe.
   const arr = makeOccurrenceGuard({ searchElementInstances: async () => [{ key: '20' }] });
-  assert.deepEqual(await arr('500', 'review-round'), { safe: true, candidates: ['20'], reason: 'unique' });
+  assert.equal((await arr('500', 'review-round')).safe, false);
 });
 
 test('#296 resumeRefIsExplicit: a bare ref string in EITHER checkpoint namespace is occurrence-authoritative', () => {
@@ -2068,7 +2054,7 @@ test('#296 (F10) preserveRecovery fails CLOSED when the recovery ref owner is un
   } finally { fc.cleanup(); }
 });
 
-test('#295 setupWorkspaceCheckpoints: a resumed run adopts its predecessor via resumeFromCheckpoint', async () => {
+test('#295 setupWorkspaceCheckpoints: a self-recorded predecessor is NOT auto-adopted (occurrence identity unprovable)', async () => {
   const f = fixture();
   try {
     const env = { NANO_AGENT_CHECKPOINT: 'on', NANO_AGENT_CHECKPOINT_INTERVAL_MS: '0' };
@@ -2080,7 +2066,9 @@ test('#295 setupWorkspaceCheckpoints: a resumed run adopts its predecessor via r
     const vars = [];
     const camunda = {
       createElementInstanceVariables: async (input) => { vars.push(input); },
-      // #295 ambiguity guard: a UNIQUE active occurrence of this elementId ⇒ safe to adopt.
+      // Even a UNIQUE active occurrence cannot prove occurrence identity (Copilot
+      // r4244212483): index lag can hide a sibling and a terminal sibling may have been
+      // the resume slot's last writer, so a self-record is never auto-adopted.
       searchElementInstances: async () => ({ items: [{ elementInstanceKey: '20' }] }),
     };
 
@@ -2099,23 +2087,23 @@ test('#295 setupWorkspaceCheckpoints: a resumed run adopts its predecessor via r
     assert.equal(resumeVar.variables.resumeFromCheckpoint.ref, 'refs/nano/wip/10');
     assert.equal(resumeVar.variables.resumeFromCheckpoint.sha, res.sha);
 
-    // The SLA escalation re-enters the task as a NEW element (20) in the SAME process;
-    // its variables carry the predecessor ref. setupWorkspaceCheckpoints adopts
-    // refs/nano/wip/10 under refs/nano/wip/20 and RESTORES it.
+    // The SLA escalation re-enters the task as a NEW element (20) in the SAME process,
+    // carrying the predecessor's SELF-RECORD (an object). Because occurrence identity is
+    // unprovable from the static elementId, it is NOT adopted — the run starts clean.
     const p2 = provision('run2');
     const logger = quietLogger();
     const job2 = { jobKey: '2', elementInstanceKey: '20', processInstanceKey: '500', elementId: 'review-round', variables: { resumeFromCheckpoint: resumeVar.variables.resumeFromCheckpoint } };
     const s2 = await setupWorkspaceCheckpoints({ provisioned: p2, job: job2, jobType: 't', runId: 'run-2', camunda, logger, env, deps: { sweepRegistry: new Map() } });
-    assert.equal(s2.restored?.restored, true);
-    assert.match(logger.lines.info.join('\n'), /adopted predecessor WIP checkpoint refs\/nano\/wip\/10/);
-    assert.equal(readFileSync(join(p2.workspaceDir, 'wip.txt'), 'utf8'), 'half done\n');
-    // The predecessor's content is now also under this run's own key.
-    assert.equal(sh(f.root, '--git-dir', f.remote, 'rev-parse', 'refs/nano/wip/20'), res.sha);
+    assert.equal(s2.restored, null, 'a self-recorded predecessor is not adopted');
+    assert.match(logger.lines.warn.join('\n'), /not adopting predecessor WIP checkpoint refs\/nano\/wip\/10 .*self-record/);
+    assert.ok(!existsSync(join(p2.workspaceDir, 'wip.txt')), 'no predecessor state is restored');
+    // The predecessor's content is NOT copied under this run's own key.
+    assert.throws(() => sh(f.root, '--git-dir', f.remote, 'rev-parse', '--verify', 'refs/nano/wip/20'));
     await s2.close();
   } finally { f.cleanup(); }
 });
 
-test('#296 setupWorkspaceCheckpoints: refuses predecessor adoption when >1 occurrence is active (parallel MI)', async () => {
+test('#296 setupWorkspaceCheckpoints: refuses to adopt an elementId-correlated self-record (occurrence identity unprovable)', async () => {
   const f = fixture();
   try {
     const env = { NANO_AGENT_CHECKPOINT: 'on', NANO_AGENT_CHECKPOINT_INTERVAL_MS: '0' };
@@ -2125,10 +2113,11 @@ test('#296 setupWorkspaceCheckpoints: refuses predecessor adoption when >1 occur
       return { workspaceDir: dir, gitEnv: ENV, committer: { name: 'bot', email: 'bot@example.com' }, startSha: sh(dir, 'rev-parse', 'HEAD'), workingBranch: 'nano/agent-work/main-x' };
     };
     const vars = [];
-    // Two active occurrences of the elementId in the process ⇒ ambiguous ⇒ fail closed.
+    // Even a UNIQUE active occurrence is not proof of identity (Copilot r4244212483):
+    // a self-recorded (object) predecessor is never auto-adopted.
     const camunda = {
       createElementInstanceVariables: async (input) => { vars.push(input); },
-      searchElementInstances: async () => ({ items: [{ elementInstanceKey: '20' }, { elementInstanceKey: '21' }] }),
+      searchElementInstances: async () => ({ items: [{ elementInstanceKey: '20' }] }),
     };
 
     const p1 = provision('run1');
@@ -2142,10 +2131,10 @@ test('#296 setupWorkspaceCheckpoints: refuses predecessor adoption when >1 occur
     const logger = quietLogger();
     const job2 = { jobKey: '2', elementInstanceKey: '20', processInstanceKey: '500', elementId: 'review-round', variables: { resumeFromCheckpoint: resumeVar.variables.resumeFromCheckpoint } };
     const s2 = await setupWorkspaceCheckpoints({ provisioned: p2, job: job2, jobType: 't', runId: 'run-2', camunda, logger, env, deps: { sweepRegistry: new Map() } });
-    // Ambiguous ⇒ NOT restored; the worktree stays pristine (no wip.txt laid down).
+    // A self-record is NOT adopted ⇒ NOT restored; the worktree stays pristine.
     assert.equal(s2.restored, null);
-    assert.ok(!existsSync(join(p2.workspaceDir, 'wip.txt')), 'no sibling occurrence state is restored');
-    assert.match(logger.lines.warn.join('\n'), /not adopting predecessor WIP checkpoint .*ambiguous.*2 active occurrences/);
+    assert.ok(!existsSync(join(p2.workspaceDir, 'wip.txt')), 'no self-recorded predecessor state is restored');
+    assert.match(logger.lines.warn.join('\n'), /not adopting predecessor WIP checkpoint .*self-record/);
     // This run never claimed the predecessor ref under its own key.
     assert.throws(() => sh(f.root, '--git-dir', f.remote, 'rev-parse', '--verify', 'refs/nano/wip/20'));
     await s2.close();
@@ -2185,6 +2174,12 @@ test('#296 setupWorkspaceCheckpoints: an EXPLICIT (string) predecessor ref bypas
     assert.equal(searched, false, 'the ambiguity guard is NOT consulted for an explicit ref');
     assert.equal(readFileSync(join(p2.workspaceDir, 'wip.txt'), 'utf8'), 'half done\n');
     assert.equal(sh(f.root, '--git-dir', f.remote, 'rev-parse', 'refs/nano/wip/20'), res.sha);
+    // #296 (review): after adoption the process-scoped pointer is ADVANCED to this run's
+    // newly-copied ref, so a no-new-checkpoint completion can't leave it naming the stale
+    // predecessor for the next activation.
+    const advanced = vars.find((v) => v.elementInstanceKey === '500' && v.variables?.resumeFromCheckpoint?.ref === 'refs/nano/wip/20');
+    assert.ok(advanced, 'the resumeFromCheckpoint pointer is advanced to this run\'s ref after adoption');
+    assert.equal(advanced.variables.resumeFromCheckpoint.adoptedFrom, 'refs/nano/wip/10');
     await s2.close();
   } finally { f.cleanup(); }
 });

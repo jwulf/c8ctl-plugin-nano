@@ -853,13 +853,16 @@ the job with a decremented retry count. Profiles are stored in the plugin's
 >   multi-instance of a single agent-task element is therefore unsupported for resume**
 >   (no nano-workforce process fans one agent-task element out that way — parallel
 >   fan-out uses distinct child processes or distinct element ids, and rounds/retries are
->   sequential). To make a wrong adoption *impossible* rather than merely unlikely, the
->   restore path asks the engine how many occurrences of the `elementId` are **active**
->   before adopting a predecessor checkpoint: more than one — or an engine that can't
->   answer — **fails closed to a clean start** (a fresh clone, no restored state) instead
->   of risking a sibling occurrence's work. When the process delivers an explicit,
->   occurrence-authoritative predecessor ref (a bare ref string) that ref is trusted
->   as-is and the ambiguity check is skipped.
+>   sequential). Because counting **active** occurrences cannot establish occurrence
+>   identity — index lag can hide a live sibling, and a sibling that already went
+>   terminal drops out of the active set yet may have been the resume slot's last writer
+>   — no engine query makes an `elementId`-correlated self-record adoption provably safe.
+>   So a self-recorded (object) predecessor is **never auto-adopted**: the restore path
+>   fails closed to a clean start (a fresh clone, transcript-only) rather than risk a
+>   sibling occurrence's work. The only predecessor trusted is an explicit,
+>   occurrence-authoritative ref delivered as a bare ref **string**, which is trusted
+>   as-is. After a successful adoption the process-scoped pointer is advanced to this
+>   run's newly-copied ref so a no-new-checkpoint completion can't leave it stale.
 
 > **Agent outcomes.** A harness may report an explicit end-of-task outcome in its
 > `session/prompt` result as `_meta.outcome` — `{ "status": "completed" | "blocked",

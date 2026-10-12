@@ -434,37 +434,34 @@ export function makeOrphanProbe({ getElementInstance, getProcessInstance = null 
 // single agent-task element is OUT OF SCOPE for resume (no nano-workforce process fans
 // one agent-task element out in parallel within a single instance — plan-fanout's
 // parallel `implement` MI calls a separate CHILD process, delivery graphs fan out to
-// DISTINCT elementIds, and review rounds / retries are sequential). This guard makes a
-// wrong adoption IMPOSSIBLE rather than merely unlikely: before adopting, it asks the
-// engine how many element instances of this `elementId` are ACTIVE in the process
-// instance. More than one active occurrence ⇒ genuine parallel MI ⇒ the correlation is
-// ambiguous ⇒ FAIL CLOSED (no restore; a clean start is the acceptable worst case).
-// Returns `null` when the host SDK exposes no `searchElementInstances` (then the caller
-// also fails closed — it cannot prove uniqueness). The returned probe resolves
-// `{ safe, candidates, reason }`; `safe:false` on >1 occurrence OR any lookup error.
-export function makeOccurrenceGuard({ searchElementInstances } = {}) {
-  if (typeof searchElementInstances !== 'function') return null;
-  return async (processInstanceKey, elementId) => {
-    const pik = processInstanceKey == null ? '' : String(processInstanceKey).trim();
-    const eid = typeof elementId === 'string' ? elementId.trim() : '';
-    if (!pik || !eid) return { safe: false, candidates: [], reason: 'missing processInstanceKey/elementId' };
-    let res;
-    try {
-      res = await searchElementInstances({ filter: { processInstanceKey: pik, elementId: eid, state: 'ACTIVE' } });
-    } catch (err) {
-      return { safe: false, candidates: [], reason: `lookup failed: ${err?.message || err}` };
-    }
-    const items = Array.isArray(res?.items) ? res.items : (Array.isArray(res) ? res : []);
-    const candidates = items
-      .map((it) => String(it?.elementInstanceKey ?? it?.elementInstanceId ?? it?.key ?? '').trim())
-      .filter(Boolean);
-    // >1 ACTIVE occurrence of the same element in one instance ⇒ parallel MI ⇒ fail
-    // closed. 0 or 1 ⇒ no concurrent sibling ⇒ safe (the lone active occurrence is
-    // this resumed run itself, or the index has not yet caught up — either way there
-    // is no sibling to confuse it with).
-    if (items.length > 1) return { safe: false, candidates, reason: `${items.length} active occurrences` };
-    return { safe: true, candidates, reason: 'unique' };
-  };
+// DISTINCT elementIds, and review rounds / retries are sequential).
+//
+// Copilot review on #296 (r4244212483): the earlier "count ACTIVE occurrences" probe
+// could NOT actually make a wrong adoption impossible, so it has been REMOVED as an
+// adoption gate. Counting active instances never establishes occurrence identity:
+//   - the search is explicitly allowed to return ZERO from index lag (`consistency
+//     waitUpToMs: 0`), and that same lag can hide a genuinely-active sibling; and
+//   - even on a fresh index, a sibling that already went TERMINAL drops out of the
+//     `state:'ACTIVE'` result yet may have been the LAST WRITER of the shared
+//     process-scoped slot — so `items.length <= 1` can still adopt that sibling's
+//     checkpoint.
+// Because a self-recorded (object) predecessor is correlated ONLY by the ambiguous
+// static elementId, NO engine query can prove it names THIS occurrence. The guard
+// therefore FAILS CLOSED BY CONSTRUCTION: it always reports `{ safe:false }`, so the
+// caller never auto-adopts a self-record. The ONLY predecessor this run trusts is the
+// EXPLICIT, occurrence-authoritative ref the process delivers as a bare STRING
+// (`resumeRefIsExplicit`, nano-workforce#891 option 2) — the process's exact choice of
+// predecessor for THIS occurrence. Until #891 delivers that, a resume starts clean
+// (transcript-only) rather than risk restoring a sibling occurrence's state.
+//
+// Kept exported (and still returning a probe) for backward compatibility and so the
+// diagnostics/tests can observe the refusal reason; it no longer consults the engine.
+export function makeOccurrenceGuard() {
+  return async () => ({
+    safe: false,
+    candidates: [],
+    reason: 'an elementId-correlated self-record cannot establish occurrence identity (parallel multi-instance shares the elementId and the resume slot); only an explicit occurrence-authoritative ref is adopted',
+  });
 }
 
 // The resume slot carries EITHER the predecessor's self-stamped record (a structured

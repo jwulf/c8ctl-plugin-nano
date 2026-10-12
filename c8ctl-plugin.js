@@ -90,7 +90,7 @@ import { createAgentInstanceProducer, isExternalAgentJob } from './agent-instanc
 // so the new agent CONTINUES rather than cold-reruns — at-least-once delivery becomes
 // a continuation, not a duplicate. Best-effort; degrades to the legacy cold rerun.
 import { resolveEffectiveEnvelope } from './agent-resume.mjs';
-import { checkpointConfig, checkpointEligibility, checkpointRef, recoveredCheckpointRef, predecessorCheckpointRef, makeOccurrenceGuard, resumeRefIsExplicit, pushNamedRef, observeRemoteRefSha, makeOrphanProbe, normalizeSecretValues, credentialsFromUrl, isAuthenticatedRemote, shouldSweep, sweepStaleCheckpoints, createGitRunner, fetchCheckpoint, restoreCheckpoint, createWorkspaceCheckpoint, createCheckpointer, deleteCheckpointRef, withCheckpointNote, sanitizeBranchSegment } from './agent-checkpoint.mjs';
+import { checkpointConfig, checkpointEligibility, checkpointRef, recoveredCheckpointRef, predecessorCheckpointRef, resumeRefIsExplicit, pushNamedRef, observeRemoteRefSha, makeOrphanProbe, normalizeSecretValues, credentialsFromUrl, isAuthenticatedRemote, shouldSweep, sweepStaleCheckpoints, createGitRunner, fetchCheckpoint, restoreCheckpoint, createWorkspaceCheckpoint, createCheckpointer, deleteCheckpointRef, withCheckpointNote, sanitizeBranchSegment } from './agent-checkpoint.mjs';
 
 const requireFromHere = createRequire(import.meta.url);
 const pluginDir = dirname(fileURLToPath(import.meta.url));
@@ -6840,41 +6840,25 @@ async function setupWorkspaceCheckpoints({ provisioned, envelope = null, token =
     // re-entry); adopt it under THIS run's key so the restore/ownership/discard paths
     // below operate unchanged and no GC can reclaim it between activations.
     if (!prior && !startupFetchFailed) {
-      // Correlate the shared process-scoped slot to THIS task by elementId (Copilot
-      // review on #295): a different task's recorded ref is refused, so a process
-      // with parallel/sequential agent tasks never adopts another task's state.
+      // Correlate the shared process-scoped slot to THIS task. Copilot review on #296
+      // (r4244212483): a SELF-RECORDED (object) predecessor is correlated only by the
+      // STATIC elementId, which is NOT unique under parallel multi-instance of one
+      // agent-task element (N occurrences share the elementId AND the one process-scoped
+      // resume slot). Counting ACTIVE occurrences cannot establish occurrence identity
+      // (index lag can hide a live sibling; a terminal sibling drops out of the ACTIVE
+      // result yet may have been the slot's last writer), so NO engine query makes a
+      // self-record adoption provably safe. We therefore adopt ONLY an EXPLICIT,
+      // occurrence-authoritative ref — a bare STRING the process delivers naming THIS
+      // occurrence's exact predecessor (nano-workforce#891, option 2). A self-recorded
+      // object is NEVER auto-adopted (fail closed to a clean start); until #891 delivers
+      // the explicit ref, a resume is transcript-only rather than risking a sibling's
+      // state. `predecessorCheckpointRef` still parses/locates the candidate ref; the
+      // explicit check below is what authorizes adopting it.
       const predRef = predecessorCheckpointRef(job?.variables, ref, job?.elementId ?? null);
       if (predRef) {
-        // #295 ambiguity guard (nano-workforce#891). A self-recorded predecessor is
-        // correlated only by the STATIC elementId, which is NOT unique under parallel
-        // multi-instance of one agent-task element (N occurrences share the elementId
-        // AND the one process-scoped resume slot). Parallel MI of a single agent-task
-        // element is OUT OF SCOPE for resume, but we make a wrong adoption IMPOSSIBLE
-        // rather than merely unlikely: unless the process delivered an EXPLICIT
-        // occurrence-authoritative ref (a bare string — then it is trusted as-is), ask
-        // the engine whether >1 occurrence of this elementId is ACTIVE in the process
-        // instance. More than one ⇒ ambiguous correlation ⇒ FAIL CLOSED (skip adoption,
-        // start clean) rather than risk restoring a sibling occurrence's state. The
-        // guard also fails closed when the host SDK can't answer (no search method, or
-        // the lookup errors) — we cannot prove uniqueness, so we do not adopt.
-        let adoptAllowed = true;
-        if (!resumeRefIsExplicit(job?.variables)) {
-          const guard = makeOccurrenceGuard({
-            searchElementInstances: typeof camunda?.searchElementInstances === 'function'
-              ? (q) => withDeadline(camunda.searchElementInstances(q, { consistency: { waitUpToMs: 0 } }), CP_SDK_TIMEOUT_MS, 'searchElementInstances')
-              : undefined,
-          });
-          if (!guard) {
-            adoptAllowed = false;
-            log.warn(`not adopting predecessor WIP checkpoint ${predRef} — the host SDK exposes no element-instance search, so the elementId correlation for element ${job?.elementId ?? '?'} cannot be proven unambiguous; starting clean. (Parallel multi-instance of one agent-task element is unsupported for resume.)`);
-          } else {
-            let verdict = null;
-            try { verdict = await guard(job?.processInstanceKey ?? null, job?.elementId ?? null); } catch (err) { verdict = { safe: false, candidates: [], reason: `guard failed: ${oneLineLog(err?.message || err)}` }; }
-            if (!verdict?.safe) {
-              adoptAllowed = false;
-              log.warn(`not adopting predecessor WIP checkpoint ${predRef} — ambiguous elementId correlation for element ${job?.elementId ?? '?'} in process ${job?.processInstanceKey ?? '?'} (${verdict?.reason || 'unknown'}${verdict?.candidates?.length ? `; active occurrences: ${verdict.candidates.join(', ')}` : ''}); starting clean. (Parallel multi-instance of one agent-task element is unsupported for resume.)`);
-            }
-          }
+        const adoptAllowed = resumeRefIsExplicit(job?.variables);
+        if (!adoptAllowed) {
+          log.warn(`not adopting predecessor WIP checkpoint ${predRef} — it is an elementId-correlated self-record, which cannot be proven to name THIS occurrence (parallel multi-instance of one agent-task element shares the elementId and the process-scoped resume slot); starting clean. Resume is transcript-only until the process delivers an explicit occurrence-authoritative ref (nano-workforce#891).`);
         }
         let predCp = null;
         if (adoptAllowed) {
@@ -6889,6 +6873,21 @@ async function setupWorkspaceCheckpoints({ provisioned, envelope = null, token =
             try { prior = await fetchCp({ git: startupGit, ref }); } catch { prior = { ...predCp, ref }; }
             if (!prior) prior = { ...predCp, ref };
             logger.info?.(`${prefix} (${corr}): adopted predecessor WIP checkpoint ${predRef}@${predCp.sha.slice(0, 12)} under this run's key ${ref} (SLA-escalation resume); restoring it below.`);
+            // #296 (review): the process-scoped slot still names the PREDECESSOR ref.
+            // If this resumed activation now succeeds WITHOUT taking another checkpoint
+            // (a short run before the safety timer), its adopted WIP ref is deleted on
+            // ack while the stale slot keeps pointing at the predecessor — a later
+            // activation would re-restore that old snapshot. Advance the slot to THIS
+            // run's newly-copied ref so the pointer tracks the current owner. Best-effort.
+            if (typeof camunda?.createElementInstanceVariables === 'function' && job?.processInstanceKey) {
+              try {
+                await withDeadline(camunda.createElementInstanceVariables({
+                  elementInstanceKey: String(job.processInstanceKey),
+                  variables: { resumeFromCheckpoint: { ref, sha: predCp.sha, elementInstanceKey: String(job.elementInstanceKey ?? ''), elementId: job.elementId ?? null, branch: provisioned.workingBranch || null, at: Date.now(), adoptedFrom: predRef } },
+                  local: true,
+                }), CP_SDK_TIMEOUT_MS, 'createElementInstanceVariables');
+              } catch (err) { log.debug(`could not advance the resumeFromCheckpoint pointer to ${ref} — ${oneLineLog(err?.message || err)}.`); }
+            }
           } else if (copied?.staleLease) {
             // A concurrent activation populated this key first — adopt what IS there
             // rather than force over it; the ref now holds the race winner's state.

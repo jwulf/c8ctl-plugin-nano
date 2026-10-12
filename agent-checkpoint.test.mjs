@@ -1300,15 +1300,26 @@ test('#296 (F8/F9) createGitRunner signal aborts an in-flight git op instead of 
   // under the 60s timeout) with a non-zero/aborted result.
   const f = fixture();
   try {
-    f.clone('abortable');
+    // Run from the CLONE (a real repo) — not f.root, which is not a git repository
+    // and would make any op fail instantly, proving ordinary command failure rather
+    // than the abort path.
+    const { dir } = f.clone('abortable');
     const ac = new AbortController();
-    const runner = createGitRunner({ cwd: f.root, env: ENV, timeoutMs: 60_000, signal: ac.signal });
+    const runner = createGitRunner({ cwd: dir, env: ENV, timeoutMs: 60_000, signal: ac.signal });
     const started = Date.now();
-    const p = runner(['ls-remote', '--quiet', 'origin', 'refs/nano/wip/*']);
+    // A `!`-shell git alias that TRAPS (ignores) SIGTERM and sleeps 30s: the op is
+    // genuinely IN FLIGHT when abort() fires, so the fast settle below can ONLY be
+    // the abort tearing the child down (SIGTERM→SIGKILL escalation) — never the op
+    // finishing or failing on its own. This is what proves cancellation terminates a
+    // long-running child rather than passing on an ordinary fast failure.
+    const p = runner(['-c', "alias.hang=!trap '' TERM; sleep 30", 'hang']);
+    // Let the child spawn and enter its 30s sleep before aborting, so the abort lands
+    // mid-operation (not at the entry fast-path guard).
+    await new Promise((r) => setTimeout(r, 100));
     ac.abort();
     const r = await p;
     const elapsed = Date.now() - started;
-    assert.ok(elapsed < 10_000, `aborted git op settled in ${elapsed}ms, not the 60s timeout`);
+    assert.ok(elapsed < 10_000, `aborted git op settled in ${elapsed}ms, not the 30s sleep or the 60s timeout`);
     assert.notEqual(r.status, 0, 'aborted op does not report success');
     assert.match(`${r.stderr}`, /aborted/i);
   } finally { f.cleanup(); }

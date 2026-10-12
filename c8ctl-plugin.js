@@ -6988,7 +6988,7 @@ async function setupWorkspaceCheckpoints({ provisioned, envelope = null, token =
         // the sweep's git is still live. The deadline only bounds it by aborting the git.
         gc = Promise.resolve(sweep({ git: sweepGit, ownRef: ref, ttlMs: cfg.ttlMs, graceMs: cfg.gcGraceMs, isTerminal, now, signal: sweepAbort.signal }))
           .then((r) => {
-            if (r?.deleted?.length) logger.info?.(`${prefix} (${corr}): reclaimed ${r.deleted.length} orphaned WIP checkpoint ref(s): ${r.deleted.map((d) => `${d.ref}@${String(d.sha || '').slice(0, 12) || '?'} [${d.why}]`).join(', ')}.`);
+            if (r?.deleted?.length) logger.info?.(`${prefix} (${corr}): reclaimed ${r.deleted.length} orphaned WIP checkpoint ref(s): ${r.deleted.map((d) => `${d.ref}@${String(d.sha || '') || '?'} [${d.why}]`).join(', ')}.`);
             else if (sweepAbort.signal.aborted) log.debug(`WIP checkpoint GC bounded at ${GC_OVERALL_TIMEOUT_MS}ms — aborted its in-flight git and drained; leftover refs reclaimed on a later sweep.`);
             else if (r?.error) log.debug(`WIP checkpoint GC skipped — ${redactToken(oneLineLog(r.error), token)}.`);
           }, (err) => log.debug(`WIP checkpoint GC threw — ${redactToken(oneLineLog(err?.message || err), token)}.`))

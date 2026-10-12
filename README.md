@@ -826,7 +826,15 @@ the job with a decremented retry count. Profiles are stored in the plugin's
 >   the job, so the ref stays restorable. Orphans (cancelled instances, failed acks,
 >   exhausted retries) are reclaimed by a background sweep (at most hourly per remote per
 >   worker) that deletes WIP refs older than `NANO_AGENT_CHECKPOINT_TTL_MS` (7 days), or
->   older than 1h whose element instance the engine reports `COMPLETED`/`TERMINATED`.
+>   older than 1h once the run is confirmed terminal. "Terminal" is **process-aware** where
+>   the host SDK exposes process-instance lookup: a ref is reclaimed only when its element
+>   instance is `COMPLETED`/`TERMINATED` **and** its process instance is also terminal
+>   (`COMPLETED`/`TERMINATED`/`CANCELED`). A terminal element inside a **still-active**
+>   process is **spared** — an SLA boundary timer can cancel the element while its process
+>   waits for a human to answer the escalation, and that spared checkpoint is exactly what
+>   the resume needs (issue #295). The sweep fails closed (any missing key / unreachable
+>   lookup spares the ref; the 7-day TTL is the backstop) and degrades to the element-only
+>   check on hosts whose SDK lacks process-instance lookup.
 > - **Safety:** pushes use `--force-with-lease`, so a superseded worker can't clobber a
 >   newer run's checkpoint. A remote *policy* refusal (repository rules, secret push
 >   protection) or a permission error stops checkpointing for that job with a warning;

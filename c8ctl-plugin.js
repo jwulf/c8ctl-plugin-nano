@@ -261,7 +261,7 @@ const READINESS_POLL_MS = 500;
 const HEALTH_TIMEOUT_MS = 1_500;
 const STOP_GRACE_MS = 8_000;
 // #296: a `stop --force` SIGTERMs a `nano work` child, which (on an interrupted
-// agent job) flushes a last WIP checkpoint and promotes it to a GC-proof recovery
+// agent job) flushes a last WIP checkpoint and promotes it to a durable recovery
 // ref (#295) before exiting. That flush+promote must fit inside the window the
 // supervisor allows before its SIGKILL backstop, or the recovery ref is never
 // written. This is the bounded budget the worker gives that force-stop recovery,
@@ -276,7 +276,7 @@ const FORCE_STOP_RECOVERY_MS = 20_000;
 // SIGKILL backstop (`forceStopWorker` waits STOP_GRACE_MS + FORCE_STOP_RECOVERY_MS),
 // plus a small margin for the daemon to observe the worker's exit and shut down.
 // Otherwise the outer path SIGKILLs the group ~18s early and kills a worker that is
-// still flushing + promoting its GC-proof recovery ref (#295).
+// still flushing + promoting its durable recovery ref (#295).
 const FORCE_STOP_DAEMON_GRACE_MS = STOP_GRACE_MS + FORCE_STOP_RECOVERY_MS + 2_000;
 // #202: the signal a graceful `supervisor stop`/`workforce stop` sends each
 // `nano work` child to quiesce it — stop leasing new jobs, finish in-flight work,
@@ -6783,7 +6783,7 @@ async function setupWorkspaceCheckpoints({ provisioned, envelope = null, token =
     };
     // #296 (F9): the checkpoint-path git runner must stay USABLE after the harness
     // abort. The force-stop RECOVERY path (flush + preserveRecovery, promoting the
-    // GC-proof recovery ref #295) runs only once `result.aborted` is observed — i.e.
+    // durable recovery ref #295) runs only once `result.aborted` is observed — i.e.
     // AFTER the job's `abortSignal` has already fired. Binding this runner to
     // `abortSignal` (the round-4 F8 attempt) made `createGitRunner` fail every
     // recovery command (`[aborted]`), so the abort flush could not push its snapshot
@@ -6944,7 +6944,7 @@ async function setupWorkspaceCheckpoints({ provisioned, envelope = null, token =
     // 4099558206 / 4099762442).
     const GC_OVERALL_TIMEOUT_MS = 120000;
     if (shouldSweep(gcKey, { everyMs: cfg.gcEveryMs, now: now(), registry: deps.sweepRegistry })) {
-      // #295: a nano-managed ref (WIP or GC-proof recovery) is an orphan only when its
+      // #295: a nano-managed ref (WIP or durable recovery) is an orphan only when its
       // element is terminal AND its PROCESS instance is finished too. An element
       // cancelled by an SLA boundary timer, inside a process that is still active (human
       // escalation pending), must NOT be reclaimed — the TTL is the final backstop.
@@ -7017,7 +7017,7 @@ async function setupWorkspaceCheckpoints({ provisioned, envelope = null, token =
     let resumeVarWarned = false;
     // #296 (review): the in-flight ABORT-path metadata write (`setVar` fired
     // fire-and-forget on a force-stop flush, below). The force-stop recovery path
-    // later writes the GC-proof recovery ref to the SAME process-scoped
+    // later writes the durable recovery ref to the SAME process-scoped
     // `resumeFromCheckpoint` slot. If this earlier WIP write is still in flight and
     // lands AFTER the recovery-pointer write, it overwrites the recovery pointer with
     // a stale WIP ref — and once the WIP TTL expires, auto-resume can no longer
@@ -7121,7 +7121,7 @@ async function setupWorkspaceCheckpoints({ provisioned, envelope = null, token =
         // fires the metadata writes off the serialized flush/promote chain: that path
         // is bounded by FORCE_STOP_RECOVERY_MS and the worker returns early (no
         // settle), so awaiting a hung engine there could burn the whole recovery
-        // budget before the recovery git promotion runs — and the GC-proof recovery
+        // budget before the recovery git promotion runs — and the durable recovery
         // ref, not these vars, is the durable artifact of a force-stopped run.
         // A `failed` flush is DIFFERENT: the job settles (settleJob.fail) right after
         // the flush returns, and a retry/reactivation can read variables before a
@@ -7179,7 +7179,7 @@ async function setupWorkspaceCheckpoints({ provisioned, envelope = null, token =
       // `resumeFromCheckpoint` write fired fire-and-forget on a force-stop flush),
       // bounded, so the force-stop recovery path can guarantee ITS recovery-pointer
       // write to the same slot lands LAST (a slow WIP write must not overwrite the
-      // GC-proof recovery ref). Best-effort, never throws; resolves immediately when
+      // durable recovery ref). Best-effort, never throws; resolves immediately when
       // no abort write is in flight. The caller bounds the wait inside the shared
       // force-stop budget, so a hung engine cannot stall the force-stop exit.
       // #296 (review, r4244116341): accept the recovery-deadline `signal` so this SDK
@@ -7205,11 +7205,15 @@ async function setupWorkspaceCheckpoints({ provisioned, envelope = null, token =
           ]);
         } catch { /* best effort */ } finally { if (onAbort) signal.removeEventListener('abort', onAbort); }
       },
-      // #295: promote the latest snapshot to a GC-PROOF recovery ref on an SLA
+      // #295: promote the latest snapshot to a durable recovery ref on an SLA
       // cancellation or a force-stop. `refs/nano/recovered/<elementInstanceKey>`
-      // lives OUTSIDE the WIP namespace the orphan GC sweeps, so it survives until an
-      // operator reclaims it — long enough for the human escalation to be answered and
-      // the work recovered. Returns `{ ref, sha }` (surfaced in the job outcome) or
+      // lives OUTSIDE the `refs/nano/wip/*` namespace, so it survives the
+      // per-checkpoint WIP cleanup (`discardAfterAck`, which only deletes WIP refs)
+      // and workspace reaping — long enough for the human escalation to be answered
+      // and the work recovered. It is NOT exempt from the orphan GC, though: the
+      // sweep reclaims it under the same process-terminal / 7d-TTL policy as a WIP
+      // ref (#296), sparing it only while its process is still ACTIVE. Returns
+      // `{ ref, sha }` (surfaced in the job outcome) or
       // null when there is nothing durable to preserve / the push failed. Best-effort;
       // never throws. The live WIP ref is kept too (this is an additional durable copy).
       async preserveRecovery(reason = 'recovery') {
@@ -7259,7 +7263,7 @@ async function setupWorkspaceCheckpoints({ provisioned, envelope = null, token =
           }
           const r = await pushNamedRef({ git, ref: recRef, sha: ownedSha, expectSha: prevRecSha });
           if (r?.ok) {
-            logger.info?.(`${prefix} (${corr}): preserved a GC-proof recovery checkpoint ${recRef}@${ownedSha.slice(0, 12)} (${reason}) — it survives the orphan GC so the SLA-cancelled/force-stopped run can be recovered and resumed.`);
+            logger.info?.(`${prefix} (${corr}): preserved a durable recovery checkpoint ${recRef}@${ownedSha.slice(0, 12)} (${reason}) — it survives the per-checkpoint WIP cleanup and workspace reaping (the orphan GC spares it while its process stays active) so the SLA-cancelled/force-stopped run can be recovered and resumed.`);
             return { ref: recRef, sha: ownedSha };
           }
           if (r?.staleLease) {
@@ -10081,7 +10085,7 @@ function buildResultEnvelope(result, { sandbox, image, git, result: agentResult,
     if (git.branchMismatch) env.branchMismatch = git.branchMismatch;
     if (git.pr) env.pr = git.pr;
     if (git.error) env.gitError = git.error;
-    // #295: a GC-proof recovery ref (refs/nano/recovered/<eik>) an SLA-cancelled or
+    // #295: a durable recovery ref (refs/nano/recovered/<eik>) an SLA-cancelled or
     // force-stopped run left behind — carried in the outcome so the escalation /
     // resume can recover the snapshot from it even after the workspace is reaped.
     if (git.recoveryRef) env.recoveryRef = git.recoveryRef;
@@ -12859,7 +12863,7 @@ async function workAgent(req, flags, ctx) {
         // then an independent close() wait) and risking a SIGKILL during cleanup
         // (Copilot review on #296). 0 until a force-stop begins.
         let forceStopDeadline = 0;
-        // #295: the GC-proof recovery ref (and SHA) a preserveRecovery() pushed on an
+        // #295: the durable recovery ref (and SHA) a preserveRecovery() pushed on an
         // SLA cancellation / failed run, surfaced in the job outcome (io.nanobpm.agentResult)
         // — but ONLY on the failed/SLA-cancel path, which settles normally and so reaches
         // buildResultEnvelope. A FORCE-STOPPED run is yielded (settle.fail, retries
@@ -13016,11 +13020,13 @@ async function workAgent(req, flags, ctx) {
           // that yield. The finally below still runs (container/run-dir/relay
           // cleanup); recordJobEnd fires in the outer finally.
           if (result && result.aborted) {
-            logger.warn(`[${jobType}] job ${job.jobKey} aborted (worker force-stop) — harness killed; yielding job for retry.`);
+            logger.warn(`[${jobType}] job ${job.jobKey} aborted (worker force-stop or SLA/lease-loss cancellation) — harness killed; releasing the job (the broker re-activates it for retry when the run is still live).`);
             // #264: last-chance WIP checkpoint so the retry can pick up the
             // uncommitted work (bounded; the lease guards a newer owner).
-            // #295: then promote it to a GC-proof recovery ref so a force-stopped run
-            // is never reclaimed as an orphan before it can be resumed. The ref is
+            // #295: then promote it to a durable recovery ref so a force-stopped or
+            // SLA-cancelled run keeps a recovery point. The orphan GC spares that ref
+            // while its process stays active, so it survives long enough to be
+            // resumed. The ref is
             // pushed here, but it is NOT surfaced in a job outcome: this path yields
             // the job and returns early, never reaching buildResultEnvelope — a
             // force-stopped run produces no outcome envelope by design (Copilot
@@ -13087,7 +13093,7 @@ async function workAgent(req, flags, ctx) {
                 // job outcome. Persist the recovery ref through the PROCESS-scoped
                 // `resumeFromCheckpoint` slot instead: it survives the element re-entry an
                 // SLA escalation triggers, so the resumed run's predecessorCheckpointRef
-                // can discover the GC-proof refs/nano/recovered/<eik> point. Bounded and
+                // can discover the durable refs/nano/recovered/<eik> point. Bounded and
                 // best-effort — never holds the force-stop exit; the pushed ref itself
                 // remains the authoritative recovery handle.
                 // #296 (review): the abort flush fired its OWN WIP `resumeFromCheckpoint`
@@ -13147,7 +13153,7 @@ async function workAgent(req, flags, ctx) {
           }
           // #264: a failed run is retried — checkpoint what it left behind.
           // #295: an SLA-cancelled run surfaces here as a non-ok (timed-out) result;
-          // preserve a GC-proof recovery ref and report it in the job outcome below.
+          // preserve a durable recovery ref and report it in the job outcome below.
           if (checkpointer && !result.ok) {
             await checkpointer.flush('failed', { timeoutMs: checkpointing.flushTimeoutMs }); checkpointFinalized = true;
             try { recoveryRefInfo = await checkpointing.preserveRecovery('failed') || recoveryRefInfo; } catch { /* best effort */ }
@@ -13293,7 +13299,7 @@ async function workAgent(req, flags, ctx) {
           } else if (provisioned) {
             gitResult = { remote: provisioned.remote, branch: provisioned.workingBranch, baseSha: provisioned.startSha || null, commits: [], pushed: false };
           }
-          // #295: surface the GC-proof recovery ref (pushed on an SLA cancellation /
+          // #295: surface the durable recovery ref (pushed on an SLA cancellation /
           // failed run above) in the job outcome so the escalation can point a resume
           // at it. Attach to whatever gitResult was built for this (provisioned) job.
           if (recoveryRefInfo && gitResult) { gitResult.recoveryRef = recoveryRefInfo.ref; gitResult.recoverySha = recoveryRefInfo.sha; }
@@ -15212,7 +15218,7 @@ async function runSupervisorDaemon() {
     if (w.child && pid) {
       try { process.kill(pid, 'SIGTERM'); } catch { /* already gone */ }
       // #296: wait STOP_GRACE_MS for a routine exit PLUS the bounded recovery budget,
-      // so a worker that is flushing + promoting a GC-proof recovery ref (#295) for an
+      // so a worker that is flushing + promoting a durable recovery ref (#295) for an
       // interrupted agent job can finish before the SIGKILL backstop. A worker that
       // exits sooner is reaped at once — this only lengthens the ceiling for one that
       // is actively preserving recovery.
@@ -16349,7 +16355,7 @@ async function supervisorStopCmd(force = false) {
   // operator opted to wait); a force stop applies the grace window + a SIGKILL
   // backstop so a wedged daemon/worker group can't linger. The window must cover
   // the daemon's own worker force-stop grace (#296), or the SIGKILL below reaps the
-  // group while a worker is still promoting its GC-proof recovery ref (#295).
+  // group while a worker is still promoting its durable recovery ref (#295).
   if (force) {
     const deadline = Date.now() + FORCE_STOP_DAEMON_GRACE_MS;
     while (Date.now() < deadline) {
@@ -16830,7 +16836,7 @@ async function stopSupervisorProcess(running) {
   try { await supervisorRequest({ op: 'stop' }); }
   catch { try { process.kill(running.pid, 'SIGTERM'); } catch { /* already gone */ } }
   // #296: cover the daemon's own worker force-stop grace so the group SIGKILL below
-  // does not reap a worker mid-recovery (promoting its GC-proof recovery ref, #295).
+  // does not reap a worker mid-recovery (promoting its durable recovery ref, #295).
   const deadline = Date.now() + FORCE_STOP_DAEMON_GRACE_MS;
   while (Date.now() < deadline) {
     if (!isPidAlive(running.pid)) break;

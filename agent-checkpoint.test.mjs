@@ -1600,7 +1600,7 @@ test('job handler wires checkpoints: notify on ACP updates, flush on abort/failu
   assert.ok(ar > 0 && src.slice(ar, ar + 160).includes('gcAbort?.abort()'), 'abortRecovery() also aborts the GC sweep so the shared deadline bounds cleanup');
   // #296 (Copilot review, recovery-pointer ordering): the abort flush fires its WIP
   // `resumeFromCheckpoint` write fire-and-forget; the recovery path then writes the
-  // GC-proof recovery ref to the SAME slot. The recovery write must AWAIT the in-flight
+  // durable recovery ref to the SAME slot. The recovery write must AWAIT the in-flight
   // WIP write first, or a slow WIP write lands after and clobbers the recovery pointer
   // (which the orphan GC then reclaims on TTL, losing recovery discovery).
   const abortFire = src.indexOf("if (res.reason === 'abort') { const w = setVar(res); abortMetaWrite = { promise: w.promise.catch(() => {}), cancel: w.cancel }; return; }");
@@ -1690,7 +1690,7 @@ test('#295 predecessorCheckpointRef: correlates the shared process slot to THIS 
   assert.equal(predecessorCheckpointRef(wip('review-round'), 'refs/nano/wip/10', 'review-round'), null);
 });
 
-test('#296 predecessorCheckpointRef: accepts a GC-proof RECOVERY ref (AC3 — SLA-cancel resume)', () => {
+test('#296 predecessorCheckpointRef: accepts a durable RECOVERY ref (AC3 — SLA-cancel resume)', () => {
   // An SLA-cancelled / force-stopped run writes its refs/nano/recovered/<eik> point
   // into the process-scoped slot (its element is terminated before buildResultEnvelope
   // runs, so this is the durable report path). The resumed run must adopt it.
@@ -1906,7 +1906,7 @@ test('#296 sweepStaleCheckpoints: DEFAULT sweep reclaims a terminal recovery ref
   } finally { f.cleanup(); }
 });
 
-test('#295 preserveRecovery: promotes the latest snapshot to a GC-proof recovery ref', async () => {
+test('#295 preserveRecovery: promotes the latest snapshot to a durable recovery ref', async () => {
   const f = fixture();
   try {
     const env = { NANO_AGENT_CHECKPOINT: 'on', NANO_AGENT_CHECKPOINT_INTERVAL_MS: '0' };
@@ -1923,7 +1923,7 @@ test('#295 preserveRecovery: promotes the latest snapshot to a GC-proof recovery
     const rec = await s.preserveRecovery('force-stop');
     assert.deepEqual(rec, { ref: 'refs/nano/recovered/808', sha: res.sha });
     assert.equal(sh(f.root, '--git-dir', f.remote, 'rev-parse', 'refs/nano/recovered/808'), res.sha);
-    assert.match(logger.lines.info.join('\n'), /preserved a GC-proof recovery checkpoint refs\/nano\/recovered\/808/);
+    assert.match(logger.lines.info.join('\n'), /preserved a durable recovery checkpoint refs\/nano\/recovered\/808/);
     // The WIP ref is retained too (an additional durable copy).
     assert.equal(sh(f.root, '--git-dir', f.remote, 'rev-parse', 'refs/nano/wip/808'), res.sha);
     await s.close();

@@ -296,7 +296,7 @@ SDK client (job workers) — do **not** add the SDK as a dependency or use raw
   (nano-workforce#891 plugs in with no further plugin change). After a successful
   adoption the process-scoped pointer is **advanced** to this run's newly-copied ref, so
   a no-new-checkpoint completion can't leave a stale predecessor pointer for the next
-  activation. (c) **GC-proof
+  activation. (c) **Durable
   recovery refs**: on a force-stop/abort or failed (SLA-cancelled) run,
   `preserveRecovery` promotes the latest snapshot to `refs/nano/recovered/<eik>`
   (`recoveredCheckpointRef`) — **outside** the `refs/nano/wip/*` namespace, so it

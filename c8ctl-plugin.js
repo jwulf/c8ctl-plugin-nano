@@ -7306,14 +7306,26 @@ async function setupWorkspaceCheckpoints({ provisioned, envelope = null, token =
       // positively this run returns false, so the caller SKIPS the variable write and
       // leaves the newer activation's pointer intact (the pushed ref stays the durable
       // fallback). `expectedSha` is the sha this run's preserveRecovery returned.
-      async verifyRecoveryOwnership(expectedSha) {
+      // #296 (review, r4244916101): accept a per-call `signal` and run the git reads
+      // on a DEDICATED runner bound to it (AND the recovery deadline). The caller
+      // races this against a 5s timeout; without a wired signal the losing branch
+      // left the verify's git process live on the 60s runner — untracked by
+      // checkpointer.stop()/gc — so recover() returned and the run dir was reaped
+      // under a live git. Binding the runner to the per-call signal lets the caller
+      // abort+await the verify on timeout so it is SETTLED before cleanup proceeds.
+      async verifyRecoveryOwnership(expectedSha, { signal } = {}) {
         try {
           const recRef = recoveredCheckpointRef(job?.elementInstanceKey);
           if (!recRef || !expectedSha) return false;
-          const curSha = await observeRemoteRefSha({ git, ref: recRef });
+          // Combine the per-call abort with the recovery-deadline abort so EITHER
+          // tears the git down (whichever fires first). AbortSignal.any is Node 20+.
+          const signals = [recoveryController.signal, signal].filter(Boolean);
+          const combined = signals.length > 1 ? AbortSignal.any(signals) : (signals[0] || undefined);
+          const vgit = mkGit({ cwd: provisioned.workspaceDir, env: gitEnv, timeoutMs: cfg.gitTimeoutMs, signal: combined });
+          const curSha = await observeRemoteRefSha({ git: vgit, ref: recRef });
           if (!curSha || curSha !== expectedSha) return false;
           let ownerRunId = '';
-          try { ownerRunId = (await fetchCheckpoint({ git, ref: recRef }))?.runId || ''; } catch { return false; }
+          try { ownerRunId = (await fetchCheckpoint({ git: vgit, ref: recRef }))?.runId || ''; } catch { return false; }
           const myRun = String(runId || '');
           const supersededRun = String(prior?.runId || '');
           return Boolean(ownerRunId) && (ownerRunId === myRun || (supersededRun && ownerRunId === supersededRun));
@@ -13164,11 +13176,31 @@ async function workAgent(req, flags, ctx) {
                     let stillOwns = false;
                     try {
                       let vt; let vOnAbort = null;
+                      // #296 (review, r4244916101): drive the verify off its OWN
+                      // AbortController so that when the 5s branch wins we can CANCEL
+                      // the in-flight git reads AND await the verify to full settlement
+                      // in the finally below — before recover() returns and the run dir
+                      // is reaped. Without this the losing verify kept running on the
+                      // 60s runner (untracked by stop()/gc) under a reaped workspace.
+                      const verifyAbort = new AbortController();
+                      const verifyOp = Promise.resolve(
+                        checkpointing.verifyRecoveryOwnership?.(recoveryRefInfo.sha, { signal: verifyAbort.signal }),
+                      ).then((v) => v === true);
                       stillOwns = await Promise.race([
-                        Promise.resolve(checkpointing.verifyRecoveryOwnership?.(recoveryRefInfo.sha)).then((v) => v === true),
+                        verifyOp,
                         new Promise((res) => { vt = setTimeout(() => res(false), 5000); vt?.unref?.(); }),
                         new Promise((res) => { vOnAbort = () => res(false); recoverySdkAbort.signal.addEventListener('abort', vOnAbort, { once: true }); }),
-                      ]).finally(() => { clearTimeout(vt); if (vOnAbort) recoverySdkAbort.signal.removeEventListener('abort', vOnAbort); });
+                      ]).finally(() => {
+                        clearTimeout(vt);
+                        if (vOnAbort) recoverySdkAbort.signal.removeEventListener('abort', vOnAbort);
+                        // The race settled (timeout/abort/complete). If the verify is
+                        // still mid-git (timeout/abort won), cancel its runner so the
+                        // git process is SIGTERM→SIGKILLed now, not at abortAtMs.
+                        try { verifyAbort.abort(); } catch { /* best effort */ }
+                      });
+                      // AWAIT the verify to full settlement (its git is now aborted, so
+                      // this resolves promptly) so no live git outlives recover()/close().
+                      try { await verifyOp; } catch { /* best effort */ }
                     } catch { stillOwns = false; }
                     if (!stillOwns) {
                       logger.warn?.(`[${jobType}] job ${job.jobKey}: recovery ref ${recoveryRefInfo.ref} is no longer owned by this run (a newer activation superseded it) — skipping the process-scoped resumeFromCheckpoint write so the newer pointer stays authoritative.`);

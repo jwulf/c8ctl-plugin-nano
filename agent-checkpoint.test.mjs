@@ -1437,6 +1437,46 @@ test('#296 (r4244827082) verifyRecoveryOwnership: true only while THIS run owns 
   } finally { f.cleanup(); }
 });
 
+test('#296 (r4244916101) verifyRecoveryOwnership: a per-call abort signal cancels the verify git and settles it promptly', async () => {
+  const f = fixture();
+  try {
+    const env = { NANO_AGENT_CHECKPOINT: 'on', NANO_AGENT_CHECKPOINT_INTERVAL_MS: '0' };
+    const job = { jobKey: '9', elementInstanceKey: '909' };
+    const provision = (name) => {
+      const { dir } = f.clone(name);
+      sh(dir, 'checkout', '-q', '-b', 'nano/agent-work/main-x');
+      return { workspaceDir: dir, gitEnv: ENV, committer: { name: 'bot', email: 'bot@example.com' }, startSha: sh(dir, 'rev-parse', 'HEAD'), workingBranch: 'nano/agent-work/main-x' };
+    };
+    const p1 = provision('run1');
+    const s1 = await setupWorkspaceCheckpoints({ provisioned: p1, job, jobType: 't', runId: 'run-1', logger: quietLogger(), env, deps: { sweepRegistry: new Map() } });
+    writeFileSync(join(p1.workspaceDir, 'wip.txt'), 'run-1 wip\n');
+    await s1.checkpointer.flush('abort', { timeoutMs: 0 });
+    const rec = await s1.preserveRecovery('force-stop');
+    assert.ok(rec?.sha, `run-1 preserved a recovery ref: ${JSON.stringify(rec)}`);
+
+    // An ALREADY-aborted per-call signal must short-circuit the verify (the dedicated
+    // runner's fast-path guard returns [aborted] before spawning git) so it fails closed
+    // promptly instead of running a live git under a reaped workspace.
+    const pre = new AbortController(); pre.abort();
+    assert.equal(await s1.verifyRecoveryOwnership(rec.sha, { signal: pre.signal }), false, 'an already-aborted per-call signal fails closed without running git');
+
+    // A signal that fires MID-verify cancels the in-flight git and the returned promise
+    // SETTLES (resolves false, bounded by gitKillGraceMs) — so awaiting it after the race
+    // never hangs and no live git outlives recover()/close(). Abort on the next tick so
+    // the first git read is already in flight.
+    const mid = new AbortController();
+    const op = s1.verifyRecoveryOwnership(rec.sha, { signal: mid.signal });
+    mid.abort();
+    const settled = await Promise.race([
+      op.then((v) => ({ settled: true, value: v })),
+      new Promise((res) => setTimeout(() => res({ settled: false }), 10_000)),
+    ]);
+    assert.ok(settled.settled, 'the aborted verify settles promptly (no orphaned live git) rather than running to the 60s git timeout');
+    assert.equal(settled.value, false, 'an aborted verify fails closed');
+    await s1.close();
+  } finally { f.cleanup(); }
+});
+
 test('setupWorkspaceCheckpoints: checkpoint → variable → restore on the next activation → discard', async () => {
   const f = fixture();
   try {
@@ -1674,14 +1714,27 @@ test('job handler wires checkpoints: notify on ACP updates, flush on abort/failu
   // newer activation published its own. The write must be GATED on a fresh ownership
   // re-verify (verifyRecoveryOwnership) that fails closed when the recovery ref has
   // moved to another run — the same ownership rule the GIT fence applies.
-  const verifyHook = src.indexOf('async verifyRecoveryOwnership(expectedSha)');
-  assert.ok(verifyHook > 0, 'setupWorkspaceCheckpoints exposes verifyRecoveryOwnership(expectedSha)');
+  const verifyHook = src.indexOf('async verifyRecoveryOwnership(expectedSha');
+  assert.ok(verifyHook > 0, 'setupWorkspaceCheckpoints exposes verifyRecoveryOwnership(expectedSha, …)');
   const verifyBody = src.slice(verifyHook, src.indexOf('hasUncommittedChanges', verifyHook));
   assert.ok(verifyBody.includes('curSha !== expectedSha'), 'verifyRecoveryOwnership fails closed when the recovery ref moved off the sha this run preserved');
   assert.ok(verifyBody.includes('ownerRunId === myRun || (supersededRun && ownerRunId === supersededRun)'), 'verifyRecoveryOwnership applies the same Nano-Checkpoint-Run ownership rule as the GIT fence');
   const ownGate = src.indexOf('stillOwns = await Promise.race([');
   assert.ok(ownGate > gateBeforeWrite && ownGate < recWrite, 'the recovery-pointer write is gated on a fresh verifyRecoveryOwnership re-check (after the deadline gate, before the write)');
   assert.ok(src.indexOf('if (!stillOwns)', ownGate) > ownGate && src.indexOf('if (!stillOwns)', ownGate) < recWrite, 'a failed ownership re-verify SKIPS the process-scoped write (leaves the newer pointer authoritative)');
+  // #296 (Copilot review, r4244916101): when the 5s race wins, the verify must NOT keep
+  // running on the 60s runner untracked by stop()/gc (recover() would return and the run
+  // dir be reaped under a live git). The verify runs on a DEDICATED per-call signal, is
+  // ABORTED in the race finally, and AWAITED to full settlement before recover() returns.
+  assert.ok(verifyBody.includes('AbortSignal.any'), 'verifyRecoveryOwnership binds its git runner to the per-call signal AND the recovery deadline (AbortSignal.any)');
+  assert.ok(verifyBody.includes('mkGit({ cwd: provisioned.workspaceDir, env: gitEnv, timeoutMs: cfg.gitTimeoutMs, signal: combined })'), 'verifyRecoveryOwnership runs its git reads on a dedicated signal-bound runner (not the shared 60s runner)');
+  const vAbort = src.indexOf('const verifyAbort = new AbortController();');
+  assert.ok(vAbort > gateBeforeWrite && vAbort < recWrite, 'the verify is driven off its own AbortController');
+  assert.ok(src.indexOf('verifyRecoveryOwnership?.(recoveryRefInfo.sha, { signal: verifyAbort.signal })', vAbort) > vAbort, 'the per-call signal is threaded into verifyRecoveryOwnership');
+  const vAbortFire = src.indexOf('try { verifyAbort.abort(); } catch { /* best effort */ }', vAbort);
+  assert.ok(vAbortFire > vAbort && vAbortFire < recWrite, 'the race finally ABORTS the in-flight verify git when the timeout/abort branch wins');
+  const vAwait = src.indexOf('try { await verifyOp; } catch { /* best effort */ }', vAbort);
+  assert.ok(vAwait > vAbortFire && vAwait < recWrite, 'the verify is AWAITED to full settlement after the race so no live git outlives recover()/close()');
   const race = src.indexOf('await Promise.race([recover, budget])');
   const awaitRecover = src.indexOf('try { await recover; } catch { /* best effort */ }');
   assert.ok(awaitRecover > race, 'recover is AWAITED after the race so it is settled/cancelled before the job yields');

@@ -232,6 +232,12 @@ export function checkpointConfig(env = process.env) {
     gcGraceMs: DEFAULTS.gcGraceMs,
     gcEveryMs: DEFAULTS.gcEveryMs,
     gitTimeoutMs: DEFAULTS.gitTimeoutMs,
+    // Exposed so the force-stop path can reserve a drain window: abortRecovery()
+    // only SIGTERMs checkpoint git, and createGitRunner grants this grace before
+    // SIGKILL — so the recovery race must finish early enough to leave close() a
+    // real window to drain the now-terminated git, not the 1ms an expired deadline
+    // would otherwise hand it (Copilot review on #296).
+    gitKillGraceMs: DEFAULTS.gitKillGraceMs,
     flushTimeoutMs: DEFAULTS.flushTimeoutMs,
   };
 }
@@ -315,8 +321,16 @@ export function predecessorCheckpointRef(variables, selfRef = null, elementId = 
   const v = variables && typeof variables === 'object' ? variables.resumeFromCheckpoint : null;
   const ref = typeof v === 'string' ? v : (v && typeof v === 'object' ? v.ref : null);
   const s = typeof ref === 'string' ? ref.trim() : '';
-  if (!s || !s.startsWith(CHECKPOINT_REF_PREFIX)) return null;
-  const key = s.slice(CHECKPOINT_REF_PREFIX.length);
+  // Accept a WIP ref (the normal per-checkpoint pointer) OR a GC-proof recovery ref
+  // (`refs/nano/recovered/<eik>`). The recovery ref is what an SLA-cancelled /
+  // force-stopped run writes here (Copilot review on #296, AC3): its element is
+  // terminated before buildResultEnvelope runs, so the process-scoped slot is the
+  // durable path that lets the resumed run discover the recovery point. Both are
+  // adopted identically below (fetch + restore are ref-agnostic).
+  const prefix = s.startsWith(CHECKPOINT_REF_PREFIX) ? CHECKPOINT_REF_PREFIX
+    : (s.startsWith(RECOVERED_REF_PREFIX) ? RECOVERED_REF_PREFIX : null);
+  if (!s || !prefix) return null;
+  const key = s.slice(prefix.length);
   if (!/^[0-9A-Za-z_-]{1,128}$/.test(key)) return null;
   if (s === selfRef) return null;
   // Correlation gate: only a POSITIVE mismatch on a present recorded elementId

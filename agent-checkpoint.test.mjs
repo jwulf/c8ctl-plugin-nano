@@ -1510,10 +1510,20 @@ test('job handler wires checkpoints: notify on ACP updates, flush on abort/failu
   // single budget and can't be SIGKILLed mid-cleanup. Unbounded (undefined) otherwise.
   const closeOpts = src.indexOf('const closeOpts = forceStopping', lastChance);
   assert.ok(closeOpts > lastChance && closeOpts < close, 'close() opts computed on the force-stop path before close()');
-  assert.ok(src.slice(closeOpts, close).includes('Math.max(1, forceStopDeadline - Date.now())'), 'force-stop close() uses the REMAINING shared deadline (never a fresh full budget, never 0)');
+  // #296 (Copilot review, 1ms finding): the force-stop close() cap is the REMAINING
+  // shared deadline, but the FLOOR is the git kill grace (closeFloorMs), not 1ms —
+  // abortRecovery() only SIGTERMs git and createGitRunner grants gitKillGraceMs before
+  // SIGKILL, so a 1ms floor would abandon a still-dying git to have its workspace
+  // reaped under it. The drain must await the actual termination.
+  assert.ok(src.slice(closeOpts, close).includes('Math.max(closeFloorMs, forceStopDeadline - Date.now())'), 'force-stop close() caps at the REMAINING shared deadline with a git-kill-grace FLOOR (never a fresh full budget, never 0, never 1ms)');
+  assert.ok(src.indexOf('const closeFloorMs = Math.max(1, Number(checkpointing?.gitKillGraceMs) || 0)') > lastChance, 'the close() floor is the git kill grace');
   assert.ok(src.slice(closeOpts, close).includes(': undefined'), 'close() is unbounded off the force-stop path');
   // The one shared deadline is anchored once when the force-stop recovery block begins.
   assert.ok(src.includes('forceStopDeadline = Date.now() + recoveryDeadline'), 'the shared force-stop deadline is set once at the start of the recovery block');
+  // #296 (Copilot review, 1ms finding): abortRecovery() fires EARLY (gitKillGraceMs +
+  // margin before the deadline) so the git SIGKILL lands by forceStopDeadline and
+  // close() gets a real drain window, not an expired one.
+  assert.ok(src.includes('const abortAtMs = Math.max(1, recoveryDeadline - drainReserveMs)'), 'abortRecovery() is armed gitKillGraceMs before the deadline to reserve a drain window');
   // #296 (Copilot review): abortRecovery() tears down the GC sweep too, so the single
   // deadline bounds recovery AND the (up to 120s) GC cleanup together.
   const ar = src.indexOf('abortRecovery() {');
@@ -1571,6 +1581,23 @@ test('#295 predecessorCheckpointRef: correlates the shared process slot to THIS 
   assert.equal(predecessorCheckpointRef(wip('implement'), 'refs/nano/wip/20'), 'refs/nano/wip/10');
   // The correlation gate never resurrects a self-ref / malformed ref.
   assert.equal(predecessorCheckpointRef(wip('review-round'), 'refs/nano/wip/10', 'review-round'), null);
+});
+
+test('#296 predecessorCheckpointRef: accepts a GC-proof RECOVERY ref (AC3 — SLA-cancel resume)', () => {
+  // An SLA-cancelled / force-stopped run writes its refs/nano/recovered/<eik> point
+  // into the process-scoped slot (its element is terminated before buildResultEnvelope
+  // runs, so this is the durable report path). The resumed run must adopt it.
+  assert.equal(predecessorCheckpointRef({ resumeFromCheckpoint: { ref: 'refs/nano/recovered/808', sha: 'abc', recovered: true } }), 'refs/nano/recovered/808');
+  assert.equal(predecessorCheckpointRef({ resumeFromCheckpoint: 'refs/nano/recovered/808' }), 'refs/nano/recovered/808');
+  // elementId correlation still applies to a recovery ref.
+  assert.equal(predecessorCheckpointRef({ resumeFromCheckpoint: { ref: 'refs/nano/recovered/808', elementId: 'review-round' } }, null, 'review-round'), 'refs/nano/recovered/808');
+  assert.equal(predecessorCheckpointRef({ resumeFromCheckpoint: { ref: 'refs/nano/recovered/808', elementId: 'implement' } }, null, 'review-round'), null);
+  // A recovery ref equal to this run's OWN wip key is still a predecessor (different
+  // namespace), but a recovery ref that IS selfRef is rejected.
+  assert.equal(predecessorCheckpointRef({ resumeFromCheckpoint: 'refs/nano/recovered/808' }, 'refs/nano/recovered/808'), null);
+  // Malformed recovery refs are still rejected.
+  assert.equal(predecessorCheckpointRef({ resumeFromCheckpoint: 'refs/nano/recovered/bad/key' }), null);
+  assert.equal(predecessorCheckpointRef({ resumeFromCheckpoint: 'refs/nano/recovered/' }), null);
 });
 
 test('#296 makeOccurrenceGuard: fails closed on ambiguous parallel MI; safe on a unique occurrence', async () => {
@@ -1816,6 +1843,42 @@ test('#296 force-stop recovery is not blocked by hung metadata writes', async ()
     const elapsed = Date.now() - started;
     assert.deepEqual(rec, { ref: 'refs/nano/recovered/818', sha: res.sha });
     assert.ok(elapsed < 10_000, `abort flush + recovery completed in ${elapsed}ms despite the hung write (< one SDK timeout)`);
+    await s.close({ timeoutMs: 2000 });
+  } finally { f.cleanup(); }
+});
+
+test('#296 withDeadline CANCELS a timed-out checkpoint write (no late overwrite of a newer pointer)', async () => {
+  // High finding (r4243918057): a bare Promise.race REJECTS on timeout but leaves the
+  // SDK mutation in flight — a timed-out process-scoped `resumeFromCheckpoint` write
+  // could then complete AFTER a retry wrote a newer pointer and overwrite it with the
+  // stale ref. The SDK returns a CancelablePromise; withDeadline must call .cancel()
+  // on timeout so the underlying fetch is aborted and the late settle can never land.
+  const f = fixture();
+  try {
+    const env = { NANO_AGENT_CHECKPOINT: 'on', NANO_AGENT_CHECKPOINT_INTERVAL_MS: '0' };
+    const { dir } = f.clone('cancel-meta');
+    sh(dir, 'checkout', '-q', '-b', 'nano/agent-work/main-x');
+    const provisioned = { workspaceDir: dir, gitEnv: ENV, committer: { name: 'bot', email: 'bot@example.com' }, startSha: sh(dir, 'rev-parse', 'HEAD'), workingBranch: 'nano/agent-work/main-x' };
+    let cancelCalls = 0;
+    let settled = false;
+    // A CancelablePromise-shaped write that NEVER resolves on its own; only .cancel()
+    // settles it (rejects), mirroring the SDK's toCancelable. If withDeadline fails to
+    // cancel, `settled` stays false and the write would remain in flight.
+    const camunda = {
+      createElementInstanceVariables: () => {
+        const p = new Promise(() => {});
+        p.cancel = () => { cancelCalls++; settled = true; };
+        return p;
+      },
+    };
+    const s = await setupWorkspaceCheckpoints({ provisioned, job: { jobKey: '1', elementInstanceKey: '820', processInstanceKey: '500', elementId: 'review' }, jobType: 't', runId: 'r', camunda, logger: quietLogger(), env, deps: { sweepRegistry: new Map() } });
+    writeFileSync(join(dir, 'wip.txt'), 'half done\n');
+    // A normal (non-abort) flush AWAITS the metadata write, so the CP_SDK_TIMEOUT_MS
+    // (10s) deadline fires and must CANCEL the in-flight write before rejecting.
+    const res = await s.checkpointer.flush('failed', { timeoutMs: 20_000 });
+    assert.ok(res.sha, JSON.stringify(res));
+    assert.ok(cancelCalls > 0, 'the timed-out checkpoint write was cancelled (CancelablePromise.cancel invoked)');
+    assert.ok(settled, 'the cancelled write is settled — it can never complete late and overwrite a newer pointer');
     await s.close({ timeoutMs: 2000 });
   } finally { f.cleanup(); }
 });

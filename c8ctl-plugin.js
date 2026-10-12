@@ -6812,7 +6812,15 @@ async function setupWorkspaceCheckpoints({ provisioned, envelope = null, token =
     const CP_SDK_TIMEOUT_MS = 10000;
     const withDeadline = (p, ms, label) => {
       let timer;
-      const timeout = new Promise((_r, reject) => { timer = setTimeout(() => reject(new Error(`${label} timed out after ${ms}ms`)), ms); timer?.unref?.(); });
+      // #296 (review): a bare Promise.race REJECTS on timeout but leaves the SDK
+      // mutation in flight — a timed-out `resumeFromCheckpoint` write could then
+      // complete AFTER a retry already wrote a newer pointer and overwrite it with
+      // the stale ref. The SDK returns a CancelablePromise (toCancelable): cancel it
+      // on timeout so the underlying fetch is aborted and the late settle can never
+      // land. `p.cancel?.()` is a no-op for a plain (non-cancelable) promise, and a
+      // cancelled SDK call rejects with CancelSdkError, which the `.catch(() => {})`
+      // below swallows.
+      const timeout = new Promise((_r, reject) => { timer = setTimeout(() => { try { p?.cancel?.(); } catch { /* best effort */ } reject(new Error(`${label} timed out after ${ms}ms`)); }, ms); timer?.unref?.(); });
       Promise.resolve(p).catch(() => {});
       return Promise.race([Promise.resolve(p).finally(() => clearTimeout(timer)), timeout]);
     };
@@ -7104,6 +7112,10 @@ async function setupWorkspaceCheckpoints({ provisioned, envelope = null, token =
       restored,
       priorNotRestored,
       flushTimeoutMs: cfg.flushTimeoutMs,
+      // #296 (review): the git SIGKILL grace window, surfaced so the force-stop path
+      // can reserve a real drain window for close() instead of the 1ms an expired
+      // shared deadline would otherwise hand it (see the force-stop block).
+      gitKillGraceMs: cfg.gitKillGraceMs,
       // #296 (F9): abort the recovery-deadline controller — tears down an in-flight
       // checkpoint/recovery git push so `stop()`/`close()` settle promptly. Driven by
       // the force-stop path once the recovery budget expires (NOT by the job's
@@ -12964,23 +12976,66 @@ async function workAgent(req, flags, ctx) {
               // force-stop window is a single FORCE_STOP_RECOVERY_MS (not 2x), fitting
               // inside the supervisor's STOP_GRACE_MS + FORCE_STOP_RECOVERY_MS backstop.
               forceStopDeadline = Date.now() + recoveryDeadline;
+              // #296 (review): reserve a DRAIN window inside the deadline. abortRecovery()
+              // only SIGTERMs the checkpoint git; createGitRunner then grants up to
+              // gitKillGraceMs before SIGKILL. If abortRecovery() fires AT the deadline,
+              // a stubborn git is still dying when close() hits its (expired) cap and the
+              // finally reaps the workspace under a live process. Fire the abort EARLY —
+              // gitKillGraceMs + a small margin before the deadline — so the SIGKILL lands
+              // by `forceStopDeadline` and close() gets the remaining grace window to
+              // actually drain the now-dead git, not the 1ms `Math.max(1, …)` would give.
+              const killGrace = Math.max(0, Number(checkpointing?.gitKillGraceMs) || 0);
+              const drainReserveMs = killGrace + 250;
+              const abortAtMs = Math.max(1, recoveryDeadline - drainReserveMs);
               // #296 (F9): arm the recovery-deadline. When the budget expires, abort
               // the DEDICATED recovery git runner (not the job's abortSignal, which
               // has already fired and would fail every recovery command) so an
               // in-flight flush/preserveRecovery push is torn down and the chain
               // settles — letting the `finally`'s bounded `close()` drain inside the
-              // supervisor's SIGKILL window. Left to fire for the whole flush +
-              // promote + drain; unref'd so it never keeps the process alive.
-              let deadlineTimer = setTimeout(() => { try { checkpointing.abortRecovery(); } catch { /* best effort */ } }, recoveryDeadline);
+              // supervisor's SIGKILL window. Fires `abortAtMs` (the deadline MINUS the
+              // reserved drain window) so the git SIGKILL completes before the deadline;
+              // unref'd so it never keeps the process alive.
+              let deadlineTimer = setTimeout(() => { try { checkpointing.abortRecovery(); } catch { /* best effort */ } }, abortAtMs);
               deadlineTimer?.unref?.();
               const recover = (async () => {
                 await checkpointer.flush('abort', { timeoutMs: recoveryDeadline }); checkpointFinalized = true;
                 try { recoveryRefInfo = await checkpointing.preserveRecovery('force-stop') || recoveryRefInfo; } catch { /* best effort */ }
+                // #296 (review, AC3): an SLA boundary cancel reaches THIS aborted branch
+                // too — the supervisor heartbeat treats the resulting lease-loss 404 as
+                // terminal and interrupts the runner (supervisor/src/dispatch.ts), so
+                // runAgentJob returns aborted:true. The early return below then skips
+                // buildResultEnvelope, so recoveryRef/recoverySha are never reported in a
+                // job outcome. Persist the recovery ref through the PROCESS-scoped
+                // `resumeFromCheckpoint` slot instead: it survives the element re-entry an
+                // SLA escalation triggers, so the resumed run's predecessorCheckpointRef
+                // can discover the GC-proof refs/nano/recovered/<eik> point. Bounded and
+                // best-effort — never holds the force-stop exit; the pushed ref itself
+                // remains the authoritative recovery handle.
+                if (recoveryRefInfo && typeof camunda?.createElementInstanceVariables === 'function' && job?.processInstanceKey) {
+                  try {
+                    const w = camunda.createElementInstanceVariables({
+                      elementInstanceKey: String(job.processInstanceKey),
+                      variables: { resumeFromCheckpoint: { ref: recoveryRefInfo.ref, sha: recoveryRefInfo.sha, elementInstanceKey: String(job.elementInstanceKey ?? ''), elementId: job.elementId ?? null, recovered: true, at: Date.now() } },
+                      local: true,
+                    });
+                    let wt;
+                    await Promise.race([
+                      Promise.resolve(w).finally(() => clearTimeout(wt)),
+                      new Promise((_r, rej) => { wt = setTimeout(() => { try { w?.cancel?.(); } catch { /* best effort */ } rej(new Error('resumeFromCheckpoint recovery write timed out')); }, 5000); wt?.unref?.(); }),
+                    ]);
+                  } catch { /* best effort — the pushed ref is the fallback */ }
+                }
               })();
               let budgetTimer = null;
               const budget = new Promise((res) => { budgetTimer = setTimeout(res, recoveryDeadline); if (budgetTimer.unref) budgetTimer.unref(); });
               try { await Promise.race([recover, budget]); } catch { /* best effort */ }
-              finally { if (budgetTimer) clearTimeout(budgetTimer); }
+              // Clear the recover-race budget timer (it has fired or the race settled).
+              // deadlineTimer is deliberately NOT cleared: even when the recover race
+              // settles early, abortRecovery() must still fire at abortAtMs to abort the
+              // background GC sweep (gcAbort) — otherwise close() below would await a
+              // sweep that can run up to GC_OVERALL_TIMEOUT_MS (120s), holding the
+              // force-stop open past the supervisor's SIGKILL window (the F8 failure).
+              if (budgetTimer) clearTimeout(budgetTimer);
               checkpointFinalized = true;
             }
             return;
@@ -13189,11 +13244,16 @@ async function workAgent(req, flags, ctx) {
             // consumed most of the budget, so a fresh window here could run the total
             // (recovery + cleanup) to ~2x the budget and be SIGKILLed mid-cleanup
             // (Copilot review on #296). The recovery DEADLINE (abortRecovery) tears down
-            // both the checkpoint git AND the GC sweep at that same absolute instant, so
-            // the drain settles on its own; `Math.max(1, …)` keeps it a BOUNDED cap even
-            // when the budget is already spent (close() treats 0 as unbounded).
+            // both the checkpoint git AND the GC sweep — and it now fires gitKillGraceMs
+            // BEFORE the deadline, so by the time we get here the git SIGKILL has landed
+            // (or is in its grace window) and the drain settles on its own. The cap is the
+            // REMAINING budget; the floor is the git kill grace (not 1ms) so that even when
+            // the recover race consumed the whole window the drain still awaits the actual
+            // SIGKILL of the already-SIGTERMed git instead of abandoning a live process to
+            // have its workspace reaped under it (Copilot review on #296, 1ms finding).
+            const closeFloorMs = Math.max(1, Number(checkpointing?.gitKillGraceMs) || 0);
             const closeOpts = forceStopping
-              ? { timeoutMs: Math.max(1, forceStopDeadline - Date.now()) }
+              ? { timeoutMs: Math.max(closeFloorMs, forceStopDeadline - Date.now()) }
               : undefined;
             try { await checkpointing.close(closeOpts); } catch { /* best effort */ }
           }

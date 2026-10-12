@@ -1754,6 +1754,34 @@ test('job handler wires checkpoints: notify on ACP updates, flush on abort/failu
   assert.ok(close > decide && close < src.indexOf('rmSync(runDir', close), 'in-flight git work drains before the run dir is reaped');
 });
 
+test('#296 (r4245146247) the setup-path predecessor-pointer advance write is abort-guarded and abort-cancellable', () => {
+  const src = readFileSync(new URL('./c8ctl-plugin.js', import.meta.url), 'utf8');
+  // The SAME stale-write hazard the recovery-pointer write guards against (a last-writer
+  // process-scoped `resumeFromCheckpoint` write landing after a replacement activation
+  // published a newer pointer) applies to the SETUP-path `advanceResumePointer` write
+  // too: the startup fetch/push can straddle a lease loss, after which a replacement
+  // activation owns the pointer slot. So (a) the shared `withDeadline` helper must accept
+  // an optional abort signal and cancel the in-flight SDK CancelablePromise when it fires
+  // (not only on the per-call timeout), and (b) `advanceResumePointer` must recheck the
+  // job signal before the write AND bind that write to it.
+  const wd = src.indexOf('const withDeadline = (p, ms, label');
+  assert.ok(wd > 0, 'withDeadline is defined');
+  assert.ok(src.slice(wd, wd + 80).includes('signal = null'), 'withDeadline takes an optional abort signal (default null, so timeout-only callers are unchanged)');
+  const wdBody = src.slice(wd, src.indexOf('let prior = null', wd));
+  assert.ok(wdBody.includes("signal.addEventListener('abort'"), 'withDeadline cancels the SDK call when the supplied signal fires');
+  assert.ok(wdBody.includes('signal.aborted === true') && wdBody.includes('p?.cancel?.()'), 'withDeadline fast-cancels an already-aborted signal and cancels the underlying CancelablePromise');
+  assert.ok(wdBody.includes('removeEventListener'), 'withDeadline detaches its abort listener on settle (no leak)');
+  const adv = src.indexOf('const advanceResumePointer = async (adoptedSha)');
+  assert.ok(adv > 0, 'advanceResumePointer is defined');
+  const advBody = src.slice(adv, src.indexOf('};', adv));
+  // (a) recheck the job signal before the side effect — skip the write when aborted.
+  const guard = advBody.indexOf('if (abortSignal?.aborted === true) return;');
+  const write = advBody.indexOf('camunda.createElementInstanceVariables(');
+  assert.ok(guard > 0 && write > guard, 'advanceResumePointer rechecks abortSignal BEFORE the process-scoped write and skips it when aborted');
+  // (b) bind the write to abortSignal so a lease loss DURING it cancels it.
+  assert.ok(/CP_SDK_TIMEOUT_MS, 'createElementInstanceVariables', abortSignal/.test(advBody), 'the advance write passes abortSignal to withDeadline so a mid-write lease loss cancels it');
+});
+
 // ── #295: orphan GC must spare SLA-cancelled runs; recovery/predecessor refs ──
 
 test('#295 recoveredCheckpointRef / RECOVERED_REF_PREFIX: outside the WIP (swept) namespace', () => {

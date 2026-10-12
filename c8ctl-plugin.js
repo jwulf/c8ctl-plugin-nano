@@ -6810,8 +6810,9 @@ async function setupWorkspaceCheckpoints({ provisioned, envelope = null, token =
     // swallowed so it can never surface as an unhandled rejection. Hoisted here (ahead
     // of the GC block, which reuses them) so the #295 ambiguity guard below is bounded.
     const CP_SDK_TIMEOUT_MS = cfg.sdkTimeoutMs;
-    const withDeadline = (p, ms, label) => {
+    const withDeadline = (p, ms, label, signal = null) => {
       let timer;
+      let onAbort = null;
       // #296 (review): a bare Promise.race REJECTS on timeout but leaves the SDK
       // mutation in flight — a timed-out `resumeFromCheckpoint` write could then
       // complete AFTER a retry already wrote a newer pointer and overwrite it with
@@ -6820,9 +6821,23 @@ async function setupWorkspaceCheckpoints({ provisioned, envelope = null, token =
       // land. `p.cancel?.()` is a no-op for a plain (non-cancelable) promise, and a
       // cancelled SDK call rejects with CancelSdkError, which the `.catch(() => {})`
       // below swallows.
-      const timeout = new Promise((_r, reject) => { timer = setTimeout(() => { try { p?.cancel?.(); } catch { /* best effort */ } reject(new Error(`${label} timed out after ${ms}ms`)); }, ms); timer?.unref?.(); });
+      // #296 (review r4245146247): the SAME stale-write hazard applies to the job's
+      // ABORT (lease loss), not just the per-call timeout. An optional `signal` lets a
+      // setup-path side-effect write be cancelled the instant the job loses its lease,
+      // so a write left pending after a replacement activation published a newer
+      // pointer is torn down and its late settle can never overwrite that newer value.
+      const race = new Promise((_r, reject) => {
+        timer = setTimeout(() => { try { p?.cancel?.(); } catch { /* best effort */ } reject(new Error(`${label} timed out after ${ms}ms`)); }, ms);
+        timer?.unref?.();
+        if (signal) {
+          if (signal.aborted === true) { try { p?.cancel?.(); } catch { /* best effort */ } reject(new Error(`${label} aborted`)); return; }
+          onAbort = () => { try { p?.cancel?.(); } catch { /* best effort */ } reject(new Error(`${label} aborted`)); };
+          signal.addEventListener('abort', onAbort, { once: true });
+        }
+      });
       Promise.resolve(p).catch(() => {});
-      return Promise.race([Promise.resolve(p).finally(() => clearTimeout(timer)), timeout]);
+      const cleanup = () => { clearTimeout(timer); if (signal && onAbort) { try { signal.removeEventListener('abort', onAbort); } catch { /* best effort */ } } };
+      return Promise.race([Promise.resolve(p).finally(cleanup), race]);
     };
 
     let prior = null;
@@ -6878,12 +6893,19 @@ async function setupWorkspaceCheckpoints({ provisioned, envelope = null, token =
           // never blocks setup.
           const advanceResumePointer = async (adoptedSha) => {
             if (!adoptedSha || typeof camunda?.createElementInstanceVariables !== 'function' || !job?.processInstanceKey) return;
+            // #296 (review r4245146247): recheck the job signal before this process-scoped
+            // side effect. The startup git work above (fetch/push) may have straddled a
+            // lease loss; once aborted, a replacement activation owns this pointer slot and
+            // may already have published a newer value, so writing our (now stale) ref here
+            // would overwrite it. Skip when aborted, and bind the SDK call to abortSignal so
+            // a lease loss DURING the write cancels it before its late settle can land.
+            if (abortSignal?.aborted === true) return;
             try {
               await withDeadline(camunda.createElementInstanceVariables({
                 elementInstanceKey: String(job.processInstanceKey),
                 variables: { resumeFromCheckpoint: { ref, sha: adoptedSha, elementInstanceKey: String(job.elementInstanceKey ?? ''), elementId: job.elementId ?? null, branch: provisioned.workingBranch || null, at: Date.now(), adoptedFrom: predRef } },
                 local: true,
-              }), CP_SDK_TIMEOUT_MS, 'createElementInstanceVariables');
+              }), CP_SDK_TIMEOUT_MS, 'createElementInstanceVariables', abortSignal || undefined);
             } catch (err) { log.debug(`could not advance the resumeFromCheckpoint pointer to ${ref} — ${oneLineLog(err?.message || err)}.`); }
           };
           // Create-only adoption (default expectSha=''): only write our key while it

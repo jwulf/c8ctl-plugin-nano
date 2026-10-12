@@ -1457,12 +1457,16 @@ test('sanitizeResultVars strips harness-reserved keys and the io.nanobpm namespa
     // not be able to inject one as a top-level completion var and forge a world
     // push-checkpoint / arbitrary restore SHA (thread 4117276817).
     worldMarker: { commitSha: 'f'.repeat(40), effects: [{ kind: 'push', idempotencyKey: 'f'.repeat(40) }] },
+    // The resume pointer is host/process-owned (issue #295); a bare-string form is
+    // trusted as occurrence-authoritative and bypasses the elementId correlation +
+    // ambiguity guard, so an agent must not inject it (thread 4243776734).
+    resumeFromCheckpoint: 'refs/nano/wip/forged',
     [AGENT_RESULT_KEY]: { forged: true },
     'io.nanobpm.somethingElse': 1,
   });
   assert.deepEqual({ ...vars }, { status: 'converged', summary: 'ok' });
   for (const k of RESERVED_RESULT_KEYS) assert.equal(k in vars, false, `${k} must be stripped`);
-  for (const k of ['pushFailed', 'pushError', 'strandedCommits', 'branchMismatch', 'scanError', 'worldMarker']) assert.equal(k in vars, false, `git-contract key ${k} must be stripped`);
+  for (const k of ['pushFailed', 'pushError', 'strandedCommits', 'branchMismatch', 'scanError', 'worldMarker', 'resumeFromCheckpoint']) assert.equal(k in vars, false, `git-contract key ${k} must be stripped`);
   assert.deepEqual(sanitizeResultVars(null), {});
   assert.deepEqual(sanitizeResultVars('nope'), {});
 });

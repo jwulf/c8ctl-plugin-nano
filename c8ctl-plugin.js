@@ -2895,6 +2895,19 @@ const RESERVED_RESULT_KEYS = new Set([
   // push-checkpoint / points world-restore at an arbitrary SHA, so reserve it
   // alongside the other host-owned git-result keys (thread 4117276817).
   'worldMarker',
+  // `resumeFromCheckpoint` is the host/process-owned resume pointer (issue #295):
+  // the plugin writes it at the PROCESS scope so a re-entered (new element
+  // instance) activation can find the predecessor's WIP checkpoint. When it is a
+  // bare STRING it is trusted as an EXPLICIT, occurrence-authoritative ref that
+  // BYPASSES both the elementId correlation AND the ambiguity guard
+  // (resumeRefIsExplicit). Because a successful agent result is merged into the
+  // process variables, an unreserved `resumeFromCheckpoint` lets an untrusted
+  // harness emit a bare-string ref that a later activation then trusts as
+  // occurrence-authoritative — restoring an ARBITRARY WIP ref from the repository
+  // with no correlation or guard. Reserve it so the agent result can never inject
+  // or shadow the host/process-owned pointer (Copilot review on #296, thread
+  // 4243776734).
+  'resumeFromCheckpoint',
 ]);
 
 // Parse `text` as a JSON object, returning it only when it is a plain object.

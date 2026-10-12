@@ -1069,6 +1069,70 @@ test('GC deletes TTL-expired and terminal-element refs, keeps own/unknown/fresh 
   } finally { f.cleanup(); }
 });
 
+test('#296 GC reclaims orphaned RECOVERED refs under the same terminal/TTL policy, sparing active escalations and own/fresh ones', async () => {
+  const f = fixture();
+  try {
+    const w = f.clone('w');
+    const base = sh(w.dir, 'rev-parse', 'HEAD');
+    const put = async (ref, ageMs) => {
+      const date = `${Math.floor((Date.now() - ageMs) / 1000)} +0000`;
+      const git = createGitRunner({ cwd: w.dir, env: { ...ENV, GIT_COMMITTER_DATE: date } });
+      writeFileSync(join(w.dir, 'x.txt'), ref);
+      const snap = await snapshotWorktree({ git, baseSha: base });
+      assert.ok((await pushCheckpoint({ git, ref, sha: snap.sha })).ok);
+    };
+    const DAY = 86_400_000;
+    // Recovery refs (#295) must be reclaimed too, not only WIP refs — otherwise they
+    // grow without bound once their escalation is resolved (Copilot review on #296).
+    await put(recoveredCheckpointRef('10'), 8 * DAY);        // recovered, TTL-expired
+    await put(recoveredCheckpointRef('11'), 2 * 3_600_000);  // recovered, process-terminal
+    await put(recoveredCheckpointRef('12'), 2 * 3_600_000);  // recovered, escalation still ACTIVE -> spared
+    await put(recoveredCheckpointRef('13'), 60_000);         // recovered, terminal but inside grace -> spared
+    await put(recoveredCheckpointRef('14'), 9 * DAY);        // recovered, but this run's OWN ref -> never swept
+    await put(checkpointRef('20'), 2 * 3_600_000);           // a WIP ref in the SAME sweep, process-terminal
+    const looked = [];
+    const isTerminal = async (key) => { looked.push(key); return key === '11' || key === '13' || key === '20'; };
+    const r = await sweepStaleCheckpoints({ git: w.git, ownRef: recoveredCheckpointRef('14'), ttlMs: 7 * DAY, graceMs: 3_600_000, isTerminal });
+    assert.deepEqual(r.deleted.map((d) => `${d.ref}:${d.why}`).sort(), [
+      'refs/nano/recovered/10:ttl',
+      'refs/nano/recovered/11:element-terminal',
+      'refs/nano/wip/20:element-terminal',
+    ]);
+    // '12' is probed and spared (active); '13' is inside grace so it is never probed;
+    // '14' (own) is never probed.
+    assert.deepEqual(looked.sort(), ['11', '12', '20']);
+    const rec = sh(f.root, '--git-dir', f.remote, 'for-each-ref', '--format=%(refname)', 'refs/nano/recovered/').split('\n').filter(Boolean).sort();
+    assert.deepEqual(rec, ['refs/nano/recovered/12', 'refs/nano/recovered/13', 'refs/nano/recovered/14']);
+    const wip = sh(f.root, '--git-dir', f.remote, 'for-each-ref', '--format=%(refname)', 'refs/nano/wip/').split('\n').filter(Boolean);
+    assert.deepEqual(wip, [], 'the terminal WIP ref in the same sweep is reclaimed too');
+    // The distinct-namespace local temp refs are cleaned up and never collided a WIP
+    // ref with its recovery ref under one `refs/nano-gc/<key>`.
+    assert.equal(sh(w.dir, 'for-each-ref', 'refs/nano-gc/'), '', 'temporary GC refs are cleaned up');
+  } finally { f.cleanup(); }
+});
+
+test('#296 GC can be scoped to a single namespace, leaving the other intact (explicit prefix list)', async () => {
+  const f = fixture();
+  try {
+    const w = f.clone('w');
+    const base = sh(w.dir, 'rev-parse', 'HEAD');
+    const put = async (ref, ageMs) => {
+      const date = `${Math.floor((Date.now() - ageMs) / 1000)} +0000`;
+      const git = createGitRunner({ cwd: w.dir, env: { ...ENV, GIT_COMMITTER_DATE: date } });
+      writeFileSync(join(w.dir, 'x.txt'), ref);
+      const snap = await snapshotWorktree({ git, baseSha: base });
+      assert.ok((await pushCheckpoint({ git, ref, sha: snap.sha })).ok);
+    };
+    const DAY = 86_400_000;
+    await put(checkpointRef('30'), 8 * DAY);
+    await put(recoveredCheckpointRef('31'), 8 * DAY);
+    const r = await sweepStaleCheckpoints({ git: w.git, ttlMs: 7 * DAY, graceMs: 3_600_000, isTerminal: null, prefixes: ['refs/nano/wip/'] });
+    assert.deepEqual(r.deleted.map((d) => d.ref), ['refs/nano/wip/30']);
+    const rec = sh(f.root, '--git-dir', f.remote, 'for-each-ref', '--format=%(refname)', 'refs/nano/recovered/').split('\n').filter(Boolean);
+    assert.deepEqual(rec, ['refs/nano/recovered/31'], 'a WIP-only sweep leaves recovery refs intact');
+  } finally { f.cleanup(); }
+});
+
 test('GC stops scheduling engine lookups once the overall-deadline signal fires', async () => {
   const f = fixture();
   try {
@@ -1582,8 +1646,10 @@ test('#295 recoveredCheckpointRef / RECOVERED_REF_PREFIX: outside the WIP (swept
   assert.equal(recoveredCheckpointRef(''), null);
   assert.equal(recoveredCheckpointRef('bad/key'), null);
   assert.equal(recoveredCheckpointRef(null), null);
-  // A recovery ref is NOT in the WIP namespace the sweep enumerates, so the GC can
-  // never reclaim it — the whole point of #295.
+  // A recovery ref is NOT in the WIP namespace, so the per-checkpoint WIP cleanup
+  // (discardAfterAck) never touches it — it survives the WIP reap so an SLA-cancelled
+  // escalation can be answered (#295). It IS reclaimed by the orphan sweep once its
+  // process is terminal / past the TTL (#296), but never while the escalation is live.
   assert.ok(!recoveredCheckpointRef('808').startsWith('refs/nano/wip/'));
 });
 
@@ -1822,17 +1888,21 @@ test('#295 sweepStaleCheckpoints: deleted entries carry the sha (for the GC log)
   } finally { f.cleanup(); }
 });
 
-test('#295 sweepStaleCheckpoints: NEVER lists or deletes recovery refs', async () => {
+test('#296 sweepStaleCheckpoints: DEFAULT sweep reclaims a terminal recovery ref but spares an active-process one', async () => {
   const f = fixture();
   try {
     const { dir, git } = f.clone('rec');
     const sha = sh(dir, 'rev-parse', 'HEAD');
-    sh(dir, 'push', '-q', 'origin', `${sha}:refs/nano/recovered/999`);
-    // Even an always-terminal probe + zero TTL cannot reach a recovered ref: the
-    // sweep enumerates only refs/nano/wip/*.
-    const r = await sweepStaleCheckpoints({ git, ttlMs: 0, graceMs: 0, isTerminal: async () => true, now: () => Date.now() + 10_000 });
-    assert.equal(r.deleted.length, 0);
-    assert.equal(sh(f.root, '--git-dir', f.remote, 'rev-parse', 'refs/nano/recovered/999'), sha);
+    sh(dir, 'push', '-q', 'origin', `${sha}:refs/nano/recovered/999`);  // escalation resolved -> terminal
+    sh(dir, 'push', '-q', 'origin', `${sha}:refs/nano/recovered/888`);  // escalation still pending -> active
+    // #296: the DEFAULT sweep (no explicit `prefixes`) now covers the recovered
+    // namespace too, so a recovery ref whose process is terminal is reclaimed (no more
+    // unbounded growth) while an active-escalation one is spared.
+    const isTerminal = async (key) => key === '999';
+    const r = await sweepStaleCheckpoints({ git, ttlMs: 7 * 86_400_000, graceMs: 0, isTerminal, now: () => Date.now() + 10_000 });
+    assert.deepEqual(r.deleted.map((d) => `${d.ref}:${d.why}`), ['refs/nano/recovered/999:element-terminal']);
+    assert.throws(() => sh(f.root, '--git-dir', f.remote, 'rev-parse', 'refs/nano/recovered/999'), 'the terminal recovery ref is reclaimed');
+    assert.equal(sh(f.root, '--git-dir', f.remote, 'rev-parse', 'refs/nano/recovered/888'), sha, 'the active-escalation recovery ref is spared');
   } finally { f.cleanup(); }
 });
 
@@ -2257,7 +2327,7 @@ test('#295 job handler wires preserveRecovery on abort/failed and surfaces recov
   assert.ok(i('const isTerminal = makeOrphanProbe({') > 0);
   assert.ok(i('getProcessInstance: typeof camunda?.getProcessInstance === \'function\'') > 0);
   // The GC reclaim log reports ref@sha [why].
-  assert.ok(i('reclaimed ${r.deleted.length} orphaned WIP checkpoint ref(s)') > 0);
+  assert.ok(i('reclaimed ${r.deleted.length} orphaned checkpoint ref(s)') > 0);
   // #296 (F9): the checkpoint git runner is driven by a DEDICATED recovery-deadline
   // controller (so recovery survives the harness abort), and the force-stop block arms
   // the deadline that cancels it via abortRecovery() once the budget expires.

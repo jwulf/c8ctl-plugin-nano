@@ -257,7 +257,9 @@ SDK client (job workers) — do **not** add the SDK as a dependency or use raw
   and on a failed run, stopped before `finalizeGit`, the ref deleted after a clean
   finalize (kept on any push failure), and `close()` drains in-flight git work before
   the run dir is reaped. A background `sweepStaleCheckpoints` (throttled per remote by
-  `shouldSweep`) deletes other WIP refs past `NANO_AGENT_CHECKPOINT_TTL_MS` (7d) or >1h old
+  `shouldSweep`) deletes other stale refs in **both** the `refs/nano/wip/*` and
+  `refs/nano/recovered/*` namespaces (`SWEPT_REF_PREFIXES`) past
+  `NANO_AGENT_CHECKPOINT_TTL_MS` (7d) or >1h old
   whose element instance `getElementInstance` reports COMPLETED/TERMINATED (an error/404
   is never treated as terminal). `agentCheckpoint` is written via
   `camunda.createElementInstanceVariables` (`local:true`), best-effort, warning once.
@@ -297,8 +299,18 @@ SDK client (job workers) — do **not** add the SDK as a dependency or use raw
   activation. (c) **GC-proof
   recovery refs**: on a force-stop/abort or failed (SLA-cancelled) run,
   `preserveRecovery` promotes the latest snapshot to `refs/nano/recovered/<eik>`
-  (`recoveredCheckpointRef`) — **outside** the `refs/nano/wip/*` namespace the sweep
-  enumerates, so it is never GC-reclaimed. How the recovery point is *reported*
+  (`recoveredCheckpointRef`) — **outside** the `refs/nano/wip/*` namespace, so it
+  survives the per-checkpoint WIP cleanup (`discardAfterAck`) that only deletes WIP
+  refs. It is **not immortal**, though: the orphan sweep enumerates **both**
+  `refs/nano/wip/*` and `refs/nano/recovered/*` (`SWEPT_REF_PREFIXES`) and reclaims a
+  recovery ref under the **same** process-terminal / TTL policy as a WIP ref (Copilot
+  review on #296) — a recovery ref whose process is COMPLETED/TERMINATED/CANCELED (or
+  aged past the 7d TTL) is reclaimed so recovery refs cannot grow without bound once
+  their escalation resolves, while an **active escalation** (process still ACTIVE) is
+  spared (and a freshly-written one is inside the GC grace window). This degrades with
+  `makeOrphanProbe` to the legacy element-only check when the host SDK lacks
+  `getProcessInstance`, exactly as the WIP sweep does. How the recovery point is
+  *reported*
   depends on HOW the run ended. A **non-aborted failed** run (a non-ok result that
   did NOT interrupt the runner — e.g. a harness non-zero exit) settles normally and
   surfaces `recoveryRef`/`recoverySha` in the job outcome (`buildResultEnvelope`).

@@ -6944,12 +6944,14 @@ async function setupWorkspaceCheckpoints({ provisioned, envelope = null, token =
     // 4099558206 / 4099762442).
     const GC_OVERALL_TIMEOUT_MS = 120000;
     if (shouldSweep(gcKey, { everyMs: cfg.gcEveryMs, now: now(), registry: deps.sweepRegistry })) {
-      // #295: a WIP ref is an orphan only when its element is terminal AND its
-      // PROCESS instance is finished too. An element cancelled by an SLA boundary
-      // timer, inside a process that is still active (human escalation pending),
-      // must NOT be reclaimed — the TTL is the final backstop. `makeOrphanProbe`
-      // encodes that; it degrades to the legacy element-only check when the host
-      // SDK exposes no `getProcessInstance`.
+      // #295: a nano-managed ref (WIP or GC-proof recovery) is an orphan only when its
+      // element is terminal AND its PROCESS instance is finished too. An element
+      // cancelled by an SLA boundary timer, inside a process that is still active (human
+      // escalation pending), must NOT be reclaimed — the TTL is the final backstop.
+      // `makeOrphanProbe` encodes that; it degrades to the legacy element-only check when
+      // the host SDK exposes no `getProcessInstance`. The sweep applies this to BOTH the
+      // `refs/nano/wip/*` and `refs/nano/recovered/*` namespaces so recovery refs cannot
+      // grow without bound once their escalation is resolved.
       const isTerminal = makeOrphanProbe({
         getElementInstance: typeof camunda?.getElementInstance === 'function'
           ? (key) => withDeadline(
@@ -6995,10 +6997,10 @@ async function setupWorkspaceCheckpoints({ provisioned, envelope = null, token =
         // the sweep's git is still live. The deadline only bounds it by aborting the git.
         gc = Promise.resolve(sweep({ git: sweepGit, ownRef: ref, ttlMs: cfg.ttlMs, graceMs: cfg.gcGraceMs, isTerminal, now, signal: sweepAbort.signal }))
           .then((r) => {
-            if (r?.deleted?.length) logger.info?.(`${prefix} (${corr}): reclaimed ${r.deleted.length} orphaned WIP checkpoint ref(s): ${r.deleted.map((d) => `${d.ref}@${String(d.sha || '') || '?'} [${d.why}]`).join(', ')}.`);
-            else if (sweepAbort.signal.aborted) log.debug(`WIP checkpoint GC bounded at ${GC_OVERALL_TIMEOUT_MS}ms — aborted its in-flight git and drained; leftover refs reclaimed on a later sweep.`);
-            else if (r?.error) log.debug(`WIP checkpoint GC skipped — ${redactToken(oneLineLog(r.error), token)}.`);
-          }, (err) => log.debug(`WIP checkpoint GC threw — ${redactToken(oneLineLog(err?.message || err), token)}.`))
+            if (r?.deleted?.length) logger.info?.(`${prefix} (${corr}): reclaimed ${r.deleted.length} orphaned checkpoint ref(s): ${r.deleted.map((d) => `${d.ref}@${String(d.sha || '') || '?'} [${d.why}]`).join(', ')}.`);
+            else if (sweepAbort.signal.aborted) log.debug(`checkpoint GC bounded at ${GC_OVERALL_TIMEOUT_MS}ms — aborted its in-flight git and drained; leftover refs reclaimed on a later sweep.`);
+            else if (r?.error) log.debug(`checkpoint GC skipped — ${redactToken(oneLineLog(r.error), token)}.`);
+          }, (err) => log.debug(`checkpoint GC threw — ${redactToken(oneLineLog(err?.message || err), token)}.`))
           .finally(() => { clearTimeout(deadlineTimer); if (sweepDir) { try { rmSync(sweepDir, { recursive: true, force: true }); } catch { /* best effort */ } } });
       } catch (err) {
         if (sweepDir) { try { rmSync(sweepDir, { recursive: true, force: true }); } catch { /* best effort */ } }

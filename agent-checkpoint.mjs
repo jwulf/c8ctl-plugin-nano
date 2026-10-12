@@ -294,11 +294,17 @@ export function checkpointRef(elementInstanceKey) {
   return /^[0-9A-Za-z_-]{1,128}$/.test(key) ? `${CHECKPOINT_REF_PREFIX}${key}` : null;
 }
 
-// Durable "recovery" refs (#295) live OUTSIDE the WIP namespace the orphan GC
-// sweeps (`CHECKPOINT_REF_PREFIX`), so a snapshot promoted here on an SLA-cancel or
-// force-stop is GC-PROOF — it survives until an operator reclaims it manually, long
-// enough for the human escalation to be answered and the run resumed.
+// Durable "recovery" refs (#295) live OUTSIDE the WIP namespace so a snapshot promoted
+// here on an SLA-cancel or force-stop is GC-PROOF against the per-checkpoint reap — it
+// survives the WIP cleanup so the human escalation can be answered and the run resumed.
+// It is NOT immortal: the orphan sweep reclaims it under the SAME process-terminal /
+// TTL policy as a WIP ref (see `sweepStaleCheckpoints`), so a recovery ref whose process
+// has finished (or aged past the TTL) is reclaimed instead of pinning a ref forever,
+// while an active escalation (process still ACTIVE) stays protected.
 export const RECOVERED_REF_PREFIX = 'refs/nano/recovered/';
+// Shared root of every nano-managed ref namespace, and the full set the orphan GC reaps.
+export const NANO_REF_ROOT = 'refs/nano/';
+export const SWEPT_REF_PREFIXES = Object.freeze([CHECKPOINT_REF_PREFIX, RECOVERED_REF_PREFIX]);
 export function recoveredCheckpointRef(elementInstanceKey) {
   const key = String(elementInstanceKey ?? '').trim();
   return /^[0-9A-Za-z_-]{1,128}$/.test(key) ? `${RECOVERED_REF_PREFIX}${key}` : null;
@@ -1084,13 +1090,29 @@ export function shouldSweep(key, { everyMs = DEFAULTS.gcEveryMs, now = Date.now(
   return true;
 }
 
-export async function sweepStaleCheckpoints({ git, ownRef = null, ttlMs = DEFAULTS.ttlMs, graceMs = DEFAULTS.gcGraceMs, isTerminal = null, now = () => Date.now(), maxDeletes = 50, maxLookups = 20, remote = 'origin', signal = null }) {
-  const ls = await git(['ls-remote', '--refs', remote, `${CHECKPOINT_REF_PREFIX}*`]);
+export async function sweepStaleCheckpoints({ git, ownRef = null, ttlMs = DEFAULTS.ttlMs, graceMs = DEFAULTS.gcGraceMs, isTerminal = null, now = () => Date.now(), maxDeletes = 50, maxLookups = 20, remote = 'origin', signal = null, prefixes = SWEPT_REF_PREFIXES }) {
+  // Sweep EVERY nano-managed ref namespace, not just the WIP one. The GC-proof
+  // recovery refs (`refs/nano/recovered/*`, #295) are deliberately excluded from the
+  // WIP-only orphan reap so an SLA-cancelled escalation survives — but if nothing ever
+  // reclaims them they grow without bound (one snapshot ref/commit pinned per element
+  // instance, even for a transient failure later retried successfully). Reclaim both
+  // namespaces under the SAME policy: the `isTerminal` orphan probe spares a ref whose
+  // PROCESS is still active (the escalation is still pending), so an active escalation
+  // stays protected while a finished one — and the TTL backstop — is reclaimed.
+  const prefixList = (Array.isArray(prefixes) ? prefixes : [prefixes]).filter((p) => typeof p === 'string' && p);
+  if (!prefixList.length) return { scanned: 0, deleted: [] };
+  const prefixOf = (r) => prefixList.find((p) => r.startsWith(p)) || null;
+  const ls = await git(['ls-remote', '--refs', remote, ...prefixList.map((p) => `${p}*`)]);
   if (!ok(ls)) return { error: errText(ls), deleted: [] };
-  const entries = out(ls).split('\n').filter(Boolean).map((l) => { const [sha, ref] = l.split(/\s+/); return { sha, ref }; }).filter((e) => e.ref && e.ref !== ownRef);
+  const entries = out(ls).split('\n').filter(Boolean).map((l) => { const [sha, ref] = l.split(/\s+/); return { sha, ref }; })
+    .filter((e) => e.ref && e.ref !== ownRef && prefixOf(e.ref));
   if (!entries.length) return { scanned: 0, deleted: [] };
   const refs = entries.map((e) => e.ref);
-  const local = (r) => `refs/nano-gc/${r.slice(CHECKPOINT_REF_PREFIX.length)}`;
+  // Distinct local temp refs across namespaces: every swept prefix shares the
+  // `refs/nano/` root, so slicing it keeps `wip/<key>` and `recovered/<key>` apart
+  // (a bare key slice would collide a WIP ref with its recovery ref under one local).
+  const local = (r) => `refs/nano-gc/${r.startsWith(NANO_REF_ROOT) ? r.slice(NANO_REF_ROOT.length) : r.replace(/^refs\//, '')}`;
+  const keyOf = (r) => { const p = prefixOf(r); return p ? r.slice(p.length) : r; };
   const fetch = await git(['fetch', '--quiet', '--no-tags', '--no-write-fetch-head', remote, ...refs.map((r) => `+${r}:${local(r)}`)]);
   if (!ok(fetch)) return { error: errText(fetch), deleted: [] };
   const doomed = [];
@@ -1112,7 +1134,7 @@ export async function sweepStaleCheckpoints({ git, ownRef = null, ttlMs = DEFAUL
       if (isTerminal && age > graceMs && lookups < maxLookups && !signal?.aborted) {
         lookups++;
         let terminal = false;
-        try { terminal = await isTerminal(ref.slice(CHECKPOINT_REF_PREFIX.length)); } catch { terminal = false; }
+        try { terminal = await isTerminal(keyOf(ref)); } catch { terminal = false; }
         if (terminal) doomed.push({ ref, sha, why: 'element-terminal' });
       }
     }

@@ -13253,6 +13253,23 @@ async function workAgent(req, flags, ctx) {
             await checkpointer.flush('failed', { timeoutMs: checkpointing.flushTimeoutMs }); checkpointFinalized = true;
             try { recoveryRefInfo = await checkpointing.preserveRecovery('failed') || recoveryRefInfo; } catch { /* best effort */ }
           }
+          // #296 (review, r4244991586): the failed-result path can outlive its lease.
+          // `result.aborted` is only true when the harness observed the abort WHILE the
+          // process ran; an abortSignal that fires AFTER runAgentJob() returned (with a
+          // genuine non-ok result) but DURING the flush/promote above leaves
+          // `result.aborted === false`. Effect has already interrupted the raw runner and
+          // released the slot, so if we now fall through to settleJob.fail (and the
+          // checkpoint-variable/envelope writes) we overlap a replacement activation with
+          // STALE writes + a STALE settle. Recheck the job signal here — after the
+          // post-run flush/promote, before any settlement — and switch to the
+          // interrupted/yield path (return WITHOUT settling, exactly like the
+          // result.aborted branch and settleRunError's abort idiom) when it has fired.
+          // The recovery ref preserved above still stands (the durable handle); we simply
+          // do not settle a job whose lease is already gone. The broker re-activates it.
+          if (!result.ok && abortSignal?.aborted === true) {
+            logger.warn(`[${jobType}] job ${job.jobKey}: abortSignal fired after the failed run returned (lease loss/force-stop won the race) — yielding WITHOUT settleJob.fail so a replacement activation does not overlap stale checkpoint/settle writes (the preserved recovery ref remains the durable handle).`);
+            return;
+          }
 
           // Gap 2 (#678): a clean run that emitted no machine-readable result gets
           // ONE bounded re-emit nudge in the same workspace, feeding back its own

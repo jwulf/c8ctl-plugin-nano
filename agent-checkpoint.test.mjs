@@ -2510,4 +2510,15 @@ test('#295 job handler wires preserveRecovery on abort/failed and surfaces recov
   const deadline = i('try { checkpointing.abortRecovery(); } catch');
   const flushAbort = i("await checkpointer.flush('abort'");
   assert.ok(deadline > 0 && deadline < flushAbort, 'the recovery deadline (abortRecovery) is armed before the force-stop flush');
+  // #296 (review, r4244991586): the failed-result path rechecks the job abortSignal
+  // AFTER its flush/promote and yields WITHOUT settling when it fired — so a stale
+  // activation never reaches settleJob.fail / the checkpoint-var writes once Effect has
+  // released the slot. The guard must sit after the failed preserve and before the
+  // failed-path settleJob.fail.
+  const recheck = i("if (!result.ok && abortSignal?.aborted === true) {");
+  assert.ok(recheck > failedPreserve, 'the post-run abortSignal recheck runs after the failed-path preserveRecovery');
+  const yieldLog = i('yielding WITHOUT settleJob.fail so a replacement activation does not overlap');
+  assert.ok(yieldLog > recheck, 'the recheck logs + yields instead of settling');
+  const failedSettle = i('return await settleJob.fail({\n          errorMessage: `agent "${profile.name}" failed:');
+  assert.ok(recheck < failedSettle, 'the recheck guards the failed-path settleJob.fail');
 });

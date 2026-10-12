@@ -1539,10 +1539,16 @@ test('job handler wires checkpoints: notify on ACP updates, flush on abort/failu
   // GC-proof recovery ref to the SAME slot. The recovery write must AWAIT the in-flight
   // WIP write first, or a slow WIP write lands after and clobbers the recovery pointer
   // (which the orphan GC then reclaims on TTL, losing recovery discovery).
-  const abortFire = src.indexOf("if (res.reason === 'abort') { abortMetaWrite = setVar(res).catch(() => {}); return; }");
-  assert.ok(abortFire > 0, 'the abort-path WIP metadata write is captured (not discarded) so it can be awaited');
+  const abortFire = src.indexOf("if (res.reason === 'abort') { const w = setVar(res); abortMetaWrite = { promise: w.promise.catch(() => {}), cancel: w.cancel }; return; }");
+  assert.ok(abortFire > 0, 'the abort-path WIP metadata write is captured (promise + cancel, not discarded) so it can be awaited AND cancelled');
   const settleHook = src.indexOf('async settleAbortMetaWrite(signal = null)');
   assert.ok(settleHook > 0, 'setupWorkspaceCheckpoints exposes settleAbortMetaWrite(signal) — cancellable by the recovery deadline');
+  // #296 (Copilot review, r4244281967): stopping the await is not enough — the underlying
+  // createElementInstanceVariables mutation must be CANCELLED when the recovery signal
+  // aborts, or it stays in flight and can land late over a newer activation's
+  // resumeFromCheckpoint. settleAbortMetaWrite must invoke the retained cancel hook.
+  const settleBody = src.slice(settleHook, src.indexOf('preserveRecovery', settleHook));
+  assert.ok(settleBody.includes('w.cancel?.()'), 'settleAbortMetaWrite CANCELS the in-flight abort write (not just stops awaiting) when the recovery signal aborts');
   const recWrite = src.indexOf("variables: { resumeFromCheckpoint: { ref: recoveryRefInfo.ref");
   assert.ok(recWrite > 0, 'the recovery pointer is written to resumeFromCheckpoint');
   const settleAwait = src.indexOf('await checkpointing.settleAbortMetaWrite?.(recoverySdkAbort.signal)');
@@ -1912,6 +1918,46 @@ test('#296 withDeadline CANCELS a timed-out checkpoint write (no late overwrite 
     assert.ok(cancelCalls > 0, 'the timed-out checkpoint write was cancelled (CancelablePromise.cancel invoked)');
     assert.ok(settled, 'the cancelled write is settled — it can never complete late and overwrite a newer pointer');
     assert.ok(Date.now() - started < 5_000, 'the injected SDK deadline fired fast — no real-time 10s wait');
+    await s.close({ timeoutMs: 2000 });
+  } finally { f.cleanup(); }
+});
+
+test('#296 settleAbortMetaWrite CANCELS the in-flight abort write when the recovery signal aborts', async () => {
+  // High finding (r4244281967): aborting the recovery race must not merely stop AWAITING
+  // the fire-and-forget abort WIP write — the underlying createElementInstanceVariables
+  // mutation would otherwise stay in flight past the recovery deadline and could land
+  // LATE over a newer activation's resumeFromCheckpoint. settleAbortMetaWrite must CANCEL
+  // the retained CancelablePromise(s) when the recovery signal aborts.
+  const f = fixture();
+  try {
+    const env = { NANO_AGENT_CHECKPOINT: 'on', NANO_AGENT_CHECKPOINT_INTERVAL_MS: '0' };
+    const { dir } = f.clone('settle-cancel');
+    sh(dir, 'checkout', '-q', '-b', 'nano/agent-work/main-x');
+    const provisioned = { workspaceDir: dir, gitEnv: ENV, committer: { name: 'bot', email: 'bot@example.com' }, startSha: sh(dir, 'rev-parse', 'HEAD'), workingBranch: 'nano/agent-work/main-x' };
+    let cancelCalls = 0;
+    let settled = false;
+    // A CancelablePromise-shaped write that NEVER resolves on its own; only .cancel()
+    // settles it (rejects). If settleAbortMetaWrite fails to cancel on abort, `settled`
+    // stays false and the write would remain in flight to land late.
+    const camunda = {
+      createElementInstanceVariables: () => {
+        const p = new Promise(() => {});
+        p.cancel = () => { cancelCalls++; settled = true; };
+        return p;
+      },
+    };
+    const s = await setupWorkspaceCheckpoints({ provisioned, job: { jobKey: '1', elementInstanceKey: '821', processInstanceKey: '500', elementId: 'review' }, jobType: 't', runId: 'r', camunda, logger: quietLogger(), env, deps: { sweepRegistry: new Map() } });
+    writeFileSync(join(dir, 'wip.txt'), 'half done\n');
+    // The abort flush fires the WIP write fire-and-forget (captured as abortMetaWrite).
+    await s.checkpointer.flush('abort', { timeoutMs: 20_000 });
+    // Simulate the recovery deadline firing: settleAbortMetaWrite under an aborting signal
+    // must CANCEL the in-flight write, not just stop awaiting it.
+    const ac = new AbortController();
+    const settleP = s.settleAbortMetaWrite(ac.signal);
+    ac.abort();
+    await settleP;
+    assert.ok(cancelCalls > 0, 'the in-flight abort WIP write was cancelled when the recovery signal aborted (not merely un-awaited)');
+    assert.ok(settled, 'the cancelled write is settled — it can never complete late and overwrite a newer resumeFromCheckpoint');
     await s.close({ timeoutMs: 2000 });
   } finally { f.cleanup(); }
 });

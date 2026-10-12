@@ -7033,12 +7033,22 @@ async function setupWorkspaceCheckpoints({ provisioned, envelope = null, token =
         // starve the recovery git promotion. Racing them caps the worst case at a
         // single timeout, and each has an independent try/catch so one failing (or
         // being absent, e.g. no processInstanceKey) never blocks the other.
-        const writes = [
-          withDeadline(camunda.createElementInstanceVariables({
+        // #296 (review, r4244281967): RETAIN the underlying CancelablePromise(s) so
+        // the abort path can CANCEL them when the recovery deadline fires — not just
+        // stop awaiting. Otherwise a fire-and-forget abort write whose own SDK timeout
+        // outlasts the recovery window stays in flight after the worker yields and can
+        // land LATE over a newer activation's `resumeFromCheckpoint`. The SDK returns a
+        // CancelablePromise (toCancelable); `.cancel?.()` is a no-op for a plain promise
+        // (the test stubs), so capturing the raw return is enough.
+        const rawWrites = [
+          camunda.createElementInstanceVariables({
             elementInstanceKey: String(job.elementInstanceKey),
             variables: { agentCheckpoint: { ref, sha: res.sha, head: res.head, at: res.at, reason: res.reason, branch } },
             local: true,
-          }), CP_SDK_TIMEOUT_MS, 'createElementInstanceVariables').catch((err) => {
+          }),
+        ];
+        const writes = [
+          withDeadline(rawWrites[0], CP_SDK_TIMEOUT_MS, 'createElementInstanceVariables').catch((err) => {
             if (!varWarned) { varWarned = true; log.warn(`could not set the agentCheckpoint variable — ${oneLineLog(err?.message || err)}; checkpoints still pushed to ${ref}.`); }
           }),
         ];
@@ -7049,15 +7059,21 @@ async function setupWorkspaceCheckpoints({ provisioned, envelope = null, token =
         // checkpoint via `resumeFromCheckpoint`. Best-effort and independent of the
         // local write; a failure never blocks the push.
         if (job?.processInstanceKey) {
-          writes.push(withDeadline(camunda.createElementInstanceVariables({
+          const rawProcess = camunda.createElementInstanceVariables({
             elementInstanceKey: String(job.processInstanceKey),
             variables: { resumeFromCheckpoint: { ref, sha: res.sha, elementInstanceKey: String(job.elementInstanceKey ?? ''), elementId: job.elementId ?? null, branch, at: res.at } },
             local: true,
-          }), CP_SDK_TIMEOUT_MS, 'createElementInstanceVariables').catch((err) => {
+          });
+          rawWrites.push(rawProcess);
+          writes.push(withDeadline(rawProcess, CP_SDK_TIMEOUT_MS, 'createElementInstanceVariables').catch((err) => {
             if (!resumeVarWarned) { resumeVarWarned = true; log.warn(`could not set the resumeFromCheckpoint variable — ${oneLineLog(err?.message || err)}; a resumed run may not auto-find ${ref}.`); }
           }));
         }
-        return Promise.all(writes);
+        const promise = Promise.all(writes);
+        // Cancel every in-flight underlying write (best-effort; no-op for plain
+        // promises). Used by the abort path when the recovery deadline fires.
+        const cancel = () => { for (const w of rawWrites) { try { w?.cancel?.(); } catch { /* best effort */ } } };
+        return { promise, cancel };
       }
       : null;
 
@@ -7111,13 +7127,15 @@ async function setupWorkspaceCheckpoints({ provisioned, envelope = null, token =
         // process-scoped write could overwrite a NEWER activation's pointer. So the
         // failed path (and every normal checkpoint) AWAITS the write before
         // settlement, keeping the predecessor pointer durable before the job settles.
-        // #296 (review): on the abort path, CAPTURE the fire-and-forget promise so the
-        // force-stop recovery path can await it before writing the recovery pointer to
-        // the same slot — otherwise a slow WIP write lands after and clobbers the
-        // recovery ref. `.catch(() => {})` keeps it fire-and-forget for the flush; the
-        // settled/rejected result is irrelevant to the caller.
-        if (res.reason === 'abort') { abortMetaWrite = setVar(res).catch(() => {}); return; }
-        await setVar(res);
+        // #296 (review): on the abort path, CAPTURE the fire-and-forget write (promise +
+        // cancel) so the force-stop recovery path can await it before writing the
+        // recovery pointer to the same slot — otherwise a slow WIP write lands after and
+        // clobbers the recovery ref. `.promise.catch(() => {})` keeps it fire-and-forget
+        // for the flush; the settled/rejected result is irrelevant to the caller. The
+        // retained `cancel` lets settleAbortMetaWrite tear down the in-flight SDK call
+        // when the recovery deadline fires (r4244281967), so it can never land late.
+        if (res.reason === 'abort') { const w = setVar(res); abortMetaWrite = { promise: w.promise.catch(() => {}), cancel: w.cancel }; return; }
+        await setVar(res).promise;
       },
     });
     return {
@@ -7166,18 +7184,22 @@ async function setupWorkspaceCheckpoints({ provisioned, envelope = null, token =
       // await is cancelled by the SAME deadline that tears down the recovery git — the
       // recover chain must SETTLE (not dangle) when the budget expires, so a stale
       // continuation can never write the old recovery pointer over a reactivated
-      // worker's newer one. The underlying fire-and-forget write stays bounded by its
-      // own withDeadline; we only stop AWAITING it once the deadline fires.
+      // worker's newer one.
+      // #296 (review, r4244281967): stopping the AWAIT is not enough — the underlying
+      // `createElementInstanceVariables` mutation would otherwise stay in flight past
+      // the deadline and could land LATE over a newer activation's `resumeFromCheckpoint`.
+      // So when `signal` aborts we also CANCEL the retained CancelablePromise(s)
+      // (`abortMetaWrite.cancel()`), aborting the fetch so the late settle can never land.
       async settleAbortMetaWrite(signal = null) {
-        const p = abortMetaWrite;
-        if (!p) return;
-        if (signal?.aborted) return;
-        if (!signal) { try { await p; } catch { /* best effort */ } return; }
+        const w = abortMetaWrite;
+        if (!w) return;
+        if (signal?.aborted) { try { w.cancel?.(); } catch { /* best effort */ } return; }
+        if (!signal) { try { await w.promise; } catch { /* best effort */ } return; }
         let onAbort = null;
         try {
           await Promise.race([
-            p.catch(() => {}),
-            new Promise((res) => { onAbort = () => res(); signal.addEventListener('abort', onAbort, { once: true }); }),
+            w.promise.catch(() => {}),
+            new Promise((res) => { onAbort = () => { try { w.cancel?.(); } catch { /* best effort */ } res(); }; signal.addEventListener('abort', onAbort, { once: true }); }),
           ]);
         } catch { /* best effort */ } finally { if (onAbort) signal.removeEventListener('abort', onAbort); }
       },

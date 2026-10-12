@@ -1772,6 +1772,16 @@ test('#296 (r4245472572) the recovery-pointer write is occurrence-fenced and nat
   assert.ok(readback > ownGate && readback < recWrite, 'an occurrence-scoped searchVariables read-back fences the write (after ownership, before the write)');
   assert.ok(src.indexOf("name: 'resumeFromCheckpoint'", readback) > readback && src.indexOf("name: 'resumeFromCheckpoint'", readback) < recWrite, 'the read-back filters on the resumeFromCheckpoint variable name');
   assert.ok(src.indexOf('scopeKey: String(job.processInstanceKey)', readback) > readback && src.indexOf('scopeKey: String(job.processInstanceKey)', readback) < recWrite, 'the read-back is scoped to THIS process instance');
+  // #296 (r4245620587): the consistency options MUST be nested under `consistency` — the
+  // real @camunda8 client throws "Missing consistency options" when they are passed at the
+  // top level, and the surrounding catch would swallow that throw, making the read-back
+  // fail OPEN on every call (never protecting the write). Guard the exact nesting + native
+  // signal shape so a regression to the flat `{ waitUpToMs, abortSignal }` form is caught.
+  const svEnd = src.indexOf('));', readback);
+  const svCall = src.slice(readback, svEnd);
+  assert.ok(/consistency:\s*\{\s*waitUpToMs:\s*0\s*\}/.test(svCall), 'the read-back nests waitUpToMs under `consistency` (not the flat top-level shape the SDK rejects)');
+  assert.ok(/signal:\s*recoverySdkAbort\.signal/.test(svCall), 'the read-back passes the recovery-deadline signal NATIVELY (as `signal`, reaching fetch)');
+  assert.ok(!/abortSignal:/.test(svCall), 'the read-back does NOT use the non-honoured `abortSignal` key');
   const skipNewer = src.indexOf('slotRef && slotRef !== recoveryRefInfo.ref', readback);
   assert.ok(skipNewer > readback && skipNewer < recWrite, 'the write is SKIPPED when the slot already names a different (newer) run\'s ref');
   // Fence (2): the write carries a NATIVE abort signal (SDK options extend RequestInit, so

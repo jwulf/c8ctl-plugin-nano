@@ -13253,7 +13253,9 @@ async function workAgent(req, flags, ctx) {
                     // the new activation published a newer resumeFromCheckpoint. The write
                     // is unconditional last-writer-wins, so it could then overwrite that
                     // newer pointer. Two fences close the class (no atomic process-scoped
-                    // CAS exists):
+                    // CAS exists — so the write is a best-effort DISCOVERY HINT, not an
+                    // authoritative fence, and these two narrowings reduce (not eliminate)
+                    // its staleness:
                     //  (1) OCCURRENCE-SCOPED READ-BACK — re-read the shared slot and skip
                     //      when it already names a DIFFERENT run's ref (a newer activation
                     //      beat us). Best-effort: a read failure/empty/absent result fails
@@ -13264,11 +13266,29 @@ async function workAgent(req, flags, ctx) {
                     //      RequestInit, so `signal` reaches fetch and aborts the in-flight
                     //      HTTP request the instant the recovery deadline fires, tearing the
                     //      mutation down at the transport (not just a best-effort .cancel()).
+                    // #296 (review, r4245620621): a read-then-write is NOT atomic, so a
+                    // replacement activation can still publish its ref between the read-back
+                    // and this write — the residual TOCTOU the reviewer notes is real. It is
+                    // BENIGN for recovery CORRECTNESS, which does not rest on this write:
+                    // the self-recorded OBJECT form of resumeFromCheckpoint is NEVER
+                    // auto-adopted on resume (`makeOccurrenceGuard` fails closed BY
+                    // CONSTRUCTION — only a process-delivered bare STRING is adopted), and
+                    // the authoritative durable recovery handle is the CAS-fenced git ref
+                    // refs/nano/recovered/<eik> (`preserveRecovery` → `pushNamedRef`
+                    // --force-with-lease). A stale object pointer therefore yields a
+                    // transcript-only resume (identical to an ABSENT pointer), never an
+                    // incorrect restore. These narrowings keep the HINT as fresh as is
+                    // cheaply possible; they are not relied on for a safety property.
+                    // #296 (review, r4245620587): the consistency options MUST be nested
+                    // under `consistency` (the real @camunda8 client throws "Missing
+                    // consistency options" otherwise — mirrors the 6994/6999 reads and
+                    // agent-resume's READ_CONSISTENCY) or the catch below would swallow the
+                    // throw and this read-back would silently fail OPEN on every call.
                     if (typeof camunda?.searchVariables === 'function') {
                       try {
                         const found = await Promise.resolve(camunda.searchVariables(
                           { filter: { name: 'resumeFromCheckpoint', scopeKey: String(job.processInstanceKey) }, truncateValues: false },
-                          { waitUpToMs: 0, abortSignal: recoverySdkAbort.signal },
+                          { consistency: { waitUpToMs: 0 }, signal: recoverySdkAbort.signal },
                         ));
                         const items = Array.isArray(found?.items) ? found.items : (Array.isArray(found?.data?.items) ? found.data.items : []);
                         let slotRef = null;

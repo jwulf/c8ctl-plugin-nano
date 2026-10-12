@@ -2309,6 +2309,74 @@ test('#296 setupWorkspaceCheckpoints: an EXPLICIT (string) predecessor ref bypas
   } finally { f.cleanup(); }
 });
 
+test('#296 setupWorkspaceCheckpoints: the lost-race adoption branch ALSO advances the resume pointer', async () => {
+  // Previously-missed (review 5486602850): the create-only adoption WINNER advances the
+  // process-scoped resumeFromCheckpoint pointer, but the lost-race branch adopted the
+  // winner's ref WITHOUT advancing it. If the winner's own best-effort advance failed,
+  // the slot kept naming the bare predecessor; a no-new-checkpoint completion then
+  // deletes the WIP ref on ack while the slot still points at the predecessor — a later
+  // activation re-adopts that stale snapshot. The loser must advance the pointer too
+  // (using the re-read sha), making the advance idempotent across the race.
+  const f = fixture();
+  try {
+    const env = { NANO_AGENT_CHECKPOINT: 'on', NANO_AGENT_CHECKPOINT_INTERVAL_MS: '0' };
+    const provision = (name) => {
+      const { dir } = f.clone(name);
+      sh(dir, 'checkout', '-q', '-b', 'nano/agent-work/main-x');
+      return { workspaceDir: dir, gitEnv: ENV, committer: { name: 'bot', email: 'bot@example.com' }, startSha: sh(dir, 'rev-parse', 'HEAD'), workingBranch: 'nano/agent-work/main-x' };
+    };
+    const vars = [];
+    const camunda = { createElementInstanceVariables: async (input) => { vars.push(input); } };
+
+    // 1) The PREDECESSOR run (eik 10) checkpoints "predecessor work" → refs/nano/wip/10.
+    const p1 = provision('pred');
+    const s1 = await setupWorkspaceCheckpoints({ provisioned: p1, job: { jobKey: '1', elementInstanceKey: '10', processInstanceKey: '500', elementId: 'review-round' }, jobType: 't', runId: 'run-1', camunda, logger: quietLogger(), env, deps: { sweepRegistry: new Map() } });
+    writeFileSync(join(p1.workspaceDir, 'wip.txt'), 'predecessor work\n');
+    const predRes = await s1.checkpointer.flush('abort', { timeoutMs: 0 });
+    await s1.close();
+
+    // 2) The RACE WINNER (same eik 20 as the loser) already populated refs/nano/wip/20
+    //    with DIFFERENT content, simulating a concurrent same-key activation that won
+    //    the create-only lease first.
+    const pw = provision('winner');
+    const sw = await setupWorkspaceCheckpoints({ provisioned: pw, job: { jobKey: '9', elementInstanceKey: '20', processInstanceKey: '500', elementId: 'review-round' }, jobType: 't', runId: 'run-W', camunda, logger: quietLogger(), env, deps: { sweepRegistry: new Map() } });
+    writeFileSync(join(pw.workspaceDir, 'wip.txt'), 'winner work\n');
+    const winRes = await sw.checkpointer.flush('abort', { timeoutMs: 0 });
+    await sw.close();
+    assert.notEqual(winRes.sha, predRes.sha, 'winner and predecessor snapshots differ');
+    assert.equal(sh(f.root, '--git-dir', f.remote, 'rev-parse', 'refs/nano/wip/20'), winRes.sha);
+    vars.length = 0;
+
+    // 3) The LOSER (eik 20) resumes with an explicit predecessor ref. Inject a
+    //    fetchCheckpoint that hides refs/nano/wip/20 at the STARTUP fetch (so the
+    //    predecessor-adoption block is entered) but delegates to the real reader
+    //    everywhere else — so the create-only push loses the lease (the remote ref
+    //    already exists) and the re-read returns the WINNER's real checkpoint.
+    const p2 = provision('loser');
+    const logger = quietLogger();
+    let hidStartup = false;
+    const fetchCheckpointRacing = async (opts) => {
+      if (!hidStartup && opts?.ref === 'refs/nano/wip/20') { hidStartup = true; return null; }
+      return fetchCheckpoint(opts);
+    };
+    const job2 = { jobKey: '2', elementInstanceKey: '20', processInstanceKey: '500', elementId: 'review-round', variables: { resumeFromCheckpoint: 'refs/nano/wip/10' } };
+    const s2 = await setupWorkspaceCheckpoints({ provisioned: p2, job: job2, jobType: 't', runId: 'run-2', camunda, logger, env, deps: { sweepRegistry: new Map(), fetchCheckpoint: fetchCheckpointRacing } });
+
+    // The loser adopts the WINNER's state (not the predecessor's) and does NOT overwrite
+    // the winner's ref.
+    assert.equal(s2.restored?.restored, true);
+    assert.equal(readFileSync(join(p2.workspaceDir, 'wip.txt'), 'utf8'), 'winner work\n');
+    assert.equal(sh(f.root, '--git-dir', f.remote, 'rev-parse', 'refs/nano/wip/20'), winRes.sha, 'the winner ref is not clobbered by the loser');
+    assert.match(logger.lines.info.join('\n'), /a concurrent activation already populated refs\/nano\/wip\/20/);
+    // The fix: the loser advances the pointer to ITS key with the RE-READ (winner) sha.
+    const advanced = vars.find((v) => v.elementInstanceKey === '500' && v.variables?.resumeFromCheckpoint?.ref === 'refs/nano/wip/20');
+    assert.ok(advanced, 'the lost-race branch advances the resumeFromCheckpoint pointer to this run\'s ref');
+    assert.equal(advanced.variables.resumeFromCheckpoint.sha, winRes.sha, 'the advanced pointer carries the re-read (winner) sha, not the predecessor sha');
+    assert.equal(advanced.variables.resumeFromCheckpoint.adoptedFrom, 'refs/nano/wip/10');
+    await s2.close();
+  } finally { f.cleanup(); }
+});
+
 test('#295 job handler wires preserveRecovery on abort/failed and surfaces recoveryRef in the outcome', () => {
   const src = readFileSync(new URL('./c8ctl-plugin.js', import.meta.url), 'utf8');
   const i = (s) => { const at = src.indexOf(s); assert.ok(at >= 0, `missing: ${s}`); return at; };

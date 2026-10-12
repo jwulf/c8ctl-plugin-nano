@@ -6865,6 +6865,27 @@ async function setupWorkspaceCheckpoints({ provisioned, envelope = null, token =
           try { predCp = await fetchCp({ git: startupGit, ref: predRef }); } catch (err) { log.debug(`could not fetch predecessor WIP checkpoint ${predRef} — ${oneLineLog(err?.message || err)}.`); }
         }
         if (predCp?.sha) {
+          // #296 (review): after ANY adoption the process-scoped slot still names the
+          // stale PREDECESSOR ref. If this resumed activation then succeeds WITHOUT
+          // taking another checkpoint (a short run before the safety timer), its adopted
+          // WIP ref is deleted on ack while the slot keeps pointing at the predecessor —
+          // a later activation would re-restore that old snapshot. Advance the slot to
+          // THIS run's key (with the sha we actually adopted) so the pointer tracks the
+          // current owner. Factored into one helper so EVERY adoption branch advances it
+          // (the create-only win AND the lost-race re-read, whose race winner's own
+          // best-effort advance may have failed — this makes the advance idempotent
+          // across the race rather than reliant on the winner). Best-effort; a failure
+          // never blocks setup.
+          const advanceResumePointer = async (adoptedSha) => {
+            if (!adoptedSha || typeof camunda?.createElementInstanceVariables !== 'function' || !job?.processInstanceKey) return;
+            try {
+              await withDeadline(camunda.createElementInstanceVariables({
+                elementInstanceKey: String(job.processInstanceKey),
+                variables: { resumeFromCheckpoint: { ref, sha: adoptedSha, elementInstanceKey: String(job.elementInstanceKey ?? ''), elementId: job.elementId ?? null, branch: provisioned.workingBranch || null, at: Date.now(), adoptedFrom: predRef } },
+                local: true,
+              }), CP_SDK_TIMEOUT_MS, 'createElementInstanceVariables');
+            } catch (err) { log.debug(`could not advance the resumeFromCheckpoint pointer to ${ref} — ${oneLineLog(err?.message || err)}.`); }
+          };
           // Create-only adoption (default expectSha=''): only write our key while it
           // is ABSENT, so a concurrent same-key retry that already adopted + advanced
           // the ref is never clobbered (Copilot review on #296).
@@ -6873,27 +6894,20 @@ async function setupWorkspaceCheckpoints({ provisioned, envelope = null, token =
             try { prior = await fetchCp({ git: startupGit, ref }); } catch { prior = { ...predCp, ref }; }
             if (!prior) prior = { ...predCp, ref };
             logger.info?.(`${prefix} (${corr}): adopted predecessor WIP checkpoint ${predRef}@${predCp.sha.slice(0, 12)} under this run's key ${ref} (SLA-escalation resume); restoring it below.`);
-            // #296 (review): the process-scoped slot still names the PREDECESSOR ref.
-            // If this resumed activation now succeeds WITHOUT taking another checkpoint
-            // (a short run before the safety timer), its adopted WIP ref is deleted on
-            // ack while the stale slot keeps pointing at the predecessor — a later
-            // activation would re-restore that old snapshot. Advance the slot to THIS
-            // run's newly-copied ref so the pointer tracks the current owner. Best-effort.
-            if (typeof camunda?.createElementInstanceVariables === 'function' && job?.processInstanceKey) {
-              try {
-                await withDeadline(camunda.createElementInstanceVariables({
-                  elementInstanceKey: String(job.processInstanceKey),
-                  variables: { resumeFromCheckpoint: { ref, sha: predCp.sha, elementInstanceKey: String(job.elementInstanceKey ?? ''), elementId: job.elementId ?? null, branch: provisioned.workingBranch || null, at: Date.now(), adoptedFrom: predRef } },
-                  local: true,
-                }), CP_SDK_TIMEOUT_MS, 'createElementInstanceVariables');
-              } catch (err) { log.debug(`could not advance the resumeFromCheckpoint pointer to ${ref} — ${oneLineLog(err?.message || err)}.`); }
-            }
+            await advanceResumePointer(predCp.sha);
           } else if (copied?.staleLease) {
             // A concurrent activation populated this key first — adopt what IS there
             // rather than force over it; the ref now holds the race winner's state.
             try { prior = await fetchCp({ git: startupGit, ref }); } catch { prior = null; }
-            if (prior) logger.info?.(`${prefix} (${corr}): a concurrent activation already populated ${ref}; adopting its checkpoint ${prior.sha ? '@' + String(prior.sha).slice(0, 12) : ''} (SLA-escalation resume); restoring it below.`);
-            else log.warn(`found predecessor WIP checkpoint ${predRef}@${predCp.sha.slice(0, 12)} but ${ref} was concurrently moved and could not be re-read — the predecessor ref is retained for explicit recovery.`);
+            if (prior) {
+              logger.info?.(`${prefix} (${corr}): a concurrent activation already populated ${ref}; adopting its checkpoint ${prior.sha ? '@' + String(prior.sha).slice(0, 12) : ''} (SLA-escalation resume); restoring it below.`);
+              // Advance the pointer to the re-read sha too: the race winner's own
+              // best-effort advance may have failed, which would leave the slot naming
+              // the bare predecessor and risk a later re-adoption of stale work.
+              await advanceResumePointer(prior.sha);
+            } else {
+              log.warn(`found predecessor WIP checkpoint ${predRef}@${predCp.sha.slice(0, 12)} but ${ref} was concurrently moved and could not be re-read — the predecessor ref is retained for explicit recovery.`);
+            }
           } else {
             log.warn(`found predecessor WIP checkpoint ${predRef}@${predCp.sha.slice(0, 12)} but could not copy it to ${ref} — ${copied?.error || 'unknown'}; the predecessor ref is retained for explicit recovery.`);
           }

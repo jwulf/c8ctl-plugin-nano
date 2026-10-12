@@ -115,6 +115,11 @@ const DEFAULTS = Object.freeze({
   // timeout/abort — bounds how long the runner can stay pending past its deadline.
   gitKillGraceMs: 5_000,
   flushTimeoutMs: 20_000,
+  // Deadline every checkpoint-path SDK call (createElementInstanceVariables, the
+  // #295 occurrence/terminal lookups) is bounded by. A seam so a test can drive the
+  // timeout deterministically with a tiny value instead of consuming the real 10s of
+  // wall clock to observe the cancel-on-timeout behaviour (Copilot review on #296).
+  sdkTimeoutMs: 10_000,
   ttlMs: 7 * 24 * 60 * 60 * 1000,
   gcGraceMs: 60 * 60 * 1000,
   gcEveryMs: 60 * 60 * 1000,
@@ -239,6 +244,9 @@ export function checkpointConfig(env = process.env) {
     // would otherwise hand it (Copilot review on #296).
     gitKillGraceMs: DEFAULTS.gitKillGraceMs,
     flushTimeoutMs: DEFAULTS.flushTimeoutMs,
+    // Floor of 1ms so a test can inject a near-instant deadline; production uses the
+    // 10s default when the env var is unset (Copilot review on #296).
+    sdkTimeoutMs: Math.max(1, intOr(env.NANO_AGENT_CHECKPOINT_SDK_TIMEOUT_MS, DEFAULTS.sdkTimeoutMs)),
   };
 }
 

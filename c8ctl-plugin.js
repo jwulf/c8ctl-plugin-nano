@@ -6809,7 +6809,7 @@ async function setupWorkspaceCheckpoints({ provisioned, envelope = null, token =
     // Bound every checkpoint-path SDK call: a timed-out call rejects; a late settle is
     // swallowed so it can never surface as an unhandled rejection. Hoisted here (ahead
     // of the GC block, which reuses them) so the #295 ambiguity guard below is bounded.
-    const CP_SDK_TIMEOUT_MS = 10000;
+    const CP_SDK_TIMEOUT_MS = cfg.sdkTimeoutMs;
     const withDeadline = (p, ms, label) => {
       let timer;
       // #296 (review): a bare Promise.race REJECTS on timeout but leaves the SDK
@@ -7163,10 +7163,24 @@ async function setupWorkspaceCheckpoints({ provisioned, envelope = null, token =
       // GC-proof recovery ref). Best-effort, never throws; resolves immediately when
       // no abort write is in flight. The caller bounds the wait inside the shared
       // force-stop budget, so a hung engine cannot stall the force-stop exit.
-      async settleAbortMetaWrite() {
+      // #296 (review, r4244116341): accept the recovery-deadline `signal` so this SDK
+      // await is cancelled by the SAME deadline that tears down the recovery git — the
+      // recover chain must SETTLE (not dangle) when the budget expires, so a stale
+      // continuation can never write the old recovery pointer over a reactivated
+      // worker's newer one. The underlying fire-and-forget write stays bounded by its
+      // own withDeadline; we only stop AWAITING it once the deadline fires.
+      async settleAbortMetaWrite(signal = null) {
         const p = abortMetaWrite;
         if (!p) return;
-        try { await p; } catch { /* best effort */ }
+        if (signal?.aborted) return;
+        if (!signal) { try { await p; } catch { /* best effort */ } return; }
+        let onAbort = null;
+        try {
+          await Promise.race([
+            p.catch(() => {}),
+            new Promise((res) => { onAbort = () => res(); signal.addEventListener('abort', onAbort, { once: true }); }),
+          ]);
+        } catch { /* best effort */ } finally { if (onAbort) signal.removeEventListener('abort', onAbort); }
       },
       // #295: promote the latest snapshot to a GC-PROOF recovery ref on an SLA
       // cancellation or a force-stop. `refs/nano/recovered/<elementInstanceKey>`
@@ -13023,7 +13037,21 @@ async function workAgent(req, flags, ctx) {
               // supervisor's SIGKILL window. Fires `abortAtMs` (the deadline MINUS the
               // reserved drain window) so the git SIGKILL completes before the deadline;
               // unref'd so it never keeps the process alive.
-              let deadlineTimer = setTimeout(() => { try { checkpointing.abortRecovery(); } catch { /* best effort */ } }, abortAtMs);
+              // #296 (review, r4244116341): the recover-race `Promise.race([recover,
+              // budget])` below only bounds the AWAIT — when `budget` wins, the SDK
+              // mutations inside `recover` (settleAbortMetaWrite's awaited WIP write and
+              // the recovery-pointer write) keep running. The job then yields and a
+              // reactivated worker can publish a NEWER `resumeFromCheckpoint`; a stale
+              // `recover` continuation that completes afterward would clobber it with the
+              // old recovery pointer. abortRecovery() cancels only git/GC, not these SDK
+              // calls. So drive the SDK mutations off a DEDICATED recovery-deadline
+              // signal, fired by the same deadline (and on budget expiry), and AWAIT
+              // `recover` after the race so it is SETTLED/cancelled before we yield.
+              const recoverySdkAbort = new AbortController();
+              let deadlineTimer = setTimeout(() => {
+                try { checkpointing.abortRecovery(); } catch { /* best effort */ }
+                try { recoverySdkAbort.abort(); } catch { /* best effort */ }
+              }, abortAtMs);
               deadlineTimer?.unref?.();
               const recover = (async () => {
                 await checkpointer.flush('abort', { timeoutMs: recoveryDeadline }); checkpointFinalized = true;
@@ -13044,9 +13072,14 @@ async function workAgent(req, flags, ctx) {
                 // flight it could land AFTER the recovery-pointer write below and
                 // overwrite the recovery ref with a stale WIP pointer (which the orphan
                 // GC then reclaims on TTL, losing the recovery discovery). Await the WIP
-                // write FIRST so the recovery pointer is guaranteed to land last. Bounded
-                // by the recover-race budget around this whole block; best-effort.
-                try { await checkpointing.settleAbortMetaWrite?.(); } catch { /* best effort */ }
+                // write FIRST — under the recovery-deadline signal so the await is
+                // cancelled when the budget expires — so the recovery pointer is
+                // guaranteed to land last. Bounded by the recover-race budget; best-effort.
+                try { await checkpointing.settleAbortMetaWrite?.(recoverySdkAbort.signal); } catch { /* best effort */ }
+                // #296 (review, r4244116341): if the recovery deadline has already fired,
+                // do NOT write the recovery pointer — a write that lands after this branch
+                // yields could overwrite a reactivated worker's newer resumeFromCheckpoint.
+                if (recoverySdkAbort.signal.aborted) return;
                 if (recoveryRefInfo && typeof camunda?.createElementInstanceVariables === 'function' && job?.processInstanceKey) {
                   try {
                     const w = camunda.createElementInstanceVariables({
@@ -13054,10 +13087,14 @@ async function workAgent(req, flags, ctx) {
                       variables: { resumeFromCheckpoint: { ref: recoveryRefInfo.ref, sha: recoveryRefInfo.sha, elementInstanceKey: String(job.elementInstanceKey ?? ''), elementId: job.elementId ?? null, recovered: true, at: Date.now() } },
                       local: true,
                     });
-                    let wt;
+                    let wt; let onAbort = null;
+                    // Cancel the in-flight write when the recovery deadline fires (the SDK
+                    // returns a CancelablePromise), AND reject the race so the chain
+                    // settles — the mutation never lands late over a newer pointer.
                     await Promise.race([
-                      Promise.resolve(w).finally(() => clearTimeout(wt)),
+                      Promise.resolve(w).finally(() => { clearTimeout(wt); if (onAbort) recoverySdkAbort.signal.removeEventListener('abort', onAbort); }),
                       new Promise((_r, rej) => { wt = setTimeout(() => { try { w?.cancel?.(); } catch { /* best effort */ } rej(new Error('resumeFromCheckpoint recovery write timed out')); }, 5000); wt?.unref?.(); }),
+                      new Promise((_r, rej) => { onAbort = () => { try { w?.cancel?.(); } catch { /* best effort */ } rej(new Error('resumeFromCheckpoint recovery write aborted')); }; recoverySdkAbort.signal.addEventListener('abort', onAbort, { once: true }); }),
                     ]);
                   } catch { /* best effort — the pushed ref is the fallback */ }
                 }
@@ -13072,6 +13109,15 @@ async function workAgent(req, flags, ctx) {
               // sweep that can run up to GC_OVERALL_TIMEOUT_MS (120s), holding the
               // force-stop open past the supervisor's SIGKILL window (the F8 failure).
               if (budgetTimer) clearTimeout(budgetTimer);
+              // #296 (review, r4244116341): the race above only bounds the await — when
+              // `budget` wins, `recover` may still be mid-SDK-write. Abort the recovery
+              // signal (cancels the in-flight SDK mutation and short-circuits recover's
+              // remaining steps) and AWAIT `recover` so it is fully settled BEFORE we
+              // yield the job. This guarantees no stale continuation writes the old
+              // recovery pointer after a reactivated worker publishes a newer one. The
+              // signal + each step's internal deadline keep this await bounded.
+              try { recoverySdkAbort.abort(); } catch { /* best effort */ }
+              try { await recover; } catch { /* best effort */ }
               checkpointFinalized = true;
             }
             return;

@@ -293,12 +293,20 @@ SDK client (job workers) — do **not** add the SDK as a dependency or use raw
   recovery refs**: on a force-stop/abort or failed (SLA-cancelled) run,
   `preserveRecovery` promotes the latest snapshot to `refs/nano/recovered/<eik>`
   (`recoveredCheckpointRef`) — **outside** the `refs/nano/wip/*` namespace the sweep
-  enumerates, so it is never GC-reclaimed. On the failed/SLA-cancelled path (which
-  settles normally) it surfaces `recoveryRef`/`recoverySha` in the job outcome
-  (`buildResultEnvelope`); a **force-stopped** run is yielded (`settle.fail`) and
-  returns early, so it produces **no outcome envelope** and its recovery ref is
-  recoverable from the pushed `refs/nano/recovered/<eik>` ref itself, not from a job
-  result. All recovery-ref writes are **fenced** (Copilot review on #296): predecessor
+  enumerates, so it is never GC-reclaimed. How the recovery point is *reported*
+  depends on HOW the run ended. A **non-aborted failed** run (a non-ok result that
+  did NOT interrupt the runner — e.g. a harness non-zero exit) settles normally and
+  surfaces `recoveryRef`/`recoverySha` in the job outcome (`buildResultEnvelope`).
+  But a **force-stopped run OR an SLA lease-loss cancellation** both take the *aborted*
+  early return (`settle.fail`, `result.aborted === true`): the supervisor heartbeat
+  treats the SLA cancel's lease-loss 404 as terminal and interrupts the runner, so it
+  reaches the SAME aborted branch as a force-stop. That branch returns before
+  `buildResultEnvelope`, so it produces **no outcome envelope** — `recoveryRef`/
+  `recoverySha` are NOT emitted there. Instead it records the recovery point through
+  the **process-scoped `resumeFromCheckpoint`** variable (so a resumed element
+  re-entry can discover it), and the pushed `refs/nano/recovered/<eik>` ref itself is
+  the authoritative, durable recovery handle (recoverable without any job result).
+  All recovery-ref writes are **fenced** (Copilot review on #296): predecessor
   adoption is create-only and the recovery promotion leases against the sha it observed
   on `refs/nano/recovered/<eik>`, so a slower/stale activation can never blind-force
   over a newer run's recovery point (`pushNamedRef`/`observeRemoteRefSha`). That lease

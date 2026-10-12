@@ -52,6 +52,12 @@ test('config, ref, deny-list, triggers', () => {
   assert.equal(c.enabled, true);
   assert.equal(c.minIntervalMs, 5000);
   assert.equal(c.intervalMs, 0);
+  // #296 (review): the SDK-deadline seam defaults to 10s and is overridable (floor 1ms)
+  // so a test can drive the cancel-on-timeout behaviour deterministically.
+  assert.equal(checkpointConfig({}).sdkTimeoutMs, 10_000);
+  assert.equal(checkpointConfig({ NANO_AGENT_CHECKPOINT_SDK_TIMEOUT_MS: '20' }).sdkTimeoutMs, 20);
+  assert.equal(checkpointConfig({ NANO_AGENT_CHECKPOINT_SDK_TIMEOUT_MS: '0' }).sdkTimeoutMs, 1);
+  assert.equal(checkpointConfig({ NANO_AGENT_CHECKPOINT_SDK_TIMEOUT_MS: 'nan' }).sdkTimeoutMs, 10_000);
   assert.equal(checkpointRef('2251799813685249'), 'refs/nano/wip/2251799813685249');
   assert.equal(checkpointRef('../x'), null);
   assert.equal(checkpointRef(''), null);
@@ -1535,12 +1541,28 @@ test('job handler wires checkpoints: notify on ACP updates, flush on abort/failu
   // (which the orphan GC then reclaims on TTL, losing recovery discovery).
   const abortFire = src.indexOf("if (res.reason === 'abort') { abortMetaWrite = setVar(res).catch(() => {}); return; }");
   assert.ok(abortFire > 0, 'the abort-path WIP metadata write is captured (not discarded) so it can be awaited');
-  const settleHook = src.indexOf('async settleAbortMetaWrite()');
-  assert.ok(settleHook > 0, 'setupWorkspaceCheckpoints exposes settleAbortMetaWrite()');
+  const settleHook = src.indexOf('async settleAbortMetaWrite(signal = null)');
+  assert.ok(settleHook > 0, 'setupWorkspaceCheckpoints exposes settleAbortMetaWrite(signal) — cancellable by the recovery deadline');
   const recWrite = src.indexOf("variables: { resumeFromCheckpoint: { ref: recoveryRefInfo.ref");
   assert.ok(recWrite > 0, 'the recovery pointer is written to resumeFromCheckpoint');
-  const settleAwait = src.indexOf('await checkpointing.settleAbortMetaWrite?.()');
-  assert.ok(settleAwait > 0 && settleAwait < recWrite, 'the recovery-pointer write awaits the in-flight abort WIP write first, so the recovery ref lands last');
+  const settleAwait = src.indexOf('await checkpointing.settleAbortMetaWrite?.(recoverySdkAbort.signal)');
+  assert.ok(settleAwait > 0 && settleAwait < recWrite, 'the recovery-pointer write awaits the in-flight abort WIP write first (under the recovery signal), so the recovery ref lands last');
+  // #296 (Copilot review, r4244116341): the recover-race only bounds the AWAIT — when
+  // `budget` wins, the SDK mutations inside `recover` keep running and a stale
+  // continuation could clobber a reactivated worker's newer resumeFromCheckpoint. The
+  // SDK mutations must therefore be driven off a DEDICATED recovery-deadline signal
+  // (fired by the deadline AND on budget expiry), the recovery-pointer write GATED on
+  // that signal, and `recover` AWAITED so it is settled/cancelled before the yield.
+  const sdkAc = src.indexOf('const recoverySdkAbort = new AbortController()');
+  assert.ok(sdkAc > 0, 'the force-stop block owns a dedicated recovery-SDK AbortController');
+  const deadlineAborts = src.indexOf('try { recoverySdkAbort.abort(); } catch { /* best effort */ }');
+  assert.ok(deadlineAborts > sdkAc, 'the recovery deadline also aborts the SDK signal (not just git/GC)');
+  const gateBeforeWrite = src.indexOf('if (recoverySdkAbort.signal.aborted) return;');
+  assert.ok(gateBeforeWrite > sdkAc && gateBeforeWrite < recWrite, 'the recovery-pointer write is SKIPPED once the recovery deadline fired (no stale late write)');
+  const race = src.indexOf('await Promise.race([recover, budget])');
+  const awaitRecover = src.indexOf('try { await recover; } catch { /* best effort */ }');
+  assert.ok(awaitRecover > race, 'recover is AWAITED after the race so it is settled/cancelled before the job yields');
+  assert.ok(src.lastIndexOf('try { recoverySdkAbort.abort(); } catch { /* best effort */ }') > race, 'the SDK signal is aborted after the race (budget-win path) before awaiting recover');
   assert.ok(lastChance > decide && lastChance < close, 'the exception path flushes a failed checkpoint before close()');
   assert.ok(close > decide && close < src.indexOf('rmSync(runDir', close), 'in-flight git work drains before the run dir is reaped');
 });
@@ -1875,7 +1897,10 @@ test('#296 withDeadline CANCELS a timed-out checkpoint write (no late overwrite 
   // on timeout so the underlying fetch is aborted and the late settle can never land.
   const f = fixture();
   try {
-    const env = { NANO_AGENT_CHECKPOINT: 'on', NANO_AGENT_CHECKPOINT_INTERVAL_MS: '0' };
+    // #296 (review, agent-checkpoint.test.mjs:1898): inject a near-instant SDK
+    // deadline via the seam so this asserts the cancel-on-timeout behaviour
+    // DETERMINISTICALLY, instead of blocking on the real 10s production deadline.
+    const env = { NANO_AGENT_CHECKPOINT: 'on', NANO_AGENT_CHECKPOINT_INTERVAL_MS: '0', NANO_AGENT_CHECKPOINT_SDK_TIMEOUT_MS: '20' };
     const { dir } = f.clone('cancel-meta');
     sh(dir, 'checkout', '-q', '-b', 'nano/agent-work/main-x');
     const provisioned = { workspaceDir: dir, gitEnv: ENV, committer: { name: 'bot', email: 'bot@example.com' }, startSha: sh(dir, 'rev-parse', 'HEAD'), workingBranch: 'nano/agent-work/main-x' };
@@ -1893,12 +1918,14 @@ test('#296 withDeadline CANCELS a timed-out checkpoint write (no late overwrite 
     };
     const s = await setupWorkspaceCheckpoints({ provisioned, job: { jobKey: '1', elementInstanceKey: '820', processInstanceKey: '500', elementId: 'review' }, jobType: 't', runId: 'r', camunda, logger: quietLogger(), env, deps: { sweepRegistry: new Map() } });
     writeFileSync(join(dir, 'wip.txt'), 'half done\n');
-    // A normal (non-abort) flush AWAITS the metadata write, so the CP_SDK_TIMEOUT_MS
-    // (10s) deadline fires and must CANCEL the in-flight write before rejecting.
+    const started = Date.now();
+    // A normal (non-abort) flush AWAITS the metadata write, so the injected 20ms
+    // deadline fires and must CANCEL the in-flight write before rejecting.
     const res = await s.checkpointer.flush('failed', { timeoutMs: 20_000 });
     assert.ok(res.sha, JSON.stringify(res));
     assert.ok(cancelCalls > 0, 'the timed-out checkpoint write was cancelled (CancelablePromise.cancel invoked)');
     assert.ok(settled, 'the cancelled write is settled — it can never complete late and overwrite a newer pointer');
+    assert.ok(Date.now() - started < 5_000, 'the injected SDK deadline fired fast — no real-time 10s wait');
     await s.close({ timeoutMs: 2000 });
   } finally { f.cleanup(); }
 });

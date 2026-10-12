@@ -1528,6 +1528,19 @@ test('job handler wires checkpoints: notify on ACP updates, flush on abort/failu
   // deadline bounds recovery AND the (up to 120s) GC cleanup together.
   const ar = src.indexOf('abortRecovery() {');
   assert.ok(ar > 0 && src.slice(ar, ar + 160).includes('gcAbort?.abort()'), 'abortRecovery() also aborts the GC sweep so the shared deadline bounds cleanup');
+  // #296 (Copilot review, recovery-pointer ordering): the abort flush fires its WIP
+  // `resumeFromCheckpoint` write fire-and-forget; the recovery path then writes the
+  // GC-proof recovery ref to the SAME slot. The recovery write must AWAIT the in-flight
+  // WIP write first, or a slow WIP write lands after and clobbers the recovery pointer
+  // (which the orphan GC then reclaims on TTL, losing recovery discovery).
+  const abortFire = src.indexOf("if (res.reason === 'abort') { abortMetaWrite = setVar(res).catch(() => {}); return; }");
+  assert.ok(abortFire > 0, 'the abort-path WIP metadata write is captured (not discarded) so it can be awaited');
+  const settleHook = src.indexOf('async settleAbortMetaWrite()');
+  assert.ok(settleHook > 0, 'setupWorkspaceCheckpoints exposes settleAbortMetaWrite()');
+  const recWrite = src.indexOf("variables: { resumeFromCheckpoint: { ref: recoveryRefInfo.ref");
+  assert.ok(recWrite > 0, 'the recovery pointer is written to resumeFromCheckpoint');
+  const settleAwait = src.indexOf('await checkpointing.settleAbortMetaWrite?.()');
+  assert.ok(settleAwait > 0 && settleAwait < recWrite, 'the recovery-pointer write awaits the in-flight abort WIP write first, so the recovery ref lands last');
   assert.ok(lastChance > decide && lastChance < close, 'the exception path flushes a failed checkpoint before close()');
   assert.ok(close > decide && close < src.indexOf('rmSync(runDir', close), 'in-flight git work drains before the run dir is reaped');
 });
@@ -1634,12 +1647,19 @@ test('#296 makeOccurrenceGuard: fails closed on ambiguous parallel MI; safe on a
   assert.deepEqual(await arr('500', 'review-round'), { safe: true, candidates: ['20'], reason: 'unique' });
 });
 
-test('#296 resumeRefIsExplicit: only a bare WIP-ref string is occurrence-authoritative', () => {
+test('#296 resumeRefIsExplicit: a bare ref string in EITHER checkpoint namespace is occurrence-authoritative', () => {
   // A bare string ref is the process's explicit choice (nano-workforce#891, option 2):
   // trusted as-is, bypassing elementId correlation AND the ambiguity guard.
   assert.equal(resumeRefIsExplicit({ resumeFromCheckpoint: 'refs/nano/wip/10' }), true);
-  // The self-stamped object record is NOT explicit (it is correlated + guarded).
+  // #296 (review): a bare RECOVERED ref (`refs/nano/recovered/<eik>`) — the explicit
+  // pointer an SLA-cancelled run leaves — is ALSO occurrence-authoritative. Routing it
+  // through the ambiguity guard would reject it whenever the host SDK can't prove
+  // uniqueness, defeating the durable resume it exists to enable.
+  assert.equal(resumeRefIsExplicit({ resumeFromCheckpoint: 'refs/nano/recovered/10' }), true);
+  // The self-stamped object record is NOT explicit (it is correlated + guarded), in
+  // either namespace.
   assert.equal(resumeRefIsExplicit({ resumeFromCheckpoint: { ref: 'refs/nano/wip/10' } }), false);
+  assert.equal(resumeRefIsExplicit({ resumeFromCheckpoint: { ref: 'refs/nano/recovered/10', recovered: true } }), false);
   assert.equal(resumeRefIsExplicit({ resumeFromCheckpoint: 'refs/heads/main' }), false);
   assert.equal(resumeRefIsExplicit({ resumeFromCheckpoint: '' }), false);
   assert.equal(resumeRefIsExplicit({}), false);

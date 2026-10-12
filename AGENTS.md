@@ -324,10 +324,16 @@ SDK client (job workers) — do **not** add the SDK as a dependency or use raw
   force-stop path anchors **ONE shared absolute deadline** (`forceStopDeadline`) when the
   recovery block begins: the recover race and the post-abort `close()` drain BOTH bound
   against the *same* deadline (`close()` gets only the REMAINING budget,
-  `Math.max(1, forceStopDeadline - Date.now())`, never a fresh full one and never 0),
-  so recovery **and** the (up to 120s) GC cleanup together fit inside a single
+  `Math.max(closeFloorMs, forceStopDeadline - Date.now())`, never a fresh full one), so
+  recovery **and** the (up to 120s) GC cleanup together fit inside a single
   `FORCE_STOP_RECOVERY_MS` window instead of consuming it twice and being SIGKILLed
-  mid-cleanup (Copilot review on #296). The supervisor's `forceStopWorker` waits
+  mid-cleanup (Copilot review on #296). The floor is `closeFloorMs` (the git kill grace,
+  `gitKillGraceMs`), **not** a bare `1`: `abortRecovery()` is armed to fire
+  `gitKillGraceMs` *before* `forceStopDeadline`, so the git SIGKILL lands by the deadline
+  and the floor reserves just enough of the remaining window for `close()` to actually
+  drain the now-SIGTERMed git process — a `Math.max(1, …)` floor would let `close()`
+  abandon the drain after 1 ms while git was still dying, then reap the workspace under a
+  live process (Copilot review on #296). The supervisor's `forceStopWorker` waits
   `STOP_GRACE_MS + FORCE_STOP_RECOVERY_MS` before
   its SIGKILL backstop, so a worker can finish writing the recovery ref before it is
   killed (a worker that exits sooner is reaped immediately). (d) The GC reclaim log

@@ -468,10 +468,18 @@ export function makeOccurrenceGuard({ searchElementInstances } = {}) {
 // occurrence). A self-record (object) is correlated by elementId and gated by the
 // guard. This lets #891 plug in with NO further plugin change: deliver a bare ref string
 // and the restore path trusts it; until then the elementId-correlated self-record path
-// (with the guard) is used. Returns true only for a bare, well-formed WIP-ref string.
+// (with the guard) is used. Returns true only for a bare, well-formed ref string in
+// EITHER supported checkpoint namespace — the WIP prefix (a normal per-checkpoint
+// pointer) OR the GC-proof recovered prefix (`refs/nano/recovered/<eik>`, the explicit
+// pointer an SLA-cancelled run leaves). Both are occurrence-authoritative when delivered
+// as a bare string, so both bypass the guard; restricting this to the WIP prefix would
+// route a recovered pointer through the ambiguity guard and reject it whenever the host
+// SDK can't prove uniqueness (Copilot review on #296).
 export function resumeRefIsExplicit(variables) {
   const v = variables && typeof variables === 'object' ? variables.resumeFromCheckpoint : null;
-  return typeof v === 'string' && v.trim().startsWith(CHECKPOINT_REF_PREFIX);
+  if (typeof v !== 'string') return false;
+  const s = v.trim();
+  return s.startsWith(CHECKPOINT_REF_PREFIX) || s.startsWith(RECOVERED_REF_PREFIX);
 }
 
 // Never let git invoke the host's configured credential helper for our remote

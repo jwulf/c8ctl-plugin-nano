@@ -7014,6 +7014,17 @@ async function setupWorkspaceCheckpoints({ provisioned, envelope = null, token =
     let ownedSha = prior?.sha || '';
     let varWarned = false;
     let resumeVarWarned = false;
+    // #296 (review): the in-flight ABORT-path metadata write (`setVar` fired
+    // fire-and-forget on a force-stop flush, below). The force-stop recovery path
+    // later writes the GC-proof recovery ref to the SAME process-scoped
+    // `resumeFromCheckpoint` slot. If this earlier WIP write is still in flight and
+    // lands AFTER the recovery-pointer write, it overwrites the recovery pointer with
+    // a stale WIP ref — and once the WIP TTL expires, auto-resume can no longer
+    // discover the still-existing recovery ref. Track the promise so the recovery
+    // path can AWAIT it (bounded) before writing the recovery pointer, guaranteeing
+    // the recovery write lands last. The WIP write still lands on its own when
+    // promotion fails (the fallback is retained); we only serialize the ordering.
+    let abortMetaWrite = null;
     const setVar = typeof camunda?.createElementInstanceVariables === 'function' && job?.elementInstanceKey
       ? (res) => {
         // #296: run the element-scope and process-scope writes CONCURRENTLY, not
@@ -7101,7 +7112,12 @@ async function setupWorkspaceCheckpoints({ provisioned, envelope = null, token =
         // process-scoped write could overwrite a NEWER activation's pointer. So the
         // failed path (and every normal checkpoint) AWAITS the write before
         // settlement, keeping the predecessor pointer durable before the job settles.
-        if (res.reason === 'abort') { setVar(res).catch(() => {}); return; }
+        // #296 (review): on the abort path, CAPTURE the fire-and-forget promise so the
+        // force-stop recovery path can await it before writing the recovery pointer to
+        // the same slot — otherwise a slow WIP write lands after and clobbers the
+        // recovery ref. `.catch(() => {})` keeps it fire-and-forget for the flush; the
+        // settled/rejected result is irrelevant to the caller.
+        if (res.reason === 'abort') { abortMetaWrite = setVar(res).catch(() => {}); return; }
         await setVar(res);
       },
     });
@@ -7139,6 +7155,18 @@ async function setupWorkspaceCheckpoints({ provisioned, envelope = null, token =
       // falsy; the live checkpointer has already stopped by the time this is called.
       updateCredential(nextToken) {
         if (nextToken && nextToken !== token) token = nextToken;
+      },
+      // #296 (review): await the in-flight ABORT-path metadata write (the WIP
+      // `resumeFromCheckpoint` write fired fire-and-forget on a force-stop flush),
+      // bounded, so the force-stop recovery path can guarantee ITS recovery-pointer
+      // write to the same slot lands LAST (a slow WIP write must not overwrite the
+      // GC-proof recovery ref). Best-effort, never throws; resolves immediately when
+      // no abort write is in flight. The caller bounds the wait inside the shared
+      // force-stop budget, so a hung engine cannot stall the force-stop exit.
+      async settleAbortMetaWrite() {
+        const p = abortMetaWrite;
+        if (!p) return;
+        try { await p; } catch { /* best effort */ }
       },
       // #295: promote the latest snapshot to a GC-PROOF recovery ref on an SLA
       // cancellation or a force-stop. `refs/nano/recovered/<elementInstanceKey>`
@@ -13011,6 +13039,14 @@ async function workAgent(req, flags, ctx) {
                 // can discover the GC-proof refs/nano/recovered/<eik> point. Bounded and
                 // best-effort — never holds the force-stop exit; the pushed ref itself
                 // remains the authoritative recovery handle.
+                // #296 (review): the abort flush fired its OWN WIP `resumeFromCheckpoint`
+                // write fire-and-forget (see onCheckpoint). If that write is still in
+                // flight it could land AFTER the recovery-pointer write below and
+                // overwrite the recovery ref with a stale WIP pointer (which the orphan
+                // GC then reclaims on TTL, losing the recovery discovery). Await the WIP
+                // write FIRST so the recovery pointer is guaranteed to land last. Bounded
+                // by the recover-race budget around this whole block; best-effort.
+                try { await checkpointing.settleAbortMetaWrite?.(); } catch { /* best effort */ }
                 if (recoveryRefInfo && typeof camunda?.createElementInstanceVariables === 'function' && job?.processInstanceKey) {
                   try {
                     const w = camunda.createElementInstanceVariables({

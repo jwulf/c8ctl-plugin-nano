@@ -1754,6 +1754,36 @@ test('job handler wires checkpoints: notify on ACP updates, flush on abort/failu
   assert.ok(close > decide && close < src.indexOf('rmSync(runDir', close), 'in-flight git work drains before the run dir is reaped');
 });
 
+test('#296 (r4245472572) the recovery-pointer write is occurrence-fenced and natively abort-cancellable', () => {
+  const src = readFileSync(new URL('./c8ctl-plugin.js', import.meta.url), 'utf8');
+  // The Git-ref ownership check (verifyRecoveryOwnership) CANNOT fence the process-scoped
+  // resumeFromCheckpoint write across an SLA resume: a re-activated run is a NEW element
+  // instance owning a DIFFERENT refs/nano/recovered/<eik>, so the superseded run still
+  // "owns" its old ref and passes the check even after the new activation published a
+  // newer pointer. The unconditional last-writer-wins write could then overwrite it.
+  const recWrite = src.indexOf("variables: { resumeFromCheckpoint: { ref: recoveryRefInfo.ref");
+  assert.ok(recWrite > 0, 'the recovery pointer is written to resumeFromCheckpoint');
+  const ownGate = src.indexOf('stillOwns = await Promise.race([');
+  assert.ok(ownGate > 0 && ownGate < recWrite, 'the Git-ref ownership gate still runs before the write');
+  // Fence (1): an OCCURRENCE-SCOPED read-back of the shared slot — skip the write when the
+  // slot already names a DIFFERENT run's ref (a newer activation beat us). It must sit
+  // between the ownership gate and the write, read via searchVariables at the process scope.
+  const readback = src.indexOf("camunda.searchVariables(");
+  assert.ok(readback > ownGate && readback < recWrite, 'an occurrence-scoped searchVariables read-back fences the write (after ownership, before the write)');
+  assert.ok(src.indexOf("name: 'resumeFromCheckpoint'", readback) > readback && src.indexOf("name: 'resumeFromCheckpoint'", readback) < recWrite, 'the read-back filters on the resumeFromCheckpoint variable name');
+  assert.ok(src.indexOf('scopeKey: String(job.processInstanceKey)', readback) > readback && src.indexOf('scopeKey: String(job.processInstanceKey)', readback) < recWrite, 'the read-back is scoped to THIS process instance');
+  const skipNewer = src.indexOf('slotRef && slotRef !== recoveryRefInfo.ref', readback);
+  assert.ok(skipNewer > readback && skipNewer < recWrite, 'the write is SKIPPED when the slot already names a different (newer) run\'s ref');
+  // Fence (2): the write carries a NATIVE abort signal (SDK options extend RequestInit, so
+  // `signal` reaches fetch and aborts the in-flight HTTP request at the transport on lease
+  // loss) — not merely a best-effort .cancel() on the returned promise.
+  const wStart = src.indexOf('const w = camunda.createElementInstanceVariables({', skipNewer);
+  assert.ok(wStart > skipNewer && wStart < recWrite, 'the write call follows both fences');
+  const wEnd = src.indexOf('});', wStart);
+  const wBody = src.slice(wStart, wEnd);
+  assert.ok(wBody.includes('signal: recoverySdkAbort.signal'), 'the recovery-pointer write passes the recovery-deadline signal NATIVELY to the SDK (atomic transport-level abort)');
+});
+
 test('#296 (r4245146247) the setup-path predecessor-pointer advance write is abort-guarded and abort-cancellable', () => {
   const src = readFileSync(new URL('./c8ctl-plugin.js', import.meta.url), 'utf8');
   // The SAME stale-write hazard the recovery-pointer write guards against (a last-writer

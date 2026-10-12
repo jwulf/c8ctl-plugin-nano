@@ -13246,10 +13246,46 @@ async function workAgent(req, flags, ctx) {
                       logger.warn?.(`[${jobType}] job ${job.jobKey}: recovery ref ${recoveryRefInfo.ref} is no longer owned by this run (a newer activation superseded it) — skipping the process-scoped resumeFromCheckpoint write so the newer pointer stays authoritative.`);
                       return;
                     }
+                    // #296 (review, r4245472572): the Git-ref ownership check above cannot
+                    // fence THIS write across an SLA resume — a re-activated run is a NEW
+                    // element instance, so it owns a DIFFERENT refs/nano/recovered/<eik>
+                    // and this run still "owns" its old one (passing the check) even after
+                    // the new activation published a newer resumeFromCheckpoint. The write
+                    // is unconditional last-writer-wins, so it could then overwrite that
+                    // newer pointer. Two fences close the class (no atomic process-scoped
+                    // CAS exists):
+                    //  (1) OCCURRENCE-SCOPED READ-BACK — re-read the shared slot and skip
+                    //      when it already names a DIFFERENT run's ref (a newer activation
+                    //      beat us). Best-effort: a read failure/empty/absent result fails
+                    //      OPEN (we still write) so a transient search outage never strands
+                    //      recovery; eventual consistency (index lag) can hide a JUST-landed
+                    //      newer write, which is exactly why fence (2) is also required.
+                    //  (2) NATIVE ABORT SIGNAL on the write itself — the SDK options extend
+                    //      RequestInit, so `signal` reaches fetch and aborts the in-flight
+                    //      HTTP request the instant the recovery deadline fires, tearing the
+                    //      mutation down at the transport (not just a best-effort .cancel()).
+                    if (typeof camunda?.searchVariables === 'function') {
+                      try {
+                        const found = await Promise.resolve(camunda.searchVariables(
+                          { filter: { name: 'resumeFromCheckpoint', scopeKey: String(job.processInstanceKey) }, truncateValues: false },
+                          { waitUpToMs: 0, abortSignal: recoverySdkAbort.signal },
+                        ));
+                        const items = Array.isArray(found?.items) ? found.items : (Array.isArray(found?.data?.items) ? found.data.items : []);
+                        let slotRef = null;
+                        for (const it of items) {
+                          try { const v = JSON.parse(it?.value ?? 'null'); slotRef = (v && typeof v === 'object' ? v.ref : (typeof v === 'string' ? v : null)) ?? slotRef; } catch { /* unparseable entry — ignore */ }
+                        }
+                        if (slotRef && slotRef !== recoveryRefInfo.ref) {
+                          logger.warn?.(`[${jobType}] job ${job.jobKey}: the process-scoped resumeFromCheckpoint slot already names a newer activation's ref ${slotRef} (not this run's ${recoveryRefInfo.ref}) — skipping the stale overwrite so the newer pointer stays authoritative.`);
+                          return;
+                        }
+                      } catch { /* best effort — a read failure fails OPEN (write proceeds) */ }
+                    }
                     const w = camunda.createElementInstanceVariables({
                       elementInstanceKey: String(job.processInstanceKey),
                       variables: { resumeFromCheckpoint: { ref: recoveryRefInfo.ref, sha: recoveryRefInfo.sha, elementInstanceKey: String(job.elementInstanceKey ?? ''), elementId: job.elementId ?? null, recovered: true, at: Date.now() } },
                       local: true,
+                      signal: recoverySdkAbort.signal,
                     });
                     let wt; let onAbort = null;
                     // Cancel the in-flight write when the recovery deadline fires (the SDK

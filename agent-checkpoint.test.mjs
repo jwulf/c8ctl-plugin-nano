@@ -8,6 +8,7 @@ import {
   checkpointConfig, checkpointRef, checkpointEligibility, classifyPushFailure, containsSecret, normalizeSecretValues, credentialsFromUrl, isAuthenticatedRemote, shouldSweep, sweepStaleCheckpoints, isDeniedPath, isCheckpointTrigger, createGitRunner,
   snapshotWorktree, pushCheckpoint, fetchCheckpoint, restoreCheckpoint, deleteCheckpointRef, redactUrlUserinfo, CHECKPOINT_DETACHED_MARKER,
   createWorkspaceCheckpoint, createCheckpointer, withCheckpointNote,
+  recoveredCheckpointRef, predecessorCheckpointRef, makeOccurrenceGuard, resumeRefIsExplicit, pushNamedRef, observeRemoteRefSha, makeOrphanProbe, RECOVERED_REF_PREFIX,
 } from './agent-checkpoint.mjs';
 
 const ENV = {
@@ -51,6 +52,12 @@ test('config, ref, deny-list, triggers', () => {
   assert.equal(c.enabled, true);
   assert.equal(c.minIntervalMs, 5000);
   assert.equal(c.intervalMs, 0);
+  // #296 (review): the SDK-deadline seam defaults to 10s and is overridable (floor 1ms)
+  // so a test can drive the cancel-on-timeout behaviour deterministically.
+  assert.equal(checkpointConfig({}).sdkTimeoutMs, 10_000);
+  assert.equal(checkpointConfig({ NANO_AGENT_CHECKPOINT_SDK_TIMEOUT_MS: '20' }).sdkTimeoutMs, 20);
+  assert.equal(checkpointConfig({ NANO_AGENT_CHECKPOINT_SDK_TIMEOUT_MS: '0' }).sdkTimeoutMs, 1);
+  assert.equal(checkpointConfig({ NANO_AGENT_CHECKPOINT_SDK_TIMEOUT_MS: 'nan' }).sdkTimeoutMs, 10_000);
   assert.equal(checkpointRef('2251799813685249'), 'refs/nano/wip/2251799813685249');
   assert.equal(checkpointRef('../x'), null);
   assert.equal(checkpointRef(''), null);
@@ -1062,6 +1069,70 @@ test('GC deletes TTL-expired and terminal-element refs, keeps own/unknown/fresh 
   } finally { f.cleanup(); }
 });
 
+test('#296 GC reclaims orphaned RECOVERED refs under the same terminal/TTL policy, sparing active escalations and own/fresh ones', async () => {
+  const f = fixture();
+  try {
+    const w = f.clone('w');
+    const base = sh(w.dir, 'rev-parse', 'HEAD');
+    const put = async (ref, ageMs) => {
+      const date = `${Math.floor((Date.now() - ageMs) / 1000)} +0000`;
+      const git = createGitRunner({ cwd: w.dir, env: { ...ENV, GIT_COMMITTER_DATE: date } });
+      writeFileSync(join(w.dir, 'x.txt'), ref);
+      const snap = await snapshotWorktree({ git, baseSha: base });
+      assert.ok((await pushCheckpoint({ git, ref, sha: snap.sha })).ok);
+    };
+    const DAY = 86_400_000;
+    // Recovery refs (#295) must be reclaimed too, not only WIP refs — otherwise they
+    // grow without bound once their escalation is resolved (Copilot review on #296).
+    await put(recoveredCheckpointRef('10'), 8 * DAY);        // recovered, TTL-expired
+    await put(recoveredCheckpointRef('11'), 2 * 3_600_000);  // recovered, process-terminal
+    await put(recoveredCheckpointRef('12'), 2 * 3_600_000);  // recovered, escalation still ACTIVE -> spared
+    await put(recoveredCheckpointRef('13'), 60_000);         // recovered, terminal but inside grace -> spared
+    await put(recoveredCheckpointRef('14'), 9 * DAY);        // recovered, but this run's OWN ref -> never swept
+    await put(checkpointRef('20'), 2 * 3_600_000);           // a WIP ref in the SAME sweep, process-terminal
+    const looked = [];
+    const isTerminal = async (key) => { looked.push(key); return key === '11' || key === '13' || key === '20'; };
+    const r = await sweepStaleCheckpoints({ git: w.git, ownRef: recoveredCheckpointRef('14'), ttlMs: 7 * DAY, graceMs: 3_600_000, isTerminal });
+    assert.deepEqual(r.deleted.map((d) => `${d.ref}:${d.why}`).sort(), [
+      'refs/nano/recovered/10:ttl',
+      'refs/nano/recovered/11:element-terminal',
+      'refs/nano/wip/20:element-terminal',
+    ]);
+    // '12' is probed and spared (active); '13' is inside grace so it is never probed;
+    // '14' (own) is never probed.
+    assert.deepEqual(looked.sort(), ['11', '12', '20']);
+    const rec = sh(f.root, '--git-dir', f.remote, 'for-each-ref', '--format=%(refname)', 'refs/nano/recovered/').split('\n').filter(Boolean).sort();
+    assert.deepEqual(rec, ['refs/nano/recovered/12', 'refs/nano/recovered/13', 'refs/nano/recovered/14']);
+    const wip = sh(f.root, '--git-dir', f.remote, 'for-each-ref', '--format=%(refname)', 'refs/nano/wip/').split('\n').filter(Boolean);
+    assert.deepEqual(wip, [], 'the terminal WIP ref in the same sweep is reclaimed too');
+    // The distinct-namespace local temp refs are cleaned up and never collided a WIP
+    // ref with its recovery ref under one `refs/nano-gc/<key>`.
+    assert.equal(sh(w.dir, 'for-each-ref', 'refs/nano-gc/'), '', 'temporary GC refs are cleaned up');
+  } finally { f.cleanup(); }
+});
+
+test('#296 GC can be scoped to a single namespace, leaving the other intact (explicit prefix list)', async () => {
+  const f = fixture();
+  try {
+    const w = f.clone('w');
+    const base = sh(w.dir, 'rev-parse', 'HEAD');
+    const put = async (ref, ageMs) => {
+      const date = `${Math.floor((Date.now() - ageMs) / 1000)} +0000`;
+      const git = createGitRunner({ cwd: w.dir, env: { ...ENV, GIT_COMMITTER_DATE: date } });
+      writeFileSync(join(w.dir, 'x.txt'), ref);
+      const snap = await snapshotWorktree({ git, baseSha: base });
+      assert.ok((await pushCheckpoint({ git, ref, sha: snap.sha })).ok);
+    };
+    const DAY = 86_400_000;
+    await put(checkpointRef('30'), 8 * DAY);
+    await put(recoveredCheckpointRef('31'), 8 * DAY);
+    const r = await sweepStaleCheckpoints({ git: w.git, ttlMs: 7 * DAY, graceMs: 3_600_000, isTerminal: null, prefixes: ['refs/nano/wip/'] });
+    assert.deepEqual(r.deleted.map((d) => d.ref), ['refs/nano/wip/30']);
+    const rec = sh(f.root, '--git-dir', f.remote, 'for-each-ref', '--format=%(refname)', 'refs/nano/recovered/').split('\n').filter(Boolean);
+    assert.deepEqual(rec, ['refs/nano/recovered/31'], 'a WIP-only sweep leaves recovery refs intact');
+  } finally { f.cleanup(); }
+});
+
 test('GC stops scheduling engine lookups once the overall-deadline signal fires', async () => {
   const f = fixture();
   try {
@@ -1176,6 +1247,39 @@ test('checkpointer rate-limits, coalesces triggers and flushes', async () => {
   assert.equal(calls.length, 4);
 });
 
+test('#295 checkpointer: stop() drains a flush that returned early so a late onCheckpoint SHA is observed', async () => {
+  // Models the preserveRecovery race (Copilot review on #295): a BOUNDED flush can
+  // RETURN while its forced checkpoint is still in flight, and `onCheckpoint` (which
+  // records the SHA a recovery ref would promote) only fires once that checkpoint's
+  // push resolves. Awaiting `stop()` after the flush must drain the chain so the
+  // late SHA is observed — reading it synchronously after the flush would miss it.
+  // Injected timers make the flush-timeout beat deterministic (no real-clock race).
+  const timers = [];
+  const setTimer = (fn, ms) => { const h = { fn, ms }; timers.push(h); return h; };
+  const clearTimer = (h) => { const i = timers.indexOf(h); if (i >= 0) timers.splice(i, 1); };
+  let release;
+  const gate = new Promise((r) => { release = r; });
+  let ownedSha = null;
+  const cp = createCheckpointer({
+    // The checkpoint's push hangs until `release()` fires, so the flush timeout
+    // (fired below) wins the race and flush returns BEFORE onCheckpoint records the SHA.
+    checkpoint: async () => { await gate; return { sha: 'newsha' }; },
+    onCheckpoint: (r) => { ownedSha = r.sha; },
+    minIntervalMs: 0, intervalMs: 0, setTimer, clearTimer,
+  });
+  const flushPromise = cp.flush('abort', { timeoutMs: 5 });
+  // Fire the pending flush-timeout timer so the flush resolves early (checkpoint hung).
+  for (const h of timers.splice(0)) h.fn();
+  const flushed = await flushPromise;
+  assert.equal(flushed.skipped && /timed out/.test(flushed.skipped), true, 'flush must return early (bounded) while the push is still in flight');
+  assert.equal(ownedSha, null, 'onCheckpoint has not fired yet — a synchronous read here would see no SHA');
+  // preserveRecovery drains the chain (stop()) before selecting the recovery SHA.
+  const drained = cp.stop();
+  release();
+  await drained;
+  assert.equal(ownedSha, 'newsha', 'after the drain, the in-flight checkpoint\'s SHA is observed');
+});
+
 test('withCheckpointNote appends only for a restored checkpoint', () => {
   const env = { task: { prompt: 'do it' }, repository: {} };
   assert.equal(withCheckpointNote(env, { restored: false }), env);
@@ -1184,6 +1288,41 @@ test('withCheckpointNote appends only for a restored checkpoint', () => {
   assert.match(seeded.task.prompt, /WIP CHECKPOINT/);
   assert.match(seeded.task.prompt, /git status/);
   assert.equal(withCheckpointNote({ task: {} }, { restored: true }).task.prompt, undefined);
+});
+
+test('#296 (F8/F9) createGitRunner signal aborts an in-flight git op instead of running to timeout', async () => {
+  // The checkpoint git runner is driven by a DEDICATED recovery-deadline signal (NOT
+  // the job's abortSignal, which fires BEFORE force-stop recovery runs and would fail
+  // every recovery command). When that recovery deadline fires — abortRecovery() — it
+  // CANCELS the in-flight push, settling the checkpointer chain promptly rather than
+  // letting it run to the full gitTimeoutMs while the supervisor's SIGKILL backstop
+  // looms. This drives `signal` directly: an aborted runner must settle fast (well
+  // under the 60s timeout) with a non-zero/aborted result.
+  const f = fixture();
+  try {
+    // Run from the CLONE (a real repo) — not f.root, which is not a git repository
+    // and would make any op fail instantly, proving ordinary command failure rather
+    // than the abort path.
+    const { dir } = f.clone('abortable');
+    const ac = new AbortController();
+    const runner = createGitRunner({ cwd: dir, env: ENV, timeoutMs: 60_000, signal: ac.signal });
+    const started = Date.now();
+    // A `!`-shell git alias that TRAPS (ignores) SIGTERM and sleeps 30s: the op is
+    // genuinely IN FLIGHT when abort() fires, so the fast settle below can ONLY be
+    // the abort tearing the child down (SIGTERM→SIGKILL escalation) — never the op
+    // finishing or failing on its own. This is what proves cancellation terminates a
+    // long-running child rather than passing on an ordinary fast failure.
+    const p = runner(['-c', "alias.hang=!trap '' TERM; sleep 30", 'hang']);
+    // Let the child spawn and enter its 30s sleep before aborting, so the abort lands
+    // mid-operation (not at the entry fast-path guard).
+    await new Promise((r) => setTimeout(r, 100));
+    ac.abort();
+    const r = await p;
+    const elapsed = Date.now() - started;
+    assert.ok(elapsed < 10_000, `aborted git op settled in ${elapsed}ms, not the 30s sleep or the 60s timeout`);
+    assert.notEqual(r.status, 0, 'aborted op does not report success');
+    assert.match(`${r.stderr}`, /aborted/i);
+  } finally { f.cleanup(); }
 });
 
 // ── c8ctl-plugin.js wiring (setupWorkspaceCheckpoints + job-handler seams) ──
@@ -1266,6 +1405,86 @@ test('setupWorkspaceCheckpoints: an un-restored (branch-mismatch) prior ref is N
     await s2.close();
     // The ref still holds run1's snapshot, untouched.
     assert.equal(sh(f.root, '--git-dir', f.remote, 'rev-parse', 'refs/nano/wip/808'), priorSha);
+  } finally { f.cleanup(); }
+});
+
+test('#296 (r4244827082) verifyRecoveryOwnership: true only while THIS run owns the preserved recovery ref', async () => {
+  const f = fixture();
+  try {
+    const env = { NANO_AGENT_CHECKPOINT: 'on', NANO_AGENT_CHECKPOINT_INTERVAL_MS: '0' };
+    const job = { jobKey: '9', elementInstanceKey: '909' };
+    const provision = (name) => {
+      const { dir } = f.clone(name);
+      sh(dir, 'checkout', '-q', '-b', 'nano/agent-work/main-x');
+      return { workspaceDir: dir, gitEnv: ENV, committer: { name: 'bot', email: 'bot@example.com' }, startSha: sh(dir, 'rev-parse', 'HEAD'), workingBranch: 'nano/agent-work/main-x' };
+    };
+    // run-1 checkpoints and preserves a durable recovery ref.
+    const p1 = provision('run1');
+    const s1 = await setupWorkspaceCheckpoints({ provisioned: p1, job, jobType: 't', runId: 'run-1', logger: quietLogger(), env, deps: { sweepRegistry: new Map() } });
+    writeFileSync(join(p1.workspaceDir, 'wip.txt'), 'run-1 wip\n');
+    await s1.checkpointer.flush('abort', { timeoutMs: 0 });
+    const rec = await s1.preserveRecovery('force-stop');
+    assert.ok(rec?.sha, `run-1 preserved a recovery ref: ${JSON.stringify(rec)}`);
+    // The preserving run positively owns its own recovery ref.
+    assert.equal(await s1.verifyRecoveryOwnership(rec.sha), true, 'the preserving run owns its just-preserved recovery ref');
+    // A sha this run did NOT preserve (the ref has moved) fails closed.
+    assert.equal(await s1.verifyRecoveryOwnership('0'.repeat(40)), false, 'a moved/absent recovery ref fails closed');
+    await s1.close();
+
+    // A NEWER activation (run-2) supersedes: it adopts run-1's checkpoint as its
+    // prior, preserves its OWN recovery point over the same ref, and now owns it.
+    const p2 = provision('run2');
+    const s2 = await setupWorkspaceCheckpoints({ provisioned: p2, job, jobType: 't', runId: 'run-2', logger: quietLogger(), env, deps: { sweepRegistry: new Map() } });
+    writeFileSync(join(p2.workspaceDir, 'wip2.txt'), 'run-2 wip\n');
+    await s2.checkpointer.flush('abort', { timeoutMs: 0 });
+    const rec2 = await s2.preserveRecovery('force-stop');
+    assert.ok(rec2?.sha, `run-2 preserved its recovery ref: ${JSON.stringify(rec2)}`);
+    assert.equal(await s2.verifyRecoveryOwnership(rec2.sha), true, 'the newer run owns its recovery ref');
+    // The SUPERSEDED run-1's stale handle no longer owns the ref: its preserved sha
+    // has been moved off, so its re-verify fails closed and its process-scoped write
+    // would be skipped (the newer run's pointer stays authoritative).
+    assert.equal(await s1.verifyRecoveryOwnership(rec.sha), false, 'a superseded run no longer owns the moved recovery ref — its stale pointer write is refused');
+    await s2.close();
+  } finally { f.cleanup(); }
+});
+
+test('#296 (r4244916101) verifyRecoveryOwnership: a per-call abort signal cancels the verify git and settles it promptly', async () => {
+  const f = fixture();
+  try {
+    const env = { NANO_AGENT_CHECKPOINT: 'on', NANO_AGENT_CHECKPOINT_INTERVAL_MS: '0' };
+    const job = { jobKey: '9', elementInstanceKey: '909' };
+    const provision = (name) => {
+      const { dir } = f.clone(name);
+      sh(dir, 'checkout', '-q', '-b', 'nano/agent-work/main-x');
+      return { workspaceDir: dir, gitEnv: ENV, committer: { name: 'bot', email: 'bot@example.com' }, startSha: sh(dir, 'rev-parse', 'HEAD'), workingBranch: 'nano/agent-work/main-x' };
+    };
+    const p1 = provision('run1');
+    const s1 = await setupWorkspaceCheckpoints({ provisioned: p1, job, jobType: 't', runId: 'run-1', logger: quietLogger(), env, deps: { sweepRegistry: new Map() } });
+    writeFileSync(join(p1.workspaceDir, 'wip.txt'), 'run-1 wip\n');
+    await s1.checkpointer.flush('abort', { timeoutMs: 0 });
+    const rec = await s1.preserveRecovery('force-stop');
+    assert.ok(rec?.sha, `run-1 preserved a recovery ref: ${JSON.stringify(rec)}`);
+
+    // An ALREADY-aborted per-call signal must short-circuit the verify (the dedicated
+    // runner's fast-path guard returns [aborted] before spawning git) so it fails closed
+    // promptly instead of running a live git under a reaped workspace.
+    const pre = new AbortController(); pre.abort();
+    assert.equal(await s1.verifyRecoveryOwnership(rec.sha, { signal: pre.signal }), false, 'an already-aborted per-call signal fails closed without running git');
+
+    // A signal that fires MID-verify cancels the in-flight git and the returned promise
+    // SETTLES (resolves false, bounded by gitKillGraceMs) — so awaiting it after the race
+    // never hangs and no live git outlives recover()/close(). Abort on the next tick so
+    // the first git read is already in flight.
+    const mid = new AbortController();
+    const op = s1.verifyRecoveryOwnership(rec.sha, { signal: mid.signal });
+    mid.abort();
+    const settled = await Promise.race([
+      op.then((v) => ({ settled: true, value: v })),
+      new Promise((res) => setTimeout(() => res({ settled: false }), 10_000)),
+    ]);
+    assert.ok(settled.settled, 'the aborted verify settles promptly (no orphaned live git) rather than running to the 60s git timeout');
+    assert.equal(settled.value, false, 'an aborted verify fails closed');
+    await s1.close();
   } finally { f.cleanup(); }
 });
 
@@ -1444,8 +1663,965 @@ test('job handler wires checkpoints: notify on ACP updates, flush on abort/failu
   assert.ok(discard < src.indexOf('return settled;', discard));
   assert.equal(src.indexOf('await checkpointing.discard()'), -1, 'no pre-ack delete remains');
   assert.ok(src.indexOf('envelope: effectiveEnvelope', setup) > setup, 'the restored note reaches the harness envelope');
-  const close = src.indexOf('await checkpointing.close()', lastChance);
+  const close = src.indexOf('await checkpointing.close(', lastChance);
   assert.ok(close > lastChance, 'the exception/cleanup path closes the checkpointing');
+  // #296 (Copilot review): the cleanup-path close() is bounded on the force-stop path
+  // by the REMAINING of the ONE shared force-stop deadline (forceStopDeadline), NOT a
+  // fresh full FORCE_STOP_RECOVERY_MS — so recovery + cleanup together fit inside a
+  // single budget and can't be SIGKILLed mid-cleanup. Unbounded (undefined) otherwise.
+  const closeOpts = src.indexOf('const closeOpts = forceStopping', lastChance);
+  assert.ok(closeOpts > lastChance && closeOpts < close, 'close() opts computed on the force-stop path before close()');
+  // #296 (Copilot review, 1ms finding): the force-stop close() cap is the REMAINING
+  // shared deadline, but the FLOOR is the git kill grace (closeFloorMs), not 1ms —
+  // abortRecovery() only SIGTERMs git and createGitRunner grants gitKillGraceMs before
+  // SIGKILL, so a 1ms floor would abandon a still-dying git to have its workspace
+  // reaped under it. The drain must await the actual termination.
+  assert.ok(src.slice(closeOpts, close).includes('Math.max(closeFloorMs, forceStopDeadline - Date.now())'), 'force-stop close() caps at the REMAINING shared deadline with a git-kill-grace FLOOR (never a fresh full budget, never 0, never 1ms)');
+  assert.ok(src.indexOf('const closeFloorMs = Math.max(1, Number(checkpointing?.gitKillGraceMs) || 0)') > lastChance, 'the close() floor is the git kill grace');
+  assert.ok(src.slice(closeOpts, close).includes(': undefined'), 'close() is unbounded off the force-stop path');
+  // The one shared deadline is anchored once when the force-stop recovery block begins.
+  assert.ok(src.includes('forceStopDeadline = Date.now() + recoveryDeadline'), 'the shared force-stop deadline is set once at the start of the recovery block');
+  // #296 (Copilot review, 1ms finding): abortRecovery() fires EARLY (gitKillGraceMs +
+  // margin before the deadline) so the git SIGKILL lands by forceStopDeadline and
+  // close() gets a real drain window, not an expired one.
+  assert.ok(src.includes('const abortAtMs = Math.max(1, recoveryDeadline - drainReserveMs)'), 'abortRecovery() is armed gitKillGraceMs before the deadline to reserve a drain window');
+  // #296 (Copilot review): abortRecovery() tears down the GC sweep too, so the single
+  // deadline bounds recovery AND the (up to 120s) GC cleanup together.
+  const ar = src.indexOf('abortRecovery() {');
+  assert.ok(ar > 0 && src.slice(ar, ar + 160).includes('gcAbort?.abort()'), 'abortRecovery() also aborts the GC sweep so the shared deadline bounds cleanup');
+  // #296 (Copilot review, recovery-pointer ordering): the abort flush fires its WIP
+  // `resumeFromCheckpoint` write fire-and-forget; the recovery path then writes the
+  // durable recovery ref to the SAME slot. The recovery write must AWAIT the in-flight
+  // WIP write first, or a slow WIP write lands after and clobbers the recovery pointer
+  // (which the orphan GC then reclaims on TTL, losing recovery discovery).
+  const abortFire = src.indexOf("if (res.reason === 'abort') { const w = setVar(res); abortMetaWrite = { promise: w.promise.catch(() => {}), cancel: w.cancel }; return; }");
+  assert.ok(abortFire > 0, 'the abort-path WIP metadata write is captured (promise + cancel, not discarded) so it can be awaited AND cancelled');
+  const settleHook = src.indexOf('async settleAbortMetaWrite(signal = null)');
+  assert.ok(settleHook > 0, 'setupWorkspaceCheckpoints exposes settleAbortMetaWrite(signal) — cancellable by the recovery deadline');
+  // #296 (Copilot review, r4244281967): stopping the await is not enough — the underlying
+  // createElementInstanceVariables mutation must be CANCELLED when the recovery signal
+  // aborts, or it stays in flight and can land late over a newer activation's
+  // resumeFromCheckpoint. settleAbortMetaWrite must invoke the retained cancel hook.
+  const settleBody = src.slice(settleHook, src.indexOf('preserveRecovery', settleHook));
+  assert.ok(settleBody.includes('w.cancel?.()'), 'settleAbortMetaWrite CANCELS the in-flight abort write (not just stops awaiting) when the recovery signal aborts');
+  const recWrite = src.indexOf("variables: { resumeFromCheckpoint: { ref: recoveryRefInfo.ref");
+  assert.ok(recWrite > 0, 'the recovery pointer is written to resumeFromCheckpoint');
+  const settleAwait = src.indexOf('await checkpointing.settleAbortMetaWrite?.(recoverySdkAbort.signal)');
+  assert.ok(settleAwait > 0 && settleAwait < recWrite, 'the recovery-pointer write awaits the in-flight abort WIP write first (under the recovery signal), so the recovery ref lands last');
+  // #296 (Copilot review, r4244116341): the recover-race only bounds the AWAIT — when
+  // `budget` wins, the SDK mutations inside `recover` keep running and a stale
+  // continuation could clobber a reactivated worker's newer resumeFromCheckpoint. The
+  // SDK mutations must therefore be driven off a DEDICATED recovery-deadline signal
+  // (fired by the deadline AND on budget expiry), the recovery-pointer write GATED on
+  // that signal, and `recover` AWAITED so it is settled/cancelled before the yield.
+  const sdkAc = src.indexOf('const recoverySdkAbort = new AbortController()');
+  assert.ok(sdkAc > 0, 'the force-stop block owns a dedicated recovery-SDK AbortController');
+  const deadlineAborts = src.indexOf('try { recoverySdkAbort.abort(); } catch { /* best effort */ }');
+  assert.ok(deadlineAborts > sdkAc, 'the recovery deadline also aborts the SDK signal (not just git/GC)');
+  const gateBeforeWrite = src.indexOf('if (recoverySdkAbort.signal.aborted) return;');
+  assert.ok(gateBeforeWrite > sdkAc && gateBeforeWrite < recWrite, 'the recovery-pointer write is SKIPPED once the recovery deadline fired (no stale late write)');
+  // #296 (Copilot review, r4244827082): the process-scoped resumeFromCheckpoint write is
+  // last-writer-wins, so a SUPERSEDED activation could land its stale pointer after a
+  // newer activation published its own. The write must be GATED on a fresh ownership
+  // re-verify (verifyRecoveryOwnership) that fails closed when the recovery ref has
+  // moved to another run — the same ownership rule the GIT fence applies.
+  const verifyHook = src.indexOf('async verifyRecoveryOwnership(expectedSha');
+  assert.ok(verifyHook > 0, 'setupWorkspaceCheckpoints exposes verifyRecoveryOwnership(expectedSha, …)');
+  const verifyBody = src.slice(verifyHook, src.indexOf('hasUncommittedChanges', verifyHook));
+  assert.ok(verifyBody.includes('curSha !== expectedSha'), 'verifyRecoveryOwnership fails closed when the recovery ref moved off the sha this run preserved');
+  assert.ok(verifyBody.includes('ownerRunId === myRun || (supersededRun && ownerRunId === supersededRun)'), 'verifyRecoveryOwnership applies the same Nano-Checkpoint-Run ownership rule as the GIT fence');
+  const ownGate = src.indexOf('stillOwns = await Promise.race([');
+  assert.ok(ownGate > gateBeforeWrite && ownGate < recWrite, 'the recovery-pointer write is gated on a fresh verifyRecoveryOwnership re-check (after the deadline gate, before the write)');
+  assert.ok(src.indexOf('if (!stillOwns)', ownGate) > ownGate && src.indexOf('if (!stillOwns)', ownGate) < recWrite, 'a failed ownership re-verify SKIPS the process-scoped write (leaves the newer pointer authoritative)');
+  // #296 (Copilot review, r4244916101): when the 5s race wins, the verify must NOT keep
+  // running on the 60s runner untracked by stop()/gc (recover() would return and the run
+  // dir be reaped under a live git). The verify runs on a DEDICATED per-call signal, is
+  // ABORTED in the race finally, and AWAITED to full settlement before recover() returns.
+  assert.ok(verifyBody.includes('AbortSignal.any'), 'verifyRecoveryOwnership binds its git runner to the per-call signal AND the recovery deadline (AbortSignal.any)');
+  assert.ok(verifyBody.includes('mkGit({ cwd: provisioned.workspaceDir, env: gitEnv, timeoutMs: cfg.gitTimeoutMs, signal: combined })'), 'verifyRecoveryOwnership runs its git reads on a dedicated signal-bound runner (not the shared 60s runner)');
+  const vAbort = src.indexOf('const verifyAbort = new AbortController();');
+  assert.ok(vAbort > gateBeforeWrite && vAbort < recWrite, 'the verify is driven off its own AbortController');
+  assert.ok(src.indexOf('verifyRecoveryOwnership?.(recoveryRefInfo.sha, { signal: verifyAbort.signal })', vAbort) > vAbort, 'the per-call signal is threaded into verifyRecoveryOwnership');
+  const vAbortFire = src.indexOf('try { verifyAbort.abort(); } catch { /* best effort */ }', vAbort);
+  assert.ok(vAbortFire > vAbort && vAbortFire < recWrite, 'the race finally ABORTS the in-flight verify git when the timeout/abort branch wins');
+  const vAwait = src.indexOf('try { await verifyOp; } catch { /* best effort */ }', vAbort);
+  assert.ok(vAwait > vAbortFire && vAwait < recWrite, 'the verify is AWAITED to full settlement after the race so no live git outlives recover()/close()');
+  const race = src.indexOf('await Promise.race([recover, budget])');
+  const awaitRecover = src.indexOf('try { await recover; } catch { /* best effort */ }');
+  assert.ok(awaitRecover > race, 'recover is AWAITED after the race so it is settled/cancelled before the job yields');
+  assert.ok(src.lastIndexOf('try { recoverySdkAbort.abort(); } catch { /* best effort */ }') > race, 'the SDK signal is aborted after the race (budget-win path) before awaiting recover');
   assert.ok(lastChance > decide && lastChance < close, 'the exception path flushes a failed checkpoint before close()');
   assert.ok(close > decide && close < src.indexOf('rmSync(runDir', close), 'in-flight git work drains before the run dir is reaped');
+});
+
+test('#296 (r4245472572) the recovery-pointer write is occurrence-fenced and natively abort-cancellable', () => {
+  const src = readFileSync(new URL('./c8ctl-plugin.js', import.meta.url), 'utf8');
+  // The Git-ref ownership check (verifyRecoveryOwnership) CANNOT fence the process-scoped
+  // resumeFromCheckpoint write across an SLA resume: a re-activated run is a NEW element
+  // instance owning a DIFFERENT refs/nano/recovered/<eik>, so the superseded run still
+  // "owns" its old ref and passes the check even after the new activation published a
+  // newer pointer. The unconditional last-writer-wins write could then overwrite it.
+  const recWrite = src.indexOf("variables: { resumeFromCheckpoint: { ref: recoveryRefInfo.ref");
+  assert.ok(recWrite > 0, 'the recovery pointer is written to resumeFromCheckpoint');
+  const ownGate = src.indexOf('stillOwns = await Promise.race([');
+  assert.ok(ownGate > 0 && ownGate < recWrite, 'the Git-ref ownership gate still runs before the write');
+  // Fence (1): an OCCURRENCE-SCOPED read-back of the shared slot — skip the write when the
+  // slot already names a DIFFERENT run's ref (a newer activation beat us). It must sit
+  // between the ownership gate and the write, read via searchVariables at the process scope.
+  const readback = src.indexOf("camunda.searchVariables(");
+  assert.ok(readback > ownGate && readback < recWrite, 'an occurrence-scoped searchVariables read-back fences the write (after ownership, before the write)');
+  assert.ok(src.indexOf("name: 'resumeFromCheckpoint'", readback) > readback && src.indexOf("name: 'resumeFromCheckpoint'", readback) < recWrite, 'the read-back filters on the resumeFromCheckpoint variable name');
+  assert.ok(src.indexOf('scopeKey: String(job.processInstanceKey)', readback) > readback && src.indexOf('scopeKey: String(job.processInstanceKey)', readback) < recWrite, 'the read-back is scoped to THIS process instance');
+  // #296 (r4245620587): the consistency options MUST be nested under `consistency` — the
+  // real @camunda8 client throws "Missing consistency options" when they are passed at the
+  // top level, and the surrounding catch would swallow that throw, making the read-back
+  // fail OPEN on every call (never protecting the write). Guard the exact nesting + native
+  // signal shape so a regression to the flat `{ waitUpToMs, abortSignal }` form is caught.
+  const svEnd = src.indexOf('));', readback);
+  const svCall = src.slice(readback, svEnd);
+  assert.ok(/consistency:\s*\{\s*waitUpToMs:\s*0\s*\}/.test(svCall), 'the read-back nests waitUpToMs under `consistency` (not the flat top-level shape the SDK rejects)');
+  assert.ok(/signal:\s*recoverySdkAbort\.signal/.test(svCall), 'the read-back passes the recovery-deadline signal NATIVELY (as `signal`, reaching fetch)');
+  assert.ok(!/abortSignal:/.test(svCall), 'the read-back does NOT use the non-honoured `abortSignal` key');
+  const skipNewer = src.indexOf('slotRef && slotRef !== recoveryRefInfo.ref', readback);
+  assert.ok(skipNewer > readback && skipNewer < recWrite, 'the write is SKIPPED when the slot already names a different (newer) run\'s ref');
+  // Fence (2): the write carries a NATIVE abort signal (SDK options extend RequestInit, so
+  // `signal` reaches fetch and aborts the in-flight HTTP request at the transport on lease
+  // loss) — not merely a best-effort .cancel() on the returned promise.
+  const wStart = src.indexOf('const w = camunda.createElementInstanceVariables({', skipNewer);
+  assert.ok(wStart > skipNewer && wStart < recWrite, 'the write call follows both fences');
+  const wEnd = src.indexOf('});', wStart);
+  const wBody = src.slice(wStart, wEnd);
+  assert.ok(wBody.includes('signal: recoverySdkAbort.signal'), 'the recovery-pointer write passes the recovery-deadline signal NATIVELY to the SDK (atomic transport-level abort)');
+});
+
+test('#296 (r4245146247) the setup-path predecessor-pointer advance write is abort-guarded and abort-cancellable', () => {
+  const src = readFileSync(new URL('./c8ctl-plugin.js', import.meta.url), 'utf8');
+  // The SAME stale-write hazard the recovery-pointer write guards against (a last-writer
+  // process-scoped `resumeFromCheckpoint` write landing after a replacement activation
+  // published a newer pointer) applies to the SETUP-path `advanceResumePointer` write
+  // too: the startup fetch/push can straddle a lease loss, after which a replacement
+  // activation owns the pointer slot. So (a) the shared `withDeadline` helper must accept
+  // an optional abort signal and cancel the in-flight SDK CancelablePromise when it fires
+  // (not only on the per-call timeout), and (b) `advanceResumePointer` must recheck the
+  // job signal before the write AND bind that write to it.
+  const wd = src.indexOf('const withDeadline = (p, ms, label');
+  assert.ok(wd > 0, 'withDeadline is defined');
+  assert.ok(src.slice(wd, wd + 80).includes('signal = null'), 'withDeadline takes an optional abort signal (default null, so timeout-only callers are unchanged)');
+  const wdBody = src.slice(wd, src.indexOf('let prior = null', wd));
+  assert.ok(wdBody.includes("signal.addEventListener('abort'"), 'withDeadline cancels the SDK call when the supplied signal fires');
+  assert.ok(wdBody.includes('signal.aborted === true') && wdBody.includes('p?.cancel?.()'), 'withDeadline fast-cancels an already-aborted signal and cancels the underlying CancelablePromise');
+  assert.ok(wdBody.includes('removeEventListener'), 'withDeadline detaches its abort listener on settle (no leak)');
+  const adv = src.indexOf('const advanceResumePointer = async (adoptedSha)');
+  assert.ok(adv > 0, 'advanceResumePointer is defined');
+  const advBody = src.slice(adv, src.indexOf('};', adv));
+  // (a) recheck the job signal before the side effect — skip the write when aborted.
+  const guard = advBody.indexOf('if (abortSignal?.aborted === true) return;');
+  const write = advBody.indexOf('camunda.createElementInstanceVariables(');
+  assert.ok(guard > 0 && write > guard, 'advanceResumePointer rechecks abortSignal BEFORE the process-scoped write and skips it when aborted');
+  // (b) bind the write to abortSignal so a lease loss DURING it cancels it.
+  assert.ok(/CP_SDK_TIMEOUT_MS, 'createElementInstanceVariables', abortSignal/.test(advBody), 'the advance write passes abortSignal to withDeadline so a mid-write lease loss cancels it');
+});
+
+test('#296 (r4245278256) the non-abort checkpointer setVar write is bound to the job abort signal', () => {
+  const src = readFileSync(new URL('./c8ctl-plugin.js', import.meta.url), 'utf8');
+  // Same bug class as r4245146247, now for the checkpointer's SHARED process-scoped
+  // write: a periodic/`failed` checkpoint can be AWAITING setVar's `resumeFromCheckpoint`
+  // mutation when heartbeat lease loss interrupts the raw runner and releases the slot.
+  // A replacement activation can then publish a newer pointer that this stale call
+  // overwrites; the post-flush signal recheck cannot undo a write that already landed.
+  // So (a) setVar must accept an optional signal and thread it to BOTH withDeadline
+  // calls, (b) the non-abort onCheckpoint path must pass abortSignal, and (c) the
+  // `abort` path must pass NO signal (it stays owned by settleAbortMetaWrite's
+  // recovery-deadline flow, which must fire AFTER the job abort).
+  const sv = src.indexOf('const setVar = typeof camunda?.createElementInstanceVariables');
+  assert.ok(sv > 0, 'setVar is defined');
+  const svBody = src.slice(sv, src.indexOf('const checkpoint = createWorkspaceCheckpoint', sv));
+  assert.ok(/\?\s*\(res, signal = null\) =>/.test(svBody), 'setVar accepts an optional abort signal (default null, so callers that omit it are unchanged)');
+  // BOTH the element-scoped and process-scoped writes thread the signal through.
+  const bound = svBody.match(/CP_SDK_TIMEOUT_MS, 'createElementInstanceVariables', signal \|\| undefined/g) || [];
+  assert.equal(bound.length, 2, 'both setVar writes pass the signal to withDeadline');
+  // The non-abort onCheckpoint path AWAITS the write WITH abortSignal; the abort path
+  // captures a fire-and-forget write WITHOUT a signal (settleAbortMetaWrite owns it).
+  assert.ok(src.includes('await setVar(res, abortSignal || undefined).promise;'), 'the non-abort checkpoint path binds the setVar write to the job abort signal');
+  assert.ok(/if \(res\.reason === 'abort'\) \{ const w = setVar\(res\);/.test(src), 'the abort path calls setVar with NO signal, leaving the recovery-deadline flow in charge');
+});
+
+// ── #295: orphan GC must spare SLA-cancelled runs; recovery/predecessor refs ──
+
+test('#295 recoveredCheckpointRef / RECOVERED_REF_PREFIX: outside the WIP (swept) namespace', () => {
+  assert.equal(RECOVERED_REF_PREFIX, 'refs/nano/recovered/');
+  assert.equal(recoveredCheckpointRef('808'), 'refs/nano/recovered/808');
+  assert.equal(recoveredCheckpointRef('a-b_C'), 'refs/nano/recovered/a-b_C');
+  assert.equal(recoveredCheckpointRef(''), null);
+  assert.equal(recoveredCheckpointRef('bad/key'), null);
+  assert.equal(recoveredCheckpointRef(null), null);
+  // A recovery ref is NOT in the WIP namespace, so the per-checkpoint WIP cleanup
+  // (discardAfterAck) never touches it — it survives the WIP reap so an SLA-cancelled
+  // escalation can be answered (#295). It IS reclaimed by the orphan sweep once its
+  // process is terminal / past the TTL (#296), but never while the escalation is live.
+  assert.ok(!recoveredCheckpointRef('808').startsWith('refs/nano/wip/'));
+});
+
+test('#295 predecessorCheckpointRef: reads resumeFromCheckpoint; rejects self/malformed/foreign', () => {
+  // String form.
+  assert.equal(predecessorCheckpointRef({ resumeFromCheckpoint: 'refs/nano/wip/10' }), 'refs/nano/wip/10');
+  // Object form (what the plugin actually writes).
+  assert.equal(predecessorCheckpointRef({ resumeFromCheckpoint: { ref: 'refs/nano/wip/10', sha: 'abc' } }), 'refs/nano/wip/10');
+  // The same ref this run already owns is not a predecessor.
+  assert.equal(predecessorCheckpointRef({ resumeFromCheckpoint: 'refs/nano/wip/20' }, 'refs/nano/wip/20'), null);
+  assert.equal(predecessorCheckpointRef({ resumeFromCheckpoint: { ref: 'refs/nano/wip/20' } }, 'refs/nano/wip/20'), null);
+  // A different run's ref IS adopted.
+  assert.equal(predecessorCheckpointRef({ resumeFromCheckpoint: 'refs/nano/wip/10' }, 'refs/nano/wip/20'), 'refs/nano/wip/10');
+  // Missing / malformed / foreign-namespace are all ignored.
+  assert.equal(predecessorCheckpointRef(undefined), null);
+  assert.equal(predecessorCheckpointRef({}), null);
+  assert.equal(predecessorCheckpointRef({ resumeFromCheckpoint: '' }), null);
+  assert.equal(predecessorCheckpointRef({ resumeFromCheckpoint: 'refs/heads/main' }), null);
+  assert.equal(predecessorCheckpointRef({ resumeFromCheckpoint: 'refs/nano/wip/bad/key' }), null);
+});
+
+test('#295 predecessorCheckpointRef: correlates the shared process slot to THIS task by elementId', () => {
+  const wip = (elementId) => ({ resumeFromCheckpoint: { ref: 'refs/nano/wip/10', sha: 'abc', elementInstanceKey: '999', elementId } });
+  // A recorded elementId that MATCHES the current job's is adopted.
+  assert.equal(predecessorCheckpointRef(wip('review-round'), 'refs/nano/wip/20', 'review-round'), 'refs/nano/wip/10');
+  // A recorded elementId that DIFFERS is refused: in a process with parallel /
+  // sequential agent tasks, the shared slot must never adopt another task's state.
+  assert.equal(predecessorCheckpointRef(wip('implement'), 'refs/nano/wip/20', 'review-round'), null);
+  // A recorded elementId that is absent/null (legacy or elementId-less writer) is
+  // still adopted — refusing it would break the resume #295 exists to support.
+  assert.equal(predecessorCheckpointRef({ resumeFromCheckpoint: { ref: 'refs/nano/wip/10' } }, 'refs/nano/wip/20', 'review-round'), 'refs/nano/wip/10');
+  assert.equal(predecessorCheckpointRef(wip(null), 'refs/nano/wip/20', 'review-round'), 'refs/nano/wip/10');
+  // String form carries no elementId, so it stays adoptable under correlation.
+  assert.equal(predecessorCheckpointRef({ resumeFromCheckpoint: 'refs/nano/wip/10' }, 'refs/nano/wip/20', 'review-round'), 'refs/nano/wip/10');
+  // When the caller passes no elementId the correlation is skipped (legacy callers).
+  assert.equal(predecessorCheckpointRef(wip('implement'), 'refs/nano/wip/20'), 'refs/nano/wip/10');
+  // The correlation gate never resurrects a self-ref / malformed ref.
+  assert.equal(predecessorCheckpointRef(wip('review-round'), 'refs/nano/wip/10', 'review-round'), null);
+});
+
+test('#296 predecessorCheckpointRef: accepts a durable RECOVERY ref (AC3 — SLA-cancel resume)', () => {
+  // An SLA-cancelled / force-stopped run writes its refs/nano/recovered/<eik> point
+  // into the process-scoped slot (its element is terminated before buildResultEnvelope
+  // runs, so this is the durable report path). The resumed run must adopt it.
+  assert.equal(predecessorCheckpointRef({ resumeFromCheckpoint: { ref: 'refs/nano/recovered/808', sha: 'abc', recovered: true } }), 'refs/nano/recovered/808');
+  assert.equal(predecessorCheckpointRef({ resumeFromCheckpoint: 'refs/nano/recovered/808' }), 'refs/nano/recovered/808');
+  // elementId correlation still applies to a recovery ref.
+  assert.equal(predecessorCheckpointRef({ resumeFromCheckpoint: { ref: 'refs/nano/recovered/808', elementId: 'review-round' } }, null, 'review-round'), 'refs/nano/recovered/808');
+  assert.equal(predecessorCheckpointRef({ resumeFromCheckpoint: { ref: 'refs/nano/recovered/808', elementId: 'implement' } }, null, 'review-round'), null);
+  // A recovery ref equal to this run's OWN wip key is still a predecessor (different
+  // namespace), but a recovery ref that IS selfRef is rejected.
+  assert.equal(predecessorCheckpointRef({ resumeFromCheckpoint: 'refs/nano/recovered/808' }, 'refs/nano/recovered/808'), null);
+  // Malformed recovery refs are still rejected.
+  assert.equal(predecessorCheckpointRef({ resumeFromCheckpoint: 'refs/nano/recovered/bad/key' }), null);
+  assert.equal(predecessorCheckpointRef({ resumeFromCheckpoint: 'refs/nano/recovered/' }), null);
+});
+
+test('#296 makeOccurrenceGuard: fails closed by construction — a self-record can never prove occurrence identity', async () => {
+  // Copilot review r4244212483: counting ACTIVE occurrences cannot establish occurrence
+  // identity (index lag hides a live sibling; a terminal sibling drops out of the ACTIVE
+  // set yet may have been the resume slot's last writer), so NO engine query makes an
+  // elementId-correlated self-record adoption provably safe. The guard therefore fails
+  // closed BY CONSTRUCTION: it always reports safe:false regardless of what the engine
+  // would return, and never even consults the search method.
+  let searched = false;
+  const guard = makeOccurrenceGuard({
+    searchElementInstances: async () => { searched = true; return { items: [{ elementInstanceKey: '20' }] }; },
+  });
+  const v = await guard('500', 'review-round');
+  assert.equal(v.safe, false, 'a self-record is never auto-adopted — even a "unique" active occurrence is not proof of identity');
+  assert.equal(searched, false, 'the guard no longer consults the engine');
+  assert.match(v.reason, /cannot establish occurrence identity/);
+  // A bare-array / alternate-key engine response is irrelevant — still unsafe.
+  const arr = makeOccurrenceGuard({ searchElementInstances: async () => [{ key: '20' }] });
+  assert.equal((await arr('500', 'review-round')).safe, false);
+});
+
+test('#296 resumeRefIsExplicit: a bare ref string in EITHER checkpoint namespace is occurrence-authoritative', () => {
+  // A bare string ref is the process's explicit choice (nano-workforce#891, option 2):
+  // trusted as-is, bypassing elementId correlation AND the ambiguity guard.
+  assert.equal(resumeRefIsExplicit({ resumeFromCheckpoint: 'refs/nano/wip/10' }), true);
+  // #296 (review): a bare RECOVERED ref (`refs/nano/recovered/<eik>`) — the explicit
+  // pointer an SLA-cancelled run leaves — is ALSO occurrence-authoritative. Routing it
+  // through the ambiguity guard would reject it whenever the host SDK can't prove
+  // uniqueness, defeating the durable resume it exists to enable.
+  assert.equal(resumeRefIsExplicit({ resumeFromCheckpoint: 'refs/nano/recovered/10' }), true);
+  // The self-stamped object record is NOT explicit (it is correlated + guarded), in
+  // either namespace.
+  assert.equal(resumeRefIsExplicit({ resumeFromCheckpoint: { ref: 'refs/nano/wip/10' } }), false);
+  assert.equal(resumeRefIsExplicit({ resumeFromCheckpoint: { ref: 'refs/nano/recovered/10', recovered: true } }), false);
+  assert.equal(resumeRefIsExplicit({ resumeFromCheckpoint: 'refs/heads/main' }), false);
+  assert.equal(resumeRefIsExplicit({ resumeFromCheckpoint: '' }), false);
+  assert.equal(resumeRefIsExplicit({}), false);
+  assert.equal(resumeRefIsExplicit(undefined), false);
+  // #296 (review): the suffix must be a well-formed elementInstanceKey — a bare prefix
+  // match must NOT accept a malformed ref (e.g. an extra path segment), since this
+  // predicate is the authorization boundary that bypasses the ambiguity guard.
+  assert.equal(resumeRefIsExplicit({ resumeFromCheckpoint: 'refs/nano/wip/bad/key' }), false);
+  assert.equal(resumeRefIsExplicit({ resumeFromCheckpoint: 'refs/nano/recovered/bad/key' }), false);
+  assert.equal(resumeRefIsExplicit({ resumeFromCheckpoint: 'refs/nano/wip/' }), false);
+  assert.equal(resumeRefIsExplicit({ resumeFromCheckpoint: 'refs/nano/recovered/' }), false);
+  assert.equal(resumeRefIsExplicit({ resumeFromCheckpoint: 'refs/nano/wip/has space' }), false);
+  assert.equal(resumeRefIsExplicit({ resumeFromCheckpoint: 'refs/nano/wip/' + 'a'.repeat(129) }), false);
+});
+
+test('#295 makeOrphanProbe: spares an SLA-cancelled element inside a still-active process', async () => {
+  // No reader at all → null (sweep then reclaims purely by TTL).
+  assert.equal(makeOrphanProbe({}), null);
+  assert.equal(makeOrphanProbe({ getElementInstance: null }), null);
+
+  // Element-only (host SDK without getProcessInstance) keeps the legacy behaviour.
+  const elemOnly = makeOrphanProbe({ getElementInstance: async (k) => ({ state: k === 'done' ? 'TERMINATED' : 'ACTIVE' }) });
+  assert.equal(await elemOnly('done'), true);
+  assert.equal(await elemOnly('live'), false);
+
+  // Process-aware: the #295 case. Element TERMINATED by an SLA boundary timer, but
+  // its PROCESS is still ACTIVE (human escalation pending) → NOT an orphan.
+  const probe = makeOrphanProbe({
+    getElementInstance: async (k) => ({ state: 'TERMINATED', processInstanceKey: `pi-${k}` }),
+    getProcessInstance: async (pik) => ({ state: pik === 'pi-stuck' ? 'ACTIVE' : 'COMPLETED' }),
+  });
+  assert.equal(await probe('stuck'), false, 'SLA-cancelled element in an ACTIVE process must be spared');
+  assert.equal(await probe('finished'), true, 'element + process both terminal → orphan');
+
+  // Element still running → never an orphan (process not even consulted).
+  const running = makeOrphanProbe({
+    getElementInstance: async () => ({ state: 'ACTIVE', processInstanceKey: 'pi-x' }),
+    getProcessInstance: async () => { throw new Error('should not be called'); },
+  });
+  assert.equal(await running('x'), false);
+
+  // Unknown / unreachable lookups fail CLOSED (spare the ref; TTL is the backstop).
+  const noPik = makeOrphanProbe({ getElementInstance: async () => ({ state: 'TERMINATED' }), getProcessInstance: async () => ({ state: 'COMPLETED' }) });
+  assert.equal(await noPik('x'), false, 'no process key → cannot prove finished → spare');
+  const elemThrows = makeOrphanProbe({ getElementInstance: async () => { throw new Error('404'); }, getProcessInstance: async () => ({ state: 'COMPLETED' }) });
+  assert.equal(await elemThrows('x'), false);
+  const procThrows = makeOrphanProbe({ getElementInstance: async () => ({ state: 'TERMINATED', processInstanceKey: 'p' }), getProcessInstance: async () => { throw new Error('boom'); } });
+  assert.equal(await procThrows('x'), false);
+  // CANCELED counts as a terminal process state too.
+  const canceled = makeOrphanProbe({ getElementInstance: async () => ({ state: 'TERMINATED', processInstanceKey: 'p' }), getProcessInstance: async () => ({ state: 'CANCELED' }) });
+  assert.equal(await canceled('x'), true);
+});
+
+test('#295/#296 pushNamedRef: fenced writes — create-only adoption + lease-against-observed recovery', async () => {
+  const f = fixture();
+  try {
+    const { dir, git } = f.clone('named');
+    const sha = sh(dir, 'rev-parse', 'HEAD');
+    // Default (expectSha='') is CREATE-ONLY: first write of an absent ref succeeds.
+    assert.deepEqual(await pushNamedRef({ git, ref: 'refs/nano/recovered/77', sha }), { ok: true });
+    assert.equal(sh(f.root, '--git-dir', f.remote, 'rev-parse', 'refs/nano/recovered/77'), sha);
+    // A second create-only write over the now-present ref loses the lease (a stale
+    // activation can never blind-overwrite a newer run's recovery point) — #296.
+    const other = f.clone('named2');
+    sh(other.dir, 'commit', '-q', '--allow-empty', '-m', 'x');
+    const sha2 = sh(other.dir, 'rev-parse', 'HEAD');
+    const stale = await pushNamedRef({ git: other.git, ref: 'refs/nano/recovered/77', sha: sha2 });
+    assert.equal(stale.ok, false);
+    assert.equal(stale.staleLease, true, JSON.stringify(stale));
+    assert.equal(sh(f.root, '--git-dir', f.remote, 'rev-parse', 'refs/nano/recovered/77'), sha, 'ref unchanged after a lost lease');
+    // Leasing against the OBSERVED sha overwrites cleanly (the legitimate newer run).
+    const obs = await observeRemoteRefSha({ git: other.git, ref: 'refs/nano/recovered/77' });
+    assert.equal(obs, sha);
+    assert.deepEqual(await pushNamedRef({ git: other.git, ref: 'refs/nano/recovered/77', sha: sha2, expectSha: obs }), { ok: true });
+    assert.equal(sh(f.root, '--git-dir', f.remote, 'rev-parse', 'refs/nano/recovered/77'), sha2);
+    // Missing args → a clean error, no throw.
+    assert.equal((await pushNamedRef({ git, ref: '', sha })).ok, false);
+    assert.equal((await pushNamedRef({ git, ref: 'refs/x', sha: '' })).ok, false);
+  } finally { f.cleanup(); }
+});
+
+test('#296 observeRemoteRefSha: reports the current sha, empty when absent/unreadable', async () => {
+  const f = fixture();
+  try {
+    const { dir, git } = f.clone('obs');
+    const sha = sh(dir, 'rev-parse', 'HEAD');
+    // Absent ref → '' (create-only / fail-closed semantics).
+    assert.equal(await observeRemoteRefSha({ git, ref: 'refs/nano/recovered/absent' }), '');
+    // Present ref → its sha.
+    sh(dir, 'push', '-q', 'origin', `${sha}:refs/nano/recovered/123`);
+    assert.equal(await observeRemoteRefSha({ git, ref: 'refs/nano/recovered/123' }), sha);
+    // A git failure never throws — it falls back to '' (fail closed).
+    const boom = async () => { throw new Error('ls-remote boom'); };
+    assert.equal(await observeRemoteRefSha({ git: boom, ref: 'refs/nano/recovered/123' }), '');
+  } finally { f.cleanup(); }
+});
+
+test('#296 (F7) recovery-ref overwrite is fenced by run identity, not just a CAS', async () => {
+  // The bug: a bare compare-and-swap against the just-observed sha let a SUPERSEDED
+  // activation observe the newer run's recovery point and still overwrite it with its
+  // older snapshot. The fix mirrors the WIP path: the recovery snapshot carries a
+  // `Nano-Checkpoint-Run` trailer, and an existing ref is only overwritten by its own
+  // run or the run it explicitly superseded — never by a foreign (newer/concurrent) run.
+  const f = fixture();
+  try {
+    const eik = '4242';
+    const recRef = recoveredCheckpointRef(eik);
+    // Two "activations" of the same element instance, each with its own clone + run id.
+    // Give each a DISTINCT working-tree change so their shadow snapshots differ.
+    const a = f.clone('runA');
+    const b = f.clone('runB');
+    writeFileSync(join(a.dir, 'wip-a.txt'), 'alpha\n');
+    writeFileSync(join(b.dir, 'wip-b.txt'), 'beta\n');
+    // Build a run-tagged shadow snapshot in each (the recovery point each would promote).
+    const snapA = await snapshotWorktree({ git: a.git, baseSha: sh(a.dir, 'rev-parse', 'HEAD'), runId: 'run-A', message: 'A' });
+    const snapB = await snapshotWorktree({ git: b.git, baseSha: sh(b.dir, 'rev-parse', 'HEAD'), runId: 'run-B', message: 'B' });
+    assert.ok(snapA.sha && snapB.sha && snapA.sha !== snapB.sha, `distinct snapshots: ${snapA.sha} vs ${snapB.sha}`);
+    // The NEWER run (B) preserves first: an absent ref is a create-only write.
+    assert.deepEqual(await pushNamedRef({ git: b.git, ref: recRef, sha: snapB.sha }), { ok: true });
+    assert.equal(sh(f.root, '--git-dir', f.remote, 'rev-parse', recRef), snapB.sha);
+    // The SUPERSEDED run (A) now wakes up. It observes B's sha (a bare CAS would let it
+    // overwrite), but the run-identity fence must refuse: B is a foreign run.
+    const prevRecSha = await observeRemoteRefSha({ git: a.git, ref: recRef });
+    assert.equal(prevRecSha, snapB.sha, 'A observes the newer run B recovery point');
+    const owner = await fetchCheckpoint({ git: a.git, ref: recRef });
+    const foreign = owner?.runId && owner.runId !== 'run-A' && owner.runId !== '';
+    assert.equal(owner.runId, 'run-B');
+    assert.equal(foreign, true, 'B is foreign to A — A must NOT overwrite (the F7 fix)');
+    // And a same-run re-preservation IS allowed (idempotent), proving the fence is
+    // ownership-based, not a blanket refusal.
+    assert.equal(owner.runId === 'run-B', true);
+  } finally { f.cleanup(); }
+});
+
+test('#295 sweepStaleCheckpoints: deleted entries carry the sha (for the GC log)', async () => {  const f = fixture();
+  try {
+    const { dir, git } = f.clone('sweep');
+    const sha = sh(dir, 'rev-parse', 'HEAD');
+    // Seed a WIP ref and age it beyond the grace window so the probe is consulted.
+    sh(dir, 'push', '-q', 'origin', `${sha}:refs/nano/wip/555`);
+    const isTerminal = async () => true;
+    const r = await sweepStaleCheckpoints({ git, ttlMs: 0, graceMs: 0, isTerminal, now: () => Date.now() + 10_000 });
+    assert.equal(r.deleted.length, 1);
+    assert.deepEqual(r.deleted[0], { ref: 'refs/nano/wip/555', sha, why: 'element-terminal' });
+    assert.throws(() => sh(f.root, '--git-dir', f.remote, 'rev-parse', '--verify', 'refs/nano/wip/555'));
+  } finally { f.cleanup(); }
+});
+
+test('#296 sweepStaleCheckpoints: DEFAULT sweep reclaims a terminal recovery ref but spares an active-process one', async () => {
+  const f = fixture();
+  try {
+    const { dir, git } = f.clone('rec');
+    const sha = sh(dir, 'rev-parse', 'HEAD');
+    sh(dir, 'push', '-q', 'origin', `${sha}:refs/nano/recovered/999`);  // escalation resolved -> terminal
+    sh(dir, 'push', '-q', 'origin', `${sha}:refs/nano/recovered/888`);  // escalation still pending -> active
+    // #296: the DEFAULT sweep (no explicit `prefixes`) now covers the recovered
+    // namespace too, so a recovery ref whose process is terminal is reclaimed (no more
+    // unbounded growth) while an active-escalation one is spared.
+    const isTerminal = async (key) => key === '999';
+    const r = await sweepStaleCheckpoints({ git, ttlMs: 7 * 86_400_000, graceMs: 0, isTerminal, now: () => Date.now() + 10_000 });
+    assert.deepEqual(r.deleted.map((d) => `${d.ref}:${d.why}`), ['refs/nano/recovered/999:element-terminal']);
+    assert.throws(() => sh(f.root, '--git-dir', f.remote, 'rev-parse', 'refs/nano/recovered/999'), 'the terminal recovery ref is reclaimed');
+    assert.equal(sh(f.root, '--git-dir', f.remote, 'rev-parse', 'refs/nano/recovered/888'), sha, 'the active-escalation recovery ref is spared');
+  } finally { f.cleanup(); }
+});
+
+test('#295 preserveRecovery: promotes the latest snapshot to a durable recovery ref', async () => {
+  const f = fixture();
+  try {
+    const env = { NANO_AGENT_CHECKPOINT: 'on', NANO_AGENT_CHECKPOINT_INTERVAL_MS: '0' };
+    const { dir } = f.clone('preserve');
+    sh(dir, 'checkout', '-q', '-b', 'nano/agent-work/main-x');
+    const provisioned = { workspaceDir: dir, gitEnv: ENV, committer: { name: 'bot', email: 'bot@example.com' }, startSha: sh(dir, 'rev-parse', 'HEAD'), workingBranch: 'nano/agent-work/main-x' };
+    const logger = quietLogger();
+    const s = await setupWorkspaceCheckpoints({ provisioned, job: { jobKey: '1', elementInstanceKey: '808' }, jobType: 't', runId: 'r', logger, env, deps: { sweepRegistry: new Map() } });
+    // Nothing durable yet → null.
+    assert.equal(await s.preserveRecovery('force-stop'), null);
+    writeFileSync(join(dir, 'wip.txt'), 'half done\n');
+    const res = await s.checkpointer.flush('abort', { timeoutMs: 0 });
+    assert.ok(res.sha, JSON.stringify(res));
+    const rec = await s.preserveRecovery('force-stop');
+    assert.deepEqual(rec, { ref: 'refs/nano/recovered/808', sha: res.sha });
+    assert.equal(sh(f.root, '--git-dir', f.remote, 'rev-parse', 'refs/nano/recovered/808'), res.sha);
+    assert.match(logger.lines.info.join('\n'), /preserved a durable recovery checkpoint refs\/nano\/recovered\/808/);
+    // The WIP ref is retained too (an additional durable copy).
+    assert.equal(sh(f.root, '--git-dir', f.remote, 'rev-parse', 'refs/nano/wip/808'), res.sha);
+    await s.close();
+  } finally { f.cleanup(); }
+});
+
+test('#296 force-stop recovery is not blocked by hung metadata writes', async () => {
+  // High finding (r4243653664): the best-effort agentCheckpoint / resumeFromCheckpoint
+  // SDK writes must NOT sit on the serialized flush/promote critical path during a
+  // force-stop (`abort`) flush. A hung engine would otherwise burn up to 2×
+  // CP_SDK_TIMEOUT_MS (20s) inside onCheckpoint and starve the recovery git promotion.
+  // With a camunda whose createElementInstanceVariables NEVER resolves, the abort flush
+  // + preserveRecovery must still land the recovery ref promptly.
+  const f = fixture();
+  try {
+    const env = { NANO_AGENT_CHECKPOINT: 'on', NANO_AGENT_CHECKPOINT_INTERVAL_MS: '0' };
+    const { dir } = f.clone('hung-meta');
+    sh(dir, 'checkout', '-q', '-b', 'nano/agent-work/main-x');
+    const provisioned = { workspaceDir: dir, gitEnv: ENV, committer: { name: 'bot', email: 'bot@example.com' }, startSha: sh(dir, 'rev-parse', 'HEAD'), workingBranch: 'nano/agent-work/main-x' };
+    const logger = quietLogger();
+    // Never-resolving write: if it were awaited on the critical path, the flush below
+    // would hang well past this test's own wall-clock budget.
+    const camunda = { createElementInstanceVariables: () => new Promise(() => {}) };
+    const s = await setupWorkspaceCheckpoints({ provisioned, job: { jobKey: '1', elementInstanceKey: '818', processInstanceKey: '500', elementId: 'review' }, jobType: 't', runId: 'r', camunda, logger, env, deps: { sweepRegistry: new Map() } });
+    writeFileSync(join(dir, 'wip.txt'), 'half done\n');
+    const started = Date.now();
+    const res = await s.checkpointer.flush('abort', { timeoutMs: 20_000 });
+    assert.ok(res.sha, JSON.stringify(res));
+    const rec = await s.preserveRecovery('force-stop');
+    const elapsed = Date.now() - started;
+    assert.deepEqual(rec, { ref: 'refs/nano/recovered/818', sha: res.sha });
+    assert.ok(elapsed < 10_000, `abort flush + recovery completed in ${elapsed}ms despite the hung write (< one SDK timeout)`);
+    await s.close({ timeoutMs: 2000 });
+  } finally { f.cleanup(); }
+});
+
+test('#296 withDeadline CANCELS a timed-out checkpoint write (no late overwrite of a newer pointer)', async () => {
+  // High finding (r4243918057): a bare Promise.race REJECTS on timeout but leaves the
+  // SDK mutation in flight — a timed-out process-scoped `resumeFromCheckpoint` write
+  // could then complete AFTER a retry wrote a newer pointer and overwrite it with the
+  // stale ref. The SDK returns a CancelablePromise; withDeadline must call .cancel()
+  // on timeout so the underlying fetch is aborted and the late settle can never land.
+  const f = fixture();
+  try {
+    // #296 (review, agent-checkpoint.test.mjs:1898): inject a near-instant SDK
+    // deadline via the seam so this asserts the cancel-on-timeout behaviour
+    // DETERMINISTICALLY, instead of blocking on the real 10s production deadline.
+    const env = { NANO_AGENT_CHECKPOINT: 'on', NANO_AGENT_CHECKPOINT_INTERVAL_MS: '0', NANO_AGENT_CHECKPOINT_SDK_TIMEOUT_MS: '20' };
+    const { dir } = f.clone('cancel-meta');
+    sh(dir, 'checkout', '-q', '-b', 'nano/agent-work/main-x');
+    const provisioned = { workspaceDir: dir, gitEnv: ENV, committer: { name: 'bot', email: 'bot@example.com' }, startSha: sh(dir, 'rev-parse', 'HEAD'), workingBranch: 'nano/agent-work/main-x' };
+    let cancelCalls = 0;
+    let settled = false;
+    // A CancelablePromise-shaped write that NEVER resolves on its own; only .cancel()
+    // settles it (rejects), mirroring the SDK's toCancelable. If withDeadline fails to
+    // cancel, `settled` stays false and the write would remain in flight.
+    const camunda = {
+      createElementInstanceVariables: () => {
+        const p = new Promise(() => {});
+        p.cancel = () => { cancelCalls++; settled = true; };
+        return p;
+      },
+    };
+    const s = await setupWorkspaceCheckpoints({ provisioned, job: { jobKey: '1', elementInstanceKey: '820', processInstanceKey: '500', elementId: 'review' }, jobType: 't', runId: 'r', camunda, logger: quietLogger(), env, deps: { sweepRegistry: new Map() } });
+    writeFileSync(join(dir, 'wip.txt'), 'half done\n');
+    const started = Date.now();
+    // A normal (non-abort) flush AWAITS the metadata write, so the injected 20ms
+    // deadline fires and must CANCEL the in-flight write before rejecting.
+    const res = await s.checkpointer.flush('failed', { timeoutMs: 20_000 });
+    assert.ok(res.sha, JSON.stringify(res));
+    assert.ok(cancelCalls > 0, 'the timed-out checkpoint write was cancelled (CancelablePromise.cancel invoked)');
+    assert.ok(settled, 'the cancelled write is settled — it can never complete late and overwrite a newer pointer');
+    assert.ok(Date.now() - started < 5_000, 'the injected SDK deadline fired fast — no real-time 10s wait');
+    await s.close({ timeoutMs: 2000 });
+  } finally { f.cleanup(); }
+});
+
+test('#296 settleAbortMetaWrite CANCELS the in-flight abort write when the recovery signal aborts', async () => {
+  // High finding (r4244281967): aborting the recovery race must not merely stop AWAITING
+  // the fire-and-forget abort WIP write — the underlying createElementInstanceVariables
+  // mutation would otherwise stay in flight past the recovery deadline and could land
+  // LATE over a newer activation's resumeFromCheckpoint. settleAbortMetaWrite must CANCEL
+  // the retained CancelablePromise(s) when the recovery signal aborts.
+  const f = fixture();
+  try {
+    const env = { NANO_AGENT_CHECKPOINT: 'on', NANO_AGENT_CHECKPOINT_INTERVAL_MS: '0' };
+    const { dir } = f.clone('settle-cancel');
+    sh(dir, 'checkout', '-q', '-b', 'nano/agent-work/main-x');
+    const provisioned = { workspaceDir: dir, gitEnv: ENV, committer: { name: 'bot', email: 'bot@example.com' }, startSha: sh(dir, 'rev-parse', 'HEAD'), workingBranch: 'nano/agent-work/main-x' };
+    let cancelCalls = 0;
+    let settled = false;
+    // A CancelablePromise-shaped write that NEVER resolves on its own; only .cancel()
+    // settles it (rejects). If settleAbortMetaWrite fails to cancel on abort, `settled`
+    // stays false and the write would remain in flight to land late.
+    const camunda = {
+      createElementInstanceVariables: () => {
+        const p = new Promise(() => {});
+        p.cancel = () => { cancelCalls++; settled = true; };
+        return p;
+      },
+    };
+    const s = await setupWorkspaceCheckpoints({ provisioned, job: { jobKey: '1', elementInstanceKey: '821', processInstanceKey: '500', elementId: 'review' }, jobType: 't', runId: 'r', camunda, logger: quietLogger(), env, deps: { sweepRegistry: new Map() } });
+    writeFileSync(join(dir, 'wip.txt'), 'half done\n');
+    // The abort flush fires the WIP write fire-and-forget (captured as abortMetaWrite).
+    await s.checkpointer.flush('abort', { timeoutMs: 20_000 });
+    // Simulate the recovery deadline firing: settleAbortMetaWrite under an aborting signal
+    // must CANCEL the in-flight write, not just stop awaiting it.
+    const ac = new AbortController();
+    const settleP = s.settleAbortMetaWrite(ac.signal);
+    ac.abort();
+    await settleP;
+    assert.ok(cancelCalls > 0, 'the in-flight abort WIP write was cancelled when the recovery signal aborted (not merely un-awaited)');
+    assert.ok(settled, 'the cancelled write is settled — it can never complete late and overwrite a newer resumeFromCheckpoint');
+    await s.close({ timeoutMs: 2000 });
+  } finally { f.cleanup(); }
+});
+
+test('#296 failed flush AWAITS the metadata write so the resume pointer is durable before settlement', async () => {
+  // High finding (r4243737447): on the SLA-failure path the job settles
+  // (settleJob.fail) immediately after `flush('failed')` returns, and a resumed
+  // activation reads `resumeFromCheckpoint` to find its predecessor. If that write
+  // were fired off the chain (as the force-stop `abort` path deliberately does), the
+  // job could settle — and the retry could read variables — BEFORE the pointer is
+  // durable; a delayed process-scoped write could even overwrite a NEWER activation's
+  // pointer. So the `failed` flush must AWAIT the write: by the time it resolves, the
+  // process-scoped resumeFromCheckpoint variable has been recorded.
+  const f = fixture();
+  try {
+    const env = { NANO_AGENT_CHECKPOINT: 'on', NANO_AGENT_CHECKPOINT_INTERVAL_MS: '0' };
+    const { dir } = f.clone('failed-await');
+    sh(dir, 'checkout', '-q', '-b', 'nano/agent-work/main-x');
+    const provisioned = { workspaceDir: dir, gitEnv: ENV, committer: { name: 'bot', email: 'bot@example.com' }, startSha: sh(dir, 'rev-parse', 'HEAD'), workingBranch: 'nano/agent-work/main-x' };
+    const vars = [];
+    const camunda = { createElementInstanceVariables: async (input) => { vars.push(input); } };
+    const s = await setupWorkspaceCheckpoints({ provisioned, job: { jobKey: '1', elementInstanceKey: '819', processInstanceKey: '500', elementId: 'review' }, jobType: 't', runId: 'r', camunda, logger: quietLogger(), env, deps: { sweepRegistry: new Map() } });
+    writeFileSync(join(dir, 'wip.txt'), 'half done\n');
+    const res = await s.checkpointer.flush('failed', { timeoutMs: 20_000 });
+    assert.ok(res.sha, JSON.stringify(res));
+    // By the time the failed flush resolves, BOTH the element-scope agentCheckpoint
+    // and the process-scope resumeFromCheckpoint writes have landed (awaited).
+    const resume = vars.find((v) => v.elementInstanceKey === '500' && v.variables?.resumeFromCheckpoint);
+    assert.ok(resume, 'the process-scoped resumeFromCheckpoint write completed before the failed flush returned');
+    assert.equal(resume.variables.resumeFromCheckpoint.ref, 'refs/nano/wip/819');
+    assert.equal(resume.variables.resumeFromCheckpoint.sha, res.sha);
+    await s.close({ timeoutMs: 2000 });
+  } finally { f.cleanup(); }
+});
+
+
+test('#296 (F9) checkpoint git stays usable AFTER the job abort; abortRecovery cancels it', async () => {
+  // The round-4 F8 attempt bound the checkpoint git runner to the JOB abortSignal.
+  // But the force-stop recovery path (flush + preserveRecovery) runs only once
+  // `result.aborted` is observed — i.e. AFTER that signal has fired — so every
+  // recovery command failed `[aborted]` and the recovery ref could never be written
+  // (the whole #295 goal). The fix drives the checkpoint git from a DEDICATED
+  // recovery-deadline controller instead: it survives the harness abort, and is
+  // cancelled only by abortRecovery() when the budget expires.
+  const f = fixture();
+  try {
+    const env = { NANO_AGENT_CHECKPOINT: 'on', NANO_AGENT_CHECKPOINT_INTERVAL_MS: '0' };
+    const { dir } = f.clone('f9');
+    sh(dir, 'checkout', '-q', '-b', 'nano/agent-work/main-x');
+    const provisioned = { workspaceDir: dir, gitEnv: ENV, committer: { name: 'bot', email: 'bot@example.com' }, startSha: sh(dir, 'rev-parse', 'HEAD'), workingBranch: 'nano/agent-work/main-x' };
+    const ac = new AbortController();
+    const s = await setupWorkspaceCheckpoints({ provisioned, job: { jobKey: '1', elementInstanceKey: '909' }, jobType: 't', runId: 'r', logger: quietLogger(), env, abortSignal: ac.signal });
+    assert.ok(s, 'checkpointing is set up while the abortSignal is still live');
+    assert.equal(typeof s.abortRecovery, 'function', 'exposes abortRecovery()');
+    writeFileSync(join(dir, 'wip.txt'), 'half done\n');
+    const res = await s.checkpointer.flush('abort', { timeoutMs: 0 });
+    assert.ok(res.sha, JSON.stringify(res));
+    // Simulate the worker force-stop: the JOB abort fires BEFORE recovery runs.
+    ac.abort();
+    const rec = await s.preserveRecovery('force-stop');
+    assert.deepEqual(rec, { ref: 'refs/nano/recovered/909', sha: res.sha }, 'recovery still lands after the job abort');
+    assert.equal(sh(f.root, '--git-dir', f.remote, 'rev-parse', 'refs/nano/recovered/909'), res.sha);
+    // Now the recovery DEADLINE fires: abortRecovery() cancels the recovery git runner
+    // so no further push can run (bounded cleanup — the chain settles, close() drains).
+    s.abortRecovery();
+    writeFileSync(join(dir, 'wip2.txt'), 'more\n');
+    assert.equal(await s.preserveRecovery('force-stop'), null, 'after abortRecovery the checkpoint git is cancelled');
+    await s.close({ timeoutMs: 2000 });
+  } finally { f.cleanup(); }
+});
+
+test('#296 (F10) preserveRecovery fails CLOSED when the recovery ref owner is unknown/foreign', async () => {
+  // The round-4 F7 fence read the existing ref's runId but fell THROUGH to the CAS
+  // whenever ownership could not be positively established — a thrown/empty ownership
+  // fetch, or a ref with no run trailer — so a transient read failure could still let
+  // a stale activation clobber a newer recovery point. The fix fails CLOSED: an
+  // existing recovery ref is overwritten ONLY when positively identified as this run
+  // or the run it explicitly superseded; every other case refuses.
+  const env = { NANO_AGENT_CHECKPOINT: 'on', NANO_AGENT_CHECKPOINT_INTERVAL_MS: '0' };
+
+  // (a) FOREIGN owner: a newer run B already holds the recovery ref → run A refuses.
+  const fa = fixture();
+  try {
+    const recRef = recoveredCheckpointRef('717');
+    const { dir } = fa.clone('f10a');
+    sh(dir, 'checkout', '-q', '-b', 'nano/agent-work/main-x');
+    writeFileSync(join(dir, 'foreign-b.txt'), 'B work\n');
+    const bSnap = await snapshotWorktree({ git: createGitRunner({ cwd: dir, env: ENV }), baseSha: sh(dir, 'rev-parse', 'HEAD'), runId: 'run-B', message: 'B' });
+    assert.ok(bSnap.sha, 'foreign snapshot built');
+    sh(dir, 'push', '-q', 'origin', `${bSnap.sha}:${recRef}`);
+    const provisioned = { workspaceDir: dir, gitEnv: ENV, committer: { name: 'bot', email: 'bot@example.com' }, startSha: sh(dir, 'rev-parse', 'HEAD'), workingBranch: 'nano/agent-work/main-x' };
+    const logger = quietLogger();
+    const s = await setupWorkspaceCheckpoints({ provisioned, job: { jobKey: '1', elementInstanceKey: '717' }, jobType: 't', runId: 'run-A', logger, env });
+    writeFileSync(join(dir, 'wip.txt'), 'A work\n');
+    await s.checkpointer.flush('abort', { timeoutMs: 0 });
+    assert.equal(await s.preserveRecovery('force-stop'), null, 'run-A must NOT overwrite the foreign run-B ref');
+    assert.equal(sh(fa.root, '--git-dir', fa.remote, 'rev-parse', recRef), bSnap.sha, 'the foreign recovery ref is unchanged');
+    assert.match(logger.lines.warn.join('\n'), /owned by another run/);
+    await s.close();
+  } finally { fa.cleanup(); }
+
+  // (b) NO run identity: the existing ref points at a commit without a run trailer →
+  // the owner cannot be established → fail closed (refuse the overwrite).
+  const fb = fixture();
+  try {
+    const recRef = recoveredCheckpointRef('717');
+    const { dir } = fb.clone('f10b');
+    sh(dir, 'checkout', '-q', '-b', 'nano/agent-work/main-x');
+    const plain = sh(dir, 'rev-parse', 'HEAD'); // the init commit: no Nano-Checkpoint-Run trailer
+    sh(dir, 'push', '-q', 'origin', `${plain}:${recRef}`);
+    const provisioned = { workspaceDir: dir, gitEnv: ENV, committer: { name: 'bot', email: 'bot@example.com' }, startSha: sh(dir, 'rev-parse', 'HEAD'), workingBranch: 'nano/agent-work/main-x' };
+    const logger = quietLogger();
+    const s = await setupWorkspaceCheckpoints({ provisioned, job: { jobKey: '1', elementInstanceKey: '717' }, jobType: 't', runId: 'run-A', logger, env });
+    writeFileSync(join(dir, 'wip.txt'), 'A work\n');
+    await s.checkpointer.flush('abort', { timeoutMs: 0 });
+    assert.equal(await s.preserveRecovery('force-stop'), null, 'an un-owned ref is not overwritten');
+    assert.equal(sh(fb.root, '--git-dir', fb.remote, 'rev-parse', recRef), plain, 'the un-owned recovery ref is unchanged');
+    assert.match(logger.lines.warn.join('\n'), /carries no run identity/);
+    await s.close();
+  } finally { fb.cleanup(); }
+
+  // (c) OWNERSHIP-based, not a blanket refusal: a re-preservation by the SAME run that
+  // created the ref IS allowed (it overwrites its own earlier recovery point).
+  const fc = fixture();
+  try {
+    const { dir } = fc.clone('f10c');
+    sh(dir, 'checkout', '-q', '-b', 'nano/agent-work/main-x');
+    const provisioned = { workspaceDir: dir, gitEnv: ENV, committer: { name: 'bot', email: 'bot@example.com' }, startSha: sh(dir, 'rev-parse', 'HEAD'), workingBranch: 'nano/agent-work/main-x' };
+    const s = await setupWorkspaceCheckpoints({ provisioned, job: { jobKey: '1', elementInstanceKey: '717' }, jobType: 't', runId: 'run-A', logger: quietLogger(), env });
+    writeFileSync(join(dir, 'wip.txt'), 'first\n');
+    await s.checkpointer.flush('abort', { timeoutMs: 0 });
+    const r1 = await s.preserveRecovery('force-stop');
+    assert.ok(r1?.sha, 'first create-only preserve lands');
+    writeFileSync(join(dir, 'wip.txt'), 'second\n');
+    const r2res = await s.checkpointer.flush('abort', { timeoutMs: 0 });
+    const r2 = await s.preserveRecovery('force-stop');
+    assert.deepEqual(r2, { ref: recoveredCheckpointRef('717'), sha: r2res.sha }, 'same-run re-preserve overwrites its own ref');
+    assert.notEqual(r2.sha, r1.sha, 'the ref advanced to the newer snapshot');
+    await s.close();
+  } finally { fc.cleanup(); }
+});
+
+test('#295 setupWorkspaceCheckpoints: a self-recorded predecessor is NOT auto-adopted (occurrence identity unprovable)', async () => {
+  const f = fixture();
+  try {
+    const env = { NANO_AGENT_CHECKPOINT: 'on', NANO_AGENT_CHECKPOINT_INTERVAL_MS: '0' };
+    const provision = (name) => {
+      const { dir } = f.clone(name);
+      sh(dir, 'checkout', '-q', '-b', 'nano/agent-work/main-x');
+      return { workspaceDir: dir, gitEnv: ENV, committer: { name: 'bot', email: 'bot@example.com' }, startSha: sh(dir, 'rev-parse', 'HEAD'), workingBranch: 'nano/agent-work/main-x' };
+    };
+    const vars = [];
+    const camunda = {
+      createElementInstanceVariables: async (input) => { vars.push(input); },
+      // Even a UNIQUE active occurrence cannot prove occurrence identity (Copilot
+      // r4244212483): index lag can hide a sibling and a terminal sibling may have been
+      // the resume slot's last writer, so a self-record is never auto-adopted.
+      searchElementInstances: async () => ({ items: [{ elementInstanceKey: '20' }] }),
+    };
+
+    // run1 is element 10 in process 500; it checkpoints and records resumeFromCheckpoint
+    // at the PROCESS scope.
+    const p1 = provision('run1');
+    const s1 = await setupWorkspaceCheckpoints({ provisioned: p1, job: { jobKey: '1', elementInstanceKey: '10', processInstanceKey: '500', elementId: 'review-round' }, jobType: 't', runId: 'run-1', camunda, logger: quietLogger(), env, deps: { sweepRegistry: new Map() } });
+    writeFileSync(join(p1.workspaceDir, 'wip.txt'), 'half done\n');
+    const res = await s1.checkpointer.flush('abort', { timeoutMs: 0 });
+    await s1.close();
+    // Two writes: agentCheckpoint @ element 10, resumeFromCheckpoint @ process 500.
+    const resumeVar = vars.find((v) => v.variables.resumeFromCheckpoint);
+    assert.ok(resumeVar, 'a resumeFromCheckpoint var is written at the process scope');
+    assert.equal(resumeVar.elementInstanceKey, '500');
+    assert.equal(resumeVar.local, true);
+    assert.equal(resumeVar.variables.resumeFromCheckpoint.ref, 'refs/nano/wip/10');
+    assert.equal(resumeVar.variables.resumeFromCheckpoint.sha, res.sha);
+
+    // The SLA escalation re-enters the task as a NEW element (20) in the SAME process,
+    // carrying the predecessor's SELF-RECORD (an object). Because occurrence identity is
+    // unprovable from the static elementId, it is NOT adopted — the run starts clean.
+    const p2 = provision('run2');
+    const logger = quietLogger();
+    const job2 = { jobKey: '2', elementInstanceKey: '20', processInstanceKey: '500', elementId: 'review-round', variables: { resumeFromCheckpoint: resumeVar.variables.resumeFromCheckpoint } };
+    const s2 = await setupWorkspaceCheckpoints({ provisioned: p2, job: job2, jobType: 't', runId: 'run-2', camunda, logger, env, deps: { sweepRegistry: new Map() } });
+    assert.equal(s2.restored, null, 'a self-recorded predecessor is not adopted');
+    assert.match(logger.lines.warn.join('\n'), /not adopting predecessor WIP checkpoint refs\/nano\/wip\/10 .*self-record/);
+    assert.ok(!existsSync(join(p2.workspaceDir, 'wip.txt')), 'no predecessor state is restored');
+    // The predecessor's content is NOT copied under this run's own key.
+    assert.throws(() => sh(f.root, '--git-dir', f.remote, 'rev-parse', '--verify', 'refs/nano/wip/20'));
+    await s2.close();
+  } finally { f.cleanup(); }
+});
+
+test('#296 setupWorkspaceCheckpoints: refuses to adopt an elementId-correlated self-record (occurrence identity unprovable)', async () => {
+  const f = fixture();
+  try {
+    const env = { NANO_AGENT_CHECKPOINT: 'on', NANO_AGENT_CHECKPOINT_INTERVAL_MS: '0' };
+    const provision = (name) => {
+      const { dir } = f.clone(name);
+      sh(dir, 'checkout', '-q', '-b', 'nano/agent-work/main-x');
+      return { workspaceDir: dir, gitEnv: ENV, committer: { name: 'bot', email: 'bot@example.com' }, startSha: sh(dir, 'rev-parse', 'HEAD'), workingBranch: 'nano/agent-work/main-x' };
+    };
+    const vars = [];
+    // Even a UNIQUE active occurrence is not proof of identity (Copilot r4244212483):
+    // a self-recorded (object) predecessor is never auto-adopted.
+    const camunda = {
+      createElementInstanceVariables: async (input) => { vars.push(input); },
+      searchElementInstances: async () => ({ items: [{ elementInstanceKey: '20' }] }),
+    };
+
+    const p1 = provision('run1');
+    const s1 = await setupWorkspaceCheckpoints({ provisioned: p1, job: { jobKey: '1', elementInstanceKey: '10', processInstanceKey: '500', elementId: 'review-round' }, jobType: 't', runId: 'run-1', camunda, logger: quietLogger(), env, deps: { sweepRegistry: new Map() } });
+    writeFileSync(join(p1.workspaceDir, 'wip.txt'), 'half done\n');
+    await s1.checkpointer.flush('abort', { timeoutMs: 0 });
+    await s1.close();
+    const resumeVar = vars.find((v) => v.variables.resumeFromCheckpoint);
+
+    const p2 = provision('run2');
+    const logger = quietLogger();
+    const job2 = { jobKey: '2', elementInstanceKey: '20', processInstanceKey: '500', elementId: 'review-round', variables: { resumeFromCheckpoint: resumeVar.variables.resumeFromCheckpoint } };
+    const s2 = await setupWorkspaceCheckpoints({ provisioned: p2, job: job2, jobType: 't', runId: 'run-2', camunda, logger, env, deps: { sweepRegistry: new Map() } });
+    // A self-record is NOT adopted ⇒ NOT restored; the worktree stays pristine.
+    assert.equal(s2.restored, null);
+    assert.ok(!existsSync(join(p2.workspaceDir, 'wip.txt')), 'no self-recorded predecessor state is restored');
+    assert.match(logger.lines.warn.join('\n'), /not adopting predecessor WIP checkpoint .*self-record/);
+    // This run never claimed the predecessor ref under its own key.
+    assert.throws(() => sh(f.root, '--git-dir', f.remote, 'rev-parse', '--verify', 'refs/nano/wip/20'));
+    await s2.close();
+  } finally { f.cleanup(); }
+});
+
+test('#296 setupWorkspaceCheckpoints: an EXPLICIT (string) predecessor ref bypasses the ambiguity guard', async () => {
+  const f = fixture();
+  try {
+    const env = { NANO_AGENT_CHECKPOINT: 'on', NANO_AGENT_CHECKPOINT_INTERVAL_MS: '0' };
+    const provision = (name) => {
+      const { dir } = f.clone(name);
+      sh(dir, 'checkout', '-q', '-b', 'nano/agent-work/main-x');
+      return { workspaceDir: dir, gitEnv: ENV, committer: { name: 'bot', email: 'bot@example.com' }, startSha: sh(dir, 'rev-parse', 'HEAD'), workingBranch: 'nano/agent-work/main-x' };
+    };
+    const vars = [];
+    // searchElementInstances WOULD report ambiguity, but an explicit string ref is
+    // occurrence-authoritative (the process chose it) ⇒ the guard is bypassed.
+    let searched = false;
+    const camunda = {
+      createElementInstanceVariables: async (input) => { vars.push(input); },
+      searchElementInstances: async () => { searched = true; return { items: [{ elementInstanceKey: '20' }, { elementInstanceKey: '21' }] }; },
+    };
+
+    const p1 = provision('run1');
+    const s1 = await setupWorkspaceCheckpoints({ provisioned: p1, job: { jobKey: '1', elementInstanceKey: '10', processInstanceKey: '500', elementId: 'review-round' }, jobType: 't', runId: 'run-1', camunda, logger: quietLogger(), env, deps: { sweepRegistry: new Map() } });
+    writeFileSync(join(p1.workspaceDir, 'wip.txt'), 'half done\n');
+    const res = await s1.checkpointer.flush('abort', { timeoutMs: 0 });
+    await s1.close();
+
+    const p2 = provision('run2');
+    const logger = quietLogger();
+    // The process delivers a BARE string ref (option 2) — trusted as-is.
+    const job2 = { jobKey: '2', elementInstanceKey: '20', processInstanceKey: '500', elementId: 'review-round', variables: { resumeFromCheckpoint: 'refs/nano/wip/10' } };
+    const s2 = await setupWorkspaceCheckpoints({ provisioned: p2, job: job2, jobType: 't', runId: 'run-2', camunda, logger, env, deps: { sweepRegistry: new Map() } });
+    assert.equal(s2.restored?.restored, true);
+    assert.equal(searched, false, 'the ambiguity guard is NOT consulted for an explicit ref');
+    assert.equal(readFileSync(join(p2.workspaceDir, 'wip.txt'), 'utf8'), 'half done\n');
+    assert.equal(sh(f.root, '--git-dir', f.remote, 'rev-parse', 'refs/nano/wip/20'), res.sha);
+    // #296 (review): after adoption the process-scoped pointer is ADVANCED to this run's
+    // newly-copied ref, so a no-new-checkpoint completion can't leave it naming the stale
+    // predecessor for the next activation.
+    const advanced = vars.find((v) => v.elementInstanceKey === '500' && v.variables?.resumeFromCheckpoint?.ref === 'refs/nano/wip/20');
+    assert.ok(advanced, 'the resumeFromCheckpoint pointer is advanced to this run\'s ref after adoption');
+    assert.equal(advanced.variables.resumeFromCheckpoint.adoptedFrom, 'refs/nano/wip/10');
+    await s2.close();
+  } finally { f.cleanup(); }
+});
+
+test('#296 setupWorkspaceCheckpoints: the lost-race adoption branch ALSO advances the resume pointer', async () => {
+  // Previously-missed (review 5486602850): the create-only adoption WINNER advances the
+  // process-scoped resumeFromCheckpoint pointer, but the lost-race branch adopted the
+  // winner's ref WITHOUT advancing it. If the winner's own best-effort advance failed,
+  // the slot kept naming the bare predecessor; a no-new-checkpoint completion then
+  // deletes the WIP ref on ack while the slot still points at the predecessor — a later
+  // activation re-adopts that stale snapshot. The loser must advance the pointer too
+  // (using the re-read sha), making the advance idempotent across the race.
+  const f = fixture();
+  try {
+    const env = { NANO_AGENT_CHECKPOINT: 'on', NANO_AGENT_CHECKPOINT_INTERVAL_MS: '0' };
+    const provision = (name) => {
+      const { dir } = f.clone(name);
+      sh(dir, 'checkout', '-q', '-b', 'nano/agent-work/main-x');
+      return { workspaceDir: dir, gitEnv: ENV, committer: { name: 'bot', email: 'bot@example.com' }, startSha: sh(dir, 'rev-parse', 'HEAD'), workingBranch: 'nano/agent-work/main-x' };
+    };
+    const vars = [];
+    const camunda = { createElementInstanceVariables: async (input) => { vars.push(input); } };
+
+    // 1) The PREDECESSOR run (eik 10) checkpoints "predecessor work" → refs/nano/wip/10.
+    const p1 = provision('pred');
+    const s1 = await setupWorkspaceCheckpoints({ provisioned: p1, job: { jobKey: '1', elementInstanceKey: '10', processInstanceKey: '500', elementId: 'review-round' }, jobType: 't', runId: 'run-1', camunda, logger: quietLogger(), env, deps: { sweepRegistry: new Map() } });
+    writeFileSync(join(p1.workspaceDir, 'wip.txt'), 'predecessor work\n');
+    const predRes = await s1.checkpointer.flush('abort', { timeoutMs: 0 });
+    await s1.close();
+
+    // 2) The RACE WINNER (same eik 20 as the loser) already populated refs/nano/wip/20
+    //    with DIFFERENT content, simulating a concurrent same-key activation that won
+    //    the create-only lease first.
+    const pw = provision('winner');
+    const sw = await setupWorkspaceCheckpoints({ provisioned: pw, job: { jobKey: '9', elementInstanceKey: '20', processInstanceKey: '500', elementId: 'review-round' }, jobType: 't', runId: 'run-W', camunda, logger: quietLogger(), env, deps: { sweepRegistry: new Map() } });
+    writeFileSync(join(pw.workspaceDir, 'wip.txt'), 'winner work\n');
+    const winRes = await sw.checkpointer.flush('abort', { timeoutMs: 0 });
+    await sw.close();
+    assert.notEqual(winRes.sha, predRes.sha, 'winner and predecessor snapshots differ');
+    assert.equal(sh(f.root, '--git-dir', f.remote, 'rev-parse', 'refs/nano/wip/20'), winRes.sha);
+    vars.length = 0;
+
+    // 3) The LOSER (eik 20) resumes with an explicit predecessor ref. Inject a
+    //    fetchCheckpoint that hides refs/nano/wip/20 at the STARTUP fetch (so the
+    //    predecessor-adoption block is entered) but delegates to the real reader
+    //    everywhere else — so the create-only push loses the lease (the remote ref
+    //    already exists) and the re-read returns the WINNER's real checkpoint.
+    const p2 = provision('loser');
+    const logger = quietLogger();
+    let hidStartup = false;
+    const fetchCheckpointRacing = async (opts) => {
+      if (!hidStartup && opts?.ref === 'refs/nano/wip/20') { hidStartup = true; return null; }
+      return fetchCheckpoint(opts);
+    };
+    const job2 = { jobKey: '2', elementInstanceKey: '20', processInstanceKey: '500', elementId: 'review-round', variables: { resumeFromCheckpoint: 'refs/nano/wip/10' } };
+    const s2 = await setupWorkspaceCheckpoints({ provisioned: p2, job: job2, jobType: 't', runId: 'run-2', camunda, logger, env, deps: { sweepRegistry: new Map(), fetchCheckpoint: fetchCheckpointRacing } });
+
+    // The loser adopts the WINNER's state (not the predecessor's) and does NOT overwrite
+    // the winner's ref.
+    assert.equal(s2.restored?.restored, true);
+    assert.equal(readFileSync(join(p2.workspaceDir, 'wip.txt'), 'utf8'), 'winner work\n');
+    assert.equal(sh(f.root, '--git-dir', f.remote, 'rev-parse', 'refs/nano/wip/20'), winRes.sha, 'the winner ref is not clobbered by the loser');
+    assert.match(logger.lines.info.join('\n'), /a concurrent activation already populated refs\/nano\/wip\/20/);
+    // The fix: the loser advances the pointer to ITS key with the RE-READ (winner) sha.
+    const advanced = vars.find((v) => v.elementInstanceKey === '500' && v.variables?.resumeFromCheckpoint?.ref === 'refs/nano/wip/20');
+    assert.ok(advanced, 'the lost-race branch advances the resumeFromCheckpoint pointer to this run\'s ref');
+    assert.equal(advanced.variables.resumeFromCheckpoint.sha, winRes.sha, 'the advanced pointer carries the re-read (winner) sha, not the predecessor sha');
+    assert.equal(advanced.variables.resumeFromCheckpoint.adoptedFrom, 'refs/nano/wip/10');
+    await s2.close();
+  } finally { f.cleanup(); }
+});
+
+test('#295 job handler wires preserveRecovery on abort/failed and surfaces recoveryRef in the outcome', () => {
+  const src = readFileSync(new URL('./c8ctl-plugin.js', import.meta.url), 'utf8');
+  const i = (s) => { const at = src.indexOf(s); assert.ok(at >= 0, `missing: ${s}`); return at; };
+  const abortFlush = i("await checkpointer.flush('abort'");
+  const abortPreserve = i("recoveryRefInfo = await checkpointing.preserveRecovery('force-stop')");
+  const failedFlush = i("await checkpointer.flush('failed', { timeoutMs: checkpointing.flushTimeoutMs })");
+  const failedPreserve = i("recoveryRefInfo = await checkpointing.preserveRecovery('failed')");
+  // preserveRecovery runs AFTER each flush (the snapshot must exist first).
+  assert.ok(abortFlush < abortPreserve, 'abort preserve follows the abort flush');
+  assert.ok(failedFlush < failedPreserve, 'failed preserve follows the failed flush');
+  // The recovery ref is attached to the git result and surfaced in the outcome envelope.
+  assert.ok(i('if (recoveryRefInfo && gitResult) { gitResult.recoveryRef = recoveryRefInfo.ref; gitResult.recoverySha = recoveryRefInfo.sha; }') > 0);
+  assert.ok(i('if (git.recoveryRef) env.recoveryRef = git.recoveryRef;') > 0);
+  assert.ok(i('if (git.recoverySha) env.recoverySha = git.recoverySha;') > 0);
+  // The orphan probe is process-instance-aware (the core #295 fix).
+  assert.ok(i('const isTerminal = makeOrphanProbe({') > 0);
+  assert.ok(i('getProcessInstance: typeof camunda?.getProcessInstance === \'function\'') > 0);
+  // The GC reclaim log reports ref@sha [why].
+  assert.ok(i('reclaimed ${r.deleted.length} orphaned checkpoint ref(s)') > 0);
+  // #296 (F9): the checkpoint git runner is driven by a DEDICATED recovery-deadline
+  // controller (so recovery survives the harness abort), and the force-stop block arms
+  // the deadline that cancels it via abortRecovery() once the budget expires.
+  assert.ok(i('const recoveryController = new AbortController();') > 0, 'checkpoint git uses a dedicated recovery controller');
+  assert.ok(i('signal: recoveryController.signal') > 0, 'the checkpoint git runner is bound to the recovery signal, not the job abortSignal');
+  const deadline = i('try { checkpointing.abortRecovery(); } catch');
+  const flushAbort = i("await checkpointer.flush('abort'");
+  assert.ok(deadline > 0 && deadline < flushAbort, 'the recovery deadline (abortRecovery) is armed before the force-stop flush');
+  // #296 (review, r4244991586): the failed-result path rechecks the job abortSignal
+  // AFTER its flush/promote and yields WITHOUT settling when it fired — so a stale
+  // activation never reaches settleJob.fail / the checkpoint-var writes once Effect has
+  // released the slot. The guard must sit after the failed preserve and before the
+  // failed-path settleJob.fail.
+  const recheck = i("if (!result.ok && abortSignal?.aborted === true) {");
+  assert.ok(recheck > failedPreserve, 'the post-run abortSignal recheck runs after the failed-path preserveRecovery');
+  const yieldLog = i('yielding WITHOUT settleJob.fail so a replacement activation does not overlap');
+  assert.ok(yieldLog > recheck, 'the recheck logs + yields instead of settling');
+  const failedSettle = i('return await settleJob.fail({\n          errorMessage: `agent "${profile.name}" failed:');
+  assert.ok(recheck < failedSettle, 'the recheck guards the failed-path settleJob.fail');
 });

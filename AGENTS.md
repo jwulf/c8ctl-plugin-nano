@@ -257,11 +257,114 @@ SDK client (job workers) — do **not** add the SDK as a dependency or use raw
   and on a failed run, stopped before `finalizeGit`, the ref deleted after a clean
   finalize (kept on any push failure), and `close()` drains in-flight git work before
   the run dir is reaped. A background `sweepStaleCheckpoints` (throttled per remote by
-  `shouldSweep`) deletes other WIP refs past `NANO_AGENT_CHECKPOINT_TTL_MS` (7d) or >1h old
+  `shouldSweep`) deletes other stale refs in **both** the `refs/nano/wip/*` and
+  `refs/nano/recovered/*` namespaces (`SWEPT_REF_PREFIXES`) past
+  `NANO_AGENT_CHECKPOINT_TTL_MS` (7d) or >1h old
   whose element instance `getElementInstance` reports COMPLETED/TERMINATED (an error/404
   is never treated as terminal). `agentCheckpoint` is written via
   `camunda.createElementInstanceVariables` (`local:true`), best-effort, warning once.
   Tests: `agent-checkpoint.test.mjs` (real temp repos + bare remote).
+- **SLA-cancel-safe checkpoints (issue #295, `agent-checkpoint.mjs`).** The #264 GC
+  treated an element-terminal WIP ref as an orphan, but an SLA **boundary timer**
+  cancels the *element* (→ TERMINATED) while its *process* keeps waiting for a human
+  to answer the escalation — so the sweep deleted the exact checkpoint a resume needs.
+  Four changes close that: (a) **process-instance-aware orphan probe**
+  (`makeOrphanProbe`): a WIP ref is an orphan only when its element is terminal **AND**,
+  when the host SDK exposes `getProcessInstance`, its process is also
+  COMPLETED/TERMINATED/CANCELED; an element terminal inside a still-ACTIVE process is
+  **spared** (fail-closed — any missing key / unreachable / thrown lookup spares the ref;
+  the 7d TTL stays the backstop). Degrades to the legacy element-only check when the SDK
+  lacks `getProcessInstance`. (b) **Predecessor adoption on resume**: a resumed run
+  re-enters the task as a NEW element instance (new key), so its deterministic
+  `refs/nano/wip/<newKey>` is empty. The interrupted run records its ref in a
+  **process-scoped** `resumeFromCheckpoint` variable (written at `processInstanceKey`
+  with `local:true`, so it survives element re-entry); on resume
+  `predecessorCheckpointRef` reads it and `pushNamedRef` copies the predecessor ref
+  under this run's key so restore/ownership/discard run unchanged. Because that
+  correlation keys on the **static `elementId`** (not an occurrence id), it is
+  AMBIGUOUS under parallel multi-instance of one agent-task element in a single process
+  instance — which is **out of scope for resume** (no nano-workforce process fans one
+  agent-task element out that way). Because counting ACTIVE occurrences cannot establish
+  occurrence identity (index lag can hide a live sibling, and a terminal sibling drops
+  out of the ACTIVE result yet may have been the slot's last writer), NO engine query
+  makes an elementId-correlated self-record adoption provably safe. So a self-recorded
+  (object) predecessor is **never auto-adopted** — `makeOccurrenceGuard` fails closed by
+  construction and the restore path starts clean (transcript-only) rather than risk
+  restoring a sibling occurrence's state. The ONLY predecessor trusted is the explicit,
+  occurrence-authoritative ref the process delivers as a bare **string**:
+  `resumeRefIsExplicit` bypasses the correlation when that string is present
+  (nano-workforce#891 plugs in with no further plugin change). After a successful
+  adoption the process-scoped pointer is **advanced** to this run's newly-copied ref, so
+  a no-new-checkpoint completion can't leave a stale predecessor pointer for the next
+  activation. (c) **Durable
+  recovery refs**: on a force-stop/abort or failed (SLA-cancelled) run,
+  `preserveRecovery` promotes the latest snapshot to `refs/nano/recovered/<eik>`
+  (`recoveredCheckpointRef`) — **outside** the `refs/nano/wip/*` namespace, so it
+  survives the per-checkpoint WIP cleanup (`discardAfterAck`) that only deletes WIP
+  refs. It is **not immortal**, though: the orphan sweep enumerates **both**
+  `refs/nano/wip/*` and `refs/nano/recovered/*` (`SWEPT_REF_PREFIXES`) and reclaims a
+  recovery ref under the **same** process-terminal / TTL policy as a WIP ref (Copilot
+  review on #296) — a recovery ref whose process is COMPLETED/TERMINATED/CANCELED (or
+  aged past the 7d TTL) is reclaimed so recovery refs cannot grow without bound once
+  their escalation resolves, while an **active escalation** (process still ACTIVE) is
+  spared (and a freshly-written one is inside the GC grace window). This degrades with
+  `makeOrphanProbe` to the legacy element-only check when the host SDK lacks
+  `getProcessInstance`, exactly as the WIP sweep does. How the recovery point is
+  *reported*
+  depends on HOW the run ended. A **non-aborted failed** run (a non-ok result that
+  did NOT interrupt the runner — e.g. a harness non-zero exit) settles normally and
+  surfaces `recoveryRef`/`recoverySha` in the job outcome (`buildResultEnvelope`).
+  But a **force-stopped run OR an SLA lease-loss cancellation** both take the *aborted*
+  early return (`settle.fail`, `result.aborted === true`): the supervisor heartbeat
+  treats the SLA cancel's lease-loss 404 as terminal and interrupts the runner, so it
+  reaches the SAME aborted branch as a force-stop. That branch returns before
+  `buildResultEnvelope`, so it produces **no outcome envelope** — `recoveryRef`/
+  `recoverySha` are NOT emitted there. Instead it records the recovery point through
+  the **process-scoped `resumeFromCheckpoint`** variable (so a resumed element
+  re-entry can discover it), and the pushed `refs/nano/recovered/<eik>` ref itself is
+  the authoritative, durable recovery handle (recoverable without any job result).
+  All recovery-ref writes are **fenced** (Copilot review on #296): predecessor
+  adoption is create-only and the recovery promotion leases against the sha it observed
+  on `refs/nano/recovered/<eik>`, so a slower/stale activation can never blind-force
+  over a newer run's recovery point (`pushNamedRef`/`observeRemoteRefSha`). That lease
+  is only a compare-and-swap, so it is **reinforced by run identity** and **fails
+  closed** (Copilot review on #296, F7/F10): an existing recovery ref is overwritten
+  only when its `Nano-Checkpoint-Run` trailer **positively identifies** it as this run
+  or the run it explicitly superseded (`prior.runId`); a foreign (newer/concurrent)
+  run's point is kept, and any case where ownership **cannot be established** — the
+  ownership fetch threw/failed, or the ref carries no run trailer — **refuses** the
+  overwrite rather than falling through to the CAS, so a transient read failure can't
+  let a stale activation clobber a newer recovery point. The
+  force-stop flush+promote is **bounded** by `FORCE_STOP_RECOVERY_MS` and made genuinely
+  **cancellable**: the checkpoint-path git runner is driven by a **dedicated
+  recovery-deadline `AbortController`** — NOT the job's `abortSignal` (Copilot review on
+  #296, F9). The recovery path (flush + `preserveRecovery`) runs only once
+  `result.aborted` is observed, i.e. AFTER the job signal has fired, so binding git to
+  that signal made `createGitRunner` fail every recovery command (`[aborted]`) and
+  defeated the whole #295 recovery; the dedicated controller keeps git usable after the
+  harness abort and is cancelled (`checkpointing.abortRecovery()`, armed from the
+  force-stop block) only when the recovery budget expires — tearing the in-flight push
+  down (SIGTERM→SIGKILL) so the chain settles promptly instead of running to
+  `gitTimeoutMs`. That `abortRecovery()` also aborts the background **GC sweep**, and the
+  force-stop path anchors **ONE shared absolute deadline** (`forceStopDeadline`) when the
+  recovery block begins: the recover race and the post-abort `close()` drain BOTH bound
+  against the *same* deadline (`close()` gets only the REMAINING budget,
+  `Math.max(closeFloorMs, forceStopDeadline - Date.now())`, never a fresh full one), so
+  recovery **and** the (up to 120s) GC cleanup together fit inside a single
+  `FORCE_STOP_RECOVERY_MS` window instead of consuming it twice and being SIGKILLed
+  mid-cleanup (Copilot review on #296). The floor is `closeFloorMs` (the git kill grace,
+  `gitKillGraceMs`), **not** a bare `1`: `abortRecovery()` is armed to fire
+  `gitKillGraceMs` *before* `forceStopDeadline`, so the git SIGKILL lands by the deadline
+  and the floor reserves just enough of the remaining window for `close()` to actually
+  drain the now-SIGTERMed git process — a `Math.max(1, …)` floor would let `close()`
+  abandon the drain after 1 ms while git was still dying, then reap the workspace under a
+  live process (Copilot review on #296). The supervisor's `forceStopWorker` waits
+  `STOP_GRACE_MS + FORCE_STOP_RECOVERY_MS` before
+  its SIGKILL backstop, so a worker can finish writing the recovery ref before it is
+  killed (a worker that exits sooner is reaped immediately). (d) The GC reclaim log
+  reports `ref@sha [why]`
+  (the sweep's `deleted` entries now carry the `sha`). Tests: the `#295 …` cases in
+  `agent-checkpoint.test.mjs`.
 - **Agent outcomes (`acpOutcomeFrom` / `resultVarsFromAcpOutcome`).** A
   `session/prompt` result may carry `_meta.outcome` `{status:'completed'|'blocked',
   summary}` (rusty-harness's `report_outcome`). `spawnCaptureAcp` surfaces it as

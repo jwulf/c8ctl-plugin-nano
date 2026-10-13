@@ -115,6 +115,11 @@ const DEFAULTS = Object.freeze({
   // timeout/abort — bounds how long the runner can stay pending past its deadline.
   gitKillGraceMs: 5_000,
   flushTimeoutMs: 20_000,
+  // Deadline every checkpoint-path SDK call (createElementInstanceVariables, the
+  // #295 occurrence/terminal lookups) is bounded by. A seam so a test can drive the
+  // timeout deterministically with a tiny value instead of consuming the real 10s of
+  // wall clock to observe the cancel-on-timeout behaviour (Copilot review on #296).
+  sdkTimeoutMs: 10_000,
   ttlMs: 7 * 24 * 60 * 60 * 1000,
   gcGraceMs: 60 * 60 * 1000,
   gcEveryMs: 60 * 60 * 1000,
@@ -232,7 +237,16 @@ export function checkpointConfig(env = process.env) {
     gcGraceMs: DEFAULTS.gcGraceMs,
     gcEveryMs: DEFAULTS.gcEveryMs,
     gitTimeoutMs: DEFAULTS.gitTimeoutMs,
+    // Exposed so the force-stop path can reserve a drain window: abortRecovery()
+    // only SIGTERMs checkpoint git, and createGitRunner grants this grace before
+    // SIGKILL — so the recovery race must finish early enough to leave close() a
+    // real window to drain the now-terminated git, not the 1ms an expired deadline
+    // would otherwise hand it (Copilot review on #296).
+    gitKillGraceMs: DEFAULTS.gitKillGraceMs,
     flushTimeoutMs: DEFAULTS.flushTimeoutMs,
+    // Floor of 1ms so a test can inject a near-instant deadline; production uses the
+    // 10s default when the env var is unset (Copilot review on #296).
+    sdkTimeoutMs: Math.max(1, intOr(env.NANO_AGENT_CHECKPOINT_SDK_TIMEOUT_MS, DEFAULTS.sdkTimeoutMs)),
   };
 }
 
@@ -278,6 +292,213 @@ export function checkpointEligibility({ mode, provisioned, envelope, token }) {
 export function checkpointRef(elementInstanceKey) {
   const key = String(elementInstanceKey ?? '').trim();
   return /^[0-9A-Za-z_-]{1,128}$/.test(key) ? `${CHECKPOINT_REF_PREFIX}${key}` : null;
+}
+
+// Durable "recovery" refs (#295) live OUTSIDE the WIP namespace so a snapshot promoted
+// here on an SLA-cancel or force-stop is GC-PROOF against the per-checkpoint reap — it
+// survives the WIP cleanup so the human escalation can be answered and the run resumed.
+// It is NOT immortal: the orphan sweep reclaims it under the SAME process-terminal /
+// TTL policy as a WIP ref (see `sweepStaleCheckpoints`), so a recovery ref whose process
+// has finished (or aged past the TTL) is reclaimed instead of pinning a ref forever,
+// while an active escalation (process still ACTIVE) stays protected.
+export const RECOVERED_REF_PREFIX = 'refs/nano/recovered/';
+// Shared root of every nano-managed ref namespace, and the full set the orphan GC reaps.
+export const NANO_REF_ROOT = 'refs/nano/';
+export const SWEPT_REF_PREFIXES = Object.freeze([CHECKPOINT_REF_PREFIX, RECOVERED_REF_PREFIX]);
+export function recoveredCheckpointRef(elementInstanceKey) {
+  const key = String(elementInstanceKey ?? '').trim();
+  return /^[0-9A-Za-z_-]{1,128}$/.test(key) ? `${RECOVERED_REF_PREFIX}${key}` : null;
+}
+
+// A resumed run re-enters the task as a NEW element instance with a new key, so the
+// deterministic `refs/nano/wip/<newKey>` is empty even though the interrupted run
+// pushed `refs/nano/wip/<oldKey>` (#295). The predecessor writes its ref into a
+// PROCESS-scoped `resumeFromCheckpoint` variable (survives element re-entry); on
+// resume the new run reads it here, fetches that ref and adopts it under the new
+// key. Returns the predecessor WIP ref, or null when absent / malformed / the same
+// ref this run already owns.
+//
+// `resumeFromCheckpoint` is ONE process-scoped slot shared by every agent task in
+// the process, so it must be correlated to THIS task before adoption (Copilot
+// review on #295): in a process with parallel/sequential agent tasks, whichever
+// task checkpointed last overwrites the slot, and an un-correlated read could adopt
+// ANOTHER task's repository state. The writer stamps the producing task's
+// `elementId`; when the current job's `elementId` is supplied here, a recorded
+// `elementId` that DIFFERS is refused (returns null). A recorded `elementId` that
+// is absent/null (an older writer, or a writer whose job carried no elementId) is
+// still adopted — refusing it would break the very resume #295 exists to support —
+// and when the caller passes no `elementId` the correlation is simply skipped
+// (legacy callers/tests). Task identity is `elementId`, NOT the recorded
+// `elementInstanceKey`: a resume re-enters as a NEW element instance, so the
+// instance key always differs and can never correlate.
+export function predecessorCheckpointRef(variables, selfRef = null, elementId = null) {
+  const v = variables && typeof variables === 'object' ? variables.resumeFromCheckpoint : null;
+  const ref = typeof v === 'string' ? v : (v && typeof v === 'object' ? v.ref : null);
+  const s = typeof ref === 'string' ? ref.trim() : '';
+  // Accept a WIP ref (the normal per-checkpoint pointer) OR a GC-proof recovery ref
+  // (`refs/nano/recovered/<eik>`). The recovery ref is what an SLA-cancelled /
+  // force-stopped run writes here (Copilot review on #296, AC3): its element is
+  // terminated before buildResultEnvelope runs, so the process-scoped slot is the
+  // durable path that lets the resumed run discover the recovery point. Both are
+  // adopted identically below (fetch + restore are ref-agnostic).
+  const prefix = s.startsWith(CHECKPOINT_REF_PREFIX) ? CHECKPOINT_REF_PREFIX
+    : (s.startsWith(RECOVERED_REF_PREFIX) ? RECOVERED_REF_PREFIX : null);
+  if (!s || !prefix) return null;
+  const key = s.slice(prefix.length);
+  if (!/^[0-9A-Za-z_-]{1,128}$/.test(key)) return null;
+  if (s === selfRef) return null;
+  // Correlation gate: only a POSITIVE mismatch on a present recorded elementId
+  // refuses adoption. A missing recorded elementId (legacy/elementId-less writer)
+  // or a missing caller elementId (correlation unavailable) both fall through.
+  if (elementId != null && v && typeof v === 'object') {
+    const recorded = typeof v.elementId === 'string' ? v.elementId : null;
+    if (recorded != null && recorded !== elementId) return null;
+  }
+  return s;
+}
+
+// Push `sha` to `ref` on `remote`, FENCED so a slower/stale activation can never
+// blind-overwrite a newer run's state (Copilot review on #296). A plain `+<sha>:<ref>`
+// force let whichever writer ran LAST win, so a zombie prior activation could clobber
+// the recovery point of the newer run that superseded it — the exact failure the WIP
+// path already guards against with `--force-with-lease`. `expectSha` is the remote sha
+// this run believes `ref` holds and the write is leased against it:
+//   - '' (default) demands the ref be ABSENT — "create-only". Used to ADOPT a
+//     predecessor's checkpoint under THIS run's own key (#295): if a concurrent
+//     activation already populated the key the lease is lost and we keep theirs.
+//   - a non-empty sha only overwrites while `ref` still points at exactly that sha —
+//     used to promote a GC-proof recovery ref over the value we OBSERVED, so a stale
+//     activation that observed an older/absent value loses the lease once a newer run
+//     moved the ref.
+//   - `null` keeps the legacy unconditional force (no caller uses it; kept for tests).
+// A lease mismatch means another writer moved `ref` first: returns
+// { ok:false, staleLease:true, error } and leaves their state intact. Other failures
+// return { ok:false, error }.
+export async function pushNamedRef({ git, ref, sha, remote = 'origin', expectSha = '' }) {
+  if (!ref || !sha) return { ok: false, error: 'missing ref or sha' };
+  const args = expectSha != null
+    ? ['push', '--quiet', '--no-verify', `--force-with-lease=${ref}:${expectSha}`, remote, `${sha}:${ref}`]
+    : ['push', '--quiet', '--no-verify', remote, `+${sha}:${ref}`];
+  const r = await git(args);
+  if (ok(r)) return { ok: true };
+  const text = `${r.stderr}\n${r.stdout}`;
+  if (expectSha != null && classifyPushFailure(text) === 'lease') {
+    return { ok: false, staleLease: true, error: errText(r) };
+  }
+  return { ok: false, error: errText(r) };
+}
+
+// Observe the sha `ref` currently holds on `remote` ('' when absent/unreadable), so a
+// fenced `pushNamedRef` can lease against it. Best-effort: any ls-remote failure
+// returns '' (create-only semantics — fail closed, never blind-overwrite).
+export async function observeRemoteRefSha({ git, ref, remote = 'origin' }) {
+  try {
+    const r = await git(['ls-remote', '--quiet', remote, ref]);
+    if (!ok(r)) return '';
+    const first = String(r.stdout ?? '').trim().split(/\s+/)[0] || '';
+    return /^[0-9a-f]{7,64}$/i.test(first) ? first : '';
+  } catch { return ''; }
+}
+
+// Build the orphan predicate the GC sweep consults (#295). A WIP ref is an orphan
+// ONLY when its element instance is terminal AND — when a process-instance reader is
+// available — its PROCESS instance is also finished. An element cancelled by an SLA
+// boundary timer inside a STILL-ACTIVE process is pending human escalation/resume,
+// NOT an orphan, so it must be spared (the TTL stays the final backstop). Any
+// unknown / unreachable lookup (404, a foreign engine, a missing field, a thrown
+// error) returns false so only the TTL reclaims it — losing a recoverable checkpoint
+// is never worth an eager delete. `getElementInstance`/`getProcessInstance` are
+// injected (key → instance object with a `state`), so this is deterministically
+// unit-testable without the SDK. Returns null when element lookups are unavailable
+// (the sweep then reclaims purely by TTL).
+export function makeOrphanProbe({ getElementInstance, getProcessInstance = null } = {}) {
+  if (typeof getElementInstance !== 'function') return null;
+  const terminal = (s) => s === 'COMPLETED' || s === 'TERMINATED' || s === 'CANCELED';
+  return async (key) => {
+    let ei;
+    try { ei = await getElementInstance(key); } catch { return false; }
+    if (!(ei?.state === 'COMPLETED' || ei?.state === 'TERMINATED')) return false;
+    // Element is terminal. Without a process reader, keep the legacy element-only
+    // behaviour; with one, require the process to be finished too.
+    if (typeof getProcessInstance !== 'function') return true;
+    const pik = ei?.processInstanceKey ?? ei?.processInstanceId ?? null;
+    // Can't identify / reach the process → cannot PROVE it is finished, so spare the
+    // ref (recoverable until the TTL) rather than delete a possibly-active run's WIP.
+    if (pik == null) return false;
+    let pi;
+    try { pi = await getProcessInstance(pik); } catch { return false; }
+    return terminal(pi?.state);
+  };
+}
+
+// #295 ambiguity guard (scope decided on nanobpmn/nano-workforce#891). The
+// predecessor checkpoint is correlated to THIS task by its STATIC `elementId`, which
+// is NOT unique when one agent-task element runs as PARALLEL multi-instance within a
+// single process instance: N concurrent occurrences share the elementId AND the one
+// process-scoped `resumeFromCheckpoint` slot, so a last-writer-wins read could make a
+// resumed occurrence adopt a SIBLING occurrence's repository state. Parallel MI of a
+// single agent-task element is OUT OF SCOPE for resume (no nano-workforce process fans
+// one agent-task element out in parallel within a single instance — plan-fanout's
+// parallel `implement` MI calls a separate CHILD process, delivery graphs fan out to
+// DISTINCT elementIds, and review rounds / retries are sequential).
+//
+// Copilot review on #296 (r4244212483): the earlier "count ACTIVE occurrences" probe
+// could NOT actually make a wrong adoption impossible, so it has been REMOVED as an
+// adoption gate. Counting active instances never establishes occurrence identity:
+//   - the search is explicitly allowed to return ZERO from index lag (`consistency
+//     waitUpToMs: 0`), and that same lag can hide a genuinely-active sibling; and
+//   - even on a fresh index, a sibling that already went TERMINAL drops out of the
+//     `state:'ACTIVE'` result yet may have been the LAST WRITER of the shared
+//     process-scoped slot — so `items.length <= 1` can still adopt that sibling's
+//     checkpoint.
+// Because a self-recorded (object) predecessor is correlated ONLY by the ambiguous
+// static elementId, NO engine query can prove it names THIS occurrence. The guard
+// therefore FAILS CLOSED BY CONSTRUCTION: it always reports `{ safe:false }`, so the
+// caller never auto-adopts a self-record. The ONLY predecessor this run trusts is the
+// EXPLICIT, occurrence-authoritative ref the process delivers as a bare STRING
+// (`resumeRefIsExplicit`, nano-workforce#891 option 2) — the process's exact choice of
+// predecessor for THIS occurrence. Until #891 delivers that, a resume starts clean
+// (transcript-only) rather than risk restoring a sibling occurrence's state.
+//
+// Kept exported (and still returning a probe) for backward compatibility and so the
+// diagnostics/tests can observe the refusal reason; it no longer consults the engine.
+export function makeOccurrenceGuard() {
+  return async () => ({
+    safe: false,
+    candidates: [],
+    reason: 'an elementId-correlated self-record cannot establish occurrence identity (parallel multi-instance shares the elementId and the resume slot); only an explicit occurrence-authoritative ref is adopted',
+  });
+}
+
+// The resume slot carries EITHER the predecessor's self-stamped record (a structured
+// object `{ ref, elementId, ... }` the plugin writes at the process scope) OR — once
+// the process delivers it (nanobpmn/nano-workforce#891, option 2) — an EXPLICIT,
+// occurrence-authoritative ref as a bare STRING. An explicit ref is the process's exact
+// choice of predecessor for THIS occurrence, so it bypasses the elementId correlation
+// AND the ambiguity guard (which exist only because a self-record cannot identify the
+// occurrence). A self-record (object) is correlated by elementId and gated by the
+// guard. This lets #891 plug in with NO further plugin change: deliver a bare ref string
+// and the restore path trusts it; until then the elementId-correlated self-record path
+// (with the guard) is used. Returns true only for a bare, well-formed ref string in
+// EITHER supported checkpoint namespace — the WIP prefix (a normal per-checkpoint
+// pointer) OR the GC-proof recovered prefix (`refs/nano/recovered/<eik>`, the explicit
+// pointer an SLA-cancelled run leaves). Both are occurrence-authoritative when delivered
+// as a bare string, so both bypass the guard; restricting this to the WIP prefix would
+// route a recovered pointer through the ambiguity guard and reject it whenever the host
+// SDK can't prove uniqueness (Copilot review on #296). The suffix is validated against
+// the same elementInstanceKey shape `checkpointRef`/`recoveredCheckpointRef` enforce
+// (`/^[0-9A-Za-z_-]{1,128}$/`), so a malformed ref such as `refs/nano/wip/bad/key` is
+// NOT occurrence-authoritative — this predicate is an authorization boundary (it decides
+// whether the ambiguity guard is bypassed), so it must not trust a ref the canonical
+// builders would never mint (Copilot review on #296).
+export function resumeRefIsExplicit(variables) {
+  const v = variables && typeof variables === 'object' ? variables.resumeFromCheckpoint : null;
+  if (typeof v !== 'string') return false;
+  const s = v.trim();
+  const prefix = s.startsWith(CHECKPOINT_REF_PREFIX) ? CHECKPOINT_REF_PREFIX
+    : (s.startsWith(RECOVERED_REF_PREFIX) ? RECOVERED_REF_PREFIX : null);
+  if (!prefix) return false;
+  return /^[0-9A-Za-z_-]{1,128}$/.test(s.slice(prefix.length));
 }
 
 // Never let git invoke the host's configured credential helper for our remote
@@ -869,13 +1090,29 @@ export function shouldSweep(key, { everyMs = DEFAULTS.gcEveryMs, now = Date.now(
   return true;
 }
 
-export async function sweepStaleCheckpoints({ git, ownRef = null, ttlMs = DEFAULTS.ttlMs, graceMs = DEFAULTS.gcGraceMs, isTerminal = null, now = () => Date.now(), maxDeletes = 50, maxLookups = 20, remote = 'origin', signal = null }) {
-  const ls = await git(['ls-remote', '--refs', remote, `${CHECKPOINT_REF_PREFIX}*`]);
+export async function sweepStaleCheckpoints({ git, ownRef = null, ttlMs = DEFAULTS.ttlMs, graceMs = DEFAULTS.gcGraceMs, isTerminal = null, now = () => Date.now(), maxDeletes = 50, maxLookups = 20, remote = 'origin', signal = null, prefixes = SWEPT_REF_PREFIXES }) {
+  // Sweep EVERY nano-managed ref namespace, not just the WIP one. The GC-proof
+  // recovery refs (`refs/nano/recovered/*`, #295) are deliberately excluded from the
+  // WIP-only orphan reap so an SLA-cancelled escalation survives — but if nothing ever
+  // reclaims them they grow without bound (one snapshot ref/commit pinned per element
+  // instance, even for a transient failure later retried successfully). Reclaim both
+  // namespaces under the SAME policy: the `isTerminal` orphan probe spares a ref whose
+  // PROCESS is still active (the escalation is still pending), so an active escalation
+  // stays protected while a finished one — and the TTL backstop — is reclaimed.
+  const prefixList = (Array.isArray(prefixes) ? prefixes : [prefixes]).filter((p) => typeof p === 'string' && p);
+  if (!prefixList.length) return { scanned: 0, deleted: [] };
+  const prefixOf = (r) => prefixList.find((p) => r.startsWith(p)) || null;
+  const ls = await git(['ls-remote', '--refs', remote, ...prefixList.map((p) => `${p}*`)]);
   if (!ok(ls)) return { error: errText(ls), deleted: [] };
-  const entries = out(ls).split('\n').filter(Boolean).map((l) => { const [sha, ref] = l.split(/\s+/); return { sha, ref }; }).filter((e) => e.ref && e.ref !== ownRef);
+  const entries = out(ls).split('\n').filter(Boolean).map((l) => { const [sha, ref] = l.split(/\s+/); return { sha, ref }; })
+    .filter((e) => e.ref && e.ref !== ownRef && prefixOf(e.ref));
   if (!entries.length) return { scanned: 0, deleted: [] };
   const refs = entries.map((e) => e.ref);
-  const local = (r) => `refs/nano-gc/${r.slice(CHECKPOINT_REF_PREFIX.length)}`;
+  // Distinct local temp refs across namespaces: every swept prefix shares the
+  // `refs/nano/` root, so slicing it keeps `wip/<key>` and `recovered/<key>` apart
+  // (a bare key slice would collide a WIP ref with its recovery ref under one local).
+  const local = (r) => `refs/nano-gc/${r.startsWith(NANO_REF_ROOT) ? r.slice(NANO_REF_ROOT.length) : r.replace(/^refs\//, '')}`;
+  const keyOf = (r) => { const p = prefixOf(r); return p ? r.slice(p.length) : r; };
   const fetch = await git(['fetch', '--quiet', '--no-tags', '--no-write-fetch-head', remote, ...refs.map((r) => `+${r}:${local(r)}`)]);
   if (!ok(fetch)) return { error: errText(fetch), deleted: [] };
   const doomed = [];
@@ -897,7 +1134,7 @@ export async function sweepStaleCheckpoints({ git, ownRef = null, ttlMs = DEFAUL
       if (isTerminal && age > graceMs && lookups < maxLookups && !signal?.aborted) {
         lookups++;
         let terminal = false;
-        try { terminal = await isTerminal(ref.slice(CHECKPOINT_REF_PREFIX.length)); } catch { terminal = false; }
+        try { terminal = await isTerminal(keyOf(ref)); } catch { terminal = false; }
         if (terminal) doomed.push({ ref, sha, why: 'element-terminal' });
       }
     }
@@ -909,7 +1146,7 @@ export async function sweepStaleCheckpoints({ git, ownRef = null, ttlMs = DEFAUL
     let lastError = null;
     for (const d of doomed) {
       const r = await deleteCheckpointRef({ git, ref: d.ref, remote, expectSha: d.sha });
-      if (r.ok) deleted.push({ ref: d.ref, why: d.why });
+      if (r.ok) deleted.push({ ref: d.ref, sha: d.sha, why: d.why });
       else if (r.error) lastError = r.error;
     }
     const result = { scanned: refs.length, deleted };

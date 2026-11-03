@@ -488,7 +488,12 @@ every other code path stays Effect-free.
   `singleFlight`). Pieces: **worker registry + capability map** (`registry.ts`,
   per-type free-slot accounting), **capacity-gated activation** (`activation.ts`,
   one `raceAll` long-poll per serviceable-with-capacity type, `maxJobsToActivate=1`,
-  losers interrupted → lapse), **dispatch + lock lifecycle** (`dispatch.ts`, short
+  losers interrupted → lapse; a type's poll ERROR is retried inside that type's
+  loop with capped exponential backoff (`errorBackoffInitialMs`→`errorBackoffMaxMs`)
+  and never ends its branch — `raceAll` only fails once every branch has failed, so
+  an exiting branch would silently unsubscribe its type until another type got a
+  job; an empty poll answered sooner than `minEmptyPollIntervalMs` waits out the
+  remainder, so a non-long-polling engine can't cause a hot loop), **dispatch + lock lifecycle** (`dispatch.ts`, short
   lock → extend-winner-before-start → periodic extender; never touch a lapsed job),
   **cached reconcile** (`reconcile.ts`, fetch only new keys, skip the crawl when the
   key-set hash is unchanged), **parking lot** (`parking.ts`, promote-on-slot-free),

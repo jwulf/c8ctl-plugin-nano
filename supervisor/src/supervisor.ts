@@ -290,7 +290,9 @@ export const makeSupervisor = (deps: SupervisorDeps): Effect.Effect<Supervisor> 
                 ),
               );
             }
-            return activateWinner(deps.engine, targets, cfg.activation).pipe(
+            return activateWinner(deps.engine, targets, cfg.activation, (type, err, retryInMs) =>
+              logger.warn(`activation error — ${err.message} (type ${type} stays subscribed; retrying in ${retryInMs}ms)`),
+            ).pipe(
               Effect.flatMap((winners) => dispatchBatch(winners)),
               Effect.catch((err) =>
                 Effect.sync(() => logger.warn(`activation error — ${err.message}`)),

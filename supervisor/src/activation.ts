@@ -26,7 +26,7 @@
  * "let it lapse". Any winner in the returned batch that then cannot claim a slot
  * is parked by the caller — also never failed.
  */
-import { Duration, Effect } from "effect";
+import { Clock, Duration, Effect } from "effect";
 import type { ActivatedJob, EngineClient, SupervisorError } from "./ports.ts";
 
 export interface ActivationConfig {
@@ -36,6 +36,18 @@ export interface ActivationConfig {
   readonly initialLockMs: number;
   /** Spacing before re-polling a type that returned nothing (ms). 0 relies on the server long-poll. */
   readonly emptyPollBackoffMs: number;
+  /**
+   * Floor on how often ONE type may be re-polled after an empty answer (ms). An
+   * empty poll that returned sooner than this (the engine answered instead of
+   * holding the long-poll) waits out the remainder, so a server that stops
+   * honouring `requestTimeout` can't turn every type into a hot loop. A normal
+   * long-poll takes longer than the floor and is re-issued immediately.
+   */
+  readonly minEmptyPollIntervalMs: number;
+  /** First retry delay after a type's poll fails (ms); doubles per consecutive failure. */
+  readonly errorBackoffInitialMs: number;
+  /** Cap on the per-type retry delay after consecutive poll failures (ms). */
+  readonly errorBackoffMaxMs: number;
   /**
    * Upper bound on `maxJobsToActivate` for any single type's activation, even
    * when that type has more free slots. Bounds a single hot type's extra batch
@@ -48,8 +60,21 @@ export const defaultActivationConfig: ActivationConfig = {
   requestTimeoutMs: 10_000,
   initialLockMs: 15_000,
   emptyPollBackoffMs: 0,
+  minEmptyPollIntervalMs: 1_000,
+  errorBackoffInitialMs: 1_000,
+  errorBackoffMaxMs: 30_000,
   maxBatchPerType: 10,
 };
+
+/** Called each time one type's poll fails and is about to be retried. */
+export type PollErrorHandler = (type: string, error: SupervisorError, retryInMs: number) => void;
+
+/** Delay before retry N (1-based) of a failing type: initial × 2^(N-1), capped. */
+export const errorBackoffFor = (consecutiveFailures: number, cfg: ActivationConfig): number =>
+  Math.min(
+    Math.max(0, cfg.errorBackoffMaxMs),
+    Math.max(0, cfg.errorBackoffInitialMs) * 2 ** Math.max(0, Math.min(consecutiveFailures - 1, 30)),
+  );
 
 /** One serviceable type with its current free-slot count (the batch size to request). */
 export interface PollTarget {
@@ -66,22 +91,44 @@ const activateType = (
   type: string,
   maxJobs: number,
   cfg: ActivationConfig,
-): Effect.Effect<ReadonlyArray<ActivatedJob>, SupervisorError> =>
-  // Explicit constant-space loop (not self-recursion): re-poll on an empty
-  // return until jobs are leased, without building an ever-deeper Effect chain.
+  onPollError: PollErrorHandler,
+): Effect.Effect<ReadonlyArray<ActivatedJob>> =>
+  // A poll ERROR must never end this loop. `raceAll` only fails once EVERY branch
+  // has failed, so a branch that exits on error silently drops its type from the
+  // round: after an engine restart the worker kept polling only the few types
+  // whose poll happened to straddle the outage, until one of THEM got a job. So
+  // a failed poll is reported and retried with capped exponential backoff — the
+  // type stays subscribed, and a dead engine is probed at a falling rate instead
+  // of hammered. Interruption (this type lost the race) is not a failure and
+  // still ends the loop immediately.
   Effect.gen(function* () {
+    let consecutiveFailures = 0;
     while (true) {
-      const jobs = yield* engine.activate({
-        type,
-        maxJobsToActivate: maxJobs,
-        requestTimeoutMs: cfg.requestTimeoutMs,
-        lockMs: cfg.initialLockMs,
-      });
+      const startedAt = yield* Clock.currentTimeMillis;
+      const result = yield* engine
+        .activate({
+          type,
+          maxJobsToActivate: maxJobs,
+          requestTimeoutMs: cfg.requestTimeoutMs,
+          lockMs: cfg.initialLockMs,
+        })
+        .pipe(Effect.result);
+      if (result._tag === "Failure") {
+        consecutiveFailures += 1;
+        const retryInMs = errorBackoffFor(consecutiveFailures, cfg);
+        onPollError(type, result.failure, retryInMs);
+        yield* Effect.sleep(Duration.millis(retryInMs));
+        continue;
+      }
+      consecutiveFailures = 0;
+      const jobs = result.success;
       if (jobs.length > 0) {
         return jobs;
       }
-      if (cfg.emptyPollBackoffMs > 0) {
-        yield* Effect.sleep(Duration.millis(cfg.emptyPollBackoffMs));
+      const elapsedMs = (yield* Clock.currentTimeMillis) - startedAt;
+      const waitMs = Math.max(cfg.emptyPollBackoffMs, cfg.minEmptyPollIntervalMs - elapsedMs);
+      if (waitMs > 0) {
+        yield* Effect.sleep(Duration.millis(waitMs));
       }
     }
   });
@@ -101,11 +148,12 @@ export const activateWinner = (
   engine: EngineClient,
   targets: ReadonlyArray<PollTarget>,
   cfg: ActivationConfig,
+  onPollError: PollErrorHandler = () => {},
 ): Effect.Effect<ReadonlyArray<ActivatedJob>, SupervisorError> => {
   if (targets.length === 0) {
     return Effect.die(new Error("activateWinner: no serviceable-with-capacity types to poll"));
   }
   return Effect.raceAll(
-    targets.map((t) => activateType(engine, t.type, batchSizeFor(t.freeSlots, cfg), cfg)),
+    targets.map((t) => activateType(engine, t.type, batchSizeFor(t.freeSlots, cfg), cfg, onPollError)),
   );
 };

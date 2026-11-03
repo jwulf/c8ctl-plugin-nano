@@ -2,6 +2,7 @@ import assert from "node:assert/strict";
 import { test } from "node:test";
 import { Duration, Effect, Fiber } from "effect";
 import { TestClock } from "effect/testing";
+import { defaultActivationConfig } from "../src/activation.ts";
 import { makeSupervisor } from "../src/supervisor.ts";
 import { makeRegistry } from "../src/registry.ts";
 import { noopLogger } from "../src/ports.ts";
@@ -28,7 +29,7 @@ test("end-to-end: a job is activated, its worker claimed, winner extended, agent
         reconcileReader: reader,
         scan,
         logger: noopLogger,
-        config: { idleSpacingMs: 1_000, activation: { requestTimeoutMs: 10_000, initialLockMs: 15_000, emptyPollBackoffMs: 0, maxBatchPerType: 10 } },
+        config: { idleSpacingMs: 1_000, activation: { ...defaultActivationConfig, requestTimeoutMs: 10_000, initialLockMs: 15_000, emptyPollBackoffMs: 0, maxBatchPerType: 10 } },
       });
 
       const fiber = yield* Effect.forkChild(sup.run);
@@ -77,7 +78,7 @@ test("onFirstActivation fires exactly once on the first non-empty poll set (leas
         scan,
         logger: noopLogger,
         onFirstActivation: Effect.sync(() => { fired += 1; }),
-        config: { idleSpacingMs: 1_000, activation: { requestTimeoutMs: 60_000, initialLockMs: 15_000, emptyPollBackoffMs: 0, maxBatchPerType: 10 } },
+        config: { idleSpacingMs: 1_000, activation: { ...defaultActivationConfig, requestTimeoutMs: 60_000, initialLockMs: 15_000, emptyPollBackoffMs: 0, maxBatchPerType: 10 } },
       });
 
       const fiber = yield* Effect.forkChild(sup.run);
@@ -124,7 +125,7 @@ test("onFirstActivation does NOT fire while the worker has zero serviceable type
         logger: noopLogger,
         autoWorkerId: "w1", // reconcile rewrites w1's serviceable types
         onFirstActivation: Effect.sync(() => { fired += 1; }),
-        config: { idleSpacingMs: 1_000, reconcileIntervalMs: 5_000, activation: { requestTimeoutMs: 60_000, initialLockMs: 15_000, emptyPollBackoffMs: 0, maxBatchPerType: 10 } },
+        config: { idleSpacingMs: 1_000, reconcileIntervalMs: 5_000, activation: { ...defaultActivationConfig, requestTimeoutMs: 60_000, initialLockMs: 15_000, emptyPollBackoffMs: 0, maxBatchPerType: 10 } },
       });
 
       const fiber = yield* Effect.forkChild(sup.run);
@@ -171,7 +172,7 @@ test("a throwing onFirstActivation is swallowed — the loop keeps activating (#
         scan,
         logger: noopLogger,
         onFirstActivation: Effect.sync(() => { fired += 1; throw new Error("marker write failed"); }),
-        config: { idleSpacingMs: 1_000, activation: { requestTimeoutMs: 10_000, initialLockMs: 15_000, emptyPollBackoffMs: 0, maxBatchPerType: 10 } },
+        config: { idleSpacingMs: 1_000, activation: { ...defaultActivationConfig, requestTimeoutMs: 10_000, initialLockMs: 15_000, emptyPollBackoffMs: 0, maxBatchPerType: 10 } },
       });
 
       const fiber = yield* Effect.forkChild(sup.run);

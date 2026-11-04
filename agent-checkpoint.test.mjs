@@ -1158,19 +1158,31 @@ const remoteRefs = (f, prefix) => sh(f.root, '--git-dir', f.remote, 'for-each-re
   .split('\n').filter(Boolean).map((l) => { const [ref, sha] = l.split(' '); return { ref, sha }; });
 const DAY = 86_400_000;
 const AW = 'refs/heads/nano/agent-work/';
+// Distinct generated per-run fallback tokens (UUIDs) for the GC tests — provisioning only cuts
+// `nano/agent-work/<base>-<runId>` names, and the sweep ignores anything without that shape.
+const TKN = {
+  merged: '11111111-1111-4111-8111-111111111111',
+  fresh: '22222222-2222-4222-8222-222222222222',
+  orphan: '33333333-3333-4333-8333-333333333333',
+  sibling: '44444444-4444-4444-8444-444444444444',
+  pr: '55555555-5555-4555-8555-555555555555',
+  x: '66666666-6666-4666-8666-666666666666',
+  race: '77777777-7777-4777-8777-777777777777',
+  stablehome: '88888888-8888-4888-8888-888888888888',
+};
 
 test('agent-work GC: stale branch whose tip is contained in another branch is deleted; fresh one kept; temp refs cleaned', async () => {
   const f = fixture();
   try {
     const w = f.clone('w');
     const put = agentWorkPusher(w);
-    const mergedSha = put('main-merged', 8 * DAY, 'merged');
+    const mergedSha = put(`main-${TKN.merged}`, 8 * DAY, 'merged');
     // The work landed on a real PR branch: that branch contains the fallback tip.
     sh(w.dir, 'push', '-q', 'origin', `${mergedSha}:refs/heads/feat/real-pr`);
-    put('main-fresh', 60_000, 'recent');
+    put(`main-${TKN.fresh}`, 60_000, 'recent');
     const r = await sweepStaleAgentWorkBranches({ git: w.git, ttlMs: 7 * DAY, hasOpenPr: async () => false });
-    assert.deepEqual(r.deleted.map((d) => `${d.ref}:${d.why}`), [`${AW}main-merged:merged`]);
-    assert.deepEqual(remoteRefs(f, AW).map((e) => e.ref), [`${AW}main-fresh`]);
+    assert.deepEqual(r.deleted.map((d) => `${d.ref}:${d.why}`), [`${AW}main-${TKN.merged}:merged`]);
+    assert.deepEqual(remoteRefs(f, AW).map((e) => e.ref), [`${AW}main-${TKN.fresh}`]);
     assert.deepEqual(remoteRefs(f, 'refs/nano/archive/'), [], 'contained work needs no archive');
     assert.equal(sh(w.dir, 'for-each-ref', 'refs/nano-gc/'), '', 'temporary GC refs are cleaned up');
   } finally { f.cleanup(); }
@@ -1181,14 +1193,14 @@ test('agent-work GC: stale branch whose work exists NOWHERE else is archived (no
   try {
     const w = f.clone('w');
     const put = agentWorkPusher(w);
-    const sha = put('main-orphan', 8 * DAY, 'only copy');
+    const sha = put(`main-${TKN.orphan}`, 8 * DAY, 'only copy');
     // A (fresh) sibling FALLBACK branch containing the tip is itself a GC candidate, not a safe home.
-    put('main-sibling', 60_000, 'built on top', { from: sha });
+    put(`main-${TKN.sibling}`, 60_000, 'built on top', { from: sha });
     const NOW = Date.now();
     const r = await sweepStaleAgentWorkBranches({ git: w.git, ttlMs: 7 * DAY, now: () => NOW, hasOpenPr: async () => false });
-    assert.deepEqual(r.deleted.map((d) => `${d.ref}:${d.why}`), [`${AW}main-orphan:archived`]);
-    assert.deepEqual(remoteRefs(f, AW).map((e) => e.ref), [`${AW}main-sibling`], 'the branch is gone from the branch list');
-    assert.deepEqual(remoteRefs(f, 'refs/nano/archive/'), [{ ref: `refs/nano/archive/agent-work/${NOW}/main-orphan`, sha }],
+    assert.deepEqual(r.deleted.map((d) => `${d.ref}:${d.why}`), [`${AW}main-${TKN.orphan}:archived`]);
+    assert.deepEqual(remoteRefs(f, AW).map((e) => e.ref), [`${AW}main-${TKN.sibling}`], 'the branch is gone from the branch list');
+    assert.deepEqual(remoteRefs(f, 'refs/nano/archive/'), [{ ref: `refs/nano/archive/agent-work/${NOW}/main-${TKN.orphan}`, sha }],
       'the unmerged tip is preserved under the archive namespace');
   } finally { f.cleanup(); }
 });
@@ -1197,14 +1209,14 @@ test('agent-work GC: a stale branch that heads an open PR is never touched (dele
   const f = fixture();
   try {
     const w = f.clone('w');
-    const sha = agentWorkPusher(w)('main-pr', 8 * DAY, 'awaiting review');
+    const sha = agentWorkPusher(w)(`main-${TKN.pr}`, 8 * DAY, 'awaiting review');
     sh(w.dir, 'push', '-q', 'origin', `${sha}:refs/heads/other`); // even when contained elsewhere
     const asked = [];
     const r = await sweepStaleAgentWorkBranches({ git: w.git, ttlMs: 7 * DAY, hasOpenPr: async (b) => { asked.push(b); return true; } });
-    assert.deepEqual(asked, ['nano/agent-work/main-pr']);
+    assert.deepEqual(asked, [`nano/agent-work/main-${TKN.pr}`]);
     assert.deepEqual(r.deleted, []);
     assert.deepEqual(r.kept.map((k) => k.why), ['open-pr']);
-    assert.deepEqual(remoteRefs(f, AW).map((e) => e.ref), [`${AW}main-pr`]);
+    assert.deepEqual(remoteRefs(f, AW).map((e) => e.ref), [`${AW}main-${TKN.pr}`]);
   } finally { f.cleanup(); }
 });
 
@@ -1213,7 +1225,7 @@ test('agent-work GC fails closed when open-PR status is unknown (no lookup, look
     const f = fixture();
     try {
       const w = f.clone('w');
-      agentWorkPusher(w)('main-x', 8 * DAY, 'x');
+      agentWorkPusher(w)(`main-${TKN.x}`, 8 * DAY, 'x');
       const r = await sweepStaleAgentWorkBranches({ git: w.git, ttlMs: 7 * DAY, hasOpenPr });
       assert.deepEqual(r.deleted, []);
       assert.deepEqual(r.kept.map((k) => k.why), ['pr-unknown']);
@@ -1243,20 +1255,58 @@ test('agent-work GC delete is leased: a branch advanced after the scan is left i
   try {
     const w = f.clone('w');
     const put = agentWorkPusher(w);
-    const ref = `${AW}main-race`;
-    const old = put('main-race', 8 * DAY, 'old');
+    const ref = `${AW}main-${TKN.race}`;
+    const old = put(`main-${TKN.race}`, 8 * DAY, 'old');
     sh(w.dir, 'push', '-q', 'origin', `${old}:refs/heads/landed`); // contained -> doomed as merged
     let moved = false;
     const git = async (args, opts) => {
       if (!moved && args[0] === 'push' && args.includes(`:${ref}`)) {
         moved = true;
-        put('main-race', 60_000, 'newer', { from: old });
+        put(`main-${TKN.race}`, 60_000, 'newer', { from: old });
       }
       return w.git(args, opts);
     };
     const r = await sweepStaleAgentWorkBranches({ git, ttlMs: 7 * DAY, hasOpenPr: async () => false });
     assert.deepEqual(r.deleted, [], 'a branch advanced after the scan is not race-deleted');
     assert.ok(remoteRefs(f, AW).some((e) => e.ref === ref), 'the advanced branch survives the race');
+  } finally { f.cleanup(); }
+});
+
+test('agent-work GC: a stable (non-generated) branch under the namespace is never a candidate, however old', async () => {
+  const f = fixture();
+  try {
+    const w = f.clone('w');
+    const put = agentWorkPusher(w);
+    // A REAL branch that merely lives under nano/agent-work/ — no generated <base>-<runToken>
+    // identity. Age alone must never authorise deleting it (Copilot discussion_r4109717425).
+    put('my-feature', 400 * DAY, 'stable work');
+    const asked = [];
+    const r = await sweepStaleAgentWorkBranches({
+      git: w.git, ttlMs: 7 * DAY,
+      hasOpenPr: async (b) => { asked.push(b); return false; },
+    });
+    assert.deepEqual(r.deleted, [], 'a stable branch is never deleted');
+    assert.deepEqual(r.scanned, 0, 'a stable branch is not even scanned as a candidate');
+    assert.deepEqual(asked, [], 'a stable branch never reaches the open-PR lookup');
+    assert.deepEqual(r.kept.map((k) => `${k.ref}:${k.why}`), [`${AW}my-feature:not-a-fallback`]);
+    assert.deepEqual(remoteRefs(f, AW).map((e) => e.ref), [`${AW}my-feature`]);
+    assert.deepEqual(remoteRefs(f, 'refs/nano/archive/'), [], 'a stable branch is never archived');
+  } finally { f.cleanup(); }
+});
+
+test('agent-work GC: a stable namespace branch is a safe containment home for a fallback tip', async () => {
+  const f = fixture();
+  try {
+    const w = f.clone('w');
+    const put = agentWorkPusher(w);
+    // The fallback's work was merged INTO a stable nano/agent-work/ branch. The stable branch is
+    // not a GC candidate, so the fallback tip contained in it is safe to reclaim as 'merged'.
+    const sha = put(`main-${TKN.stablehome}`, 8 * DAY, 'landed on a stable branch');
+    sh(w.dir, 'push', '-q', 'origin', `${sha}:refs/heads/nano/agent-work/stable`);
+    const r = await sweepStaleAgentWorkBranches({ git: w.git, ttlMs: 7 * DAY, hasOpenPr: async () => false });
+    assert.deepEqual(r.deleted.map((d) => `${d.ref}:${d.why}`), [`${AW}main-${TKN.stablehome}:merged`]);
+    assert.deepEqual(remoteRefs(f, AW).map((e) => e.ref).sort(), [`${AW}stable`]);
+    assert.deepEqual(remoteRefs(f, 'refs/nano/archive/'), [], 'contained in a stable branch — no archive needed');
   } finally { f.cleanup(); }
 });
 

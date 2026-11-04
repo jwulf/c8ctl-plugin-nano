@@ -3261,7 +3261,12 @@ function capStdoutTail(s) {
 }
 
 // #301: statuses that already report an honest non-success; left untouched.
-const HONEST_NON_SUCCESS_STATUSES = new Set(['blocked', 'escalated', 'failed', 'incomplete']);
+// `needs_input` belongs here too: it is a supported non-success result that
+// carries the actual `question` a human must answer. Rewriting it to `blocked`
+// would replace that question with the generic budget-retry prompt and lose the
+// information needed to unblock the task (Copilot review on #302, "previously
+// missed" — see agent-workers.test.mjs for needs_input as a supported status).
+const HONEST_NON_SUCCESS_STATUSES = new Set(['blocked', 'escalated', 'failed', 'incomplete', 'needs_input']);
 export function isWorkDelivered(git) {
   if (!git) return false;
   // A PR only proves delivery while it is OPEN or MERGED. `reconcileAgentPr`

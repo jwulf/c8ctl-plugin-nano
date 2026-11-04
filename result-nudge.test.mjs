@@ -477,6 +477,21 @@ test('#302 a max_turn_requests "completed" backed only by a closed PR is downgra
   assert.equal(downgradeBudgetStopResult(raw, { stopReason: 'max_turn_requests', git: { pr: { found: true, state: 'OPEN' } } }), raw);
 });
 
+// "Previously missed" (Copilot review on #302, round 3): `needs_input` is a
+// supported non-success status carrying the actual `question` a human must
+// answer. A budget-cut `needs_input` must be preserved, not rewritten to
+// `blocked` with the generic budget-retry question (which loses the real one).
+test('#302 a max_turn_requests needs_input keeps its status and question', async () => {
+  const { downgradeBudgetStopResult } = await import('./c8ctl-plugin.js');
+  const raw = { status: 'needs_input', summary: 'need a base branch', question: 'which base branch?' };
+  // No delivery → still preserved (needs_input is an honest non-success).
+  assert.equal(downgradeBudgetStopResult(raw, { stopReason: 'max_turn_requests', git: null }), raw);
+  assert.equal(downgradeBudgetStopResult(raw, { stopReason: 'max_tokens', git: { pushed: false, commits: [] } }), raw);
+  // A claimed success is still downgraded (needs_input does not mask it).
+  const done = { status: 'completed', summary: 'done' };
+  assert.equal(downgradeBudgetStopResult(done, { stopReason: 'max_turn_requests', git: null }).status, 'blocked');
+});
+
 // discussion_r4464312610: the nudge turn's OWN stopReason must propagate so the
 // delivery check fires when EITHER turn was cut off.
 test('#302 resolveAgentResultWithNudge propagates the nudge turn stopReason', async () => {

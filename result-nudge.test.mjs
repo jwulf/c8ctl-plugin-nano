@@ -357,3 +357,210 @@ test('a nudge is delivered as the raw prompt string in ACP mode', () => {
   // ACP writes stdin verbatim as the session/prompt text — it must be the raw nudge.
   assert.equal(stdin, nudge);
 });
+
+// #301: a turn cut off by its budget (max_turn_requests) must not be nudged into
+// a false "completed".
+test('#301 acpStopReasonFrom / isTruncatedStopReason', async () => {
+  const { acpStopReasonFrom, isTruncatedStopReason } = await import('./c8ctl-plugin.js');
+  assert.equal(acpStopReasonFrom({ stopReason: 'max_turn_requests' }), 'max_turn_requests');
+  assert.equal(acpStopReasonFrom({}), null);
+  assert.equal(isTruncatedStopReason('end_turn'), false);
+  assert.equal(isTruncatedStopReason(null), false);
+  assert.equal(isTruncatedStopReason('max_turn_requests'), true);
+  assert.equal(isTruncatedStopReason('max_tokens'), true);
+});
+
+test('#301 end_turn nudge no longer asserts completion and allows blocked', () => {
+  const p = buildResultNudgePrompt('prior', { stopReason: 'end_turn' });
+  assert.doesNotMatch(p, /You already completed the task/);
+  assert.match(p, /blocked/);
+});
+
+test('#301 max_turn_requests sends a budget continuation, not the "already completed" nudge', async () => {
+  const { dir, file } = tmpResultFile();
+  try {
+    let sent = null;
+    const lines = [];
+    const out = await resolveAgentResultWithNudge({
+      result: { ok: true, stdout: 'working… stopped after 300 LLM calls', stopReason: 'max_turn_requests' },
+      resultFile: file,
+      logger: { info: (m) => lines.push(m), warn: (m) => lines.push(m) },
+      rerun: async (text) => { sent = text; writeFileSync(file, JSON.stringify({ status: 'completed' })); return { ok: true, stdout: 'done' }; },
+    });
+    assert.equal(out.nudged, true);
+    assert.doesNotMatch(sent, /You already completed/);
+    assert.doesNotMatch(sent, /Do NOT redo the work, re-run tools, edit files, push/);
+    assert.match(sent, /CUT OFF/);
+    assert.match(sent, /max_turn_requests/);
+    assert.match(sent, /commit/);
+    assert.ok(lines.some((l) => /stopReason=max_turn_requests/.test(l)), 'stop reason is logged');
+  } finally { rmSync(dir, { recursive: true, force: true }); }
+});
+
+test('#301 a max_turn_requests "completed" without delivery is downgraded to blocked', async () => {
+  const { downgradeBudgetStopResult } = await import('./c8ctl-plugin.js');
+  const raw = { status: 'completed', summary: 'all green' };
+  const noGit = downgradeBudgetStopResult(raw, { stopReason: 'max_turn_requests', git: null });
+  assert.equal(noGit.status, 'blocked');
+  assert.equal(noGit.claimedStatus, 'completed');
+  assert.equal(noGit.stopReason, 'max_turn_requests');
+  assert.match(noGit.question, /max_turn_requests/);
+  const notPushed = downgradeBudgetStopResult(raw, { stopReason: 'max_turn_requests', git: { commits: [], pushed: false } });
+  assert.equal(notPushed.status, 'blocked');
+  assert.equal(downgradeBudgetStopResult(null, { stopReason: 'max_tokens' }).status, 'blocked');
+  // Delivered → untouched. (An OPEN PR proves delivery; a bare `found` with no
+  // state fails closed — see the #302 isWorkDelivered tests below.)
+  assert.equal(downgradeBudgetStopResult(raw, { stopReason: 'max_turn_requests', git: { pr: { found: true, number: 1, state: 'OPEN' } } }), raw);
+  assert.equal(downgradeBudgetStopResult(raw, { stopReason: 'max_turn_requests', git: { commits: ['a'], pushed: true } }), raw);
+  // end_turn / absent → untouched; honest blocked → untouched.
+  assert.equal(downgradeBudgetStopResult(raw, { stopReason: 'end_turn' }), raw);
+  assert.equal(downgradeBudgetStopResult(raw, {}), raw);
+  const blocked = { status: 'blocked', question: 'q' };
+  assert.equal(downgradeBudgetStopResult(blocked, { stopReason: 'max_turn_requests' }), blocked);
+});
+
+test('#301 buildResultEnvelope records stopReason', async () => {
+  const { buildResultEnvelope } = await import('./c8ctl-plugin.js');
+  if (typeof buildResultEnvelope !== 'function') return;
+  const env = buildResultEnvelope({ ok: true, stdout: '', stopReason: 'max_turn_requests', budgetDowngraded: true }, {});
+  assert.equal(env.stopReason, 'max_turn_requests');
+  assert.equal(env.budgetDowngraded, true);
+});
+
+// --- Copilot review on #302 (round 2) ---------------------------------------
+
+// discussion_r4464312531: a budget-cut continuation must NOT tell the agent to
+// push — the fresh nudge session runs without the task's branch/push policy, so
+// a push could bypass `branch.push=false` / publish to the base. Commit locally
+// only; the harness (finalizeGit) pushes when the task allows it.
+test('#302 the budget-continuation nudge asks for a LOCAL commit only, never a push', () => {
+  const p = buildResultNudgePrompt('prior', { stopReason: 'max_turn_requests' });
+  assert.match(p, /commit/i, 'still asks the agent to preserve work by committing');
+  assert.match(p, /do NOT push/i, 'explicitly forbids the push');
+  assert.doesNotMatch(p, /and push them to your branch/i, 'the old "commit and push" instruction is gone');
+});
+
+// discussion_r4464312576: `reconcileAgentPr` searches `--state all`, so a CLOSED,
+// unmerged PR on the branch must NOT count as delivery proof — only OPEN/MERGED.
+test('#302 isWorkDelivered excludes closed, unmerged PRs from the delivery proof', async () => {
+  const { isWorkDelivered } = await import('./c8ctl-plugin.js');
+  // No git at all → not delivered.
+  assert.equal(isWorkDelivered(null), false);
+  assert.equal(isWorkDelivered(undefined), false);
+  // Open / merged PR → delivered.
+  assert.equal(isWorkDelivered({ pr: { found: true, state: 'OPEN' } }), true);
+  assert.equal(isWorkDelivered({ pr: { found: true, state: 'MERGED' } }), true);
+  // Closed, unmerged PR with no pushed commits → NOT delivered.
+  assert.equal(isWorkDelivered({ pr: { found: true, state: 'CLOSED' } }), false);
+  // A closed PR must not mask the commit proof either way.
+  assert.equal(isWorkDelivered({ pr: { found: true, state: 'CLOSED' }, pushed: true, commits: ['a'] }), true,
+    'pushed commits still prove delivery even alongside a closed PR');
+  assert.equal(isWorkDelivered({ pr: { found: true, state: 'CLOSED' }, pushed: false, commits: [] }), false);
+  // An unknown/absent PR state fails closed (not delivered on the PR alone).
+  assert.equal(isWorkDelivered({ pr: { found: true } }), false);
+  // Commit proof unchanged (no PR).
+  assert.equal(isWorkDelivered({ pushed: true, commits: ['a'] }), true);
+  assert.equal(isWorkDelivered({ pushed: false, commits: ['a'] }), false);
+  assert.equal(isWorkDelivered({ pushed: true, commits: [] }), false);
+});
+
+// discussion_r4464312576 (cont.): a budget-cut "completed" whose only "delivery"
+// is a closed, unmerged PR is downgraded to blocked.
+test('#302 a max_turn_requests "completed" backed only by a closed PR is downgraded to blocked', async () => {
+  const { downgradeBudgetStopResult } = await import('./c8ctl-plugin.js');
+  const raw = { status: 'completed', summary: 'done' };
+  const closedPr = { pr: { found: true, state: 'CLOSED', number: 7 }, pushed: false, commits: [] };
+  const out = downgradeBudgetStopResult(raw, { stopReason: 'max_turn_requests', git: closedPr });
+  assert.equal(out.status, 'blocked', 'a closed, unmerged PR is not delivery — downgrade to blocked');
+  assert.equal(out.claimedStatus, 'completed');
+  // An OPEN PR still counts as delivered → untouched.
+  assert.equal(downgradeBudgetStopResult(raw, { stopReason: 'max_turn_requests', git: { pr: { found: true, state: 'OPEN' } } }), raw);
+});
+
+// "Previously missed" (Copilot review on #302, round 3): `needs_input` is a
+// supported non-success status carrying the actual `question` a human must
+// answer. A budget-cut `needs_input` must be preserved, not rewritten to
+// `blocked` with the generic budget-retry question (which loses the real one).
+test('#302 a max_turn_requests needs_input keeps its status and question', async () => {
+  const { downgradeBudgetStopResult } = await import('./c8ctl-plugin.js');
+  const raw = { status: 'needs_input', summary: 'need a base branch', question: 'which base branch?' };
+  // No delivery → still preserved (needs_input is an honest non-success).
+  assert.equal(downgradeBudgetStopResult(raw, { stopReason: 'max_turn_requests', git: null }), raw);
+  assert.equal(downgradeBudgetStopResult(raw, { stopReason: 'max_tokens', git: { pushed: false, commits: [] } }), raw);
+  // A claimed success is still downgraded (needs_input does not mask it).
+  const done = { status: 'completed', summary: 'done' };
+  assert.equal(downgradeBudgetStopResult(done, { stopReason: 'max_turn_requests', git: null }).status, 'blocked');
+});
+
+// discussion_r4464312610: the nudge turn's OWN stopReason must propagate so the
+// delivery check fires when EITHER turn was cut off.
+test('#302 resolveAgentResultWithNudge propagates the nudge turn stopReason', async () => {
+  const { dir, file } = tmpResultFile();
+  try {
+    // First turn ended cleanly (end_turn) but dropped its result; the nudge turn
+    // is ITSELF cut off (max_turn_requests) after writing "completed". The
+    // effective stopReason must be the nudge's truncated reason.
+    const result = { ok: true, stdout: 'did work, dropped result', stopReason: 'end_turn' };
+    const rerun = async () => {
+      writeFileSync(file, JSON.stringify({ status: 'completed' }));
+      return { ok: true, stdout: 'wrote result', stopReason: 'max_turn_requests' };
+    };
+    const out = await resolveAgentResultWithNudge({ result, resultFile: file, rerun });
+    assert.equal(out.nudged, true);
+    assert.equal(out.stopReason, 'max_turn_requests', 'the truncated nudge reason becomes the effective reason');
+    assert.equal(out.nudgeStopReason, 'max_turn_requests', 'the nudge turn own reason is surfaced for audit');
+  } finally {
+    rmSync(dir, { recursive: true, force: true });
+  }
+});
+
+test('#302 a clean nudge keeps the first turn stopReason as the effective one', async () => {
+  const { dir, file } = tmpResultFile();
+  try {
+    // First turn was budget-cut; the nudge turn ends cleanly. The effective reason
+    // stays the first turn's truncated reason (the nudge recovered the result).
+    const result = { ok: true, stdout: 'cut off mid-work', stopReason: 'max_turn_requests' };
+    const rerun = async () => {
+      writeFileSync(file, JSON.stringify({ status: 'blocked', summary: 'partial', question: 'continue?' }));
+      return { ok: true, stdout: 'done', stopReason: 'end_turn' };
+    };
+    const out = await resolveAgentResultWithNudge({ result, resultFile: file, rerun });
+    assert.equal(out.stopReason, 'max_turn_requests', 'a clean nudge does not erase the first turn truncated reason');
+    assert.equal(out.nudgeStopReason, 'end_turn', 'the nudge own reason is still recorded');
+  } finally {
+    rmSync(dir, { recursive: true, force: true });
+  }
+});
+
+test('#302 the downgrade check applies when the NUDGE turn was cut off (first turn end_turn)', async () => {
+  // End-to-end of the review scenario: first turn end_turn + dropped result, the
+  // nudge writes status:"completed" but is cut off (max_turn_requests) and no PR /
+  // pushed commits exist. Feeding the propagated effective stopReason into the
+  // downgrade must turn the false "completed" into "blocked".
+  const { downgradeBudgetStopResult } = await import('./c8ctl-plugin.js');
+  const { dir, file } = tmpResultFile();
+  try {
+    const result = { ok: true, stdout: 'did work, dropped result', stopReason: 'end_turn' };
+    const rerun = async () => {
+      writeFileSync(file, JSON.stringify({ status: 'completed', summary: 'all done' }));
+      return { ok: true, stdout: 'wrote result', stopReason: 'max_turn_requests' };
+    };
+    const { stopReason: effectiveStopReason } = await resolveAgentResultWithNudge({ result, resultFile: file, rerun });
+    // The caller feeds the effective reason into the delivery check.
+    const { readAgentResultFile } = await import('./c8ctl-plugin.js');
+    const raw = readAgentResultFile(file);
+    const honest = downgradeBudgetStopResult(raw, { stopReason: effectiveStopReason, git: { pr: null, pushed: false, commits: [] } });
+    assert.equal(honest.status, 'blocked', 'a nudge cut off after a false "completed" is downgraded');
+    assert.equal(honest.claimedStatus, 'completed');
+  } finally {
+    rmSync(dir, { recursive: true, force: true });
+  }
+});
+
+test('#302 buildResultEnvelope records the nudge stopReason', async () => {
+  const { buildResultEnvelope } = await import('./c8ctl-plugin.js');
+  if (typeof buildResultEnvelope !== 'function') return;
+  const env = buildResultEnvelope({ ok: true, stdout: '', stopReason: 'max_turn_requests', nudgeStopReason: 'max_turn_requests' }, {});
+  assert.equal(env.stopReason, 'max_turn_requests');
+  assert.equal(env.nudgeStopReason, 'max_turn_requests', 'the nudge turn reason reaches the audit envelope');
+});

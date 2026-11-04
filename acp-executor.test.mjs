@@ -118,6 +118,9 @@ function finish(stopReason, extra) {
   writeResult(extra);
   // FAKE_OUTCOME: report an end-of-task outcome in the prompt result (as rusty-harness does).
   const outcome = process.env.FAKE_OUTCOME ? { _meta: { outcome: JSON.parse(process.env.FAKE_OUTCOME) } } : {};
+  // FAKE_STOP_REASON: override the turn's stopReason (e.g. max_turn_requests) so the
+  // ACP response -> run-result handoff of stopReason is exercised end-to-end (#301).
+  if (process.env.FAKE_STOP_REASON) stopReason = process.env.FAKE_STOP_REASON;
   if (promptId != null) send({ jsonrpc: '2.0', id: promptId, result: { stopReason, ...outcome } });
   // FAKE_TAIL: after the turn resolves, leave a non-newline-terminated tail on
   // stdout, then exit 0. stdout is a pure newline-delimited JSON-RPC stream, so
@@ -859,6 +862,18 @@ test('spawnCaptureAcp surfaces the prompt result _meta.outcome as acpOutcome', a
   const plain = await run({});
   assert.equal(plain.ok, true, plain.error || plain.stderr);
   assert.equal('acpOutcome' in plain, false, 'no outcome → result shape unchanged');
+});
+
+test('spawnCaptureAcp propagates the session/prompt stopReason into the run result (#301 handoff)', async () => {
+  const run = (env) => spawnCaptureAcp({ command: 'node', args: [FAKE_AGENT], cwd: workRoot, env: { ...baseEnv(), ...env }, stdinData: 'go', timeoutMs: 20_000 });
+  for (const reason of ['max_turn_requests', 'max_tokens']) {
+    const cut = await run({ FAKE_STOP_REASON: reason });
+    assert.equal(cut.ok, true, cut.error || cut.stderr);
+    assert.equal(cut.stopReason, reason, `a budget-cut turn must surface stopReason=${reason}`);
+  }
+  const normal = await run({});
+  assert.equal(normal.ok, true, normal.error || normal.stderr);
+  assert.equal(normal.stopReason, 'end_turn');
 });
 
 test('workAgent handoff: resolveEffectiveEnvelope\'s plan feeds acpSessionNewParams as session/new _meta.plan', async () => {

@@ -3191,11 +3191,14 @@ function buildResultNudgePrompt(priorStdout, { hasResultFile = true, stopReason 
         'You did NOT emit a machine-readable result, and the task may be INCOMPLETE.',
         '',
         'Do not start new work. If you have uncommitted changes that belong to the task,',
-        'commit (`git commit -s`) and push them to your branch so they are not lost.',
+        'commit them LOCALLY (`git commit -s`) so they are not lost — do NOT push:',
+        'this turn runs without the task\'s branch/push policy, and the harness pushes',
+        'for you afterwards when the task allows it (a push here could bypass that',
+        'policy and publish to the wrong branch).',
         'Then report your TRUE status as a single flat JSON object of result variables.',
         'Use "blocked" (with a "summary" and a "question" explaining what remains) unless',
         'you actually delivered the full task (e.g. the PR is open). Never claim',
-        '"completed" for work that was not committed, pushed and delivered.',
+        '"completed" for work that was not committed and delivered.',
         '',
       ]
     : [
@@ -3261,7 +3264,18 @@ function capStdoutTail(s) {
 const HONEST_NON_SUCCESS_STATUSES = new Set(['blocked', 'escalated', 'failed', 'incomplete']);
 export function isWorkDelivered(git) {
   if (!git) return false;
-  if (git.pr?.found) return true;
+  // A PR only proves delivery while it is OPEN or MERGED. `reconcileAgentPr`
+  // searches `--state all`, so `found: true` also matches a CLOSED, unmerged PR
+  // — e.g. an old, abandoned PR on the same branch. Treating that as delivered
+  // would leave a claimed `completed` result unchanged for work that never
+  // shipped, so a closed-unmerged PR is NOT delivery proof (Copilot review on
+  // #302, discussion_r4464312576). `state` is the gh `pr list` field
+  // (OPEN/CLOSED/MERGED); an absent/unknown state fails closed (not delivered).
+  if (git.pr?.found) {
+    const state = typeof git.pr.state === 'string' ? git.pr.state.trim().toUpperCase() : '';
+    if (state === 'OPEN' || state === 'MERGED') return true;
+    // CLOSED (unmerged) or unknown: fall through to the commit proof below.
+  }
   return git.pushed === true && Array.isArray(git.commits) && git.commits.length > 0;
 }
 // Given the picked raw result of a run whose ACP turn ended with `stopReason`,
@@ -3332,13 +3346,22 @@ async function resolveAgentResultWithNudge({ result, resultFile, rerun, logger, 
   // no-nudge early return above).
   const truncated = result?.truncated === true || capped.truncated;
   const recovered = hasUsableResult(readAgentResultFile(resultFile) ?? parseResultFromStdout(stdout));
+  // The nudge turn has its OWN ACP `stopReason` (#301, Copilot review on #302,
+  // discussion_r4464312610). It must NOT be discarded: when the first turn ended
+  // cleanly (`end_turn`) but the NUDGE was itself cut off (`max_turn_requests`,
+  // `max_tokens`, …) after writing `status:"completed"`, the delivery check must
+  // still see a truncated reason or it would permit completion without delivery
+  // and the logs/audit would show only the first turn's reason. Prefer the
+  // nudge's reason when it is truncated; otherwise keep the first turn's.
+  const nudgeStopReason = nudge && typeof nudge.stopReason === 'string' && nudge.stopReason.trim() ? nudge.stopReason.trim() : null;
+  const effectiveStopReason = (isTruncatedStopReason(nudgeStopReason) ? nudgeStopReason : null) ?? stopReason;
   if (nudgeError && logger?.warn) {
     logger.warn(`${logPrefix} re-emit nudge rerun threw — ${nudgeError?.message ?? nudgeError}`);
   }
   if (logger?.info) {
     logger.info(recovered
-      ? `${logPrefix} no result on the first turn${stopReason ? ` (stopReason=${stopReason})` : ''} — recovered it via one ${isTruncatedStopReason(stopReason) ? 'budget-continuation' : 're-emit'} nudge`
-      : `${logPrefix} no result on the first turn${stopReason ? ` (stopReason=${stopReason})` : ''} — ${isTruncatedStopReason(stopReason) ? 'budget-continuation' : 're-emit'} nudge did not recover one`);
+      ? `${logPrefix} no result on the first turn${stopReason ? ` (stopReason=${stopReason})` : ''} — recovered it via one ${isTruncatedStopReason(stopReason) ? 'budget-continuation' : 're-emit'} nudge${nudgeStopReason ? ` (nudge stopReason=${nudgeStopReason})` : ''}`
+      : `${logPrefix} no result on the first turn${stopReason ? ` (stopReason=${stopReason})` : ''} — ${isTruncatedStopReason(stopReason) ? 'budget-continuation' : 're-emit'} nudge did not recover one${nudgeStopReason ? ` (nudge stopReason=${nudgeStopReason})` : ''}`);
   }
   // Propagate the rerun turn's OWN validated ACP outcome back to the caller (#263):
   // the nudge is a continuation, so a fresh `_meta.outcome` it reports (e.g. a
@@ -3352,7 +3375,7 @@ async function resolveAgentResultWithNudge({ result, resultFile, rerun, logger, 
   // agent work (thread 4118913047).
   const transcriptFloorOnly = result?.acpTranscriptFloorOnly === true
     && (!nudgeOut.trim() || nudge?.acpTranscriptFloorOnly === true);
-  return { stdout, nudged: true, truncated, acpOutcome: nudge?.acpOutcome ?? result?.acpOutcome ?? null, transcriptFloorOnly };
+  return { stdout, nudged: true, truncated, acpOutcome: nudge?.acpOutcome ?? result?.acpOutcome ?? null, transcriptFloorOnly, stopReason: effectiveStopReason, nudgeStopReason };
 }
 
 function coerceBool(v, dflt = false) {
@@ -10199,8 +10222,11 @@ function buildResultEnvelope(result, { sandbox, image, git, result: agentResult,
   // The agent's explicit ACP end-of-task report (`_meta.outcome`), host-recorded
   // alongside whatever result vars it returned.
   if (result.acpOutcome) env.outcome = result.acpOutcome;
-  // #301: why the (first) ACP turn ended — `end_turn` or a budget cut-off.
+  // #301: why the (first) ACP turn ended — `end_turn` or a budget cut-off. After a
+  // nudge this is the EFFECTIVE reason (the nudge's when it was truncated), and the
+  // nudge turn's own reason is recorded separately so the audit shows both turns.
   if (result.stopReason) env.stopReason = result.stopReason;
+  if (result.nudgeStopReason) env.nudgeStopReason = result.nudgeStopReason;
   if (result.budgetDowngraded) env.budgetDowngraded = true;
   // Audit (issue #63): record which linked-resource key supplied the base prompt.
   // The engine only keeps `latest` per resourceId (no pinning), so recording the
@@ -13437,7 +13463,7 @@ async function workAgent(req, flags, ctx) {
           // the result is recoverable only via the stdout `::nano:result::`
           // sentinel, which `resolveAgentResultWithNudge` handles directly.
           if (result.ok) {
-            const { stdout, nudged, truncated, acpOutcome, transcriptFloorOnly } = await resolveAgentResultWithNudge({
+            const { stdout, nudged, truncated, acpOutcome, transcriptFloorOnly, stopReason: effectiveStopReason, nudgeStopReason } = await resolveAgentResultWithNudge({
               result,
               resultFile,
               logger,
@@ -13469,6 +13495,15 @@ async function workAgent(req, flags, ctx) {
               // Adopt the nudge turn's outcome so the escalation / envelope reflect
               // the latest continuation, not only the first turn (#263).
               result.acpOutcome = acpOutcome;
+              // Adopt the EFFECTIVE stopReason (#301, Copilot review on #302,
+              // discussion_r4464312610): when the nudge turn was itself cut off
+              // (e.g. first turn `end_turn`, nudge `max_turn_requests`), the
+              // delivery check + logs/audit must reflect the truncated nudge turn,
+              // not only the first turn. `effectiveStopReason` is the nudge's reason
+              // when truncated, else the first turn's. Record the nudge's own reason
+              // separately for audit.
+              if (effectiveStopReason) result.stopReason = effectiveStopReason;
+              if (nudgeStopReason) result.nudgeStopReason = nudgeStopReason;
             }
           }
 

@@ -835,6 +835,14 @@ the job with a decremented retry count. Profiles are stored in the plugin's
 >   the resume needs (issue #295). The sweep fails closed (any missing key / unreachable
 >   lookup spares the ref; the 7-day TTL is the backstop) and degrades to the element-only
 >   check on hosts whose SDK lacks process-instance lookup.
+>   The same sweep reclaims stale `nano/agent-work/*` fallback branches (tip older than
+>   the same TTL) **without losing work**: a branch that heads an open PR is kept (as is
+>   any branch whose PR status can't be determined, e.g. non-GitHub remotes or `gh`
+>   failing); a branch whose tip is contained in another branch is deleted; otherwise the
+>   tip is first pushed to `refs/nano/archive/agent-work/<archivedAtMs>/<name>` and only then
+>   is the branch deleted. Archive refs are purged after `NANO_AGENT_WORK_ARCHIVE_TTL_MS`
+>   (90 days; `0` keeps them forever). Recover one with
+>   `git fetch origin refs/nano/archive/agent-work/<ts>/<name>:refs/heads/<name>`.
 > - **Safety:** pushes use `--force-with-lease`, so a superseded worker can't clobber a
 >   newer run's checkpoint. A remote *policy* refusal (repository rules, secret push
 >   protection) or a permission error stops checkpointing for that job with a warning;

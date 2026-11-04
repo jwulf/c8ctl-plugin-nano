@@ -357,3 +357,71 @@ test('a nudge is delivered as the raw prompt string in ACP mode', () => {
   // ACP writes stdin verbatim as the session/prompt text — it must be the raw nudge.
   assert.equal(stdin, nudge);
 });
+
+// #301: a turn cut off by its budget (max_turn_requests) must not be nudged into
+// a false "completed".
+test('#301 acpStopReasonFrom / isTruncatedStopReason', async () => {
+  const { acpStopReasonFrom, isTruncatedStopReason } = await import('./c8ctl-plugin.js');
+  assert.equal(acpStopReasonFrom({ stopReason: 'max_turn_requests' }), 'max_turn_requests');
+  assert.equal(acpStopReasonFrom({}), null);
+  assert.equal(isTruncatedStopReason('end_turn'), false);
+  assert.equal(isTruncatedStopReason(null), false);
+  assert.equal(isTruncatedStopReason('max_turn_requests'), true);
+  assert.equal(isTruncatedStopReason('max_tokens'), true);
+});
+
+test('#301 end_turn nudge no longer asserts completion and allows blocked', () => {
+  const p = buildResultNudgePrompt('prior', { stopReason: 'end_turn' });
+  assert.doesNotMatch(p, /You already completed the task/);
+  assert.match(p, /blocked/);
+});
+
+test('#301 max_turn_requests sends a budget continuation, not the "already completed" nudge', async () => {
+  const { dir, file } = tmpResultFile();
+  try {
+    let sent = null;
+    const lines = [];
+    const out = await resolveAgentResultWithNudge({
+      result: { ok: true, stdout: 'working… stopped after 300 LLM calls', stopReason: 'max_turn_requests' },
+      resultFile: file,
+      logger: { info: (m) => lines.push(m), warn: (m) => lines.push(m) },
+      rerun: async (text) => { sent = text; writeFileSync(file, JSON.stringify({ status: 'completed' })); return { ok: true, stdout: 'done' }; },
+    });
+    assert.equal(out.nudged, true);
+    assert.doesNotMatch(sent, /You already completed/);
+    assert.doesNotMatch(sent, /Do NOT redo the work, re-run tools, edit files, push/);
+    assert.match(sent, /CUT OFF/);
+    assert.match(sent, /max_turn_requests/);
+    assert.match(sent, /commit/);
+    assert.ok(lines.some((l) => /stopReason=max_turn_requests/.test(l)), 'stop reason is logged');
+  } finally { rmSync(dir, { recursive: true, force: true }); }
+});
+
+test('#301 a max_turn_requests "completed" without delivery is downgraded to blocked', async () => {
+  const { downgradeBudgetStopResult } = await import('./c8ctl-plugin.js');
+  const raw = { status: 'completed', summary: 'all green' };
+  const noGit = downgradeBudgetStopResult(raw, { stopReason: 'max_turn_requests', git: null });
+  assert.equal(noGit.status, 'blocked');
+  assert.equal(noGit.claimedStatus, 'completed');
+  assert.equal(noGit.stopReason, 'max_turn_requests');
+  assert.match(noGit.question, /max_turn_requests/);
+  const notPushed = downgradeBudgetStopResult(raw, { stopReason: 'max_turn_requests', git: { commits: [], pushed: false } });
+  assert.equal(notPushed.status, 'blocked');
+  assert.equal(downgradeBudgetStopResult(null, { stopReason: 'max_tokens' }).status, 'blocked');
+  // Delivered → untouched.
+  assert.equal(downgradeBudgetStopResult(raw, { stopReason: 'max_turn_requests', git: { pr: { found: true, number: 1 } } }), raw);
+  assert.equal(downgradeBudgetStopResult(raw, { stopReason: 'max_turn_requests', git: { commits: ['a'], pushed: true } }), raw);
+  // end_turn / absent → untouched; honest blocked → untouched.
+  assert.equal(downgradeBudgetStopResult(raw, { stopReason: 'end_turn' }), raw);
+  assert.equal(downgradeBudgetStopResult(raw, {}), raw);
+  const blocked = { status: 'blocked', question: 'q' };
+  assert.equal(downgradeBudgetStopResult(blocked, { stopReason: 'max_turn_requests' }), blocked);
+});
+
+test('#301 buildResultEnvelope records stopReason', async () => {
+  const { buildResultEnvelope } = await import('./c8ctl-plugin.js');
+  if (typeof buildResultEnvelope !== 'function') return;
+  const env = buildResultEnvelope({ ok: true, stdout: '', stopReason: 'max_turn_requests', budgetDowngraded: true }, {});
+  assert.equal(env.stopReason, 'max_turn_requests');
+  assert.equal(env.budgetDowngraded, true);
+});

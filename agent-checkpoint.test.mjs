@@ -1809,6 +1809,21 @@ test('setupWorkspaceCheckpoints wires the agent-work GC with the open-PR lookup 
   } finally { f.cleanup(); }
 });
 
+test('agent-work GC: a stable namespace branch is a containment home even when it is the ONLY non-candidate head', async () => {
+  const f = fixture();
+  try {
+    const w = f.clone('w');
+    const put = agentWorkPusher(w);
+    const sha = put(`main-${TKN.stablehome}`, 8 * DAY, 'landed on the only stable home');
+    sh(w.dir, 'push', '-q', 'origin', `${sha}:refs/heads/nano/agent-work/stable`);
+    // Remove every non-namespace head so the stable branch is the sole containment home.
+    sh(f.root, '--git-dir', f.remote, 'update-ref', '-d', 'refs/heads/main');
+    const r = await sweepStaleAgentWorkBranches({ git: w.git, ttlMs: 7 * DAY, hasOpenPr: async () => false });
+    assert.deepEqual(r.deleted.map((d) => `${d.ref}:${d.why}`), [`${AW}main-${TKN.stablehome}:merged`]);
+    assert.deepEqual(remoteRefs(f, 'refs/nano/archive/'), [], 'contained in the stable-only home — no archive needed');
+  } finally { f.cleanup(); }
+});
+
 test('ghHasOpenPr is tri-state and fails to null (unknown) on every error path', async () => {
   const fake = ({ code = 0, stdout = '', error = null, hang = false } = {}) => (cmd, args) => {
     assert.equal(cmd, 'gh');
@@ -1833,6 +1848,8 @@ test('ghHasOpenPr is tri-state and fails to null (unknown) on every error path',
   assert.equal(await q({ error: new Error('ENOENT') }), null);
   assert.equal(await q({ hang: true }, { timeoutMs: 20 }), null);
   assert.equal(await q({}, { provider: 'gitlab' }), null);
+  // A SYNCHRONOUS spawn throw (invalid cwd/options) resolves null, never rejects (TDZ timer).
+  assert.equal(await ghHasOpenPr({ cwd: tmpdir(), token: 't', branch: 'b', spawnImpl: () => { throw new Error('EINVAL'); } }), null);
 });
 
 test('createGitRunner suppresses configured credential helpers so the token is never persisted', async () => {

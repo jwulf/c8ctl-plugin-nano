@@ -6735,13 +6735,16 @@ function ghHasOpenPr({ cwd, token, branch, provider = 'github', signal = null, t
   return new Promise((resolve) => {
     let stdout = '';
     let done = false;
-    const finish = (v) => { if (!done) { done = true; clearTimeout(timer); resolve(v); } };
+    // Declared BEFORE the spawn so a synchronous spawn throw (invalid cwd/options) reaching
+    // finish() never reads `timer` in its TDZ (a ReferenceError instead of the tri-state null).
+    let timer = null;
+    const finish = (v) => { if (!done) { done = true; if (timer) clearTimeout(timer); resolve(v); } };
     let child;
     try {
       child = spawnImpl('gh', ['pr', 'list', '--head', branch, '--state', 'open', '--json', 'number', '--limit', '1'],
         { cwd, env: ghAuthEnv(token, cwd), stdio: ['ignore', 'pipe', 'ignore'], signal: signal || undefined });
     } catch { finish(null); return; }
-    const timer = setTimeout(() => { try { child.kill('SIGKILL'); } catch { /* gone */ } finish(null); }, timeoutMs);
+    timer = setTimeout(() => { try { child.kill('SIGKILL'); } catch { /* gone */ } finish(null); }, timeoutMs);
     timer.unref?.();
     child.stdout?.on('data', (d) => { stdout += d; });
     child.on('error', () => finish(null));

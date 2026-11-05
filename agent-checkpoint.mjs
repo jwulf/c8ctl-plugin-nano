@@ -1254,7 +1254,8 @@ export async function sweepStaleAgentWorkBranches({ git, ttlMs = DEFAULTS.ttlMs,
       try { open = typeof hasOpenPr === 'function' ? await hasOpenPr(branch) : null; } catch { open = null; }
       if (open !== false) { result.kept.push({ ref, why: open === true ? 'open-pr' : 'pr-unknown' }); continue; }
       actions++;
-      const contains = others.length
+      // Any containment home — a non-namespace branch OR a stable namespace branch — runs the query.
+      const contains = (others.length || stable.length)
         ? await git(['for-each-ref', '--count=1', '--format=%(refname)', '--contains', sha, 'refs/nano-gc/other-heads/'])
         : null;
       if (contains && !ok(contains)) { lastError = errText(contains); result.kept.push({ ref, why: 'containment-unknown' }); continue; }

@@ -1824,6 +1824,82 @@ test('agent-work GC: a stable namespace branch is a containment home even when i
   } finally { f.cleanup(); }
 });
 
+test('agent-work GC: a containment home force-pushed after the snapshot demotes the delete to archive (never loses the tip)', async () => {
+  const f = fixture();
+  try {
+    const w = f.clone('w');
+    const put = agentWorkPusher(w);
+    const sha = put(`main-${TKN.race}`, 8 * DAY, 'merged work');
+    sh(w.dir, 'push', '-q', 'origin', `${sha}:refs/heads/feat/real-pr`); // contains the tip at scan time
+    // After the GC's ls-remote/fetch snapshot but before its delete, the home is force-pushed
+    // to history that no longer contains the fallback tip (Copilot discussion_r4475075083).
+    let moved = false;
+    const git = async (args, opts) => {
+      if (!moved && args[0] === 'for-each-ref') {
+        moved = true;
+        // Replace the home with history that does NOT contain the fallback tip (the clone's
+        // HEAD is the tip itself, so build the replacement from origin/main).
+        sh(w.dir, 'checkout', '-q', '-B', 'replacement', 'origin/main');
+        writeFileSync(join(w.dir, 'replacement.txt'), 'unrelated\n');
+        sh(w.dir, 'add', '-A');
+        sh(w.dir, 'commit', '-q', '-m', 'replacement without the work');
+        sh(w.dir, 'push', '-q', '--force', 'origin', 'HEAD:refs/heads/feat/real-pr');
+      }
+      return w.git(args, opts);
+    };
+    const NOW = Date.now();
+    const r = await sweepStaleAgentWorkBranches({ git, ttlMs: 7 * DAY, now: () => NOW, hasOpenPr: async () => false });
+    assert.deepEqual(r.deleted.map((d) => `${d.ref}:${d.why}`), [`${AW}main-${TKN.race}:archived`],
+      'the moved home no longer contains the tip, so the delete is demoted to the archive path');
+    assert.deepEqual(remoteRefs(f, 'refs/nano/archive/'), [{ ref: `refs/nano/archive/agent-work/${NOW}/main-${TKN.race}`, sha }],
+      'the tip is preserved under the archive namespace');
+    assert.deepEqual(remoteRefs(f, AW), [], 'the stale fallback branch is still reclaimed');
+  } finally { f.cleanup(); }
+});
+
+test('agent-work GC: a containment home deleted after the snapshot demotes the delete to archive', async () => {
+  const f = fixture();
+  try {
+    const w = f.clone('w');
+    const put = agentWorkPusher(w);
+    const sha = put(`main-${TKN.race}`, 8 * DAY, 'merged work');
+    sh(w.dir, 'push', '-q', 'origin', `${sha}:refs/heads/feat/real-pr`);
+    let moved = false;
+    const git = async (args, opts) => {
+      if (!moved && args[0] === 'for-each-ref') {
+        moved = true;
+        sh(w.dir, 'push', '-q', 'origin', '--delete', 'refs/heads/feat/real-pr');
+      }
+      return w.git(args, opts);
+    };
+    const NOW = Date.now();
+    const r = await sweepStaleAgentWorkBranches({ git, ttlMs: 7 * DAY, now: () => NOW, hasOpenPr: async () => false });
+    assert.deepEqual(r.deleted.map((d) => `${d.ref}:${d.why}`), [`${AW}main-${TKN.race}:archived`]);
+    assert.deepEqual(remoteRefs(f, 'refs/nano/archive/'), [{ ref: `refs/nano/archive/agent-work/${NOW}/main-${TKN.race}`, sha }]);
+  } finally { f.cleanup(); }
+});
+
+test('agent-work GC: an unverifiable containment home (live re-check fails) fails closed and keeps the branch', async () => {
+  const f = fixture();
+  try {
+    const w = f.clone('w');
+    const put = agentWorkPusher(w);
+    const sha = put(`main-${TKN.race}`, 8 * DAY, 'merged work');
+    sh(w.dir, 'push', '-q', 'origin', `${sha}:refs/heads/feat/real-pr`);
+    const git = async (args, opts) => {
+      if (args[0] === 'ls-remote' && args.includes('refs/heads/feat/real-pr')) {
+        return { status: 128, stdout: '', stderr: 'fatal: unable to connect' };
+      }
+      return w.git(args, opts);
+    };
+    const r = await sweepStaleAgentWorkBranches({ git, ttlMs: 7 * DAY, hasOpenPr: async () => false });
+    assert.deepEqual(r.deleted, [], 'never deletes on an unverifiable home');
+    assert.deepEqual(r.kept.map((k) => k.why), ['containment-unknown']);
+    assert.deepEqual(remoteRefs(f, AW).map((e) => e.ref), [`${AW}main-${TKN.race}`], 'the branch survives');
+    assert.deepEqual(remoteRefs(f, 'refs/nano/archive/'), []);
+  } finally { f.cleanup(); }
+});
+
 test('ghHasOpenPr is tri-state and fails to null (unknown) on every error path', async () => {
   const fake = ({ code = 0, stdout = '', error = null, hang = false } = {}) => (cmd, args) => {
     assert.equal(cmd, 'gh');

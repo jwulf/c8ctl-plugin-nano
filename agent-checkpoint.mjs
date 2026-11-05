@@ -1259,7 +1259,29 @@ export async function sweepStaleAgentWorkBranches({ git, ttlMs = DEFAULTS.ttlMs,
         ? await git(['for-each-ref', '--count=1', '--format=%(refname)', '--contains', sha, 'refs/nano-gc/other-heads/'])
         : null;
       if (contains && !ok(contains)) { lastError = errText(contains); result.kept.push({ ref, why: 'containment-unknown' }); continue; }
-      const contained = !!(contains && out(contains));
+      let contained = !!(contains && out(contains));
+      if (contained) {
+        // The containment answer comes from the ls-remote/fetch SNAPSHOT, but only the
+        // candidate's own delete is leased: a home that contained the tip at scan time can be
+        // force-pushed or deleted before this delete lands, orphaning the tip despite the
+        // must-never-lose-work contract (Copilot discussion_r4475075083). Revalidate the home
+        // against the LIVE remote immediately before deleting: a home that no longer contains
+        // the tip demotes the delete to the archive path. An UNREACHABLE remote fails closed
+        // (kept, 'containment-unknown') — never delete on an unverifiable home.
+        // The for-each-ref output is the LOCAL throwaway ref — map it back to the remote
+        // branch name it was fetched from (the fetch spec inverted `otherLocal`).
+        const homeLocal = out(contains).trim();
+        const homeRef = `refs/heads/${homeLocal.slice('refs/nano-gc/other-heads/'.length)}`;
+        const live = await git(['ls-remote', remote, homeRef]);
+        if (!ok(live)) { lastError = errText(live); result.kept.push({ ref, why: 'containment-unknown' }); continue; }
+        const liveSha = (out(live).split(/\s+/)[0] || '').trim();
+        if (!liveSha) contained = false; // the home itself is gone
+        else {
+          const re = await git(['merge-base', '--is-ancestor', sha, liveSha]);
+          if (re.status !== 0 && re.status !== 1) { lastError = errText(re); result.kept.push({ ref, why: 'containment-unknown' }); continue; }
+          contained = re.status === 0;
+        }
+      }
       if (!contained) {
         const archiveRef = `${AGENT_WORK_ARCHIVE_PREFIX}${now()}/${ref.slice(AGENT_WORK_REF_PREFIX.length)}`;
         const a = await git(['push', '--quiet', '--no-verify', remote, `${sha}:${archiveRef}`]);

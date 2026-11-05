@@ -261,7 +261,11 @@ SDK client (job workers) — do **not** add the SDK as a dependency or use raw
   `refs/nano/recovered/*` namespaces (`SWEPT_REF_PREFIXES`) past
   `NANO_AGENT_CHECKPOINT_TTL_MS` (7d) or >1h old
   whose element instance `getElementInstance` reports COMPLETED/TERMINATED (an error/404
-  is never treated as terminal). `agentCheckpoint` is written via
+  is never treated as terminal). It then runs `sweepStaleAgentWorkBranches` for stale
+  `nano/agent-work/*` fallback branches, which must never lose work: open-PR heads (and
+  unknown PR status — fail closed) are kept, tips contained in a non-fallback branch are
+  deleted, anything else is archived to `refs/nano/archive/agent-work/<ms>/…` before the
+  leased delete; archives are purged past `NANO_AGENT_WORK_ARCHIVE_TTL_MS` (90d). `agentCheckpoint` is written via
   `camunda.createElementInstanceVariables` (`local:true`), best-effort, warning once.
   Tests: `agent-checkpoint.test.mjs` (real temp repos + bare remote).
 - **SLA-cancel-safe checkpoints (issue #295, `agent-checkpoint.mjs`).** The #264 GC

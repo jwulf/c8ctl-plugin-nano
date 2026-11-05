@@ -121,6 +121,8 @@ const DEFAULTS = Object.freeze({
   // wall clock to observe the cancel-on-timeout behaviour (Copilot review on #296).
   sdkTimeoutMs: 10_000,
   ttlMs: 7 * 24 * 60 * 60 * 1000,
+  // Retention for archived (unmerged) fallback-branch tips — see sweepStaleAgentWorkBranches.
+  agentWorkArchiveTtlMs: 90 * 24 * 60 * 60 * 1000,
   gcGraceMs: 60 * 60 * 1000,
   gcEveryMs: 60 * 60 * 1000,
 });
@@ -234,6 +236,8 @@ export function checkpointConfig(env = process.env) {
     intervalMs: intOr(env.NANO_AGENT_CHECKPOINT_INTERVAL_MS, DEFAULTS.intervalMs),
     maxFileBytes: intOr(env.NANO_AGENT_CHECKPOINT_MAX_FILE_BYTES, DEFAULTS.maxFileBytes),
     ttlMs: intOr(env.NANO_AGENT_CHECKPOINT_TTL_MS, DEFAULTS.ttlMs),
+    // 0 disables purging archived agent-work tips (they are then kept forever).
+    agentWorkArchiveTtlMs: intOr(env.NANO_AGENT_WORK_ARCHIVE_TTL_MS, DEFAULTS.agentWorkArchiveTtlMs),
     gcGraceMs: DEFAULTS.gcGraceMs,
     gcEveryMs: DEFAULTS.gcEveryMs,
     gitTimeoutMs: DEFAULTS.gitTimeoutMs,
@@ -1154,6 +1158,143 @@ export async function sweepStaleCheckpoints({ git, ownRef = null, ttlMs = DEFAUL
     return result;
   } finally {
     for (const ref of refs) await git(['update-ref', '-d', local(ref)]);
+  }
+}
+
+// The fallback work-branch namespace `provisionRepo` cuts when a push-enabled round is
+// provisioned WITHOUT a `branch.create` naming a real (non-base) work branch (issue #231):
+// rather than commit directly on the base, the harness cuts `nano/agent-work/<base>-<runId>`
+// and pushes it so the round's commits are never lost. When the round's work also landed on a
+// real PR branch (the app now emits `branch.create`, jwulf/c8ctl-plugin-nano#231 / nano-workforce
+// service fix), or the run is long dead, these pushed fallbacks are pure orphans that otherwise
+// accumulate forever — the WIP-checkpoint sweep only reclaims `refs/nano/wip/*`.
+export const AGENT_WORK_REF_PREFIX = 'refs/heads/nano/agent-work/';
+
+// Archive namespace for unmerged fallback tips the GC removes from the branch list. NOT under
+// `refs/heads/`, so it never clutters branches / PR pickers, but the commits stay reachable
+// (and fetchable by exact ref) on the remote. Layout: `<prefix><archivedAtMs>/<branch-suffix>` —
+// the archive TIME is encoded in the ref because git refs carry no timestamp and the tip's
+// commit date (old by construction) can't measure how long it has been archived.
+export const AGENT_WORK_ARCHIVE_PREFIX = 'refs/nano/archive/agent-work/';
+
+// Orphan GC for the pushed fallback work branches. A fallback branch can be the ONLY copy of a
+// run's work (the agent died without opening a PR), so age alone never authorises deleting it.
+// A branch past `ttlMs` (tip commit age — the branch segment is a UUID runId, not an element
+// instance key, so the WIP sweep's element-terminal lookup can't map here) is then:
+//   1. KEPT if it heads an open PR (`hasOpenPr(branch) === true`) — deleting a PR's head branch
+//      closes the PR. FAIL-CLOSED: no lookup, a throw, or any non-boolean answer also keeps it.
+//   2. DELETED ('merged') if its tip is contained in another remote branch — the work is safe.
+//   3. Otherwise ARCHIVED ('archived'): the tip is pushed to `AGENT_WORK_ARCHIVE_PREFIX` FIRST and
+//      the branch is deleted only after that push succeeds, so the commits are never unreachable.
+// Archive refs are purged once `archiveTtlMs` past their archive time (<= 0 disables purging).
+// Every remote delete is leased against the SHA observed at ls-remote time, so a ref a
+// concurrent activation just advanced is left intact. Runs in the same isolated scratch repo as
+// `sweepStaleCheckpoints`, so it shares the GC deadline/abort signal.
+//
+// Only GENERATED per-run fallbacks are GC candidates. The `nano/agent-work/` namespace is not
+// fallback-only — a stable/unrelated branch (`nano/agent-work/my-feature`) can live under it
+// (see `fallbackBranchParts`), and age must never authorise deleting one. So the ls-remote list
+// is filtered through the same generated-name parser provisioning's names satisfy
+// (`<base>-<runToken>`, runToken a UUID or `run-<token>`): a name that does not parse is NOT a
+// fallback — it is kept (reported 'not-a-fallback'), never fetched as a candidate, and counts
+// as a safe "other" head for the containment test (its commits are real, retained work).
+export async function sweepStaleAgentWorkBranches({ git, ttlMs = DEFAULTS.ttlMs, archiveTtlMs = DEFAULTS.agentWorkArchiveTtlMs, hasOpenPr = null, now = () => Date.now(), maxDeletes = 50, remote = 'origin', signal = null }) {
+  const ls = await git(['ls-remote', '--refs', remote, 'refs/heads/*', `${AGENT_WORK_ARCHIVE_PREFIX}*`]);
+  if (!ok(ls)) return { error: errText(ls), deleted: [], kept: [], purged: [] };
+  const entries = out(ls).split('\n').filter(Boolean).map((l) => { const [sha, ref] = l.split(/\s+/); return { sha, ref }; }).filter((e) => e.ref);
+  const inNs = entries.filter((e) => e.ref.startsWith(AGENT_WORK_REF_PREFIX));
+  // Split the namespace into generated fallbacks (GC candidates) and everything else (stable —
+  // kept, and a safe containment home). `fallbackBranchParts` is the single source of truth for
+  // what provisioning's generated name looks like, so the GC can never mistake a stable branch
+  // for a fallback no matter how old its tip is.
+  const work = [];
+  const stable = [];
+  for (const e of inNs) (fallbackBranchParts(e.ref.slice('refs/heads/'.length)) ? work : stable).push(e);
+  const others = entries.filter((e) => e.ref.startsWith('refs/heads/') && !e.ref.startsWith(AGENT_WORK_REF_PREFIX));
+  const archives = entries.filter((e) => e.ref.startsWith(AGENT_WORK_ARCHIVE_PREFIX));
+  const result = { scanned: work.length, deleted: [], kept: stable.map((e) => ({ ref: e.ref, why: 'not-a-fallback' })), purged: [] };
+  let lastError = null;
+
+  // Purge archives past their retention. Needs no fetch: the archive time is in the ref name.
+  if (archiveTtlMs > 0) {
+    for (const { ref, sha } of archives) {
+      if (result.purged.length >= maxDeletes || signal?.aborted) break;
+      const at = Number(ref.slice(AGENT_WORK_ARCHIVE_PREFIX.length).split('/')[0]);
+      if (!Number.isFinite(at) || at <= 0 || now() - at <= archiveTtlMs) continue;
+      const r = await deleteCheckpointRef({ git, ref, remote, expectSha: sha });
+      if (r.ok) result.purged.push({ ref, why: 'archive-ttl' });
+      else if (r.error) lastError = r.error;
+    }
+  }
+  if (!work.length) { if (lastError && !result.purged.length) result.error = lastError; return result; }
+
+  // Fetch the fallback tips AND every other branch head (for the containment test) into
+  // throwaway local refs, always removed in `finally`. The two sets land in DISJOINT namespaces
+  // so the containment scan can never count a fallback branch (itself or a sibling fallback,
+  // both GC candidates) as a safe home for the work. Stable namespace branches are NOT
+  // candidates, so they join `others` as legitimate containment homes.
+  const workLocal = (r) => `refs/nano-gc/agent-work/${r.slice(AGENT_WORK_REF_PREFIX.length)}`;
+  const otherLocal = (r) => `refs/nano-gc/other-heads/${r.slice('refs/heads/'.length)}`;
+  const specs = [...work.map((e) => [e.ref, workLocal(e.ref)]), ...others.map((e) => [e.ref, otherLocal(e.ref)]), ...stable.map((e) => [e.ref, otherLocal(e.ref)])];
+  const fetch = await git(['fetch', '--quiet', '--no-tags', '--no-write-fetch-head', remote, ...specs.map(([r, l]) => `+${r}:${l}`)]);
+  if (!ok(fetch)) return { ...result, error: errText(fetch) };
+  try {
+    const stale = [];
+    for (const e of work) {
+      if (signal?.aborted) break;
+      const at = Number(out(await git(['log', '-1', '--format=%ct', workLocal(e.ref)]))) * 1000;
+      if (!Number.isFinite(at) || at <= 0) continue;
+      if (ttlMs > 0 && now() - at > ttlMs) stale.push(e);
+    }
+    let actions = 0;
+    for (const { ref, sha } of stale) {
+      if (actions >= maxDeletes || signal?.aborted) break;
+      const branch = ref.slice('refs/heads/'.length);
+      let open = null;
+      try { open = typeof hasOpenPr === 'function' ? await hasOpenPr(branch) : null; } catch { open = null; }
+      if (open !== false) { result.kept.push({ ref, why: open === true ? 'open-pr' : 'pr-unknown' }); continue; }
+      actions++;
+      // Any containment home — a non-namespace branch OR a stable namespace branch — runs the query.
+      const contains = (others.length || stable.length)
+        ? await git(['for-each-ref', '--count=1', '--format=%(refname)', '--contains', sha, 'refs/nano-gc/other-heads/'])
+        : null;
+      if (contains && !ok(contains)) { lastError = errText(contains); result.kept.push({ ref, why: 'containment-unknown' }); continue; }
+      let contained = !!(contains && out(contains));
+      if (contained) {
+        // The containment answer comes from the ls-remote/fetch SNAPSHOT, but only the
+        // candidate's own delete is leased: a home that contained the tip at scan time can be
+        // force-pushed or deleted before this delete lands, orphaning the tip despite the
+        // must-never-lose-work contract (Copilot discussion_r4475075083). Revalidate the home
+        // against the LIVE remote immediately before deleting: a home that no longer contains
+        // the tip demotes the delete to the archive path. An UNREACHABLE remote fails closed
+        // (kept, 'containment-unknown') — never delete on an unverifiable home.
+        // The for-each-ref output is the LOCAL throwaway ref — map it back to the remote
+        // branch name it was fetched from (the fetch spec inverted `otherLocal`).
+        const homeLocal = out(contains).trim();
+        const homeRef = `refs/heads/${homeLocal.slice('refs/nano-gc/other-heads/'.length)}`;
+        const live = await git(['ls-remote', remote, homeRef]);
+        if (!ok(live)) { lastError = errText(live); result.kept.push({ ref, why: 'containment-unknown' }); continue; }
+        const liveSha = (out(live).split(/\s+/)[0] || '').trim();
+        if (!liveSha) contained = false; // the home itself is gone
+        else {
+          const re = await git(['merge-base', '--is-ancestor', sha, liveSha]);
+          if (re.status !== 0 && re.status !== 1) { lastError = errText(re); result.kept.push({ ref, why: 'containment-unknown' }); continue; }
+          contained = re.status === 0;
+        }
+      }
+      if (!contained) {
+        const archiveRef = `${AGENT_WORK_ARCHIVE_PREFIX}${now()}/${ref.slice(AGENT_WORK_REF_PREFIX.length)}`;
+        const a = await git(['push', '--quiet', '--no-verify', remote, `${sha}:${archiveRef}`]);
+        if (!ok(a)) { lastError = errText(a); result.kept.push({ ref, why: 'archive-failed' }); continue; }
+      }
+      const r = await deleteCheckpointRef({ git, ref, remote, expectSha: sha });
+      if (r.ok) result.deleted.push({ ref, why: contained ? 'merged' : 'archived' });
+      else if (r.error) lastError = r.error;
+    }
+    if (!result.deleted.length && !result.purged.length && lastError) result.error = lastError;
+    return result;
+  } finally {
+    for (const [, l] of specs) await git(['update-ref', '-d', l]);
   }
 }
 

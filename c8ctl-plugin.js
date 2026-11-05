@@ -90,7 +90,7 @@ import { createAgentInstanceProducer, isExternalAgentJob } from './agent-instanc
 // so the new agent CONTINUES rather than cold-reruns — at-least-once delivery becomes
 // a continuation, not a duplicate. Best-effort; degrades to the legacy cold rerun.
 import { resolveEffectiveEnvelope } from './agent-resume.mjs';
-import { checkpointConfig, checkpointEligibility, checkpointRef, recoveredCheckpointRef, predecessorCheckpointRef, resumeRefIsExplicit, pushNamedRef, observeRemoteRefSha, makeOrphanProbe, normalizeSecretValues, credentialsFromUrl, isAuthenticatedRemote, shouldSweep, sweepStaleCheckpoints, createGitRunner, fetchCheckpoint, restoreCheckpoint, createWorkspaceCheckpoint, createCheckpointer, deleteCheckpointRef, withCheckpointNote, sanitizeBranchSegment } from './agent-checkpoint.mjs';
+import { checkpointConfig, checkpointEligibility, checkpointRef, recoveredCheckpointRef, predecessorCheckpointRef, resumeRefIsExplicit, pushNamedRef, observeRemoteRefSha, makeOrphanProbe, normalizeSecretValues, credentialsFromUrl, isAuthenticatedRemote, shouldSweep, sweepStaleCheckpoints, sweepStaleAgentWorkBranches, createGitRunner, fetchCheckpoint, restoreCheckpoint, createWorkspaceCheckpoint, createCheckpointer, deleteCheckpointRef, withCheckpointNote, sanitizeBranchSegment } from './agent-checkpoint.mjs';
 
 const requireFromHere = createRequire(import.meta.url);
 const pluginDir = dirname(fileURLToPath(import.meta.url));
@@ -6726,6 +6726,38 @@ function reconcileAgentPr({ workspaceDir, token, branch, provider }) {
   }
 }
 
+// Does `branch` head an OPEN PR? Used by the agent-work branch GC, which must never delete a
+// PR's head branch (GitHub closes the PR). Tri-state: true / false, or null when unknown (non-
+// GitHub provider, gh missing/failing, unparsable output) — the GC treats null as "keep".
+// Async (not spawnSync) so a slow gh never blocks the event loop; aborts with the GC signal.
+function ghHasOpenPr({ cwd, token, branch, provider = 'github', signal = null, timeoutMs = 30_000, spawnImpl = spawn }) {
+  if (provider !== 'github') return Promise.resolve(null);
+  return new Promise((resolve) => {
+    let stdout = '';
+    let done = false;
+    // Declared BEFORE the spawn so a synchronous spawn throw (invalid cwd/options) reaching
+    // finish() never reads `timer` in its TDZ (a ReferenceError instead of the tri-state null).
+    let timer = null;
+    const finish = (v) => { if (!done) { done = true; if (timer) clearTimeout(timer); resolve(v); } };
+    let child;
+    try {
+      child = spawnImpl('gh', ['pr', 'list', '--head', branch, '--state', 'open', '--json', 'number', '--limit', '1'],
+        { cwd, env: ghAuthEnv(token, cwd), stdio: ['ignore', 'pipe', 'ignore'], signal: signal || undefined });
+    } catch { finish(null); return; }
+    timer = setTimeout(() => { try { child.kill('SIGKILL'); } catch { /* gone */ } finish(null); }, timeoutMs);
+    timer.unref?.();
+    child.stdout?.on('data', (d) => { stdout += d; });
+    child.on('error', () => finish(null));
+    child.on('close', (code) => {
+      if (code !== 0) return finish(null);
+      try {
+        const arr = JSON.parse(stdout.trim() || 'null');
+        finish(Array.isArray(arr) ? arr.length > 0 : null);
+      } catch { finish(null); }
+    });
+  });
+}
+
 // Build the gh environment for PR-side calls: inject the resolved job token, or
 // (anonymous path) scrub every ambient gh credential so we can only use what we
 // were explicitly handed. Scrubbing the token env vars alone is not enough — gh
@@ -6852,6 +6884,8 @@ async function setupWorkspaceCheckpoints({ provisioned, envelope = null, token =
     restoreCheckpoint: restoreCp = restoreCheckpoint,
     deleteCheckpointRef: deleteCp = deleteCheckpointRef,
     sweep = sweepStaleCheckpoints,
+    sweepAgentWork = sweepStaleAgentWorkBranches,
+    hasOpenPr: openPr = ghHasOpenPr,
     now = () => Date.now(),
   } = deps;
   const log = {
@@ -7121,6 +7155,23 @@ async function setupWorkspaceCheckpoints({ provisioned, envelope = null, token =
             else if (sweepAbort.signal.aborted) log.debug(`checkpoint GC bounded at ${GC_OVERALL_TIMEOUT_MS}ms — aborted its in-flight git and drained; leftover refs reclaimed on a later sweep.`);
             else if (r?.error) log.debug(`checkpoint GC skipped — ${redactToken(oneLineLog(r.error), token)}.`);
           }, (err) => log.debug(`checkpoint GC threw — ${redactToken(oneLineLog(err?.message || err), token)}.`))
+          // Reclaim orphaned `nano/agent-work/*` fallback branches in the SAME scratch repo, sharing
+          // the deadline/abort (issue #231). Chained (not raced) so `close()`/`discard()` await
+          // both sweeps before the scratch dir is reaped. Never loses work: open-PR heads are kept,
+          // contained tips are deleted, unmerged tips are archived first. Failures stay debug-level.
+          .then(() => sweepAgentWork({
+            git: sweepGit, ttlMs: cfg.ttlMs, archiveTtlMs: cfg.agentWorkArchiveTtlMs, now, signal: sweepAbort.signal,
+            // gh resolves the repo from the scratch repo's `origin`. Unknown (null) => branch kept.
+            hasOpenPr: (branch) => openPr({ cwd: sweepDir, token, branch, provider: envelope?.repository?.provider || 'github', signal: sweepAbort.signal }),
+          }))
+          .then((r) => {
+            if (r?.deleted?.length) logger.info?.(`${prefix} (${corr}): reclaimed ${r.deleted.length} orphaned agent-work branch(es): ${r.deleted.map((d) => `${d.ref} [${d.why}]`).join(', ')}.`);
+            if (r?.purged?.length) logger.info?.(`${prefix} (${corr}): purged ${r.purged.length} expired agent-work archive ref(s): ${r.purged.map((d) => d.ref).join(', ')}.`);
+            if (r?.kept?.length) log.debug(`agent-work branch GC kept ${r.kept.length} stale branch(es): ${r.kept.map((k) => `${k.ref} [${k.why}]`).join(', ')}.`);
+            if (r?.deleted?.length || r?.purged?.length) return;
+            if (sweepAbort.signal.aborted) log.debug(`agent-work branch GC bounded at ${GC_OVERALL_TIMEOUT_MS}ms — aborted its in-flight git and drained; leftover branches reclaimed on a later sweep.`);
+            else if (r?.error) log.debug(`agent-work branch GC skipped — ${redactToken(oneLineLog(r.error), token)}.`);
+          }, (err) => log.debug(`agent-work branch GC threw — ${redactToken(oneLineLog(err?.message || err), token)}.`))
           .finally(() => { clearTimeout(deadlineTimer); if (sweepDir) { try { rmSync(sweepDir, { recursive: true, force: true }); } catch { /* best effort */ } } });
       } catch (err) {
         if (sweepDir) { try { rmSync(sweepDir, { recursive: true, force: true }); } catch { /* best effort */ } }
@@ -20176,6 +20227,7 @@ export {
   sanitizeBranchSegment,
   shouldPreserveRunDir,
   setupWorkspaceCheckpoints,
+  ghHasOpenPr,
   computeRelayCloseReason,
   describeGitFailure,
   boundGitOutput,

@@ -9961,6 +9961,39 @@ function baseAgentEnv(profile, job) {
  *                       is force-removed so it never leaks a slot or disk.
  * Both paths resolve to the same result contract.
  */
+// #305: derive the harness PROVIDER timeout from the worker idle-kill budget.
+// The worker idle-kills a silent harness after `idleTimeoutMs`; if the harness's
+// own provider (LLM request) stall timeout is >= that budget, a hung model request
+// kills the WHOLE run instead of being retried inside the harness. We hand the
+// harness `NANO_CODER_PROVIDER_TIMEOUT_SECS = floor(idleMs/1000/2)` so a stalled
+// request always times out (and can retry) well inside the idle window. Returns
+// null when there is no idle kill (<= 0 / non-finite) or the budget is too small
+// to express a whole-second timeout strictly below it. Invariant (tested):
+// `secs * 1000 < idleTimeoutMs` whenever non-null.
+export const PROVIDER_TIMEOUT_ENV = 'NANO_CODER_PROVIDER_TIMEOUT_SECS';
+export function deriveProviderTimeoutSecs(idleTimeoutMs) {
+  const ms = Number(idleTimeoutMs);
+  if (!Number.isFinite(ms) || ms <= 0) return null;
+  const secs = Math.floor(ms / 1000 / 2);
+  return secs >= 1 ? secs : null;
+}
+export function providerTimeoutEnv(idleTimeoutMs) {
+  const secs = deriveProviderTimeoutSecs(idleTimeoutMs);
+  return secs == null ? {} : { [PROVIDER_TIMEOUT_ENV]: String(secs) };
+}
+// #305: startup guard — a profile-configured harness provider timeout that is
+// >= the idle budget means a hung request idle-kills the run. Returns a warning
+// string (or null).
+export function providerTimeoutWarning(env, idleTimeoutMs) {
+  const raw = env && typeof env === 'object' ? env[PROVIDER_TIMEOUT_ENV] : undefined;
+  const ms = Number(idleTimeoutMs);
+  if (raw == null || String(raw).trim() === '' || !Number.isFinite(ms) || ms <= 0) return null;
+  const secs = Number(String(raw).trim());
+  if (!Number.isFinite(secs)) return null;
+  if (secs * 1000 < ms) return null;
+  return `configured harness provider timeout ${PROVIDER_TIMEOUT_ENV}=${raw}s is >= the worker idle budget (${ms}ms) — a hung model request will idle-kill the whole run instead of being retried inside the harness; lower it below ${Math.floor(ms / 1000)}s (derived default: ${deriveProviderTimeoutSecs(ms) ?? 'unset'}s)`;
+}
+
 function runAgentJob(profile, job, opts = {}) {
   const { timeoutMs, idleTimeoutMs, recoveryWindowMs, envelope, sandbox = 'none', image, runId, secretEnv = {}, passThroughSecretNames = [], cwd, extraEnv = {}, profileEnv = {}, gitEnv = null, resultFile, stream = false, streamPrefix = '', onStreamOut, onStreamErr, args: commandArgs, terminal = 'pipe', protocol = 'pipe', permission = 'yolo', relaySession = null, ptyFactory, nudgePayload = null, onAcpUpdate = null, abortSignal = null, onSpawn = null, resumePlan = null } = opts;
   // #110: `protocol`/`permission` drive the ACP executor branch below. The
@@ -9982,7 +10015,7 @@ function runAgentJob(profile, job, opts = {}) {
   // harness's permission toggles) plus the per-job envelope's setup.env
   // (job-specific tuning wins over the profile default). Reserved AGENT_* and
   // resolved secrets are layered on top so user env can never shadow them.
-  const staticEnv = { ...normalizeEnvMap(profileEnv), ...normalizeEnvMap(envelope?.setup?.env) };
+  const staticEnv = { ...providerTimeoutEnv(idleTimeoutMs), ...normalizeEnvMap(profileEnv), ...normalizeEnvMap(envelope?.setup?.env) };
   // #283: the provisioning git env (non-interactive editor no-ops,
   // GIT_TERMINAL_PROMPT=0, GIT_CONFIG_NOSYSTEM=1, …) is the harness env's
   // BOTTOM layer above process.env — a headless agent's own `git commit` (no
@@ -11953,6 +11986,11 @@ async function workAgent(req, flags, ctx) {
   logger.info(`  sandbox: ${sandbox}${isContainer ? ` (image ${image})` : ''}`);
   const profileEnvKeys = Object.keys(profileEnv);
   if (profileEnvKeys.length > 0) logger.info(`  harness env: ${profileEnvKeys.join(', ')}`);
+  {
+    const ptWarn = providerTimeoutWarning(profileEnv, idleTimeoutMs);
+    if (ptWarn) logger.warn(`  ${ptWarn}`);
+    else if (deriveProviderTimeoutSecs(idleTimeoutMs) != null && !(PROVIDER_TIMEOUT_ENV in profileEnv)) logger.info(`  harness provider timeout: ${PROVIDER_TIMEOUT_ENV}=${deriveProviderTimeoutSecs(idleTimeoutMs)}s (derived from idle budget ${idleTimeoutMs}ms)`);
+  }
   if (autoMode) {
     logger.info(`  enrolment: --auto (zero-config engine read${autoScope ? `, scope "${autoScope}"` : ', all agent job types'}) — no capability gate; serves any deployed agent job on this engine.`);
   }

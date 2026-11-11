@@ -58,6 +58,13 @@ SDK client (job workers) — do **not** add the SDK as a dependency or use raw
   overridden at work time (`work --env`). Applied on host + container; per-job
   `setup.env` layers on top, and reserved `AGENT_*` + resolved secrets always win
   (user env can't shadow them). Secret values go through `secretRefs`, not `--env`.
+- **Provider timeout from the idle budget (issue #305).** Every harness spawn
+  (host + container) gets `NANO_CODER_PROVIDER_TIMEOUT_SECS = floor(idleMs/1000/2)`
+  (`deriveProviderTimeoutSecs`, from the job's effective idle timeout; unset when
+  there is no idle kill or the budget is < 2s), layered UNDER the profile/setup env
+  so an operator override wins. `nano work` warns at startup when a profile env
+  sets it >= the idle budget (`providerTimeoutWarning`). Invariant (tested in
+  `provider-timeout.test.mjs`): the derived value is always strictly below the idle kill.
 - Git provisioning (host, `sandbox=none` + `repository.url`): clone into a
   throwaway `<state>/agent-runs/run-*` workspace → checkout/create the branch →
   run the harness with that workspace as `cwd` → push the branch (`branch.push`)

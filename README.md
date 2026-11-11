@@ -1363,7 +1363,10 @@ c8ctl nano supervisor reload # roll it into the running fleet, zero downtime
   since the daemon is a thin process manager. `supervisor status` shows an
   `on disk:` line flagging "update available" whenever the code on disk has
   advanced past the running daemon, so you know when a reload (or restart) is
-  worthwhile.
+  worthwhile. While a reload is in progress, `supervisor status` also prints a
+  `reload:` line (`rolling N/M adopted — draining <id> — do not restart the
+  daemon`) so a detached operator can see the roll without staying attached to
+  the streaming `reload` command.
 
 ### Surviving SSH logout: `supervisor install` / `uninstall`
 

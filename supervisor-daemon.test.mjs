@@ -1056,3 +1056,31 @@ test('formatSupervisorStatus: renders the update-available reload hint when the 
   assert.doesNotMatch(current, /on disk:/, 'no on-disk line when versions match');
   assert.doesNotMatch(current, /update available/, 'no update-available warning when versions match');
 });
+
+test('formatSupervisorStatus: renders a rolling-reload progress line while a reload is in progress', async () => {
+  const mod = await import(pluginUrl);
+  const rolling = mod.formatSupervisorStatus({
+    daemon: { pid: 999999999, version: '1.0.0', socket: '/tmp/sock' },
+    pluginVersion: '1.1.0',
+    reload: {
+      inProgress: true,
+      current: 'omarchy-nano-coder-00ea3c71',
+      targets: ['a', 'b', 'c'],
+      reloaded: ['a'],
+      total: 3,
+    },
+    workers: [],
+  });
+  assert.match(rolling, /reload:\s+rolling 1\/3 adopted/, 'N/M adopted is visible');
+  assert.match(rolling, /draining omarchy-nano-coder-00ea3c71/, 'the worker currently draining is named');
+  assert.match(rolling, /1\.0\.0 → 1\.1\.0/, 'the version hop is shown when disk and daemon differ');
+  assert.match(rolling, /do not restart the daemon/, 'operators are told not to bounce the daemon mid-roll');
+
+  const idle = mod.formatSupervisorStatus({
+    daemon: { pid: 999999999, version: '1.1.0', socket: '/tmp/sock' },
+    pluginVersion: '1.1.0',
+    reload: { inProgress: false, current: null, targets: [], reloaded: [], total: 0 },
+    workers: [],
+  });
+  assert.doesNotMatch(idle, /reload:/, 'no reload line when nothing is rolling');
+});

@@ -15927,6 +15927,14 @@ async function runSupervisorDaemon() {
       reloadCurrent = null;
       reloadTargets = [];
       reloadDone = [];
+      // Clearing the progress flags may not change the monitor signature (it may
+      // already have sampled the final replacement mid-readiness-wait), and the
+      // terminal `reloaded` frame goes only to the initiating socket — so push a
+      // fresh status to every attached console now, or they could keep showing
+      // the "rolling … do not restart the daemon" line after completion.
+      if (!shuttingDown && attachClients.size > 0) {
+        try { broadcast(statusFrame(false)); } catch { /* best effort */ }
+      }
       // Terminal success requires BOTH a clean pass (not interrupted) AND nothing
       // skipped: a skipped worker (failed reload, or removed/absent mid-roll) is a
       // partial reload, so `ok: true` would let the streaming client exit zero and

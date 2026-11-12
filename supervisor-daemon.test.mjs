@@ -1362,3 +1362,37 @@ test('installParentDeathWatchdog: after a retarget the ppid leg no longer orphan
   assert.equal(orphanCalled, false, 'after a retarget the ppid leg is skipped (reparent-to-init is expected), so no orphan fires while the watched pid lives');
   wd();
 });
+
+test('#309 review: a retargeted watchdog falls back to the still-alive predecessor when the successor dies', async (t) => {
+  if (process.platform === 'win32') return;
+  const mod = await import(pluginUrl);
+  const { spawn } = await import('node:child_process');
+  let orphanCount = 0;
+  // Predecessor = this process (alive); the ppid seam matches it so the ppid leg holds.
+  const wd = mod.installParentDeathWatchdog({ intervalMs: 20, parentPid: process.pid, readPpid: () => process.pid, onOrphan: () => { orphanCount += 1; } });
+  t.after(() => wd());
+  const dead = spawn(process.execPath, ['-e', ''], { stdio: 'ignore' });
+  await new Promise((r) => dead.once('exit', r));
+  assert.equal(wd.retarget(dead.pid), true); // successor that has since died
+  await new Promise((r) => setTimeout(r, 150));
+  assert.equal(orphanCount, 0, 'must not self-reap while the predecessor is alive');
+  assert.equal(wd.watchedPid(), process.pid, 'falls back to guarding the predecessor');
+});
+
+test('#309 review: a retargeted watchdog orphans when BOTH successor and predecessor are gone', async (t) => {
+  if (process.platform === 'win32') return;
+  const mod = await import(pluginUrl);
+  const { spawn } = await import('node:child_process');
+  const pred = spawn(process.execPath, ['-e', 'setTimeout(()=>{},60000)'], { stdio: 'ignore' });
+  t.after(() => { try { pred.kill('SIGKILL'); } catch {} });
+  let orphanCount = 0;
+  const wd = mod.installParentDeathWatchdog({ intervalMs: 20, parentPid: pred.pid, readPpid: () => pred.pid, onOrphan: () => { orphanCount += 1; } });
+  t.after(() => wd());
+  const dead = spawn(process.execPath, ['-e', ''], { stdio: 'ignore' });
+  await new Promise((r) => dead.once('exit', r));
+  wd.retarget(dead.pid);
+  pred.kill('SIGKILL');
+  await new Promise((r) => pred.once('exit', r));
+  await new Promise((r) => setTimeout(r, 150));
+  assert.equal(orphanCount, 1);
+});

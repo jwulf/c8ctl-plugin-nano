@@ -15130,6 +15130,24 @@ function formatSupervisorStatus(status) {
   if (onDiskVersion && d.version && onDiskVersion !== d.version) {
     lines.push(`  on disk:    ${onDiskVersion} (update available — run \`c8ctl nano supervisor reload\` to adopt new worker code; restart the daemon for new supervisor code)`);
   }
+  // A rolling reload can run for a long time (each worker drains in-flight
+  // work). Surface it on every `status` so a detached operator — or someone
+  // who only ever polls status — can see the roll is live and must not
+  // `restart` the daemon. `reload` is the progress object from the live
+  // socket frame; absent on the socket-unreachable fallback.
+  const roll = status.reload;
+  if (roll && roll.inProgress) {
+    const done = Array.isArray(roll.reloaded) ? roll.reloaded.length : 0;
+    const total = Number(roll.total) || 0;
+    const current = roll.current ? String(roll.current) : null;
+    const parts = [`rolling ${done}/${total} adopted`];
+    if (current) parts.push(`draining ${current}`);
+    if (onDiskVersion && d.version && onDiskVersion !== d.version) {
+      parts.push(`${d.version} → ${onDiskVersion}`);
+    }
+    parts.push('do not restart the daemon');
+    lines.push(`  reload:     ${parts.join(' — ')}`);
+  }
   if (d.startedAt) lines.push(`  started:    ${d.startedAt}`);
   if (d.socket) lines.push(`  control:    ${d.socket}`);
   const workers = Array.isArray(status.workers) ? status.workers : [];
@@ -15421,6 +15439,11 @@ async function runSupervisorDaemon() {
   // them one at a time (so the fleet keeps serving). This flag rejects a second
   // concurrent reload — a single rolling pass owns the fleet until it finishes.
   let reloading = false;
+  // Progress for `status.reload` while `reloading` is true. Reset when the
+  // roll starts; `reloadCurrent` is the id in `reloadWorker` right now.
+  let reloadTargets = [];
+  let reloadDone = [];
+  let reloadCurrent = null;
   // Live-view monitor: tracks the last-broadcast fleet signature so we push a
   // refreshed status to attached consoles only on real change (see below).
   let monitorTimer = null;
@@ -15839,12 +15862,24 @@ async function runSupervisorDaemon() {
   // shutting down. Never clears `supervisor.json` — a reload is not a stop.
   const runReload = async (ids, sock) => {
     reloading = true;
+    reloadTargets = [...ids];
+    reloadDone = [];
+    reloadCurrent = null;
     const reloaded = [];
     const skipped = [];
     let interrupted = false;
     try {
       for (let i = 0; i < ids.length; i++) {
         const id = ids[i];
+        reloadCurrent = id;
+        // Broadcast (not just to the initiating socket) on every target
+        // transition so every attached console sees the drain progress and the
+        // "do not restart the daemon" warning even with periodic monitoring
+        // disabled (NANO_SUPERVISOR_MONITOR_MS=0). The initiator is itself an
+        // attach client, so it is covered too.
+        if (!shuttingDown) {
+          try { broadcast(statusFrame(false)); } catch { /* best effort */ }
+        }
         // If the daemon starts shutting down mid-roll, the remaining workers
         // never adopt the new code — record them as skipped (and flag the roll
         // interrupted) so the terminal frame can't report a clean success for a
@@ -15868,6 +15903,8 @@ async function runSupervisorDaemon() {
         const ok = await reloadWorker(id);
         if (ok) {
           reloaded.push(id);
+          reloadDone.push(id);
+          reloadCurrent = null;
           // Emit the per-worker "reloaded" progress signal ONLY after the final
           // success gate above confirmed a live, still-current replacement — not
           // at spawn time. A crash/spawn-fail makes `reloadWorker` return false
@@ -15888,13 +15925,24 @@ async function runSupervisorDaemon() {
           for (let j = i; j < ids.length; j++) skipped.push(ids[j]);
           break;
         }
-        try { sock.write(encodeFrame(statusFrame(false))); } catch { /* client gone */ }
+        try { broadcast(statusFrame(false)); } catch { /* best effort */ }
       }
     } catch (err) {
       interrupted = true;
       dlog(`reload error: ${err?.message || err}`);
     } finally {
       reloading = false;
+      reloadCurrent = null;
+      reloadTargets = [];
+      reloadDone = [];
+      // Clearing the progress flags may not change the monitor signature (it may
+      // already have sampled the final replacement mid-readiness-wait), and the
+      // terminal `reloaded` frame goes only to the initiating socket — so push a
+      // fresh status to every attached console now, or they could keep showing
+      // the "rolling … do not restart the daemon" line after completion.
+      if (!shuttingDown && attachClients.size > 0) {
+        try { broadcast(statusFrame(false)); } catch { /* best effort */ }
+      }
       // Terminal success requires BOTH a clean pass (not interrupted) AND nothing
       // skipped: a skipped worker (failed reload, or removed/absent mid-roll) is a
       // partial reload, so `ok: true` would let the streaming client exit zero and
@@ -15927,6 +15975,18 @@ async function runSupervisorDaemon() {
     // i.e. a `supervisor reload` would adopt new worker code (and a daemon
     // restart new supervisor code). Best-effort; falls back to the daemon's own.
     pluginVersion: (() => { try { return pluginPackage().version; } catch { return daemonVersion; } })(),
+    // Live rolling-reload progress so `supervisor status` (and the attach
+    // view) show a roll that was detached or started by someone else.
+    // `inProgress` is the latch; `current` is the worker being drained
+    // right now (null between respawn and the next drain); `reloaded` /
+    // `targets` / `total` let the renderer print N/M.
+    reload: {
+      inProgress: reloading,
+      current: reloadCurrent,
+      targets: reloadTargets,
+      reloaded: [...reloadDone],
+      total: reloadTargets.length,
+    },
     workers: pub || [...workers.values()].map(workerPublic),
     ...(final ? { final: true } : {}),
   });
@@ -16068,6 +16128,9 @@ async function runSupervisorDaemon() {
           // rolling pass over the same workers. The flag is reset in runReload's
           // `finally`.
           reloading = true;
+          reloadTargets = [...ids];
+          reloadDone = [];
+          reloadCurrent = null;
           attachClients.add(sock);
           sock.write(encodeFrame({ ok: true, type: 'reloading', targets: ids }));
           sock.write(encodeFrame(statusFrame(false)));

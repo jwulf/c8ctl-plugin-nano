@@ -442,7 +442,12 @@ SDK client (job workers) — do **not** add the SDK as a dependency or use raw
   supervisor code needs a full `supervisor stop && supervisor start`. `status`
   surfaces this: the frame carries `pluginVersion` (the version on disk, re-read
   each call) alongside the daemon's running `version`, and the render flags
-  "update available — run `supervisor reload`" when they diverge.
+  "update available — run `supervisor reload`" when they diverge. While a
+  rolling reload is in progress the frame also carries `reload: { inProgress,
+  current, targets, reloaded, total }` and the render prints
+  `reload: rolling N/M adopted — draining <id> — do not restart the daemon`
+  so a detached operator (or anyone who only polls `status`) can see the roll
+  is live.
 - **Graceful drain on stop (issue #202).** `supervisor stop` (and `workforce
   stop`) **drain by default**: the daemon quiesces each `nano work` child with a
   `SIGUSR2` (registry `quiesce()` latches the activation loop so it leases NO new

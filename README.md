@@ -1403,10 +1403,29 @@ the fleet untouched, so a failed upgrade never strands the workers.
 - **Not supported on Windows** (the watchdog retarget relies on `SIGUSR2`,
   which Windows cannot deliver) — use `supervisor stop` + `start` there, as
   before.
-- A daemon running under an **installed service** (`supervisor install`) is
-  restarted by launchd/systemd after the handoff; the relaunched daemon
-  re-adopts the fleet from the state file, so the upgrade still lands on the new
-  code.
+- **Installed services (`supervisor install`).** The upgrade spawns the
+  successor as a **detached process in the invoking session**, not under
+  launchd/systemd. Two consequences follow. First, the successor is no longer
+  service-supervised: on macOS-over-SSH it loses the logout protection the
+  LaunchAgent provided, and under systemd the old unit's clean (exit 0) handover
+  does NOT trigger a service restart (the generated units use crash-only
+  policies — `Restart=on-failure` / `KeepAlive={SuccessfulExit:false}` — so a
+  successful exit correctly stays down). Second, the service's supervision of
+  the fleet is suspended until you re-establish it. **After upgrading a
+  service-managed daemon, re-run `c8ctl nano supervisor install`** (or
+  `stop` + `start`) to bring the new-code daemon back under the service. A
+  fully service-owned handoff (systemd `NOTIFY` / socket activation) is a
+  possible future increment; today the upgrade is a session-level operation.
+- **Worker log piping across the swap.** With log capping on (the default),
+  each worker's stdout/stderr is piped through the daemon that spawned it. A
+  daemon upgrade adopts a worker by pid but cannot inherit that pipe, so output
+  a long-lived worker emits *after* the old daemon exits is not captured by the
+  new daemon's log ring (and a worker writing to a fully-drained pipe could see
+  `EPIPE`). Workers spawned or restarted *after* the upgrade are piped through
+  the new daemon normally. If you need uninterrupted logs across a daemon
+  upgrade, run with `NANO_SUPERVISOR_LOG_MAX_BYTES=0` (workers append directly
+  to their log file, which survives the swap) or roll the workers afterward
+  with `supervisor reload`.
 - Tunables (rarely needed): `NANO_SUPERVISOR_UPGRADE_QUIESCE_TIMEOUT_MS` (how
   long the successor waits for the old daemon to quiesce, default 30s),
   `NANO_SUPERVISOR_UPGRADE_ACK_TIMEOUT_MS` (how long the handoff waits for the

@@ -1315,3 +1315,50 @@ test('supervisor upgrade: a successor with no live predecessor starts as a plain
   assert.equal(up.workers.length, 0, 'no workers adopted (there were none)');
   assert.ok(!up.upgrade, 'no upgrade block once there is nothing to hand over');
 });
+
+// --- #309 review regression tests -------------------------------------------
+
+test('installParentDeathWatchdog: retarget re-arms at a new daemon pid and reports it via watchedPid (issue #309)', async () => {
+  if (process.platform === 'win32') return; // watchdog is a no-op on win32
+  const mod = await import(pluginUrl);
+  // Watch a guaranteed-live pid (init, pid 1) and report our ppid AS that pid so
+  // the arm-time orphan check passes (otherwise the default onOrphan would
+  // process.exit the test runner). onOrphan is a no-op — we assert on the
+  // retarget/watchedPid surface, not on the reap.
+  const wd = mod.installParentDeathWatchdog({ intervalMs: 50, parentPid: 1, onOrphan: () => {}, readPpid: () => 1 });
+  assert.equal(typeof wd.retarget, 'function', 'the watchdog exposes a retarget()');
+  assert.equal(typeof wd.watchedPid, 'function', 'the watchdog exposes a watchedPid()');
+  assert.equal(wd.watchedPid(), 1, 'initially watches the given parent pid');
+  // Retarget at our own (live) pid and confirm the watch moved.
+  assert.equal(wd.retarget(process.pid), true, 'retarget to a valid pid lands');
+  assert.equal(wd.watchedPid(), process.pid, 'watchedPid now names the retargeted pid');
+  // An invalid retarget is refused and leaves the watch unchanged.
+  assert.equal(wd.retarget(-5), false, 'retarget to an invalid pid is refused');
+  assert.equal(wd.watchedPid(), process.pid, 'a refused retarget leaves the watch unchanged');
+  wd(); // cancel
+});
+
+test('installParentDeathWatchdog: after a retarget the ppid leg no longer orphans (issue #309)', async () => {
+  if (process.platform === 'win32') return;
+  const mod = await import(pluginUrl);
+  // Simulate the upgrade: we start as a child of the watched daemon (ppid ===
+  // watched), then the daemon hands over and we are reparented to init — our
+  // ppid reader starts reporting init. BEFORE a retarget that reparent would be
+  // an orphan event; AFTER a retarget it is the EXPECTED handoff end state and
+  // must NOT fire the orphan (only the successor's own death should).
+  let currentPpid = 1; // initially a child of the watched daemon (pid 1 here)
+  let orphanCalled = false;
+  const wd = mod.installParentDeathWatchdog({
+    intervalMs: 50,
+    parentPid: 1,
+    onOrphan: () => { orphanCalled = true; },
+    readPpid: () => currentPpid,
+  });
+  // Retarget at init (the "successor"), THEN reparent away — the ppid leg is now
+  // skipped, so no orphan fires while the watched pid (init) lives.
+  wd.retarget(1);
+  currentPpid = 999999; // simulate the post-handoff reparent to init
+  await sleep(200); // several ticks
+  assert.equal(orphanCalled, false, 'after a retarget the ppid leg is skipped (reparent-to-init is expected), so no orphan fires while the watched pid lives');
+  wd();
+});

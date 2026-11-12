@@ -15840,6 +15840,11 @@ async function runSupervisorDaemon() {
     const activityFile = supervisorWorkerActivityFile(w.id);
     w.activityFile = activityFile;
     try { rmSync(activityFile, { force: true }); } catch { /* best effort */ }
+    // #309 review: also clear a stale `.upgrade` retarget sidecar. A worker
+    // force-restarted mid-handoff before consuming it would otherwise inherit
+    // the same path and treat its next genuine drain SIGUSR2 as a retarget.
+    // (A handoff in progress re-writes the sidecar before it SIGUSR2s.)
+    try { rmSync(`${activityFile}.upgrade`, { force: true }); } catch { /* best effort */ }
     // `--name w.id` makes the child's broker workerName match this worker's
     // supervisor id, so the same profile launched twice is distinct end-to-end.
     // NANO_SUPERVISOR_ACTIVITY_FILE tells the child where to report per-job
@@ -16649,18 +16654,29 @@ async function runSupervisorDaemon() {
     upgrading = false;
     quiesced = false;
     upgradeInfo = null;
+    // Capture the snapshot BEFORE clearing it — the membership reconcile below
+    // reads this copy (clearing first made every rollback drop the whole fleet).
+    // A null snapshot (quiesce never reached the snapshot point) means there is
+    // nothing to reconcile against, so membership is left untouched.
+    const rollbackSnapshotIds = quiesceSnapshotIds;
     quiesceSnapshotIds = null;
     if (quiesceKeepalive) { try { clearInterval(quiesceKeepalive); } catch { /* ignore */ } quiesceKeepalive = null; }
     // Re-open the accept loop. The socket path may still be held by the dead
     // successor's listen socket; remove it first (same takeover the successor
     // itself performs), then re-bind.
     if (osPlatform() !== 'win32') { try { rmSync(socketPath, { force: true }); } catch { /* ignore */ } }
+    // Same owner-only umask as the initial bind, so the socket is private from
+    // creation (no listen()→chmod window for another local user to connect).
+    const rbWin = osPlatform() === 'win32';
+    const rbPrevUmask = rbWin ? null : process.umask(0o177);
     try {
       server.listen(socketPath);
-      if (osPlatform() !== 'win32') { try { chmodSync(socketPath, 0o600); } catch { /* ignore */ } }
+      if (!rbWin) { try { chmodSync(socketPath, 0o600); } catch { /* ignore */ } }
       dlog('daemon upgrade rollback: control socket re-opened — fleet serving normally');
     } catch (err) {
       dlog(`daemon upgrade rollback: failed to re-open the control socket: ${err?.message || err}`);
+    } finally {
+      if (!rbWin) { try { process.umask(rbPrevUmask); } catch { /* ignore */ } }
     }
     // #309 review: reconcile the inventory. Respawns were suppressed while
     // quiesced (expired restart timers and death handlers bailed), so reschedule
@@ -16670,8 +16686,18 @@ async function runSupervisorDaemon() {
     // from it was removed through the SUCCESSOR while this daemon was quiesced
     // (the successor owns add/remove during the handoff), so re-adding it here
     // would resurrect a deliberately removed worker.
-    const snapshotIds = new Set(quiesceSnapshotIds || []);
-    for (const id of [...workers.keys()]) {
+    // The authoritative handoff inventory is what the SUCCESSOR persisted (it
+    // owns add/remove during the handoff): if the state file was last written
+    // by the dead successor, its worker list wins; otherwise fall back to our
+    // quiesce snapshot (the successor never wrote — nothing was removed).
+    let snapshotIds = rollbackSnapshotIds ? new Set(rollbackSnapshotIds) : null;
+    try {
+      const succState = readSupervisorState();
+      if (succState && succState.pid === deadSuccessorPid && Array.isArray(succState.workers)) {
+        snapshotIds = new Set(succState.workers.map((x) => x && x.id).filter(Boolean));
+      }
+    } catch { /* unreadable — keep the snapshot */ }
+    for (const id of snapshotIds ? [...workers.keys()] : []) {
       if (!snapshotIds.has(id)) {
         dlog(`daemon upgrade rollback: worker '${id}' is not in the quiesce snapshot (removed through the successor mid-handoff?) — leaving it removed`);
         workers.delete(id);

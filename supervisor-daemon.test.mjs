@@ -1596,6 +1596,10 @@ test('#309 review: rollback after a failed handoff does not resurrect a worker r
   const added = await mod.supervisorRequest({ op: 'add', profile: 'faker' });
   assert.equal(added.ok, true);
   const workerId = added.worker.id;
+  // A second, UNCHANGED worker that the rollback must retain.
+  const kept = await mod.supervisorRequest({ op: 'add', profile: 'faker' });
+  assert.equal(kept.ok, true);
+  const keptId = kept.worker.id;
   let workerPid = null;
   for (let i = 0; i < 40 && !workerPid; i++) {
     const s = await mod.supervisorRequest({ op: 'status' });
@@ -1620,7 +1624,10 @@ test('#309 review: rollback after a failed handoff does not resurrect a worker r
   // quiesced) — exactly the divergence the rollback must reconcile.
   const stBefore = mod.readSupervisorState();
   assert.ok((stBefore.workers || []).some((w) => w.id === workerId), 'the quiesce snapshot lists the worker');
-  mod.clearSupervisorState(); // the successor's inventory no longer has the worker
+  // The successor persisted its inventory (pid = successor) without the removed worker.
+  writeFileSync(join(HOME, 'supervisor.json'), JSON.stringify({
+    ...stBefore, pid: fakeSuccessor.pid, workers: (stBefore.workers || []).filter((w) => w.id !== workerId),
+  }));
   // Kill the worker (the successor force-removed it) so it is down at rollback.
   try { process.kill(workerPid, 'SIGKILL'); } catch { /* ignore */ }
 
@@ -1642,6 +1649,7 @@ test('#309 review: rollback after a failed handoff does not resurrect a worker r
   assert.ok(rolledBack, 'the predecessor rolled back and re-opened its accept loop');
   const resurrected = (rolledBack.workers || []).find((x) => x.id === workerId);
   assert.ok(!resurrected, `the worker removed through the successor stays removed after rollback (got ${JSON.stringify(resurrected)})`);
+  assert.ok((rolledBack.workers || []).some((x) => x.id === keptId), 'an unchanged worker is retained across the rollback');
 
   function isAlive(pid) { try { process.kill(pid, 0); return true; } catch { return false; } }
 });

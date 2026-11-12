@@ -1146,6 +1146,10 @@ test('buildActivityPayload carries engine + agentic and derives busy from jobs',
     // value) rides the marker so `supervisor status` can show it; null when the
     // producer did not stamp it (an un-primed cache / older worker).
     ghAuth: null,
+    // #309: the daemon pid this worker's parent-death watchdog guards; null
+    // until the producer stamps it (a standalone `nano work` has no watchdog).
+    // The daemon-upgrade handoff reads it as the retarget ack.
+    watchdogPid: null,
   });
 
   // Busy: jobs present → busy:true; the live job list rides through untouched.

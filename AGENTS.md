@@ -436,18 +436,57 @@ SDK client (job workers) — do **not** add the SDK as a dependency or use raw
   that capacity for the drain+boot window, and on the bounded-timeout fallback path the
   daemon advances while a slow replacement is still unready, so two or more workers can
   be temporarily unavailable (see `README.md` "Hot code reload"). Run more than one
-  worker per type for continuous service across a reload. The daemon's OWN
-  process-manager code is NOT adopted by `reload` (its workers are its children
-  watching its pid, so a daemon re-exec would take the fleet down) — new
-  supervisor code needs a full `supervisor stop && supervisor start`. `status`
-  surfaces this: the frame carries `pluginVersion` (the version on disk, re-read
-  each call) alongside the daemon's running `version`, and the render flags
-  "update available — run `supervisor reload`" when they diverge. While a
-  rolling reload is in progress the frame also carries `reload: { inProgress,
-  current, targets, reloaded, total }` and the render prints
+  worker per type for continuous service across a reload. While a rolling reload
+  is in progress the `status` frame also carries `reload: { inProgress, current,
+  targets, reloaded, total }` and the render prints
   `reload: rolling N/M adopted — draining <id> — do not restart the daemon`
   so a detached operator (or anyone who only polls `status`) can see the roll
   is live.
+- **Rolling daemon hot-upgrade (issue #309).** `supervisor upgrade` (alias
+  `supervisor reload --daemon`) adopts new SUPERVISOR-side code — the daemon's own
+  process-manager logic, which `reload` cannot touch (the daemon keeps the module
+  graph it imported at start) — **without stopping the fleet or killing in-flight
+  jobs**. It swaps the parent process, not the workers:
+  1. the CLI spawns a **successor** daemon (detached, `NANO_SUPERVISOR_UPGRADE=1`)
+     running the on-disk (post-`nano update`) code;
+  2. the successor asks the old daemon to **quiesce** (the `prepare-upgrade` op:
+     the accept loop closes, mutations and worker respawns are refused, the
+     `upgrade` status block latches `quiesced`), then unlinks + rebinds the
+     canonical control socket and **adopts** the old daemon's workers from the
+     persisted `supervisor.json` — each live pid becomes an adopted worker with a
+     synthetic ChildProcess-shaped handle and an unref'd pid-liveness poll
+     (`NANO_SUPERVISOR_ADOPT_POLL_MS`, default 2s) feeding the SAME restart-backoff
+     path a spawned child's exit would (the workers are never signaled, so
+     in-flight jobs run undisturbed);
+  3. the successor finishes the swap itself: it writes each live worker's
+     `<activityFile>.upgrade` sidecar (the successor pid), SIGUSR2s the workers to
+     **retarget their parent-death watchdogs** at it (the worker's SIGUSR2 handler
+     reads the sidecar — authoritative, since the successor pid could not have
+     ridden the worker's spawn env — then `NANO_SUPERVISOR_UPGRADE_PID`; a retarget
+     re-arms `installParentDeathWatchdog` at the new pid and skips the ppid leg,
+     because the old daemon's exit reparents the worker to init ON PURPOSE), waits
+     (bounded, `NANO_SUPERVISOR_UPGRADE_ACK_TIMEOUT_MS`, default 15s) for each
+     worker's `watchdogPid` activity-marker ack, then SIGUSR1s the old daemon —
+     which persists a final snapshot and exits 0 WITHOUT touching the workers or
+     clearing the state file. A SIGUSR1 outside a quiesce is ignored (it must
+     never strand the fleet with no daemon).
+  Workers never die mid-job; only the parent is swapped. A successor that cannot
+  reach a quiesced old daemon in time exits 1 and leaves the fleet untouched; an
+  old daemon that crashes mid-handoff leaves its workers adopted by the successor
+  (their watchdogs treat the successor as parent once it signals them). The
+  `upgrade` status block (`{ state, fromVersion, toVersion, … }`) rides the daemon
+  descriptor, the persisted state, and the socket-unreachable fallback, and
+  `supervisor status` renders it as `upgrade: rolling <from> → <to>` — the same
+  visibility as the worker roll. Unix-only (the watchdog retarget relies on
+  SIGUSR2); on Windows use `supervisor stop` + `start`. A daemon running under an
+  installed launchd/systemd service is restarted by that service's KeepAlive after
+  the handoff — the relaunched daemon re-adopts the fleet from the state file, so
+  the upgrade still lands (on the new code, since the service re-executes the
+  on-disk plugin). `status` surfaces a code update the running daemon hasn't
+  adopted: the frame carries `pluginVersion` (the version on disk, re-read each
+  call) alongside the daemon's running `version`, and the render flags "update
+  available — run `supervisor reload` … and `supervisor upgrade`" when they
+  diverge.
 - **Graceful drain on stop (issue #202).** `supervisor stop` (and `workforce
   stop`) **drain by default**: the daemon quiesces each `nano work` child with a
   `SIGUSR2` (registry `quiesce()` latches the activation loop so it leases NO new

@@ -1248,6 +1248,7 @@ c8ctl nano supervisor add reviewer --instances 3    # add 3 distinct auto-named 
 c8ctl nano supervisor restart reviewer             # by worker id or profile name
 c8ctl nano supervisor reload                        # adopt new code fleet-wide (rolling drain+respawn, zero downtime)
 c8ctl nano supervisor reload reviewer               # reload just one worker/profile
+c8ctl nano supervisor upgrade                       # roll the DAEMON itself onto the on-disk code (adopts the running workers — no drain, no killed jobs)
 c8ctl nano supervisor reload-credentials            # after `gh auth login`/refresh: every worker re-reads its gh token now (async; old token served until the re-read lands; no drain)
 c8ctl nano supervisor remove coder                 # stop + drop a worker (also: `all`)
 c8ctl nano supervisor logs reviewer --follow       # tail a worker's log (or the daemon's)
@@ -1355,18 +1356,62 @@ c8ctl nano supervisor reload # roll it into the running fleet, zero downtime
   new code there.
 - **Scope — workers, not the daemon.** A reload adopts all **worker-side** code
   (job running, agent instances, git/container provisioning, the agentic
-  connection, the Effect runtime workers load — the bulk of the harness). The
-  supervisor **daemon** keeps running the code it started with: its workers are
-  its children and watch its pid, so re-exec'ing the daemon would take the fleet
-  down with it. To adopt new **supervisor** code, do a full restart
-  (`c8ctl nano supervisor stop && c8ctl nano supervisor start`) — a rare event,
-  since the daemon is a thin process manager. `supervisor status` shows an
-  `on disk:` line flagging "update available" whenever the code on disk has
-  advanced past the running daemon, so you know when a reload (or restart) is
-  worthwhile. While a reload is in progress, `supervisor status` also prints a
-  `reload:` line (`rolling N/M adopted — draining <id> — do not restart the
-  daemon`) so a detached operator can see the roll without staying attached to
-  the streaming `reload` command.
+  connection, the Effect runtime workers load — the bulk of the harness). To adopt
+  new **supervisor** (daemon) code, use `supervisor upgrade` (below) — no fleet
+  outage, no killed jobs. `supervisor status` shows an `on disk:` line flagging
+  "update available" whenever the code on disk has advanced past the running
+  daemon, so you know when a reload (or upgrade) is worthwhile. While a reload
+  is in progress, `supervisor status` also prints a `reload:` line (`rolling N/M
+  adopted — draining <id> — do not restart the daemon`) so a detached operator
+  can see the roll without staying attached to the streaming `reload` command.
+
+### Rolling daemon hot-upgrade: `supervisor upgrade`
+
+`supervisor reload` rolls the **workers**; `supervisor upgrade` (alias
+`supervisor reload --daemon`) rolls the **daemon itself** onto the on-disk code —
+again with **zero fleet downtime and no killed in-flight jobs**. Instead of
+draining anything, it swaps the parent process out from under the running
+workers:
+
+```bash
+c8ctl nano update              # pull the new plugin onto disk
+c8ctl nano supervisor upgrade  # the daemon hands the fleet to a successor on the new code
+```
+
+1. A **successor** daemon (the new code) starts and asks the old daemon to
+   **quiesce** — it stops accepting new control connections and refuses further
+   mutations, but **keeps the workers running**.
+2. The successor **takes the control socket** and **adopts the old daemon's
+   workers** from the persisted state — each is tracked by its existing pid and
+   polled for liveness (a crash still restarts it with the usual backoff). The
+   workers are **never signaled** at this point, so in-flight jobs run
+   undisturbed.
+3. The successor then **retargets each worker's parent-death watchdog** to
+   itself (a `SIGUSR2` the worker reads as "upgrade, keep serving" — not a drain
+   — because the successor's pid rides the worker's `<activity>.upgrade`
+   sidecar), waits for the workers to acknowledge, and only then releases the
+   old daemon, which persists a final snapshot and **exits without touching the
+   workers**.
+
+Workers never die mid-job — only the parent process is swapped. While the roll
+is in flight `supervisor status` shows it
+(`upgrade: rolling <old-version> → <new-version>`), the same visibility the
+worker roll has. **Ctrl-C detaches** the client — the swap completes in the
+background. A successor that can't reach a quiesced old daemon exits and leaves
+the fleet untouched, so a failed upgrade never strands the workers.
+
+- **Not supported on Windows** (the watchdog retarget relies on `SIGUSR2`,
+  which Windows cannot deliver) — use `supervisor stop` + `start` there, as
+  before.
+- A daemon running under an **installed service** (`supervisor install`) is
+  restarted by launchd/systemd after the handoff; the relaunched daemon
+  re-adopts the fleet from the state file, so the upgrade still lands on the new
+  code.
+- Tunables (rarely needed): `NANO_SUPERVISOR_UPGRADE_QUIESCE_TIMEOUT_MS` (how
+  long the successor waits for the old daemon to quiesce, default 30s),
+  `NANO_SUPERVISOR_UPGRADE_ACK_TIMEOUT_MS` (how long the handoff waits for the
+  workers' watchdog-retarget acks, default 15s), `NANO_SUPERVISOR_ADOPT_POLL_MS`
+  (how often an adopted worker's pid is polled for liveness, default 2s).
 
 ### Surviving SSH logout: `supervisor install` / `uninstall`
 

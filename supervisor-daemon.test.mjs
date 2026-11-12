@@ -178,7 +178,25 @@ function writeShim(shimPath, { recordArgv = false, workArgvDir = null, ignoreSig
       `  try { const { writeFileSync: rwf, mkdirSync: rmk } = await import('node:fs'); const { dirname: rdn } = await import('node:path'); const raf = process.env.NANO_SUPERVISOR_ACTIVITY_FILE; if (raf) { rmk(rdn(raf), { recursive: true }); rwf(raf, JSON.stringify({ pid: process.pid, readyAt: Date.now(), jobs: [] })); } } catch {}`,
       `  const { installParentDeathWatchdog } = await import(${JSON.stringify(pluginUrl)});`,
       `  const dp = Number.parseInt(process.env.NANO_SUPERVISOR_DAEMON_PID ?? '', 10);`,
-      `  installParentDeathWatchdog({ intervalMs: 100, parentPid: Number.isInteger(dp) ? dp : undefined });`,
+      `  const wd = installParentDeathWatchdog({ intervalMs: 100, parentPid: Number.isInteger(dp) ? dp : undefined });`,
+      // #309: mirror the real worker's SIGUSR2 branch — with
+      // NANO_SUPERVISOR_UPGRADE_PID set this is a watchdog RETARGET (not a
+      // drain): re-arm at the successor and ack by stamping `watchdogPid` on
+      // the activity marker (what the old daemon's handoff waits for).
+      `  process.on('SIGUSR2', () => {`,
+      `    (async () => {`,
+      `    let up = Number.parseInt(process.env.NANO_SUPERVISOR_UPGRADE_PID ?? '', 10);`,
+      `    try { const fs = await import('node:fs'); const aaf = process.env.NANO_SUPERVISOR_ACTIVITY_FILE; if (aaf) { const f = Number.parseInt(fs.readFileSync(aaf + '.upgrade', 'utf8').trim(), 10); if (Number.isInteger(f) && f > 0) up = f; } } catch {}`,
+      `    if (Number.isInteger(up) && up > 0 && wd && typeof wd.retarget === 'function' && wd.retarget(up)) {`,
+      `      try { const { writeFileSync: awf } = await import('node:fs'); const aaf = process.env.NANO_SUPERVISOR_ACTIVITY_FILE; if (aaf) awf(aaf, JSON.stringify({ pid: process.pid, readyAt: Date.now(), jobs: [], watchdogPid: wd.watchedPid() })); } catch {}`,
+      `    } else {`,
+      // No upgrade in flight → SIGUSR2 is a graceful DRAIN (the #202 contract):
+      // the stand-in has no in-flight job, so it exits at once, exactly like the
+      // real worker's gracefulDrain does when its in-flight count is zero.
+      `      process.exit(0);`,
+      `    }`,
+      `    })().catch(() => {});`,
+      `  });`,
       `  setInterval(() => {}, 1 << 30); // idle keep-alive until the watchdog fires`,
     );
   }
@@ -1083,4 +1101,573 @@ test('formatSupervisorStatus: renders a rolling-reload progress line while a rel
     workers: [],
   });
   assert.doesNotMatch(idle, /reload:/, 'no reload line when nothing is rolling');
+});
+
+test('formatSupervisorStatus: renders the daemon-upgrade roll line while an upgrade is in flight (issue #309)', async () => {
+  const mod = await import(pluginUrl);
+  // A mid-roll status frame carries the `upgrade` block — the operator-visible
+  // `rolling <from> → <to>` line mirroring the worker-roll visibility.
+  const rolling = mod.formatSupervisorStatus({
+    daemon: { pid: 999999999, version: '1.70.3', socket: '/tmp/sock' },
+    pluginVersion: '1.70.3',
+    upgrade: { state: 'quiesced', fromVersion: '1.70.3', toVersion: '1.71.0', successorPid: 4242, sinceEpochMs: Date.now() - 1500 },
+    workers: [],
+  });
+  assert.match(rolling, /upgrade:\s+quiesced — daemon 1\.70\.3 → 1\.71\.0/, `the roll line is rendered: ${rolling}`);
+
+  // No upgrade block → no upgrade line (the quiet-fleet render is unchanged).
+  const quiet = mod.formatSupervisorStatus({
+    daemon: { pid: 999999999, version: '1.71.0', socket: '/tmp/sock' },
+    pluginVersion: '1.71.0',
+    workers: [],
+  });
+  assert.doesNotMatch(quiet, /upgrade:/, 'no upgrade line when no upgrade is in flight');
+
+  // The persisted-state fallback (socket briefly unreachable mid-handoff) must
+  // carry the block too — statusFromState passes it through.
+  const fromState = mod.statusFromState({
+    pid: 999999999, version: '1.70.3', socket: '/tmp/sock', logFile: null, startedAt: new Date().toISOString(),
+    upgrade: { state: 'rolling', fromVersion: '1.70.3', toVersion: '1.71.0' },
+    workers: [],
+  });
+  assert.ok(fromState.upgrade && fromState.upgrade.state === 'rolling', 'statusFromState carries the persisted upgrade block');
+});
+
+test('supervisor upgrade: successor adopts the fleet and the old daemon hands over (issue #309)', async (t) => {
+  if (process.platform === 'win32') { t.skip('daemon upgrade is Unix-only (SIGUSR2 watchdog retarget)'); return; }
+  const HOME = mkdtempSync(join(tmpdir(), 'c8ctl-sup-upg-'));
+  const prevHome = process.env.C8CTL_NANO_HOME;
+  const prevEntry = process.env.C8CTL_NANO_ENTRY;
+  const prevAck = process.env.NANO_SUPERVISOR_UPGRADE_ACK_TIMEOUT_MS;
+  process.env.C8CTL_NANO_HOME = HOME;
+  // Short ack deadline: the shim worker predates #309 (no watchdog retarget), so
+  // the old daemon's ack wait always runs to the deadline — keep it brief.
+  process.env.NANO_SUPERVISOR_UPGRADE_ACK_TIMEOUT_MS = '800';
+  writeFileSync(join(HOME, 'config.json'), JSON.stringify({
+    hires: { faker: { name: 'faker', rank: 'senior', command: 'true', model: '', capabilities: [] } },
+  }));
+  const shim = join(HOME, 'fake-entry.mjs');
+  writeShim(shim);
+  process.env.C8CTL_NANO_ENTRY = shim;
+  const mod = await import(pluginUrl);
+  const { spawn } = await import('node:child_process');
+
+  let successorPid = null;
+  t.after(async () => {
+    // Best-effort teardown: stop whichever daemon currently answers, then hard-
+    // kill anything left. The stand-in workers self-reap via their watchdog.
+    try { await mod.supervisorRequest({ op: 'stop', force: true }, { timeoutMs: 500, responseTimeoutMs: 2000 }); } catch { /* ignore */ }
+    const st = mod.runningSupervisor();
+    if (st) { try { process.kill(st.pid, 'SIGKILL'); } catch { /* ignore */ } }
+    if (successorPid) { try { process.kill(successorPid, 'SIGKILL'); } catch { /* ignore */ } }
+    mod.clearSupervisorState();
+    restoreEnv('C8CTL_NANO_ENTRY', prevEntry);
+    restoreEnv('C8CTL_NANO_HOME', prevHome);
+    restoreEnv('NANO_SUPERVISOR_UPGRADE_ACK_TIMEOUT_MS', prevAck);
+    try { rmSync(HOME, { recursive: true, force: true }); } catch { /* ignore */ }
+  });
+
+  // Boot the old daemon with one worker.
+  const state = await mod.startSupervisorDaemon();
+  const oldPid = state.pid;
+  const added = await mod.supervisorRequest({ op: 'add', profile: 'faker' });
+  assert.equal(added.ok, true);
+  const workerId = added.worker.id;
+  let workerPid = null;
+  for (let i = 0; i < 40 && !workerPid; i++) {
+    const s = await mod.supervisorRequest({ op: 'status' });
+    const w = (s.workers || []).find((x) => x.id === workerId);
+    if (w && w.state === 'running' && w.pid) workerPid = w.pid;
+    else await sleep(50);
+  }
+  assert.ok(workerPid, 'the worker should be running before the upgrade');
+
+  // Spawn the successor. It quiesces the old daemon, binds the socket, and
+  // adopts the worker — all before any `upgrade` op arrives.
+  const successor = spawn(process.execPath, [shim, 'nano', 'supervisor', '__daemon'], {
+    env: { ...process.env, NANO_SUPERVISOR_UPGRADE: '1' },
+    detached: true,
+    stdio: ['ignore', 'ignore', 'ignore'],
+  });
+  successor.unref();
+  successorPid = successor.pid;
+  assert.ok(typeof successorPid === 'number', 'successor spawned');
+
+  // The socket's answer flips to the successor once it has bound + adopted.
+  let adopted = null;
+  for (let i = 0; i < 120 && !adopted; i++) {
+    try {
+      const s = await mod.supervisorRequest({ op: 'status' }, { timeoutMs: 400, responseTimeoutMs: 1000 });
+      if (s && s.ok && s.daemon && s.daemon.pid === successorPid) {
+        const w = (s.workers || []).find((x) => x.id === workerId);
+        if (w && w.pid === workerPid && w.state === 'running') adopted = s;
+      }
+    } catch { /* mid-handoff */ }
+    if (!adopted) await sleep(100);
+  }
+  assert.ok(adopted, `the successor should serve status with the adopted worker (same pid ${workerPid})`);
+  assert.equal(adopted.upgrade?.state, 'adopting', 'the successor reports the roll in flight');
+
+  // The worker must be UNTOUCHED: same pid, never signaled to drain/exit.
+  assert.ok(isAlive(workerPid), 'the worker survives the socket handoff');
+
+  // The old daemon is quiesced but alive: mutations now land on the SUCCESSOR
+  // (the socket flipped at the bind), so the fleet is fully manageable through
+  // the handoff — the core zero-downtime guarantee.
+  const viaSuccessor = await mod.supervisorRequest({ op: 'status' }, { timeoutMs: 400, responseTimeoutMs: 1500 });
+  assert.equal(viaSuccessor.daemon.pid, successorPid, 'the socket serves the successor');
+
+  // The state file must name the SUCCESSOR once it has persisted its own
+  // descriptor (it persists on bind, a beat after the socket flips) — so a
+  // crash mid-window never reads as a stale dead daemon. Poll briefly: the
+  // socket flip (observed above) and the state-file persist are not atomic.
+  let persisted = null;
+  for (let i = 0; i < 40; i++) {
+    persisted = mod.readSupervisorState();
+    if (persisted && persisted.pid === successorPid) break;
+    await sleep(50);
+  }
+  assert.equal(persisted && persisted.pid, successorPid, 'the state file names the successor after the socket flip');
+  assert.ok((persisted.workers || []).some((w) => w.id === workerId && w.pid === workerPid), 'the adopted worker is persisted');
+
+  // The successor DRIVES the handoff itself: it writes the worker's `.upgrade`
+  // sidecar, SIGUSR2s the worker (which retargets its watchdog and acks via
+  // `watchdogPid`), then SIGUSR1s the old daemon to exit. Wait for the worker's
+  // ack and then the old daemon's exit — no manual intervention.
+  const actFile = join(HOME, 'supervisor-activity', `${workerId}.json`);
+  let acked = false;
+  for (let i = 0; i < 60 && !acked; i++) {
+    try {
+      const act = JSON.parse(readFileSync(actFile, 'utf8'));
+      if (act && act.watchdogPid === successorPid) acked = true;
+    } catch { /* not yet */ }
+    if (!acked) await sleep(50);
+  }
+  assert.ok(acked, 'the worker acked the watchdog retarget (watchdogPid = successor)');
+
+  // The old daemon exits on the successor's SIGUSR1 — WITHOUT touching the
+  // worker (no drain, no kill).
+  let oldGone = false;
+  for (let i = 0; i < 60 && !oldGone; i++) {
+    if (!isAlive(oldPid)) oldGone = true;
+    else await sleep(100);
+  }
+  assert.ok(oldGone, 'the old daemon exited after the handoff');
+  await sleep(300);
+  assert.ok(isAlive(workerPid), 'the worker survives the old daemon\'s exit (watchdog retargeted to the successor)');
+
+  const after = await mod.supervisorRequest({ op: 'status' });
+  assert.equal(after.daemon.pid, successorPid, 'the successor still serves');
+  const wAfter = (after.workers || []).find((x) => x.id === workerId);
+  assert.ok(wAfter && wAfter.pid === workerPid && wAfter.state === 'running', 'the adopted worker is still running under the successor');
+  // The roll is complete: the successor's status block clears once the
+  // predecessor is gone.
+  let cleared = false;
+  for (let i = 0; i < 40 && !cleared; i++) {
+    const s = await mod.supervisorRequest({ op: 'status' });
+    if (!s.upgrade) cleared = true;
+    else await sleep(100);
+  }
+  assert.ok(cleared, 'the upgrade status block clears once the predecessor has exited');
+
+  function isAlive(pid) { try { process.kill(pid, 0); return true; } catch { return false; } }
+});
+
+test('supervisor upgrade: a successor with no live predecessor starts as a plain daemon (issue #309)', async (t) => {
+  if (process.platform === 'win32') { t.skip('daemon upgrade is Unix-only'); return; }
+  const HOME = mkdtempSync(join(tmpdir(), 'c8ctl-sup-upg-empty-'));
+  const prevHome = process.env.C8CTL_NANO_HOME;
+  const prevEntry = process.env.C8CTL_NANO_ENTRY;
+  process.env.C8CTL_NANO_HOME = HOME;
+  writeFileSync(join(HOME, 'config.json'), JSON.stringify({ hires: {} }));
+  const shim = join(HOME, 'fake-entry.mjs');
+  writeShim(shim);
+  process.env.C8CTL_NANO_ENTRY = shim;
+  const mod = await import(pluginUrl);
+  const { spawn } = await import('node:child_process');
+  let successorPid = null;
+  t.after(async () => {
+    try { await mod.supervisorRequest({ op: 'stop', force: true }, { timeoutMs: 500, responseTimeoutMs: 2000 }); } catch { /* ignore */ }
+    if (successorPid) { try { process.kill(successorPid, 'SIGKILL'); } catch { /* ignore */ } }
+    mod.clearSupervisorState();
+    restoreEnv('C8CTL_NANO_ENTRY', prevEntry);
+    restoreEnv('C8CTL_NANO_HOME', prevHome);
+    try { rmSync(HOME, { recursive: true, force: true }); } catch { /* ignore */ }
+  });
+  // No daemon running at all: the successor must boot as a plain daemon (an
+  // upgrade with nothing to hand over degrades to a start).
+  const successor = spawn(process.execPath, [shim, 'nano', 'supervisor', '__daemon'], {
+    env: { ...process.env, NANO_SUPERVISOR_UPGRADE: '1' },
+    detached: true,
+    stdio: ['ignore', 'ignore', 'ignore'],
+  });
+  successor.unref();
+  successorPid = successor.pid;
+  let up = null;
+  for (let i = 0; i < 80 && !up; i++) {
+    try {
+      const s = await mod.supervisorRequest({ op: 'status' }, { timeoutMs: 400, responseTimeoutMs: 1000 });
+      if (s && s.ok && s.daemon && s.daemon.pid === successorPid) up = s;
+    } catch { /* not yet */ }
+    if (!up) await sleep(100);
+  }
+  assert.ok(up, 'the successor serves status as a plain daemon');
+  assert.equal(up.workers.length, 0, 'no workers adopted (there were none)');
+  assert.ok(!up.upgrade, 'no upgrade block once there is nothing to hand over');
+});
+
+// --- #309 review regression tests -------------------------------------------
+
+test('installParentDeathWatchdog: retarget re-arms at a new daemon pid and reports it via watchedPid (issue #309)', async () => {
+  if (process.platform === 'win32') return; // watchdog is a no-op on win32
+  const mod = await import(pluginUrl);
+  // Watch a guaranteed-live pid (init, pid 1) and report our ppid AS that pid so
+  // the arm-time orphan check passes (otherwise the default onOrphan would
+  // process.exit the test runner). onOrphan is a no-op — we assert on the
+  // retarget/watchedPid surface, not on the reap.
+  const wd = mod.installParentDeathWatchdog({ intervalMs: 50, parentPid: 1, onOrphan: () => {}, readPpid: () => 1 });
+  assert.equal(typeof wd.retarget, 'function', 'the watchdog exposes a retarget()');
+  assert.equal(typeof wd.watchedPid, 'function', 'the watchdog exposes a watchedPid()');
+  assert.equal(wd.watchedPid(), 1, 'initially watches the given parent pid');
+  // Retarget at our own (live) pid and confirm the watch moved.
+  assert.equal(wd.retarget(process.pid), true, 'retarget to a valid pid lands');
+  assert.equal(wd.watchedPid(), process.pid, 'watchedPid now names the retargeted pid');
+  // An invalid retarget is refused and leaves the watch unchanged.
+  assert.equal(wd.retarget(-5), false, 'retarget to an invalid pid is refused');
+  assert.equal(wd.watchedPid(), process.pid, 'a refused retarget leaves the watch unchanged');
+  wd(); // cancel
+});
+
+test('installParentDeathWatchdog: after a retarget the ppid leg no longer orphans (issue #309)', async () => {
+  if (process.platform === 'win32') return;
+  const mod = await import(pluginUrl);
+  // Simulate the upgrade: we start as a child of the watched daemon (ppid ===
+  // watched), then the daemon hands over and we are reparented to init — our
+  // ppid reader starts reporting init. BEFORE a retarget that reparent would be
+  // an orphan event; AFTER a retarget it is the EXPECTED handoff end state and
+  // must NOT fire the orphan (only the successor's own death should).
+  let currentPpid = 1; // initially a child of the watched daemon (pid 1 here)
+  let orphanCalled = false;
+  const wd = mod.installParentDeathWatchdog({
+    intervalMs: 50,
+    parentPid: 1,
+    onOrphan: () => { orphanCalled = true; },
+    readPpid: () => currentPpid,
+  });
+  // Retarget at init (the "successor"), THEN reparent away — the ppid leg is now
+  // skipped, so no orphan fires while the watched pid (init) lives.
+  wd.retarget(1);
+  currentPpid = 999999; // simulate the post-handoff reparent to init
+  await sleep(200); // several ticks
+  assert.equal(orphanCalled, false, 'after a retarget the ppid leg is skipped (reparent-to-init is expected), so no orphan fires while the watched pid lives');
+  wd();
+});
+
+test('#309 review: a retargeted watchdog falls back to the still-alive predecessor when the successor dies', async (t) => {
+  if (process.platform === 'win32') return;
+  const mod = await import(pluginUrl);
+  const { spawn } = await import('node:child_process');
+  let orphanCount = 0;
+  // Predecessor = this process (alive); the ppid seam matches it so the ppid leg holds.
+  const wd = mod.installParentDeathWatchdog({ intervalMs: 20, parentPid: process.pid, readPpid: () => process.pid, onOrphan: () => { orphanCount += 1; } });
+  t.after(() => wd());
+  const dead = spawn(process.execPath, ['-e', ''], { stdio: 'ignore' });
+  await new Promise((r) => dead.once('exit', r));
+  assert.equal(wd.retarget(dead.pid), true); // successor that has since died
+  await new Promise((r) => setTimeout(r, 150));
+  assert.equal(orphanCount, 0, 'must not self-reap while the predecessor is alive');
+  assert.equal(wd.watchedPid(), process.pid, 'falls back to guarding the predecessor');
+});
+
+test('#309 review: a retargeted watchdog orphans when BOTH successor and predecessor are gone', async (t) => {
+  if (process.platform === 'win32') return;
+  const mod = await import(pluginUrl);
+  const { spawn } = await import('node:child_process');
+  const pred = spawn(process.execPath, ['-e', 'setTimeout(()=>{},60000)'], { stdio: 'ignore' });
+  t.after(() => { try { pred.kill('SIGKILL'); } catch {} });
+  let orphanCount = 0;
+  const wd = mod.installParentDeathWatchdog({ intervalMs: 20, parentPid: pred.pid, readPpid: () => pred.pid, onOrphan: () => { orphanCount += 1; } });
+  t.after(() => wd());
+  const dead = spawn(process.execPath, ['-e', ''], { stdio: 'ignore' });
+  await new Promise((r) => dead.once('exit', r));
+  wd.retarget(dead.pid);
+  pred.kill('SIGKILL');
+  await new Promise((r) => pred.once('exit', r));
+  await new Promise((r) => setTimeout(r, 150));
+  assert.equal(orphanCount, 1);
+});
+
+// --- #309 round-4 review regression tests (handoff races) --------------------
+
+test('#309 review: prepare-upgrade binds to one successor and rejects a concurrent handoff', async (t) => {
+  if (process.platform === 'win32') { t.skip('daemon upgrade is Unix-only'); return; }
+  const HOME = mkdtempSync(join(tmpdir(), 'c8ctl-sup-upg-bind-'));
+  const prevHome = process.env.C8CTL_NANO_HOME;
+  const prevEntry = process.env.C8CTL_NANO_ENTRY;
+  process.env.C8CTL_NANO_HOME = HOME;
+  writeFileSync(join(HOME, 'config.json'), JSON.stringify({ hires: {} }));
+  const shim = join(HOME, 'fake-entry.mjs');
+  writeShim(shim);
+  process.env.C8CTL_NANO_ENTRY = shim;
+  const mod = await import(pluginUrl);
+  const { encodeFrame, decodeFrames } = mod;
+  t.after(async () => {
+    try { await mod.supervisorRequest({ op: 'stop', force: true }, { timeoutMs: 500, responseTimeoutMs: 2000 }); } catch { /* ignore */ }
+    const st = mod.runningSupervisor();
+    if (st) { try { process.kill(st.pid, 'SIGKILL'); } catch { /* ignore */ } }
+    mod.clearSupervisorState();
+    restoreEnv('C8CTL_NANO_ENTRY', prevEntry);
+    restoreEnv('C8CTL_NANO_HOME', prevHome);
+    try { rmSync(HOME, { recursive: true, force: true }); } catch { /* ignore */ }
+  });
+
+  const state = await mod.startSupervisorDaemon();
+  const oldPid = state.pid;
+  const socketPath = mod.getSupervisorSocketPath();
+  // A fake successor pid that is guaranteed alive for the whole test (so the
+  // predecessor's successor-watch never fires a rollback): this process.
+  const fakeSuccessor = process.pid;
+
+  // Drive the whole sequence over ONE held connection: the predecessor's
+  // per-connection queue serializes the frames, and the connection stays open
+  // across the quiesce (only the ACCEPT loop closes) — exactly how the real
+  // successor's single prepare-upgrade connection survives the quiesce.
+  const frames = await new Promise((resolve, reject) => {
+    const sock = createConnection(socketPath);
+    const out = [];
+    let buf = '';
+    let done = false;
+    const finish = () => { if (done) return; done = true; try { sock.end(); } catch {} resolve(out); };
+    sock.setEncoding('utf8');
+    sock.on('connect', () => {
+      // 1: the first successor's prepare (accepted, binds the handoff).
+      sock.write(encodeFrame({ op: 'prepare-upgrade', pid: fakeSuccessor, version: '9.9.9' }));
+      // 2: a rival successor with a DIFFERENT pid (must be refused — bound).
+      setTimeout(() => { try { sock.write(encodeFrame({ op: 'prepare-upgrade', pid: fakeSuccessor === 1 ? 2 : 1, version: '9.9.10' })); } catch {} }, 100);
+      // 3: the bound successor's own retry (same pid — idempotent accept).
+      setTimeout(() => { try { sock.write(encodeFrame({ op: 'prepare-upgrade', pid: fakeSuccessor, version: '9.9.9' })); } catch {} }, 200);
+      // 4: a pid-less prepare (never earns the binding — refused).
+      setTimeout(() => { try { sock.write(encodeFrame({ op: 'prepare-upgrade', pid: null })); } catch {} }, 300);
+      // Close after all four answers have had time to stream back.
+      setTimeout(finish, 1500);
+    });
+    sock.on('data', (chunk) => {
+      buf += chunk;
+      const { frames: fr, rest } = decodeFrames(buf);
+      buf = rest;
+      for (const f of fr) out.push(f);
+    });
+    sock.on('close', finish);
+    sock.on('error', () => finish());
+  });
+
+  const answers = frames.filter((f) => f && (f.type === 'prepare-upgrade' || f.ok === false));
+  assert.ok(answers.length >= 4, `expected 4 prepare-upgrade answers, got ${answers.length}: ${JSON.stringify(frames)}`);
+  assert.equal(answers[0].ok, true, `the first successor's prepare-upgrade is accepted: ${JSON.stringify(answers[0])}`);
+  assert.equal(answers[1].ok, false, 'a concurrent successor is rejected');
+  assert.match(String(answers[1].error || ''), /already bound to successor pid/, `the rejection names the binding: ${answers[1].error}`);
+  assert.equal(answers[2].ok, true, `the bound successor's retry is idempotent: ${JSON.stringify(answers[2])}`);
+  assert.equal(answers[3].ok, false, 'a pid-less prepare-upgrade is refused');
+
+  // Cleanup: hand over (SIGUSR1) so the quiesced predecessor exits cleanly.
+  try { process.kill(oldPid, 'SIGUSR1'); } catch { /* ignore */ }
+});
+
+test('#309 review: a stop accepted before/during quiesce cannot overtake the handoff', async (t) => {
+  if (process.platform === 'win32') { t.skip('daemon upgrade is Unix-only'); return; }
+  const HOME = mkdtempSync(join(tmpdir(), 'c8ctl-sup-upg-stop-'));
+  const prevHome = process.env.C8CTL_NANO_HOME;
+  const prevEntry = process.env.C8CTL_NANO_ENTRY;
+  process.env.C8CTL_NANO_HOME = HOME;
+  writeFileSync(join(HOME, 'config.json'), JSON.stringify({
+    hires: { faker: { name: 'faker', rank: 'senior', command: 'true', model: '', capabilities: [] } },
+  }));
+  const shim = join(HOME, 'fake-entry.mjs');
+  writeShim(shim);
+  process.env.C8CTL_NANO_ENTRY = shim;
+  const mod = await import(pluginUrl);
+  const { encodeFrame, decodeFrames } = mod;
+  t.after(async () => {
+    try { await mod.supervisorRequest({ op: 'stop', force: true }, { timeoutMs: 500, responseTimeoutMs: 2000 }); } catch { /* ignore */ }
+    const st = mod.runningSupervisor();
+    if (st) { try { process.kill(st.pid, 'SIGKILL'); } catch { /* ignore */ } }
+    mod.clearSupervisorState();
+    restoreEnv('C8CTL_NANO_ENTRY', prevEntry);
+    restoreEnv('C8CTL_NANO_HOME', prevHome);
+    try { rmSync(HOME, { recursive: true, force: true }); } catch { /* ignore */ }
+  });
+
+  const state = await mod.startSupervisorDaemon();
+  const oldPid = state.pid;
+  const added = await mod.supervisorRequest({ op: 'add', profile: 'faker' });
+  assert.equal(added.ok, true);
+  const workerId = added.worker.id;
+  let workerPid = null;
+  for (let i = 0; i < 40 && !workerPid; i++) {
+    const s = await mod.supervisorRequest({ op: 'status' });
+    const w = (s.workers || []).find((x) => x.id === workerId);
+    if (w && w.state === 'running' && w.pid) workerPid = w.pid;
+    else await sleep(50);
+  }
+  assert.ok(workerPid, 'worker running before the upgrade');
+
+  // Quiesce for a fake successor (this process — alive for the whole test), then
+  // send a `stop` over the SAME held connection (the accept loop is closed after
+  // the quiesce, so a fresh connection could not reach the daemon). The stop must
+  // be REFUSED (ok:false) and the worker left untouched.
+  const socketPath = mod.getSupervisorSocketPath();
+  const frames = await new Promise((resolve, reject) => {
+    const sock = createConnection(socketPath);
+    const out = [];
+    let buf = '';
+    let done = false;
+    const finish = () => { if (done) return; done = true; try { sock.end(); } catch {} resolve(out); };
+    sock.setEncoding('utf8');
+    sock.on('connect', () => {
+      sock.write(encodeFrame({ op: 'prepare-upgrade', pid: process.pid, version: '9.9.9' }));
+      // Once the quiesce ack lands, fire the stop over the same connection.
+      setTimeout(() => { try { sock.write(encodeFrame({ op: 'stop', force: true })); } catch {} }, 300);
+      setTimeout(finish, 1500);
+    });
+    sock.on('data', (chunk) => {
+      buf += chunk;
+      const { frames: fr, rest } = decodeFrames(buf);
+      buf = rest;
+      for (const f of fr) out.push(f);
+    });
+    sock.on('close', finish);
+    sock.on('error', () => finish());
+  });
+
+  const prepAck = frames.find((f) => f && f.type === 'prepare-upgrade');
+  assert.ok(prepAck && prepAck.ok === true, `the quiesce was accepted: ${JSON.stringify(frames)}`);
+  const stopAnswer = frames.find((f) => f && f.ok === false);
+  assert.ok(stopAnswer, `the stop was answered: ${JSON.stringify(frames)}`);
+  assert.match(String(stopAnswer.error || ''), /upgrade in progress/, `the refusal names the upgrade: ${stopAnswer.error}`);
+
+  await sleep(300);
+  assert.ok(isAlive(workerPid), 'the worker survives the refused stop (the successor owns it now)');
+  assert.ok(isAlive(oldPid), 'the quiesced predecessor stays alive (waiting on the handoff)');
+
+  // A SIGTERM to the quiesced predecessor must be IGNORED (logged) — it must not
+  // run shutdown() and signal the adopted workers or delete the successor's state.
+  try { process.kill(oldPid, 'SIGTERM'); } catch { /* ignore */ }
+  await sleep(400);
+  assert.ok(isAlive(oldPid), 'SIGTERM on a quiesced predecessor is ignored (the upgrade owns it)');
+  assert.ok(isAlive(workerPid), 'the adopted worker is untouched by the predecessor\'s SIGTERM');
+
+  // Hand over (SIGUSR1) so the quiesced predecessor exits cleanly.
+  try { process.kill(oldPid, 'SIGUSR1'); } catch { /* ignore */ }
+  let gone = false;
+  for (let i = 0; i < 40 && !gone; i++) { if (!isAlive(oldPid)) gone = true; else await sleep(50); }
+  assert.ok(gone, 'the predecessor exits on the SIGUSR1 handover');
+
+  function isAlive(pid) { try { process.kill(pid, 0); return true; } catch { return false; } }
+});
+
+test('#309 review: rollback after a failed handoff does not resurrect a worker removed through the successor', async (t) => {
+  if (process.platform === 'win32') { t.skip('daemon upgrade is Unix-only'); return; }
+  const HOME = mkdtempSync(join(tmpdir(), 'c8ctl-sup-upg-rb-'));
+  const prevHome = process.env.C8CTL_NANO_HOME;
+  const prevEntry = process.env.C8CTL_NANO_ENTRY;
+  process.env.C8CTL_NANO_HOME = HOME;
+  writeFileSync(join(HOME, 'config.json'), JSON.stringify({
+    hires: { faker: { name: 'faker', rank: 'senior', command: 'true', model: '', capabilities: [] } },
+  }));
+  const shim = join(HOME, 'fake-entry.mjs');
+  writeShim(shim);
+  process.env.C8CTL_NANO_ENTRY = shim;
+  const mod = await import(pluginUrl);
+  const { spawn } = await import('node:child_process');
+  let fakeSuccessor = null;
+  t.after(async () => {
+    try { await mod.supervisorRequest({ op: 'stop', force: true }, { timeoutMs: 500, responseTimeoutMs: 2000 }); } catch { /* ignore */ }
+    const st = mod.runningSupervisor();
+    if (st) { try { process.kill(st.pid, 'SIGKILL'); } catch { /* ignore */ } }
+    if (fakeSuccessor) { try { process.kill(fakeSuccessor.pid, 'SIGKILL'); } catch { /* ignore */ } }
+    mod.clearSupervisorState();
+    restoreEnv('C8CTL_NANO_ENTRY', prevEntry);
+    restoreEnv('C8CTL_NANO_HOME', prevHome);
+    try { rmSync(HOME, { recursive: true, force: true }); } catch { /* ignore */ }
+  });
+
+  const state = await mod.startSupervisorDaemon();
+  const oldPid = state.pid;
+  const added = await mod.supervisorRequest({ op: 'add', profile: 'faker' });
+  assert.equal(added.ok, true);
+  const workerId = added.worker.id;
+  // A second, UNCHANGED worker that the rollback must retain.
+  const kept = await mod.supervisorRequest({ op: 'add', profile: 'faker' });
+  assert.equal(kept.ok, true);
+  const keptId = kept.worker.id;
+  let workerPid = null;
+  for (let i = 0; i < 40 && !workerPid; i++) {
+    const s = await mod.supervisorRequest({ op: 'status' });
+    const w = (s.workers || []).find((x) => x.id === workerId);
+    if (w && w.state === 'running' && w.pid) workerPid = w.pid;
+    else await sleep(50);
+  }
+  assert.ok(workerPid, 'worker running before the upgrade');
+
+  // A CONTROLLABLE fake successor: a live process whose death we trigger to force
+  // the rollback exactly when we want (a real successor's handoff completes in a
+  // tight race, so it can't be killed reliably "mid-handoff"). Quiesce against it.
+  fakeSuccessor = spawn(process.execPath, ['-e', 'setInterval(()=>{},1<<30)'], { stdio: 'ignore' });
+  const prep = await mod.supervisorRequest({ op: 'prepare-upgrade', pid: fakeSuccessor.pid, version: '9.9.9' }, { timeoutMs: 500, responseTimeoutMs: 5000 });
+  assert.equal(prep.ok, true, `the quiesce was accepted: ${JSON.stringify(prep)}`);
+
+  // While quiesced, the predecessor refuses mutations/respawns. Model the worker
+  // being removed THROUGH the successor by deleting it from the persisted
+  // inventory (what the successor owns + writes during the handoff): after the
+  // removal the state file no longer lists the worker. The predecessor's in-memory
+  // map still holds it (it can only be mutated over its own socket, which is
+  // quiesced) — exactly the divergence the rollback must reconcile.
+  const stBefore = mod.readSupervisorState();
+  assert.ok((stBefore.workers || []).some((w) => w.id === workerId), 'the quiesce snapshot lists the worker');
+  // The successor persisted its inventory (pid = successor) without the removed worker.
+  writeFileSync(join(HOME, 'supervisor.json'), JSON.stringify({
+    ...stBefore, pid: fakeSuccessor.pid, workers: (stBefore.workers || []).filter((w) => w.id !== workerId),
+  }));
+  // Kill the worker (the successor force-removed it) so it is down at rollback.
+  try { process.kill(workerPid, 'SIGKILL'); } catch { /* ignore */ }
+
+  // The fake successor "dies" before handing over → the predecessor's
+  // successor-watch fires a rollback. The removed worker must NOT be resurrected.
+  try { process.kill(fakeSuccessor.pid, 'SIGKILL'); } catch { /* ignore */ }
+  await new Promise((r) => fakeSuccessor.once('exit', r));
+  fakeSuccessor = null;
+
+  // Wait for the predecessor to roll back and re-open its accept loop.
+  let rolledBack = null;
+  for (let i = 0; i < 120 && !rolledBack; i++) {
+    try {
+      const s = await mod.supervisorRequest({ op: 'status' }, { timeoutMs: 400, responseTimeoutMs: 1000 });
+      if (s && s.ok && s.daemon && s.daemon.pid === oldPid) rolledBack = s;
+    } catch { /* still quiesced */ }
+    if (!rolledBack) await sleep(100);
+  }
+  assert.ok(rolledBack, 'the predecessor rolled back and re-opened its accept loop');
+  const resurrected = (rolledBack.workers || []).find((x) => x.id === workerId);
+  assert.ok(!resurrected, `the worker removed through the successor stays removed after rollback (got ${JSON.stringify(resurrected)})`);
+  assert.ok((rolledBack.workers || []).some((x) => x.id === keptId), 'an unchanged worker is retained across the rollback');
+
+  function isAlive(pid) { try { process.kill(pid, 0); return true; } catch { return false; } }
+});
+
+test('#309 review: stateFromStatus carries the upgrade block so a stop client sees the handoff', async () => {
+  const mod = await import(pluginUrl);
+  const res = {
+    ok: true,
+    type: 'status',
+    daemon: { pid: 4242, startedAt: new Date().toISOString(), version: '1.71.0', socket: '/tmp/x.sock', logFile: '/tmp/x.log' },
+    upgrade: { state: 'quiesced', fromVersion: '1.70.3', toVersion: '1.71.0', successorPid: 4343, sinceEpochMs: Date.now() - 100 },
+    workers: [],
+    final: true,
+  };
+  const mapped = mod.stateFromStatus(res, '/tmp/x.sock');
+  assert.ok(mapped.upgrade && mapped.upgrade.successorPid === 4343, 'stateFromStatus preserves the upgrade block');
+  assert.equal(mapped.pid, 4242, 'the daemon pid still maps through');
+  // No upgrade block → no `upgrade` key (the quiet-fleet shape is unchanged).
+  const quiet = mod.stateFromStatus({ ...res, upgrade: undefined }, '/tmp/x.sock');
+  assert.ok(!('upgrade' in quiet), 'no upgrade key when the daemon is not mid-upgrade');
 });

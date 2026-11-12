@@ -295,6 +295,40 @@ const SUPERVISOR_RELOAD_READY_TIMEOUT_MS = Math.max(
   0,
   Number.parseInt(process.env.NANO_SUPERVISOR_RELOAD_READY_TIMEOUT_MS ?? '', 10) || 30_000,
 );
+// Rolling daemon hot-upgrade (issue #309). A `supervisor upgrade` hands the
+// fleet to a SUCCESSOR daemon process running the on-disk (new) plugin code:
+// the old daemon quiesces (stops accepting control connections + stops
+// restarting workers), asks each worker to re-arm its parent-death watchdog at
+// the successor's pid (SIGUSR2 + NANO_SUPERVISOR_UPGRADE_PID — a retarget, NOT
+// a drain), persists a final state snapshot, and exits WITHOUT touching the
+// workers. The successor binds the canonical control socket and adopts the
+// still-running worker pids. Workers never die mid-job; only the parent swaps.
+//
+// How long the old daemon waits for workers to acknowledge the watchdog
+// retarget (by stamping `watchdogPid` on their activity marker) before it exits
+// anyway. Bounded so a wedged/older worker can't stall the upgrade forever —
+// the successor adopts every live pid regardless, so an un-acked worker is
+// still parented (its watchdog self-reaps only if the successor ALSO dies).
+const SUPERVISOR_UPGRADE_ACK_TIMEOUT_MS = Math.max(
+  0,
+  Number.parseInt(process.env.NANO_SUPERVISOR_UPGRADE_ACK_TIMEOUT_MS ?? '', 10) || 15_000,
+);
+// How long a freshly spawned successor waits for the old daemon to quiesce
+// before giving up (it must never bind the socket while the old daemon still
+// accepts on it). Generous: quiesce is prompt (server.close + a latch), but a
+// loaded machine can delay the old daemon's socket loop.
+const SUPERVISOR_UPGRADE_QUIESCE_TIMEOUT_MS = Math.max(
+  0,
+  Number.parseInt(process.env.NANO_SUPERVISOR_UPGRADE_QUIESCE_TIMEOUT_MS ?? '', 10) || 30_000,
+);
+// How often the successor polls an adopted worker's pid for liveness. An
+// adopted worker has no ChildProcess handle (the successor never spawned it),
+// so there is no 'exit' event — this poll is the death detector that feeds the
+// same restart-backoff path a spawned child's exit would.
+const SUPERVISOR_ADOPT_POLL_MS = Math.max(
+  100,
+  Number.parseInt(process.env.NANO_SUPERVISOR_ADOPT_POLL_MS ?? '', 10) || 2_000,
+);
 // Upper bound on one `--auto` engine-read reconcile (enumerate deployed
 // definitions + fetch each BPMN). A read that stalls past this is treated as a
 // transient failure so the running poller set is KEPT and, crucially, shutdown
@@ -472,6 +506,19 @@ function readWorkerActivity(id) {
  */
 function activityMarkerReadyFor(act, pid) {
   return !!(act && act.pid === pid && Number.isFinite(act.readyAt));
+}
+
+/**
+ * Whether a worker's SIGUSR2 (drain/retarget) handler is provably installed
+ * (#309 review): its marker belongs to `pid` AND carries a finite
+ * `signalReadyAt` (stamped right after the handler is armed, independent of
+ * leasing). Falls back to `readyAt` for a worker that predates the field (its
+ * handler is armed before its first activation). Signalling earlier would hit
+ * Node's DEFAULT SIGUSR2 action and terminate the worker. Pure for unit tests.
+ */
+function drainSignalReadyFor(act, pid) {
+  if (!act || act.pid !== pid) return false;
+  return Number.isFinite(act.signalReadyAt) || Number.isFinite(act.readyAt);
 }
 
 /**
@@ -11281,9 +11328,9 @@ function agenticStateForTarget(target, safeUrl = (u) => u) {
  * `completeJob`/`failJob`, so the engine may still project it `CREATED`) is no
  * longer running here, so it rides the marker as a flagged, observational entry
  * without making an idle worker look busy or inflating the drain's in-flight count.
- * @param {{ pid:number, updatedAt:number, jobs:Array<{key:string,type:string,since:number,settlementPending?:boolean}>, engine:(string|null), agentic:object, readyAt:(number|null), ghAuth:(object|null) }} fields
+ * @param {{ pid:number, updatedAt:number, jobs:Array<{key:string,type:string,since:number,settlementPending?:boolean}>, engine:(string|null), agentic:object, readyAt:(number|null), ghAuth:(object|null), watchdogPid:(number|null|undefined), signalReadyAt?:(number|null) }} fields
  */
-function buildActivityPayload({ pid, updatedAt, jobs, engine, agentic, readyAt, ghAuth }) {
+function buildActivityPayload({ pid, updatedAt, jobs, engine, agentic, readyAt, ghAuth, watchdogPid, signalReadyAt }) {
   const jobList = Array.isArray(jobs) ? jobs : [];
   return {
     pid,
@@ -11296,11 +11343,23 @@ function buildActivityPayload({ pid, updatedAt, jobs, engine, agentic, readyAt, 
     // SDK client and begun leasing), the producer stamps this; null until then.
     // The supervisor's rolling reload gates on it (a spawn/PID is not readiness).
     readyAt: readyAt ?? null,
+    // #309 review: stamped once this worker's SIGUSR2 handler is INSTALLED —
+    // independent of leasing readiness (`readyAt` needs a nonempty poll set, so
+    // a healthy `--auto` worker with no deployed types never stamps it). The
+    // daemon-upgrade handoff gates its retarget SIGUSR2 on THIS, not readyAt.
+    signalReadyAt: signalReadyAt ?? null,
     // #293: the cached gh auth token's observable identity — { present,
     // fingerprint, scopes, since, ageMs, lastCheckAgoMs }, NEVER the value — so
     // `supervisor status` can show the credential's age/scopes per worker. Null
     // on a worker that has not primed the cache yet (or predates the field).
     ghAuth: ghAuth ?? null,
+    // #309: the daemon pid this worker's parent-death watchdog currently guards.
+    // A rolling daemon upgrade SIGUSR2s each worker to RETARGET that watchdog at
+    // the successor daemon before the old one exits; the old daemon waits
+    // (bounded) for this stamp to name the successor — the ack that the worker
+    // survives the handoff — so it never exits while a worker would still read
+    // the (expected) reparent-to-init as an orphan event and self-reap.
+    watchdogPid: Number.isInteger(watchdogPid) ? watchdogPid : null,
   };
 }
 
@@ -12118,9 +12177,13 @@ async function workAgent(req, flags, ctx) {
   // this worker would otherwise idle forever as an orphan reparented to init.
   // The watchdog makes the child self-exit the moment it is reparented. A
   // standalone `nano work` (no activity file) keeps classic nohup semantics.
+  // The handle is retained so a rolling daemon upgrade (#309) can RETARGET the
+  // same installation at the successor daemon's pid instead of self-reaping
+  // when the old daemon hands over and exits (see the SIGUSR2 handler below).
+  let parentWatchdog = null;
   if (activityFile) {
     const daemonPid = Number.parseInt(process.env.NANO_SUPERVISOR_DAEMON_PID ?? '', 10);
-    installParentDeathWatchdog({ parentPid: Number.isInteger(daemonPid) ? daemonPid : undefined });
+    parentWatchdog = installParentDeathWatchdog({ parentPid: Number.isInteger(daemonPid) ? daemonPid : undefined });
   }
   const activeJobs = new Map(); // jobKey -> { type, since (ms epoch) }
   // #254: settlement-pending ghosts — jobKey -> { type, since, phase, leaseToken }.
@@ -12267,6 +12330,9 @@ async function workAgent(req, flags, ctx) {
   // waits for this stamp before draining the next worker so a bare spawn/PID is
   // never mistaken for a serving replacement.
   let readyAt = null;
+  // #309 review: set once the SIGUSR2 (drain/retarget) handler is installed.
+  let signalReadyAt = null;
+  const markSignalReady = () => { signalReadyAt = Date.now(); };
   const writeActivity = () => {
     if (!activityFile) return;
     const jobs = [...activeJobs.entries()].map(([key, v]) => ({ key, type: v.type, since: v.since }));
@@ -12291,7 +12357,7 @@ async function workAgent(req, flags, ctx) {
     // #293: publish the cached gh token's identity (fingerprint/scopes/age —
     // never the value) so `supervisor status` can answer "is this worker holding
     // a stale token?" in one line.
-    const payload = buildActivityPayload({ pid: process.pid, updatedAt: Date.now(), jobs, engine: workerEngine, agentic: agenticState, readyAt, ghAuth: ghAuthTokenInfo() });
+    const payload = buildActivityPayload({ pid: process.pid, updatedAt: Date.now(), jobs, engine: workerEngine, agentic: agenticState, readyAt, signalReadyAt, ghAuth: ghAuthTokenInfo(), watchdogPid: parentWatchdog && typeof parentWatchdog.watchedPid === 'function' ? parentWatchdog.watchedPid() : null });
     const tmp = `${activityFile}.${process.pid}.tmp`;
     try {
       mkdirSync(dirname(activityFile), { recursive: true });
@@ -14330,7 +14396,62 @@ async function workAgent(req, flags, ctx) {
       setTimeout(tick, 200);
     };
 
-    process.once(SUPERVISOR_DRAIN_SIGNAL, () => { gracefulDrain(SUPERVISOR_DRAIN_SIGNAL); });
+    // #309: the SIGUSR2 handler is a named, re-armable function. The legacy path
+    // (graceful drain) fires once and the worker exits, so `once` semantics
+    // suffice there; but the daemon-upgrade path (below) does NOT exit the
+    // worker, so it re-arms the handler for a later drain/upgrade.
+    const onDrainSignal = () => {
+      // #309 rolling daemon upgrade: the daemon reuses SIGUSR2 as its
+      // per-worker signal, but when it names a successor daemon pid this is a
+      // watchdog RETARGET, not a drain — the old daemon is handing the fleet to
+      // a successor running the new plugin code and this worker must KEEP
+      // SERVING (jobs in flight are never touched; only the parent process is
+      // swapped). The successor pid arrives two ways, in priority order:
+      //   1. `<activityFile>.upgrade` — written by the old daemon just before
+      //      it SIGUSR2s (authoritative: the daemon learns the successor pid
+      //      only at handoff time, after this worker was spawned, so it cannot
+      //      have ridden this worker's env);
+      //   2. NANO_SUPERVISOR_UPGRADE_PID — covers a worker spawned mid-upgrade.
+      // Re-arm the parent-death watchdog at the successor so the old daemon's
+      // (expected) exit — which reparents this worker to init — is not read as
+      // an orphan event, then republish the activity marker: the old daemon
+      // waits (bounded) for the marker's `watchdogPid` to name the successor
+      // before it exits, so the handoff never strands a worker that would
+      // self-reap mid-upgrade.
+      let upgradePid = Number.parseInt(process.env.NANO_SUPERVISOR_UPGRADE_PID ?? '', 10);
+      if (activityFile) {
+        try {
+          const raw = readFileSync(`${activityFile}.upgrade`, 'utf8').trim();
+          const fromFile = Number.parseInt(raw, 10);
+          if (Number.isInteger(fromFile) && fromFile > 0) upgradePid = fromFile;
+        } catch { /* no upgrade file — fall back to the env var */ }
+      }
+      if (Number.isInteger(upgradePid) && upgradePid > 0 && parentWatchdog && typeof parentWatchdog.retarget === 'function') {
+        const ok = parentWatchdog.retarget(upgradePid);
+        logger.info(`Received ${SUPERVISOR_DRAIN_SIGNAL} — daemon upgrade in progress: parent-death watchdog ${ok ? `retargeted to successor daemon pid ${upgradePid}` : `could NOT be retargeted (invalid pid)`}; this worker keeps serving.`);
+        // Consume the retarget request: delete the `.upgrade` sidecar so a LATER
+        // SIGUSR2 (a genuine drain, or a later upgrade that has not written a
+        // fresh sidecar yet) is not misread as another retarget to this same
+        // successor. Without this the sidecar is sticky — every later SIGUSR2
+        // would retarget to the same (possibly long-gone) pid instead of
+        // draining, breaking graceful stop / drain-remove / worker reload after
+        // an upgrade (#309 review). Best-effort: a leftover only matters if it
+        // names a live pid, and the successor also clears it on adopt.
+        if (activityFile) { try { rmSync(`${activityFile}.upgrade`, { force: true }); } catch { /* best effort */ } }
+        try { writeActivityRef?.(); } catch { /* best effort — the ack stamp is advisory */ }
+        // Re-arm: an upgrade that aborts (successor died before binding) must
+        // leave this worker drainable by the surviving old daemon, and a LATER
+        // upgrade/drain needs the handler again. (The drain path never re-arms —
+        // the worker is on its way out.)
+        process.once(SUPERVISOR_DRAIN_SIGNAL, onDrainSignal);
+        return;
+      }
+      gracefulDrain(SUPERVISOR_DRAIN_SIGNAL);
+    };
+    process.once(SUPERVISOR_DRAIN_SIGNAL, onDrainSignal);
+    // #309 review: publish that the handler is installed, so an upgrade handoff
+    // can retarget this worker even before (or without ever) leasing.
+    try { markSignalReady(); writeActivityRef?.(); } catch { /* best effort */ }
     process.once('SIGINT', () => { forceAbort('SIGINT'); });
     process.once('SIGTERM', () => { forceAbort('SIGTERM'); });
   });
@@ -15128,7 +15249,18 @@ function formatSupervisorStatus(status) {
   const onDiskVersion = status.pluginVersion
     ?? (() => { try { return pluginPackage().version; } catch { return null; } })();
   if (onDiskVersion && d.version && onDiskVersion !== d.version) {
-    lines.push(`  on disk:    ${onDiskVersion} (update available — run \`c8ctl nano supervisor reload\` to adopt new worker code; restart the daemon for new supervisor code)`);
+    lines.push(`  on disk:    ${onDiskVersion} (update available — run \`c8ctl nano supervisor reload\` to adopt new worker code, and \`c8ctl nano supervisor upgrade\` to roll the daemon itself onto the new code)`);
+  }
+  // #309: while a rolling daemon upgrade is in flight the status frame (and the
+  // persisted-state fallback) carries an `upgrade` block — render it as the
+  // daemon-roll line, mirroring the worker-roll visibility (`rolling <from> →
+  // <to>`). Absent on a quiet daemon.
+  const up = status.upgrade;
+  if (up && typeof up === 'object' && typeof up.state === 'string') {
+    const from = up.fromVersion ?? '?';
+    const to = up.toVersion ?? '?';
+    const age = Number.isFinite(up.sinceEpochMs) ? ` (${formatDuration(Math.max(0, Date.now() - up.sinceEpochMs))})` : '';
+    lines.push(`  upgrade:    ${up.state} — daemon ${from} → ${to}${age}`);
   }
   // A rolling reload can run for a long time (each worker drains in-flight
   // work). Surface it on every `status` so a detached operator — or someone
@@ -15263,6 +15395,10 @@ function stateFromStatus(res, socketPath) {
     version: res.daemon?.version,
     socket: res.daemon?.socket || socketPath,
     logFile: res.daemon?.logFile,
+    // #309 review: carry the daemon's in-flight upgrade block so a stop client
+    // can see the handoff (and the successor's pid) even when it connected to
+    // the PREDECESSOR just before the socket flipped.
+    ...(res.upgrade && typeof res.upgrade === 'object' ? { upgrade: res.upgrade } : {}),
     workers: res.workers || [],
   };
 }
@@ -15277,6 +15413,10 @@ function stateFromStatus(res, socketPath) {
 function statusFromState(running) {
   return {
     daemon: supervisorDaemonDescriptor(running),
+    // #309: the persisted `upgrade` block rides the fallback render too — a
+    // mid-handoff daemon whose socket is briefly unreachable must still show
+    // the roll (same visibility guarantee as `version`/`logFile` above).
+    ...(running && running.upgrade && typeof running.upgrade === 'object' ? { upgrade: running.upgrade } : {}),
     workers: (running.workers || []).map((w) => summarizeSupervisorWorker(w)),
   };
 }
@@ -15367,6 +15507,20 @@ function waitForChildExit(child, timeoutMs) {
  * Unix-only: reparent-to-init is a POSIX semantic; Windows job objects are the
  * equivalent lifecycle tie and are out of scope here (matching the daemon's
  * other `win32` guards). Returns a canceller so callers/tests can stop it.
+ *
+ * Rolling daemon hot-upgrade (issue #309): `retargetToPid` re-arms the SAME
+ * watchdog installation at a NEW daemon pid — the successor daemon the old one
+ * is handing the fleet to. Without it the swap is impossible: the old daemon
+ * exits once the successor owns the socket, the worker reparents to init, and
+ * an un-retargeted watchdog would read exactly that as "daemon died
+ * ungracefully" and self-reap — killing every in-flight job mid-upgrade, the
+ * precise outcome the rolling replace exists to avoid. The retarget is safe
+ * against a stale signal because the watched pid is only ever advanced to the
+ * successor the CURRENT daemon named (via NANO_SUPERVISOR_UPGRADE_PID, set by
+ * the CLI that spawned it); a SIGUSR2 with no upgrade in flight keeps the
+ * legacy graceful-drain semantics (the caller branches on the env var, not
+ * here). No-op on win32 / when the pid is invalid; returns whether the
+ * retarget landed.
  */
 function installParentDeathWatchdog({ intervalMs = 2000, parentPid, onOrphan, readPpid } = {}) {
   if (osPlatform() === 'win32') return () => {};
@@ -15380,14 +15534,40 @@ function installParentDeathWatchdog({ intervalMs = 2000, parentPid, onOrphan, re
   // NOT treat that as "orphaned". A *fallback* ppid of 1, by contrast, means we
   // were already reparented to init with no daemon left to watch.
   const explicit = Number.isInteger(parentPid) && parentPid > 0;
-  const watched = explicit ? parentPid : ppid();
+  // `watched` is deliberately MUTABLE: a rolling daemon upgrade (#309) retargets
+  // it at the successor daemon's pid the moment the old daemon hands over, so
+  // the watchdog keeps guarding the worker across the swap instead of reading
+  // the (expected) reparent-to-init as an orphan event and self-reaping.
+  let watched = explicit ? parentPid : ppid();
+  // #309: after a retarget, the ppid leg changes meaning. The old daemon exits
+  // on purpose once the successor owns the socket, so this worker reparents to
+  // init — and that is the EXPECTED end state, not an orphan event. From the
+  // retarget on, only the SUCCESSOR's death orphans the worker (the ppid leg
+  // would fire immediately and forever on the already-reparented worker).
+  let retargeted = false;
+  // #309 review (rollback): the guard state BEFORE the latest retarget. If the
+  // successor dies mid-handoff while the predecessor is still alive (it rolls
+  // back and keeps the fleet), the worker must fall back to guarding the
+  // predecessor instead of self-reaping an in-flight job. Once the predecessor
+  // has exited too, both are gone and the worker is genuinely orphaned.
+  let fallback = null;
   const orphaned = typeof onOrphan === 'function' ? onOrphan : () => process.exit(0);
   const isOrphan = () => {
     // Reparented away from the daemon (typically to init, pid 1) → orphaned.
-    if (ppid() !== watched) return true;
-    // Defensive: the daemon pid is gone even though ppid still names it (a
-    // zombie/racey read). ESRCH ⇒ gone; EPERM ⇒ alive but not ours to signal.
-    try { process.kill(watched, 0); return false; } catch (err) { return err.code !== 'EPERM'; }
+    // Skipped after an upgrade retarget: the reparent to init IS the handoff.
+    if (!retargeted && ppid() !== watched) return true;
+    // The watched daemon is gone (ESRCH ⇒ gone; EPERM ⇒ alive but not ours to
+    // signal). After an upgrade retarget this is the ONLY orphan signal — the
+    // ppid leg above is skipped (the reparent to init is expected), so the
+    // worker self-reaps exactly when the SUCCESSOR daemon dies.
+    const alive = (pid) => { try { process.kill(pid, 0); return true; } catch (err) { return err.code === 'EPERM'; } };
+    if (alive(watched)) return false;
+    if (fallback && alive(fallback.watched) && (fallback.retargeted || ppid() === fallback.watched)) {
+      ({ watched, retargeted } = fallback);
+      fallback = null;
+      return false;
+    }
+    return true;
   };
   // Orphaned already — self-reap now rather than idle forever. Either we fell
   // back to ppid and it is already init (no known parent), or the recorded
@@ -15395,7 +15575,22 @@ function installParentDeathWatchdog({ intervalMs = 2000, parentPid, onOrphan, re
   if ((!explicit && watched === 1) || isOrphan()) { orphaned(); return () => {}; }
   const timer = setInterval(() => { if (isOrphan()) { clearInterval(timer); orphaned(); } }, intervalMs);
   if (typeof timer.unref === 'function') timer.unref();
-  return () => { try { clearInterval(timer); } catch { /* ignore */ } };
+  const cancel = () => { try { clearInterval(timer); } catch { /* ignore */ } };
+  // #309: re-arm at the successor daemon's pid. The ppid leg of isOrphan() then
+  // reads "reparented to init" as expected (the old daemon exited on purpose),
+  // and only the SUCCESSOR's death orphans the worker from here on.
+  cancel.retarget = (newPid) => {
+    if (!Number.isInteger(newPid) || newPid <= 0) return false;
+    if (newPid !== watched) fallback = { watched, retargeted };
+    watched = newPid;
+    retargeted = true;
+    return true;
+  };
+  // The pid this installation currently guards — the daemon stamps it on the
+  // worker's activity marker as the upgrade ack (the old daemon waits, bounded,
+  // for it to name the successor before exiting).
+  cancel.watchedPid = () => watched;
+  return cancel;
 }
 
 // --- Daemon ----------------------------------------------------------------
@@ -15404,6 +15599,18 @@ function installParentDeathWatchdog({ intervalMs = 2000, parentPid, onOrphan, re
  * The supervisor daemon body. Runs under `c8ctl nano supervisor __daemon`,
  * spawned detached by `startSupervisorDaemon`. Never returns — it runs until a
  * stop request or SIGTERM, then drains children and exits.
+ *
+ * Issue #309 (rolling daemon hot-upgrade): when spawned with
+ * NANO_SUPERVISOR_UPGRADE=1 this process is a SUCCESSOR — the CLI launched it
+ * to take over the fleet from an old daemon running stale plugin code. Before
+ * binding the control socket it waits for the old daemon to quiesce (its
+ * `prepare-upgrade` op stops the accept loop), then adopts the old daemon's
+ * workers from the persisted state (pid-polled synthetic child handles — the
+ * workers themselves are never signaled, so in-flight jobs run undisturbed)
+ * and finally asks the old daemon to hand over (its `upgrade` op retargets
+ * every worker's parent-death watchdog here and exits). A successor that
+ * cannot reach a quiesced old daemon in time exits 1 and leaves the old fleet
+ * untouched.
  */
 async function runSupervisorDaemon() {
   const startedAt = new Date().toISOString();
@@ -15416,6 +15623,68 @@ async function runSupervisorDaemon() {
   const socketPath = getSupervisorSocketPath();
   const daemonLogFile = supervisorDaemonLogFile();
   mkdirSync(getSupervisorLogDir(), { recursive: true });
+
+  // Boot-time log line, available before the closure-scoped `dlog` exists (the
+  // upgrade-mode quiesce handshake below runs before the workers map and its
+  // helpers are initialized). Identical format.
+  const dlogBoot = (msg) => {
+    try { appendFileSync(daemonLogFile, `[${new Date().toISOString()}] ${msg}\n`); } catch { /* best effort */ }
+  };
+
+  // #309: successor boot. `upgradeMode` latches once the old daemon has been
+  // asked to quiesce; `predecessorPid`/`upgradeFromVersion` feed the status
+  // frame's `upgrade` block so `supervisor status` shows the roll in flight
+  // (`rolling <from> → <to>`), mirroring the worker-roll visibility.
+  const upgradeMode = process.env.NANO_SUPERVISOR_UPGRADE === '1';
+  let predecessorPid = null;
+  let upgradeFromVersion = null;
+  let upgradeStartedMs = null;
+  if (upgradeMode) {
+    const t0 = Date.now();
+    dlogBoot(`upgrade mode: waiting for the current daemon to quiesce (pid from ${getSupervisorStateFile()})`);
+    for (;;) {
+      const st = readSupervisorState();
+      if (!st || !isPidAlive(st.pid)) {
+        // No live old daemon — nothing to hand over. Serve the fleet normally
+        // (there is nothing to adopt; the state file, if any, is stale).
+        dlogBoot('upgrade mode: no live predecessor daemon — starting as a plain daemon');
+        break;
+      }
+      predecessorPid = st.pid;
+      upgradeFromVersion = typeof st.version === 'string' ? st.version : null;
+      // Ask the old daemon to stop accepting new control connections. An old
+      // daemon that predates #309 answers `unknown op` — refuse to upgrade from
+      // it rather than racing its accept loop for the socket.
+      let prep = null;
+      try {
+        // #309 review: quiescence awaits admitted opQueue mutations (a restart
+        // can take ~28s to stop its worker), and the predecessor closes its
+        // listener as soon as it latches — so a retry could never reach it.
+        // Keep THIS connection open for the remaining quiesce budget.
+        const remainingMs = SUPERVISOR_UPGRADE_QUIESCE_TIMEOUT_MS - (Date.now() - t0);
+        prep = await supervisorRequest({ op: 'prepare-upgrade', pid: process.pid }, { socketPath, timeoutMs: 750, responseTimeoutMs: Math.max(SUPERVISOR_PROBE_RESPONSE_TIMEOUT_MS, remainingMs) });
+      } catch { /* socket briefly unreachable — retry until the deadline */ }
+      if (prep && prep.ok) break; // quiesced — the accept loop is closed
+      if (prep && prep.ok === false && /unknown op/.test(String(prep.error || ''))) {
+        dlogBoot(`upgrade mode: predecessor pid ${st.pid} does not understand prepare-upgrade (too old) — refusing to upgrade`);
+        process.exit(1);
+      }
+      // #309 review: the predecessor bound its handoff to a DIFFERENT successor
+      // (a concurrent upgrade won the race). Never keep retrying — the binding
+      // will never accept this pid, and two successors must not both wait to
+      // adopt the same fleet. Exit and leave the bound successor to finish.
+      if (prep && prep.ok === false && /already bound to successor pid/.test(String(prep.error || ''))) {
+        dlogBoot(`upgrade mode: predecessor pid ${st.pid} is bound to a different successor — exiting so the bound successor completes the handoff`);
+        process.exit(1);
+      }
+      if (Date.now() - t0 > SUPERVISOR_UPGRADE_QUIESCE_TIMEOUT_MS) {
+        dlogBoot(`upgrade mode: predecessor pid ${st.pid} did not quiesce within ${SUPERVISOR_UPGRADE_QUIESCE_TIMEOUT_MS}ms — leaving it in place`);
+        process.exit(1);
+      }
+      await new Promise((r) => setTimeout(r, 150));
+    }
+    if (predecessorPid != null) upgradeStartedMs = Date.now();
+  }
 
   const workers = new Map();
   const attachClients = new Set();
@@ -15434,6 +15703,23 @@ async function runSupervisorDaemon() {
   // restart-on-exit path and let a second `stop --force` escalate a live drain.
   let draining = false;
   let forcing = false;
+  // #309 review: `shuttingDown` is latched EARLY (in the `stop` op, before the
+  // deferred shutdown() runs) to reserve shutdown ownership against a racing
+  // prepare-upgrade. `shutdownStarted` is the separate "shutdown()'s body has
+  // begun" guard: the deferred shutdown() must still run its body even though
+  // `shuttingDown` is already true, while a SECOND stop/signal must escalate
+  // (force) or return instead of re-running the body.
+  let shutdownStarted = false;
+  // #309: a rolling daemon upgrade owns this daemon. `upgrading` is the
+  // OLD-daemon latch: set by `prepare-upgrade` (accept loop closed; mutations
+  // refused) and held through the `upgrade` handoff until this process exits.
+  // `quiesced` flips when the accept loop has actually closed — the successor
+  // polls for it before binding the socket. `upgradeInfo` carries the roll's
+  // identity ({ state, fromVersion, toVersion, successorPid, sinceEpochMs })
+  // for the status frame's `upgrade` block.
+  let upgrading = false;
+  let quiesced = false;
+  let upgradeInfo = null;
   // Hot code reload (rolling drain+respawn). A `reload` op adopts new on-disk
   // plugin code into the worker children by gracefully draining and respawning
   // them one at a time (so the fleet keeps serving). This flag rejects a second
@@ -15448,6 +15734,19 @@ async function runSupervisorDaemon() {
   // refreshed status to attached consoles only on real change (see below).
   let monitorTimer = null;
   let lastMonitorSig = null;
+  // #309: while quiesced for an upgrade the predecessor's accept loop is closed
+  // and — on a second upgrade — every worker is an ADOPTED handle whose liveness
+  // poll (`adoptTimer`) is unref'd, as is `monitorTimer`. With no referenced
+  // handle left, Node would let the predecessor EXIT before the successor's
+  // watchdog-retarget acks arrive / before SIGUSR1 lands — and the never-
+  // resolving handoff Promise does NOT keep the event loop alive. This
+  // referenced keepalive holds the predecessor up for exactly the quiesce→
+  // handover window; it is cleared on the SIGUSR1 handover (and on shutdown).
+  let quiesceKeepalive = null;
+  // #309: polls the successor pid while quiesced so a successor that dies
+  // mid-handoff (before SIGUSR1) triggers a rollback instead of leaving this
+  // daemon permanently quiesced + unreachable. Cleared on handover/rollback.
+  let successorWatchTimer = null;
 
   // Daemon-wide mutation serialization: `add`/`remove`/`restart` must not
   // interleave, or two clients racing the same worker could each spawn an
@@ -15465,16 +15764,46 @@ async function runSupervisorDaemon() {
 
   const workerPublic = (w) => summarizeSupervisorWorker(w);
 
-  const persist = () => {
+  // #309: the daemon descriptor gains an `upgrade` block while a rolling daemon
+  // upgrade is in flight — on the OLD daemon (state 'rolling', naming the
+  // successor it is handing to) and on the SUCCESSOR (state 'adopting' until
+  // the predecessor exits). `supervisor status` renders it as
+  // `upgrade: rolling <from> → <to>` — the same visibility the worker roll has.
+  const currentUpgradeBlock = () => {
+    if (upgradeInfo) return upgradeInfo;
+    if (upgradeMode && predecessorPid != null) {
+      return { state: 'adopting', fromVersion: upgradeFromVersion, toVersion: daemonVersion, predecessorPid, sinceEpochMs: upgradeStartedMs };
+    }
+    return null;
+  };
+
+  // #309: once the successor has confirmed ownership (SIGUSR1 → handedOver) the
+  // predecessor must make its final snapshot its LAST canonical write. More
+  // broadly, once QUIESCED (`upgrading` latched) the successor has already read
+  // the quiesce snapshot and adopted the inventory, so any later automatic
+  // persist (a straggler worker-death handler firing between quiesce and exit)
+  // would overwrite the successor's pid + inventory with the dead/dying daemon's
+  // — corrupting discovery/recovery until the successor happens to persist
+  // again. So persist() is suppressed while quiesced UNLESS forced (the quiesce
+  // snapshot and the final handed-over snapshot are the two deliberate writes).
+  let handedOver = false;
+  const persist = (force = false) => {
+    if (handedOver) return; // the successor owns the state file now
+    if (upgrading && !force) return; // quiesced — the successor owns the inventory
     try {
       writeSupervisorState({
         ...supervisorDaemonDescriptor({
           pid: process.pid, startedAt, version: daemonVersion, socket: socketPath, logFile: daemonLogFile,
         }),
+        ...(currentUpgradeBlock() ? { upgrade: currentUpgradeBlock() } : {}),
         workers: [...workers.values()].map((w) => ({
           id: w.id, profile: w.profile, args: w.args, pid: isPidAlive(w.pid) ? w.pid : null,
           startedAt: w.startedAt || null, restarts: w.restarts, lastExit: w.lastExit ?? null,
           stopping: !!w.stopping, logFile: w.logFile, configFailed: w.configFailed === true,
+          // #309: persist drain-remove intent so an adopted worker that exits
+          // mid-drain is still REMOVED by the successor (not retained forever,
+          // which would block name reuse and hang `workforce stop`).
+          removeOnExit: w.removeOnExit === true,
         })),
       });
     } catch { /* best effort */ }
@@ -15511,6 +15840,11 @@ async function runSupervisorDaemon() {
     const activityFile = supervisorWorkerActivityFile(w.id);
     w.activityFile = activityFile;
     try { rmSync(activityFile, { force: true }); } catch { /* best effort */ }
+    // #309 review: also clear a stale `.upgrade` retarget sidecar. A worker
+    // force-restarted mid-handoff before consuming it would otherwise inherit
+    // the same path and treat its next genuine drain SIGUSR2 as a retarget.
+    // (A handoff in progress re-writes the sidecar before it SIGUSR2s.)
+    try { rmSync(`${activityFile}.upgrade`, { force: true }); } catch { /* best effort */ }
     // `--name w.id` makes the child's broker workerName match this worker's
     // supervisor id, so the same profile launched twice is distinct end-to-end.
     // NANO_SUPERVISOR_ACTIVITY_FILE tells the child where to report per-job
@@ -15519,8 +15853,20 @@ async function runSupervisorDaemon() {
     // watchdog can self-reap if we die ungracefully (SIGKILL/crash) and can't
     // run the child-draining shutdown — even if we die mid-startup, before the
     // child reparents to init.
+    // NANO_SUPERVISOR_UPGRADE_PID (#309): when a daemon upgrade is in flight,
+    // the successor's pid rides the child's env so the worker's SIGUSR2 handler
+    // can tell a watchdog RETARGET (upgrade — keep serving) apart from a
+    // graceful DRAIN (no upgrade pid — quiesce and exit). The daemon learns the
+    // successor pid only at handoff time (the `upgrade` op), AFTER most workers
+    // were spawned — so env alone can't reach them. The daemon therefore also
+    // writes `<activityFile>.upgrade` (the successor pid) before it SIGUSR2s,
+    // and the worker reads THAT as the authoritative retarget target; this env
+    // forwarding covers only a worker spawned mid-upgrade.
+    const childEnv = { ...process.env, NANO_SUPERVISOR_ACTIVITY_FILE: activityFile, NANO_SUPERVISOR_DAEMON_PID: String(process.pid) };
+    const upgradeSuccessorPid = Number(process.env.NANO_SUPERVISOR_UPGRADE_PID ?? '', 10);
+    if (Number.isInteger(upgradeSuccessorPid) && upgradeSuccessorPid > 0) childEnv.NANO_SUPERVISOR_UPGRADE_PID = String(upgradeSuccessorPid);
     const child = spawn(exec, [entry, 'nano', 'work', w.profile, '--name', w.id, ...w.args], {
-      env: { ...process.env, NANO_SUPERVISOR_ACTIVITY_FILE: activityFile, NANO_SUPERVISOR_DAEMON_PID: String(process.pid) },
+      env: childEnv,
       stdio: ['ignore', ringed ? 'pipe' : fd, ringed ? 'pipe' : fd],
     });
     if (typeof fd === 'number') { try { closeSync(fd); } catch { /* dup'd into child */ } }
@@ -15613,7 +15959,9 @@ async function runSupervisorDaemon() {
       broadcast({ type: 'event', event: 'worker-exit', worker: workerPublic(w), restartInMs: delay });
       w.restartTimer = setTimeout(() => {
         w.restartTimer = null;
-        if (!w.stopping && !shuttingDown && workers.has(w.id)) startWorker(w);
+        // #309: a quiesced old daemon (mid-upgrade) never respawns — the
+        // successor owns the fleet and would double-spawn the worker.
+        if (!w.stopping && !shuttingDown && !upgrading && workers.has(w.id)) startWorker(w);
       }, delay);
       if (typeof w.restartTimer.unref === 'function') w.restartTimer.unref();
       persist();
@@ -15621,6 +15969,123 @@ async function runSupervisorDaemon() {
     child.on('error', (err) => handleDeath(`spawn error: ${err.message}`));
     child.on('exit', (code, signal) => handleDeath(signal ? `signal ${signal}` : `code ${code}`));
     persist();
+  };
+
+  // #309: a synthetic ChildProcess-shaped handle for an ADOPTED worker — one
+  // the old daemon spawned and the successor inherits by pid. The successor
+  // never spawned it, so there is no real 'exit' event: a poll timer is the
+  // death detector, feeding the same `handleDeath` path a real child's exit
+  // would (restart backoff included). The handle provides the surface the
+  // daemon touches: `pid`, `exitCode`/`signalCode` (null while alive — the
+  // readiness gate and reload checks read them), `kill` (force-stop),
+  // `unref`/`ref`, null stdio (the log ring stays with the OLD daemon process),
+  // and — critically — REAL `exit` listener semantics (`once`/`on`/
+  // `removeListener` + `markExited`), because `waitForChildExit()` resolves only
+  // when `exit` fires.
+  const makeAdoptedChild = (pid) => {
+    const exitWaiters = new Set();
+    const handle = {
+      pid,
+      exitCode: null,
+      signalCode: null,
+      killed: false,
+      stdout: null,
+      stderr: null,
+      stdin: null,
+      kill(signal) { try { return process.kill(pid, signal); } catch { return false; } },
+      once(event, fn) { if (event === 'exit' && typeof fn === 'function') { if (handle.exitCode !== null || handle.signalCode !== null) fn(handle.exitCode, handle.signalCode); else exitWaiters.add(fn); } return handle; },
+      on(event, fn) { if (event === 'exit' && typeof fn === 'function') { if (handle.exitCode !== null || handle.signalCode !== null) fn(handle.exitCode, handle.signalCode); else exitWaiters.add(fn); } return handle; },
+      removeListener(event, fn) { if (event === 'exit') exitWaiters.delete(fn); return handle; },
+      unref() { return handle; },
+      ref() { return handle; },
+      // Invoked by the adopt liveness poll when the pid is gone: record the exit
+      // and flush every waiter so graceful-stop/reload promises resolve.
+      markExited(code, signal) {
+        if (handle.exitCode !== null || handle.signalCode !== null) return;
+        handle.exitCode = code;
+        handle.signalCode = signal ?? null;
+        for (const fn of [...exitWaiters]) { exitWaiters.delete(fn); try { fn(code, signal ?? null); } catch { /* ignore */ } }
+      },
+    };
+    return handle;
+  };
+
+  // Adopt one worker record from the predecessor's persisted state. Returns the
+  // live worker entry, or null when the pid is already gone (nothing to adopt —
+  // the fleet is exactly what survives the swap). The poll timer is unref'd so
+  // it never keeps the daemon alive on its own.
+  const adoptWorker = (rec) => {
+    if (!rec || typeof rec.id !== 'string' || !rec.id) return null;
+    if (!isPidAlive(rec.pid)) return null;
+    const w = {
+      id: rec.id,
+      profile: typeof rec.profile === 'string' ? rec.profile : '',
+      args: Array.isArray(rec.args) ? rec.args.map(String) : [],
+      restarts: Number(rec.restarts) || 0,
+      stopping: rec.stopping === true,
+      // #309: restore drain-remove intent persisted by the predecessor, so a
+      // worker draining for removal that exits after the swap is REMOVED here
+      // (its record deleted) rather than retained — which would block name reuse
+      // and hang a `workforce stop` waiting for the record to disappear.
+      removeOnExit: rec.removeOnExit === true,
+      lastExit: rec.lastExit ?? null,
+      logFile: typeof rec.logFile === 'string' ? rec.logFile : supervisorWorkerLogFile(rec.id),
+      configFailed: rec.configFailed === true,
+      adopted: true,
+    };
+    w.activityFile = supervisorWorkerActivityFile(w.id);
+    // Clear any stale `.upgrade` sidecar the handoff left: the worker consumed
+    // it to retarget its watchdog here, and a leftover would make a LATER
+    // SIGUSR2 (a genuine drain) misread as another upgrade retarget.
+    try { rmSync(`${w.activityFile}.upgrade`, { force: true }); } catch { /* best effort */ }
+    const child = makeAdoptedChild(rec.pid);
+    w.child = child;
+    w.pid = rec.pid;
+    w.startedAt = rec.startedAt || null;
+    w.spawnedAt = rec.startedAt ? new Date(rec.startedAt).getTime() : Date.now();
+    let settled = false;
+    const handleDeath = (reason) => {
+      if (w.child !== child || settled) return;
+      settled = true;
+      if (w.adoptTimer) { try { clearInterval(w.adoptTimer); } catch { /* ignore */ } w.adoptTimer = null; }
+      // Mark the synthetic handle exited BEFORE running the death path so any
+      // `waitForChildExit` waiter (graceful stop / reload) resolves — the poll
+      // below is the only death detector for an adopted worker.
+      if (typeof child.markExited === 'function') child.markExited(1, null);
+      w.pid = null;
+      w.lastExit = reason;
+      try { rmSync(w.activityFile || supervisorWorkerActivityFile(w.id), { force: true }); } catch { /* best effort */ }
+      const ranMs = Date.now() - (w.spawnedAt || Date.now());
+      if (ranMs >= SUPERVISOR_HEALTHY_UPTIME_MS) w.restarts = 0;
+      if (w.stopping || shuttingDown || !workers.has(w.id)) {
+        if (w.removeOnExit && workers.get(w.id) === w) {
+          workers.delete(w.id);
+          try { rmSync(w.activityFile || supervisorWorkerActivityFile(w.id), { force: true }); } catch { /* best effort */ }
+          dlog(`worker '${w.id}' removed (drained)`);
+          broadcast({ type: 'event', event: 'worker-remove', id: w.id });
+        }
+        persist();
+        if (draining) { try { broadcast(statusFrame(false)); } catch { /* best effort */ } }
+        return;
+      }
+      if (upgrading) { persist(); return; } // quiesced for the handoff — the successor owns respawns
+      const delay = supervisorBackoffMs(w.restarts);
+      w.restarts += 1;
+      dlog(`adopted worker '${w.id}' down (${reason}); restarting in ${delay}ms (restart #${w.restarts})`);
+      broadcast({ type: 'event', event: 'worker-exit', worker: workerPublic(w), restartInMs: delay });
+      w.restartTimer = setTimeout(() => {
+        w.restartTimer = null;
+        if (!w.stopping && !shuttingDown && !upgrading && workers.has(w.id)) startWorker(w);
+      }, delay);
+      if (typeof w.restartTimer.unref === 'function') w.restartTimer.unref();
+      persist();
+    };
+    w.adoptTimer = setInterval(() => { if (!isPidAlive(rec.pid)) handleDeath('code 1 (adopted worker exited)'); }, SUPERVISOR_ADOPT_POLL_MS);
+    if (typeof w.adoptTimer.unref === 'function') w.adoptTimer.unref();
+    workers.set(w.id, w);
+    dlog(`worker '${w.id}' (profile ${w.profile}) adopted from predecessor daemon (pid ${w.pid})`);
+    broadcast({ type: 'event', event: 'worker-adopted', worker: workerPublic(w) });
+    return w;
   };
 
   const addWorker = (profile, args, name) => {
@@ -15643,6 +16108,33 @@ async function runSupervisorDaemon() {
     workers.set(id, w);
     startWorker(w);
     return w;
+  };
+
+  // #309 review: workers whose upgrade watchdog-retarget is still outstanding
+  // (id -> { pid, signalled, drainOnly?, drainDeferred? }), owned by the
+  // successor's handoff loop. A graceful drain (stop/remove/reload) also uses
+  // SIGUSR2, so it must not race a pending retarget: a drain signal consumed as
+  // the retarget leaves the drain unfulfilled, and a second SIGUSR2 after the
+  // one-shot handler fired would kill in-flight work. sendDrainSignal
+  // coordinates the two so both are delivered, in order.
+  const retargetPending = new Map();
+  const sendDrainSignal = (w, pid) => {
+    const p = retargetPending.get(w.id);
+    if (p && p.pid === pid) {
+      if (!p.signalled) {
+        // Retarget not sent yet: cancel it (drop the sidecar) and drain
+        // instead — the handoff loop delivers the drain once the handler is
+        // installed and keeps the predecessor alive until the worker exits.
+        try { rmSync(`${w.activityFile || supervisorWorkerActivityFile(w.id)}.upgrade`, { force: true }); } catch { /* best effort */ }
+        p.signalled = true; p.drainOnly = true; p.drainDeferred = true;
+      } else if (!p.drainOnly) {
+        // Retarget in flight: deliver the drain right after its ack.
+        p.drainDeferred = true;
+      }
+      // drainOnly without drainDeferred: already draining — nothing to send.
+      return;
+    }
+    try { process.kill(pid, SUPERVISOR_DRAIN_SIGNAL); } catch { /* already gone */ }
   };
 
   const forceStopWorker = async (w) => {
@@ -15671,7 +16163,7 @@ async function runSupervisorDaemon() {
       // — a `stop --force` escalation (forceStopWorker) is the only way to cut a
       // stuck drain short, and it resolves this same wait when the child dies.
       if (w.child && pid) {
-        try { process.kill(pid, SUPERVISOR_DRAIN_SIGNAL); } catch { /* already gone */ }
+        sendDrainSignal(w, pid);
         await waitForChildExit(w.child, null);
       }
       return true;
@@ -15693,7 +16185,7 @@ async function runSupervisorDaemon() {
       w.removeOnExit = true;
       if (w.restartTimer) { clearTimeout(w.restartTimer); w.restartTimer = null; }
       const pid = w.pid;
-      if (w.child && pid) { try { process.kill(pid, SUPERVISOR_DRAIN_SIGNAL); } catch { /* already gone */ } }
+      if (w.child && pid) { sendDrainSignal(w, pid); }
       else { workers.delete(id); try { rmSync(supervisorWorkerActivityFile(id), { force: true }); } catch { /* best effort */ } broadcast({ type: 'event', event: 'worker-remove', id }); persist(); }
       dlog(`worker '${id}' draining for removal`);
       return true;
@@ -15790,7 +16282,7 @@ async function runSupervisorDaemon() {
     if (w.restartTimer) { clearTimeout(w.restartTimer); w.restartTimer = null; }
     const pid = w.pid;
     if (child && pid) {
-      try { process.kill(pid, SUPERVISOR_DRAIN_SIGNAL); } catch { /* already gone */ }
+      sendDrainSignal(w, pid);
       await waitForChildExit(child, null);
     }
     // Only respawn if nobody else acted on this worker while we drained: it must
@@ -15987,12 +16479,28 @@ async function runSupervisorDaemon() {
       reloaded: [...reloadDone],
       total: reloadTargets.length,
     },
+    // #309: present only while a rolling daemon upgrade is in flight
+    // (`{ state, fromVersion, toVersion, … }`) — the successor polls the old
+    // daemon's `upgrade.state === 'quiesced'` through this field before binding
+    // the socket, and `supervisor status` renders it as the daemon-roll line.
+    ...(currentUpgradeBlock() ? { upgrade: currentUpgradeBlock() } : {}),
     workers: pub || [...workers.values()].map(workerPublic),
     ...(final ? { final: true } : {}),
   });
 
   const shutdown = async (signal, { force = true } = {}) => {
-    if (shuttingDown) {
+    // #309 review: a quiesced (mid-upgrade) daemon must NEVER run the shutdown
+    // path — it would SIGTERM/SIGKILL the very workers the successor has
+    // adopted, and its cleanup would delete the successor's socket and state
+    // file. The upgrade's SIGUSR1 handover is this daemon's only exit while
+    // quiesced; a signal (SIGTERM/SIGINT/SIGHUP) is logged and ignored so the
+    // handoff can finish. The socket `stop` op refuses earlier (the `upgrading`
+    // check in handleRequest) and never reaches here.
+    if (upgrading) {
+      dlog(`ignoring ${signal || 'shutdown request'} — a daemon upgrade owns this daemon (successor pid ${upgradeInfo?.successorPid ?? 'unknown'}); the successor owns the fleet now`);
+      return;
+    }
+    if (shutdownStarted) {
       // A shutdown is already running. A `stop --force` arriving mid-DRAIN
       // escalates it: hard-stop every worker still finishing its jobs so the
       // operator isn't stuck waiting. Idempotent — only the first force escalates.
@@ -16005,6 +16513,7 @@ async function runSupervisorDaemon() {
       return;
     }
     shuttingDown = true;
+    shutdownStarted = true;
     draining = !force;
     // Let any in-flight mutation finish before we snapshot the worker set, so
     // an add/restart racing the shutdown can't leave an orphaned child behind.
@@ -16013,6 +16522,7 @@ async function runSupervisorDaemon() {
     if (!force) broadcast({ type: 'event', event: 'draining', workers: [...workers.values()].map(workerPublic) });
     await Promise.all([...workers.keys()].map((id) => stopWorker(id, { force })));
     if (monitorTimer) { try { clearInterval(monitorTimer); } catch { /* ignore */ } monitorTimer = null; }
+    if (quiesceKeepalive) { try { clearInterval(quiesceKeepalive); } catch { /* ignore */ } quiesceKeepalive = null; }
     broadcast({ type: 'event', event: 'daemon-stop' });
     // Terminal frame for every waiting `stop` client (streaming or one-shot).
     // We must FLUSH these before exiting: `process.exit()` does NOT drain pending
@@ -16036,6 +16546,179 @@ async function runSupervisorDaemon() {
     process.exit(0);
   };
 
+  // #309: quiesce this daemon for an upgrade WITHOUT exiting: stop accepting
+  // new control connections (the successor binds the socket the moment our
+  // accept loop closes) and latch `upgrading` so mutations and worker respawns
+  // are refused. Idempotent — the successor polls until it observes the
+  // quiesced state. Attached consoles are destroyed (their daemon is going
+  // away). The handoff is then driven by the SUCCESSOR (it retargets the
+  // workers' watchdogs and SIGUSR1s this daemon to exit) — this daemon's
+  // accept loop is already closed, so it cannot be asked over the socket.
+  //
+  // Snapshot AFTER the mutation queue drains (#309 review): latching
+  // `upgrading` rejects NEW mutations, but one may already be admitted to
+  // `opQueue` (e.g. a restart that is mid-respawn). Persisting before that
+  // settles would snapshot a half-swapped worker set the successor then adopts
+  // — missing the replacement the in-flight restart is about to spawn. So we
+  // latch admission synchronously, then AWAIT `opQueue` (exactly as
+  // `shutdown()` does) before persisting and reporting `quiesced`.
+  let quiescePromise = null;
+  // #309 review: the worker-id set captured in the quiesce snapshot. Rollback
+  // reconciles the live map against it — the successor owns add/remove while
+  // this daemon is quiesced, so a worker the successor removed mid-handoff must
+  // stay removed if the handoff rolls back (never resurrected).
+  let quiesceSnapshotIds = null;
+  const quiesceForUpgrade = (successorPid, successorVersion) => {
+    // #309 review: bind the handoff to ONE successor. `doQuiesce` latches
+    // `upgrading` only inside its async body, so two prepare-upgrade requests
+    // that arrive before the first body's first await both observe
+    // `upgrading === false` and would share one quiesce promise — two
+    // successors, each believing it owns the bind+adopt, racing for the same
+    // socket and fleet. Validate and bind preparation to the FIRST successor
+    // pid synchronously (before any await), and reject every other pid until
+    // this handoff finishes (handover) or rolls back. The bound successor's
+    // own retries (same pid) stay idempotent — they share the promise.
+    if (!Number.isInteger(successorPid) || successorPid <= 0) {
+      // An unidentifiable caller never earns the binding — without a pid the
+      // successor watch cannot run and no retry could ever match the binding.
+      const err = new Error('prepare-upgrade requires a valid successor pid');
+      err.code = 'UPGRADE_BOUND';
+      throw err;
+    }
+    if (upgrading) {
+      const boundTo = upgradeInfo && upgradeInfo.successorPid;
+      if (boundTo !== successorPid) {
+        const err = new Error(`a daemon upgrade is already bound to successor pid ${boundTo} — refusing a concurrent handoff`);
+        err.code = 'UPGRADE_BOUND';
+        throw err;
+      }
+    }
+    if (!upgrading || !quiescePromise) quiescePromise = doQuiesce(successorPid, successorVersion);
+    return quiescePromise;
+  };
+  const doQuiesce = async (successorPid, successorVersion) => {
+    if (!upgrading) {
+      upgrading = true; // latch admission FIRST — rejects new mutations/respawns
+      upgradeInfo = { state: 'quiescing', fromVersion: daemonVersion, toVersion: successorVersion ?? null, successorPid, sinceEpochMs: Date.now() };
+      dlog(`daemon upgrade: quiescing for successor pid ${successorPid} — control socket accept loop closing, mutations refused`);
+      try { server.close(); } catch { /* ignore */ }
+      for (const s of [...attachClients]) { try { s.destroy(); } catch { /* ignore */ } }
+      // Hold the event loop open until the successor's SIGUSR1 handover (see the
+      // quiesceKeepalive declaration) — a no-op tick on a REFERENCED timer.
+      if (!quiesceKeepalive) quiesceKeepalive = setInterval(() => {}, SUPERVISOR_ADOPT_POLL_MS);
+      // #309 review (no-rollback): watch the successor. If it dies AFTER we
+      // quiesced but BEFORE handing over (SIGUSR1), this daemon is left quiesced
+      // and unreachable — respawns disabled, accept loop closed, no way for even
+      // a later upgrade to reach it. Roll back: re-open the accept loop and
+      // unlatch `upgrading` so normal operation (and a retry) resumes.
+      armSuccessorWatch(successorPid);
+      // Wait for any ALREADY-ADMITTED mutation (e.g. a restart mid-respawn) to
+      // settle before snapshotting, so the successor adopts its replacement.
+      try { await opQueue; } catch { /* mutation already logged */ }
+      if (!upgrading) return; // rolled back while draining the queue
+      upgradeInfo = { ...upgradeInfo, state: 'quiesced' };
+      quiesceSnapshotIds = [...workers.keys()];
+      persist(true); // the deliberate quiesce snapshot the successor adopts from
+    }
+    quiesced = true;
+  };
+
+  // #309 review (no-rollback): while quiesced, poll the successor pid. If it
+  // dies before handing over (SIGUSR1), this daemon would otherwise stay
+  // quiesced + unreachable forever (accept loop closed, respawns disabled, no
+  // listener for even a later upgrade). On detecting a dead successor, roll
+  // back: re-open the accept loop and unlatch `upgrading`.
+  const armSuccessorWatch = (successorPid) => {
+    if (!Number.isInteger(successorPid) || successorPid <= 0) return;
+    if (successorWatchTimer) { try { clearInterval(successorWatchTimer); } catch { /* ignore */ } successorWatchTimer = null; }
+    successorWatchTimer = setInterval(() => {
+      if (!upgrading || handedOver) { try { clearInterval(successorWatchTimer); } catch { /* ignore */ } successorWatchTimer = null; return; }
+      if (!isPidAlive(successorPid)) {
+        try { clearInterval(successorWatchTimer); } catch { /* ignore */ }
+        successorWatchTimer = null;
+        rollbackFromUpgrade(successorPid);
+      }
+    }, SUPERVISOR_ADOPT_POLL_MS);
+    if (typeof successorWatchTimer.unref === 'function') successorWatchTimer.unref();
+  };
+
+  // Restore normal operation after a successor died mid-handoff: re-listen on
+  // the control socket (the successor never bound it, or died holding it) and
+  // unlatch `upgrading` so mutations/respawns resume. Best-effort — if the
+  // re-listen fails the daemon stays quiesced and logs, but the common case
+  // (successor crashed before binding) recovers cleanly.
+  const rollbackFromUpgrade = (deadSuccessorPid) => {
+    if (!upgrading || handedOver) return;
+    quiescePromise = null;
+    dlog(`daemon upgrade: successor pid ${deadSuccessorPid} died before handover — rolling back: re-opening the control socket and resuming normal operation`);
+    upgrading = false;
+    quiesced = false;
+    upgradeInfo = null;
+    // Capture the snapshot BEFORE clearing it — the membership reconcile below
+    // reads this copy (clearing first made every rollback drop the whole fleet).
+    // A null snapshot (quiesce never reached the snapshot point) means there is
+    // nothing to reconcile against, so membership is left untouched.
+    const rollbackSnapshotIds = quiesceSnapshotIds;
+    quiesceSnapshotIds = null;
+    if (quiesceKeepalive) { try { clearInterval(quiesceKeepalive); } catch { /* ignore */ } quiesceKeepalive = null; }
+    // Re-open the accept loop. The socket path may still be held by the dead
+    // successor's listen socket; remove it first (same takeover the successor
+    // itself performs), then re-bind.
+    if (osPlatform() !== 'win32') { try { rmSync(socketPath, { force: true }); } catch { /* ignore */ } }
+    // Same owner-only umask as the initial bind, so the socket is private from
+    // creation (no listen()→chmod window for another local user to connect).
+    const rbWin = osPlatform() === 'win32';
+    const rbPrevUmask = rbWin ? null : process.umask(0o177);
+    try {
+      server.listen(socketPath);
+      if (!rbWin) { try { chmodSync(socketPath, 0o600); } catch { /* ignore */ } }
+      dlog('daemon upgrade rollback: control socket re-opened — fleet serving normally');
+    } catch (err) {
+      dlog(`daemon upgrade rollback: failed to re-open the control socket: ${err?.message || err}`);
+    } finally {
+      if (!rbWin) { try { process.umask(rbPrevUmask); } catch { /* ignore */ } }
+    }
+    // #309 review: reconcile the inventory. Respawns were suppressed while
+    // quiesced (expired restart timers and death handlers bailed), so reschedule
+    // every eligible down worker now — preserving stop/config-failure/removal
+    // intent and skipping any with a live process or a pending restart timer.
+    // Membership is reconciled against the quiesce snapshot: a worker ABSENT
+    // from it was removed through the SUCCESSOR while this daemon was quiesced
+    // (the successor owns add/remove during the handoff), so re-adding it here
+    // would resurrect a deliberately removed worker.
+    // The authoritative handoff inventory is what the SUCCESSOR persisted (it
+    // owns add/remove during the handoff): if the state file was last written
+    // by the dead successor, its worker list wins; otherwise fall back to our
+    // quiesce snapshot (the successor never wrote — nothing was removed).
+    let snapshotIds = rollbackSnapshotIds ? new Set(rollbackSnapshotIds) : null;
+    try {
+      const succState = readSupervisorState();
+      if (succState && succState.pid === deadSuccessorPid && Array.isArray(succState.workers)) {
+        snapshotIds = new Set(succState.workers.map((x) => x && x.id).filter(Boolean));
+      }
+    } catch { /* unreadable — keep the snapshot */ }
+    for (const id of snapshotIds ? [...workers.keys()] : []) {
+      if (!snapshotIds.has(id)) {
+        dlog(`daemon upgrade rollback: worker '${id}' is not in the quiesce snapshot (removed through the successor mid-handoff?) — leaving it removed`);
+        workers.delete(id);
+      }
+    }
+    for (const w of [...workers.values()]) {
+      if (w.restartTimer || (w.pid && isPidAlive(w.pid))) continue;
+      if (w.removeOnExit) {
+        workers.delete(w.id);
+        try { rmSync(w.activityFile || supervisorWorkerActivityFile(w.id), { force: true }); } catch { /* best effort */ }
+        dlog(`worker '${w.id}' removed (drained during the aborted upgrade)`);
+        continue;
+      }
+      if (w.stopping || w.configFailed) continue;
+      if (w.adoptTimer) { try { clearInterval(w.adoptTimer); } catch { /* ignore */ } w.adoptTimer = null; }
+      dlog(`daemon upgrade rollback: worker '${w.id}' was down while quiesced — rescheduling`);
+      startWorker(w);
+    }
+    persist();
+  };
+
   const handleRequest = async (req, sock) => {
     const op = req && req.op;
     try {
@@ -16043,8 +16726,30 @@ async function runSupervisorDaemon() {
         case 'status':
           sock.write(encodeFrame(statusFrame(true)));
           break;
+        case 'prepare-upgrade': {
+          // #309: a successor daemon (spawned with NANO_SUPERVISOR_UPGRADE=1)
+          // asks us to quiesce so it can bind the control socket. Refuse while
+          // a worker reload roll or a shutdown owns the fleet — an upgrade on
+          // top of either would strand its bookkeeping. Idempotent: the
+          // successor polls until it observes the quiesced state. Bound to ONE
+          // successor pid (quiesceForUpgrade throws UPGRADE_BOUND for any
+          // other) so two racing successors can never both win the fleet.
+          if (shuttingDown) { sock.write(encodeFrame({ ok: false, error: 'supervisor is shutting down', final: true })); break; }
+          if (reloading) { sock.write(encodeFrame({ ok: false, error: 'a worker reload is in progress — retry the daemon upgrade once it finishes', final: true })); break; }
+          try {
+            await quiesceForUpgrade(Number(req.pid) || null, typeof req.version === 'string' ? req.version : null);
+          } catch (err) {
+            if (err && err.code === 'UPGRADE_BOUND') { sock.write(encodeFrame({ ok: false, error: err.message, final: true })); break; }
+            throw err;
+          }
+          // Report quiesced only AFTER the mutation queue has drained and the
+          // snapshot persisted — the successor binds+adopts off this ack.
+          sock.write(encodeFrame({ ok: true, type: 'prepare-upgrade', quiesced: true, final: true }));
+          break;
+        }
         case 'add': {
           if (shuttingDown) { sock.write(encodeFrame({ ok: false, error: 'supervisor is shutting down', final: true })); break; }
+          if (upgrading) { sock.write(encodeFrame({ ok: false, error: 'supervisor daemon upgrade in progress — retry against the successor in a moment', final: true })); break; }
           if (!req.profile) { sock.write(encodeFrame({ ok: false, error: 'add requires a profile', final: true })); break; }
           // A supervised worker's name is supplied out-of-band as `req.name`
           // (which the daemon forwards to the child as `nano work … --name`).
@@ -16067,6 +16772,7 @@ async function runSupervisorDaemon() {
         }
         case 'remove': {
           if (shuttingDown) { sock.write(encodeFrame({ ok: false, error: 'supervisor is shutting down', final: true })); break; }
+          if (upgrading) { sock.write(encodeFrame({ ok: false, error: 'supervisor daemon upgrade in progress — retry against the successor in a moment', final: true })); break; }
           // #202: `req.force === false` drains each worker (finish in-flight jobs
           // then exit); the default remains a fast force-stop (used by reconcile
           // and interactive remove). A drain-remove returns immediately and the
@@ -16082,6 +16788,7 @@ async function runSupervisorDaemon() {
         }
         case 'restart': {
           if (shuttingDown) { sock.write(encodeFrame({ ok: false, error: 'supervisor is shutting down', final: true })); break; }
+          if (upgrading) { sock.write(encodeFrame({ ok: false, error: 'supervisor daemon upgrade in progress — retry against the successor in a moment', final: true })); break; }
           const restarted = await serializeOp(async () => {
             const ids = resolveTargets(req.target);
             for (const id of ids) await restartWorker(id);
@@ -16098,6 +16805,7 @@ async function runSupervisorDaemon() {
           // and ends with a terminal `reloaded` frame — draining can take a long
           // time, so this MUST be a streaming op, not a one-shot request.
           if (shuttingDown) { sock.write(encodeFrame({ ok: false, error: 'supervisor is shutting down', final: true })); break; }
+          if (upgrading) { sock.write(encodeFrame({ ok: false, error: 'supervisor daemon upgrade in progress — retry against the successor in a moment', final: true })); break; }
           if (reloading) { sock.write(encodeFrame({ ok: false, error: 'a reload is already in progress', final: true })); break; }
           // Reject reload explicitly on Windows BEFORE draining anything. The
           // rolling reload's graceful drain relies on SIGUSR2 (SUPERVISOR_DRAIN_SIGNAL)
@@ -16179,10 +16887,30 @@ async function runSupervisorDaemon() {
           // #202: default is a GRACEFUL DRAIN — quiesce workers, let in-flight
           // jobs finish, exit when idle. `req.force` hard-aborts (kill harness,
           // yield jobs) and can also ESCALATE a drain already in progress.
+          // #309: a quiesced (mid-upgrade) daemon must never run the stop path —
+          // it would SIGTERM/SIGUSR2 the very workers the successor has adopted.
+          // The upgrade's own exit path replaces this op for the old daemon.
+          if (upgrading) { sock.write(encodeFrame({ ok: false, error: 'supervisor daemon upgrade in progress — the successor owns the fleet now; stop it instead (its pid is in `supervisor status`)', final: true })); break; }
           const force = !!req.force;
-          // Register this client as an attach consumer so it streams drain
-          // progress (shrinking in-flight counts), and as a stop client so it
-          // gets a terminal `stopped` frame when the daemon has finished.
+          // #309 review: reserve shutdown ownership HERE, synchronously with the
+          // acceptance — not 20ms later when the deferred shutdown() runs. An
+          // unreserved accept lets a prepare-upgrade squeeze into the defer
+          // window and latch `upgrading` first; the shutdown then overtakes the
+          // quiesce and SIGTERMs the very workers the successor is adopting.
+          // Latching now makes the race impossible in either order: a stop
+          // accepted first refuses the upgrade (prepare-upgrade checks
+          // `shuttingDown`), and an upgrade quiesced first refuses the stop
+          // (the `upgrading` check above).
+          //
+          // A SECOND stop while one is already reserved is not a fresh shutdown:
+          // it only ESCALATES a drain (force) or is a no-op. Never re-latch
+          // `draining` here — a force stop arriving during a graceful drain must
+          // leave `draining === true` so shutdown()'s escalation branch fires,
+          // and a graceful stop during a force stop must not flip it back.
+          if (!shutdownStarted && !shuttingDown) {
+            shuttingDown = true;
+            draining = !force;
+          }
           attachClients.add(sock);
           stopClients.add(sock);
           sock.write(encodeFrame(force
@@ -16191,7 +16919,12 @@ async function runSupervisorDaemon() {
           sock.write(encodeFrame(statusFrame(false)));
           // Kick the shutdown asynchronously; don't await it here so the control
           // loop keeps serving (streaming status, accepting a force escalation).
-          setTimeout(() => { shutdown('stop', { force }); }, 20);
+          // The 250ms defer lets a `stop --force` escalation (sent right behind
+          // a graceful `stop`, as `stopStream`'s sendAfter does) land and run
+          // shutdown's escalation branch BEFORE the drain's body force-stops on
+          // its own — preserving the pre-#309 escalation contract now that
+          // `shuttingDown` is latched early (see below).
+          setTimeout(() => { shutdown('stop', { force }); }, 250);
           break;
         }
         default:
@@ -16204,7 +16937,11 @@ async function runSupervisorDaemon() {
 
   // Bind the control socket. A stale unix socket file from a crashed daemon
   // would make listen() fail with EADDRINUSE even though nobody is listening;
-  // remove it first (we already know no live daemon owns our state).
+  // remove it first. In upgrade mode the old daemon has QUIESCED (its accept
+  // loop is closed) but its listen socket still holds the path until it exits,
+  // so we must unlink + rebind to take over — the same operation, deliberately
+  // ordered AFTER the quiesce handshake so we can never steal the socket from a
+  // daemon that is still accepting (#309).
   if (osPlatform() !== 'win32') { try { rmSync(socketPath, { force: true }); } catch { /* ignore */ } }
 
   const server = createServer((sock) => {
@@ -16270,7 +17007,208 @@ async function runSupervisorDaemon() {
   // and hard crashes still can't run this — the per-worker parent-death
   // watchdog is the backstop for those.
   process.once('SIGHUP', () => shutdown('SIGHUP'));
+  // #309: SIGUSR1 is the upgrade handoff's "the successor owns the fleet — exit
+  // WITHOUT touching the workers" signal. It is ONLY meaningful after a
+  // `prepare-upgrade` quiesce (the successor sends it once it has adopted the
+  // workers and retargeted their watchdogs). A SIGUSR1 outside an upgrade must
+  // NOT exit (that would strand the fleet with no daemon), so it is ignored
+  // unless `upgrading` is latched. Unlike `shutdown`, this path never signals
+  // the workers and never clears the state file — the successor owns both now.
+  process.on('SIGUSR1', () => {
+    if (!upgrading) return;
+    dlog(`daemon upgrade: successor confirmed ownership — old daemon (pid ${process.pid}) exiting; workers keep serving`);
+    upgradeInfo = upgradeInfo ? { ...upgradeInfo, state: 'handed-over' } : upgradeInfo;
+    // #309 review: NO persist here. The quiesce snapshot was this daemon's last
+    // canonical write — the successor has since written its own pid + inventory,
+    // and any write now would clobber it with the exiting predecessor's state.
+    handedOver = true;
+    quiesceSnapshotIds = null;
+    if (monitorTimer) { try { clearInterval(monitorTimer); } catch { /* ignore */ } monitorTimer = null; }
+    if (quiesceKeepalive) { try { clearInterval(quiesceKeepalive); } catch { /* ignore */ } quiesceKeepalive = null; }
+    if (successorWatchTimer) { try { clearInterval(successorWatchTimer); } catch { /* ignore */ } successorWatchTimer = null; }
+    process.exit(0);
+  });
   dlog(`supervisor daemon up (pid ${process.pid}) — control ${socketPath}`);
+
+  // #309: adopt the predecessor's workers. The old daemon quiesced (above) and
+  // its last persist() — run when it latched the upgrade — names every worker
+  // it owned. Each live pid becomes an adopted worker (polled for liveness;
+  // never signaled, so in-flight jobs run undisturbed). Dead pids are dropped
+  // with a log line — the fleet after the swap is exactly what survived it.
+  if (upgradeMode && predecessorPid != null) {
+    const prior = readSupervisorState();
+    const adopted = [];
+    for (const rec of (prior && Array.isArray(prior.workers) ? prior.workers : [])) {
+      const w = adoptWorker(rec);
+      if (w) { adopted.push(w.id); continue; }
+      // #309 review: transfer the FULL inventory, not only live pids. A worker
+      // the predecessor recorded but that is not alive right now falls into one
+      // of three kept categories — dropping it would permanently shrink the
+      // fleet (the predecessor refuses respawns once quiesced):
+      if (!rec || typeof rec.id !== 'string' || !rec.id) { dlog('upgrade: skipping a worker record with no id'); continue; }
+      if (rec.configFailed === true) {
+        // Configuration-failed: retained (NOT restarted) so the operator's
+        // `configFailed` signal survives the swap and a later fix+restart still
+        // targets the same record.
+        workers.set(rec.id, {
+          id: rec.id, profile: typeof rec.profile === 'string' ? rec.profile : '',
+          args: Array.isArray(rec.args) ? rec.args.map(String) : [],
+          restarts: Number(rec.restarts) || 0, stopping: rec.stopping === true,
+          removeOnExit: rec.removeOnExit === true, lastExit: rec.lastExit ?? null,
+          logFile: typeof rec.logFile === 'string' ? rec.logFile : supervisorWorkerLogFile(rec.id),
+          configFailed: true, adopted: true, pid: null, child: null,
+          startedAt: rec.startedAt || null, spawnedAt: rec.startedAt ? new Date(rec.startedAt).getTime() : Date.now(),
+        });
+        dlog(`upgrade: retained configuration-failed worker '${rec.id}' (not restarted)`);
+        continue;
+      }
+      if (rec.stopping === true || rec.removeOnExit === true) {
+        // Draining for stop/remove: the process is already gone, so the removal
+        // completes here — delete the record rather than resurrect it.
+        dlog(`upgrade: worker '${rec.id}' was draining for removal and is gone — record dropped`);
+        try { rmSync(supervisorWorkerActivityFile(rec.id), { force: true }); } catch { /* best effort */ }
+        continue;
+      }
+      // Down but eligible (a crash/backoff the predecessor had not yet
+      // respawned when it quiesced): reschedule it here so fleet capacity is
+      // preserved across the swap.
+      dlog(`upgrade: worker '${rec.id}' was down at handoff — rescheduling to preserve fleet capacity`);
+      const rw = {
+        id: rec.id, profile: typeof rec.profile === 'string' ? rec.profile : '',
+        args: Array.isArray(rec.args) ? rec.args.map(String) : [],
+        restarts: Number(rec.restarts) || 0, stopping: false, removeOnExit: false,
+        lastExit: rec.lastExit ?? null,
+        logFile: typeof rec.logFile === 'string' ? rec.logFile : supervisorWorkerLogFile(rec.id),
+        configFailed: false, adopted: true,
+      };
+      workers.set(rw.id, rw);
+      startWorker(rw);
+      rw.spawnedBySuccessor = true; // its watchdog already guards this daemon
+      adopted.push(rw.id);
+    }
+    dlog(`upgrade: adopted ${adopted.length} worker(s) from predecessor pid ${predecessorPid}: ${adopted.join(', ') || '(none)'}`);
+    broadcast({ type: 'event', event: 'daemon-adopted', predecessorPid, workers: adopted });
+
+    // Drive the handoff to completion. The old daemon's accept loop is closed
+    // (quiesce), so it can no longer be asked over the socket — instead the
+    // SUCCESSOR finishes the swap: write each live worker's `.upgrade` sidecar
+    // (the successor pid the worker's SIGUSR2 handler reads), SIGUSR2 the
+    // workers to retarget their watchdogs here, wait (bounded) for their
+    // `watchdogPid` acks, then SIGUSR1 the old daemon so it persists and exits
+    // WITHOUT touching the workers. Runs async so the control loop serves
+    // immediately; the `upgrade` status block stays 'adopting' until the old
+    // daemon is gone.
+    (async () => {
+      const myPid = process.pid;
+      // Every live PREDECESSOR-owned worker stays pending until it has either
+      // acked the retarget (`watchdogPid === myPid`) or exited (#309 review).
+      // A worker still booting has Node's DEFAULT SIGUSR2 action (terminate)
+      // until its handler is up, so it is signalled only once its activity
+      // marker proves readiness (finite `readyAt` + matching pid) — but it is
+      // NEVER dropped from the wait set, so the predecessor (its watchdog
+      // target) is not released under it. Workers this successor spawned
+      // itself already guard it and need no retarget.
+      const pending = retargetPending;
+      for (const id of adopted) {
+        const w = workers.get(id);
+        if (!w || w.spawnedBySuccessor || !w.pid || !isPidAlive(w.pid)) continue;
+        if (w.stopping) {
+          // #309 review: already draining (stop/remove) under the predecessor.
+          // Its one-shot SIGUSR2 handler was consumed by that drain, so another
+          // SIGUSR2 would hit Node's default action and kill its in-flight work.
+          // Never write a sidecar or signal it — just keep it pending (its
+          // watchdog still guards the predecessor) until it exits.
+          pending.set(id, { pid: w.pid, signalled: true, drainOnly: true });
+          continue;
+        }
+        const actFile = w.activityFile || supervisorWorkerActivityFile(w.id);
+        try { writeFileSync(`${actFile}.upgrade`, String(myPid), { mode: 0o600 }); } catch { /* best effort */ }
+        pending.set(id, { pid: w.pid, signalled: false });
+      }
+      // Bounded wait first; past the deadline report INCOMPLETE but KEEP
+      // monitoring (#309 review) so a late ack / drain still releases the
+      // predecessor and its keepalive — a retried upgrade would target this
+      // successor, never the retained predecessor.
+      const ackDeadline = Date.now() + SUPERVISOR_UPGRADE_ACK_TIMEOUT_MS;
+      let reportedIncomplete = false;
+      while (pending.size > 0) {
+        if (!isPidAlive(predecessorPid)) break; // predecessor gone — nothing left to release
+        for (const [id, p] of [...pending]) {
+          const w = workers.get(id);
+          if (!w || w.pid !== p.pid || !isPidAlive(p.pid)) { pending.delete(id); continue; }
+          const act = readWorkerActivity(id);
+          if (p.drainOnly) {
+            // Draining, not retargeting: a deferred drain request (below) is
+            // delivered once the handler is provably installed; then just wait
+            // for the exit.
+            if (p.drainDeferred && drainSignalReadyFor(act, p.pid)) {
+              p.drainDeferred = false;
+              try { process.kill(p.pid, SUPERVISOR_DRAIN_SIGNAL); } catch { /* already gone */ }
+            }
+            continue;
+          }
+          if (act && act.pid === p.pid && act.watchdogPid === myPid) {
+            pending.delete(id);
+            // Retarget landed and the handler re-armed — now deliver any drain
+            // that was requested while the retarget was outstanding.
+            if (p.drainDeferred) { try { process.kill(p.pid, SUPERVISOR_DRAIN_SIGNAL); } catch { /* already gone */ } }
+            continue;
+          }
+          if (!p.signalled && drainSignalReadyFor(act, p.pid)) {
+            p.signalled = true;
+            try { process.kill(p.pid, SUPERVISOR_DRAIN_SIGNAL); } catch { /* already gone */ }
+          }
+        }
+        if (pending.size === 0) break;
+        if (!reportedIncomplete && Date.now() >= ackDeadline) {
+          reportedIncomplete = true;
+          dlog(`upgrade: ${pending.size} worker(s) have not acked the watchdog retarget within ${SUPERVISOR_UPGRADE_ACK_TIMEOUT_MS}ms (${[...pending.keys()].join(', ')}) — NOT releasing the predecessor yet; handoff INCOMPLETE, still monitoring until they ack or exit`);
+          upgradeInfo = { state: 'incomplete', fromVersion: upgradeFromVersion, toVersion: daemonVersion, predecessorPid, unacked: [...pending.keys()], sinceEpochMs: upgradeStartedMs };
+          persist();
+        }
+        await new Promise((r) => setTimeout(r, reportedIncomplete ? SUPERVISOR_ADOPT_POLL_MS : 100));
+      }
+      // Predecessor gone with entries still pending: deliver deferred drains
+      // that are safe now (handler installed and no retarget signal in flight
+      // that the drain could be mistaken for). A drain deferred behind an
+      // un-acked retarget is logged — signalling now could hit a consumed
+      // one-shot handler and kill in-flight work.
+      for (const [id, p] of pending) {
+        if (!p.drainDeferred || !isPidAlive(p.pid)) continue;
+        if (p.drainOnly && drainSignalReadyFor(readWorkerActivity(id), p.pid)) {
+          try { process.kill(p.pid, SUPERVISOR_DRAIN_SIGNAL); } catch { /* already gone */ }
+        } else {
+          dlog(`upgrade: deferred drain for worker '${id}' not delivered (retarget unacknowledged or handler not ready) — re-issue stop/remove once it settles`);
+        }
+      }
+      pending.clear();
+      // Release the old daemon: it persists a final snapshot and exits 0 without
+      // touching the workers. If it is already gone (crashed mid-handoff), the
+      // workers are still adopted here — nothing more to do.
+      if (isPidAlive(predecessorPid)) {
+        try { process.kill(predecessorPid, 'SIGUSR1'); } catch { /* already gone */ }
+      }
+      dlog(`upgrade: handoff complete — successor pid ${myPid} owns the fleet (${daemonVersion})`);
+    })().catch((err) => dlog(`upgrade handoff error: ${err?.message || err}`));
+
+    // Clear the status `upgrade` block once the predecessor has actually exited
+    // — the roll is complete from then on, and a quiet fleet's status should
+    // not carry a stale 'adopting' line forever. Unref'd: it never keeps the
+    // daemon alive.
+    const clearTimer = setInterval(() => {
+      if (!isPidAlive(predecessorPid)) {
+        try { clearInterval(clearTimer); } catch { /* ignore */ }
+        predecessorPid = null;
+        // #309 review: a handoff reported INCOMPLETE that later completed (late
+        // acks/drains released the predecessor) must not keep reporting
+        // 'incomplete' forever — currentUpgradeBlock() returns upgradeInfo first.
+        if (upgradeInfo && upgradeInfo.state === 'incomplete') upgradeInfo = null;
+        persist();
+      }
+    }, SUPERVISOR_ADOPT_POLL_MS);
+    if (typeof clearTimer.unref === 'function') clearTimer.unref();
+  }
+
   persist();
 
   // Live-view refresh: periodically re-sample worker activity and push a fresh
@@ -16663,9 +17601,9 @@ async function streamSupervisorReload(socketPath, req, logger, { label = 'fleet'
  * Hot-adopt new plugin code into the running fleet with zero downtime: roll
  * through the target workers, gracefully draining (finish in-flight jobs) and
  * respawning each so the new child re-reads the updated `c8ctl-plugin.js` from
- * disk. Defaults to the whole fleet. Note this adopts new WORKER code only; the
- * supervisor daemon itself keeps running its startup code until a full restart
- * (`supervisor stop && supervisor start`).
+ * disk. Defaults to the whole fleet. Note this adopts new WORKER code only;
+ * the supervisor daemon itself is rolled separately, without stopping the
+ * fleet, by `supervisor upgrade` (issue #309).
  */
 async function supervisorReloadCmd(req) {
   const logger = getLogger();
@@ -16678,6 +17616,116 @@ async function supervisorReloadCmd(req) {
   if (outcome === 'unreachable') { logger.error('Could not reach the supervisor control socket to reload it.'); process.exit(1); }
   if (outcome === 'closed') { logger.error('The supervisor closed the connection before the reload finished (daemon crash or concurrent stop?) — the roll may be incomplete. Rerun `nano supervisor status` to check the fleet.'); process.exit(1); }
   if (outcome === 'error') process.exit(1);
+}
+
+/**
+ * Rolling hot-upgrade of the supervisor DAEMON process (issue #309) — the
+ * daemon-level counterpart of `supervisor reload` (which rolls only workers).
+ * The daemon keeps the module graph it imported at start, so adopting new
+ * SUPERVISOR-side code used to require `supervisor stop && start` — a fleet
+ * outage (or, with --force, killed in-flight jobs). This command swaps the
+ * parent process instead:
+ *
+ *   1. spawn a SUCCESSOR daemon (detached, NANO_SUPERVISOR_UPGRADE=1) running
+ *      the on-disk — post-`nano update` — plugin code;
+ *   2. the successor asks the old daemon to QUIESCE (`prepare-upgrade`: accept
+ *      loop closed, mutations refused), then binds the canonical control
+ *      socket and ADOPTS the old daemon's workers from the persisted state
+ *      (pid-polled; the workers are never signaled, so in-flight jobs run
+ *      undisturbed);
+ *   3. the successor then finishes the swap itself: it writes each worker's
+ *      `<activityFile>.upgrade` sidecar, SIGUSR2s the workers to retarget their
+ *      parent-death watchdogs at it, waits (bounded) for the `watchdogPid`
+ *      acks, and SIGUSR1s the old daemon — which persists a final snapshot and
+ *      exits 0 WITHOUT touching the workers.
+ *
+ * Workers never die mid-job; only the parent is swapped. A successor that
+ * cannot reach a quiesced old daemon exits 1 and leaves the fleet untouched.
+ * This client just spawns the successor and waits for the swap to land; Ctrl-C
+ * detaches — the handoff completes in the background.
+ */
+async function supervisorUpgradeCmd() {
+  const logger = getLogger();
+  if (osPlatform() === 'win32') {
+    logger.error('supervisor upgrade is not supported on Windows (its worker watchdog retarget relies on SIGUSR2, which Windows cannot deliver) — use `supervisor stop` + `start` to adopt new supervisor code.');
+    process.exit(1);
+  }
+  const running = await liveSupervisor();
+  if (!running) { logger.error('Supervisor is not running.'); process.exit(1); }
+  const socketPath = running.socket || getSupervisorSocketPath();
+  const oldPid = running.pid;
+  const fromVersion = running.version || null;
+  const toVersion = (() => { try { return pluginPackage().version; } catch { return null; } })();
+
+  // 1. Spawn the successor. NANO_SUPERVISOR_UPGRADE=1 puts its boot into
+  //    upgrade mode (quiesce handshake → bind → adopt → drive the handoff). We
+  //    deliberately do NOT clear the state file first — the successor reads the
+  //    old daemon's worker list from it. Ctrl-C detaches the waiter below; the
+  //    successor is detached and completes the swap regardless.
+  const { exec, entry } = c8ctlInvocation();
+  mkdirSync(getSupervisorLogDir(), { recursive: true });
+  const logFile = supervisorDaemonLogFile();
+  let fd;
+  try { fd = openSync(logFile, 'a'); } catch { fd = 'ignore'; }
+  const child = spawn(exec, [entry, 'nano', 'supervisor', '__daemon'], {
+    env: { ...process.env, NANO_SUPERVISOR_UPGRADE: '1' },
+    detached: true,
+    stdio: ['ignore', fd, fd],
+  });
+  child.unref();
+  if (typeof fd === 'number') { try { closeSync(fd); } catch { /* ignore */ } }
+  if (typeof child.pid !== 'number') { logger.error('Failed to spawn the successor supervisor daemon.'); process.exit(1); }
+  const successorPid = child.pid;
+  logger.info(`Upgrading the supervisor daemon (pid ${oldPid}${fromVersion ? `, v${fromVersion}` : ''}) → successor pid ${successorPid}${toVersion ? ` (v${toVersion})` : ''}. Workers keep serving; only the parent process is swapped. Press Ctrl-C to detach.`);
+  // #309 review (detached-breaks-supervision): the successor is spawned DETACHED
+  // in this session, not under launchd/systemd. If a service unit is installed,
+  // warn the operator that the new daemon is no longer service-supervised (and
+  // that the old unit's clean exit 0 won't restart it — the generated units use
+  // crash-only policies), and tell them how to re-establish supervision.
+  try {
+    if (supervisorServiceInstalled()) {
+      logger.warn('A supervisor service is installed, but the upgraded daemon runs DETACHED in this session — it is no longer under launchd/systemd supervision (and the old unit\'s clean exit will not auto-restart it). After the upgrade, run `c8ctl nano supervisor install` (or `stop` + `start`) to bring the new-code daemon back under the service.');
+    }
+  } catch { /* best effort — never block the upgrade on a detection hiccup */ }
+
+  // 2. Wait for the swap to land: the successor takes the socket (status names
+  //    its pid) and the old daemon exits (released by the successor's SIGUSR1
+  //    once the workers' watchdogs are retargeted). Ctrl-C detaches — the
+  //    handoff completes in the background.
+  let detached = false;
+  const onSigint = () => { detached = true; };
+  process.on('SIGINT', onSigint);
+  const deadline = Date.now() + SUPERVISOR_UPGRADE_QUIESCE_TIMEOUT_MS + SUPERVISOR_UPGRADE_ACK_TIMEOUT_MS + 10_000;
+  try {
+    for (;;) {
+      if (detached) {
+        logger.info('Detached — the daemon upgrade completes in the background. Rerun `nano supervisor status` to confirm.');
+        return;
+      }
+      if (!isPidAlive(successorPid)) {
+        logger.error(`The successor daemon (pid ${successorPid}) died during the upgrade — the old daemon (pid ${oldPid}) may still be in place. See ${logFile}.`);
+        process.exit(1);
+      }
+      let successorServing = false;
+      try {
+        const res = await supervisorRequest({ op: 'status' }, { socketPath, timeoutMs: 500, responseTimeoutMs: SUPERVISOR_PROBE_RESPONSE_TIMEOUT_MS });
+        successorServing = !!(res && res.ok && res.daemon && res.daemon.pid === successorPid);
+      } catch { /* socket mid-handoff — retry */ }
+      const oldGone = !isPidAlive(oldPid);
+      if (successorServing && oldGone) {
+        logger.info(`Supervisor daemon upgraded${fromVersion || toVersion ? ` (${fromVersion ?? '?'} → ${toVersion ?? '?'})` : ''} — successor pid ${successorPid} owns the fleet; no worker was stopped.`);
+        return;
+      }
+      if (Date.now() >= deadline) {
+        if (!successorServing) logger.warn(`The successor daemon (pid ${successorPid}) did not take the control socket in time — the old daemon (pid ${oldPid}) may still own the fleet. Check \`nano supervisor status\` and ${logFile}.`);
+        else logger.warn(`The old daemon (pid ${oldPid}) has not exited yet — the watchdog handoff is still completing. Check \`nano supervisor status\` in a moment.`);
+        process.exit(1);
+      }
+      await new Promise((r) => setTimeout(r, 150));
+    }
+  } finally {
+    try { process.removeListener('SIGINT', onSigint); } catch { /* ignore */ }
+  }
 }
 
 /**
@@ -16787,7 +17835,15 @@ async function supervisorStopCmd(force = false) {
         const { frames, rest } = decodeFrames(buf);
         buf = rest;
         for (const frame of frames) {
-          if (frame && frame.type === 'stopping') {
+          // #309 review: an ok:false terminal frame is a REFUSAL, not a stop —
+          // the daemon rejected the op (a daemon upgrade owns the fleet; the
+          // successor holds the socket now). Treating it as a successful stop
+          // would wait indefinitely for the wrong pid and, with --force,
+          // SIGKILL the quiesced predecessor's process group — including the
+          // workers the successor adopted — then erase the successor's state.
+          if (frame && frame.ok === false) {
+            finish({ error: String(frame.error || 'the supervisor refused the stop request') });
+          } else if (frame && frame.type === 'stopping') {
             logger.info('Aborting in-flight work — killing harnesses and yielding jobs for retry...');
           } else if (frame && frame.event === 'draining-escalated') {
             logger.info('Escalating to --force — aborting in-flight work...');
@@ -16813,6 +17869,15 @@ async function supervisorStopCmd(force = false) {
 
   if (outcome === 'detached') return;
 
+  // A refused stop (ok:false) is an ERROR outcome: surface it and exit before
+  // any pid wait, force escalation, or state cleanup — the daemon that refused
+  // (e.g. a quiesced predecessor mid-upgrade) is not ours to reap, and the
+  // state file now names the successor that owns the fleet.
+  if (outcome && typeof outcome === 'object' && outcome.error) {
+    logger.error(`Supervisor stop refused: ${outcome.error}`);
+    process.exit(1);
+  }
+
   if (outcome === 'unreachable') {
     if (force) {
       // Socket unreachable — fall back to signalling the daemon pid directly.
@@ -16828,6 +17893,15 @@ async function supervisorStopCmd(force = false) {
   // backstop so a wedged daemon/worker group can't linger. The window must cover
   // the daemon's own worker force-stop grace (#296), or the SIGKILL below reaps the
   // group while a worker is still promoting its durable recovery ref (#295).
+  // #309 review: if the daemon we asked is mid-upgrade (quiesced), the pid we
+  // captured is the PREDECESSOR's — it exits on the successor's handover, not on
+  // our refused/naive stop. Say so, and never SIGKILL its process group (the
+  // successor's adopted workers share it) or clear the successor's state.
+  if (running.upgrade && typeof running.upgrade === 'object') {
+    const successorPid = Number(running.upgrade.successorPid);
+    logger.warn(`The supervisor is mid-upgrade (handing the fleet to successor pid ${Number.isInteger(successorPid) && successorPid > 0 ? successorPid : 'unknown'}) — stop the successor instead; this daemon exits when the handoff completes.`);
+    return;
+  }
   if (force) {
     const deadline = Date.now() + FORCE_STOP_DAEMON_GRACE_MS;
     while (Date.now() < deadline) {
@@ -17534,7 +18608,13 @@ async function supervisorCommand(req, flags, ctx) {
       await supervisorRestartCmd(req);
       return;
     case 'reload':
+      // `reload --daemon` is the daemon-upgrade alias (issue #309): the plain
+      // op rolls WORKER code; this rolls the daemon process itself.
+      if (flags?.daemon) { await supervisorUpgradeCmd(); return; }
       await supervisorReloadCmd(req);
+      return;
+    case 'upgrade':
+      await supervisorUpgradeCmd();
       return;
     case 'reload-credentials':
       await supervisorReloadCredentialsCmd(req);
@@ -17547,7 +18627,7 @@ async function supervisorCommand(req, flags, ctx) {
       supervisorLogsCmd(req);
       return;
     default:
-      getLogger().error(`Unknown supervisor action "${action}". Use: start|install|uninstall|status|add|remove|restart|reload|reload-credentials|stop|logs|attach`);
+      getLogger().error(`Unknown supervisor action "${action}". Use: start|install|uninstall|status|add|remove|restart|reload|upgrade|reload-credentials|stop|logs|attach`);
       process.exit(1);
   }
 }
@@ -20446,6 +21526,7 @@ export {
   summarizeSupervisorWorker,
   formatSupervisorStatus,
   statusFromState,
+  stateFromStatus,
   supervisorDaemonDescriptor,
   formatSupervisorLogsLines,
   reageSupervisorStatus,
@@ -20462,6 +21543,7 @@ export {
   normalizeAgenticMessage,
   buildActivityPayload,
   activityMarkerReadyFor,
+  drainSignalReadyFor,
   reloadCredentialsReady,
   waitForChildExit,
   supervisorWorkerActivityFile,
@@ -20474,6 +21556,7 @@ export {
   supervisorStartCmd,
   supervisorAddCmd,
   supervisorReloadCmd,
+  supervisorUpgradeCmd,
   supervisorReloadCredentialsCmd,
   workforceReloadCmd,
   runningSupervisor,
@@ -20582,7 +21665,8 @@ export const metadata = {
         { command: 'c8ctl nano supervisor add decider', description: 'Add a supervised worker (forwarding work flags) to the running supervisor' },
         { command: 'c8ctl nano supervisor add reviewer --instances 3', description: 'Add 3 distinct auto-named instances of a profile in one call' },
         { command: 'c8ctl nano supervisor restart reviewer', description: 'Restart a supervised worker by id or profile' },
-        { command: 'c8ctl nano supervisor reload', description: 'Adopt updated harness code with zero downtime: after `nano update`, roll through the fleet draining in-flight jobs and respawning each worker so it re-reads the new plugin (workers only; restart the daemon for new supervisor code)' },
+        { command: 'c8ctl nano supervisor reload', description: 'Adopt updated harness code with zero downtime: after `nano update`, roll through the fleet draining in-flight jobs and respawning each worker so it re-reads the new plugin (workers only — use `supervisor upgrade` for the daemon)' },
+        { command: 'c8ctl nano supervisor upgrade', description: 'Rolling hot-upgrade of the supervisor DAEMON itself (alias: `reload --daemon`): a successor daemon on the new code takes the control socket and ADOPTS the running workers (no drain — in-flight jobs never stop), then the old daemon exits. Status shows `upgrade: rolling <from> → <to>` while it runs' },
         { command: 'c8ctl nano supervisor reload-credentials', description: 'After a `gh auth login`/`refresh`, tell every worker to re-read its gh token from the CLI now (async; the still-valid old token is served until the new one lands; no drain, in-flight jobs keep running) — status shows each worker\'s token age/scopes' },
         { command: 'c8ctl nano supervisor stop', description: 'Stop the supervisor daemon and all its workers' },
         { command: 'c8ctl nano workforce add copilot --instances 5 --auto', description: 'Compose a reusable fleet: 5 copilot workers serving every deployed agent job type (--auto)' },
@@ -20664,6 +21748,7 @@ export const commands = {
       worker: { type: 'string', multiple: true, description: 'supervisor start: profile to launch as a supervised worker (repeatable)' },
       instances: { type: 'string', description: `supervisor add / workforce add: spawn/compose N distinct instances of the profile in one call (default 1, max ${MAX_ADD_INSTANCES}; for supervisor add cannot combine with --name)` },
       attach: { type: 'boolean', description: 'supervisor start: attach the interactive console after starting the daemon' },
+      daemon: { type: 'boolean', description: 'supervisor reload: roll the DAEMON process itself onto the on-disk code (alias of `supervisor upgrade`) instead of rolling worker code' },
       manifest: { type: 'string', description: `workforce: manifest name to operate on (default ${DEFAULT_WORKFORCE_MANIFEST}); each subcommand reads/writes <stateHome>/workforce/<name>.json. Renamed from --profile (which now collides with c8ctl's global connection-profile flag).` },
       roles: { type: 'string', description: 'workforce add: comma-separated role list for the entry (→ --job-type <rank>:<role> at start); mutually exclusive with --auto' },
     },

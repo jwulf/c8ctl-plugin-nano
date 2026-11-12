@@ -49,6 +49,7 @@ import {
   bindJobSettle,
   countSupervisorInFlight,
   activityMarkerReadyFor,
+  drainSignalReadyFor,
   reloadCredentialsReady,
   waitForChildExit,
   supervisorWorkerActivityFile,
@@ -1142,10 +1143,15 @@ test('buildActivityPayload carries engine + agentic and derives busy from jobs',
     engine: 'http://localhost:8080',
     agentic: { status: 'connected', mode: 'local' },
     readyAt: null,
+    signalReadyAt: null,
     // #293: the cached gh token's identity (fingerprint/scopes/age — never the
     // value) rides the marker so `supervisor status` can show it; null when the
     // producer did not stamp it (an un-primed cache / older worker).
     ghAuth: null,
+    // #309: the daemon pid this worker's parent-death watchdog guards; null
+    // until the producer stamps it (a standalone `nano work` has no watchdog).
+    // The daemon-upgrade handoff reads it as the retarget ack.
+    watchdogPid: null,
   });
 
   // Busy: jobs present → busy:true; the live job list rides through untouched.
@@ -1183,6 +1189,22 @@ test('activityMarkerReadyFor: a marker is ready only with a finite readyAt AND a
   // A non-finite readyAt is never ready; a missing marker is never ready.
   assert.equal(activityMarkerReadyFor({ pid: 4242, readyAt: NaN }, 4242), false);
   assert.equal(activityMarkerReadyFor(null, 4242), false);
+});
+
+test('drainSignalReadyFor: retarget gate uses the handler-installed stamp, not leasing readiness (#309 review)', () => {
+  // A healthy --auto worker with no deployed types never stamps readyAt, but its
+  // SIGUSR2 handler is installed — it must be retargetable.
+  assert.equal(drainSignalReadyFor({ pid: 7, readyAt: null, signalReadyAt: 50 }, 7), true);
+  // Back-compat: a worker predating signalReadyAt is ready via readyAt.
+  assert.equal(drainSignalReadyFor({ pid: 7, readyAt: 50 }, 7), true);
+  // Neither stamp: handler may not be installed (default SIGUSR2 = terminate).
+  assert.equal(drainSignalReadyFor({ pid: 7, readyAt: null, signalReadyAt: null }, 7), false);
+  // Foreign/stale marker or none at all never passes.
+  assert.equal(drainSignalReadyFor({ pid: 8, signalReadyAt: 50 }, 7), false);
+  assert.equal(drainSignalReadyFor(null, 7), false);
+  // The producer publishes the stamp (null until set).
+  assert.equal(buildActivityPayload({ pid: 7, updatedAt: 1, jobs: [], agentic: {}, signalReadyAt: 9 }).signalReadyAt, 9);
+  assert.equal(buildActivityPayload({ pid: 7, updatedAt: 1, jobs: [], agentic: {} }).signalReadyAt, null);
 });
 
 test('reloadCredentialsReady: only signal a worker whose reload listener is proven installed (#293)', () => {

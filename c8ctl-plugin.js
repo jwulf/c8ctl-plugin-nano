@@ -509,6 +509,19 @@ function activityMarkerReadyFor(act, pid) {
 }
 
 /**
+ * Whether a worker's SIGUSR2 (drain/retarget) handler is provably installed
+ * (#309 review): its marker belongs to `pid` AND carries a finite
+ * `signalReadyAt` (stamped right after the handler is armed, independent of
+ * leasing). Falls back to `readyAt` for a worker that predates the field (its
+ * handler is armed before its first activation). Signalling earlier would hit
+ * Node's DEFAULT SIGUSR2 action and terminate the worker. Pure for unit tests.
+ */
+function drainSignalReadyFor(act, pid) {
+  if (!act || act.pid !== pid) return false;
+  return Number.isFinite(act.signalReadyAt) || Number.isFinite(act.readyAt);
+}
+
+/**
  * Whether a worker should receive a `reload-credentials` SIGUSR1 this round.
  * All three must hold (#293): the worker exists, its PID is alive, AND its
  * activity marker proves its SIGUSR1 reload listener is installed (a finite
@@ -11315,9 +11328,9 @@ function agenticStateForTarget(target, safeUrl = (u) => u) {
  * `completeJob`/`failJob`, so the engine may still project it `CREATED`) is no
  * longer running here, so it rides the marker as a flagged, observational entry
  * without making an idle worker look busy or inflating the drain's in-flight count.
- * @param {{ pid:number, updatedAt:number, jobs:Array<{key:string,type:string,since:number,settlementPending?:boolean}>, engine:(string|null), agentic:object, readyAt:(number|null), ghAuth:(object|null), watchdogPid:(number|null|undefined) }} fields
+ * @param {{ pid:number, updatedAt:number, jobs:Array<{key:string,type:string,since:number,settlementPending?:boolean}>, engine:(string|null), agentic:object, readyAt:(number|null), ghAuth:(object|null), watchdogPid:(number|null|undefined), signalReadyAt?:(number|null) }} fields
  */
-function buildActivityPayload({ pid, updatedAt, jobs, engine, agentic, readyAt, ghAuth, watchdogPid }) {
+function buildActivityPayload({ pid, updatedAt, jobs, engine, agentic, readyAt, ghAuth, watchdogPid, signalReadyAt }) {
   const jobList = Array.isArray(jobs) ? jobs : [];
   return {
     pid,
@@ -11330,6 +11343,11 @@ function buildActivityPayload({ pid, updatedAt, jobs, engine, agentic, readyAt, 
     // SDK client and begun leasing), the producer stamps this; null until then.
     // The supervisor's rolling reload gates on it (a spawn/PID is not readiness).
     readyAt: readyAt ?? null,
+    // #309 review: stamped once this worker's SIGUSR2 handler is INSTALLED —
+    // independent of leasing readiness (`readyAt` needs a nonempty poll set, so
+    // a healthy `--auto` worker with no deployed types never stamps it). The
+    // daemon-upgrade handoff gates its retarget SIGUSR2 on THIS, not readyAt.
+    signalReadyAt: signalReadyAt ?? null,
     // #293: the cached gh auth token's observable identity — { present,
     // fingerprint, scopes, since, ageMs, lastCheckAgoMs }, NEVER the value — so
     // `supervisor status` can show the credential's age/scopes per worker. Null
@@ -12312,6 +12330,9 @@ async function workAgent(req, flags, ctx) {
   // waits for this stamp before draining the next worker so a bare spawn/PID is
   // never mistaken for a serving replacement.
   let readyAt = null;
+  // #309 review: set once the SIGUSR2 (drain/retarget) handler is installed.
+  let signalReadyAt = null;
+  const markSignalReady = () => { signalReadyAt = Date.now(); };
   const writeActivity = () => {
     if (!activityFile) return;
     const jobs = [...activeJobs.entries()].map(([key, v]) => ({ key, type: v.type, since: v.since }));
@@ -12336,7 +12357,7 @@ async function workAgent(req, flags, ctx) {
     // #293: publish the cached gh token's identity (fingerprint/scopes/age —
     // never the value) so `supervisor status` can answer "is this worker holding
     // a stale token?" in one line.
-    const payload = buildActivityPayload({ pid: process.pid, updatedAt: Date.now(), jobs, engine: workerEngine, agentic: agenticState, readyAt, ghAuth: ghAuthTokenInfo(), watchdogPid: parentWatchdog && typeof parentWatchdog.watchedPid === 'function' ? parentWatchdog.watchedPid() : null });
+    const payload = buildActivityPayload({ pid: process.pid, updatedAt: Date.now(), jobs, engine: workerEngine, agentic: agenticState, readyAt, signalReadyAt, ghAuth: ghAuthTokenInfo(), watchdogPid: parentWatchdog && typeof parentWatchdog.watchedPid === 'function' ? parentWatchdog.watchedPid() : null });
     const tmp = `${activityFile}.${process.pid}.tmp`;
     try {
       mkdirSync(dirname(activityFile), { recursive: true });
@@ -14428,6 +14449,9 @@ async function workAgent(req, flags, ctx) {
       gracefulDrain(SUPERVISOR_DRAIN_SIGNAL);
     };
     process.once(SUPERVISOR_DRAIN_SIGNAL, onDrainSignal);
+    // #309 review: publish that the handler is installed, so an upgrade handoff
+    // can retarget this worker even before (or without ever) leasing.
+    try { markSignalReady(); writeActivityRef?.(); } catch { /* best effort */ }
     process.once('SIGINT', () => { forceAbort('SIGINT'); });
     process.once('SIGTERM', () => { forceAbort('SIGTERM'); });
   });
@@ -15629,7 +15653,12 @@ async function runSupervisorDaemon() {
       // it rather than racing its accept loop for the socket.
       let prep = null;
       try {
-        prep = await supervisorRequest({ op: 'prepare-upgrade', pid: process.pid }, { socketPath, timeoutMs: 750, responseTimeoutMs: SUPERVISOR_PROBE_RESPONSE_TIMEOUT_MS });
+        // #309 review: quiescence awaits admitted opQueue mutations (a restart
+        // can take ~28s to stop its worker), and the predecessor closes its
+        // listener as soon as it latches — so a retry could never reach it.
+        // Keep THIS connection open for the remaining quiesce budget.
+        const remainingMs = SUPERVISOR_UPGRADE_QUIESCE_TIMEOUT_MS - (Date.now() - t0);
+        prep = await supervisorRequest({ op: 'prepare-upgrade', pid: process.pid }, { socketPath, timeoutMs: 750, responseTimeoutMs: Math.max(SUPERVISOR_PROBE_RESPONSE_TIMEOUT_MS, remainingMs) });
       } catch { /* socket briefly unreachable — retry until the deadline */ }
       if (prep && prep.ok) break; // quiesced — the accept loop is closed
       if (prep && prep.ok === false && /unknown op/.test(String(prep.error || ''))) {
@@ -16057,6 +16086,33 @@ async function runSupervisorDaemon() {
     return w;
   };
 
+  // #309 review: workers whose upgrade watchdog-retarget is still outstanding
+  // (id -> { pid, signalled, drainOnly?, drainDeferred? }), owned by the
+  // successor's handoff loop. A graceful drain (stop/remove/reload) also uses
+  // SIGUSR2, so it must not race a pending retarget: a drain signal consumed as
+  // the retarget leaves the drain unfulfilled, and a second SIGUSR2 after the
+  // one-shot handler fired would kill in-flight work. sendDrainSignal
+  // coordinates the two so both are delivered, in order.
+  const retargetPending = new Map();
+  const sendDrainSignal = (w, pid) => {
+    const p = retargetPending.get(w.id);
+    if (p && p.pid === pid) {
+      if (!p.signalled) {
+        // Retarget not sent yet: cancel it (drop the sidecar) and drain
+        // instead — the handoff loop delivers the drain once the handler is
+        // installed and keeps the predecessor alive until the worker exits.
+        try { rmSync(`${w.activityFile || supervisorWorkerActivityFile(w.id)}.upgrade`, { force: true }); } catch { /* best effort */ }
+        p.signalled = true; p.drainOnly = true; p.drainDeferred = true;
+      } else if (!p.drainOnly) {
+        // Retarget in flight: deliver the drain right after its ack.
+        p.drainDeferred = true;
+      }
+      // drainOnly without drainDeferred: already draining — nothing to send.
+      return;
+    }
+    try { process.kill(pid, SUPERVISOR_DRAIN_SIGNAL); } catch { /* already gone */ }
+  };
+
   const forceStopWorker = async (w) => {
     const pid = w.pid;
     if (w.child && pid) {
@@ -16083,7 +16139,7 @@ async function runSupervisorDaemon() {
       // — a `stop --force` escalation (forceStopWorker) is the only way to cut a
       // stuck drain short, and it resolves this same wait when the child dies.
       if (w.child && pid) {
-        try { process.kill(pid, SUPERVISOR_DRAIN_SIGNAL); } catch { /* already gone */ }
+        sendDrainSignal(w, pid);
         await waitForChildExit(w.child, null);
       }
       return true;
@@ -16105,7 +16161,7 @@ async function runSupervisorDaemon() {
       w.removeOnExit = true;
       if (w.restartTimer) { clearTimeout(w.restartTimer); w.restartTimer = null; }
       const pid = w.pid;
-      if (w.child && pid) { try { process.kill(pid, SUPERVISOR_DRAIN_SIGNAL); } catch { /* already gone */ } }
+      if (w.child && pid) { sendDrainSignal(w, pid); }
       else { workers.delete(id); try { rmSync(supervisorWorkerActivityFile(id), { force: true }); } catch { /* best effort */ } broadcast({ type: 'event', event: 'worker-remove', id }); persist(); }
       dlog(`worker '${id}' draining for removal`);
       return true;
@@ -16202,7 +16258,7 @@ async function runSupervisorDaemon() {
     if (w.restartTimer) { clearTimeout(w.restartTimer); w.restartTimer = null; }
     const pid = w.pid;
     if (child && pid) {
-      try { process.kill(pid, SUPERVISOR_DRAIN_SIGNAL); } catch { /* already gone */ }
+      sendDrainSignal(w, pid);
       await waitForChildExit(child, null);
     }
     // Only respawn if nobody else acted on this worker while we drained: it must
@@ -16924,10 +16980,19 @@ async function runSupervisorDaemon() {
       // NEVER dropped from the wait set, so the predecessor (its watchdog
       // target) is not released under it. Workers this successor spawned
       // itself already guard it and need no retarget.
-      const pending = new Map();
+      const pending = retargetPending;
       for (const id of adopted) {
         const w = workers.get(id);
         if (!w || w.spawnedBySuccessor || !w.pid || !isPidAlive(w.pid)) continue;
+        if (w.stopping) {
+          // #309 review: already draining (stop/remove) under the predecessor.
+          // Its one-shot SIGUSR2 handler was consumed by that drain, so another
+          // SIGUSR2 would hit Node's default action and kill its in-flight work.
+          // Never write a sidecar or signal it — just keep it pending (its
+          // watchdog still guards the predecessor) until it exits.
+          pending.set(id, { pid: w.pid, signalled: true, drainOnly: true });
+          continue;
+        }
         const actFile = w.activityFile || supervisorWorkerActivityFile(w.id);
         try { writeFileSync(`${actFile}.upgrade`, String(myPid), { mode: 0o600 }); } catch { /* best effort */ }
         pending.set(id, { pid: w.pid, signalled: false });
@@ -16944,8 +17009,24 @@ async function runSupervisorDaemon() {
           const w = workers.get(id);
           if (!w || w.pid !== p.pid || !isPidAlive(p.pid)) { pending.delete(id); continue; }
           const act = readWorkerActivity(id);
-          if (act && act.pid === p.pid && act.watchdogPid === myPid) { pending.delete(id); continue; }
-          if (!p.signalled && activityMarkerReadyFor(act, p.pid)) {
+          if (p.drainOnly) {
+            // Draining, not retargeting: a deferred drain request (below) is
+            // delivered once the handler is provably installed; then just wait
+            // for the exit.
+            if (p.drainDeferred && drainSignalReadyFor(act, p.pid)) {
+              p.drainDeferred = false;
+              try { process.kill(p.pid, SUPERVISOR_DRAIN_SIGNAL); } catch { /* already gone */ }
+            }
+            continue;
+          }
+          if (act && act.pid === p.pid && act.watchdogPid === myPid) {
+            pending.delete(id);
+            // Retarget landed and the handler re-armed — now deliver any drain
+            // that was requested while the retarget was outstanding.
+            if (p.drainDeferred) { try { process.kill(p.pid, SUPERVISOR_DRAIN_SIGNAL); } catch { /* already gone */ } }
+            continue;
+          }
+          if (!p.signalled && drainSignalReadyFor(act, p.pid)) {
             p.signalled = true;
             try { process.kill(p.pid, SUPERVISOR_DRAIN_SIGNAL); } catch { /* already gone */ }
           }
@@ -16959,6 +17040,20 @@ async function runSupervisorDaemon() {
         }
         await new Promise((r) => setTimeout(r, reportedIncomplete ? SUPERVISOR_ADOPT_POLL_MS : 100));
       }
+      // Predecessor gone with entries still pending: deliver deferred drains
+      // that are safe now (handler installed and no retarget signal in flight
+      // that the drain could be mistaken for). A drain deferred behind an
+      // un-acked retarget is logged — signalling now could hit a consumed
+      // one-shot handler and kill in-flight work.
+      for (const [id, p] of pending) {
+        if (!p.drainDeferred || !isPidAlive(p.pid)) continue;
+        if (p.drainOnly && drainSignalReadyFor(readWorkerActivity(id), p.pid)) {
+          try { process.kill(p.pid, SUPERVISOR_DRAIN_SIGNAL); } catch { /* already gone */ }
+        } else {
+          dlog(`upgrade: deferred drain for worker '${id}' not delivered (retarget unacknowledged or handler not ready) — re-issue stop/remove once it settles`);
+        }
+      }
+      pending.clear();
       // Release the old daemon: it persists a final snapshot and exits 0 without
       // touching the workers. If it is already gone (crashed mid-handoff), the
       // workers are still adopted here — nothing more to do.
@@ -16976,6 +17071,10 @@ async function runSupervisorDaemon() {
       if (!isPidAlive(predecessorPid)) {
         try { clearInterval(clearTimer); } catch { /* ignore */ }
         predecessorPid = null;
+        // #309 review: a handoff reported INCOMPLETE that later completed (late
+        // acks/drains released the predecessor) must not keep reporting
+        // 'incomplete' forever — currentUpgradeBlock() returns upgradeInfo first.
+        if (upgradeInfo && upgradeInfo.state === 'incomplete') upgradeInfo = null;
         persist();
       }
     }, SUPERVISOR_ADOPT_POLL_MS);
@@ -21289,6 +21388,7 @@ export {
   normalizeAgenticMessage,
   buildActivityPayload,
   activityMarkerReadyFor,
+  drainSignalReadyFor,
   reloadCredentialsReady,
   waitForChildExit,
   supervisorWorkerActivityFile,

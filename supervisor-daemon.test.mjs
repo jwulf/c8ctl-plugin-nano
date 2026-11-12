@@ -1396,3 +1396,270 @@ test('#309 review: a retargeted watchdog orphans when BOTH successor and predece
   await new Promise((r) => setTimeout(r, 150));
   assert.equal(orphanCount, 1);
 });
+
+// --- #309 round-4 review regression tests (handoff races) --------------------
+
+test('#309 review: prepare-upgrade binds to one successor and rejects a concurrent handoff', async (t) => {
+  if (process.platform === 'win32') { t.skip('daemon upgrade is Unix-only'); return; }
+  const HOME = mkdtempSync(join(tmpdir(), 'c8ctl-sup-upg-bind-'));
+  const prevHome = process.env.C8CTL_NANO_HOME;
+  const prevEntry = process.env.C8CTL_NANO_ENTRY;
+  process.env.C8CTL_NANO_HOME = HOME;
+  writeFileSync(join(HOME, 'config.json'), JSON.stringify({ hires: {} }));
+  const shim = join(HOME, 'fake-entry.mjs');
+  writeShim(shim);
+  process.env.C8CTL_NANO_ENTRY = shim;
+  const mod = await import(pluginUrl);
+  const { encodeFrame, decodeFrames } = mod;
+  t.after(async () => {
+    try { await mod.supervisorRequest({ op: 'stop', force: true }, { timeoutMs: 500, responseTimeoutMs: 2000 }); } catch { /* ignore */ }
+    const st = mod.runningSupervisor();
+    if (st) { try { process.kill(st.pid, 'SIGKILL'); } catch { /* ignore */ } }
+    mod.clearSupervisorState();
+    restoreEnv('C8CTL_NANO_ENTRY', prevEntry);
+    restoreEnv('C8CTL_NANO_HOME', prevHome);
+    try { rmSync(HOME, { recursive: true, force: true }); } catch { /* ignore */ }
+  });
+
+  const state = await mod.startSupervisorDaemon();
+  const oldPid = state.pid;
+  const socketPath = mod.getSupervisorSocketPath();
+  // A fake successor pid that is guaranteed alive for the whole test (so the
+  // predecessor's successor-watch never fires a rollback): this process.
+  const fakeSuccessor = process.pid;
+
+  // Drive the whole sequence over ONE held connection: the predecessor's
+  // per-connection queue serializes the frames, and the connection stays open
+  // across the quiesce (only the ACCEPT loop closes) — exactly how the real
+  // successor's single prepare-upgrade connection survives the quiesce.
+  const frames = await new Promise((resolve, reject) => {
+    const sock = createConnection(socketPath);
+    const out = [];
+    let buf = '';
+    let done = false;
+    const finish = () => { if (done) return; done = true; try { sock.end(); } catch {} resolve(out); };
+    sock.setEncoding('utf8');
+    sock.on('connect', () => {
+      // 1: the first successor's prepare (accepted, binds the handoff).
+      sock.write(encodeFrame({ op: 'prepare-upgrade', pid: fakeSuccessor, version: '9.9.9' }));
+      // 2: a rival successor with a DIFFERENT pid (must be refused — bound).
+      setTimeout(() => { try { sock.write(encodeFrame({ op: 'prepare-upgrade', pid: fakeSuccessor === 1 ? 2 : 1, version: '9.9.10' })); } catch {} }, 100);
+      // 3: the bound successor's own retry (same pid — idempotent accept).
+      setTimeout(() => { try { sock.write(encodeFrame({ op: 'prepare-upgrade', pid: fakeSuccessor, version: '9.9.9' })); } catch {} }, 200);
+      // 4: a pid-less prepare (never earns the binding — refused).
+      setTimeout(() => { try { sock.write(encodeFrame({ op: 'prepare-upgrade', pid: null })); } catch {} }, 300);
+      // Close after all four answers have had time to stream back.
+      setTimeout(finish, 1500);
+    });
+    sock.on('data', (chunk) => {
+      buf += chunk;
+      const { frames: fr, rest } = decodeFrames(buf);
+      buf = rest;
+      for (const f of fr) out.push(f);
+    });
+    sock.on('close', finish);
+    sock.on('error', () => finish());
+  });
+
+  const answers = frames.filter((f) => f && (f.type === 'prepare-upgrade' || f.ok === false));
+  assert.ok(answers.length >= 4, `expected 4 prepare-upgrade answers, got ${answers.length}: ${JSON.stringify(frames)}`);
+  assert.equal(answers[0].ok, true, `the first successor's prepare-upgrade is accepted: ${JSON.stringify(answers[0])}`);
+  assert.equal(answers[1].ok, false, 'a concurrent successor is rejected');
+  assert.match(String(answers[1].error || ''), /already bound to successor pid/, `the rejection names the binding: ${answers[1].error}`);
+  assert.equal(answers[2].ok, true, `the bound successor's retry is idempotent: ${JSON.stringify(answers[2])}`);
+  assert.equal(answers[3].ok, false, 'a pid-less prepare-upgrade is refused');
+
+  // Cleanup: hand over (SIGUSR1) so the quiesced predecessor exits cleanly.
+  try { process.kill(oldPid, 'SIGUSR1'); } catch { /* ignore */ }
+});
+
+test('#309 review: a stop accepted before/during quiesce cannot overtake the handoff', async (t) => {
+  if (process.platform === 'win32') { t.skip('daemon upgrade is Unix-only'); return; }
+  const HOME = mkdtempSync(join(tmpdir(), 'c8ctl-sup-upg-stop-'));
+  const prevHome = process.env.C8CTL_NANO_HOME;
+  const prevEntry = process.env.C8CTL_NANO_ENTRY;
+  process.env.C8CTL_NANO_HOME = HOME;
+  writeFileSync(join(HOME, 'config.json'), JSON.stringify({
+    hires: { faker: { name: 'faker', rank: 'senior', command: 'true', model: '', capabilities: [] } },
+  }));
+  const shim = join(HOME, 'fake-entry.mjs');
+  writeShim(shim);
+  process.env.C8CTL_NANO_ENTRY = shim;
+  const mod = await import(pluginUrl);
+  const { encodeFrame, decodeFrames } = mod;
+  t.after(async () => {
+    try { await mod.supervisorRequest({ op: 'stop', force: true }, { timeoutMs: 500, responseTimeoutMs: 2000 }); } catch { /* ignore */ }
+    const st = mod.runningSupervisor();
+    if (st) { try { process.kill(st.pid, 'SIGKILL'); } catch { /* ignore */ } }
+    mod.clearSupervisorState();
+    restoreEnv('C8CTL_NANO_ENTRY', prevEntry);
+    restoreEnv('C8CTL_NANO_HOME', prevHome);
+    try { rmSync(HOME, { recursive: true, force: true }); } catch { /* ignore */ }
+  });
+
+  const state = await mod.startSupervisorDaemon();
+  const oldPid = state.pid;
+  const added = await mod.supervisorRequest({ op: 'add', profile: 'faker' });
+  assert.equal(added.ok, true);
+  const workerId = added.worker.id;
+  let workerPid = null;
+  for (let i = 0; i < 40 && !workerPid; i++) {
+    const s = await mod.supervisorRequest({ op: 'status' });
+    const w = (s.workers || []).find((x) => x.id === workerId);
+    if (w && w.state === 'running' && w.pid) workerPid = w.pid;
+    else await sleep(50);
+  }
+  assert.ok(workerPid, 'worker running before the upgrade');
+
+  // Quiesce for a fake successor (this process — alive for the whole test), then
+  // send a `stop` over the SAME held connection (the accept loop is closed after
+  // the quiesce, so a fresh connection could not reach the daemon). The stop must
+  // be REFUSED (ok:false) and the worker left untouched.
+  const socketPath = mod.getSupervisorSocketPath();
+  const frames = await new Promise((resolve, reject) => {
+    const sock = createConnection(socketPath);
+    const out = [];
+    let buf = '';
+    let done = false;
+    const finish = () => { if (done) return; done = true; try { sock.end(); } catch {} resolve(out); };
+    sock.setEncoding('utf8');
+    sock.on('connect', () => {
+      sock.write(encodeFrame({ op: 'prepare-upgrade', pid: process.pid, version: '9.9.9' }));
+      // Once the quiesce ack lands, fire the stop over the same connection.
+      setTimeout(() => { try { sock.write(encodeFrame({ op: 'stop', force: true })); } catch {} }, 300);
+      setTimeout(finish, 1500);
+    });
+    sock.on('data', (chunk) => {
+      buf += chunk;
+      const { frames: fr, rest } = decodeFrames(buf);
+      buf = rest;
+      for (const f of fr) out.push(f);
+    });
+    sock.on('close', finish);
+    sock.on('error', () => finish());
+  });
+
+  const prepAck = frames.find((f) => f && f.type === 'prepare-upgrade');
+  assert.ok(prepAck && prepAck.ok === true, `the quiesce was accepted: ${JSON.stringify(frames)}`);
+  const stopAnswer = frames.find((f) => f && f.ok === false);
+  assert.ok(stopAnswer, `the stop was answered: ${JSON.stringify(frames)}`);
+  assert.match(String(stopAnswer.error || ''), /upgrade in progress/, `the refusal names the upgrade: ${stopAnswer.error}`);
+
+  await sleep(300);
+  assert.ok(isAlive(workerPid), 'the worker survives the refused stop (the successor owns it now)');
+  assert.ok(isAlive(oldPid), 'the quiesced predecessor stays alive (waiting on the handoff)');
+
+  // A SIGTERM to the quiesced predecessor must be IGNORED (logged) — it must not
+  // run shutdown() and signal the adopted workers or delete the successor's state.
+  try { process.kill(oldPid, 'SIGTERM'); } catch { /* ignore */ }
+  await sleep(400);
+  assert.ok(isAlive(oldPid), 'SIGTERM on a quiesced predecessor is ignored (the upgrade owns it)');
+  assert.ok(isAlive(workerPid), 'the adopted worker is untouched by the predecessor\'s SIGTERM');
+
+  // Hand over (SIGUSR1) so the quiesced predecessor exits cleanly.
+  try { process.kill(oldPid, 'SIGUSR1'); } catch { /* ignore */ }
+  let gone = false;
+  for (let i = 0; i < 40 && !gone; i++) { if (!isAlive(oldPid)) gone = true; else await sleep(50); }
+  assert.ok(gone, 'the predecessor exits on the SIGUSR1 handover');
+
+  function isAlive(pid) { try { process.kill(pid, 0); return true; } catch { return false; } }
+});
+
+test('#309 review: rollback after a failed handoff does not resurrect a worker removed through the successor', async (t) => {
+  if (process.platform === 'win32') { t.skip('daemon upgrade is Unix-only'); return; }
+  const HOME = mkdtempSync(join(tmpdir(), 'c8ctl-sup-upg-rb-'));
+  const prevHome = process.env.C8CTL_NANO_HOME;
+  const prevEntry = process.env.C8CTL_NANO_ENTRY;
+  process.env.C8CTL_NANO_HOME = HOME;
+  writeFileSync(join(HOME, 'config.json'), JSON.stringify({
+    hires: { faker: { name: 'faker', rank: 'senior', command: 'true', model: '', capabilities: [] } },
+  }));
+  const shim = join(HOME, 'fake-entry.mjs');
+  writeShim(shim);
+  process.env.C8CTL_NANO_ENTRY = shim;
+  const mod = await import(pluginUrl);
+  const { spawn } = await import('node:child_process');
+  let fakeSuccessor = null;
+  t.after(async () => {
+    try { await mod.supervisorRequest({ op: 'stop', force: true }, { timeoutMs: 500, responseTimeoutMs: 2000 }); } catch { /* ignore */ }
+    const st = mod.runningSupervisor();
+    if (st) { try { process.kill(st.pid, 'SIGKILL'); } catch { /* ignore */ } }
+    if (fakeSuccessor) { try { process.kill(fakeSuccessor.pid, 'SIGKILL'); } catch { /* ignore */ } }
+    mod.clearSupervisorState();
+    restoreEnv('C8CTL_NANO_ENTRY', prevEntry);
+    restoreEnv('C8CTL_NANO_HOME', prevHome);
+    try { rmSync(HOME, { recursive: true, force: true }); } catch { /* ignore */ }
+  });
+
+  const state = await mod.startSupervisorDaemon();
+  const oldPid = state.pid;
+  const added = await mod.supervisorRequest({ op: 'add', profile: 'faker' });
+  assert.equal(added.ok, true);
+  const workerId = added.worker.id;
+  let workerPid = null;
+  for (let i = 0; i < 40 && !workerPid; i++) {
+    const s = await mod.supervisorRequest({ op: 'status' });
+    const w = (s.workers || []).find((x) => x.id === workerId);
+    if (w && w.state === 'running' && w.pid) workerPid = w.pid;
+    else await sleep(50);
+  }
+  assert.ok(workerPid, 'worker running before the upgrade');
+
+  // A CONTROLLABLE fake successor: a live process whose death we trigger to force
+  // the rollback exactly when we want (a real successor's handoff completes in a
+  // tight race, so it can't be killed reliably "mid-handoff"). Quiesce against it.
+  fakeSuccessor = spawn(process.execPath, ['-e', 'setInterval(()=>{},1<<30)'], { stdio: 'ignore' });
+  const prep = await mod.supervisorRequest({ op: 'prepare-upgrade', pid: fakeSuccessor.pid, version: '9.9.9' }, { timeoutMs: 500, responseTimeoutMs: 5000 });
+  assert.equal(prep.ok, true, `the quiesce was accepted: ${JSON.stringify(prep)}`);
+
+  // While quiesced, the predecessor refuses mutations/respawns. Model the worker
+  // being removed THROUGH the successor by deleting it from the persisted
+  // inventory (what the successor owns + writes during the handoff): after the
+  // removal the state file no longer lists the worker. The predecessor's in-memory
+  // map still holds it (it can only be mutated over its own socket, which is
+  // quiesced) — exactly the divergence the rollback must reconcile.
+  const stBefore = mod.readSupervisorState();
+  assert.ok((stBefore.workers || []).some((w) => w.id === workerId), 'the quiesce snapshot lists the worker');
+  mod.clearSupervisorState(); // the successor's inventory no longer has the worker
+  // Kill the worker (the successor force-removed it) so it is down at rollback.
+  try { process.kill(workerPid, 'SIGKILL'); } catch { /* ignore */ }
+
+  // The fake successor "dies" before handing over → the predecessor's
+  // successor-watch fires a rollback. The removed worker must NOT be resurrected.
+  try { process.kill(fakeSuccessor.pid, 'SIGKILL'); } catch { /* ignore */ }
+  await new Promise((r) => fakeSuccessor.once('exit', r));
+  fakeSuccessor = null;
+
+  // Wait for the predecessor to roll back and re-open its accept loop.
+  let rolledBack = null;
+  for (let i = 0; i < 120 && !rolledBack; i++) {
+    try {
+      const s = await mod.supervisorRequest({ op: 'status' }, { timeoutMs: 400, responseTimeoutMs: 1000 });
+      if (s && s.ok && s.daemon && s.daemon.pid === oldPid) rolledBack = s;
+    } catch { /* still quiesced */ }
+    if (!rolledBack) await sleep(100);
+  }
+  assert.ok(rolledBack, 'the predecessor rolled back and re-opened its accept loop');
+  const resurrected = (rolledBack.workers || []).find((x) => x.id === workerId);
+  assert.ok(!resurrected, `the worker removed through the successor stays removed after rollback (got ${JSON.stringify(resurrected)})`);
+
+  function isAlive(pid) { try { process.kill(pid, 0); return true; } catch { return false; } }
+});
+
+test('#309 review: stateFromStatus carries the upgrade block so a stop client sees the handoff', async () => {
+  const mod = await import(pluginUrl);
+  const res = {
+    ok: true,
+    type: 'status',
+    daemon: { pid: 4242, startedAt: new Date().toISOString(), version: '1.71.0', socket: '/tmp/x.sock', logFile: '/tmp/x.log' },
+    upgrade: { state: 'quiesced', fromVersion: '1.70.3', toVersion: '1.71.0', successorPid: 4343, sinceEpochMs: Date.now() - 100 },
+    workers: [],
+    final: true,
+  };
+  const mapped = mod.stateFromStatus(res, '/tmp/x.sock');
+  assert.ok(mapped.upgrade && mapped.upgrade.successorPid === 4343, 'stateFromStatus preserves the upgrade block');
+  assert.equal(mapped.pid, 4242, 'the daemon pid still maps through');
+  // No upgrade block → no `upgrade` key (the quiet-fleet shape is unchanged).
+  const quiet = mod.stateFromStatus({ ...res, upgrade: undefined }, '/tmp/x.sock');
+  assert.ok(!('upgrade' in quiet), 'no upgrade key when the daemon is not mid-upgrade');
+});

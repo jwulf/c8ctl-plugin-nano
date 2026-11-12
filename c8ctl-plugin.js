@@ -15395,6 +15395,10 @@ function stateFromStatus(res, socketPath) {
     version: res.daemon?.version,
     socket: res.daemon?.socket || socketPath,
     logFile: res.daemon?.logFile,
+    // #309 review: carry the daemon's in-flight upgrade block so a stop client
+    // can see the handoff (and the successor's pid) even when it connected to
+    // the PREDECESSOR just before the socket flipped.
+    ...(res.upgrade && typeof res.upgrade === 'object' ? { upgrade: res.upgrade } : {}),
     workers: res.workers || [],
   };
 }
@@ -15665,6 +15669,14 @@ async function runSupervisorDaemon() {
         dlogBoot(`upgrade mode: predecessor pid ${st.pid} does not understand prepare-upgrade (too old) — refusing to upgrade`);
         process.exit(1);
       }
+      // #309 review: the predecessor bound its handoff to a DIFFERENT successor
+      // (a concurrent upgrade won the race). Never keep retrying — the binding
+      // will never accept this pid, and two successors must not both wait to
+      // adopt the same fleet. Exit and leave the bound successor to finish.
+      if (prep && prep.ok === false && /already bound to successor pid/.test(String(prep.error || ''))) {
+        dlogBoot(`upgrade mode: predecessor pid ${st.pid} is bound to a different successor — exiting so the bound successor completes the handoff`);
+        process.exit(1);
+      }
       if (Date.now() - t0 > SUPERVISOR_UPGRADE_QUIESCE_TIMEOUT_MS) {
         dlogBoot(`upgrade mode: predecessor pid ${st.pid} did not quiesce within ${SUPERVISOR_UPGRADE_QUIESCE_TIMEOUT_MS}ms — leaving it in place`);
         process.exit(1);
@@ -15691,6 +15703,13 @@ async function runSupervisorDaemon() {
   // restart-on-exit path and let a second `stop --force` escalate a live drain.
   let draining = false;
   let forcing = false;
+  // #309 review: `shuttingDown` is latched EARLY (in the `stop` op, before the
+  // deferred shutdown() runs) to reserve shutdown ownership against a racing
+  // prepare-upgrade. `shutdownStarted` is the separate "shutdown()'s body has
+  // begun" guard: the deferred shutdown() must still run its body even though
+  // `shuttingDown` is already true, while a SECOND stop/signal must escalate
+  // (force) or return instead of re-running the body.
+  let shutdownStarted = false;
   // #309: a rolling daemon upgrade owns this daemon. `upgrading` is the
   // OLD-daemon latch: set by `prepare-upgrade` (accept loop closed; mutations
   // refused) and held through the `upgrade` handoff until this process exits.
@@ -16465,7 +16484,18 @@ async function runSupervisorDaemon() {
   });
 
   const shutdown = async (signal, { force = true } = {}) => {
-    if (shuttingDown) {
+    // #309 review: a quiesced (mid-upgrade) daemon must NEVER run the shutdown
+    // path — it would SIGTERM/SIGKILL the very workers the successor has
+    // adopted, and its cleanup would delete the successor's socket and state
+    // file. The upgrade's SIGUSR1 handover is this daemon's only exit while
+    // quiesced; a signal (SIGTERM/SIGINT/SIGHUP) is logged and ignored so the
+    // handoff can finish. The socket `stop` op refuses earlier (the `upgrading`
+    // check in handleRequest) and never reaches here.
+    if (upgrading) {
+      dlog(`ignoring ${signal || 'shutdown request'} — a daemon upgrade owns this daemon (successor pid ${upgradeInfo?.successorPid ?? 'unknown'}); the successor owns the fleet now`);
+      return;
+    }
+    if (shutdownStarted) {
       // A shutdown is already running. A `stop --force` arriving mid-DRAIN
       // escalates it: hard-stop every worker still finishing its jobs so the
       // operator isn't stuck waiting. Idempotent — only the first force escalates.
@@ -16478,6 +16508,7 @@ async function runSupervisorDaemon() {
       return;
     }
     shuttingDown = true;
+    shutdownStarted = true;
     draining = !force;
     // Let any in-flight mutation finish before we snapshot the worker set, so
     // an add/restart racing the shutdown can't leave an orphaned child behind.
@@ -16527,7 +16558,36 @@ async function runSupervisorDaemon() {
   // latch admission synchronously, then AWAIT `opQueue` (exactly as
   // `shutdown()` does) before persisting and reporting `quiesced`.
   let quiescePromise = null;
+  // #309 review: the worker-id set captured in the quiesce snapshot. Rollback
+  // reconciles the live map against it — the successor owns add/remove while
+  // this daemon is quiesced, so a worker the successor removed mid-handoff must
+  // stay removed if the handoff rolls back (never resurrected).
+  let quiesceSnapshotIds = null;
   const quiesceForUpgrade = (successorPid, successorVersion) => {
+    // #309 review: bind the handoff to ONE successor. `doQuiesce` latches
+    // `upgrading` only inside its async body, so two prepare-upgrade requests
+    // that arrive before the first body's first await both observe
+    // `upgrading === false` and would share one quiesce promise — two
+    // successors, each believing it owns the bind+adopt, racing for the same
+    // socket and fleet. Validate and bind preparation to the FIRST successor
+    // pid synchronously (before any await), and reject every other pid until
+    // this handoff finishes (handover) or rolls back. The bound successor's
+    // own retries (same pid) stay idempotent — they share the promise.
+    if (!Number.isInteger(successorPid) || successorPid <= 0) {
+      // An unidentifiable caller never earns the binding — without a pid the
+      // successor watch cannot run and no retry could ever match the binding.
+      const err = new Error('prepare-upgrade requires a valid successor pid');
+      err.code = 'UPGRADE_BOUND';
+      throw err;
+    }
+    if (upgrading) {
+      const boundTo = upgradeInfo && upgradeInfo.successorPid;
+      if (boundTo !== successorPid) {
+        const err = new Error(`a daemon upgrade is already bound to successor pid ${boundTo} — refusing a concurrent handoff`);
+        err.code = 'UPGRADE_BOUND';
+        throw err;
+      }
+    }
     if (!upgrading || !quiescePromise) quiescePromise = doQuiesce(successorPid, successorVersion);
     return quiescePromise;
   };
@@ -16552,6 +16612,7 @@ async function runSupervisorDaemon() {
       try { await opQueue; } catch { /* mutation already logged */ }
       if (!upgrading) return; // rolled back while draining the queue
       upgradeInfo = { ...upgradeInfo, state: 'quiesced' };
+      quiesceSnapshotIds = [...workers.keys()];
       persist(true); // the deliberate quiesce snapshot the successor adopts from
     }
     quiesced = true;
@@ -16588,6 +16649,7 @@ async function runSupervisorDaemon() {
     upgrading = false;
     quiesced = false;
     upgradeInfo = null;
+    quiesceSnapshotIds = null;
     if (quiesceKeepalive) { try { clearInterval(quiesceKeepalive); } catch { /* ignore */ } quiesceKeepalive = null; }
     // Re-open the accept loop. The socket path may still be held by the dead
     // successor's listen socket; remove it first (same takeover the successor
@@ -16604,6 +16666,17 @@ async function runSupervisorDaemon() {
     // quiesced (expired restart timers and death handlers bailed), so reschedule
     // every eligible down worker now — preserving stop/config-failure/removal
     // intent and skipping any with a live process or a pending restart timer.
+    // Membership is reconciled against the quiesce snapshot: a worker ABSENT
+    // from it was removed through the SUCCESSOR while this daemon was quiesced
+    // (the successor owns add/remove during the handoff), so re-adding it here
+    // would resurrect a deliberately removed worker.
+    const snapshotIds = new Set(quiesceSnapshotIds || []);
+    for (const id of [...workers.keys()]) {
+      if (!snapshotIds.has(id)) {
+        dlog(`daemon upgrade rollback: worker '${id}' is not in the quiesce snapshot (removed through the successor mid-handoff?) — leaving it removed`);
+        workers.delete(id);
+      }
+    }
     for (const w of [...workers.values()]) {
       if (w.restartTimer || (w.pid && isPidAlive(w.pid))) continue;
       if (w.removeOnExit) {
@@ -16632,10 +16705,17 @@ async function runSupervisorDaemon() {
           // asks us to quiesce so it can bind the control socket. Refuse while
           // a worker reload roll or a shutdown owns the fleet — an upgrade on
           // top of either would strand its bookkeeping. Idempotent: the
-          // successor polls until it observes the quiesced state.
+          // successor polls until it observes the quiesced state. Bound to ONE
+          // successor pid (quiesceForUpgrade throws UPGRADE_BOUND for any
+          // other) so two racing successors can never both win the fleet.
           if (shuttingDown) { sock.write(encodeFrame({ ok: false, error: 'supervisor is shutting down', final: true })); break; }
           if (reloading) { sock.write(encodeFrame({ ok: false, error: 'a worker reload is in progress — retry the daemon upgrade once it finishes', final: true })); break; }
-          await quiesceForUpgrade(Number(req.pid) || null, typeof req.version === 'string' ? req.version : null);
+          try {
+            await quiesceForUpgrade(Number(req.pid) || null, typeof req.version === 'string' ? req.version : null);
+          } catch (err) {
+            if (err && err.code === 'UPGRADE_BOUND') { sock.write(encodeFrame({ ok: false, error: err.message, final: true })); break; }
+            throw err;
+          }
           // Report quiesced only AFTER the mutation queue has drained and the
           // snapshot persisted — the successor binds+adopts off this ack.
           sock.write(encodeFrame({ ok: true, type: 'prepare-upgrade', quiesced: true, final: true }));
@@ -16786,9 +16866,25 @@ async function runSupervisorDaemon() {
           // The upgrade's own exit path replaces this op for the old daemon.
           if (upgrading) { sock.write(encodeFrame({ ok: false, error: 'supervisor daemon upgrade in progress — the successor owns the fleet now; stop it instead (its pid is in `supervisor status`)', final: true })); break; }
           const force = !!req.force;
-          // Register this client as an attach consumer so it streams drain
-          // progress (shrinking in-flight counts), and as a stop client so it
-          // gets a terminal `stopped` frame when the daemon has finished.
+          // #309 review: reserve shutdown ownership HERE, synchronously with the
+          // acceptance — not 20ms later when the deferred shutdown() runs. An
+          // unreserved accept lets a prepare-upgrade squeeze into the defer
+          // window and latch `upgrading` first; the shutdown then overtakes the
+          // quiesce and SIGTERMs the very workers the successor is adopting.
+          // Latching now makes the race impossible in either order: a stop
+          // accepted first refuses the upgrade (prepare-upgrade checks
+          // `shuttingDown`), and an upgrade quiesced first refuses the stop
+          // (the `upgrading` check above).
+          //
+          // A SECOND stop while one is already reserved is not a fresh shutdown:
+          // it only ESCALATES a drain (force) or is a no-op. Never re-latch
+          // `draining` here — a force stop arriving during a graceful drain must
+          // leave `draining === true` so shutdown()'s escalation branch fires,
+          // and a graceful stop during a force stop must not flip it back.
+          if (!shutdownStarted && !shuttingDown) {
+            shuttingDown = true;
+            draining = !force;
+          }
           attachClients.add(sock);
           stopClients.add(sock);
           sock.write(encodeFrame(force
@@ -16797,7 +16893,12 @@ async function runSupervisorDaemon() {
           sock.write(encodeFrame(statusFrame(false)));
           // Kick the shutdown asynchronously; don't await it here so the control
           // loop keeps serving (streaming status, accepting a force escalation).
-          setTimeout(() => { shutdown('stop', { force }); }, 20);
+          // The 250ms defer lets a `stop --force` escalation (sent right behind
+          // a graceful `stop`, as `stopStream`'s sendAfter does) land and run
+          // shutdown's escalation branch BEFORE the drain's body force-stops on
+          // its own — preserving the pre-#309 escalation contract now that
+          // `shuttingDown` is latched early (see below).
+          setTimeout(() => { shutdown('stop', { force }); }, 250);
           break;
         }
         default:
@@ -16895,6 +16996,7 @@ async function runSupervisorDaemon() {
     // canonical write — the successor has since written its own pid + inventory,
     // and any write now would clobber it with the exiting predecessor's state.
     handedOver = true;
+    quiesceSnapshotIds = null;
     if (monitorTimer) { try { clearInterval(monitorTimer); } catch { /* ignore */ } monitorTimer = null; }
     if (quiesceKeepalive) { try { clearInterval(quiesceKeepalive); } catch { /* ignore */ } quiesceKeepalive = null; }
     if (successorWatchTimer) { try { clearInterval(successorWatchTimer); } catch { /* ignore */ } successorWatchTimer = null; }
@@ -17707,7 +17809,15 @@ async function supervisorStopCmd(force = false) {
         const { frames, rest } = decodeFrames(buf);
         buf = rest;
         for (const frame of frames) {
-          if (frame && frame.type === 'stopping') {
+          // #309 review: an ok:false terminal frame is a REFUSAL, not a stop —
+          // the daemon rejected the op (a daemon upgrade owns the fleet; the
+          // successor holds the socket now). Treating it as a successful stop
+          // would wait indefinitely for the wrong pid and, with --force,
+          // SIGKILL the quiesced predecessor's process group — including the
+          // workers the successor adopted — then erase the successor's state.
+          if (frame && frame.ok === false) {
+            finish({ error: String(frame.error || 'the supervisor refused the stop request') });
+          } else if (frame && frame.type === 'stopping') {
             logger.info('Aborting in-flight work — killing harnesses and yielding jobs for retry...');
           } else if (frame && frame.event === 'draining-escalated') {
             logger.info('Escalating to --force — aborting in-flight work...');
@@ -17733,6 +17843,15 @@ async function supervisorStopCmd(force = false) {
 
   if (outcome === 'detached') return;
 
+  // A refused stop (ok:false) is an ERROR outcome: surface it and exit before
+  // any pid wait, force escalation, or state cleanup — the daemon that refused
+  // (e.g. a quiesced predecessor mid-upgrade) is not ours to reap, and the
+  // state file now names the successor that owns the fleet.
+  if (outcome && typeof outcome === 'object' && outcome.error) {
+    logger.error(`Supervisor stop refused: ${outcome.error}`);
+    process.exit(1);
+  }
+
   if (outcome === 'unreachable') {
     if (force) {
       // Socket unreachable — fall back to signalling the daemon pid directly.
@@ -17748,6 +17867,15 @@ async function supervisorStopCmd(force = false) {
   // backstop so a wedged daemon/worker group can't linger. The window must cover
   // the daemon's own worker force-stop grace (#296), or the SIGKILL below reaps the
   // group while a worker is still promoting its durable recovery ref (#295).
+  // #309 review: if the daemon we asked is mid-upgrade (quiesced), the pid we
+  // captured is the PREDECESSOR's — it exits on the successor's handover, not on
+  // our refused/naive stop. Say so, and never SIGKILL its process group (the
+  // successor's adopted workers share it) or clear the successor's state.
+  if (running.upgrade && typeof running.upgrade === 'object') {
+    const successorPid = Number(running.upgrade.successorPid);
+    logger.warn(`The supervisor is mid-upgrade (handing the fleet to successor pid ${Number.isInteger(successorPid) && successorPid > 0 ? successorPid : 'unknown'}) — stop the successor instead; this daemon exits when the handoff completes.`);
+    return;
+  }
   if (force) {
     const deadline = Date.now() + FORCE_STOP_DAEMON_GRACE_MS;
     while (Date.now() < deadline) {
@@ -21372,6 +21500,7 @@ export {
   summarizeSupervisorWorker,
   formatSupervisorStatus,
   statusFromState,
+  stateFromStatus,
   supervisorDaemonDescriptor,
   formatSupervisorLogsLines,
   reageSupervisorStatus,

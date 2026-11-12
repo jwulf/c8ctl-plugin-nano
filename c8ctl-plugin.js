@@ -15872,6 +15872,14 @@ async function runSupervisorDaemon() {
       for (let i = 0; i < ids.length; i++) {
         const id = ids[i];
         reloadCurrent = id;
+        // Broadcast (not just to the initiating socket) on every target
+        // transition so every attached console sees the drain progress and the
+        // "do not restart the daemon" warning even with periodic monitoring
+        // disabled (NANO_SUPERVISOR_MONITOR_MS=0). The initiator is itself an
+        // attach client, so it is covered too.
+        if (!shuttingDown) {
+          try { broadcast(statusFrame(false)); } catch { /* best effort */ }
+        }
         // If the daemon starts shutting down mid-roll, the remaining workers
         // never adopt the new code — record them as skipped (and flag the roll
         // interrupted) so the terminal frame can't report a clean success for a
@@ -15917,7 +15925,7 @@ async function runSupervisorDaemon() {
           for (let j = i; j < ids.length; j++) skipped.push(ids[j]);
           break;
         }
-        try { sock.write(encodeFrame(statusFrame(false))); } catch { /* client gone */ }
+        try { broadcast(statusFrame(false)); } catch { /* best effort */ }
       }
     } catch (err) {
       interrupted = true;

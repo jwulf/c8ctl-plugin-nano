@@ -2727,6 +2727,28 @@ function sampleSubtreeCpu(rootPid) {
 const WORKSPACE_CPU_SCAN_LIMIT = 4096;
 
 /**
+ * Canonicalize a workspace root for cwd prefix checks. The kernel reports a
+ * process cwd as the PHYSICAL path (`/proc/<pid>/cwd`, lsof), so a root reached
+ * through a symlink (e.g. `C8CTL_NANO_HOME` under a symlinked dir, or macOS
+ * `/tmp` → `/private/tmp`) must be realpath'd or every in-workspace process
+ * fails the prefix check. Returns the list of distinct roots to accept (the
+ * physical one plus the lexical one), or `[]` when the input is unusable.
+ */
+function workspaceRoots(workspaceDir, realpath = realpathSync) {
+  if (typeof workspaceDir !== 'string' || !workspaceDir) return [];
+  const lexical = resolvePath(workspaceDir);
+  let physical = lexical;
+  try { physical = realpath(lexical); } catch { /* missing dir → lexical only */ }
+  return physical === lexical ? [lexical] : [physical, lexical];
+}
+
+/** True when `cwd` is one of `roots` or lies beneath one. */
+function cwdInRoots(cwd, roots) {
+  if (typeof cwd !== 'string' || !cwd) return false;
+  return roots.some((root) => cwd === root || cwd.startsWith(root.endsWith(sep) ? root : root + sep));
+}
+
+/**
  * Linux: aggregate CPU (utime+stime ticks) of every process whose cwd resolves
  * inside `workspaceDir` — regardless of parentage — via `/proc/<pid>/cwd`
  * symlinks. Returns `{ processes, cpu }` (cpu in clock ticks, matching the
@@ -2737,9 +2759,9 @@ const WORKSPACE_CPU_SCAN_LIMIT = 4096;
  * /proc read can't stall the watchdog. `readCwd`/`listPids` are injectable for
  * tests.
  */
-function sampleWorkspaceCpuProc(workspaceDir, { readCwd, listPids, scanLimit = WORKSPACE_CPU_SCAN_LIMIT } = {}) {
-  if (typeof workspaceDir !== 'string' || !workspaceDir) return null;
-  const root = resolvePath(workspaceDir);
+function sampleWorkspaceCpuProc(workspaceDir, { readCwd, listPids, realpath, excludePids = [], scanLimit = WORKSPACE_CPU_SCAN_LIMIT } = {}) {
+  const roots = workspaceRoots(workspaceDir, realpath);
+  if (roots.length === 0) return null;
   const read = typeof readCwd === 'function' ? readCwd : (pid) => {
     try { return readlinkSync(`/proc/${pid}/cwd`); } catch { return null; }
   };
@@ -2756,9 +2778,10 @@ function sampleWorkspaceCpuProc(workspaceDir, { readCwd, listPids, scanLimit = W
     if (!/^\d+$/.test(name)) continue;
     scanned += 1;
     const pid = Number(name);
+    if (pid === process.pid || excludePids.includes(pid)) continue;
     const cwd = read(pid);
     if (typeof cwd !== 'string' || !cwd) continue;
-    if (cwd !== root && !cwd.startsWith(root + sep)) continue;
+    if (!cwdInRoots(cwd, roots)) continue;
     let stat;
     try { stat = readFileSync(`/proc/${pid}/stat`, 'utf8'); } catch { continue; }
     const rparen = stat.lastIndexOf(')');
@@ -2779,42 +2802,46 @@ function sampleWorkspaceCpuProc(workspaceDir, { readCwd, listPids, scanLimit = W
  * `{ processes, cpu, resolutionMs: 1000 }` (cpu in whole seconds, so the
  * coarse-resolution flat-CPU rule applies) or `null` when unavailable.
  */
-function sampleWorkspaceCpuLsof(workspaceDir, { scanLimit = WORKSPACE_CPU_SCAN_LIMIT } = {}) {
-  if (typeof workspaceDir !== 'string' || !workspaceDir) return null;
-  const root = resolvePath(workspaceDir);
-  let lsofOut;
-  try {
-    // `lsof -a -d cwd -Fn -- <root>` lists ONLY processes whose cwd is the
-    // workspace root itself; the descendant sweep below covers the subtree.
-    // -Fn prints machine-readable `p<pid>` records. lsof exits 1 when nothing
-    // matches, which is a valid empty result, not a failure.
-    const r = spawnSync('lsof', ['-a', '-d', 'cwd', '-Fn', '--', root], { encoding: 'utf8', timeout: 5_000, maxBuffer: 4 * 1024 * 1024 });
+function sampleWorkspaceCpuLsof(workspaceDir, { runLsof, runPs, realpath, excludePids = [], scanLimit = WORKSPACE_CPU_SCAN_LIMIT } = {}) {
+  const roots = workspaceRoots(workspaceDir, realpath);
+  if (roots.length === 0) return null;
+  const lsof = typeof runLsof === 'function' ? runLsof : () => {
+    // `lsof -d cwd -Fpn` lists the cwd of EVERY process as machine-readable
+    // `p<pid>` / `n<path>` records. A path filter (`-- <root>`) would only match
+    // processes whose cwd is EXACTLY the root, missing a compiler working in a
+    // nested crate dir, so we collect all cwd records and apply the
+    // root-or-descendant check ourselves. Bounded by timeout + maxBuffer; lsof
+    // exits 1 on partial permission errors, which still yields usable stdout.
+    const r = spawnSync('lsof', ['-n', '-P', '-w', '-d', 'cwd', '-Fpn'], { encoding: 'utf8', timeout: 5_000, maxBuffer: 16 * 1024 * 1024 });
     if (r.error && r.error.code === 'ENOENT') return null; // lsof missing → degrade
-    lsofOut = typeof r.stdout === 'string' ? r.stdout : '';
-  } catch { return null; }
+    if (r.error && !r.stdout) return null; // timeout / overflow with nothing usable
+    return typeof r.stdout === 'string' ? r.stdout : '';
+  };
+  let lsofOut;
+  try { lsofOut = lsof(); } catch { return null; }
+  if (typeof lsofOut !== 'string') return null;
   const pids = [];
+  let curPid = null;
   for (const line of lsofOut.split('\n')) {
-    if (line.charCodeAt(0) === 112 /* 'p' */) {
+    const tag = line.charCodeAt(0);
+    if (tag === 112 /* 'p' */) {
       const pid = Number(line.slice(1));
-      if (Number.isFinite(pid) && pid > 0) pids.push(pid);
+      curPid = Number.isFinite(pid) && pid > 0 && pid !== process.pid && !excludePids.includes(pid) ? pid : null;
+    } else if (tag === 110 /* 'n' */ && curPid != null) {
+      if (cwdInRoots(line.slice(1), roots) && !pids.includes(curPid)) pids.push(curPid);
+      curPid = null;
       if (pids.length >= scanLimit) break;
     }
   }
-  // lsof -d cwd only matches the exact directory; sweep the rest of the process
-  // table for cwds UNDER the root (worktrees compile in nested dirs) via one ps
-  // snapshot filtered by cwd. `ps -eo pid=,comm=` can't report cwd portably, so
-  // instead ask lsof once more WITHOUT the path filter only when the exact-root
-  // scan found nothing? No — that would scan the world. Keep it simple and
-  // correct: the exact-root match is the sccache/rustc case (the daemon chdirs
-  // into the worktree root it serves); nested-dir compilers are almost always
-  // in the agent's own tree and already covered by the subtree sampler.
   if (pids.length === 0) return { processes: 0, cpu: 0, resolutionMs: 1000 };
+  const ps = typeof runPs === 'function' ? runPs : (list) => {
+    const r = spawnSync('ps', ['-p', list.join(','), '-o', 'pid=,time='], { encoding: 'utf8', timeout: 5_000 });
+    // ps exits 1 when some pids vanished between scans; partial stdout is valid.
+    return typeof r.stdout === 'string' ? r.stdout : null;
+  };
   let psOut;
-  try {
-    const r = spawnSync('ps', ['-p', pids.join(','), '-o', 'pid=,time='], { encoding: 'utf8', timeout: 5_000 });
-    if (r.status !== 0 || !r.stdout) return null;
-    psOut = r.stdout;
-  } catch { return null; }
+  try { psOut = ps(pids); } catch { return null; }
+  if (typeof psOut !== 'string') return null;
   let processes = 0;
   let totalCpu = 0;
   for (const line of psOut.split('\n')) {
@@ -2834,9 +2861,12 @@ function sampleWorkspaceCpuLsof(workspaceDir, { scanLimit = WORKSPACE_CPU_SCAN_L
  * subtree sampler (`cpu` in ticks on Linux, whole seconds under `ps`) with
  * `processes` instead of `descendants`.
  */
-function sampleWorkspaceCpu(workspaceDir) {
-  if (process.platform === 'linux') return sampleWorkspaceCpuProc(workspaceDir);
-  if (process.platform === 'darwin') return sampleWorkspaceCpuLsof(workspaceDir);
+function sampleWorkspaceCpu(workspaceDir, { excludePids } = {}) {
+  // The agent itself runs with cwd == workspace; its own CPU (an idle harness
+  // ticking timers) is NOT out-of-tree work and must never defer its idle-kill.
+  const exclude = Array.isArray(excludePids) ? excludePids.filter((p) => Number.isFinite(p) && p > 0) : [];
+  if (process.platform === 'linux') return sampleWorkspaceCpuProc(workspaceDir, { excludePids: exclude });
+  if (process.platform === 'darwin') return sampleWorkspaceCpuLsof(workspaceDir, { excludePids: exclude });
   return null; // win32 et al: unsupported → degrade, never mis-kill
 }
 
@@ -2888,15 +2918,23 @@ function sampleWorkspaceCpu(workspaceDir) {
  * show movement) and re-probes after the recovery window. The absolute
  * `--job-timeout` hard cap remains the ultimate backstop, untouched by this.
  */
-function createIdleLivenessMonitor({ getPid, idleTimeoutMs, recoveryWindowMs, onIdleKill, isSettled, sampleCpu = sampleSubtreeCpu, extraSamplers = null, isActivityHold = null, logger = null }) {
+function createIdleLivenessMonitor({ getPid, idleTimeoutMs, recoveryWindowMs, onIdleKill, isSettled, sampleCpu = sampleSubtreeCpu, extraSamplers = null, isActivityHold = null, maxActivityHoldMs, logger = null }) {
   const enabled = idleTimeoutMs && idleTimeoutMs > 0;
   const probeWindow = recoveryWindowMs && recoveryWindowMs > 0 ? recoveryWindowMs : idleTimeoutMs;
   let timer = null;
   let prev = null; // last subtree CPU probe taken during the current silent stretch
   let prevExtra = null; // last per-extra-sampler CPU readings (array parallel to extraSamplers)
   let extraBaselined = false; // true once the extra samplers have a baseline to compare against
+  let extraResolutionMs = 0; // coarsest resolution among live extra samples at the last probe
   let flatMs = 0;  // cumulative time observed with flat CPU since the last movement/baseline
   let lastWindow = idleTimeoutMs; // duration of the currently pending probe window
+  let extraFlatMs = 0; // cumulative flat time across the extra (workspace) samplers
+  let holdMs = 0; // cumulative silent time deferred by the activity hold this stretch
+  // #313: the activity hold must be FINITE — `nano work` defaults to no hard cap,
+  // so an announced-then-hung tool call would otherwise defer forever. Default:
+  // 4 idle windows (configurable). Past it, the hold is ignored and the normal
+  // CPU probes decide (real silent work still defers via CPU progress).
+  const holdCap = Number.isFinite(maxActivityHoldMs) && maxActivityHoldMs >= 0 ? maxActivityHoldMs : (idleTimeoutMs > 0 ? idleTimeoutMs * 4 : 0);
   const settled = () => (typeof isSettled === 'function' ? isSettled() : false);
   const clear = () => { if (timer) { clearTimeout(timer); timer = null; } };
   const schedule = (ms) => { lastWindow = ms; timer = setTimeout(onElapse, ms); };
@@ -2911,10 +2949,14 @@ function createIdleLivenessMonitor({ getPid, idleTimeoutMs, recoveryWindowMs, on
     // reported a terminal status) means the silence is expected — defer. The
     // call's own timeout / the absolute hard cap still bound a hung call.
     if (held()) {
-      log(`silent for >= ${elapsed}ms but a tool call is still in flight; deferring the idle-kill (bounded by the call's own timeout and the job hard cap)`);
-      prev = null; prevExtra = null; extraBaselined = false; flatMs = 0;
-      schedule(probeWindow);
-      return;
+      if (holdMs < holdCap) {
+        holdMs += elapsed;
+        log(`silent for >= ${elapsed}ms but a tool call is still in flight; deferring the idle-kill (hold ${holdMs}/${holdCap}ms)`);
+        prev = null; prevExtra = null; extraBaselined = false; flatMs = 0; extraFlatMs = 0;
+        schedule(probeWindow);
+        return;
+      }
+      log(`a tool call has been in flight for >= ${holdMs}ms (hold cap ${holdCap}ms); falling back to CPU-progress probes`);
     }
     const pid = typeof getPid === 'function' ? getPid() : undefined;
     const sample = pid != null ? sampleCpu(pid) : null;
@@ -2925,22 +2967,30 @@ function createIdleLivenessMonitor({ getPid, idleTimeoutMs, recoveryWindowMs, on
     let extraActive = false;
     if (extras.length) {
       const next = [];
+      extraResolutionMs = 0;
       for (let i = 0; i < extras.length; i += 1) {
         let s = null;
         try { s = extras[i](); } catch { s = null; }
         next.push(s);
         if (!s || !Number.isFinite(s.cpu)) continue;
+        if (s.processes > 0 && Number.isFinite(s.resolutionMs)) extraResolutionMs = Math.max(extraResolutionMs, s.resolutionMs);
         const before = prevExtra && prevExtra[i];
         if (before != null && Number.isFinite(before.cpu) && s.cpu !== before.cpu) extraActive = true;
       }
+      const hadBaseline = prevExtra != null;
       prevExtra = next;
       if (extraActive) {
         log(`silent for >= ${elapsed}ms but a workspace process outside the agent tree is burning CPU (e.g. sccache/rustc); deferring the idle-kill`);
-        prev = sample; flatMs = 0;
+        prev = sample; flatMs = 0; extraFlatMs = 0;
         schedule(probeWindow);
         return;
       }
+      if (hadBaseline) extraFlatMs += elapsed;
     }
+    // A live workspace process read flat, but a coarse sampler (whole-second
+    // `ps`) can read flat across a sub-resolution window while still working:
+    // only treat workspace CPU as idle once the flat time covers its resolution.
+    const extraIdleConfirmed = extraFlatMs >= extraResolutionMs;
     // Childless / unsampleable / dead tree → silence is very likely a hang.
     // But with extra (workspace) samplers wired we cannot yet distinguish "no
     // workspace work" from "a workspace daemon whose baseline we have not
@@ -2954,6 +3004,11 @@ function createIdleLivenessMonitor({ getPid, idleTimeoutMs, recoveryWindowMs, on
         // either defers (workspace CPU moved) or kills (flat).
         extraBaselined = true;
         log(`silent for >= ${elapsed}ms with ${!sample ? 'an unsampleable tree' : 'no live descendant'}; baselining the workspace CPU probe and re-checking in ${probeWindow}ms`);
+        schedule(probeWindow);
+        return;
+      }
+      if (!extraIdleConfirmed) {
+        log(`silent for >= ${elapsed}ms with ${!sample ? 'an unsampleable tree' : 'no live descendant'}; workspace CPU flat for ${extraFlatMs}ms < sampler resolution ${extraResolutionMs}ms, re-checking in ${probeWindow}ms`);
         schedule(probeWindow);
         return;
       }
@@ -2983,7 +3038,7 @@ function createIdleLivenessMonitor({ getPid, idleTimeoutMs, recoveryWindowMs, on
       // low-churn subtree is still progressing but hasn't crossed the next tick.
       flatMs += elapsed;
       const resolutionMs = Number.isFinite(sample.resolutionMs) ? sample.resolutionMs : 0;
-      if (flatMs >= resolutionMs) {
+      if (flatMs >= resolutionMs && extraIdleConfirmed) {
         log(`silent for >= ${elapsed}ms with a live but CPU-flat subtree (${sample.descendants} descendant(s), cpu ${sample.cpu}) and no workspace CPU; idle-killing`);
         onIdleKill();
         return;
@@ -3006,6 +3061,9 @@ function createIdleLivenessMonitor({ getPid, idleTimeoutMs, recoveryWindowMs, on
       prevExtra = null;
       extraBaselined = false;
       flatMs = 0;
+      extraFlatMs = 0;
+      extraResolutionMs = 0;
+      holdMs = 0;
       clear();
       schedule(idleTimeoutMs);
     },
@@ -9022,7 +9080,7 @@ function spawnCaptureOneShot({ command, args = [], shell = false, detached = fal
       // #313: count CPU burned by any process whose cwd is inside the agent's
       // workspace (a shared sccache daemon lives outside the agent's tree), so
       // a silent compile holds off the idle-kill.
-      extraSamplers: cwd ? [() => sampleWorkspaceCpu(cwd)] : null,
+      extraSamplers: cwd ? [() => sampleWorkspaceCpu(cwd, { excludePids: [child?.pid] })] : null,
       onIdleKill: () => {
         try { if (onTimeout) onTimeout(child); } catch { /* best effort */ }
         finish({ ok: false, exitCode: null, stdout: joinCapped(stdoutChunks), stderr: joinCapped(stderrChunks), error: `no output and no subtree progress for >= ${idleTimeoutMs}ms (idle)`, timedOut: true, idle: true, truncated: stdoutTruncated, stderrTruncated });
@@ -9199,7 +9257,7 @@ function spawnCapturePty({ command, args = [], cwd, env, stdinData, timeoutMs, i
       // #313: count CPU burned by any process whose cwd is inside the agent's
       // workspace (a shared sccache daemon lives outside the agent's tree), so
       // a silent compile holds off the idle-kill.
-      extraSamplers: cwd ? [() => sampleWorkspaceCpu(cwd)] : null,
+      extraSamplers: cwd ? [() => sampleWorkspaceCpu(cwd, { excludePids: [term?.pid] })] : null,
       onIdleKill: () => {
         killTerm();
         finish({ ok: false, exitCode: null, stdout: joinCapped(chunks), stderr: '', error: `no output and no subtree progress for >= ${idleTimeoutMs}ms (idle)`, timedOut: true, idle: true, truncated, stderrTruncated: false });
@@ -9984,7 +10042,7 @@ function spawnCaptureAcp({ command, args = [], cwd, env, stdinData, timeoutMs, i
       // agent's workspace, wherever they sit in the process tree — a shared
       // sccache daemon (parented to launchd/init, not the agent) compiling
       // this worktree is real work and must hold off the idle-kill.
-      extraSamplers: cwd ? [() => sampleWorkspaceCpu(cwd)] : null,
+      extraSamplers: cwd ? [() => sampleWorkspaceCpu(cwd, { excludePids: [child?.pid] })] : null,
       onIdleKill: () => {
         try { killTree(child); } catch { /* best effort */ }
         finish({ ok: false, exitCode: null, stdout: humanStdout(), stderr: joinCapped(stderrChunks), error: `no output and no subtree progress for >= ${idleTimeoutMs}ms (idle)`, timedOut: true, idle: true, truncated: humanTruncated, stderrTruncated });
@@ -21665,6 +21723,7 @@ export {
   sampleSubtreeCpu,
   sampleWorkspaceCpu,
   sampleWorkspaceCpuProc,
+  sampleWorkspaceCpuLsof,
   createIdleLivenessMonitor,
   resolveLivenessOverrides,
   parsePsTime,

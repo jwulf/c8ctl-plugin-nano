@@ -1459,12 +1459,15 @@ test('spawnCaptureAcp does NOT idle-kill an agent with a silent in-flight tool c
 test('spawnCaptureAcp still idle-kills a truly idle agent (no tool call in flight) (#313)', async () => {
   const resDir = mkdtempSync(join(tmpdir(), 'acp-res-'));
   const resultFile = join(resDir, 'result.json');
+  // Own cwd (like a real per-job workspace): the shared workRoot may hold
+  // processes from sibling tests, which the workspace-CPU probe would count.
+  const ownCwd = mkdtempSync(join(tmpdir(), 'acp-idle-'));
   try {
     const t0 = Date.now();
     const result = await spawnCaptureAcp({
       command: 'node',
       args: [FAKE_AGENT],
-      cwd: workRoot,
+      cwd: ownCwd,
       // FAKE_WAIT_CANCEL holds the turn open with NO tool call in flight and no
       // output — a genuinely idle agent. (No steer is attached, so no cancel
       // ever arrives.)
@@ -1481,6 +1484,7 @@ test('spawnCaptureAcp still idle-kills a truly idle agent (no tool call in fligh
     assert.ok(elapsed < 10_000, `the idle agent was killed promptly (${elapsed}ms), not at the hard cap`);
   } finally {
     rmSync(resDir, { recursive: true, force: true });
+    rmSync(ownCwd, { recursive: true, force: true });
   }
 });
 

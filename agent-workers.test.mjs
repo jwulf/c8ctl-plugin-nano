@@ -63,6 +63,7 @@ import {
   sampleSubtreeCpu,
   sampleWorkspaceCpu,
   sampleWorkspaceCpuProc,
+  sampleWorkspaceCpuLsof,
   createIdleLivenessMonitor,
   resolveLivenessOverrides,
   parsePsTime,
@@ -6248,4 +6249,80 @@ test('ghAuthEnv: no-token path fails closed — GH_CONFIG_DIR is set even when t
   } finally {
     rmSync(base, { recursive: true, force: true });
   }
+});
+
+// #313 review: the activity hold is finite (no default hard cap in `nano work`).
+test('createIdleLivenessMonitor caps an indefinite activity hold and then idle-kills a quiescent agent', async () => {
+  let killed = 0;
+  const mon = createIdleLivenessMonitor({
+    getPid: () => 1234, idleTimeoutMs: 20, recoveryWindowMs: 20, isSettled: () => false,
+    sampleCpu: () => ({ descendants: 0, cpu: 0 }),
+    isActivityHold: () => true, // announced tool call that never terminates
+    maxActivityHoldMs: 60,
+    onIdleKill: () => { killed += 1; },
+  });
+  mon.arm();
+  await new Promise((r) => setTimeout(r, 250));
+  mon.stop();
+  assert.equal(killed, 1, 'a hung tool call cannot defer the idle-kill forever');
+});
+
+test('createIdleLivenessMonitor default hold cap is finite', async () => {
+  let killed = 0;
+  const mon = createIdleLivenessMonitor({
+    getPid: () => 1234, idleTimeoutMs: 15, recoveryWindowMs: 15, isSettled: () => false,
+    sampleCpu: () => ({ descendants: 0, cpu: 0 }), isActivityHold: () => true,
+    onIdleKill: () => { killed += 1; },
+  });
+  mon.arm();
+  await new Promise((r) => setTimeout(r, 250));
+  mon.stop();
+  assert.equal(killed, 1);
+});
+
+// #313 review: coarse workspace sampler resolution is honoured on both paths.
+for (const descendants of [0, 1]) {
+  test(`createIdleLivenessMonitor honours workspace sampler resolution (descendants=${descendants})`, async () => {
+    let killed = 0;
+    const mon = createIdleLivenessMonitor({
+      getPid: () => 1234, idleTimeoutMs: 20, recoveryWindowMs: 20, isSettled: () => false,
+      sampleCpu: () => ({ descendants, cpu: 7 }),
+      extraSamplers: [() => ({ processes: 1, cpu: 3, resolutionMs: 150 })],
+      onIdleKill: () => { killed += 1; },
+    });
+    mon.arm();
+    await new Promise((r) => setTimeout(r, 90));
+    assert.equal(killed, 0, 'flat workspace CPU below its resolution must not kill');
+    await new Promise((r) => setTimeout(r, 200));
+    mon.stop();
+    assert.equal(killed, 1, 'once flat time covers the resolution the agent ages out');
+  });
+}
+
+// #313 review: symlinked workspace roots + nested cwds on the lsof path.
+test('sampleWorkspaceCpuLsof matches nested and physical (realpath) cwds', () => {
+  const roots = { '/link/ws': '/phys/ws' };
+  const s = sampleWorkspaceCpuLsof('/link/ws', {
+    realpath: (p) => roots[p] ?? p,
+    runLsof: () => ['p10', 'n/phys/ws', 'p11', 'n/phys/ws/crates/a', 'p12', 'n/phys/wsx', 'p13', 'n/elsewhere', 'p14', 'n/link/ws/x'].join('\n'),
+    runPs: (pids) => { assert.deepEqual(pids, [10, 11, 14]); return '10 0:01\n11 0:02\n14 0:00\n'; },
+  });
+  assert.deepEqual(s, { processes: 3, cpu: 3, resolutionMs: 1000 });
+  assert.equal(sampleWorkspaceCpuLsof('/link/ws', { runLsof: () => null }), null, 'lsof unavailable → null');
+  const ex = sampleWorkspaceCpuLsof('/phys/ws', {
+    excludePids: [10],
+    runLsof: () => ['p10', 'n/phys/ws', `p${process.pid}`, 'n/phys/ws', 'p11', 'n/phys/ws'].join('\n'),
+    runPs: (pids) => { assert.deepEqual(pids, [11], 'agent pid + worker pid excluded'); return '11 0:01\n'; },
+  });
+  assert.equal(ex.processes, 1);
+});
+
+test('sampleWorkspaceCpuProc matches the physical cwd of a symlinked root', () => {
+  const s = sampleWorkspaceCpuProc('/link/ws', {
+    realpath: () => '/phys/ws',
+    listPids: () => [String(process.pid)],
+    readCwd: () => '/phys/ws/target',
+  });
+  if (process.platform === 'linux') assert.equal(s.processes, 1);
+  else assert.equal(s.processes, 0, 'no /proc stat off-linux; but cwd matched (no throw)');
 });

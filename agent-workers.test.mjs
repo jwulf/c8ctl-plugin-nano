@@ -61,6 +61,8 @@ import {
   containerEngineAvailable,
   runAgentJob,
   sampleSubtreeCpu,
+  sampleWorkspaceCpu,
+  sampleWorkspaceCpuProc,
   createIdleLivenessMonitor,
   resolveLivenessOverrides,
   parsePsTime,
@@ -5790,6 +5792,186 @@ test('createIdleLivenessMonitor is inert when idleTimeoutMs is not positive', as
   mon.stop();
   assert.equal(killed, 0, 'idle-timeout disabled (0) → no idle-kill, unbounded silence allowed');
 });
+
+// #313: an in-flight tool call (ACP) holds off the idle-kill while it runs.
+test('createIdleLivenessMonitor defers while an activity hold (in-flight tool call) is set, kills once it clears', async () => {
+  let killed = 0;
+  let held = true;
+  const mon = createIdleLivenessMonitor({
+    getPid: () => 1234,
+    idleTimeoutMs: 30,
+    recoveryWindowMs: 30,
+    isSettled: () => false,
+    // Even with a completely quiescent tree (no descendants — the extreme
+    // case), the hold must defer the kill.
+    sampleCpu: () => ({ descendants: 0, cpu: 0 }),
+    isActivityHold: () => held,
+    onIdleKill: () => { killed += 1; },
+  });
+  mon.arm();
+  await new Promise((r) => setTimeout(r, 150)); // several windows, all held
+  assert.equal(killed, 0, 'an in-flight tool call defers the idle-kill');
+  held = false; // the tool call completed
+  await new Promise((r) => setTimeout(r, 80));
+  mon.stop();
+  assert.equal(killed, 1, 'once the tool call completes the quiescent agent ages out');
+});
+
+// #313: a workspace-cwd sampler that keeps advancing CPU (an out-of-tree
+// sccache daemon compiling the worktree) defers the idle-kill even when the
+// agent's own subtree is childless/silent.
+test('createIdleLivenessMonitor defers while an extra (workspace) sampler shows advancing CPU', async () => {
+  let killed = 0;
+  let wsCpu = 0;
+  const ticker = setInterval(() => { wsCpu += 5; }, 10);
+  const mon = createIdleLivenessMonitor({
+    getPid: () => 1234,
+    idleTimeoutMs: 30,
+    recoveryWindowMs: 30,
+    isSettled: () => false,
+    // The agent's own tree has NO live descendants — only the out-of-tree
+    // workspace daemon is active.
+    sampleCpu: () => ({ descendants: 0, cpu: 0 }),
+    extraSamplers: [() => ({ processes: 1, cpu: wsCpu })],
+    onIdleKill: () => { killed += 1; },
+  });
+  mon.arm();
+  await new Promise((r) => setTimeout(r, 160)); // several probe windows of workspace progress
+  assert.equal(killed, 0, 'workspace CPU activity outside the agent tree defers the idle-kill');
+  clearInterval(ticker); // the daemon goes quiet
+  await new Promise((r) => setTimeout(r, 80));
+  mon.stop();
+  assert.equal(killed, 1, 'once the workspace goes quiet too, the childless silent agent ages out');
+});
+
+// #313: a flat (non-advancing) workspace sample never defers on its own.
+test('createIdleLivenessMonitor does not defer on a flat extra-sampler reading', async () => {
+  let killed = 0;
+  const mon = createIdleLivenessMonitor({
+    getPid: () => 1234,
+    idleTimeoutMs: 25,
+    recoveryWindowMs: 25,
+    isSettled: () => false,
+    sampleCpu: () => ({ descendants: 0, cpu: 0 }),
+    extraSamplers: [() => ({ processes: 1, cpu: 42 })], // present but never advancing
+    onIdleKill: () => { killed += 1; },
+  });
+  mon.arm();
+  await new Promise((r) => setTimeout(r, 90));
+  mon.stop();
+  assert.equal(killed, 1, 'a workspace process burning NO CPU is not activity');
+});
+
+// #313: a throwing extra sampler degrades gracefully (treated as no reading).
+test('createIdleLivenessMonitor ignores a throwing extra sampler', async () => {
+  let killed = 0;
+  const mon = createIdleLivenessMonitor({
+    getPid: () => 1234,
+    idleTimeoutMs: 25,
+    recoveryWindowMs: 25,
+    isSettled: () => false,
+    sampleCpu: () => ({ descendants: 0, cpu: 0 }),
+    extraSamplers: [() => { throw new Error('lsof exploded'); }],
+    onIdleKill: () => { killed += 1; },
+  });
+  mon.arm();
+  await new Promise((r) => setTimeout(r, 80));
+  mon.stop();
+  assert.equal(killed, 1, 'a failing workspace sampler degrades to subtree-only liveness');
+});
+
+// #313: the monitor logs WHY it considered the agent active/idle.
+test('createIdleLivenessMonitor logs the reason for each defer/kill decision', async () => {
+  const lines = [];
+  const logger = { info: (m) => lines.push(m) };
+  let killed = 0;
+  const mon = createIdleLivenessMonitor({
+    getPid: () => 1234,
+    idleTimeoutMs: 20,
+    recoveryWindowMs: 20,
+    isSettled: () => false,
+    sampleCpu: () => ({ descendants: 0, cpu: 0 }),
+    logger,
+    onIdleKill: () => { killed += 1; },
+  });
+  mon.arm();
+  await new Promise((r) => setTimeout(r, 60));
+  mon.stop();
+  assert.equal(killed, 1);
+  assert.ok(lines.some((l) => /idle-watchdog/.test(l) && /idle-killing/.test(l)), `expected a why-idle log line, got: ${JSON.stringify(lines)}`);
+});
+
+// #313: the workspace sampler itself — injected /proc view.
+test('sampleWorkspaceCpuProc filters by cwd prefix and sums utime+stime', { skip: process.platform !== 'linux' }, () => {
+  const root = process.cwd();
+  const me = process.pid;
+  // Our own process has cwd == root and a real /proc stat. A pid with a cwd
+  // OUTSIDE the root must be excluded; an unreadable cwd must be skipped.
+  const s = sampleWorkspaceCpuProc(root, {
+    listPids: () => [String(me), '999999'],
+    readCwd: (pid) => (Number(pid) === me ? root : null),
+  });
+  assert.ok(s, 'sampleable on Linux');
+  assert.equal(s.processes, 1, 'only the in-workspace pid counts');
+  assert.ok(s.cpu >= 0);
+  const outside = sampleWorkspaceCpuProc(root, {
+    listPids: () => [String(me)],
+    readCwd: () => '/definitely/not/the/workspace',
+  });
+  assert.equal(outside.processes, 0, 'a process cwd-ed outside the workspace is not counted');
+  assert.equal(outside.cpu, 0);
+  // A cwd UNDER the root (a nested worktree dir) counts too.
+  const nested = sampleWorkspaceCpuProc(root, {
+    listPids: () => [String(me)],
+    readCwd: () => join(root, 'target', 'debug'),
+  });
+  assert.equal(nested.processes, 1, 'a process cwd-ed in a subdirectory of the workspace counts');
+});
+
+test('sampleWorkspaceCpu returns null on unsupported platforms and a shaped sample on linux/darwin', () => {
+  const s = sampleWorkspaceCpu(process.cwd());
+  if (process.platform === 'linux' || process.platform === 'darwin') {
+    assert.ok(s === null || (typeof s.processes === 'number' && typeof s.cpu === 'number'));
+  } else {
+    assert.equal(s, null, 'unsupported platform → null (degrade, never mis-kill)');
+  }
+  assert.equal(sampleWorkspaceCpu(''), null, 'no workspace → null');
+  assert.equal(sampleWorkspaceCpu(null), null, 'no workspace → null');
+});
+
+// #313 end-to-end (host, pipe protocol): a silent harness whose ONLY activity
+// is a process cwd-ed inside its workspace but OUTSIDE its own process tree
+// (the sccache shape) must not be idle-killed.
+test('runAgentJob (host) idle-timeout does NOT kill when a workspace-cwd process outside the tree burns CPU', { skip: process.platform !== 'linux' }, async () => {
+  const ws = mkdtempSync(join(tmpdir(), 'ws-live-'));
+  try {
+    // The "sccache daemon": a busy process whose cwd is the workspace but which
+    // is NOT a descendant of the harness (it is a child of THIS test process,
+    // re-parented sideways — exactly how a launchd/init-parented daemon looks).
+    const daemon = spawn('sh', ['-c', `cd "${ws}" && while :; do :; done`], { stdio: 'ignore' });
+    try {
+      await new Promise((r) => setTimeout(r, 100));
+      // The harness itself is silent and its own tree is CPU-idle (a bare
+      // sleep): only the workspace sampler sees activity.
+      const profile = { name: 'p', rank: 'senior', command: 'sleep 1.2', args: [], model: '', capabilities: [] };
+      const job = { jobKey: 'jk', type: 'senior', variables: {}, customHeaders: {} };
+      const result = await runAgentJob(profile, job, {
+        sandbox: 'none',
+        envelope: normalizeTaskEnvelope({}, {}),
+        idleTimeoutMs: 250,
+        recoveryWindowMs: 250,
+        cwd: ws,
+      });
+      assert.notEqual(result.idle, true, 'workspace CPU outside the agent tree holds off the idle-kill');
+      assert.equal(result.ok, true, result.error || result.stderr);
+    } finally {
+      try { daemon.kill('SIGKILL'); } catch { /* best effort */ }
+    }
+  } finally {
+    rmSync(ws, { recursive: true, force: true });
+  }
+});
+
 
 test('runAgentJob (host) idle-timeout does NOT kill a silent harness with a CPU-active descendant', { skip: process.platform === 'win32' }, async () => {
   // The harness produces ZERO output but keeps a busy descendant alive for ~1.2s,

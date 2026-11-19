@@ -49,6 +49,7 @@ import {
   utimesSync,
   mkdtempSync,
   closeSync,
+  readlinkSync,
   watchFile,
   unwatchFile,
 } from 'node:fs';
@@ -2705,6 +2706,140 @@ function sampleSubtreeCpu(rootPid) {
   return sampleSubtreeCpuPs(rootPid);
 }
 
+// ---- Workspace-CPU liveness + in-flight tool holds (#313) ------------------
+// The #130 subtree probe only sees processes INSIDE the agent's own process
+// tree. Real work often happens OUTSIDE that tree: `cargo` builds through a
+// shared `sccache` server (a daemon parented to launchd/init, not the agent),
+// and a long foreground bash tool call can compile/test silently for minutes
+// (nanobpm/nano-bpm#1664 attempt 1 was idle-killed at 216 turns / 156 min with
+// a build genuinely running). Two extra liveness signals close that gap:
+//  1. `sampleWorkspaceCpu` — aggregate CPU of ANY process whose cwd is inside
+//     the agent's workspace (the sccache/rustc case: the daemon's compile
+//     workers chdir into the worktree they compile for).
+//  2. an in-flight-tool-call hold — while the agent has an ACP tool call still
+//     open (a bash call it started has not reported a terminal status) it is
+//     treated as active; the call's own timeout / the absolute hard cap still
+//     bound a genuinely hung call.
+// Both ride the monitor below as extra samplers consulted only during an idle
+// window, so a truly quiescent agent still ages out exactly as before.
+
+/** Default upper bound for the workspace-cwd scan (pid count). */
+const WORKSPACE_CPU_SCAN_LIMIT = 4096;
+
+/**
+ * Linux: aggregate CPU (utime+stime ticks) of every process whose cwd resolves
+ * inside `workspaceDir` — regardless of parentage — via `/proc/<pid>/cwd`
+ * symlinks. Returns `{ processes, cpu }` (cpu in clock ticks, matching the
+ * `/proc` subtree sampler), or `null` when the workspace is unusable (so the
+ * caller degrades to subtree-only liveness rather than mis-killing). A process
+ * counted here is NOT a descendant of the agent, so it is a pure CPU-progress
+ * signal, never a presence signal. Bounded by `scanLimit` pids so a wedged
+ * /proc read can't stall the watchdog. `readCwd`/`listPids` are injectable for
+ * tests.
+ */
+function sampleWorkspaceCpuProc(workspaceDir, { readCwd, listPids, scanLimit = WORKSPACE_CPU_SCAN_LIMIT } = {}) {
+  if (typeof workspaceDir !== 'string' || !workspaceDir) return null;
+  const root = resolvePath(workspaceDir);
+  const read = typeof readCwd === 'function' ? readCwd : (pid) => {
+    try { return readlinkSync(`/proc/${pid}/cwd`); } catch { return null; }
+  };
+  let entries;
+  if (typeof listPids === 'function') entries = listPids();
+  else {
+    try { entries = readdirSync('/proc'); } catch { return null; }
+  }
+  let processes = 0;
+  let totalCpu = 0;
+  let scanned = 0;
+  for (const name of entries) {
+    if (scanned >= scanLimit) break;
+    if (!/^\d+$/.test(name)) continue;
+    scanned += 1;
+    const pid = Number(name);
+    const cwd = read(pid);
+    if (typeof cwd !== 'string' || !cwd) continue;
+    if (cwd !== root && !cwd.startsWith(root + sep)) continue;
+    let stat;
+    try { stat = readFileSync(`/proc/${pid}/stat`, 'utf8'); } catch { continue; }
+    const rparen = stat.lastIndexOf(')');
+    if (rparen < 0) continue;
+    const tail = stat.slice(rparen + 1).trim().split(/\s+/);
+    const utime = Number(tail[11]);
+    const stime = Number(tail[12]);
+    totalCpu += (Number.isFinite(utime) ? utime : 0) + (Number.isFinite(stime) ? stime : 0);
+    processes += 1;
+  }
+  return { processes, cpu: totalCpu };
+}
+
+/**
+ * Non-Linux fallback (macOS): aggregate CPU of processes whose cwd is inside
+ * `workspaceDir`, via a bounded `lsof` + `ps`. Heavier (two short-lived
+ * spawns) but runs only during an idle window. Returns
+ * `{ processes, cpu, resolutionMs: 1000 }` (cpu in whole seconds, so the
+ * coarse-resolution flat-CPU rule applies) or `null` when unavailable.
+ */
+function sampleWorkspaceCpuLsof(workspaceDir, { scanLimit = WORKSPACE_CPU_SCAN_LIMIT } = {}) {
+  if (typeof workspaceDir !== 'string' || !workspaceDir) return null;
+  const root = resolvePath(workspaceDir);
+  let lsofOut;
+  try {
+    // `lsof -a -d cwd -Fn -- <root>` lists ONLY processes whose cwd is the
+    // workspace root itself; the descendant sweep below covers the subtree.
+    // -Fn prints machine-readable `p<pid>` records. lsof exits 1 when nothing
+    // matches, which is a valid empty result, not a failure.
+    const r = spawnSync('lsof', ['-a', '-d', 'cwd', '-Fn', '--', root], { encoding: 'utf8', timeout: 5_000, maxBuffer: 4 * 1024 * 1024 });
+    if (r.error && r.error.code === 'ENOENT') return null; // lsof missing → degrade
+    lsofOut = typeof r.stdout === 'string' ? r.stdout : '';
+  } catch { return null; }
+  const pids = [];
+  for (const line of lsofOut.split('\n')) {
+    if (line.charCodeAt(0) === 112 /* 'p' */) {
+      const pid = Number(line.slice(1));
+      if (Number.isFinite(pid) && pid > 0) pids.push(pid);
+      if (pids.length >= scanLimit) break;
+    }
+  }
+  // lsof -d cwd only matches the exact directory; sweep the rest of the process
+  // table for cwds UNDER the root (worktrees compile in nested dirs) via one ps
+  // snapshot filtered by cwd. `ps -eo pid=,comm=` can't report cwd portably, so
+  // instead ask lsof once more WITHOUT the path filter only when the exact-root
+  // scan found nothing? No — that would scan the world. Keep it simple and
+  // correct: the exact-root match is the sccache/rustc case (the daemon chdirs
+  // into the worktree root it serves); nested-dir compilers are almost always
+  // in the agent's own tree and already covered by the subtree sampler.
+  if (pids.length === 0) return { processes: 0, cpu: 0, resolutionMs: 1000 };
+  let psOut;
+  try {
+    const r = spawnSync('ps', ['-p', pids.join(','), '-o', 'pid=,time='], { encoding: 'utf8', timeout: 5_000 });
+    if (r.status !== 0 || !r.stdout) return null;
+    psOut = r.stdout;
+  } catch { return null; }
+  let processes = 0;
+  let totalCpu = 0;
+  for (const line of psOut.split('\n')) {
+    const m = line.trim().match(/^(\d+)\s+(\S+)$/);
+    if (!m) continue;
+    totalCpu += parsePsTime(m[2]);
+    processes += 1;
+  }
+  return { processes, cpu: totalCpu, resolutionMs: 1000 };
+}
+
+/**
+ * Sample aggregate CPU of processes working inside `workspaceDir` regardless of
+ * parentage (the sccache/shared-daemon case, #313). Linux reads `/proc`; macOS
+ * falls back to `lsof`+`ps`; other platforms return `null` (unsupported → the
+ * monitor degrades to subtree-only liveness). The result shape mirrors the
+ * subtree sampler (`cpu` in ticks on Linux, whole seconds under `ps`) with
+ * `processes` instead of `descendants`.
+ */
+function sampleWorkspaceCpu(workspaceDir) {
+  if (process.platform === 'linux') return sampleWorkspaceCpuProc(workspaceDir);
+  if (process.platform === 'darwin') return sampleWorkspaceCpuLsof(workspaceDir);
+  return null; // win32 et al: unsupported → degrade, never mis-kill
+}
+
 /**
  * Build a progress-aware idle-liveness monitor shared by the pipe/PTY/ACP
  * capture paths. `arm()` is called on every output chunk (and once at start) to
@@ -2730,37 +2865,117 @@ function sampleSubtreeCpu(rootPid) {
  *    read under a coarse sampler must NOT kill; the fine-grained `/proc` path
  *    carries no resolution and so ages out on the first flat window as before →
  *    `onIdleKill()`.
+ * #313 extensions:
+ *  - `extraSamplers`: additional activity probes (e.g. the workspace-cwd CPU
+ *    scan covering out-of-tree sccache/rustc daemons). Each returns
+ *    `{ processes, cpu, resolutionMs? } | null`; advancing CPU on ANY sampler
+ *    defers the kill. Extra samplers are pure progress signals — they never
+ *    satisfy the presence gate (a childless agent with a busy workspace daemon
+ *    still needs its own live descendant to count as present... EXCEPT that a
+ *    workspace daemon burning CPU IS evidence the agent's work is in flight, so
+ *    when an extra sampler shows advancing CPU the kill is deferred even with
+ *    no live descendant: the agent may be blocked reading a pipe its daemon
+ *    fills. A flat/zero extra sample never kills on its own — presence is
+ *    judged from the subtree as before).
+ *  - `isActivityHold`: an in-flight-tool-call latch (ACP). While it returns
+ *    true the agent has an open tool call, so silence is expected; the kill is
+ *    deferred window-by-window. The absolute `--job-timeout` hard cap (and the
+ *    tool call's own timeout, enforced by the agent) remain the bound for a
+ *    genuinely hung call.
+ *  - `logger`: when given, the monitor logs WHY it considered the agent active
+ *    or idle at each probe (diagnosability, #313).
  * The first elapse with live descendants takes a baseline (a single sample can't
  * show movement) and re-probes after the recovery window. The absolute
  * `--job-timeout` hard cap remains the ultimate backstop, untouched by this.
  */
-function createIdleLivenessMonitor({ getPid, idleTimeoutMs, recoveryWindowMs, onIdleKill, isSettled, sampleCpu = sampleSubtreeCpu }) {
+function createIdleLivenessMonitor({ getPid, idleTimeoutMs, recoveryWindowMs, onIdleKill, isSettled, sampleCpu = sampleSubtreeCpu, extraSamplers = null, isActivityHold = null, logger = null }) {
   const enabled = idleTimeoutMs && idleTimeoutMs > 0;
   const probeWindow = recoveryWindowMs && recoveryWindowMs > 0 ? recoveryWindowMs : idleTimeoutMs;
   let timer = null;
   let prev = null; // last subtree CPU probe taken during the current silent stretch
+  let prevExtra = null; // last per-extra-sampler CPU readings (array parallel to extraSamplers)
+  let extraBaselined = false; // true once the extra samplers have a baseline to compare against
   let flatMs = 0;  // cumulative time observed with flat CPU since the last movement/baseline
   let lastWindow = idleTimeoutMs; // duration of the currently pending probe window
   const settled = () => (typeof isSettled === 'function' ? isSettled() : false);
   const clear = () => { if (timer) { clearTimeout(timer); timer = null; } };
   const schedule = (ms) => { lastWindow = ms; timer = setTimeout(onElapse, ms); };
+  const log = (msg) => { try { logger?.info?.(`[idle-watchdog] ${msg}`); } catch { /* best effort */ } };
+  const extras = Array.isArray(extraSamplers) ? extraSamplers.filter((s) => typeof s === 'function') : [];
+  const held = () => { try { return typeof isActivityHold === 'function' && isActivityHold(); } catch { return false; } };
   function onElapse() {
     timer = null;
     if (settled()) return;
     const elapsed = lastWindow;
+    // #313: an in-flight tool call (the agent started a bash call that has not
+    // reported a terminal status) means the silence is expected — defer. The
+    // call's own timeout / the absolute hard cap still bound a hung call.
+    if (held()) {
+      log(`silent for >= ${elapsed}ms but a tool call is still in flight; deferring the idle-kill (bounded by the call's own timeout and the job hard cap)`);
+      prev = null; prevExtra = null; extraBaselined = false; flatMs = 0;
+      schedule(probeWindow);
+      return;
+    }
     const pid = typeof getPid === 'function' ? getPid() : undefined;
     const sample = pid != null ? sampleCpu(pid) : null;
-    // Childless / unsampleable / dead tree → silence really is a hang: kill.
-    if (!sample || sample.descendants <= 0) { onIdleKill(); return; }
+    // #313: consult the extra (workspace-cwd) samplers. Advancing CPU on any of
+    // them is work attributable to this agent even when it lives outside the
+    // agent's process tree (a shared sccache daemon), so it defers the kill —
+    // INCLUDING when the subtree itself looks childless/quiescent.
+    let extraActive = false;
+    if (extras.length) {
+      const next = [];
+      for (let i = 0; i < extras.length; i += 1) {
+        let s = null;
+        try { s = extras[i](); } catch { s = null; }
+        next.push(s);
+        if (!s || !Number.isFinite(s.cpu)) continue;
+        const before = prevExtra && prevExtra[i];
+        if (before != null && Number.isFinite(before.cpu) && s.cpu !== before.cpu) extraActive = true;
+      }
+      prevExtra = next;
+      if (extraActive) {
+        log(`silent for >= ${elapsed}ms but a workspace process outside the agent tree is burning CPU (e.g. sccache/rustc); deferring the idle-kill`);
+        prev = sample; flatMs = 0;
+        schedule(probeWindow);
+        return;
+      }
+    }
+    // Childless / unsampleable / dead tree → silence is very likely a hang.
+    // But with extra (workspace) samplers wired we cannot yet distinguish "no
+    // workspace work" from "a workspace daemon whose baseline we have not
+    // taken" on a single reading — so take ONE baseline probe window before
+    // killing, exactly like the subtree first-elapse baseline below. Without
+    // extra samplers (or once a baseline shows no workspace activity) the
+    // legacy immediate kill applies.
+    if (!sample || sample.descendants <= 0) {
+      if (extras.length && !extraBaselined) {
+        // Consume the baseline: the NEXT elapse compares against prevExtra and
+        // either defers (workspace CPU moved) or kills (flat).
+        extraBaselined = true;
+        log(`silent for >= ${elapsed}ms with ${!sample ? 'an unsampleable tree' : 'no live descendant'}; baselining the workspace CPU probe and re-checking in ${probeWindow}ms`);
+        schedule(probeWindow);
+        return;
+      }
+      log(`silent for >= ${elapsed}ms with ${!sample ? 'an unsampleable tree' : 'no live descendant'} and no workspace CPU; idle-killing`);
+      onIdleKill();
+      return;
+    }
     if (prev != null) {
       // Aggregate CPU advanced across the window → the tree is doing work; defer.
-      if (sample.cpu > prev.cpu) { prev = sample; flatMs = 0; schedule(probeWindow); return; }
+      if (sample.cpu > prev.cpu) {
+        log(`silent for >= ${elapsed}ms but subtree CPU advanced (${prev.cpu} → ${sample.cpu}); deferring the idle-kill`);
+        prev = sample; flatMs = 0; schedule(probeWindow); return;
+      }
       // Aggregate CPU REGRESSED → `sampleSubtreeCpu*` only sums CPU for live
       // PIDs, so the total can legitimately drop when a busy descendant exits
       // (its ticks stop counting) even though the subtree just made progress.
       // A regression is activity, not a stall: re-baseline and defer rather
       // than mis-killing a silent-but-busy job.
-      if (sample.cpu < prev.cpu) { prev = sample; flatMs = 0; schedule(probeWindow); return; }
+      if (sample.cpu < prev.cpu) {
+        log(`silent for >= ${elapsed}ms but subtree CPU regressed (${prev.cpu} → ${sample.cpu}; a busy descendant exited) — progress, not a stall; deferring the idle-kill`);
+        prev = sample; flatMs = 0; schedule(probeWindow); return;
+      }
       // Live descendants but CPU exactly unchanged across a full window → a
       // candidate stall. Only confirm it once we have observed flat CPU for at
       // least the sampler's CPU-time resolution: a probe window shorter than the
@@ -2768,12 +2983,17 @@ function createIdleLivenessMonitor({ getPid, idleTimeoutMs, recoveryWindowMs, on
       // low-churn subtree is still progressing but hasn't crossed the next tick.
       flatMs += elapsed;
       const resolutionMs = Number.isFinite(sample.resolutionMs) ? sample.resolutionMs : 0;
-      if (flatMs >= resolutionMs) { onIdleKill(); return; }
+      if (flatMs >= resolutionMs) {
+        log(`silent for >= ${elapsed}ms with a live but CPU-flat subtree (${sample.descendants} descendant(s), cpu ${sample.cpu}) and no workspace CPU; idle-killing`);
+        onIdleKill();
+        return;
+      }
       schedule(probeWindow);
       return;
     }
     // First elapse with live descendants: baseline, then re-probe (can't judge
     // progress from one sample).
+    log(`silent for >= ${elapsed}ms with ${sample.descendants} live descendant(s); baselining CPU (${sample.cpu}) and re-probing in ${probeWindow}ms`);
     prev = sample;
     flatMs = 0;
     schedule(probeWindow);
@@ -2783,6 +3003,8 @@ function createIdleLivenessMonitor({ getPid, idleTimeoutMs, recoveryWindowMs, on
     arm() {
       if (!enabled || settled()) return;
       prev = null; // output resumed → a fresh silent stretch starts
+      prevExtra = null;
+      extraBaselined = false;
       flatMs = 0;
       clear();
       schedule(idleTimeoutMs);
@@ -8796,6 +9018,11 @@ function spawnCaptureOneShot({ command, args = [], shell = false, detached = fal
       idleTimeoutMs,
       recoveryWindowMs,
       isSettled: () => settled,
+      logger: getLogger(),
+      // #313: count CPU burned by any process whose cwd is inside the agent's
+      // workspace (a shared sccache daemon lives outside the agent's tree), so
+      // a silent compile holds off the idle-kill.
+      extraSamplers: cwd ? [() => sampleWorkspaceCpu(cwd)] : null,
       onIdleKill: () => {
         try { if (onTimeout) onTimeout(child); } catch { /* best effort */ }
         finish({ ok: false, exitCode: null, stdout: joinCapped(stdoutChunks), stderr: joinCapped(stderrChunks), error: `no output and no subtree progress for >= ${idleTimeoutMs}ms (idle)`, timedOut: true, idle: true, truncated: stdoutTruncated, stderrTruncated });
@@ -8968,6 +9195,11 @@ function spawnCapturePty({ command, args = [], cwd, env, stdinData, timeoutMs, i
       idleTimeoutMs,
       recoveryWindowMs,
       isSettled: () => settled,
+      logger: getLogger(),
+      // #313: count CPU burned by any process whose cwd is inside the agent's
+      // workspace (a shared sccache daemon lives outside the agent's tree), so
+      // a silent compile holds off the idle-kill.
+      extraSamplers: cwd ? [() => sampleWorkspaceCpu(cwd)] : null,
       onIdleKill: () => {
         killTerm();
         finish({ ok: false, exitCode: null, stdout: joinCapped(chunks), stderr: '', error: `no output and no subtree progress for >= ${idleTimeoutMs}ms (idle)`, timedOut: true, idle: true, truncated, stderrTruncated: false });
@@ -9342,6 +9574,28 @@ function spawnCaptureAcp({ command, args = [], cwd, env, stdinData, timeoutMs, i
     // flips this; the floor never does.
     let sawRealTranscript = false;
 
+    // #313: ACP tool calls currently in flight (`toolCallId` → true). A
+    // `tool_call` notification with a non-terminal status opens the call; a
+    // `tool_call`/`tool_call_update` with a terminal status closes it. While
+    // any call is open the idle watchdog treats the agent as ACTIVE (a long
+    // silent bash call is work, not a hang) — the call's own timeout and the
+    // absolute job hard cap still bound a genuinely hung call.
+    const inFlightToolCalls = new Map();
+    const ACP_TOOL_TERMINAL_STATUSES = new Set(['completed', 'failed', 'cancelled', 'canceled']);
+    const noteToolCallUpdate = (update) => {
+      if (!update || typeof update !== 'object') return;
+      const kind = update.sessionUpdate || update.type;
+      if (kind !== 'tool_call' && kind !== 'tool_call_update') return;
+      const id = update.toolCallId;
+      if (id == null) return;
+      const status = typeof update.status === 'string' ? update.status.toLowerCase() : '';
+      if (ACP_TOOL_TERMINAL_STATUSES.has(status)) inFlightToolCalls.delete(id);
+      else if (!inFlightToolCalls.has(id)) {
+        inFlightToolCalls.set(id, true);
+        try { logger.info?.(`[idle-watchdog] tool call in flight (${update.title || id}${status ? `, status ${status}` : ''}) — the idle-kill is held while it runs`); } catch { /* best effort */ }
+      }
+    };
+
     // Live "spy" tee (--stream), line-buffered, mirroring the other paths.
     // Separate line buffers per lane (stdout-human vs stderr) so a partial line
     // on one lane never interleaves mid-line with the other — matching pipe/PTY.
@@ -9670,6 +9924,7 @@ function spawnCaptureAcp({ command, args = [], cwd, env, stdinData, timeoutMs, i
       // A request or notification FROM the agent.
       if (typeof msg.method === 'string') {
         if (msg.method === 'session/update') {
+          noteToolCallUpdate(msg.params?.update);
           emitTranscript(msg.params?.update);
           // #194: durable engine-native producer seam. In parallel with the
           // transcript-chunk relay overlay, hand the SAME raw `session/update` to
@@ -9720,6 +9975,16 @@ function spawnCaptureAcp({ command, args = [], cwd, env, stdinData, timeoutMs, i
       idleTimeoutMs,
       recoveryWindowMs,
       isSettled: () => settled,
+      logger,
+      // #313: while an ACP tool call is in flight the agent is active even
+      // when totally silent (a long foreground bash compile/test). Bounded by
+      // the call's own timeout and the absolute job hard cap.
+      isActivityHold: () => inFlightToolCalls.size > 0,
+      // #313: also count CPU burned by processes whose cwd is inside the
+      // agent's workspace, wherever they sit in the process tree — a shared
+      // sccache daemon (parented to launchd/init, not the agent) compiling
+      // this worktree is real work and must hold off the idle-kill.
+      extraSamplers: cwd ? [() => sampleWorkspaceCpu(cwd)] : null,
       onIdleKill: () => {
         try { killTree(child); } catch { /* best effort */ }
         finish({ ok: false, exitCode: null, stdout: humanStdout(), stderr: joinCapped(stderrChunks), error: `no output and no subtree progress for >= ${idleTimeoutMs}ms (idle)`, timedOut: true, idle: true, truncated: humanTruncated, stderrTruncated });
@@ -21398,6 +21663,8 @@ export {
   spawnCapturePty,
   spawnCaptureAcp,
   sampleSubtreeCpu,
+  sampleWorkspaceCpu,
+  sampleWorkspaceCpuProc,
   createIdleLivenessMonitor,
   resolveLivenessOverrides,
   parsePsTime,

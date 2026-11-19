@@ -74,6 +74,31 @@ if (process.env.FAKE_BAD_FRAME) {
   setInterval(() => {}, 3_600_000);
 }
 
+// FAKE_HUNG_TOOL: announce a bash tool call, then go SILENT forever — the tool
+// call never completes and the turn never resolves (a genuinely hung call,
+// #313). The in-flight-tool-call hold defers the idle-kill, but the absolute
+// job hard cap must still reap us. This mode is EXCLUSIVE: it must not fall
+// through to the main stdin handler (which would answer the handshake/prompt
+// and exit), so it owns the process and returns nothing further.
+// NOTE: the tool-call frame is written IMMEDIATELY (not from a stdin handler):
+// the executor tolerates a session/update before initialize (it just maps it),
+// and the update itself re-arms the watchdog.
+if (process.env.FAKE_HUNG_TOOL) {
+  send({ jsonrpc: '2.0', method: 'session/update', params: { sessionId: 'sess-1', update: { sessionUpdate: 'tool_call', toolCallId: 'tc-hung', title: 'bash: make all', status: 'in_progress', kind: 'execute' } } });
+  // Answer handshake requests minimally so the executor drives a full turn,
+  // but never resolve session/prompt — the tool call hangs forever.
+  process.stdin.on('data', (d) => {
+    for (const line of d.toString().split('\\n')) {
+      if (!line.trim()) continue;
+      let m; try { m = JSON.parse(line); } catch { continue; }
+      if (m.method === 'initialize') send({ jsonrpc: '2.0', id: m.id, result: { protocolVersion: 1, agentCapabilities: {} } });
+      else if (m.method === 'session/new') send({ jsonrpc: '2.0', id: m.id, result: { sessionId: 'sess-1' } });
+      // session/prompt: deliberately NEVER answered (the hung call).
+    }
+  });
+  setInterval(() => {}, 3_600_000);
+} else {
+
 // FAKE_EARLY_EXIT: exit 0 during the handshake, before any session/prompt turn
 // resolves. The executor must report ok:false WITH an explicit error explaining
 // the early exit, not a confusing bare "exit code 0".
@@ -192,6 +217,19 @@ function handle(m) {
         send({ jsonrpc: '2.0', method: 'session/update', params: { sessionId: 'sess-1', update: { sessionUpdate: 'agent_message_chunk', content: { type: 'text', text: 'all done' } } } });
       }
       if (process.env.FAKE_SPLIT_MULTIBYTE) { emitSplitMultibyte(); return; }
+      // FAKE_TOOL_CALL_MS: announce a bash tool call, then go SILENT for N ms
+      // (zero stdout — the long-compile case, #313) before reporting it
+      // completed and finishing. The idle watchdog must hold off the kill while
+      // the call is in flight; a N beyond the job hard cap still dies at the cap.
+      const toolCallMs = Number(process.env.FAKE_TOOL_CALL_MS || 0);
+      if (toolCallMs > 0) {
+        send({ jsonrpc: '2.0', method: 'session/update', params: { sessionId: 'sess-1', update: { sessionUpdate: 'tool_call', toolCallId: 'tc-bash', title: 'bash: cargo build', status: 'in_progress', kind: 'execute' } } });
+        setTimeout(() => {
+          send({ jsonrpc: '2.0', method: 'session/update', params: { sessionId: 'sess-1', update: { sessionUpdate: 'tool_call_update', toolCallId: 'tc-bash', title: 'bash: cargo build', status: 'completed' } } });
+          finish('end_turn');
+        }, toolCallMs);
+        return;
+      }
       if (waitCancel) return;        // hold the turn open until session/cancel
       nextPermOrFinish();
     } else {
@@ -219,6 +257,7 @@ function handle(m) {
     nextPermOrFinish();
   }
 }
+} // end FAKE_HUNG_TOOL else
 `;
 
 const workRoot = mkdtempSync(join(tmpdir(), 'acp-test-'));
@@ -1381,6 +1420,93 @@ test('#137 floor: a throwing transcript-chunk seam falls back to the text lane (
     // than being silently lost when the chunk seam threw.
     const relayed = textChunks.join('');
     assert.ok(relayed.includes('built the slice'), `expected floor text fallback for a throwing seam, got: ${JSON.stringify(textChunks)}`);
+  } finally {
+    rmSync(resDir, { recursive: true, force: true });
+  }
+});
+
+// ---------------------------------------------------------------------------
+// #313: the idle watchdog must NOT kill an agent with an in-flight tool call
+// (a long silent bash compile/test) — but the absolute hard cap still bounds a
+// genuinely hung call.
+// ---------------------------------------------------------------------------
+
+test('spawnCaptureAcp does NOT idle-kill an agent with a silent in-flight tool call (#313)', async () => {
+  const resDir = mkdtempSync(join(tmpdir(), 'acp-res-'));
+  const resultFile = join(resDir, 'result.json');
+  try {
+    const t0 = Date.now();
+    const result = await spawnCaptureAcp({
+      command: 'node',
+      args: [FAKE_AGENT],
+      cwd: workRoot,
+      env: { ...baseEnv(), AGENT_RESULT_FILE: resultFile, FAKE_TOOL_CALL_MS: '1200' },
+      stdinData: 'prompt',
+      timeoutMs: 20_000,
+      idleTimeoutMs: 200,
+      recoveryWindowMs: 200,
+      permission: 'yolo',
+    });
+    const elapsed = Date.now() - t0;
+    assert.equal(result.ok, true, result.error || result.stderr);
+    assert.notEqual(result.idle, true, 'an in-flight tool call must not be idle-killed');
+    assert.ok(elapsed >= 1100, `the silent tool call ran to completion (${elapsed}ms)`);
+  } finally {
+    rmSync(resDir, { recursive: true, force: true });
+  }
+});
+
+test('spawnCaptureAcp still idle-kills a truly idle agent (no tool call in flight) (#313)', async () => {
+  const resDir = mkdtempSync(join(tmpdir(), 'acp-res-'));
+  const resultFile = join(resDir, 'result.json');
+  try {
+    const t0 = Date.now();
+    const result = await spawnCaptureAcp({
+      command: 'node',
+      args: [FAKE_AGENT],
+      cwd: workRoot,
+      // FAKE_WAIT_CANCEL holds the turn open with NO tool call in flight and no
+      // output — a genuinely idle agent. (No steer is attached, so no cancel
+      // ever arrives.)
+      env: { ...baseEnv(), AGENT_RESULT_FILE: resultFile, FAKE_WAIT_CANCEL: '1' },
+      stdinData: 'prompt',
+      timeoutMs: 20_000,
+      idleTimeoutMs: 200,
+      recoveryWindowMs: 200,
+      permission: 'yolo',
+    });
+    const elapsed = Date.now() - t0;
+    assert.equal(result.ok, false);
+    assert.equal(result.idle, true, `expected an idle kill, got: ${result.error}`);
+    assert.ok(elapsed < 10_000, `the idle agent was killed promptly (${elapsed}ms), not at the hard cap`);
+  } finally {
+    rmSync(resDir, { recursive: true, force: true });
+  }
+});
+
+test('spawnCaptureAcp bounds a hung tool call by the absolute hard cap (#313)', async () => {
+  const resDir = mkdtempSync(join(tmpdir(), 'acp-res-'));
+  const resultFile = join(resDir, 'result.json');
+  try {
+    const t0 = Date.now();
+    const result = await spawnCaptureAcp({
+      command: 'node',
+      args: [FAKE_AGENT],
+      cwd: workRoot,
+      // The agent announces a tool call then goes silent FOREVER: the in-flight
+      // hold defers the idle-kill, so the run must die at the hard cap instead.
+      env: { ...baseEnv(), AGENT_RESULT_FILE: resultFile, FAKE_HUNG_TOOL: '1' },
+      stdinData: 'prompt',
+      timeoutMs: 1_500,
+      idleTimeoutMs: 200,
+      recoveryWindowMs: 200,
+      permission: 'yolo',
+    });
+    const elapsed = Date.now() - t0;
+    assert.equal(result.ok, false);
+    assert.equal(result.timedOut, true, 'a hung tool call is reaped by the hard cap');
+    assert.notEqual(result.idle, true, 'the in-flight hold means this is NOT reported as an idle kill');
+    assert.ok(elapsed >= 1400 && elapsed < 8_000, `killed at the hard cap (${elapsed}ms)`);
   } finally {
     rmSync(resDir, { recursive: true, force: true });
   }

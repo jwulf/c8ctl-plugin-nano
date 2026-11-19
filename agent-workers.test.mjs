@@ -5905,8 +5905,9 @@ test('createIdleLivenessMonitor logs the reason for each defer/kill decision', a
 // #313: the workspace sampler itself — injected /proc view.
 test('sampleWorkspaceCpuProc filters by cwd prefix and sums utime+stime', { skip: process.platform !== 'linux' }, () => {
   const root = process.cwd();
-  const me = process.pid;
-  // Our own process has cwd == root and a real /proc stat. A pid with a cwd
+  // A live NON-worker pid: the sampler excludes process.pid by design.
+  const me = process.ppid;
+  // The parent process has cwd == root and a real /proc stat. A pid with a cwd
   // OUTSIDE the root must be excluded; an unreadable cwd must be skipped.
   const s = sampleWorkspaceCpuProc(root, {
     listPids: () => [String(me), '999999'],
@@ -6320,7 +6321,7 @@ test('sampleWorkspaceCpuLsof matches nested and physical (realpath) cwds', () =>
 test('sampleWorkspaceCpuProc matches the physical cwd of a symlinked root', () => {
   const s = sampleWorkspaceCpuProc('/link/ws', {
     realpath: () => '/phys/ws',
-    listPids: () => [String(process.pid)],
+    listPids: () => [String(process.ppid)],
     readCwd: () => '/phys/ws/target',
   });
   if (process.platform === 'linux') assert.equal(s.processes, 1);

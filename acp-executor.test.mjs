@@ -1502,8 +1502,10 @@ test('spawnCaptureAcp bounds a hung tool call by the absolute hard cap (#313)', 
       env: { ...baseEnv(), AGENT_RESULT_FILE: resultFile, FAKE_HUNG_TOOL: '1' },
       stdinData: 'prompt',
       timeoutMs: 1_500,
-      idleTimeoutMs: 200,
-      recoveryWindowMs: 200,
+      // Default hold cap = 4 idle windows (2000ms) > the 1500ms hard cap, so
+      // the hold is still active when the hard timeout fires.
+      idleTimeoutMs: 500,
+      recoveryWindowMs: 500,
       permission: 'yolo',
     });
     const elapsed = Date.now() - t0;

@@ -2978,6 +2978,7 @@ function createIdleLivenessMonitor({ getPid, idleTimeoutMs, recoveryWindowMs, on
         if (before != null && Number.isFinite(before.cpu) && s.cpu !== before.cpu) extraActive = true;
       }
       const hadBaseline = prevExtra != null;
+      const prevReadings = prevExtra || [];
       prevExtra = next;
       if (extraActive) {
         log(`silent for >= ${elapsed}ms but a workspace process outside the agent tree is burning CPU (e.g. sccache/rustc); deferring the idle-kill`);
@@ -2985,7 +2986,19 @@ function createIdleLivenessMonitor({ getPid, idleTimeoutMs, recoveryWindowMs, on
         schedule(probeWindow);
         return;
       }
-      if (hadBaseline) extraFlatMs += elapsed;
+      // Flat time only counts while a workspace sampler stays LIVE (a reading
+      // with processes > 0) across consecutive probes. Empty / unreadable
+      // readings must not pre-pay a sampler's resolution allowance: when any
+      // sampler transitions absent/unreadable → live, restart the accumulator
+      // so a fresh process gets its full resolution window before a kill.
+      const isLive = (r) => r != null && Number.isFinite(r.cpu) && r.processes > 0;
+      let newlyLive = false; let continuedLive = false;
+      for (let i = 0; i < next.length; i += 1) {
+        if (!isLive(next[i])) continue;
+        if (hadBaseline && isLive(prevReadings[i])) continuedLive = true; else newlyLive = true;
+      }
+      if (newlyLive || !continuedLive) extraFlatMs = 0;
+      else extraFlatMs += elapsed;
     }
     // A live workspace process read flat, but a coarse sampler (whole-second
     // `ps`) can read flat across a sub-resolution window while still working:

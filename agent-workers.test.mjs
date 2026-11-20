@@ -6300,6 +6300,37 @@ for (const descendants of [0, 1]) {
   });
 }
 
+// #313 review: empty / unreadable workspace readings must not pre-pay a newly
+// live sampler's resolution allowance (flat time restarts on absent → live).
+for (const before of ['empty', 'unreadable']) {
+  test(`createIdleLivenessMonitor resets workspace flat time when a sampler goes ${before} -> live`, async () => {
+    let killed = 0;
+    let live = false;
+    let cpu = 0;
+    const mon = createIdleLivenessMonitor({
+      getPid: () => 1234, idleTimeoutMs: 20, recoveryWindowMs: 20, isSettled: () => false,
+      // The subtree keeps working (CPU advancing) while the workspace reads
+      // empty, then goes flat exactly when a workspace process appears.
+      sampleCpu: () => ({ descendants: 1, cpu: live ? cpu : (cpu += 1) }),
+      extraSamplers: [() => {
+        if (live) return { processes: 1, cpu: 3, resolutionMs: 150 };
+        if (before === 'unreadable') throw new Error('lsof failed');
+        return { processes: 0, cpu: 0 };
+      }],
+      onIdleKill: () => { killed += 1; },
+    });
+    mon.arm();
+    // Accumulate well over 150ms of empty/unreadable workspace readings.
+    await new Promise((r) => setTimeout(r, 250));
+    live = true;
+    await new Promise((r) => setTimeout(r, 90));
+    assert.equal(killed, 0, 'a newly live workspace process gets its full resolution window');
+    await new Promise((r) => setTimeout(r, 250));
+    mon.stop();
+    assert.equal(killed, 1);
+  });
+}
+
 // #313 review: symlinked workspace roots + nested cwds on the lsof path.
 test('sampleWorkspaceCpuLsof matches nested and physical (realpath) cwds', () => {
   const roots = { '/link/ws': '/phys/ws' };

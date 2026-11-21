@@ -61,6 +61,7 @@ import { randomUUID, createHash, randomBytes } from 'node:crypto';
 import { homedir, platform as osPlatform, devNull, tmpdir, hostname } from 'node:os';
 import { join, isAbsolute, resolve as resolvePath, dirname, basename, sep, delimiter } from 'node:path';
 import { createRequire } from 'node:module';
+import { AsyncLocalStorage } from 'node:async_hooks';
 import { fileURLToPath } from 'node:url';
 import { createInterface } from 'node:readline/promises';
 import { StringDecoder } from 'node:string_decoder';
@@ -367,7 +368,38 @@ const PROCESSOS_VERSION_META = 'version.json';
 const PROCESSOS_BINARY_META_FILE = 'processos-binary.json';
 const PROCESSOS_UPDATE_CACHE_FILE = 'processos-update-check.json';
 
+// Issue #323: worker log lines (`nano work`) carry an ISO-8601 prefix so an
+// intermittent failure rate can be read from the supervisor log files. Enabled
+// by `workAgent` (text output only — never in JSON output mode).
+let workerLogTimestamps = false;
+function enableWorkerLogTimestamps(on = true) { workerLogTimestamps = !!on; }
+/** Derive the flag from the CURRENT output mode (set on every `work` call, so a
+ *  JSON-mode invocation after a text-mode one in the same process is reset). */
+function syncWorkerLogTimestamps() {
+  enableWorkerLogTimestamps(!hostOutputIsJson());
+  return workerLogTimestamps;
+}
+
+function withLogTimestamps(logger, now = () => new Date().toISOString()) {
+  if (!logger || logger.__nanoTimestamped) return logger;
+  const wrapped = Object.create(logger);
+  for (const level of ['info', 'warn', 'error', 'debug']) {
+    if (typeof logger[level] !== 'function') continue;
+    const fn = logger[level].bind(logger);
+    wrapped[level] = (msg, ...rest) => (typeof msg === 'string' ? fn(`${now()} ${msg}`, ...rest) : fn(msg, ...rest));
+  }
+  Object.defineProperty(wrapped, '__nanoTimestamped', { value: true });
+  return wrapped;
+}
+
 function getLogger() {
+  const base = getBaseLogger();
+  // Re-check the CURRENT output mode on every call: a stale flag from an earlier
+  // text-mode `work` must never timestamp a later JSON-mode command's logs.
+  return workerLogTimestamps && !hostOutputIsJson() ? withLogTimestamps(base) : base;
+}
+
+function getBaseLogger() {
   if (globalThis.c8ctl) {
     return globalThis.c8ctl.getLogger();
   }
@@ -4433,6 +4465,112 @@ function createEngineAuthResolver({ camunda, token, authHeaders, targetUrl } = {
   return undefined;
 }
 
+// ── Transient engine-fetch retry (issue #323) ──────────────────────────────
+// Hand-rolled (non-activation) engine REST fetches open a fresh TLS connection
+// after an idle gap; a relay ingress (e.g. Tailscale Funnel) intermittently
+// resets new handshakes. Retry those transient connection errors and
+// 429/502/503/504 with jittered exponential backoff. 4xx (incl. 401/403) is
+// never retried. The caller's `signal` (its whole-read timeout) stays the outer
+// bound: an aborted signal stops retrying immediately.
+const TRANSIENT_FETCH_CODES = new Set([
+  'ECONNRESET', 'ECONNREFUSED', 'ETIMEDOUT', 'EPIPE', 'UND_ERR_SOCKET',
+  'UND_ERR_CONNECT_TIMEOUT', 'EAI_AGAIN', 'ENETUNREACH', 'EHOSTUNREACH',
+]);
+const TRANSIENT_FETCH_STATUSES = new Set([429, 502, 503, 504]);
+const ENGINE_FETCH_RETRY_DEFAULTS = { attempts: 4, baseMs: 250, maxMs: 4000 };
+
+// Walk a bounded `cause` chain and return the first `{ code, message }` found
+// below the top-level error (the top `fetch failed` message hides the reason).
+function fetchErrorCause(err) {
+  let cur = err && err.cause;
+  for (let i = 0; cur && i < 5; i++, cur = cur.cause) {
+    const code = cur.code ? String(cur.code) : '';
+    const message = cur.message ? String(cur.message) : '';
+    if (code || message) return { code, message };
+  }
+  return null;
+}
+
+// `fetch failed` → `fetch failed (ECONNRESET: Client network socket …)`.
+function describeFetchError(err) {
+  const base = err && err.message ? String(err.message) : String(err);
+  const c = fetchErrorCause(err);
+  if (!c) return base;
+  const detail = [c.code, c.message].filter(Boolean).join(': ');
+  if (!detail || base.includes(detail)) return base;
+  return `${base} (${detail})`;
+}
+
+function isTransientFetchError(err) {
+  if (!err || (err.name === 'AbortError')) return false;
+  if (err.code && TRANSIENT_FETCH_CODES.has(String(err.code))) return true;
+  let cur = err.cause;
+  for (let i = 0; cur && i < 5; i++, cur = cur.cause) {
+    if (cur.code && TRANSIENT_FETCH_CODES.has(String(cur.code))) return true;
+    if (/before secure TLS connection was established|socket hang up/i.test(String(cur.message || ''))) return true;
+  }
+  return false;
+}
+
+function engineRetryDelayMs(attempt, { baseMs, maxMs }, random = Math.random) {
+  const exp = Math.min(maxMs, baseMs * 2 ** attempt);
+  return Math.round(exp / 2 + random() * (exp / 2));
+}
+
+function abortableSleep(ms, signal) {
+  return new Promise((resolve) => {
+    if (signal && signal.aborted) return resolve();
+    let onAbort;
+    const t = setTimeout(() => { if (signal) signal.removeEventListener('abort', onAbort); resolve(); }, ms);
+    if (signal) {
+      onAbort = () => { clearTimeout(t); resolve(); };
+      signal.addEventListener('abort', onAbort, { once: true });
+    }
+  });
+}
+
+// Wrap a fetch so transient failures are retried. On final failure the thrown
+// error's message carries the cause code/message (`describeFetchError`).
+function withTransientFetchRetry(fetchImpl, opts = {}) {
+  const baseFetch = typeof fetchImpl === 'function' ? fetchImpl : ((input, init) => globalThis.fetch(input, init));
+  const cfg = { ...ENGINE_FETCH_RETRY_DEFAULTS, ...opts };
+  const sleep = typeof opts.sleep === 'function' ? opts.sleep : abortableSleep;
+  return async (input, init = {}) => {
+    const signal = init && init.signal;
+    for (let attempt = 0; ; attempt++) {
+      // Never start a RETRY once the caller has aborted (e.g. the `--auto` read
+      // deadline fired during a backoff sleep) — no orphan background attempts.
+      // The first attempt still goes to the underlying fetch, which owns its
+      // own aborted-signal semantics.
+      if (attempt > 0 && signal && signal.aborted) throw signal.reason instanceof Error ? signal.reason : new Error('engine fetch aborted');
+      const last = attempt >= cfg.attempts - 1;
+      let res;
+      try {
+        res = await baseFetch(input, init);
+      } catch (err) {
+        if (last || (signal && signal.aborted) || !isTransientFetchError(err)) {
+          const msg = describeFetchError(err);
+          if (err && typeof err === 'object' && msg !== err.message) {
+            try { err.message = msg; } catch { /* frozen */ }
+            if (err.message !== msg) throw new Error(msg, { cause: err });
+          }
+          throw err;
+        }
+        if (typeof opts.onRetry === 'function') opts.onRetry({ attempt: attempt + 1, reason: describeFetchError(err) });
+        await sleep(engineRetryDelayMs(attempt, cfg), signal);
+        continue;
+      }
+      if (!last && res && TRANSIENT_FETCH_STATUSES.has(res.status) && !(signal && signal.aborted)) {
+        try { if (res.body && typeof res.body.cancel === 'function') await res.body.cancel(); } catch { /* best effort */ }
+        if (typeof opts.onRetry === 'function') opts.onRetry({ attempt: attempt + 1, reason: `HTTP ${res.status}` });
+        await sleep(engineRetryDelayMs(attempt, cfg), signal);
+        continue;
+      }
+      return res;
+    }
+  };
+}
+
 // Wrap a `fetch` implementation so every outgoing engine REST request receives
 // per-call auth headers from `createEngineAuthResolver` (issue #315). Used by
 // `defaultC8RestReader` (so `@nanobpm/agentic`'s `httpC8RestReader` — which
@@ -4442,7 +4580,8 @@ function createEngineAuthResolver({ camunda, token, authHeaders, targetUrl } = {
 // while auth headers from the resolver are merged in (avoiding duplicate
 // case-variant `authorization` / `Authorization` keys).
 function withEngineAuthFetch(fetchImpl, authOpts) {
-  const baseFetch = typeof fetchImpl === 'function' ? fetchImpl : ((input, init) => globalThis.fetch(input, init));
+  // Transient connection errors / 429/502/503/504 are retried (issue #323).
+  const baseFetch = withTransientFetchRetry(fetchImpl, (authOpts && authOpts.retry) || {});
   const resolveAuth = createEngineAuthResolver(authOpts);
   if (!resolveAuth) return baseFetch;
   return async (input, init = {}) => {
@@ -4512,7 +4651,19 @@ function isEngineAuthError(err) {
 // bearer token, and unauthenticated local clusters, issue #315). The demand
 // module is imported lazily through the single agentic surface (`agentic.mjs`)
 // so the whole agentic module graph only loads when `--auto` is actually used.
-async function defaultC8RestReader(restConfig, { camunda, authHeaders, fetchImpl } = {}) {
+//
+// Cancellation: `httpC8RestReader` does not thread an AbortSignal, so the
+// reader's methods accept an optional trailing `signal` which is carried to the
+// (retrying) fetch through an AsyncLocalStorage scope — merged with any
+// reader-wide `signal` option. An aborted read therefore stops retrying instead
+// of running its backoff schedule in the background (PR #324 review).
+const readerSignalScope = new AsyncLocalStorage();
+function combineSignals(...signals) {
+  const live = signals.filter(Boolean);
+  if (live.length <= 1) return live[0];
+  return AbortSignal.any(live);
+}
+async function defaultC8RestReader(restConfig, { camunda, authHeaders, fetchImpl, signal } = {}) {
   const { demand } = await import('./agentic.mjs');
   const base = String(restConfig?.baseUrl || DEFAULT_NANO_URL).replace(/\/+$/, '');
   const authedFetch = withEngineAuthFetch(fetchImpl, {
@@ -4521,10 +4672,20 @@ async function defaultC8RestReader(restConfig, { camunda, authHeaders, fetchImpl
     authHeaders,
     targetUrl: base,
   });
-  return demand.httpC8RestReader({
+  const scopedFetch = (input, init = {}) => {
+    const s = combineSignals(init && init.signal, signal, readerSignalScope.getStore());
+    return authedFetch(input, s ? { ...init, signal: s } : init);
+  };
+  const inner = demand.httpC8RestReader({
     restAddress: `${base}/v2`,
-    fetch: authedFetch,
+    fetch: scopedFetch,
   });
+  return {
+    searchProcessDefinitionKeys: (callSignal) =>
+      readerSignalScope.run(callSignal, () => inner.searchProcessDefinitionKeys()),
+    getProcessDefinitionXml: (key, callSignal) =>
+      readerSignalScope.run(callSignal, () => inner.getProcessDefinitionXml(key)),
+  };
 }
 
 // Resolve the desired job-type set for `--auto`: all deployed agent job types
@@ -4535,16 +4696,25 @@ async function defaultC8RestReader(restConfig, { camunda, authHeaders, fetchImpl
 // (KEEP the running set) instead of wedging the reconcile — and, via shutdown's
 // `await inFlightReconcile`, wedging `Ctrl-C`/SIGTERM.
 async function resolveAutoJobTypes({ restConfig, camunda, authHeaders, fetchImpl, scope = '', readerFactory, timeoutMs = AUTO_ENGINE_READ_TIMEOUT_MS } = {}) {
+  // Abort the read itself on timeout (not just stop awaiting it), so the
+  // retrying fetch never keeps attempting in the background past the deadline
+  // and overlaps the next crawl (PR #324 review).
+  const controller = new AbortController();
   const read = (async () => {
     const reader = readerFactory
-      ? await readerFactory()
-      : await defaultC8RestReader(restConfig, { camunda, authHeaders, fetchImpl });
+      ? await readerFactory({ signal: controller.signal })
+      : await defaultC8RestReader(restConfig, { camunda, authHeaders, fetchImpl, signal: controller.signal });
     return readDeployedAgentJobTypes(reader, { scope });
   })();
   if (!(timeoutMs > 0)) return read;
+  read.catch(() => {}); // a post-timeout abort rejection is expected, not unhandled
   let timer;
   const timeout = new Promise((_resolve, reject) => {
-    timer = setTimeout(() => reject(new Error(`engine read timed out after ${timeoutMs}ms`)), timeoutMs);
+    timer = setTimeout(() => {
+      const err = new Error(`engine read timed out after ${timeoutMs}ms`);
+      controller.abort(err);
+      reject(err);
+    }, timeoutMs);
   });
   try {
     return await Promise.race([read, timeout]);
@@ -5063,7 +5233,8 @@ function resourceContentUrl(baseUrl, resourceKey) {
 // is surfaced as a ProvisionError so the caller fails the job with a clear
 // provisioning message (never runs an agent with a silently-empty prompt).
 async function fetchLinkedResourceContent(resourceKey, opts = {}) {
-  const { baseUrl, token, authHeaders, fetchImpl = fetch, timeoutMs = 15_000 } = opts;
+  const { baseUrl, token, authHeaders, fetchImpl = fetch, timeoutMs = 15_000, retry } = opts;
+  const retryingFetch = withTransientFetchRetry(fetchImpl, retry || {});
   const url = resourceContentUrl(baseUrl, resourceKey);
   const controller = new AbortController();
   const timer = timeoutMs > 0 ? setTimeout(() => controller.abort(), timeoutMs) : null;
@@ -5075,9 +5246,9 @@ async function fetchLinkedResourceContent(resourceKey, opts = {}) {
     // empty map means unauthenticated — deliberately no Authorization header.
     if (authHeaders && typeof authHeaders === 'object') Object.assign(headers, authHeaders);
     else if (token) headers.Authorization = `Bearer ${token}`;
-    res = await fetchImpl(url, { method: 'GET', headers, signal: controller.signal });
+    res = await retryingFetch(url, { method: 'GET', headers, signal: controller.signal });
   } catch (err) {
-    throw new ProvisionError(`prompt resource ${resourceKey} fetch failed: ${err && err.message ? err.message : String(err)}`);
+    throw new ProvisionError(`prompt resource ${resourceKey} fetch failed: ${describeFetchError(err)}`);
   } finally {
     if (timer) clearTimeout(timer);
   }
@@ -12461,6 +12632,14 @@ function checkSetupAbort(abortSignal, { jobType, jobKey, stage, logger } = {}) {
  * Uses the c8ctl-provided SDK client (globalThis.c8ctl.createClient()).
  */
 async function workAgent(req, flags, ctx) {
+  // Issue #323 (review): the timestamp flag is module-global, so a worker that
+  // returns or throws would otherwise leave it enabled and leak timestamps into
+  // a LATER text-mode command in a reused host process (the JSON-mode guard in
+  // getLogger only covers text→JSON, not text→text). Save the prior flag and
+  // restore it in a `finally` around the whole worker lifecycle below.
+  const prevWorkerLogTimestamps = workerLogTimestamps;
+  try {
+  syncWorkerLogTimestamps();
   const logger = getLogger();
   // The hire to run always comes from the positional profile. `--name` no longer
   // selects the hire (that was a footgun: `work reviewer --name coder` silently
@@ -15326,6 +15505,12 @@ async function workAgent(req, flags, ctx) {
     process.once('SIGINT', () => { forceAbort('SIGINT'); });
     process.once('SIGTERM', () => { forceAbort('SIGTERM'); });
   });
+  } finally {
+    // Restore the caller's timestamp flag now the worker lifecycle has ended
+    // (normal return OR a setup throw), so a reused host process's next command
+    // does not inherit this worker's timestamping. Best-effort and synchronous.
+    enableWorkerLogTimestamps(prevWorkerLogTimestamps);
+  }
 }
 
 // ---------------------------------------------------------------------------
@@ -22514,6 +22699,13 @@ export {
   defaultC8RestReader,
   createEngineAuthResolver,
   withEngineAuthFetch,
+  withTransientFetchRetry,
+  withLogTimestamps,
+  enableWorkerLogTimestamps,
+  syncWorkerLogTimestamps,
+  getLogger as __getLoggerForTest,
+  describeFetchError,
+  isTransientFetchError,
   isEngineAuthError,
   resolveAutoJobTypes,
   loadSupervisorRuntime,

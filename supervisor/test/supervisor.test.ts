@@ -459,3 +459,35 @@ test("reconcile 401/403 emits a distinct loud auth warning instead of the generi
     }),
   );
 });
+
+test("a non --auto worker never runs the reconcile loop: zero process-definition search/XML requests (#323)", async () => {
+  await Effect.runPromise(
+    Effect.gen(function* () {
+      const engine = makeEngine({ activate: activateAfter({}) });
+      const reg = yield* makeRegistry();
+      yield* reg.add("w1", ["x"], 1);
+      const reader = makeReader([["k1"]], { k1: "x" });
+      const sup = yield* makeSupervisor({
+        engine,
+        runner: makeRunner(1_000),
+        registry: reg,
+        reconcileReader: reader,
+        scan,
+        logger: noopLogger,
+        config: { idleSpacingMs: 1_000, reconcileIntervalMs: 5_000, activation: { ...defaultActivationConfig, requestTimeoutMs: 1_000, initialLockMs: 15_000, emptyPollBackoffMs: 0, maxBatchPerType: 10 } },
+      });
+      const fiber = yield* Effect.forkChild(sup.run);
+      yield* TestClock.adjust(Duration.millis(60_000));
+      assert.equal(reader.keyCalls, 0, "no process-definition search");
+      assert.deepEqual(reader.xmlFetches, [], "no XML fetches");
+      yield* Fiber.interrupt(fiber);
+    }).pipe(Effect.provide(TestClock.layer())),
+  );
+});
+
+test("reconcile warning carries the error cause code (#323)", async () => {
+  const { describeErrorWithCause } = await import("../src/supervisor.ts");
+  const err = new SupervisorError("fetch failed", new TypeError("fetch failed", { cause: Object.assign(new Error("socket disconnected"), { code: "ECONNRESET" }) }));
+  assert.match(describeErrorWithCause(err), /fetch failed \(ECONNRESET: socket disconnected\)/);
+  assert.equal(describeErrorWithCause(new Error("plain")), "plain");
+});

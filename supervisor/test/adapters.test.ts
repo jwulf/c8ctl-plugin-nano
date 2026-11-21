@@ -321,3 +321,20 @@ test("lifted ports drive makeRegistry-backed dispatch shape end to end", async (
   );
   assert.deepEqual(got, jobs);
 });
+
+test("makeReconcileReader: fiber interruption aborts the raw read's signal", async () => {
+  let seen: AbortSignal | undefined;
+  const raw: RawReconcileReader = {
+    searchProcessDefinitionKeys: (signal) => {
+      seen = signal;
+      return new Promise(() => {});
+    },
+    getProcessDefinitionXml: async () => "",
+  };
+  const reader = makeReconcileReader(raw);
+  await Effect.runPromise(
+    Effect.timeout(reader.searchProcessDefinitionKeys(), "10 millis").pipe(Effect.ignore),
+  );
+  assert.ok(seen, "signal forwarded");
+  assert.equal(seen!.aborted, true, "aborted on interruption");
+});

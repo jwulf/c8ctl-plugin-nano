@@ -253,10 +253,10 @@ export const makeSupervisor = (deps: SupervisorDeps): Effect.Effect<Supervisor> 
           // `--auto` worker serving 0 job types doesn't look like a routine skip.
           if (/\b(?:401|403)\b/.test(err.message)) {
             logger.warn(
-              `RECONCILE AUTH FAILED (check profile credentials / NANO_REST_TOKEN) — ${err.message}; job-type set NOT updated${deps.autoWorkerId ? " (--auto worker may be serving 0 job types)" : ""}`,
+              `RECONCILE AUTH FAILED (check profile credentials / NANO_REST_TOKEN) — ${describeErrorWithCause(err)}; job-type set NOT updated${deps.autoWorkerId ? " (--auto worker may be serving 0 job types)" : ""}`,
             );
           } else {
-            logger.warn(`reconcile skipped — ${err.message} (keeping current job-type set)`);
+            logger.warn(`reconcile skipped — ${describeErrorWithCause(err)} (keeping current job-type set)`);
           }
         }),
       ),
@@ -318,7 +318,12 @@ export const makeSupervisor = (deps: SupervisorDeps): Effect.Effect<Supervisor> 
     );
 
     const run: Effect.Effect<never> = Effect.gen(function* () {
-      yield* Effect.forkChild(doReconcile.pipe(Effect.repeat(Schedule.spaced(Duration.millis(cfg.reconcileIntervalMs)))));
+      // Issue #323: the reconcile result is only ever applied through
+      // `autoWorkerId`, so a worker with an explicit job-type list skips the loop
+      // entirely (no process-definition crawl, no 30s idle polls).
+      if (deps.autoWorkerId) {
+        yield* Effect.forkChild(doReconcile.pipe(Effect.repeat(Schedule.spaced(Duration.millis(cfg.reconcileIntervalMs)))));
+      }
       // Presence projection (issue #163): heartbeat every registered instance over
       // the one multiplexed connection on a Schedule cadence, announcing/dropping
       // identities as workers join/leave the registry. Only meaningful with a live
@@ -393,3 +398,21 @@ export const makeSupervisor = (deps: SupervisorDeps): Effect.Effect<Supervisor> 
 
 // Re-export the surface a JS consumer (c8ctl-plugin.js) needs.
 export { Clock, Duration, Effect, Fiber, Ref, Schedule };
+
+/**
+ * Render an error message plus the first `code`/`message` found in its bounded
+ * `cause` chain (issue #323): a bare `fetch failed` hides the reason
+ * (e.g. `ECONNRESET`). Text already present in the message is not repeated.
+ */
+export function describeErrorWithCause(err: unknown): string {
+  const base = err instanceof Error ? err.message : String(err);
+  let cur: unknown = (err as { cause?: unknown } | null)?.cause;
+  for (let i = 0; cur && i < 6; i++) {
+    const c = cur as { code?: unknown; message?: unknown; cause?: unknown };
+    const parts = [c.code, c.message].filter((v) => v !== undefined && v !== null && String(v) !== "").map(String);
+    const fresh = parts.filter((p) => !base.includes(p));
+    if (fresh.length > 0) return `${base} (${fresh.join(": ")})`;
+    cur = c.cause;
+  }
+  return base;
+}

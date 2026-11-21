@@ -6521,3 +6521,16 @@ test('createIdleLivenessMonitor: workspace [A] → [B] → [] grants a recovery 
   });
   assert.equal(killedAt, 4, 'last workspace worker exiting defers once; a second empty sample ages out');
 });
+
+test('createIdleLivenessMonitor: subtree 1 → 0 → 0 with an empty workspace sampler still kills on probe 3 (#308)', async () => {
+  const empty = { processes: 0, cpu: 0, pids: [], resolutionMs: 0 };
+  const killedAt = await runSeqMonitor({
+    subtree: [
+      { descendants: 1, cpu: 0, pids: [201], resolutionMs: 0 },
+      { descendants: 0, cpu: 0, pids: [], resolutionMs: 0 },
+      { descendants: 0, cpu: 0, pids: [], resolutionMs: 0 },
+    ],
+    extra: [empty],
+  });
+  assert.equal(killedAt, 3, 'the childless grace window consumes the workspace baseline');
+});

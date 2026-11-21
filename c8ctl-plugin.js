@@ -3065,6 +3065,10 @@ function createIdleLivenessMonitor({ getPid, idleTimeoutMs, recoveryWindowMs, on
         log(`silent for >= ${elapsed}ms with 0 descendants right after ${prev.descendants} live descendant(s) — child may have just exited between spawns; re-checking in ${probeWindow}ms`);
         prev = null;
         flatMs = 0;
+        // The workspace samplers were already read this probe (prevExtra is
+        // set), so this grace window doubles as their baseline — don't grant
+        // a second baseline window on the next childless probe.
+        if (extras.length) extraBaselined = true;
         schedule(probeWindow);
         return;
       }

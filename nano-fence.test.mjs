@@ -109,6 +109,19 @@ test("a held answer is not accepted when the fence was written while the check w
   }
 });
 
+test("a held answer is not accepted when the job was unregistered while the check was pending", async () => {
+  let fences; let tok;
+  const fencePath = join(mkdtempSync(join(tmpdir(), "fence-test-")), "fence");
+  fences = createFenceRegistry({ check: async () => { fences.unregister(tok); return { state: "held" }; } });
+  try {
+    const r = await fences.register(job, fencePath);
+    tok = r.env.NANO_FENCE_TOKEN;
+    assert.equal((await runFenceCheck({ env: r.env })).code, 75);
+  } finally {
+    fences.close();
+  }
+});
+
 test("a hung engine renewal is bounded and cancelled (unknown, request aborted)", async () => {
   let aborted = false;
   const fetchImpl = (_url, init = {}) => new Promise((_res, rej) => {

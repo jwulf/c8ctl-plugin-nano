@@ -97,10 +97,10 @@ const httpStatusOf = (err: unknown, depth = 0): number | undefined => {
   const e = err as {
     status?: unknown;
     statusCode?: unknown;
-    response?: { status?: unknown };
+    response?: { status?: unknown; statusCode?: unknown };
     cause?: unknown;
   };
-  const s = e.status ?? e.statusCode ?? e.response?.status;
+  const s = e.status ?? e.statusCode ?? e.response?.status ?? e.response?.statusCode;
   if (typeof s === "number") return s;
   return httpStatusOf(e.cause, depth + 1);
 };

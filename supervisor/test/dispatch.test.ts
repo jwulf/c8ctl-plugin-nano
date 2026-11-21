@@ -327,6 +327,16 @@ test("#320: a STRUCTURED cause status beats a contradictory message status (lost
   assert.equal(isTerminalRenewalError(msg404cause503), false);
 });
 
+test("#320: nested response.statusCode is a structured status", () => {
+  const msg404nested503 = new SupervisorError("extendLock J1: HTTP 404 job not found", { cause: { response: { statusCode: 503 } } });
+  assert.equal(isLeaseLostError(msg404nested503), false);
+  assert.equal(isPermanentRenewalError(msg404nested503), false);
+  assert.equal(isTerminalRenewalError(msg404nested503), false);
+  const bareNested404 = new SupervisorError("extendLock J1: failed", { cause: { response: { statusCode: 404 } } });
+  assert.equal(isLeaseLostError(bareNested404), true);
+  assert.equal(leaseLostReason(bareNested404), "job-gone");
+});
+
 test("#320: explicit transient status is authoritative for the permanent-renewal classifier", () => {
   for (const m of ["extendLock J1: HTTP 503 from u — Unauthorized", "extendLock J1: HTTP 429 from u — Forbidden",
     "x: Request failed with status code 502: forbidden"]) {

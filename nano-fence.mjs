@@ -98,6 +98,9 @@ export function createFenceRegistry({ check, socketPath = defaultSocketPath(), l
       // engine call was pending — known loss beats a stale success.
       const after = readFence(entry.fencePath);
       if (after) return { state: 'lost', reason: after };
+      // The job may have been unregistered (run ended, dir reaped) while the
+      // check was pending: a stale held must not vouch for an ended activation.
+      if (byToken.get(req.token) !== entry) return { state: 'unknown', error: 'job ended while checking' };
       return { state: 'held' };
     }
     return { state: 'unknown', error: (res && res.error) || 'unknown' };

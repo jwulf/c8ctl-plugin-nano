@@ -118,20 +118,21 @@ export const makeEngineClient = (raw: RawEngineClient): EngineClient => ({
  * (IPv4-first) engine host so the 1 + N crawl is paid at most once per new key.
  */
 export interface RawReconcileReader {
-  searchProcessDefinitionKeys(): Promise<ReadonlyArray<string>>;
-  getProcessDefinitionXml(key: string): Promise<string>;
+  /** `signal` aborts on fiber interruption so in-flight fetches/retries stop. */
+  searchProcessDefinitionKeys(signal?: AbortSignal): Promise<ReadonlyArray<string>>;
+  getProcessDefinitionXml(key: string, signal?: AbortSignal): Promise<string>;
 }
 
 /** Lift a plain {@link RawReconcileReader} into the Effect {@link ReconcileReader} port. */
 export const makeReconcileReader = (raw: RawReconcileReader): ReconcileReader => ({
   searchProcessDefinitionKeys: () =>
     Effect.tryPromise({
-      try: () => Promise.resolve(raw.searchProcessDefinitionKeys()),
+      try: (signal) => Promise.resolve(raw.searchProcessDefinitionKeys(signal)),
       catch: toSupervisorError("searchProcessDefinitionKeys failed"),
     }),
   getProcessDefinitionXml: (key) =>
     Effect.tryPromise({
-      try: () => Promise.resolve(raw.getProcessDefinitionXml(key)),
+      try: (signal) => Promise.resolve(raw.getProcessDefinitionXml(key, signal)),
       catch: toSupervisorError(`getProcessDefinitionXml ${key} failed`),
     }),
 });

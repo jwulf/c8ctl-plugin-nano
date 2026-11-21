@@ -342,24 +342,24 @@ test("withEngineAuthFetch races a stalled auth resolution against the caller abo
   await new Promise((resolve) => setTimeout(resolve, 20));
   assert.equal(seen.length, 0);
   controller.abort();
-  const res = await pending; // settles promptly despite the never-resolving auth
-  assert.equal(res.ok, true);
-  assert.equal(seen.length, 1);
-  assert.equal(seen[0], undefined, "aborted-during-auth fetch proceeds without auth headers");
+  // Settles promptly despite the never-resolving auth. Since PR #324 an aborted
+  // caller signal also stops the retry wrapper from issuing ANY request (a
+  // real fetch would reject with AbortError anyway), so it rejects with no call.
+  await assert.rejects(pending);
+  assert.equal(seen.length, 0);
   // A late-settling auth promise is swallowed without an unhandled rejection.
   authResolve({ Authorization: "Bearer late" });
   await new Promise((resolve) => setTimeout(resolve, 20));
 
-  // An already-aborted signal skips auth resolution entirely.
+  // An already-aborted signal skips auth resolution AND the request entirely.
   const pre = new AbortController();
   pre.abort();
-  await authed("http://engine:8080/console/api/projects", { signal: pre.signal });
-  assert.equal(seen.length, 2);
-  assert.equal(seen[1], undefined);
+  await assert.rejects(authed("http://engine:8080/console/api/projects", { signal: pre.signal }));
+  assert.equal(seen.length, 0);
 
   // Fast auth with a live signal still merges headers (no regression).
   const fast = withEngineAuthFetch(baseFetch, { token: "T" });
   const c3 = new AbortController();
   await fast("http://engine:8080/v2", { signal: c3.signal });
-  assert.deepEqual(seen[2], { Authorization: "Bearer T" });
+  assert.deepEqual(seen[0], { Authorization: "Bearer T" });
 });

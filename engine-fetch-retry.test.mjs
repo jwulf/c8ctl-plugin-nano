@@ -15,6 +15,7 @@ import {
   __getLoggerForTest as getLogger,
   withLogTimestamps,
   withTransientFetchRetry,
+  resolveAutoJobTypes,
 } from "./c8ctl-plugin.js";
 
 const BPMN = `<?xml version="1.0" encoding="UTF-8"?>
@@ -86,7 +87,7 @@ test("withTransientFetchRetry: an aborted signal stops retrying", async () => {
   ac.abort();
   const f = withTransientFetchRetry(fetchImpl, { sleep: async () => {} });
   await assert.rejects(() => f("x", { signal: ac.signal }));
-  assert.equal(calls.length, 1);
+  assert.equal(calls.length, 0, "an already-aborted read issues no request");
 });
 
 test("isTransientFetchError / describeFetchError", () => {
@@ -258,4 +259,57 @@ test("worker lifecycle restores the prior timestamp flag (text-to-text leak)", (
     globalThis.c8ctl = prev;
     syncWorkerLogTimestamps();
   }
+});
+
+// PR #324 review: cancellation must stop the transient retries, not just the race.
+test("withTransientFetchRetry stops retrying once the caller signal aborts", async () => {
+  const ctl = new AbortController();
+  let calls = 0;
+  const f = withTransientFetchRetry(async () => {
+    calls++;
+    ctl.abort(new Error("deadline"));
+    throw Object.assign(new Error("reset"), { code: "ECONNRESET" });
+  }, { attempts: 4, baseMs: 1, sleep: async () => {} });
+  await assert.rejects(f("http://x", { signal: ctl.signal }));
+  assert.equal(calls, 1, "no retry after abort");
+  const pre = new AbortController();
+  pre.abort(new Error("gone"));
+  let n = 0;
+  await assert.rejects(withTransientFetchRetry(async () => { n++; return new Response("ok"); })("http://x", { signal: pre.signal }), /gone/);
+  assert.equal(n, 0, "an already-aborted read issues no request");
+});
+
+test("resolveAutoJobTypes timeout aborts the reader signal", async () => {
+  let readerSignal;
+  await assert.rejects(
+    resolveAutoJobTypes({
+      timeoutMs: 20,
+      readerFactory: async ({ signal }) => {
+        readerSignal = signal;
+        return { searchProcessDefinitionKeys: () => new Promise(() => {}), getProcessDefinitionXml: async () => "" };
+      },
+    }),
+    /timed out/,
+  );
+  assert.ok(readerSignal && readerSignal.aborted, "deadline must cancel the in-flight read");
+});
+
+test("defaultC8RestReader forwards construction and per-call signals to every fetch", async () => {
+  const signals = [];
+  const fetchImpl = async (_u, init) => {
+    signals.push(init.signal);
+    return new Response(JSON.stringify({ items: [] }), { status: 200 });
+  };
+  const ctor = new AbortController();
+  const reader = await defaultC8RestReader({ baseUrl: "http://127.0.0.1:1" }, { fetchImpl, signal: ctor.signal });
+  await reader.searchProcessDefinitionKeys();
+  const call = new AbortController();
+  await reader.getProcessDefinitionXml("k", call.signal).catch(() => {});
+  assert.equal(signals.length, 2);
+  assert.ok(signals.every(Boolean), "every request carries a signal");
+  call.abort();
+  assert.ok(signals[1].aborted, "per-call abort reaches the fetch");
+  assert.ok(!signals[0].aborted);
+  ctor.abort();
+  assert.ok(signals[0].aborted && signals[1].aborted, "construction abort reaches all fetches");
 });

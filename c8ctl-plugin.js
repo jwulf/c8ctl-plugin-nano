@@ -5031,6 +5031,9 @@ async function createSupervisorDeps(opts = {}) {
         // (and pile up across retries): the timeout INTERRUPTS the effect, which
         // aborts the adapter's AbortSignal and cancels the SDK request.
         rt.Effect.timeout(FENCE_CHECK_ENGINE_TIMEOUT_MS),
+        // A confirmed renewal counts toward the heartbeat's lapse window too, so a
+        // fence-check that extended the lock can't be followed by a false `lapsed`.
+        rt.Effect.tap(() => rt.recordExternalRenewal(job.jobKey, job.leaseToken)),
         rt.Effect.match({
           onSuccess: () => ({ state: 'held' }),
           onFailure: (err) =>
@@ -14140,6 +14143,7 @@ async function workAgent(req, flags, ctx) {
           // signal); the finally below unregisters the fence and reaps the run dirs.
           if (checkSetupAbort(abortSignal, { jobType, jobKey: job.jobKey, stage: 'fence-register', logger })) {
             checkpointFinalized = true;
+            if (resultDir) { try { rmSync(resultDir, { recursive: true, force: true }); } catch { /* best effort */ } liveRunDirs.delete(resultDir); resultDir = null; }
             await discardAgentInstanceProducer();
             return;
           }

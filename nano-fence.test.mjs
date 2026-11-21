@@ -5,6 +5,7 @@ import { mkdtempSync, existsSync, readFileSync } from "node:fs";
 import { tmpdir } from "node:os";
 import { join } from "node:path";
 import { spawnSync } from "node:child_process";
+import { connect } from "node:net";
 import { createFenceRegistry, runFenceCheck, FENCE_CHECK_SCRIPT } from "./nano-fence.mjs";
 import { createSupervisorDeps } from "./c8ctl-plugin.js";
 
@@ -126,4 +127,21 @@ test("a hung engine renewal is bounded and cancelled (unknown, request aborted)"
   assert.equal(r.state, "unknown");
   await new Promise((r2) => setTimeout(r2, 20));
   assert.equal(aborted, true, "the SDK request is cancelled on timeout");
+});
+
+test("an idle fence-check client is dropped and cannot pin the worker", async () => {
+  const fences = createFenceRegistry({ check: async () => ({ state: "held" }), idleSocketMs: 100 });
+  try {
+    const fencePath = join(mkdtempSync(join(tmpdir(), "fence-test-")), "fence");
+    const { env } = await fences.register(job, fencePath);
+    const closed = await new Promise((resolve) => {
+      const s = connect(env.NANO_FENCE_SOCKET);
+      s.on("error", () => {});
+      s.on("close", () => resolve(true));
+      setTimeout(() => resolve(false), 3000).unref();
+    });
+    assert.equal(closed, true, "idle connection destroyed by the server");
+  } finally {
+    fences.close();
+  }
 });

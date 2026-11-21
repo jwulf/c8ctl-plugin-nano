@@ -65,7 +65,7 @@ function defaultSocketPath() {
  * `{ state: 'held'|'lost'|'unknown', reason?, error? }` using the worker's own
  * authenticated, lease-fenced engine connection.
  */
-export function createFenceRegistry({ check, socketPath = defaultSocketPath(), logger = null } = {}) {
+export function createFenceRegistry({ check, socketPath = defaultSocketPath(), logger = null, idleSocketMs } = {}) {
   const byToken = new Map(); // token -> { job, fencePath }
   let server = null;
   let listening = null;
@@ -100,12 +100,17 @@ export function createFenceRegistry({ check, socketPath = defaultSocketPath(), l
     return { state: 'unknown', error: (res && res.error) || 'unknown' };
   };
 
+  const IDLE_SOCKET_MS = Number(idleSocketMs) > 0 ? Number(idleSocketMs) : 60_000;
   const ensureServer = () => {
     if (listening) return listening;
     listening = new Promise((resolve) => {
       if (process.platform !== 'win32') { try { rmSync(socketPath, { force: true }); } catch { /* ignore */ } }
       server = createServer((sock) => {
         let buf = '';
+        // An accepted connection must never hold the worker alive past drain:
+        // unref it and drop clients that go idle without sending a request.
+        try { sock.unref(); } catch { /* ignore */ }
+        sock.setTimeout(IDLE_SOCKET_MS, () => sock.destroy());
         sock.setEncoding('utf8');
         sock.on('error', () => {});
         sock.on('data', (chunk) => {
@@ -115,6 +120,7 @@ export function createFenceRegistry({ check, socketPath = defaultSocketPath(), l
           if (nl < 0) return;
           const line = buf.slice(0, nl);
           buf = '';
+          sock.setTimeout(0); // request received; the check itself is engine-bounded
           handle(line).then((res) => { try { sock.end(`${JSON.stringify(res)}\n`); } catch { /* ignore */ } });
         });
       });

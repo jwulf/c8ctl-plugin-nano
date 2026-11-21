@@ -2,7 +2,7 @@ import assert from "node:assert/strict";
 import { test } from "node:test";
 import { Duration, Effect, Fiber } from "effect";
 import { TestClock } from "effect/testing";
-import { defaultDispatchConfig, dispatch, isLeaseLostError, leaseLostReason, isPermanentRenewalError, isTerminalRenewalError } from "../src/dispatch.ts";
+import { defaultDispatchConfig, dispatch, recordExternalRenewal, isLeaseLostError, leaseLostReason, isPermanentRenewalError, isTerminalRenewalError } from "../src/dispatch.ts";
 import { makeRegistry } from "../src/registry.ts";
 import { noopLogger, SupervisorError } from "../src/ports.ts";
 import { failing, job, makeEngine, makeRunner } from "./fakes.ts";
@@ -563,4 +563,40 @@ test("#320 leaseLostReason: status/permanent classification", () => {
   assert.equal(leaseLostReason(new SupervisorError("x failed", { status: 409 })), "lease-lost: 409");
   assert.equal(leaseLostReason(new SupervisorError("x: Job 5 is not activated")), "lease-lost: not-activated");
   assert.equal(leaseLostReason(new SupervisorError("x: HTTP 401 from u")), "lease-lost: unrenewable");
+});
+
+test("#320 fence: a confirmed out-of-band (fence-check) renewal prevents a false 'lapsed' lease-loss", async () => {
+  await Effect.runPromise(
+    Effect.gen(function* () {
+      const events: string[] = [];
+      let extendCalls = 0;
+      const engine = makeEngine({
+        activate: () => Effect.succeed([]),
+        // The initial extend succeeds; every heartbeat renewal then fails transiently.
+        extend: () => (++extendCalls === 1 ? Effect.void : failing("extendLock J1: HTTP 503 from u")),
+      });
+      const runner = {
+        run: (_j: { jobKey: string }) =>
+          Effect.sleep(Duration.millis(400_000)).pipe(Effect.tap(() => Effect.sync(() => events.push("done")))),
+        onLeaseLost: (_j: { jobKey: string }, reason: string) => events.push(`fence:${reason}`),
+      };
+      const reg = yield* makeRegistry();
+      yield* reg.add("w1", ["a"], 1);
+      const worker = yield* reg.claim("a");
+      const fiber = yield* Effect.forkChild(
+        dispatch(
+          { engine, runner, registry: reg, logger: noopLogger, config: { recoveryWindowMs: 300_000, extendIntervalMs: 60_000 } },
+          job("J1", "a", "lease-J1"),
+          worker!,
+        ),
+      );
+      yield* TestClock.adjust(Duration.millis(200_000));
+      yield* recordExternalRenewal("J1", "lease-J1");
+      yield* recordExternalRenewal("J1", "other-lease"); // a different activation: ignored
+      yield* TestClock.adjust(Duration.millis(200_000));
+      const outcome = yield* Fiber.join(fiber);
+      assert.equal(outcome.started, true);
+      assert.deepEqual(events, ["done"], "no lapsed fence: the fence-check renewal kept the lock fresh");
+    }).pipe(Effect.provide(TestClock.layer())),
+  );
 });

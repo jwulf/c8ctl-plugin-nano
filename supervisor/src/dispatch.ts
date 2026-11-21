@@ -103,6 +103,22 @@ export const isTerminalRenewalError = (err: SupervisorError): boolean =>
 const defectText = (defect: unknown): string =>
   defect instanceof Error ? defect.message : String(defect);
 
+// Issue #320: out-of-band renewals (a `fence-check`'s lease-fenced extendLock)
+// recorded per activation (jobKey + leaseToken), so the heartbeat's lapse check
+// counts a renewal it did not perform itself — otherwise a confirmed fence-check
+// renewal could still be followed by a false `lease-lost: lapsed`. Timestamps
+// come from the Effect `Clock` (wall time in production, TestClock in tests).
+const externalRenewals = new Map<string, number>();
+const renewalKey = (jobKey: string, leaseToken?: string): string => `${jobKey}\u0000${leaseToken ?? ""}`;
+export const recordExternalRenewal = (jobKey: string, leaseToken?: string): Effect.Effect<void> =>
+  Clock.currentTimeMillis.pipe(
+    Effect.flatMap((now) => Effect.sync(() => {
+      const k = renewalKey(jobKey, leaseToken);
+      // Only for an activation that is currently being dispatched (no unbounded growth).
+      if (externalRenewals.has(k)) externalRenewals.set(k, Math.max(now, externalRenewals.get(k) ?? 0));
+    })),
+  );
+
 export interface DispatchConfig {
   /** The window the winner's lock is held to and heartbeated at (ms). */
   readonly recoveryWindowMs: number;
@@ -227,9 +243,11 @@ export const dispatch = (
       // TestClock the clock advances exactly with `TestClock.adjust`, so this is
       // still fully deterministic.
       const lastOkAtRef = yield* Ref.make(yield* Clock.currentTimeMillis);
+      const extKey = renewalKey(job.jobKey, job.leaseToken);
       const retryUnlessLapsed = (reason: string) =>
         Effect.all([Clock.currentTimeMillis, Ref.get(lastOkAtRef)]).pipe(
-          Effect.flatMap(([now, lastOkAt]) => {
+          Effect.flatMap(([now, ownOkAt]) => {
+            const lastOkAt = Math.max(ownOkAt, externalRenewals.get(extKey) ?? 0);
             const sinceOk = now - lastOkAt;
             // If the NEXT beat would land at/after the window, the lock is (about
             // to be) lapsed — give up now, a beat BEFORE expiry, rather than run
@@ -266,7 +284,11 @@ export const dispatch = (
           ),
         ),
       );
-      const heartbeatUntilLost = Effect.forever(beatOnce);
+      const heartbeatUntilLost = Effect.acquireUseRelease(
+        Effect.sync(() => { externalRenewals.set(extKey, 0); }),
+        () => Effect.forever(beatOnce),
+        () => Effect.sync(() => { externalRenewals.delete(extKey); }),
+      );
 
       // The agent child runs under a claim whose lifetime == the child's own
       // (issue #158): claimed just before spawn, released on every exit path so a

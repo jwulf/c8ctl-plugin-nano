@@ -1416,6 +1416,14 @@ the fleet untouched, so a failed upgrade never strands the workers.
   `stop` + `start`) to bring the new-code daemon back under the service. A
   fully service-owned handoff (systemd `NOTIFY` / socket activation) is a
   possible future increment; today the upgrade is a session-level operation.
+  Because the successor starts in the **invoking session**, upgrading over SSH
+  on macOS also hands it your SSH session environment (`SSH_*`, any exported
+  tokens), which it then passes to every worker, agent job and test run it
+  spawns. So **right after upgrading a service-managed daemon, run
+  `c8ctl nano supervisor stop && c8ctl nano supervisor start`** (start
+  kickstarts the installed agent with its curated env), and verify with the
+  `ps eww` check under *Surviving SSH logout* below. (Making `upgrade` hand over
+  to the service itself — kickstarting the agent — is the better long-term fix.)
 - **Worker log piping across the swap.** With log capping on (the default),
   each worker's stdout/stderr is piped through the daemon that spawned it. A
   daemon upgrade adopts a worker by pid but cannot inherit that pipe, so output
@@ -1469,6 +1477,24 @@ c8ctl nano supervisor uninstall   # stop + remove it
   short-lived tokens are not persisted into a plist/unit that outlives the session.
 - `KeepAlive`/`Restart` are **crash-only**: a `supervisor stop` (clean exit) stays
   down; only a crash is restarted.
+
+> **Session-bound daemons leak the SSH environment.** A daemon that is *not*
+> started by the service — after `supervisor uninstall`, with
+> `C8CTL_NANO_NO_LAUNCHD=1`, or straight after `supervisor upgrade` (see above) —
+> runs in your SSH session and passes that session's environment (`SSH_*`,
+> exported tokens such as `GITHUB_TOKEN`) to **every worker, agent job and test
+> run** beneath it. Prefer the installed service; if you must run session-bound,
+> start from a clean shell.
+>
+> **Operator check.** On a correctly service-owned fleet this prints nothing for
+> each worker pid (from `supervisor status`):
+>
+> ```bash
+> ps eww <worker-pid> | tr ' ' '\n' | grep ^SSH_
+> ```
+>
+> Any output means the fleet inherited an SSH session — `supervisor stop` +
+> `start` to bring it back under the service.
 
 When the service **is installed**, every path that starts the daemon
 (`supervisor start`, and a bare `supervisor` / `supervisor attach`) brings it up
@@ -1527,6 +1553,9 @@ an orphaned temp-home daemon).
 >   unless you set `C8CTL_NANO_NO_LAUNCHD=1` — without that opt-out you land in
 >   the same blocked identity. Start from a **local Terminal** session (or export
 >   `C8CTL_NANO_NO_LAUNCHD=1`) to keep the interactive grant.
+>   **Caveat:** a session-bound daemon passes the SSH session environment
+>   (`SSH_*`, tokens) to every worker, agent job and test run beneath it (see
+>   *Session-bound daemons leak the SSH environment* above).
 > - **Run the daemon as root** — root retains LAN access, but running agent
 >   harnesses as root is a poor trade; prefer the options above.
 

@@ -1194,10 +1194,17 @@ test('supervisor upgrade: successor adopts the fleet and the old daemon hands ov
   assert.ok(typeof successorPid === 'number', 'successor spawned');
 
   // The socket's answer flips to the successor once it has bound + adopted.
+  // Wall-clock deadline, NOT an iteration count: mid-handoff the socket refuses
+  // connections instantly, so a count-based budget collapses to ~12s of sleeps,
+  // which a loaded CI runner can exceed just booting the successor (node + plugin
+  // load + quiesce + the ack wait). Record the last answer for diagnosis.
   let adopted = null;
-  for (let i = 0; i < 120 && !adopted; i++) {
+  let lastSeen = 'no answer';
+  const adoptDeadline = Date.now() + 45_000;
+  while (!adopted && Date.now() < adoptDeadline) {
     try {
       const s = await mod.supervisorRequest({ op: 'status' }, { timeoutMs: 400, responseTimeoutMs: 1000 });
+      lastSeen = JSON.stringify({ daemon: s?.daemon?.pid, upgrade: s?.upgrade?.state, workers: (s?.workers || []).map((x) => [x.id, x.pid, x.state]) });
       if (s && s.ok && s.daemon && s.daemon.pid === successorPid) {
         const w = (s.workers || []).find((x) => x.id === workerId);
         if (w && w.pid === workerPid && w.state === 'running') adopted = s;
@@ -1205,7 +1212,7 @@ test('supervisor upgrade: successor adopts the fleet and the old daemon hands ov
     } catch { /* mid-handoff */ }
     if (!adopted) await sleep(100);
   }
-  assert.ok(adopted, `the successor should serve status with the adopted worker (same pid ${workerPid})`);
+  assert.ok(adopted, `the successor should serve status with the adopted worker (same pid ${workerPid}); last status: ${lastSeen}`);
   assert.equal(adopted.upgrade?.state, 'adopting', 'the successor reports the roll in flight');
 
   // The worker must be UNTOUCHED: same pid, never signaled to drain/exit.

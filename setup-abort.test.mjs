@@ -401,7 +401,7 @@ test("#294 a post-await 'secrets' abort gate guards the resolveJobSecrets settle
   const { fileURLToPath } = await import('node:url');
   const src = readFileSync(fileURLToPath(new URL('./c8ctl-plugin.js', import.meta.url)), 'utf8');
 
-  const awaitIdx = src.indexOf('await resolveJobSecrets(secretResolver, envelope)');
+  const awaitIdx = src.indexOf('await resolveJobSecrets(jobSecretResolver, envelope)');
   assert.ok(awaitIdx !== -1, 'the awaited resolveJobSecrets call is present');
 
   const gateIdx = src.indexOf("checkSetupAbort(abortSignal, { jobType, jobKey: job.jobKey, stage: 'secrets', logger })", awaitIdx);

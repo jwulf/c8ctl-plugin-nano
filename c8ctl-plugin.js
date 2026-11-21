@@ -5128,6 +5128,54 @@ function writeSecretsFile(filePath, secrets) {
   }
 }
 
+// Memoize a resolver for ONE job activation: every name is read at most once,
+// so all consumers within the job see one consistent credential snapshot.
+// A fresh wrapper per job keeps rotation effective between jobs.
+function snapshotSecretResolver(resolver) {
+  if (!resolver || typeof resolver.resolve !== 'function') return resolver;
+  const cache = new Map();
+  const snap = Object.create(resolver);
+  snap.resolve = (name) => {
+    if (!cache.has(name)) cache.set(name, resolver.resolve(name));
+    return cache.get(name);
+  };
+  return snap;
+}
+
+// Serialize a read-modify-write of the secrets file across processes with an
+// exclusive lock file (O_EXCL). The map is re-read AFTER the lock is held so
+// concurrent `set`/`unset` invocations can't drop each other's updates. A lock
+// older than `staleMs` (crashed holder) is broken. `mutate(secrets)` returns
+// false to skip the write. Throws on a read error or lock timeout.
+function updateSecretsFile(filePath, mutate, { timeoutMs = 10_000, staleMs = 30_000 } = {}) {
+  mkdirSync(dirname(filePath), { recursive: true });
+  const lockPath = `${filePath}.lock`;
+  const deadline = Date.now() + timeoutMs;
+  let fd = null;
+  while (fd === null) {
+    try {
+      fd = openSync(lockPath, 'wx', 0o600);
+    } catch (err) {
+      if (err?.code !== 'EEXIST') throw err;
+      try {
+        if (Date.now() - statSync(lockPath).mtimeMs > staleMs) { rmSync(lockPath, { force: true }); continue; }
+      } catch { continue; }
+      if (Date.now() > deadline) throw new Error(`timed out waiting for secrets lock ${lockPath}`);
+      Atomics.wait(new Int32Array(new SharedArrayBuffer(4)), 0, 0, 50);
+    }
+  }
+  try {
+    const { secrets, exists, error } = readSecretsFile(filePath);
+    if (error) throw new Error(`Failed to read existing secrets file ${filePath}: ${error}`);
+    const changed = mutate(secrets, { exists });
+    if (changed !== false) writeSecretsFile(filePath, secrets);
+    return changed !== false;
+  } finally {
+    try { closeSync(fd); } catch { /* ignore */ }
+    rmSync(lockPath, { force: true });
+  }
+}
+
 // File-based secret resolver (issue #266): reads secrets from a `chmod 600`
 // dotenv or JSON file on disk (freshly read per resolve so rotated secrets are
 // picked up immediately without restarting workers).
@@ -13309,7 +13357,12 @@ async function workAgent(req, flags, ctx) {
         // Assemble + normalize the task envelope from headers (defaults) and
         // variables (overrides), then resolve any secrets it references.
         const envelope = normalizeTaskEnvelope(job.customHeaders ?? {}, job.variables ?? {}, { basePromptOverride });
-        const { resolved, missing, names } = await resolveJobSecrets(secretResolver, envelope);
+        // One credential snapshot per activation (Copilot review on #319): the
+        // secrets file is re-read fresh between jobs, but within a job the
+        // harness-forwarded secrets and provisioning's clone token must come
+        // from the SAME read, so a mid-setup rotation can't split them.
+        const jobSecretResolver = snapshotSecretResolver(secretResolver);
+        const { resolved, missing, names } = await resolveJobSecrets(jobSecretResolver, envelope);
         // #222: recheck after the awaited secret resolution (stage: secrets) —
         // resolveJobSecrets AWAITS the gh-cache-miss forced refresh, so a
         // force-stop / lease loss can win DURING that await. Gate BEFORE the
@@ -13581,7 +13634,7 @@ async function workAgent(req, flags, ctx) {
           // a later auth failure may fall back to the operator's `gh auth token`
           // (only a 'gh-cache' token may — never an explicit GITHUB_TOKEN or a
           // custom authRef; Copilot review on #293).
-          const cred = githubCloneTokenWithSource({ provider, authRef, secretResolver });
+          const cred = githubCloneTokenWithSource({ provider, authRef, secretResolver: jobSecretResolver });
           repoToken = cred.token; // absent → anonymous clone
           repoCredentialSource = cred.source;
           try {
@@ -19146,13 +19199,12 @@ async function supervisorSecretCmd(args, { filePath = defaultSecretsFilePath(), 
       logger.error(`Refusing to store an empty value for ${name}.`);
       process.exit(1);
     }
-    const { secrets, error } = readSecretsFile(filePath);
-    if (error) {
-      logger.error(`Failed to read existing secrets file ${filePath}: ${error}`);
+    try {
+      updateSecretsFile(filePath, (secrets) => { secrets[name] = value; });
+    } catch (err) {
+      logger.error(err?.message || String(err));
       process.exit(1);
     }
-    secrets[name] = value;
-    writeSecretsFile(filePath, secrets);
     logger.info(`Stored secret ${name} in ${filePath} (chmod 600).`);
     return;
   }
@@ -19162,17 +19214,21 @@ async function supervisorSecretCmd(args, { filePath = defaultSecretsFilePath(), 
       logger.error('Usage: c8ctl nano supervisor secret unset <NAME>');
       process.exit(1);
     }
-    const { secrets, exists, error } = readSecretsFile(filePath);
-    if (error) {
-      logger.error(`Failed to read existing secrets file ${filePath}: ${error}`);
+    let removed;
+    try {
+      removed = updateSecretsFile(filePath, (secrets, { exists }) => {
+        if (!exists || !(name in secrets)) return false;
+        delete secrets[name];
+        return true;
+      });
+    } catch (err) {
+      logger.error(err?.message || String(err));
       process.exit(1);
     }
-    if (!exists || !(name in secrets)) {
+    if (!removed) {
       logger.info(`Secret ${name} is not set in ${filePath}.`);
       return;
     }
-    delete secrets[name];
-    writeSecretsFile(filePath, secrets);
     logger.info(`Removed secret ${name} from ${filePath}.`);
     return;
   }
@@ -21987,6 +22043,8 @@ export {
   defaultSecretsFilePath,
   parseSecretsFileContent,
   readSecretsFile,
+  updateSecretsFile,
+  snapshotSecretResolver,
   writeSecretsFile,
   formatMissingSecretsMessage,
   supervisorSecretCmd,

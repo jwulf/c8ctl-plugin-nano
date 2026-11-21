@@ -10,6 +10,8 @@ import {
   resolveJobSecrets,
   parseSecretsFileContent,
   readSecretsFile,
+  updateSecretsFile,
+  snapshotSecretResolver,
   writeSecretsFile,
   defaultSecretsFilePath,
   formatMissingSecretsMessage,
@@ -278,4 +280,46 @@ test('formatMissingSecretsMessage explains GITHUB_TOKEN failure and gives action
       else process.env.GITHUB_TOKEN = prevTok;
     }
   });
+});
+
+test('updateSecretsFile re-reads under the lock so interleaved updates are not lost', () => {
+  const dir = mkdtempSync(join(tmpdir(), 'nano-sec-lock-'));
+  try {
+    const f = join(dir, 'secrets.env');
+    writeSecretsFile(f, { A: '1' });
+    updateSecretsFile(f, (s) => {
+      // a concurrent writer lands between our (stale) read and our write would be lost
+      // without re-read; here the mutate sees the current file contents.
+      assert.equal(s.A, '1');
+      s.B = '2';
+    });
+    updateSecretsFile(f, (s) => { s.C = '3'; });
+    assert.deepEqual(readSecretsFile(f).secrets, { A: '1', B: '2', C: '3' });
+    assert.equal(updateSecretsFile(f, () => false), false);
+    // lock file is released
+    assert.throws(() => statSync(`${f}.lock`));
+  } finally { rmSync(dir, { recursive: true, force: true }); }
+});
+
+test('updateSecretsFile times out while another holder owns the lock, and breaks a stale lock', () => {
+  const dir = mkdtempSync(join(tmpdir(), 'nano-sec-lock-'));
+  try {
+    const f = join(dir, 'secrets.env');
+    writeFileSync(`${f}.lock`, '');
+    assert.throws(() => updateSecretsFile(f, (s) => { s.X = '1'; }, { timeoutMs: 100, staleMs: 60_000 }), /timed out/);
+    assert.equal(readSecretsFile(f).exists, false);
+    updateSecretsFile(f, (s) => { s.X = '1'; }, { timeoutMs: 100, staleMs: 0 });
+    assert.equal(readSecretsFile(f).secrets.X, '1');
+  } finally { rmSync(dir, { recursive: true, force: true }); }
+});
+
+test('snapshotSecretResolver yields one consistent value per activation', () => {
+  let v = 'old';
+  const base = { kind: 'host', resolve: () => v };
+  const snap = snapshotSecretResolver(base);
+  assert.equal(snap.resolve('GITHUB_TOKEN'), 'old');
+  v = 'new';
+  assert.equal(snap.resolve('GITHUB_TOKEN'), 'old');
+  assert.equal(snap.kind, 'host');
+  assert.equal(snapshotSecretResolver(base).resolve('GITHUB_TOKEN'), 'new');
 });

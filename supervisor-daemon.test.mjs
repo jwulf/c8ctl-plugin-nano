@@ -134,7 +134,7 @@ function writeShim(shimPath, { recordArgv = false, workArgvDir = null, ignoreSig
       ? `{ pid: process.pid, jobs: [{ key: 'J1', type: 'faker:senior', since: Date.now() }] }`
       : `{ pid: process.pid, readyAt: Date.now(), jobs: [{ key: 'J1', type: 'faker:senior', since: Date.now() }] }`;
     lines.push(
-      `  const { writeFileSync: wf, rmSync: rm, mkdirSync: mk, existsSync: ex } = await import('node:fs');`,
+      `  const { writeFileSync: wf, rmSync: rm, mkdirSync: mk, existsSync: ex, appendFileSync } = await import('node:fs');`,
       `  const { dirname } = await import('node:path');`,
       `  const actFile = process.env.NANO_SUPERVISOR_ACTIVITY_FILE;`,
       `  try { mk(dirname(actFile), { recursive: true }); } catch {}`,
@@ -159,9 +159,12 @@ function writeShim(shimPath, { recordArgv = false, workArgvDir = null, ignoreSig
       `  const endWith = (how, delay) => {`,
       `    if (ending && how !== 'forced') return; ending = true;`,
       `    try { wf(${JSON.stringify(sigFile)}, how); } catch {}`,
-      `    setTimeout(() => { try { rm(actFile, { force: true }); } catch {} process.exit(0); }, delay);`,
+      `    setTimeout(() => { try { rm(actFile, { force: true }); } catch {} try { wf(${JSON.stringify(sigFile + '.done')}, how); } catch {} process.exit(0); }, delay);`,
       `  };`,
-      `  process.on('SIGUSR2', () => endWith('drained', ${Number(drainMs)}));`,
+      // #322: mirror the real worker's ONE-SHOT drain handler (`process.once`) so
+      // a second SIGUSR2 would take the default action (terminate) and kill the
+      // job — and count drain signals so a test can prove the daemon sent one.
+      `  process.once('SIGUSR2', () => { try { appendFileSync(${JSON.stringify(sigFile + '.usr2')}, 'x'); } catch {} endWith('drained', ${Number(drainMs)}); });`,
       `  process.on('SIGTERM', () => endWith('forced', 0));`,
       `  const { installParentDeathWatchdog } = await import(${JSON.stringify(pluginUrl)});`,
       `  const dp = Number.parseInt(process.env.NANO_SUPERVISOR_DAEMON_PID ?? '', 10);`,
@@ -919,6 +922,28 @@ test('supervisor reload: gracefully drains and respawns a worker to adopt new co
   // stop.
   assert.ok(mod.runningSupervisor(), 'the daemon should keep running after a reload');
   await mod.supervisorRequest({ op: 'stop', force: true });
+});
+
+test('supervisor stop during an in-progress reload drain does not kill the in-flight job (issue #322)', async (t) => {
+  const { mod, sigFile } = await bootBusyDaemon(t, { drainMs: 1500 });
+  const before = await mod.supervisorRequest({ op: 'status' });
+  const oldPid = before.workers[0].pid;
+  // Start a reload (drains the busy worker), then a graceful stop mid-drain.
+  const reloadP = reloadStream(mod, { target: 'all' }).catch(() => []);
+  for (let i = 0; i < 40 && !existsSync(sigFile); i++) await sleep(25);
+  assert.ok(existsSync(sigFile), 'the reload should have started draining the worker');
+  const frames = await stopStream(mod, { force: false });
+  await reloadP;
+  assert.ok(frames.some((f) => f && f.type === 'stopped' && f.final), 'the stop completed');
+  // The daemon joined the reload's drain: exactly ONE drain signal reached the
+  // worker (a second SIGUSR2 would terminate it mid-job), and it finished its job.
+  assert.equal(readFileSync(`${sigFile}.usr2`, 'utf8'), 'x', 'exactly one drain signal must reach the worker');
+  assert.equal(readFileSync(sigFile, 'utf8'), 'drained', 'the worker drained, not force-killed');
+  assert.ok(existsSync(`${sigFile}.done`), 'the worker must finish its in-flight job (not be terminated mid-drain)');
+  assert.equal(readFileSync(`${sigFile}.done`, 'utf8'), 'drained');
+  let dead = false;
+  for (let i = 0; i < 40 && !dead; i++) { try { process.kill(oldPid, 0); await sleep(50); } catch { dead = true; } }
+  assert.ok(dead, 'the drained worker exited');
 });
 
 test('supervisor reload: rolls the whole fleet, giving every worker a fresh pid', async (t) => {

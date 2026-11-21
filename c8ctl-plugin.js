@@ -15242,7 +15242,15 @@ async function workAgent(req, flags, ctx) {
         process.once(SUPERVISOR_DRAIN_SIGNAL, onDrainSignal);
         return;
       }
+      // #322: keep a handler installed for the rest of the drain. A drain is
+      // idempotent, but with NO listener a second SIGUSR2 (e.g. `supervisor stop`
+      // arriving while a `reload` is already draining this worker) takes the
+      // signal's DEFAULT action — terminate — killing the in-flight job.
+      process.on(SUPERVISOR_DRAIN_SIGNAL, onRepeatDrainSignal);
       gracefulDrain(SUPERVISOR_DRAIN_SIGNAL);
+    };
+    const onRepeatDrainSignal = () => {
+      logger.info(`Received ${SUPERVISOR_DRAIN_SIGNAL} — already draining; waiting on ${inFlightCount()} in-flight job(s) to finish.`);
     };
     process.once(SUPERVISOR_DRAIN_SIGNAL, onDrainSignal);
     // #309 review: publish that the handler is installed, so an upgrade handoff
@@ -16939,6 +16947,12 @@ async function runSupervisorDaemon() {
       // drainOnly without drainDeferred: already draining — nothing to send.
       return;
     }
+    // #322: a drain is idempotent per child. A second lifecycle op (stop/remove/
+    // restart) racing an in-progress drain (e.g. a reload) must JOIN that drain,
+    // never re-signal: a worker whose one-shot drain handler already fired would
+    // otherwise take SIGUSR2's default action (terminate) and lose its job.
+    if (w.child && w.drainSignalledChild === w.child) return;
+    if (w.child) w.drainSignalledChild = w.child;
     try { process.kill(pid, SUPERVISOR_DRAIN_SIGNAL); } catch { /* already gone */ }
   };
 

@@ -62,11 +62,13 @@ const DEFAULT_CREATE_RETRY_MAX_MS = 30000;
 const DEFAULT_PRE_MINT_BUFFER_MAX = 1000;
 const DEFAULT_PRE_MINT_BUFFER_MAX_BYTES = 8_000_000;
 
-// A terminal COMPLETED update is driven directly (not via the best-effort append
-// queue) and RETRIED a bounded number of times: on a successful job end the caller
-// settles the job the instant complete() returns, so there is no reactivation to
-// retry a rejected terminal transition — a single swallowed failure would strand the
-// instance non-terminal forever (issue #230).
+// On a successful job end, complete() drains pending appends and drives a final
+// `status: 'IDLE'` update directly (not via the best-effort append queue) and
+// RETRIES transient failures a bounded number of times. Per Camunda 8.10 and
+// nanobpmn parity (#274), AgentInstanceUpdateStatusEnum is
+// { IDLE, THINKING, TOOL_CALLING, TOOL_DISCOVERY } — UPDATE never accepts
+// COMPLETED (that returns HTTP 422); the engine itself completes all active
+// AgentInstances when the owning process instance ends.
 const DEFAULT_TERMINAL_RETRY_MAX = 3;
 
 // Bound on complete()'s last-chance create attempt (issue #230). The harness awaits
@@ -261,13 +263,13 @@ export function describeSdkError(err) {
 }
 
 /**
- * True when an HTTP status marks a PERMANENT rejection of the terminal
- * status→COMPLETED update (issue #275): a 4xx (a stale lease fence, an invalid
- * transition, a 0-turns husk the engine refuses to terminalize) will not succeed
- * on a blind retry, so the producer stops retrying it immediately instead of
- * burning the remaining attempts against a dying lease. 5xx / network / timeout
- * failures are potentially transient and still retry. `null`/unknown statuses are
- * treated as transient (retry) — fail-safe toward recovery, not toward giving up.
+ * True when an HTTP status marks a PERMANENT rejection of the final
+ * status→IDLE update (issue #275, #274): a 4xx (a stale lease fence, an invalid
+ * transition, a contract error like 422) will not succeed on a blind retry, so
+ * the producer stops retrying it immediately instead of burning the remaining
+ * attempts against a dying lease. 5xx / network / timeout failures are potentially
+ * transient and still retry. `null`/unknown statuses are treated as transient
+ * (retry) — fail-safe toward recovery, not toward giving up.
  *
  * Two 4xx statuses are the exception — NOT permanent, because a retry can still
  * succeed:
@@ -633,7 +635,8 @@ function contentForResult(result) {
  *   - `ingest(rawUpdate)` — feed one raw ACP `session/update` (non-blocking; the SDK
  *     append is enqueued so the ACP hot path never blocks).
  *   - `complete(ok)` — drain pending appends, then (on a successful job end) update
- *     the instance status to COMPLETED. `job.complete` is unchanged and orthogonal.
+ *     the instance status to IDLE (the engine owns COMPLETED when the process
+ *     instance ends; issue #274). `job.complete` is unchanged and orthogonal.
  *
  * @param {object} opts
  * @param {object} opts.camunda   Host SDK client (createAgentInstance/updateAgentInstance).
@@ -1867,8 +1870,10 @@ export function createAgentInstanceProducer(opts = {}) {
     /**
      * End the AgentInstance lifecycle. Flushes any pending message turn, drains the
      * append queue, then — only on a SUCCESSFUL job end (`ok`) — updates the instance
-     * status to COMPLETED (there is no separate completeAgentInstance verb). On a
-     * failed run the instance is left non-terminal so a retry/reactivation continues
+     * status to `IDLE` (a valid update-status; Camunda 8.10 and nanobpmn reject
+     * `COMPLETED` on UPDATE with HTTP 422 because `COMPLETED` is engine-owned and
+     * written when the owning process instance ends, #274). On a failed run the
+     * instance is left at its last active status so a retry/reactivation continues
      * the same instance. Best-effort; never throws; `job.complete` is unaffected.
      */
     async complete(ok = true) {
@@ -1986,36 +1991,26 @@ export function createAgentInstanceProducer(opts = {}) {
                 elementInstanceKey,
                 jobKey,
                 jobLease: leaseToken,
-                status: 'COMPLETED',
+                status: 'IDLE',
               }),
               finalizeTimeoutMs,
               setTimer,
             );
           } catch (err) {
-            // This serialized enqueue IS the terminal transition on the drain-timeout
-            // path — the only actor that can still terminalize the instance here. The
-            // generic enqueue() catch would swallow it at debug with just err.message,
-            // losing the HTTP status/body/correlation on the very path that already
-            // warned reconciliation may be needed (issue #230). Emit the SAME shaped
-            // status/body/correlation warning the direct terminal-retry path uses
-            // (with its manual-reconciliation outcome) before it is swallowed.
             const d = describeSdkError(err);
             logger?.warn?.(
-              `AgentInstance ${agentInstanceKey}: serialized terminal COMPLETED update ` +
+              `AgentInstance ${agentInstanceKey}: serialized final IDLE update ` +
                 `${err?.__nanoTimeout ? `timed out (bounded at ${finalizeTimeoutMs}ms)` : 'failed'} — ` +
-                `status=${d.status ?? 'n/a'} body=${d.body ?? 'n/a'} message=${d.message ?? 'n/a'}; ` +
-                `MANUAL RECONCILIATION REQUIRED — the drain did not catch up and the job has ` +
-                `settled with no reactivation to retry this transition ${correlation()}.`,
+                `status=${d.status ?? 'n/a'} body=${d.body ?? 'n/a'} message=${d.message ?? 'n/a'} ` +
+                `${correlation()}.`,
             );
           }
         });
         logger?.warn?.(
           `AgentInstance ${agentInstanceKey}: history drain did not settle within ` +
-            `${finalizeTimeoutMs}ms — terminal COMPLETED update SERIALIZED behind the ` +
+            `${finalizeTimeoutMs}ms — final IDLE update SERIALIZED behind the ` +
             `pending appends (best-effort, ordered) rather than racing them; its outcome ` +
-            `is not observed here and the job settles on return, so this background write ` +
-            `is expected to be fence-rejected once its lease is void — MANUAL ` +
-            `RECONCILIATION REQUIRED (terminal status NOT confirmed) ${correlation()}.`,
+            `is not observed here and the job settles on return ${correlation()}.`,
         );
         // Emit the turn counter on this path too (issue #229/#232): the aggregate
         // append timeout is the hardest transcript failure to diagnose, so record how
@@ -2029,7 +2024,7 @@ export function createAgentInstanceProducer(opts = {}) {
               `so far over ${mins}m (drain still pending — count unobserved)` +
               `${appendsDropped > 0 ? `, ${appendsDropped} turn(s) DROPPED (append backlog cap — transcript truncated)` : ''}, ` +
               `${messageChunksDropped > 0 ? `${messageChunksDropped} streaming chunk(s) DROPPED (message buffer cap), ` : ''}` +
-              `terminal COMPLETED update serialized behind pending appends.`,
+              `final IDLE update serialized behind pending appends.`,
           );
         }
         return;
@@ -2037,25 +2032,27 @@ export function createAgentInstanceProducer(opts = {}) {
       let completedOk = false;
       let terminalErr = null;
       let terminalTimedOut = false;
-      // Issue #275: latches when the terminal update was rejected with a PERMANENT
+      // Issue #275: latches when the final status update was rejected with a PERMANENT
       // (4xx) status — surfaced in the diagnostics so a fence/validation rejection
-      // (the stuck-instance case) is distinguishable from a transient 5xx/outage.
+      // is distinguishable from a transient 5xx/outage.
       let terminalPermanent = false;
       const terminalAttempts = Math.max(1, terminalRetryMax);
       if (ok) {
         for (let attempt = 1; attempt <= terminalAttempts; attempt += 1) {
           try {
-            // BOUND each terminal update (finalizeTimeoutMs). Like the create calls,
+            // BOUND each final status update (finalizeTimeoutMs). Like the create calls,
             // the harness awaits complete() before it settles the job, so a hung
             // updateAgentInstance would otherwise hold the lease until it expires and
             // stall settlement during an engine outage (issue #230).
+            // Issue #274: send `IDLE` (valid AgentInstanceUpdateStatusEnum), never
+            // `COMPLETED` — the engine owns `COMPLETED` on process-instance end.
             await callWithin(
               camunda[SDK_UPDATE]({
                 agentInstanceKey,
                 elementInstanceKey,
                 jobKey,
                 jobLease: leaseToken,
-                status: 'COMPLETED',
+                status: 'IDLE',
               }),
               finalizeTimeoutMs,
               setTimer,
@@ -2070,10 +2067,9 @@ export function createAgentInstanceProducer(opts = {}) {
             // burns another finalizeTimeoutMs against the lease, so STOP retrying on a
             // timeout (the underlying call is left to settle in the background). A
             // plain rejection is potentially transient, so those still retry — EXCEPT
-            // a permanent 4xx (issue #275): a 422/409/400 terminal rejection (a stale
-            // lease fence, an invalid transition, a 0-turns husk the engine refuses to
-            // terminalize) will not succeed on a blind retry, so break immediately
-            // rather than burn the remaining attempts against a dying lease.
+            // a permanent 4xx (issue #275/#274): a 422/409/400 rejection will not
+            // succeed on a blind retry, so break immediately rather than burn the
+            // remaining attempts against a dying lease.
             if (err && err.__nanoTimeout) {
               terminalTimedOut = true;
               break;
@@ -2087,39 +2083,29 @@ export function createAgentInstanceProducer(opts = {}) {
       }
       const terminalOk = ok && completedOk;
       if (ok && !completedOk) {
-        // The terminal transition never confirmed (every retry rejected, or a hung
-        // request was bounded out). The job settles now with no reactivation to try
-        // again, so this is NOT self-healing — surface the SDK error details and flag
-        // that manual reconciliation is required (issue #230).
         logger?.warn?.(
-          `AgentInstance ${agentInstanceKey}: terminal status update to COMPLETED ` +
+          `AgentInstance ${agentInstanceKey}: final status update to IDLE ` +
             `${terminalTimedOut
               ? `timed out (bounded at ${finalizeTimeoutMs}ms)`
               : terminalPermanent
                 ? `rejected permanently (HTTP ${terminalErr?.status ?? '4xx'}) — not retried`
                 : `failed after ${terminalAttempts} attempt(s)`} — ` +
             `status=${terminalErr?.status ?? 'n/a'} ` +
-            `body=${terminalErr?.body ?? 'n/a'} message=${terminalErr?.message ?? 'n/a'}; ` +
-            `MANUAL RECONCILIATION REQUIRED — the job settles now with no reactivation to retry ` +
-            `this transition ${correlation()}.`,
+            `body=${terminalErr?.body ?? 'n/a'} message=${terminalErr?.message ?? 'n/a'} ` +
+            `${correlation()}.`,
         );
       }
-      // #229/#232 turn counter — "N turn(s) appended over Xm, <transition>" — so the
-      // 0-turns husk ("created but nothing ingested") is distinguishable from a healthy
-      // run at a glance. Render the HONEST terminal transition: only claim
-      // `status→COMPLETED` when the terminal update actually confirmed (terminalOk).
-      // The `!ok` (failed job end) path IS reactivatable, so it says so; but the
-      // terminalOk-false path is a SUCCESSFUL job end whose COMPLETED update failed —
-      // the caller settles the job the instant complete() returns, so there is NO
-      // reactivation to continue it (that would contradict the manual-reconciliation
-      // warning). State only that it was left non-terminal and needs reconciliation.
+      // #229/#232/#274 turn counter — "N turn(s) appended over Xm, <transition>" —
+      // render the HONEST final status transition: `status→IDLE` when confirmed
+      // (the engine owns COMPLETED when the process instance ends), or report the
+      // failed IDLE update if it was rejected.
       const elapsedMs = activatedAt ? Math.max(0, now() - activatedAt) : 0;
       const mins = (elapsedMs / 60000).toFixed(1);
       const transition = !ok
-        ? 'left non-terminal (retry/reactivation continues it)'
+        ? 'left active (retry/reactivation continues it)'
         : terminalOk
-          ? 'status→COMPLETED'
-          : 'COMPLETED update FAILED — left non-terminal; manual reconciliation required (no reactivation on a settled job)';
+          ? 'status→IDLE (engine completes on process end)'
+          : 'IDLE update FAILED (engine completes on process end)';
       // Surface the aggregate append backlog DROP count (issue #230): the warn-once
       // backlog log only says drops STARTED — the operator can't quantify the loss or
       // tell it apart from an engine append failure without the final tally. Fold it

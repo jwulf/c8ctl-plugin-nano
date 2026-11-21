@@ -521,27 +521,32 @@ test('activationNamespace is stable per activation, differs across activations, 
 });
 
 // ---------------------------------------------------------------------------
-// complete() — status COMPLETED
+// complete() — status IDLE (engine owns COMPLETED on process end, #274)
 // ---------------------------------------------------------------------------
 
-test('complete(true) drives the instance status to COMPLETED', async () => {
+test('complete(true) drives the instance status to IDLE and never sends COMPLETED (#274)', async () => {
   const client = fakeClient();
   const p = makeProducer(client);
   await p.activate();
   await p.complete(true);
-  const statusUpdates = client.calls.update.filter((u) => u.status === 'COMPLETED');
-  assert.equal(statusUpdates.length, 1);
-  assert.equal(statusUpdates[0].agentInstanceKey, 'AGENT-1');
-  assert.equal(statusUpdates[0].jobKey, '13954');
-  assert.equal(statusUpdates[0].jobLease, 'FENCE99001');
+  const idleUpdates = client.calls.update.filter((u) => u.status === 'IDLE');
+  assert.equal(idleUpdates.length, 1);
+  assert.equal(idleUpdates[0].agentInstanceKey, 'AGENT-1');
+  assert.equal(idleUpdates[0].jobKey, '13954');
+  assert.equal(idleUpdates[0].jobLease, 'FENCE99001');
+  assert.equal(
+    client.calls.update.filter((u) => u.status === 'COMPLETED').length,
+    0,
+    'UPDATE never sends COMPLETED (rejected 422 by Camunda 8.10 and nanobpmn)',
+  );
 });
 
-test('complete(false) does NOT complete the instance (a retry continues it)', async () => {
+test('complete(false) does NOT send a final IDLE or COMPLETED status (a retry continues it)', async () => {
   const client = fakeClient();
   const p = makeProducer(client);
   await p.activate();
   await p.complete(false);
-  assert.equal(client.calls.update.filter((u) => u.status === 'COMPLETED').length, 0);
+  assert.equal(client.calls.update.filter((u) => u.status === 'IDLE' || u.status === 'COMPLETED').length, 0);
 });
 
 // ---------------------------------------------------------------------------
@@ -680,12 +685,13 @@ test('a create that fails at second 0 then succeeds mid-run resumes the durable 
   assert.ok(texts.includes('captured'), 'post-recovery turn is durably appended');
   // The turns emitted while the create was still failing are replayed, not lost.
   assert.ok(texts.includes('early') && texts.includes('later'), 'pre-mint turns are replayed');
-  assert.equal(client.calls.update.filter((u) => u.status === 'COMPLETED').length, 1);
+  assert.equal(client.calls.update.filter((u) => u.status === 'IDLE').length, 1);
+  assert.equal(client.calls.update.filter((u) => u.status === 'COMPLETED').length, 0);
 });
 
 test('complete() makes a final un-throttled create attempt when the instance never minted', async () => {
   // fail once (activate), then complete()'s final attempt succeeds even inside the
-  // backoff window, so at least the config turn + COMPLETED status survive.
+  // backoff window, so at least the config turn + IDLE status survive.
   const client = fakeClient({ failCreateTimes: 1 });
   const p = makeProducer(client); // fixed clock
   await p.activate();
@@ -694,7 +700,8 @@ test('complete() makes a final un-throttled create attempt when the instance nev
   await p.complete(true);
   assert.equal(client.calls.create.length, 2);
   assert.equal(p.active, true);
-  assert.equal(client.calls.update.filter((u) => u.status === 'COMPLETED').length, 1);
+  assert.equal(client.calls.update.filter((u) => u.status === 'IDLE').length, 1);
+  assert.equal(client.calls.update.filter((u) => u.status === 'COMPLETED').length, 0);
 });
 
 test('complete() without a prior activate() is a no-op — it does NOT mint an instance (issue #230)', async () => {
@@ -962,8 +969,8 @@ test('a hung HOT-PATH create is bounded and retired so it cannot wedge every lat
   assert.equal(p.active, true, 'the fresh attempt minted the instance');
 });
 
-test('a hung terminal COMPLETED update is bounded so it cannot hold the lease and block job settlement (issue #230)', async () => {
-  // The harness awaits complete() before it settles the job. The terminal update is
+test('a hung final IDLE update is bounded so it cannot hold the lease and block job settlement (issue #230, #274)', async () => {
+  // The harness awaits complete() before it settles the job. The final IDLE update is
   // awaited directly (so its outcome can be observed + retried), so a hung
   // updateAgentInstance must be BOUNDED (finalizeTimeoutMs) — otherwise it holds the
   // lease until expiry and stalls settlement during an AgentInstance outage.
@@ -973,7 +980,7 @@ test('a hung terminal COMPLETED update is bounded so it cannot hold the lease an
     createAgentInstance: async (req) => { client.calls.create.push(req); return { agentInstanceKey: 'AGENT-T' }; },
     updateAgentInstance: (req) => {
       client.calls.update.push(req);
-      if (req.status === 'COMPLETED') return new Promise(() => {}); // the terminal update hangs forever
+      if (req.status === 'IDLE') return new Promise(() => {}); // the final IDLE update hangs forever
       return Promise.resolve({ createdHistory: [] });
     },
   };
@@ -983,11 +990,11 @@ test('a hung terminal COMPLETED update is bounded so it cannot hold the lease an
   });
   await p.activate();
   assert.equal(p.active, true, 'the instance minted');
-  // If complete() awaited the hung terminal update unbounded, this would never resolve.
+  // If complete() awaited the hung final update unbounded, this would never resolve.
   await p.complete(true);
   assert.ok(
-    warnings.some((m) => /terminal status update to COMPLETED timed out/.test(m) && /MANUAL RECONCILIATION REQUIRED/.test(m)),
-    'the hung terminal update was bounded out and flagged for manual reconciliation',
+    warnings.some((m) => /final status update to IDLE timed out/.test(m)),
+    'the hung final update was bounded out and warned',
   );
 });
 
@@ -1206,7 +1213,7 @@ test('a hung history append is bounded so complete()\'s queue drain cannot stall
     createAgentInstance: async (req) => { client.calls.create.push(req); return { agentInstanceKey: 'AGENT-A' }; },
     updateAgentInstance: (req) => {
       client.calls.update.push(req);
-      if (req.status === 'COMPLETED') { signalCompletedA(); return Promise.resolve({ createdHistory: [] }); }
+      if (req.status === 'IDLE') { signalCompletedA(); return Promise.resolve({ createdHistory: [] }); }
       return new Promise(() => {}); // history appends hang forever
     },
   };
@@ -1219,15 +1226,12 @@ test('a hung history append is bounded so complete()\'s queue drain cannot stall
   await p.complete(true);
   // complete() returned promptly (the hung append was bounded out) rather than stalling
   // settlement until lease expiry. Because the drain timed out with the append still in
-  // flight, the terminal COMPLETED is SERIALIZED behind it (not raced), landing in the
+  // flight, the final IDLE update is SERIALIZED behind it (not raced), landing in the
   // background once the bounded append settles.
-  // Await a deterministic completion signal from the fake (resolved the instant the
-  // terminal COMPLETED update is issued), not a wall-clock deadline, so pass/fail does
-  // not depend on scheduler load (issue #230).
   await completedSeenA;
   assert.ok(
-    client.calls.update.some((u) => u.status === 'COMPLETED'),
-    'the terminal COMPLETED update still ran once the hung append was bounded out',
+    client.calls.update.some((u) => u.status === 'IDLE'),
+    'the final IDLE update still ran once the hung append was bounded out',
   );
 });
 
@@ -1349,21 +1353,13 @@ test('complete()\'s FINAL last-chance create BYPASSES the maxInFlightCreates cap
   assert.equal(client.calls.create.length, 2, 'the final last-chance attempt was made once, bypassing the saturated cap');
   assert.equal(p.active, true, 'the final attempt minted the instance on the recovered engine');
   assert.ok(
-    client.calls.update.some((u) => u.status === 'COMPLETED'),
-    'the terminal COMPLETED update ran after the final attempt minted the instance',
+    client.calls.update.some((u) => u.status === 'IDLE'),
+    'the final IDLE update ran after the final attempt minted the instance',
   );
 });
 
 
-test('complete() bounds the AGGREGATE append drain and SERIALIZES the terminal COMPLETED behind pending appends — it neither waits for every hung append serially nor races the terminal update ahead of them (issue #230)', async () => {
-  // Each append is individually bounded, but the queue is serialized: N hung appends
-  // would take up to N×finalizeTimeoutMs to drain, holding the lease that whole span
-  // before the terminal COMPLETED update even begins. complete() bounds the TOTAL drain
-  // at finalizeTimeoutMs. When that bound wins the appends are STILL in flight, so the
-  // terminal COMPLETED must NOT be driven directly (a concurrent request could
-  // terminalize the instance before a delayed append lands, reordering/losing it).
-  // Instead it is ENQUEUED behind the pending appends: bounded, never raced, always
-  // ordered last.
+test('complete() bounds the AGGREGATE append drain and SERIALIZES the final IDLE behind pending appends — it neither waits for every hung append serially nor races the final update ahead of them (issue #230, #274)', async () => {
   let signalCompletedDR;
   const completedSeenDR = new Promise((r) => { signalCompletedDR = r; });
   const client = {
@@ -1371,45 +1367,33 @@ test('complete() bounds the AGGREGATE append drain and SERIALIZES the terminal C
     createAgentInstance: async (req) => { client.calls.create.push(req); return { agentInstanceKey: 'AGENT-DR' }; },
     updateAgentInstance: (req) => {
       client.calls.update.push(req);
-      if (req.status === 'COMPLETED') { signalCompletedDR(); return Promise.resolve({ createdHistory: [] }); }
+      if (req.status === 'IDLE') { signalCompletedDR(); return Promise.resolve({ createdHistory: [] }); }
       return new Promise(() => {}); // every history append hangs forever (bounded per-call)
     },
   };
   const p = makeProducer(client, { finalizeTimeoutMs: 20 });
   await p.activate();
-  // Queue six independent turns (distinct messageIds each flush the previous). Their
-  // appends all hang; serialized, an UNBOUNDED drain would issue all six SDK calls (one
-  // per finalizeTimeoutMs window) before COMPLETED. The bounded drain issues far fewer.
   for (let i = 0; i < 6; i += 1) {
     p.ingest({ sessionUpdate: 'agent_message_chunk', messageId: `m${i}`, content: { type: 'text', text: `t${i}` } });
   }
   await p.complete(true);
-  // The aggregate drain was bounded: only a slice of the six hung appends ran before
-  // complete() returned (an unbounded drain would have issued all six first).
-  const historyAtReturn = client.calls.update.filter((u) => u.status !== 'COMPLETED').length;
+  const historyAtReturn = client.calls.update.filter((u) => u.status !== 'IDLE').length;
   assert.ok(
     historyAtReturn < 6,
     `the aggregate drain was bounded — only ${historyAtReturn} of 6 hung appends were issued before complete() returned`,
   );
-  // The terminal COMPLETED was NOT raced ahead of the still-pending appends: at the
-  // moment complete() returns it is enqueued behind them, so it has not been issued yet.
   assert.ok(
-    !client.calls.update.some((u) => u.status === 'COMPLETED'),
-    'the terminal COMPLETED update was serialized behind the pending appends, not raced ahead of them',
+    !client.calls.update.some((u) => u.status === 'IDLE'),
+    'the final IDLE update was serialized behind the pending appends, not raced ahead of them',
   );
-  // Let the background queue drain (each hung append is bounded at finalizeTimeoutMs).
-  // Await a deterministic completion signal from the fake instead of a wall-clock
-  // deadline, so ordering assertions do not depend on scheduler load (issue #230).
   await completedSeenDR;
-  // The terminal COMPLETED eventually lands, and ORDERING is preserved: it is the final
-  // update, after all six history appends were issued (never reordered/lost).
-  const completedIdx = client.calls.update.findIndex((u) => u.status === 'COMPLETED');
-  assert.ok(completedIdx !== -1, 'the terminal COMPLETED update eventually ran in the background');
-  assert.equal(completedIdx, client.calls.update.length - 1, 'COMPLETED is the last update issued');
+  const completedIdx = client.calls.update.findIndex((u) => u.status === 'IDLE');
+  assert.ok(completedIdx !== -1, 'the final IDLE update eventually ran in the background');
+  assert.equal(completedIdx, client.calls.update.length - 1, 'IDLE is the last update issued');
   assert.equal(
-    client.calls.update.slice(0, completedIdx).filter((u) => u.status !== 'COMPLETED').length,
+    client.calls.update.slice(0, completedIdx).filter((u) => u.status !== 'IDLE').length,
     6,
-    'all six history appends were issued before COMPLETED (ordering preserved)',
+    'all six history appends were issued before IDLE (ordering preserved)',
   );
 });
 
@@ -1475,7 +1459,8 @@ test('pre-mint ACP updates are buffered and replayed once a retried create succe
     ['pre-one', 'pre-two', 'pre-three'],
     'every pre-mint turn is replayed in arrival order',
   );
-  assert.equal(client.calls.update.filter((u) => u.status === 'COMPLETED').length, 1);
+  assert.equal(client.calls.update.filter((u) => u.status === 'IDLE').length, 1);
+  assert.equal(client.calls.update.filter((u) => u.status === 'COMPLETED').length, 0);
 });
 
 test('the pre-mint replay buffer is bounded — overflow drops the newest, keeping a contiguous prefix', async () => {
@@ -1528,9 +1513,7 @@ test('a repeated activate() respects the create backoff (no engine hammering) (i
   assert.equal(client.calls.create.length, 2, 'a reactivation past the window re-attempts');
 });
 
-test('complete() does not falsely report status→COMPLETED when the terminal update fails', async () => {
-  // The COMPLETED update is rejected; the completion diagnostic must warn and NOT
-  // claim a terminal transition (issue #230).
+test('complete() does not falsely report status→IDLE when the final status update fails (#230, #274)', async () => {
   const lines = { info: [], warn: [] };
   const logger = {
     info: (m) => lines.info.push(m),
@@ -1554,33 +1537,25 @@ test('complete() does not falsely report status→COMPLETED when the terminal up
   await p.activate();
   await p.complete(true);
   assert.ok(
-    lines.warn.some((m) => /terminal status update to COMPLETED failed/.test(m)),
-    'a rejected terminal update is warned',
+    lines.warn.some((m) => /final status update to IDLE failed/.test(m)),
+    'a rejected final update is warned',
   );
   assert.ok(
-    lines.warn.some((m) => /MANUAL RECONCILIATION REQUIRED/.test(m)),
-    'a permanently-rejected terminal update flags manual reconciliation (no reactivation retries it)',
+    !lines.info.some((m) => /status→IDLE/.test(m)),
+    'the info line does not falsely claim status→IDLE',
   );
   assert.ok(
-    !lines.info.some((m) => /status→COMPLETED/.test(m)),
-    'the info line does not falsely claim status→COMPLETED',
+    lines.info.some((m) => /IDLE update FAILED/.test(m)),
+    'the info line reports the failed IDLE update',
   );
+  // The final update is retried (not swallowed once) before giving up.
   assert.ok(
-    lines.info.some((m) => /manual reconciliation required/.test(m)),
-    'the info line reports the non-terminal, manual-reconciliation outcome',
-  );
-  // The terminal update is retried (not swallowed once) before giving up.
-  assert.ok(
-    client.calls.update.filter((u) => u.status === 'COMPLETED').length >= 2,
-    'the terminal update is retried before reporting manual reconciliation',
+    client.calls.update.filter((u) => u.status === 'IDLE').length >= 2,
+    'the final update is retried before giving up',
   );
 });
 
-test('complete() stops retrying a PERMANENT (422) terminal rejection immediately (issue #275)', async () => {
-  // A 4xx terminal rejection (a stale lease fence, an invalid transition, a 0-turns
-  // husk the engine refuses to terminalize) will not succeed on a blind retry, so the
-  // producer must NOT burn the remaining attempts against a dying lease — it stops
-  // after the FIRST 4xx. This is the stuck-instance case from #275 (HTTP 422).
+test('complete() stops retrying a PERMANENT (422) status rejection immediately (issue #275, #274)', async () => {
   const lines = { info: [], warn: [] };
   const logger = {
     info: (m) => lines.info.push(m),
@@ -1595,7 +1570,7 @@ test('complete() stops retrying a PERMANENT (422) terminal rejection immediately
     },
     updateAgentInstance: async (req) => {
       client.calls.update.push(req);
-      if (req.status === 'COMPLETED') {
+      if (req.status === 'IDLE') {
         throw Object.assign(new Error('Unprocessable Entity'), { statusCode: 422, body: 'invalid transition' });
       }
       return { createdHistory: Array.isArray(req.history) ? req.history : [] };
@@ -1604,23 +1579,19 @@ test('complete() stops retrying a PERMANENT (422) terminal rejection immediately
   const p = makeProducer(client, { logger });
   await p.activate();
   await p.complete(true);
-  // Exactly ONE terminal attempt — the 422 is permanent, so no blind retry.
+  // Exactly ONE final attempt — the 422 is permanent, so no blind retry.
   assert.equal(
-    client.calls.update.filter((u) => u.status === 'COMPLETED').length,
+    client.calls.update.filter((u) => u.status === 'IDLE').length,
     1,
-    'a 422 terminal rejection is NOT retried',
+    'a 422 status rejection is NOT retried',
   );
-  const warn = lines.warn.find((m) => /terminal status update to COMPLETED/.test(m));
-  assert.ok(warn, 'the permanent terminal rejection is warned');
+  const warn = lines.warn.find((m) => /final status update to IDLE/.test(m));
+  assert.ok(warn, 'the permanent rejection is warned');
   assert.match(warn, /rejected permanently \(HTTP 422\) — not retried/, 'the warn names the permanent 422');
-  assert.match(warn, /MANUAL RECONCILIATION REQUIRED/, 'manual reconciliation is still flagged');
-  assert.ok(!lines.info.some((m) => /status→COMPLETED/.test(m)), 'the info line does not claim COMPLETED');
+  assert.ok(!lines.info.some((m) => /status→IDLE/.test(m)), 'the info line does not claim IDLE');
 });
 
-test('complete() still retries a TRANSIENT (5xx) terminal rejection (issue #275)', async () => {
-  // A 5xx is potentially transient (an engine outage), so the terminal update IS
-  // retried up to terminalRetryMax before giving up — the permanent-4xx fast-fail
-  // must not also short-circuit a recoverable failure.
+test('complete() still retries a TRANSIENT (5xx) status rejection (issue #275, #274)', async () => {
   const lines = { info: [], warn: [] };
   const logger = {
     info: (m) => lines.info.push(m),
@@ -1635,7 +1606,7 @@ test('complete() still retries a TRANSIENT (5xx) terminal rejection (issue #275)
     },
     updateAgentInstance: async (req) => {
       client.calls.update.push(req);
-      if (req.status === 'COMPLETED') throw Object.assign(new Error('Server Error'), { statusCode: 500 });
+      if (req.status === 'IDLE') throw Object.assign(new Error('Server Error'), { statusCode: 500 });
       return { createdHistory: [] };
     },
   };
@@ -1643,10 +1614,10 @@ test('complete() still retries a TRANSIENT (5xx) terminal rejection (issue #275)
   await p.activate();
   await p.complete(true);
   assert.ok(
-    client.calls.update.filter((u) => u.status === 'COMPLETED').length >= 2,
-    'a 5xx terminal rejection IS retried',
+    client.calls.update.filter((u) => u.status === 'IDLE').length >= 2,
+    'a 5xx rejection IS retried',
   );
-  const warn = lines.warn.find((m) => /terminal status update to COMPLETED/.test(m));
+  const warn = lines.warn.find((m) => /final status update to IDLE/.test(m));
   assert.match(warn, /failed after \d+ attempt\(s\)/, 'a transient failure reports the retried attempt count');
 });
 
@@ -1693,7 +1664,8 @@ test('a create that resolves without an agentInstanceKey stays retryable and min
     texts.includes('buffered') && texts.includes('after-mint'),
     'the update buffered during the keyless window replays once a later attempt mints',
   );
-  assert.equal(client.calls.update.filter((u) => u.status === 'COMPLETED').length, 1);
+  assert.equal(client.calls.update.filter((u) => u.status === 'IDLE').length, 1);
+  assert.equal(client.calls.update.filter((u) => u.status === 'COMPLETED').length, 0);
 });
 
 test('the pre-mint replay buffer is bounded by an approximate byte budget, and the dropped count is reported (issue #230)', async () => {
@@ -2351,7 +2323,7 @@ test('activate() rejection collapses a multiline error body/message to one log l
   assert.match(line, /message=boom ⏎ injected: fake log line/);
 });
 
-test('complete() logs a turn counter separating the 0-turns husk from a healthy run (#229)', async () => {
+test('complete() logs a turn counter separating the 0-turns husk from a healthy run (#229, #274)', async () => {
   const client = fakeClient();
   const logger = recordingLogger();
   const p = makeProducer(client, { logger });
@@ -2360,20 +2332,15 @@ test('complete() logs a turn counter separating the 0-turns husk from a healthy 
   const line = logger.lines.info.find((l) => l.includes('turn(s) appended'));
   assert.ok(line, 'expected a turn-counter info line');
   assert.match(line, /0 turn\(s\) appended/);
-  assert.match(line, /status→COMPLETED/);
+  assert.match(line, /status→IDLE/);
   assert.match(line, /job 13954 eik EIK-7 pik 13951/);
 });
 
-test('complete(true) whose status→COMPLETED update is REJECTED reports the failed transition, not COMPLETED (#229)', async () => {
-  // The status update rides the best-effort queue whose catch swallows the
-  // rejection. Reject ONLY the terminal status update (not per-turn appends) so a
-  // 400/404 there can't masquerade as a healthy COMPLETED while the instance stays
-  // non-terminal — the exact husk-diagnosis regression the statusResolved gate
-  // guards against.
+test('complete(true) whose status→IDLE update is REJECTED reports the failed transition, not IDLE (#229, #274)', async () => {
   const client = fakeClient();
   client.updateAgentInstance = async (req) => {
     client.calls.update.push(req);
-    if (req.status === 'COMPLETED') throw { status: 409, message: 'lease expired' };
+    if (req.status === 'IDLE') throw { status: 409, message: 'lease expired' };
     return { createdHistory: Array.isArray(req.history) ? req.history : [] };
   };
   const logger = recordingLogger();
@@ -2383,11 +2350,11 @@ test('complete(true) whose status→COMPLETED update is REJECTED reports the fai
   await p.complete(true);
   const line = logger.lines.info.find((l) => l.includes('turn(s) appended'));
   assert.ok(line, 'expected a turn-counter info line');
-  assert.match(line, /COMPLETED update FAILED — left non-terminal/);
-  assert.doesNotMatch(line, /status→COMPLETED\./);
+  assert.match(line, /IDLE update FAILED/);
+  assert.doesNotMatch(line, /status→IDLE/);
   assert.ok(
-    client.calls.update.some((r) => r.status === 'COMPLETED'),
-    'the status→COMPLETED update was attempted',
+    client.calls.update.some((r) => r.status === 'IDLE'),
+    'the status→IDLE update was attempted',
   );
 });
 

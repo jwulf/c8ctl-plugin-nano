@@ -372,6 +372,12 @@ const PROCESSOS_UPDATE_CACHE_FILE = 'processos-update-check.json';
 // by `workAgent` (text output only — never in JSON output mode).
 let workerLogTimestamps = false;
 function enableWorkerLogTimestamps(on = true) { workerLogTimestamps = !!on; }
+/** Derive the flag from the CURRENT output mode (set on every `work` call, so a
+ *  JSON-mode invocation after a text-mode one in the same process is reset). */
+function syncWorkerLogTimestamps() {
+  enableWorkerLogTimestamps(!hostOutputIsJson());
+  return workerLogTimestamps;
+}
 
 function withLogTimestamps(logger, now = () => new Date().toISOString()) {
   if (!logger || logger.__nanoTimestamped) return logger;
@@ -12550,7 +12556,7 @@ function checkSetupAbort(abortSignal, { jobType, jobKey, stage, logger } = {}) {
  * Uses the c8ctl-provided SDK client (globalThis.c8ctl.createClient()).
  */
 async function workAgent(req, flags, ctx) {
-  if (!hostOutputIsJson()) enableWorkerLogTimestamps(true);
+  syncWorkerLogTimestamps();
   const logger = getLogger();
   // The hire to run always comes from the positional profile. `--name` no longer
   // selects the hire (that was a footgun: `work reviewer --name coder` silently
@@ -22521,6 +22527,7 @@ export {
   withTransientFetchRetry,
   withLogTimestamps,
   enableWorkerLogTimestamps,
+  syncWorkerLogTimestamps,
   describeFetchError,
   isTransientFetchError,
   isEngineAuthError,

@@ -2,7 +2,7 @@ import assert from "node:assert/strict";
 import { test } from "node:test";
 import { Duration, Effect, Fiber } from "effect";
 import { TestClock } from "effect/testing";
-import { defaultDispatchConfig, dispatch, isLeaseLostError, isPermanentRenewalError, isTerminalRenewalError } from "../src/dispatch.ts";
+import { defaultDispatchConfig, dispatch, recordExternalRenewal, isLeaseLostError, leaseLostReason, isPermanentRenewalError, isTerminalRenewalError } from "../src/dispatch.ts";
 import { makeRegistry } from "../src/registry.ts";
 import { noopLogger, SupervisorError } from "../src/ports.ts";
 import { failing, job, makeEngine, makeRunner } from "./fakes.ts";
@@ -286,6 +286,70 @@ test("isLeaseLostError: definitive ownership-loss signals stop the heartbeat; tr
   assert.equal(isLeaseLostError(sdk500), false, "numeric 500 stays transient");
 });
 
+test("isLeaseLostError: an explicit transient HTTP status is authoritative over a lease-loss body", () => {
+  // A 503 whose BODY carries a textual lease-loss signal ("upstream not found")
+  // must NOT be classified as ownership loss: the explicit status wins, so the
+  // fence-check returns `unknown` (exit 75) and the agent retries rather than
+  // abandoning recoverable work. Regression for the fence-check 503 finding.
+  const transientWithLostBody = [
+    "extendLock J1: HTTP 503 from http://engine/v2/jobs/J1 — upstream not found",
+    "extendLock J1: SDK updateJob failed: Request failed with status code 503: job not found",
+    "extendLock J1: HTTP 429 from http://engine/v2/jobs/J1 — not activated",
+  ];
+  for (const m of transientWithLostBody) {
+    assert.equal(isLeaseLostError(new SupervisorError(m)), false, m);
+  }
+  // The status may live only on the cause chain while the message carries the
+  // misleading body text.
+  const sdk503 = new SupervisorError("extendLock J1 failed: upstream not found", {
+    message: "upstream not found",
+    status: 503,
+  });
+  assert.equal(isLeaseLostError(sdk503), false, "numeric 503 on cause beats 'not found' body");
+  // … while a definitive status with a lease-loss body is still lost.
+  assert.equal(
+    isLeaseLostError(new SupervisorError("extendLock J1: HTTP 404 from u — job not found")),
+    true,
+    "explicit 404 still lost",
+  );
+  // With NO status anywhere, the textual signals remain the fallback.
+  assert.equal(isLeaseLostError(new SupervisorError("extendLock J1: job not found")), true, "bare body, no status");
+  // leaseLostReason tracks the same authoritative status.
+  assert.equal(leaseLostReason(new SupervisorError("x: HTTP 503 from u — not found")), "lease-lost: unrenewable");
+});
+
+test("#320: a STRUCTURED cause status beats a contradictory message status (lost + permanent classifiers)", () => {
+  const msg503cause404 = new SupervisorError("extendLock J1: Request failed with status code 503", { status: 404 });
+  assert.equal(isLeaseLostError(msg503cause404), true, "cause 404 wins over message 503");
+  assert.equal(leaseLostReason(msg503cause404), "job-gone");
+  const msg404cause503 = new SupervisorError("extendLock J1: HTTP 404 job not found", { response: { status: 503 } });
+  assert.equal(isLeaseLostError(msg404cause503), false, "cause 503 wins over message 404");
+  assert.equal(isTerminalRenewalError(msg404cause503), false);
+});
+
+test("#320: nested response.statusCode is a structured status", () => {
+  const msg404nested503 = new SupervisorError("extendLock J1: HTTP 404 job not found", { cause: { response: { statusCode: 503 } } });
+  assert.equal(isLeaseLostError(msg404nested503), false);
+  assert.equal(isPermanentRenewalError(msg404nested503), false);
+  assert.equal(isTerminalRenewalError(msg404nested503), false);
+  const bareNested404 = new SupervisorError("extendLock J1: failed", { cause: { response: { statusCode: 404 } } });
+  assert.equal(isLeaseLostError(bareNested404), true);
+  assert.equal(leaseLostReason(bareNested404), "job-gone");
+});
+
+test("#320: explicit transient status is authoritative for the permanent-renewal classifier", () => {
+  for (const m of ["extendLock J1: HTTP 503 from u — Unauthorized", "extendLock J1: HTTP 429 from u — Forbidden",
+    "x: Request failed with status code 502: forbidden"]) {
+    assert.equal(isPermanentRenewalError(new SupervisorError(m)), false, m);
+    assert.equal(isTerminalRenewalError(new SupervisorError(m)), false, m);
+  }
+  assert.equal(isPermanentRenewalError(new SupervisorError("x: upstream", { status: 503, message: "Forbidden" })), false);
+  assert.equal(isPermanentRenewalError(new SupervisorError("x: Forbidden", { status: 403 })), true);
+  // No status anywhere: textual auth signals remain the fallback.
+  assert.equal(isPermanentRenewalError(new SupervisorError("extendLock J1: unauthorized")), true);
+  assert.equal(isPermanentRenewalError(new SupervisorError("extendLock J1: HTTP 401 from u")), true);
+});
+
 test("HUNG extend mid-run: a wedged extend that never resolves is bounded by extendTimeoutMs, counts toward the window, and interrupts the agent (a stall is not silent forever)", async () => {
   await Effect.runPromise(
     Effect.gen(function* () {
@@ -514,6 +578,89 @@ test("ownership: the job is claimed for the child's whole run and released after
 
       assert.deepEqual(claimedDuringRun, ["J1"], "claimed = working during the child's run");
       assert.deepEqual(yield* ownership.jobKeysFor("w1"), [], "released after the child exits");
+    }).pipe(Effect.provide(TestClock.layer())),
+  );
+});
+
+for (const [status, expected] of [[409, "lease-lost: 409"], [404, "job-gone"]] as const) {
+  test(`#320 fence: a ${status} on a heartbeat notifies onLeaseLost ("${expected}") BEFORE the run is interrupted`, async () => {
+    await Effect.runPromise(
+      Effect.gen(function* () {
+        let extendCalls = 0;
+        const events: string[] = [];
+        const engine = makeEngine({
+          activate: () => Effect.succeed([]),
+          extend: () => {
+            extendCalls += 1;
+            return extendCalls === 1 ? Effect.void : failing(`extendLock J1: HTTP ${status} from http://engine/v2/jobs/J1`);
+          },
+        });
+        const runner = {
+          run: (_j: { jobKey: string }) =>
+            Effect.sleep(Duration.millis(10_000_000)).pipe(
+              Effect.onInterrupt(() => Effect.sync(() => events.push("interrupted"))),
+            ),
+          onLeaseLost: (j: { jobKey: string }, reason: string) => events.push(`fence:${j.jobKey}:${reason}`),
+        };
+        const reg = yield* makeRegistry();
+        yield* reg.add("w1", ["a"], 1);
+        const worker = yield* reg.claim("a");
+        const fiber = yield* Effect.forkChild(
+          dispatch(
+            { engine, runner, registry: reg, logger: noopLogger, config: { recoveryWindowMs: 300_000, extendIntervalMs: 60_000 } },
+            job("J1", "a", "lease-J1"),
+            worker!,
+          ),
+        );
+        yield* TestClock.adjust(Duration.millis(60_000));
+        const outcome = yield* Fiber.join(fiber);
+        assert.equal(outcome.reason, "lock-lost");
+        assert.deepEqual(events, [`fence:J1:${expected}`, "interrupted"]);
+      }).pipe(Effect.provide(TestClock.layer())),
+    );
+  });
+}
+
+test("#320 leaseLostReason: status/permanent classification", () => {
+  assert.equal(leaseLostReason(new SupervisorError("x: HTTP 409 from u")), "lease-lost: 409");
+  assert.equal(leaseLostReason(new SupervisorError("x: HTTP 404 from u")), "job-gone");
+  assert.equal(leaseLostReason(new SupervisorError("x failed", { status: 409 })), "lease-lost: 409");
+  assert.equal(leaseLostReason(new SupervisorError("x: Job 5 is not activated")), "lease-lost: not-activated");
+  assert.equal(leaseLostReason(new SupervisorError("x: HTTP 401 from u")), "lease-lost: unrenewable");
+});
+
+test("#320 fence: a confirmed out-of-band (fence-check) renewal prevents a false 'lapsed' lease-loss", async () => {
+  await Effect.runPromise(
+    Effect.gen(function* () {
+      const events: string[] = [];
+      let extendCalls = 0;
+      const engine = makeEngine({
+        activate: () => Effect.succeed([]),
+        // The initial extend succeeds; every heartbeat renewal then fails transiently.
+        extend: () => (++extendCalls === 1 ? Effect.void : failing("extendLock J1: HTTP 503 from u")),
+      });
+      const runner = {
+        run: (_j: { jobKey: string }) =>
+          Effect.sleep(Duration.millis(400_000)).pipe(Effect.tap(() => Effect.sync(() => events.push("done")))),
+        onLeaseLost: (_j: { jobKey: string }, reason: string) => events.push(`fence:${reason}`),
+      };
+      const reg = yield* makeRegistry();
+      yield* reg.add("w1", ["a"], 1);
+      const worker = yield* reg.claim("a");
+      const fiber = yield* Effect.forkChild(
+        dispatch(
+          { engine, runner, registry: reg, logger: noopLogger, config: { recoveryWindowMs: 300_000, extendIntervalMs: 60_000 } },
+          job("J1", "a", "lease-J1"),
+          worker!,
+        ),
+      );
+      yield* TestClock.adjust(Duration.millis(200_000));
+      yield* recordExternalRenewal("J1", "lease-J1");
+      yield* recordExternalRenewal("J1", "other-lease"); // a different activation: ignored
+      yield* TestClock.adjust(Duration.millis(200_000));
+      const outcome = yield* Fiber.join(fiber);
+      assert.equal(outcome.started, true);
+      assert.deepEqual(events, ["done"], "no lapsed fence: the fence-check renewal kept the lock fresh");
     }).pipe(Effect.provide(TestClock.layer())),
   );
 });

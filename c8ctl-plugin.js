@@ -748,7 +748,7 @@ function launcherEnvMarkers(resolved) {
 // Argument parsing
 // ---------------------------------------------------------------------------
 
-const VALID_SUBCOMMANDS = ['start', 'stop', 'status', 'logs', 'log', 'restart', 'pause', 'resume', 'clean', 'set', 'unset', 'config', 'update', 'hire', 'assign', 'work', 'supervisor', 'workforce'];
+const VALID_SUBCOMMANDS = ['start', 'stop', 'status', 'logs', 'log', 'restart', 'pause', 'resume', 'clean', 'set', 'unset', 'config', 'update', 'hire', 'assign', 'work', 'supervisor', 'workforce', 'fence-check'];
 
 /**
  * Parse positional args + flags into a normalized request.
@@ -5017,7 +5017,34 @@ async function createSupervisorDeps(opts = {}) {
     fail: (jobKey, opts2) => rt.Effect.runPromise(engine.fail(jobKey, opts2)),
   };
 
-  return { deps, registry, settle, makeSupervisor: rt.makeSupervisor, Effect: rt.Effect, Fiber: rt.Fiber };
+  // Issue #320: a FRESH, lease-fenced ownership check for `fence-check` — the same
+  // `extendLock` the heartbeat beats with (a SET to the recovery window, so it is
+  // idempotent with the heartbeat), through the same authenticated engine client.
+  // Only a definitive loss (`isLeaseLostError`) is `lost`; anything else (429/5xx/
+  // network/auth) is `unknown` so the agent retries rather than abandoning.
+  const fenceRecoveryWindowMs = config?.dispatch?.recoveryWindowMs ?? rt.defaultDispatchConfig.recoveryWindowMs;
+  const FENCE_CHECK_ENGINE_TIMEOUT_MS = Number(opts.fenceCheckTimeoutMs) > 0 ? Number(opts.fenceCheckTimeoutMs) : 20_000; // < the fence-check client's 30s
+  const checkLease = (job) =>
+    rt.Effect.runPromise(
+      engine.extendLock(job.jobKey, fenceRecoveryWindowMs, job.leaseToken).pipe(
+        // Bound the renewal so a hung SDK call can't outlive the agent's check
+        // (and pile up across retries): the timeout INTERRUPTS the effect, which
+        // aborts the adapter's AbortSignal and cancels the SDK request.
+        rt.Effect.timeout(FENCE_CHECK_ENGINE_TIMEOUT_MS),
+        // A confirmed renewal counts toward the heartbeat's lapse window too, so a
+        // fence-check that extended the lock can't be followed by a false `lapsed`.
+        rt.Effect.tap(() => rt.recordExternalRenewal(job.jobKey, job.leaseToken)),
+        rt.Effect.match({
+          onSuccess: () => ({ state: 'held' }),
+          onFailure: (err) =>
+            rt.isLeaseLostError(err)
+              ? { state: 'lost', reason: rt.leaseLostReason(err) }
+              : { state: 'unknown', error: err?.message ?? String(err) },
+        }),
+      ),
+    ).catch((err) => ({ state: 'unknown', error: err instanceof Error ? err.message : String(err) }));
+
+  return { deps, registry, settle, checkLease, makeSupervisor: rt.makeSupervisor, Effect: rt.Effect, Fiber: rt.Fiber };
 }
 
 // Build the content endpoint. Per issue #63 / nano-bpm #759 the non-binary
@@ -10818,7 +10845,7 @@ export function providerTimeoutWarning(env, idleTimeoutMs) {
 }
 
 function runAgentJob(profile, job, opts = {}) {
-  const { timeoutMs, idleTimeoutMs, recoveryWindowMs, envelope, sandbox = 'none', image, runId, secretEnv = {}, passThroughSecretNames = [], cwd, extraEnv = {}, profileEnv = {}, gitEnv = null, resultFile, stream = false, streamPrefix = '', onStreamOut, onStreamErr, args: commandArgs, terminal = 'pipe', protocol = 'pipe', permission = 'yolo', relaySession = null, ptyFactory, nudgePayload = null, onAcpUpdate = null, abortSignal = null, onSpawn = null, resumePlan = null } = opts;
+  const { timeoutMs, idleTimeoutMs, recoveryWindowMs, envelope, sandbox = 'none', image, runId, secretEnv = {}, passThroughSecretNames = [], cwd, extraEnv = {}, fenceEnv = null, profileEnv = {}, gitEnv = null, resultFile, stream = false, streamPrefix = '', onStreamOut, onStreamErr, args: commandArgs, terminal = 'pipe', protocol = 'pipe', permission = 'yolo', relaySession = null, ptyFactory, nudgePayload = null, onAcpUpdate = null, abortSignal = null, onSpawn = null, resumePlan = null } = opts;
   // #110: `protocol`/`permission` drive the ACP executor branch below. The
   // pipe/PTY paths are unchanged, so `protocol === 'pipe'` behaviour is identical.
   // A `nudgePayload` (#678) carries the bespoke "re-emit your result" prompt for a
@@ -10896,7 +10923,8 @@ function runAgentJob(profile, job, opts = {}) {
     if (commandLine !== profile.command && process.platform === 'win32') {
       return Promise.resolve({ ok: false, exitCode: null, stdout: '', stderr: '', error: 'command-line args (--arg) are not supported for host execution on Windows; use a container sandbox or bake switches into the command', truncated: false, stderrTruncated: false });
     }
-    const resultEnv = resultFile ? { [AGENT_RESULT_FILE_ENV]: resultFile } : {};
+    // #320: the lease fence (NANO_FENCE + fence-check socket) rides with the result file.
+    const resultEnv = resultFile ? { ...(fenceEnv || {}), [AGENT_RESULT_FILE_ENV]: resultFile } : { ...(fenceEnv || {}) };
     // Propagate IPv4-first DNS ordering into the forked agent via NODE_OPTIONS
     // (jwulf/c8ctl-plugin-nano#151): the parent's process-wide setDefaultResultOrder
     // can't reach the child, so its own Node runtime must read the flag at startup.
@@ -11002,6 +11030,11 @@ function runAgentJob(profile, job, opts = {}) {
     const containerPath = `/nano-agent/${basename(resultFile)}`;
     mountArgs.push('-v', `${hostDir}:/nano-agent`);
     resultEnv = { [AGENT_RESULT_FILE_ENV]: containerPath };
+    // #320: inside a container only the fence FILE is reachable (via the same
+    // mount); the host-local fence-check socket is not, so it is not forwarded.
+    if (fenceEnv && fenceEnv.NANO_FENCE && dirname(fenceEnv.NANO_FENCE) === hostDir) {
+      resultEnv.NANO_FENCE = `/nano-agent/${basename(fenceEnv.NANO_FENCE)}`;
+    }
   }
   // Forward env by NAME only (`-e NAME`) so secret VALUES stay out of argv and
   // `docker inspect`; docker reads the value from our child's environment.
@@ -13478,7 +13511,21 @@ async function workAgent(req, flags, ctx) {
   // runtime now — retiring the per-type pollers, the process-wide single-flight,
   // the per-process 1+N reconcile crawl, and the per-job lock extender.
   let settle;
+  // Issue #320: per-worker lease fence (NANO_FENCE + fence-check). `checkLease` is
+  // bound once the runtime deps are composed (below), like `settle`.
+  let checkLease = null;
+  const { createFenceRegistry } = await import('./nano-fence.mjs');
+  const fences = createFenceRegistry({
+    check: (job) => (checkLease ? checkLease(job) : Promise.resolve({ state: 'unknown', error: 'worker not ready' })),
+    logger,
+  });
+  process.once('exit', () => fences.close());
   const runner = {
+    // Called by the runtime heartbeat BEFORE it interrupts the run (#320).
+    onLeaseLost: (job, reason) => {
+      fences.leaseLost(job, reason);
+      logger.warn(`[${job.type}] job ${job.jobKey}: lease fence written (${reason})`);
+    },
     run: async (job, abortSignal) => {
       const jobType = job.type;
       // #256 review: mark THIS activation's settle in flight BEFORE recordJobStart,
@@ -14070,6 +14117,8 @@ async function workAgent(req, flags, ctx) {
         // repo clone so it can't be `git add`ed) to write its job-result vars to.
         let resultDir = null;
         let resultFile = null;
+        let fenceToken = null;
+        let fenceEnv = null;
         try {
           try {
             mkdirSync(workerNsDir, { recursive: true });
@@ -14079,6 +14128,25 @@ async function workAgent(req, flags, ctx) {
             // (as a `res-*` dir) if this worker crashes before the cleanup below.
             liveRunDirs.add(resultDir);
           } catch { resultDir = null; resultFile = null; }
+          // #320: the agent-visible lease fence lives beside the result file (so a
+          // container sandbox sees it through the same /nano-agent mount).
+          if (resultDir) {
+            try {
+              const reg = await fences.register(job, join(resultDir, 'fence'));
+              fenceToken = reg.token;
+              fenceEnv = reg.env;
+            } catch { fenceEnv = null; }
+          }
+          // #320: `fences.register` awaits the socket listen, so a lease-loss /
+          // force-stop may have won the race. Stop BEFORE the job marker and the
+          // harness spawn (executors spawn before observing an already-aborted
+          // signal); the finally below unregisters the fence and reaps the run dirs.
+          if (checkSetupAbort(abortSignal, { jobType, jobKey: job.jobKey, stage: 'fence-register', logger })) {
+            checkpointFinalized = true;
+            if (resultDir) { try { rmSync(resultDir, { recursive: true, force: true }); } catch { /* best effort */ } liveRunDirs.delete(resultDir); resultDir = null; }
+            await discardAgentInstanceProducer();
+            return;
+          }
 
           // Record an in-flight job marker in this worker's namespace BEFORE the
           // harness starts (#205). A later orphan reclamation of a dead owner uses
@@ -14113,6 +14181,7 @@ async function workAgent(req, flags, ctx) {
             passThroughSecretNames: names,
             cwd,
             extraEnv,
+            fenceEnv,
             profileEnv,
             // #283: the provisioning git env — runAgentJob layers it UNDER
             // profile/setup env (minus the credential keys) so the harness's
@@ -14603,6 +14672,7 @@ async function workAgent(req, flags, ctx) {
           // finalization error keeps this false so the relay close is 'error'.
           runCompleted = !gitFinalizeFailed;
         } finally {
+          if (fenceToken) fences.unregister(fenceToken);
           if (checkpointing) {
             // #264: exception path — if the run threw before any terminal checkpoint
             // decision was taken (abort/failed flush or the success-path stop), take a
@@ -14927,6 +14997,7 @@ async function workAgent(req, flags, ctx) {
   // shared `activeJobs` map by jobKey, because a same-key reactivation could make
   // that lookup fence a settlement with the wrong activation's token.
   settle = composed.settle;
+  checkLease = composed.checkLease;
   const {
     deps: supervisorDeps,
     registry: workerRegistry,
@@ -22736,6 +22807,14 @@ export const commands = {
           case 'workforce':
             await workforceCommand(req, flags);
             break;
+          case 'fence-check': {
+            // Issue #320: the agent-side lease check. Exit 0 held, 1 lost (fence
+            // written), 75 unknown/transient — so it bypasses the generic failure path.
+            const { runFenceCheck } = await import('./nano-fence.mjs');
+            const { code, message } = await runFenceCheck();
+            if (code === 0) logger.output(message); else logger.error(message);
+            process.exit(code);
+          }
         }
       } catch (error) {
         logger.error(`nano ${req.subcommand} failed: ${error instanceof Error ? error.message : error}`);

@@ -6538,3 +6538,48 @@ test('createIdleLivenessMonitor: subtree 1 → 0 → 0 with an empty workspace s
   });
   assert.equal(killedAt, 3, 'the childless grace window consumes the workspace baseline');
 });
+
+// #320: the worker→harness fence handoff. Host jobs get all four fence vars and
+// they win over profile/setup env; containers get only the mounted fence FILE.
+test('runAgentJob (host) #320 exports the four fence vars, which beat profile/setup env', { skip: process.platform === 'win32' }, async () => {
+  const dir = mkdtempSync(join(tmpdir(), 'nano-fence-handoff-'));
+  const fenceEnv = { NANO_FENCE: join(dir, 'fence'), NANO_FENCE_CHECK: '/x/fence-check.mjs', NANO_FENCE_SOCKET: '/x/s.sock', NANO_FENCE_TOKEN: 'tok' };
+  const profile = { name: 'p', rank: 'senior', command: 'printf "%s|%s|%s|%s" "$NANO_FENCE" "$NANO_FENCE_CHECK" "$NANO_FENCE_SOCKET" "$NANO_FENCE_TOKEN"', model: '', capabilities: [] };
+  const job = { jobKey: 'jk', type: 'senior', variables: {}, customHeaders: {} };
+  const envelope = normalizeTaskEnvelope({}, {});
+  envelope.setup.env = { NANO_FENCE: 'setup-spoof', NANO_FENCE_TOKEN: 'setup-spoof' };
+  const result = await runAgentJob(profile, job, {
+    sandbox: 'none', envelope, fenceEnv, resultFile: join(dir, 'result.json'),
+    profileEnv: { NANO_FENCE_SOCKET: 'profile-spoof', NANO_FENCE_CHECK: 'profile-spoof' },
+    timeoutMs: 30_000,
+  });
+  assert.equal(result.ok, true, result.error || result.stderr);
+  assert.equal(result.stdout, `${fenceEnv.NANO_FENCE}|/x/fence-check.mjs|/x/s.sock|tok`);
+});
+
+test('runAgentJob (container) #320 forwards only the mounted /nano-agent fence, never the host socket/token', { skip: process.platform === 'win32' }, async () => {
+  const dir = mkdtempSync(join(tmpdir(), 'nano-fence-ctr-'));
+  const bin = join(dir, 'bin');
+  mkdirSync(bin);
+  // Fake engine: report argv + the forwarded fence values, then exit 0.
+  writeFileSync(join(bin, 'docker'), '#!/bin/sh\nprintf "ARGS:%s\\n" "$*"\nprintf "FENCE:%s\\nSOCK:%s\\nTOK:%s\\n" "$NANO_FENCE" "$NANO_FENCE_SOCKET" "$NANO_FENCE_TOKEN"\n', { mode: 0o755 });
+  const fenceEnv = { NANO_FENCE: join(dir, 'fence'), NANO_FENCE_CHECK: '/x/fence-check.mjs', NANO_FENCE_SOCKET: '/x/s.sock', NANO_FENCE_TOKEN: 'tok' };
+  const profile = { name: 'p', rank: 'senior', command: 'cat', model: '', capabilities: [] };
+  const job = { jobKey: 'jk', type: 'senior', variables: {}, customHeaders: {} };
+  const oldPath = process.env.PATH;
+  process.env.PATH = `${bin}:${oldPath}`;
+  try {
+    const result = await runAgentJob(profile, job, {
+      sandbox: 'docker', image: 'busybox', runId: 'r-fence', envelope: normalizeTaskEnvelope({}, {}),
+      fenceEnv, resultFile: join(dir, 'result.json'), timeoutMs: 30_000,
+    });
+    const out = `${result.stdout}`;
+    assert.match(out, /FENCE:\/nano-agent\/fence\n/);
+    assert.match(out, /SOCK:\n/);
+    assert.match(out, /TOK:\n/);
+    assert.doesNotMatch(out, /NANO_FENCE_SOCKET|NANO_FENCE_TOKEN|NANO_FENCE_CHECK/);
+    assert.match(out, /-e NANO_FENCE\b/);
+  } finally {
+    process.env.PATH = oldPath;
+  }
+});

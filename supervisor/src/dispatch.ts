@@ -30,9 +30,18 @@ import { withOwnedJob } from "./ownership.ts";
  * a 404 (job gone), or the engine's "not activated" body — mean the lease is gone.
  * Everything TRANSIENT (a 5xx, a 429, a network blip, a timeout) is NOT ownership
  * loss and must not, on its own, stop lock renewal.
+ *
+ * An explicit HTTP status is AUTHORITATIVE: when one can be determined (from the
+ * message or the cause chain), only a definitive 409/404 means lost — a transient
+ * status (503/429/…) is NOT ownership loss even if its body happens to carry a
+ * textual lease-loss signal (e.g. a 503 "upstream not found"). The textual signals
+ * are the fallback for when NO status is available.
  */
-export const isLeaseLostError = (err: SupervisorError): boolean =>
-  LEASE_LOST_RE.test(err.message) || isLostStatus(httpStatusOf(err.cause));
+export const isLeaseLostError = (err: SupervisorError): boolean => {
+  const status = renewalStatusOf(err);
+  if (status !== undefined) return isLostStatus(status);
+  return LEASE_LOST_RE.test(err.message);
+};
 
 /**
  * Match the textual lease-loss signals. Beyond the raw client's own `HTTP 409`/
@@ -42,7 +51,39 @@ export const isLeaseLostError = (err: SupervisorError): boolean =>
 const LEASE_LOST_RE =
   /HTTP 4(?:09|04)\b|status\s*code\s*4(?:09|04)\b|\bnot activated\b|joblease\s*mismatch|lease\s*mismatch|\bnot found\b|\breclaim/i;
 
+/**
+ * Issue #320: the one-line reason written to the agent-visible fence file when a
+ * renewal error ends the heartbeat: `lease-lost: <status>` for a definitive loss
+ * (`job-gone` for a 404), `lease-lost: unrenewable` for a permanent 4xx.
+ */
+export const leaseLostReason = (err: SupervisorError): string => {
+  if (!isLeaseLostError(err)) return "lease-lost: unrenewable";
+  const status = renewalStatusOf(err);
+  if (status === 404) return "job-gone";
+  return `lease-lost: ${status ?? "not-activated"}`;
+};
+
+/**
+ * The ONE authoritative status for a renewal error: a STRUCTURED status on the
+ * cause chain wins over a status parsed from message text (a message may be a
+ * generic wrapper that contradicts the real response); message text is the
+ * fallback. Shared by every renewal classifier so none can disagree.
+ */
+export const renewalStatusOf = (err: SupervisorError): number | undefined =>
+  httpStatusOf(err.cause) ?? statusFromMessage(err.message);
+
 const isLostStatus = (status: number | undefined): boolean => status === 409 || status === 404;
+
+/**
+ * Pull an explicit HTTP status out of an error MESSAGE — the raw client's own
+ * `HTTP 409`/`HTTP 404` prefixes and an injected SDK rejection's generic
+ * `Request failed with status code 409` shape. Returns undefined when the message
+ * carries no status (a bare "not activated" / "lease mismatch" body).
+ */
+const statusFromMessage = (message: string): number | undefined => {
+  const m = /(?:HTTP|status\s*code)\s*(\d{3})\b/i.exec(message);
+  return m ? Number(m[1]) : undefined;
+};
 
 /**
  * Pull an HTTP status off an arbitrary (SDK/fetch) error, walking its `cause`
@@ -56,10 +97,10 @@ const httpStatusOf = (err: unknown, depth = 0): number | undefined => {
   const e = err as {
     status?: unknown;
     statusCode?: unknown;
-    response?: { status?: unknown };
+    response?: { status?: unknown; statusCode?: unknown };
     cause?: unknown;
   };
-  const s = e.status ?? e.statusCode ?? e.response?.status;
+  const s = e.status ?? e.statusCode ?? e.response?.status ?? e.response?.statusCode;
   if (typeof s === "number") return s;
   return httpStatusOf(e.cause, depth + 1);
 };
@@ -74,8 +115,14 @@ const httpStatusOf = (err: unknown, depth = 0): number | undefined => {
  * (the server is asking us to back off / is briefly unhealthy), so they are
  * excluded — only a definitively permanent 4xx counts.
  */
-export const isPermanentRenewalError = (err: SupervisorError): boolean =>
-  /HTTP 4(?:00|01|03|22)\b|\bunauthori[sz]ed\b|\bforbidden\b/i.test(err.message);
+export const isPermanentRenewalError = (err: SupervisorError): boolean => {
+  const status = renewalStatusOf(err);
+  // An explicit status is authoritative: a 503/429 whose body says
+  // "Unauthorized"/"Forbidden" is still transient.
+  if (status !== undefined) return PERMANENT_RENEWAL_STATUSES.has(status);
+  return /\bunauthori[sz]ed\b|\bforbidden\b/i.test(err.message);
+};
+const PERMANENT_RENEWAL_STATUSES = new Set([400, 401, 403, 422]);
 
 /**
  * A heartbeat beat must END the renewal loop (and so interrupt the run) when the
@@ -89,6 +136,22 @@ export const isTerminalRenewalError = (err: SupervisorError): boolean =>
 
 const defectText = (defect: unknown): string =>
   defect instanceof Error ? defect.message : String(defect);
+
+// Issue #320: out-of-band renewals (a `fence-check`'s lease-fenced extendLock)
+// recorded per activation (jobKey + leaseToken), so the heartbeat's lapse check
+// counts a renewal it did not perform itself — otherwise a confirmed fence-check
+// renewal could still be followed by a false `lease-lost: lapsed`. Timestamps
+// come from the Effect `Clock` (wall time in production, TestClock in tests).
+const externalRenewals = new Map<string, number>();
+const renewalKey = (jobKey: string, leaseToken?: string): string => `${jobKey}\u0000${leaseToken ?? ""}`;
+export const recordExternalRenewal = (jobKey: string, leaseToken?: string): Effect.Effect<void> =>
+  Clock.currentTimeMillis.pipe(
+    Effect.flatMap((now) => Effect.sync(() => {
+      const k = renewalKey(jobKey, leaseToken);
+      // Only for an activation that is currently being dispatched (no unbounded growth).
+      if (externalRenewals.has(k)) externalRenewals.set(k, Math.max(now, externalRenewals.get(k) ?? 0));
+    })),
+  );
 
 export interface DispatchConfig {
   /** The window the winner's lock is held to and heartbeated at (ms). */
@@ -144,6 +207,16 @@ export const dispatch = (
 ): Effect.Effect<DispatchOutcome, never> =>
   Effect.gen(function* () {
     const { engine, runner, registry, logger, config, ownership } = deps;
+    // Issue #320: tell the runner the lease is gone BEFORE the race interrupts the
+    // run, so the agent-visible fence file exists by the time the agent is killed.
+    const notifyLeaseLost = (reason: string) =>
+      Effect.sync(() => {
+        try {
+          runner.onLeaseLost?.(job, reason);
+        } catch {
+          /* best effort — a fence write must never break the heartbeat */
+        }
+      });
     // A single extend must never AWAIT unboundedly — a hung SDK/HTTP call would
     // otherwise stall both the winner extend (wedging the claimed slot forever) and
     // each heartbeat beat (freezing renewal). Bound every extend by this deadline.
@@ -204,19 +277,21 @@ export const dispatch = (
       // TestClock the clock advances exactly with `TestClock.adjust`, so this is
       // still fully deterministic.
       const lastOkAtRef = yield* Ref.make(yield* Clock.currentTimeMillis);
+      const extKey = renewalKey(job.jobKey, job.leaseToken);
       const retryUnlessLapsed = (reason: string) =>
         Effect.all([Clock.currentTimeMillis, Ref.get(lastOkAtRef)]).pipe(
-          Effect.flatMap(([now, lastOkAt]) => {
+          Effect.flatMap(([now, ownOkAt]) => {
+            const lastOkAt = Math.max(ownOkAt, externalRenewals.get(extKey) ?? 0);
             const sinceOk = now - lastOkAt;
             // If the NEXT beat would land at/after the window, the lock is (about
             // to be) lapsed — give up now, a beat BEFORE expiry, rather than run
             // the agent on unlocked.
             return sinceOk + config.extendIntervalMs >= config.recoveryWindowMs
-              ? Effect.fail(
+              ? notifyLeaseLost("lease-lost: lapsed").pipe(Effect.andThen(Effect.fail(
                   new SupervisorError(
                     `job ${job.jobKey}: lock lapsed — no successful extend in ${sinceOk}ms (recovery window ${config.recoveryWindowMs}ms); last error: ${reason}`,
                   ),
-                )
+                )))
               : Effect.sync(() =>
                   logger.warn(
                     `[${job.type}] job ${job.jobKey}: heartbeat extend failed (transient, retrying) — ${reason}`,
@@ -236,14 +311,18 @@ export const dispatch = (
             Effect.flatMap((now) => Ref.set(lastOkAtRef, now)),
             Effect.catch((err: SupervisorError | { message?: string }) =>
               err instanceof SupervisorError && isTerminalRenewalError(err)
-                ? Effect.fail(err)
+                ? notifyLeaseLost(leaseLostReason(err)).pipe(Effect.andThen(Effect.fail(err)))
                 : retryUnlessLapsed(err?.message ?? String(err)),
             ),
             Effect.catchDefect((defect) => retryUnlessLapsed(defectText(defect))),
           ),
         ),
       );
-      const heartbeatUntilLost = Effect.forever(beatOnce);
+      const heartbeatUntilLost = Effect.acquireUseRelease(
+        Effect.sync(() => { externalRenewals.set(extKey, 0); }),
+        () => Effect.forever(beatOnce),
+        () => Effect.sync(() => { externalRenewals.delete(extKey); }),
+      );
 
       // The agent child runs under a claim whose lifetime == the child's own
       // (issue #158): claimed just before spawn, released on every exit path so a

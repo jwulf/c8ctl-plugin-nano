@@ -1,7 +1,7 @@
 // Issue #320: NANO_FENCE + fence-check.
 import assert from "node:assert/strict";
 import { test } from "node:test";
-import { mkdtempSync, existsSync, readFileSync, symlinkSync, lstatSync } from "node:fs";
+import { mkdtempSync, existsSync, readFileSync, symlinkSync, lstatSync, chmodSync } from "node:fs";
 import { tmpdir } from "node:os";
 import { join } from "node:path";
 import { spawnSync } from "node:child_process";
@@ -117,6 +117,50 @@ test("a held answer is not accepted when the job was unregistered while the chec
     const r = await fences.register(job, fencePath);
     tok = r.env.NANO_FENCE_TOKEN;
     assert.equal((await runFenceCheck({ env: r.env })).code, 75);
+  } finally {
+    fences.close();
+  }
+});
+
+test("a latched loss beats a delayed held even when the fence write cannot land (unwritable dir)", async () => {
+  const dir = mkdtempSync(join(tmpdir(), "fence-test-"));
+  const fencePath = join(dir, "fence");
+  let fences;
+  // Delayed successful check: the heartbeat confirms the loss while it is pending.
+  fences = createFenceRegistry({
+    check: async () => { await new Promise((r) => setTimeout(r, 30)); return { state: "held" }; },
+  });
+  try {
+    const { env } = await fences.register(job, fencePath);
+    chmodSync(dir, 0o555); // unwritable: the fence write fails
+    const pending = runFenceCheck({ env });
+    fences.leaseLost(job, "lease-lost: 409");
+    assert.deepEqual(await pending, { code: 1, message: "lease-lost: 409" });
+    assert.equal(existsSync(fencePath), false, "no fence file could be written");
+    // The latch also answers subsequent checks without touching the engine.
+    assert.deepEqual(await runFenceCheck({ env }), { code: 1, message: "lease-lost: 409" });
+  } finally {
+    chmodSync(dir, 0o755);
+    fences.close();
+  }
+});
+
+test("a latched loss beats a delayed held even when the fence path is a planted dangling symlink", { skip: process.platform === "win32" }, async () => {
+  const dir = mkdtempSync(join(tmpdir(), "fence-test-"));
+  const fencePath = join(dir, "fence");
+  symlinkSync(join(dir, "nonexistent-target"), fencePath); // dangling: 'wx' write fails with EEXIST
+  let fences;
+  fences = createFenceRegistry({
+    check: async () => { await new Promise((r) => setTimeout(r, 30)); return { state: "held" }; },
+  });
+  try {
+    const { env } = await fences.register(job, fencePath);
+    const pending = runFenceCheck({ env });
+    fences.leaseLost(job, "lease-lost: 409");
+    const r = await pending;
+    // The file can never be written through the symlink, so the client-side
+    // re-read finds nothing; the latched server answer must still be `lost`.
+    assert.equal(r.code, 1, r.message);
   } finally {
     fences.close();
   }

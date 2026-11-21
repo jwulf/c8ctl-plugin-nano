@@ -69,9 +69,20 @@ function defaultSocketPath() {
  * authenticated, lease-fenced engine connection.
  */
 export function createFenceRegistry({ check, socketPath = defaultSocketPath(), logger = null, idleSocketMs } = {}) {
-  const byToken = new Map(); // token -> { job, fencePath }
+  const byToken = new Map(); // token -> { job, fencePath, lostReason }
   let server = null;
   let listening = null;
+
+  // Known loss is LATCHED on the registry entry, not only in the fence file: a
+  // fence write can fail (unwritable dir) or be refused (a planted dangling
+  // symlink), and the file must never be the difference between reporting a
+  // confirmed loss and a stale `held`.
+  const latchLost = (entry, reason) => {
+    const r = String(reason || 'lease-lost').split('\n')[0] || 'lease-lost';
+    if (!entry.lostReason) entry.lostReason = r; // first loss reason wins
+    writeFence(entry.fencePath, entry.lostReason);
+    return entry.lostReason;
+  };
 
   const handle = async (line) => {
     let req;
@@ -80,8 +91,9 @@ export function createFenceRegistry({ check, socketPath = defaultSocketPath(), l
     // An unknown token means this job is no longer running on this worker: its
     // run finished or was interrupted. Not definitive about the engine, so unknown.
     if (!entry) return { state: 'unknown', error: 'no active job for this fence token' };
+    if (entry.lostReason) return { state: 'lost', reason: entry.lostReason };
     const already = readFence(entry.fencePath);
-    if (already) return { state: 'lost', reason: already };
+    if (already) return { state: 'lost', reason: latchLost(entry, already) };
     let res;
     try {
       res = await check(entry.job);
@@ -89,15 +101,15 @@ export function createFenceRegistry({ check, socketPath = defaultSocketPath(), l
       res = { state: 'unknown', error: err instanceof Error ? err.message : String(err) };
     }
     if (res && res.state === 'lost') {
-      const reason = res.reason || 'lease-lost';
-      writeFence(entry.fencePath, reason);
-      return { state: 'lost', reason: readFence(entry.fencePath) || reason };
+      return { state: 'lost', reason: latchLost(entry, res.reason) };
     }
     if (res && res.state === 'held') {
-      // The heartbeat (or a concurrent check) may have written the fence while the
-      // engine call was pending — known loss beats a stale success.
+      // The heartbeat (or a concurrent check) may have confirmed the loss while
+      // the engine call was pending — known loss beats a stale success, even
+      // when its fence write could not land on disk.
+      if (entry.lostReason) return { state: 'lost', reason: entry.lostReason };
       const after = readFence(entry.fencePath);
-      if (after) return { state: 'lost', reason: after };
+      if (after) return { state: 'lost', reason: latchLost(entry, after) };
       // The job may have been unregistered (run ended, dir reaped) while the
       // check was pending: a stale held must not vouch for an ended activation.
       if (byToken.get(req.token) !== entry) return { state: 'unknown', error: 'job ended while checking' };
@@ -144,18 +156,18 @@ export function createFenceRegistry({ check, socketPath = defaultSocketPath(), l
     /** Register a running job; returns the env the agent should receive. */
     async register(job, fencePath) {
       const token = randomBytes(16).toString('hex');
-      byToken.set(token, { job, fencePath });
+      byToken.set(token, { job, fencePath, lostReason: null });
       const ok = await ensureServer();
       const env = { [FENCE_ENV]: fencePath, [FENCE_CHECK_ENV]: FENCE_CHECK_SCRIPT };
       if (ok) { env[FENCE_SOCKET_ENV] = socketPath; env[FENCE_TOKEN_ENV] = token; }
       return { token, env };
     },
     unregister(token) { byToken.delete(token); },
-    /** Heartbeat lease loss: write the fence of every registration for this activation. */
+    /** Heartbeat lease loss: latch the loss and write the fence of every registration for this activation. */
     leaseLost(job, reason) {
       for (const e of byToken.values()) {
         if (String(e.job.jobKey) === String(job.jobKey) && (e.job.leaseToken ?? null) === (job.leaseToken ?? null)) {
-          writeFence(e.fencePath, reason);
+          latchLost(e, reason);
         }
       }
     },

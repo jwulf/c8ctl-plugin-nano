@@ -68,8 +68,22 @@ function defaultSocketPath() {
  * `{ state: 'held'|'lost'|'unknown', reason?, error? }` using the worker's own
  * authenticated, lease-fenced engine connection.
  */
-export function createFenceRegistry({ check, socketPath = defaultSocketPath(), logger = null, idleSocketMs } = {}) {
+export function createFenceRegistry({ check, socketPath = defaultSocketPath(), logger = null, idleSocketMs, maxInFlight } = {}) {
   const byToken = new Map(); // token -> { job, fencePath, lostReason }
+  // Issue #320 (Copilot critical): the agent controls when and how often it runs
+  // fence-check, so an unbounded `handle()` lets it pile up concurrent engine
+  // calls (memory) and saturate the event loop the heartbeat/abort timers share.
+  // Two guards fail that closed:
+  //   * inFlight — a GLOBAL cap on concurrent engine checks. Over the cap the
+  //     request gets a fast `unknown` (the client's designed retry signal), never
+  //     a queued engine call.
+  //   * perToken — concurrent checks for the SAME token share one in-flight
+  //     engine call. The check is idempotent (extendLock to the recovery window),
+  //     so a retry while one is pending rides the same Promise instead of
+  //     spawning a second renewal.
+  const inFlight = new Set(); // in-flight check Promises (global cap)
+  const perToken = new Map(); // token -> in-flight check Promise
+  const MAX_IN_FLIGHT = Number(maxInFlight) > 0 ? Number(maxInFlight) : 8;
   let server = null;
   let listening = null;
 
@@ -94,11 +108,29 @@ export function createFenceRegistry({ check, socketPath = defaultSocketPath(), l
     if (entry.lostReason) return { state: 'lost', reason: entry.lostReason };
     const already = readFence(entry.fencePath);
     if (already) return { state: 'lost', reason: latchLost(entry, already) };
+    // Run the engine check bounded: dedup concurrent checks for this token onto
+    // one shared call, and refuse to start a new engine call once the global
+    // in-flight cap is reached (fail closed to `unknown`, the client's retry
+    // signal) so an agent hammering fence-check can't pile up engine work.
     let res;
-    try {
-      res = await check(entry.job);
-    } catch (err) {
-      res = { state: 'unknown', error: err instanceof Error ? err.message : String(err) };
+    if (inFlight.size >= MAX_IN_FLIGHT && !perToken.has(req.token)) {
+      res = { state: 'unknown', error: 'fence-check busy (in-flight cap reached) — retry' };
+    } else {
+      let p = perToken.get(req.token);
+      if (!p) {
+        p = (async () => {
+          try {
+            return await check(entry.job);
+          } catch (err) {
+            return { state: 'unknown', error: err instanceof Error ? err.message : String(err) };
+          }
+        })();
+        perToken.set(req.token, p);
+        inFlight.add(p);
+        const done = () => { perToken.delete(req.token); inFlight.delete(p); };
+        p.then(done, done);
+      }
+      res = await p;
     }
     if (res && res.state === 'lost') {
       return { state: 'lost', reason: latchLost(entry, res.reason) };

@@ -268,6 +268,74 @@ test("an idle fence-check client is dropped and cannot pin the worker", async ()
   }
 });
 
+// Issue #320 (Copilot critical): agent-controlled fence reads must not pile up
+// unbounded concurrent engine calls (memory) nor saturate the worker event loop.
+test("concurrent fence-checks for one token share a single engine call (dedup)", async () => {
+  let calls = 0;
+  let release;
+  const gate = new Promise((r) => { release = r; });
+  const fences = createFenceRegistry({
+    check: async () => { calls += 1; await gate; return { state: "held" }; },
+  });
+  try {
+    const fencePath = join(mkdtempSync(join(tmpdir(), "fence-test-")), "fence");
+    const { env } = await fences.register(job, fencePath);
+    // Fire a burst of concurrent checks for the SAME token while the engine call
+    // is still pending. They must all ride the ONE in-flight call, not each spawn
+    // a renewal.
+    const burst = await Promise.all([
+      runFenceCheck({ env }),
+      runFenceCheck({ env }),
+      runFenceCheck({ env }),
+      runFenceCheck({ env }),
+      runFenceCheck({ env }),
+      (async () => { await new Promise((r) => setTimeout(r, 20)); release(); })(),
+    ]);
+    const codes = burst.slice(0, 5).map((r) => r.code);
+    assert.deepEqual(codes, [0, 0, 0, 0, 0], "all concurrent checks resolve held");
+    assert.equal(calls, 1, "concurrent same-token checks share one engine call");
+  } finally {
+    release();
+    fences.close();
+  }
+});
+
+test("a global in-flight cap fails a new token's check closed to unknown instead of piling up engine work", async () => {
+  let calls = 0;
+  const gates = [];
+  const fences = createFenceRegistry({
+    maxInFlight: 2,
+    check: async () => { calls += 1; await new Promise((r) => gates.push(r)); return { state: "held" }; },
+  });
+  try {
+    const dir = mkdtempSync(join(tmpdir(), "fence-test-"));
+    // Register maxInFlight distinct tokens and start a (blocked) check for each.
+    const envs = [];
+    for (let i = 0; i < 2; i += 1) {
+      const { env } = await fences.register({ ...job, jobKey: `J-cap-${i}` }, join(dir, `fence-${i}`));
+      envs.push(env);
+    }
+    const pending = envs.map((env) => runFenceCheck({ env }));
+    // Let both reach the engine and block.
+    await new Promise((r) => setTimeout(r, 50));
+    assert.equal(calls, 2, "both in-flight checks reached the engine");
+    // A THIRD distinct token's check must NOT start a third engine call: the cap
+    // fails it closed to unknown (the client's retry signal).
+    const { env: env3 } = await fences.register({ ...job, jobKey: "J-cap-2" }, join(dir, "fence-2"));
+    const third = await runFenceCheck({ env: env3 });
+    assert.equal(third.code, 75, `over-cap check fails closed to unknown, got ${third.code}: ${third.message}`);
+    assert.match(third.message, /in-flight cap|busy/i);
+    assert.equal(calls, 2, "no third engine call was spawned while at the cap");
+    // Release the blocked checks; they resolve held.
+    for (const g of gates) g();
+    const settled = await Promise.all(pending);
+    assert.deepEqual(settled.map((r) => r.code), [0, 0]);
+  } finally {
+    for (const g of gates) g();
+    fences.close();
+  }
+});
+
 test("writeFence never follows a planted (dangling) symlink and keeps the first reason", { skip: process.platform === "win32" }, () => {
   const dir = mkdtempSync(join(tmpdir(), "nano-fence-sym-"));
   const outside = join(mkdtempSync(join(tmpdir(), "nano-fence-out-")), "escaped");

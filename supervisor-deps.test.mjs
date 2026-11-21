@@ -272,6 +272,9 @@ test("createSupervisorDeps: derives engine authHeaders from camunda.getAuthHeade
   };
   let getAuthCalls = 0;
   const camunda = {
+    // Same origin as restConfig.baseUrl: implicit SDK creds are only forwarded
+    // same-origin (PR #316 review).
+    getConfig: () => ({ restAddress: "http://engine:8080/v2" }),
     getAuthHeaders: async () => {
       getAuthCalls++;
       return { Authorization: "Bearer derived-token" };

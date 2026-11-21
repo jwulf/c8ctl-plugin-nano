@@ -515,12 +515,16 @@ test('resolveLinkedPromptSource: a pre-resolved baseUrl is reused verbatim (no c
     // base must win over what the client's profile would otherwise yield, and
     // auth headers must still come from the (possibly rotating) client.
     const camunda = {
-      getConfig: () => ({ restAddress: 'http://should-not-use:8080/v2' }),
+      getConfig: () => ({ restAddress: 'http://pre-resolved:8080/v2' }),
       getAuthHeaders: async () => ({ Authorization: '******' }),
     };
     const src = await resolveLinkedPromptSource(camunda, {}, { baseUrl: 'http://pre-resolved:8080' });
     assert.equal(src.baseUrl, 'http://pre-resolved:8080');
     assert.deepEqual(src.authHeaders, { Authorization: '******' });
+    // A cross-origin pre-resolved base never receives the profile's implicit SDK
+    // credentials (PR #316 review: same-origin gate).
+    const cross = await resolveLinkedPromptSource(camunda, {}, { baseUrl: 'http://other-host:8080' });
+    assert.equal(cross.authHeaders, undefined);
   });
 });
 

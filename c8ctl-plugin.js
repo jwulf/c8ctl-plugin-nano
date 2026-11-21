@@ -4310,7 +4310,26 @@ async function readDeployedAgentJobTypes(reader, { scope = '' } = {}) {
 // when auth is configured (or `undefined` when no auth source is present). Guarded
 // so an older/atypical SDK client degrades cleanly to unauthenticated rather than
 // throwing.
-function createEngineAuthResolver({ camunda, token, authHeaders } = {}) {
+//
+// Same-origin gate (PR #316 review): when a `targetUrl` is supplied, the
+// IMPLICIT SDK credentials (step 3) are only forwarded when `targetUrl` is
+// same-origin as the SDK client's own `getConfig().restAddress`. An operator
+// override (NANO_REST_URL / NANO_BASE_URL / cfg.nanoUrl) pointing at another
+// host therefore never receives the profile's Basic password / OAuth token;
+// explicit destination credentials (steps 1-2) still apply cross-origin. Fails
+// closed: an unreadable/absent restAddress forwards nothing.
+function sdkCredentialsAllowedFor(camunda, targetUrl) {
+  if (targetUrl === undefined || targetUrl === null) return true;
+  if (!camunda || typeof camunda.getConfig !== 'function') return false;
+  try {
+    const restAddress = camunda.getConfig()?.restAddress;
+    return typeof restAddress === 'string' && sameOrigin(String(targetUrl), restAddress);
+  } catch {
+    return false;
+  }
+}
+
+function createEngineAuthResolver({ camunda, token, authHeaders, targetUrl } = {}) {
   if (typeof authHeaders === 'function') {
     return async () => {
       try {
@@ -4329,7 +4348,7 @@ function createEngineAuthResolver({ camunda, token, authHeaders } = {}) {
     const fixed = { Authorization: `Bearer ${token}` };
     return async () => fixed;
   }
-  if (camunda && typeof camunda.getAuthHeaders === 'function') {
+  if (camunda && typeof camunda.getAuthHeaders === 'function' && sdkCredentialsAllowedFor(camunda, targetUrl)) {
     return async () => {
       try {
         const h = await camunda.getAuthHeaders();
@@ -4359,10 +4378,12 @@ function withEngineAuthFetch(fetchImpl, authOpts) {
     if (!auth || Object.keys(auth).length === 0) return baseFetch(input, init);
     const merged = {};
     if (init.headers) {
-      if (typeof init.headers.forEach === 'function') {
-        init.headers.forEach((v, k) => { merged[k] = v; });
-      } else if (Array.isArray(init.headers)) {
+      // Tuple arrays first: arrays also have `forEach`, which would otherwise
+      // write numeric keys (`0`, `1`, …) and drop the caller's headers.
+      if (Array.isArray(init.headers)) {
         for (const [k, v] of init.headers) merged[k] = v;
+      } else if (typeof init.headers.forEach === 'function') {
+        init.headers.forEach((v, k) => { merged[k] = v; });
       } else if (typeof init.headers === 'object') {
         Object.assign(merged, init.headers);
       }
@@ -4402,6 +4423,7 @@ async function defaultC8RestReader(restConfig, { camunda, authHeaders, fetchImpl
     camunda,
     token: restConfig?.token,
     authHeaders,
+    targetUrl: base,
   });
   return demand.httpC8RestReader({
     restAddress: `${base}/v2`,
@@ -4850,7 +4872,7 @@ async function createSupervisorDeps(opts = {}) {
   // `camunda.getAuthHeaders()` (covering OAuth, basic auth, and rotating tokens).
   // Shared by BOTH `createRawEngineClient` AND `defaultC8RestReader` so the
   // reconcile reader never drops credentials behind basic/OAuth auth.
-  const resolvedAuthHeaders = createEngineAuthResolver({ camunda, token: rc.token, authHeaders });
+  const resolvedAuthHeaders = createEngineAuthResolver({ camunda, token: rc.token, authHeaders, targetUrl: rc.baseUrl });
 
   const rawEngine = createRawEngineClient({ baseUrl: rc.baseUrl, token: rc.token, authHeaders: resolvedAuthHeaders, worker, fetchImpl, camunda });
   const engine = rt.makeEngineClient(rawEngine);
@@ -5081,7 +5103,7 @@ async function resolveLinkedPromptSource(camunda, env = process.env, { baseUrl: 
   // pre-resolved base (already normalized at worker startup) is reused verbatim to
   // avoid a per-job config.json read.
   const baseUrl = preResolvedBase ?? resolveLinkedPromptBase(camunda, env);
-  const resolveAuth = createEngineAuthResolver({ camunda, token: env.NANO_REST_TOKEN });
+  const resolveAuth = createEngineAuthResolver({ camunda, token: env.NANO_REST_TOKEN, targetUrl: baseUrl });
   const authHeaders = resolveAuth ? await resolveAuth() : undefined;
   return { baseUrl, authHeaders };
 }
@@ -11259,7 +11281,12 @@ async function discoverAgenticHubs(engineBaseUrl, {
     // Issue #315: carry the engine's auth headers (e.g. profile basic auth /
     // OAuth) on the `/console/api/projects` discovery fetch so a reverse proxy
     // enforcing basic auth doesn't 401 hub discovery.
-    const authedFetch = withEngineAuthFetch(fetchImpl, { camunda, authHeaders });
+    // REST credentials for the discovery target resolve through the same
+    // token gate as every other engine REST call (NANO_REST_TOKEN / same-origin
+    // agentic fallback); `token` stays solely the WS channel identity. SDK
+    // credentials are only forwarded same-origin (targetUrl gate).
+    const restToken = authHeaders ? undefined : (resolveBrokerRestConfig(process.env, { baseUrl: base }).token || undefined);
+    const authedFetch = withEngineAuthFetch(fetchImpl, { camunda, authHeaders, token: restToken, targetUrl: base });
     const res = await authedFetch(`${base}/console/api/projects`, { signal: controller.signal });
     if (!res || !res.ok) return [];
     projects = await res.json();

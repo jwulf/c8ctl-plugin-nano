@@ -301,3 +301,25 @@ test("defaultC8RestReader respects explicit bare token when no camunda client is
   assert.equal(seen.length, 1);
   assert.equal(seen[0].auth, "Bearer bare-tok");
 });
+
+test("createEngineAuthResolver forwards implicit SDK credentials only same-origin as the profile restAddress (PR #316 review)", async () => {
+  const camunda = makeBasicAuthCamunda();
+  const origin = new URL(camunda.getConfig().restAddress).origin;
+  const sameOk = createEngineAuthResolver({ camunda, targetUrl: `${origin}/v2` });
+  assert.deepEqual(await sameOk(), { Authorization: EXPECTED_BASIC_HEADER });
+  assert.equal(createEngineAuthResolver({ camunda, targetUrl: "https://evil.example.com" }), undefined);
+  // explicit destination credentials still apply cross-origin
+  assert.deepEqual(await createEngineAuthResolver({ camunda, token: "T", targetUrl: "https://evil.example.com" })(), { Authorization: "Bearer T" });
+  // fail closed without a readable restAddress
+  assert.equal(createEngineAuthResolver({ camunda: { getAuthHeaders: async () => ({ A: "b" }) }, targetUrl: "http://x" }), undefined);
+  assert.equal(createEngineAuthResolver({ camunda: { getConfig: () => { throw new Error("x"); }, getAuthHeaders: async () => ({ A: "b" }) }, targetUrl: "http://x" }), undefined);
+});
+
+test("withEngineAuthFetch preserves tuple-array HeadersInit (PR #316 review)", async () => {
+  const seen = [];
+  const authed = withEngineAuthFetch(async (_u, init) => { seen.push(init.headers); return { ok: true }; }, { token: "T" });
+  await authed("http://e/v2", { headers: [["content-type", "application/json"], ["authorization", "old"]] });
+  assert.deepEqual(seen[0], { "content-type": "application/json", Authorization: "Bearer T" });
+  await authed("http://e/v2", { headers: new Headers({ "x-a": "1" }) });
+  assert.equal(seen[1]["x-a"], "1");
+});

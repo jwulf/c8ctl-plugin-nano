@@ -247,9 +247,18 @@ export const makeSupervisor = (deps: SupervisorDeps): Effect.Effect<Supervisor> 
         ),
       ),
       Effect.catch((err) =>
-        Effect.sync(() =>
-          logger.warn(`reconcile skipped — ${err.message} (keeping current job-type set)`),
-        ),
+        Effect.sync(() => {
+          // Issue #315: a 401/403 from reconcile is an auth-misconfiguration error,
+          // not a transient network blip — surface a loud, distinct warning so an
+          // `--auto` worker serving 0 job types doesn't look like a routine skip.
+          if (/\b(?:401|403)\b/.test(err.message)) {
+            logger.warn(
+              `RECONCILE AUTH FAILED (check profile credentials / NANO_REST_TOKEN) — ${err.message}; job-type set NOT updated${deps.autoWorkerId ? " (--auto worker may be serving 0 job types)" : ""}`,
+            );
+          } else {
+            logger.warn(`reconcile skipped — ${err.message} (keeping current job-type set)`);
+          }
+        }),
       ),
     );
 

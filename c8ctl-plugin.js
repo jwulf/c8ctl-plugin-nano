@@ -4298,18 +4298,114 @@ async function readDeployedAgentJobTypes(reader, { scope = '' } = {}) {
   return out;
 }
 
+// Single source of truth for auth headers on hand-rolled engine REST requests
+// (issue #315). Precedence:
+//   1. Explicit ready-made `authHeaders` map (or per-call resolver function)
+//   2. Bare REST bearer `token` (e.g. `restConfig.token` / `NANO_REST_TOKEN`)
+//   3. The activating SDK client's `camunda.getAuthHeaders()`, resolved PER CALL
+//      (so rotating OAuth tokens refresh and basic-auth / none profiles work
+//      identically to the SDK's own job-activation calls).
+//
+// Returns a per-call async resolver `() => Promise<Record<string, string> | undefined>`
+// when auth is configured (or `undefined` when no auth source is present). Guarded
+// so an older/atypical SDK client degrades cleanly to unauthenticated rather than
+// throwing.
+function createEngineAuthResolver({ camunda, token, authHeaders } = {}) {
+  if (typeof authHeaders === 'function') {
+    return async () => {
+      try {
+        const h = await authHeaders();
+        return h && typeof h === 'object' ? h : undefined;
+      } catch {
+        return undefined;
+      }
+    };
+  }
+  if (authHeaders && typeof authHeaders === 'object') {
+    const fixed = { ...authHeaders };
+    return async () => fixed;
+  }
+  if (token) {
+    const fixed = { Authorization: `Bearer ${token}` };
+    return async () => fixed;
+  }
+  if (camunda && typeof camunda.getAuthHeaders === 'function') {
+    return async () => {
+      try {
+        const h = await camunda.getAuthHeaders();
+        return h && typeof h === 'object' ? h : undefined;
+      } catch {
+        return undefined;
+      }
+    };
+  }
+  return undefined;
+}
+
+// Wrap a `fetch` implementation so every outgoing engine REST request receives
+// per-call auth headers from `createEngineAuthResolver` (issue #315). Used by
+// `defaultC8RestReader` (so `@nanobpm/agentic`'s `httpC8RestReader` — which
+// only natively accepts a static bearer `token` — sends basic-auth / OAuth /
+// rotating SDK headers on both `POST /process-definitions/search` and
+// `GET /process-definitions/{key}/xml`). Caller-supplied headers are preserved
+// while auth headers from the resolver are merged in (avoiding duplicate
+// case-variant `authorization` / `Authorization` keys).
+function withEngineAuthFetch(fetchImpl, authOpts) {
+  const baseFetch = typeof fetchImpl === 'function' ? fetchImpl : ((input, init) => globalThis.fetch(input, init));
+  const resolveAuth = createEngineAuthResolver(authOpts);
+  if (!resolveAuth) return baseFetch;
+  return async (input, init = {}) => {
+    const auth = await resolveAuth();
+    if (!auth || Object.keys(auth).length === 0) return baseFetch(input, init);
+    const merged = {};
+    if (init.headers) {
+      if (typeof init.headers.forEach === 'function') {
+        init.headers.forEach((v, k) => { merged[k] = v; });
+      } else if (Array.isArray(init.headers)) {
+        for (const [k, v] of init.headers) merged[k] = v;
+      } else if (typeof init.headers === 'object') {
+        Object.assign(merged, init.headers);
+      }
+    }
+    const authLowerKeys = new Set(Object.keys(auth).map((k) => k.toLowerCase()));
+    for (const k of Object.keys(merged)) {
+      if (authLowerKeys.has(k.toLowerCase())) delete merged[k];
+    }
+    Object.assign(merged, auth);
+    return baseFetch(input, { ...init, headers: merged });
+  };
+}
+
+// Detect a 401/403 authentication/authorization failure from an engine REST
+// error (e.g. `C8 REST process-definitions/search failed: 401 Unauthorized` or
+// `HTTP 403 ...`). Used to surface a loud, distinct auth-misconfigured warning
+// on reconcile / `--auto` initial read instead of a generic transient skip
+// (issue #315).
+function isEngineAuthError(err) {
+  const msg = String(err && err.message ? err.message : err || '');
+  return /\b(?:401|403)\b/.test(msg);
+}
+
 // Build the live C8 v2 REST reader from the broker REST config. `httpC8RestReader`
 // appends `/process-definitions/...` to its `restAddress`, and the C8 v2 API is
 // mounted under `/v2` on the broker (same base the linked-resource fetch uses),
-// so the reader's address is `<baseUrl>/v2`. The demand module is imported lazily
-// through the single agentic surface (`agentic.mjs`) so the whole agentic module
-// graph only loads when `--auto` is actually used.
-async function defaultC8RestReader(restConfig) {
+// so the reader's address is `<baseUrl>/v2`. Auth headers are injected per call
+// via `withEngineAuthFetch` (using the same `createEngineAuthResolver` source as
+// the engine client and linked-resource fetch — covering basic auth, OAuth, bare
+// bearer token, and unauthenticated local clusters, issue #315). The demand
+// module is imported lazily through the single agentic surface (`agentic.mjs`)
+// so the whole agentic module graph only loads when `--auto` is actually used.
+async function defaultC8RestReader(restConfig, { camunda, authHeaders, fetchImpl } = {}) {
   const { demand } = await import('./agentic.mjs');
   const base = String(restConfig?.baseUrl || DEFAULT_NANO_URL).replace(/\/+$/, '');
+  const authedFetch = withEngineAuthFetch(fetchImpl, {
+    camunda,
+    token: restConfig?.token,
+    authHeaders,
+  });
   return demand.httpC8RestReader({
     restAddress: `${base}/v2`,
-    token: restConfig?.token ? restConfig.token : undefined,
+    fetch: authedFetch,
   });
 }
 
@@ -4320,9 +4416,11 @@ async function defaultC8RestReader(restConfig) {
 // with a clear error, so a stalled engine read settles the awaited promise
 // (KEEP the running set) instead of wedging the reconcile — and, via shutdown's
 // `await inFlightReconcile`, wedging `Ctrl-C`/SIGTERM.
-async function resolveAutoJobTypes({ restConfig, scope = '', readerFactory, timeoutMs = AUTO_ENGINE_READ_TIMEOUT_MS } = {}) {
+async function resolveAutoJobTypes({ restConfig, camunda, authHeaders, fetchImpl, scope = '', readerFactory, timeoutMs = AUTO_ENGINE_READ_TIMEOUT_MS } = {}) {
   const read = (async () => {
-    const reader = readerFactory ? await readerFactory() : await defaultC8RestReader(restConfig);
+    const reader = readerFactory
+      ? await readerFactory()
+      : await defaultC8RestReader(restConfig, { camunda, authHeaders, fetchImpl });
     return readDeployedAgentJobTypes(reader, { scope });
   })();
   if (!(timeoutMs > 0)) return read;
@@ -4747,32 +4845,19 @@ async function createSupervisorDeps(opts = {}) {
     token: (restConfig && restConfig.token) || gated.token,
   };
 
-  // Auth: an explicit ready-made `authHeaders` map wins; else a bare REST token
-  // (`rc.token`) is applied by the engine client itself; else — on OAuth/basic
-  // profiles where no bare token exists — derive the headers from the SDK client's
-  // `getAuthHeaders()` (mirroring resolveLinkedPromptSource). Guarded so an older or
-  // atypical client runtime degrades to the token/none path rather than throw.
-  let resolvedAuthHeaders = authHeaders;
-  if (!resolvedAuthHeaders && !rc.token && camunda && typeof camunda.getAuthHeaders === 'function') {
-    // Resolve PER CALL, not once at startup: SDK auth headers (e.g. an OAuth
-    // bearer) rotate on token refresh, so a long-lived supervisor must re-derive
-    // them on every engine call — a cached startup snapshot would silently expire
-    // and fail activations. Pass a resolver the engine client invokes per request.
-    resolvedAuthHeaders = async () => {
-      try {
-        return await camunda.getAuthHeaders();
-      } catch {
-        return undefined;
-      }
-    };
-  }
+  // Auth: single source of truth via `createEngineAuthResolver` (issue #315).
+  // Precedence: explicit `authHeaders` → bare REST token (`rc.token`) → per-call
+  // `camunda.getAuthHeaders()` (covering OAuth, basic auth, and rotating tokens).
+  // Shared by BOTH `createRawEngineClient` AND `defaultC8RestReader` so the
+  // reconcile reader never drops credentials behind basic/OAuth auth.
+  const resolvedAuthHeaders = createEngineAuthResolver({ camunda, token: rc.token, authHeaders });
 
   const rawEngine = createRawEngineClient({ baseUrl: rc.baseUrl, token: rc.token, authHeaders: resolvedAuthHeaders, worker, fetchImpl, camunda });
   const engine = rt.makeEngineClient(rawEngine);
   // `reconcileReader` (a raw `{ searchProcessDefinitionKeys, getProcessDefinitionXml }`)
   // may be injected to override the default keep-alive `httpC8RestReader` — the
   // caller may already hold one, and a test drives the crawl without a socket.
-  const rawReader = opts.reconcileReader || (await defaultC8RestReader(rc));
+  const rawReader = opts.reconcileReader || (await defaultC8RestReader(rc, { camunda, authHeaders: resolvedAuthHeaders, fetchImpl }));
   const reconcileReader = rt.makeReconcileReader(rawReader);
   const scan = (xml) => scanAgentTaskLeaves(xml, demand.scanTaskDefinitions);
   const logger = rt.asLogger(getLogger());
@@ -4996,16 +5081,8 @@ async function resolveLinkedPromptSource(camunda, env = process.env, { baseUrl: 
   // pre-resolved base (already normalized at worker startup) is reused verbatim to
   // avoid a per-job config.json read.
   const baseUrl = preResolvedBase ?? resolveLinkedPromptBase(camunda, env);
-  let authHeaders;
-  if (env.NANO_REST_TOKEN) {
-    authHeaders = { Authorization: `Bearer ${env.NANO_REST_TOKEN}` };
-  } else if (camunda && typeof camunda.getAuthHeaders === 'function') {
-    try {
-      authHeaders = await camunda.getAuthHeaders();
-    } catch {
-      authHeaders = undefined;
-    }
-  }
+  const resolveAuth = createEngineAuthResolver({ camunda, token: env.NANO_REST_TOKEN });
+  const authHeaders = resolveAuth ? await resolveAuth() : undefined;
   return { baseUrl, authHeaders };
 }
 
@@ -11138,6 +11215,8 @@ async function raceProbeCandidates(port, {
  */
 async function discoverAgenticHubs(engineBaseUrl, {
   token = LOCAL_AGENTIC_TOKEN,
+  camunda,
+  authHeaders,
   fetchImpl = globalThis.fetch,
   wsProbe = probeAgenticChannel,
   lookupImpl = dnsLookup,
@@ -11177,7 +11256,11 @@ async function discoverAgenticHubs(engineBaseUrl, {
   const controller = new AbortController();
   const timer = setTimeout(() => controller.abort(), fetchTimeoutMs);
   try {
-    const res = await fetchImpl(`${base}/console/api/projects`, { signal: controller.signal });
+    // Issue #315: carry the engine's auth headers (e.g. profile basic auth /
+    // OAuth) on the `/console/api/projects` discovery fetch so a reverse proxy
+    // enforcing basic auth doesn't 401 hub discovery.
+    const authedFetch = withEngineAuthFetch(fetchImpl, { camunda, authHeaders });
+    const res = await authedFetch(`${base}/console/api/projects`, { signal: controller.signal });
     if (!res || !res.ok) return [];
     projects = await res.json();
   } catch {
@@ -11265,7 +11348,7 @@ async function resolveAgenticTarget({ camunda, cache, ...opts } = {}) {
   // Explicit target wins verbatim and skips discovery entirely.
   if (base.explicitUrl) return { status: 'connect', config: base };
 
-  const hubs = await discoverAgenticHubs(base.url, { token: base.token, ...opts });
+  const hubs = await discoverAgenticHubs(base.url, { token: base.token, camunda, ...opts });
 
   // The host to suggest in operator-facing messages: the engine's own host
   // (bracketed if an IPv6 literal, so the suggested URL authority is valid), so a
@@ -12364,10 +12447,14 @@ async function workAgent(req, flags, ctx) {
   let jobTypes;
   if (autoMode) {
     try {
-      const autoTypes = await resolveAutoJobTypes({ restConfig, scope: autoScope });
+      const autoTypes = await resolveAutoJobTypes({ restConfig, camunda, scope: autoScope });
       jobTypes = [...new Set([...autoTypes, ...extraJobTypes])];
     } catch (err) {
-      logger.warn(`--auto: initial engine read failed (${err?.message || err}); starting with no auto pollers — will retry on the next poll.`);
+      if (isEngineAuthError(err)) {
+        logger.warn(`--auto: ENGINE AUTH FAILED (${err?.message || err}) — check your c8ctl profile credentials / NANO_REST_TOKEN. Starting with 0 auto job types; this worker will serve NO auto-discovered jobs until auth is fixed.`);
+      } else {
+        logger.warn(`--auto: initial engine read failed (${err?.message || err}); starting with no auto pollers — will retry on the next poll.`);
+      }
       if (isLikelyLocalNetworkTccBlock({ error: err })) logger.warn(localNetworkTccHint());
       jobTypes = [...new Set(extraJobTypes)];
     }
@@ -21812,6 +21899,10 @@ export {
   serviceTaskOptsOutOfAutoSubscribe,
   autoSubscribeOptOutElementIds,
   readDeployedAgentJobTypes,
+  defaultC8RestReader,
+  createEngineAuthResolver,
+  withEngineAuthFetch,
+  isEngineAuthError,
   resolveAutoJobTypes,
   loadSupervisorRuntime,
   createAgenticEndpoint,

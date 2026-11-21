@@ -6471,3 +6471,53 @@ test('createIdleLivenessMonitor survives a real silent subtree cycling short-liv
     try { process.kill(-child.pid, 'SIGKILL'); } catch { /* best effort */ }
   }
 });
+
+// #308 review: bounded childless-gap grace. Drive deterministic sample sequences
+// and record at which probe the idle-kill fires.
+async function runSeqMonitor({ subtree, extra = null }) {
+  let calls = 0; let killedAt = null;
+  const at = (seq, i) => seq[Math.min(i, seq.length - 1)];
+  const mon = createIdleLivenessMonitor({
+    getPid: () => 100,
+    idleTimeoutMs: 15,
+    recoveryWindowMs: 15,
+    isSettled: () => false,
+    sampleCpu: () => at(subtree, calls++),
+    extraSamplers: extra ? [() => at(extra, calls - 1)] : null,
+    onIdleKill: () => { killedAt = calls; },
+  });
+  mon.arm();
+  await new Promise((r) => setTimeout(r, 200));
+  mon.stop();
+  return killedAt;
+}
+
+test('createIdleLivenessMonitor: subtree 1 → 0 → 1 survives the childless gap (#308)', async () => {
+  const one = (pid) => ({ descendants: 1, cpu: 0, pids: [pid], resolutionMs: 0 });
+  const zero = { descendants: 0, cpu: 0, pids: [], resolutionMs: 0 };
+  const killedAt = await runSeqMonitor({ subtree: [one(201), zero, one(202), one(203), one(204), one(205), one(206), one(207), one(208), one(209), one(210), one(211), one(212), one(213), one(214), one(215), one(216)] });
+  assert.ok(killedAt == null || killedAt > 3, `the gap sample must not kill (killed at probe ${killedAt})`);
+});
+
+test('createIdleLivenessMonitor: subtree 1 → 0 → 0 kills after one grace window (#308)', async () => {
+  const killedAt = await runSeqMonitor({ subtree: [
+    { descendants: 1, cpu: 0, pids: [201], resolutionMs: 0 },
+    { descendants: 0, cpu: 0, pids: [], resolutionMs: 0 },
+    { descendants: 0, cpu: 0, pids: [], resolutionMs: 0 },
+  ] });
+  assert.equal(killedAt, 3, 'second consecutive childless sample is killed');
+});
+
+test('createIdleLivenessMonitor: workspace [A] → [B] → [] grants a recovery window, [] → [] kills (#308)', async () => {
+  const childless = { descendants: 0, cpu: 0, pids: [], resolutionMs: 0 };
+  const killedAt = await runSeqMonitor({
+    subtree: [childless],
+    extra: [
+      { processes: 1, cpu: 0, pids: [301], resolutionMs: 0 },
+      { processes: 1, cpu: 0, pids: [302], resolutionMs: 0 },
+      { processes: 0, cpu: 0, pids: [], resolutionMs: 0 },
+      { processes: 0, cpu: 0, pids: [], resolutionMs: 0 },
+    ],
+  });
+  assert.equal(killedAt, 4, 'last workspace worker exiting defers once; a second empty sample ages out');
+});

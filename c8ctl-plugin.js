@@ -3017,7 +3017,7 @@ function createIdleLivenessMonitor({ getPid, idleTimeoutMs, recoveryWindowMs, on
         if (s.processes > 0 && Number.isFinite(s.resolutionMs)) extraResolutionMs = Math.max(extraResolutionMs, s.resolutionMs);
         const before = prevExtra && prevExtra[i];
         if (before != null && Number.isFinite(before.cpu) && s.cpu !== before.cpu) extraActive = true;
-        if (before != null && s.processes > 0 && pidSetChanged(before.pids, s.pids)) extraActive = true;
+        if (before != null && pidSetChanged(before.pids, s.pids)) extraActive = true;
       }
       const hadBaseline = prevExtra != null;
       const prevReadings = prevExtra || [];

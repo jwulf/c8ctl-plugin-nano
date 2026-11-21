@@ -16,7 +16,7 @@
 // 75 (EX_TEMPFAIL) = unknown — transient engine/network error or the worker is
 // unreachable; retry briefly, then decide.
 import { createServer, connect } from 'node:net';
-import { readFileSync, writeFileSync, rmSync } from 'node:fs';
+import { openSync, readSync, fstatSync, closeSync, writeFileSync, rmSync, constants as fsc } from 'node:fs';
 import { randomBytes } from 'node:crypto';
 import { tmpdir } from 'node:os';
 import { join } from 'node:path';
@@ -49,12 +49,37 @@ export function writeFence(path, reason) {
   }
 }
 
+/** Max bytes of a fence file we ever read (the worker writes one short line). */
+export const FENCE_READ_MAX = 4096;
+
+/**
+ * Read the fence without ever blocking or buffering unboundedly. The path lives
+ * in agent-writable space, so an agent could plant a FIFO (a sync read would
+ * block the worker's event loop — heartbeat + abort included), a symlink to
+ * one, a directory, or a huge file. Open is nonblocking + no-follow, the
+ * descriptor must be a regular file, and at most FENCE_READ_MAX bytes are
+ * read. Policy: ENOENT == no fence; ANY other entry that is present but not a
+ * readable regular file FAILS CLOSED as lost (`fence-invalid`), consistent
+ * with writeFence treating any existing entry as a fence.
+ */
 export function readFence(path) {
   if (!path) return null;
+  let fd;
   try {
-    return readFileSync(path, 'utf8').trim() || 'lease-lost';
+    fd = openSync(path, fsc.O_RDONLY | (fsc.O_NONBLOCK ?? 0) | (fsc.O_NOFOLLOW ?? 0));
+  } catch (err) {
+    if (err && (err.code === 'ENOENT' || err.code === 'ENOTDIR')) return null;
+    return 'lease-lost: fence-invalid';
+  }
+  try {
+    if (!fstatSync(fd).isFile()) return 'lease-lost: fence-invalid';
+    const buf = Buffer.alloc(FENCE_READ_MAX);
+    const n = readSync(fd, buf, 0, FENCE_READ_MAX, 0);
+    return buf.subarray(0, n).toString('utf8').split('\n')[0].trim() || 'lease-lost';
   } catch {
-    return null;
+    return 'lease-lost: fence-invalid';
+  } finally {
+    try { closeSync(fd); } catch { /* ignore */ }
   }
 }
 
@@ -169,16 +194,21 @@ export function createFenceRegistry({ check, socketPath = defaultSocketPath(), l
         sock.setTimeout(IDLE_SOCKET_MS, () => sock.destroy());
         sock.setEncoding('utf8');
         sock.on('error', () => {});
-        sock.on('data', (chunk) => {
+        const onData = (chunk) => {
           buf += chunk;
           if (buf.length > 64 * 1024) { sock.destroy(); return; }
           const nl = buf.indexOf('\n');
           if (nl < 0) return;
           const line = buf.slice(0, nl);
           buf = '';
+          // One request per connection: stop reading so a client can't pile up
+          // suspended handlers/reply callbacks on one socket while a check is pending.
+          sock.off('data', onData);
+          sock.pause();
           sock.setTimeout(0); // request received; the check itself is engine-bounded
           handle(line).then((res) => { try { sock.end(`${JSON.stringify(res)}\n`); } catch { /* ignore */ } });
-        });
+        };
+        sock.on('data', onData);
       });
       server.on('error', (err) => {
         logger?.warn?.(`fence-check socket unavailable (${err.message}) — agents can still read $NANO_FENCE`);

@@ -1,12 +1,12 @@
 // Issue #320: NANO_FENCE + fence-check.
 import assert from "node:assert/strict";
 import { test } from "node:test";
-import { mkdtempSync, existsSync, readFileSync, symlinkSync, lstatSync, chmodSync } from "node:fs";
+import { mkdtempSync, existsSync, readFileSync, writeFileSync, symlinkSync, lstatSync, chmodSync } from "node:fs";
 import { tmpdir } from "node:os";
 import { join } from "node:path";
 import { spawnSync } from "node:child_process";
 import { connect } from "node:net";
-import { createFenceRegistry, runFenceCheck, writeFence, FENCE_CHECK_SCRIPT } from "./nano-fence.mjs";
+import { createFenceRegistry, runFenceCheck, writeFence, readFence, FENCE_READ_MAX, FENCE_CHECK_SCRIPT } from "./nano-fence.mjs";
 import { createSupervisorDeps } from "./c8ctl-plugin.js";
 
 const BASIC = `Basic ${Buffer.from("u:p").toString("base64")}`;
@@ -348,4 +348,40 @@ test("writeFence never follows a planted (dangling) symlink and keeps the first 
   assert.equal(writeFence(plain, "job-gone"), true);
   assert.equal(writeFence(plain, "other"), true);
   assert.equal(readFileSync(plain, "utf8"), "job-gone\n");
+});
+
+test("#320 readFence: FIFO, symlink, directory fail closed without blocking; large file is bounded", { skip: process.platform === "win32" }, () => {
+  const dir = mkdtempSync(join(tmpdir(), "fence-rd-"));
+  const fifo = join(dir, "fifo");
+  assert.equal(spawnSync("mkfifo", [fifo]).status, 0);
+  assert.equal(readFence(fifo), "lease-lost: fence-invalid");
+  const link = join(dir, "link");
+  symlinkSync(fifo, link);
+  assert.equal(readFence(link), "lease-lost: fence-invalid");
+  assert.equal(readFence(dir), "lease-lost: fence-invalid");
+  assert.equal(readFence(join(dir, "absent")), null);
+  const big = join(dir, "big");
+  writeFileSync(big, "lease-lost: x" + "y".repeat(FENCE_READ_MAX * 4));
+  assert.ok(readFence(big).length <= FENCE_READ_MAX);
+});
+
+test("#320 fence socket: extra requests on one connection are not handled", async () => {
+  let calls = 0;
+  let release;
+  const gate = new Promise((r) => { release = r; });
+  const sockPath = join(mkdtempSync(join(tmpdir(), "fence-sk-")), "s.sock");
+  const reg = createFenceRegistry({ socketPath: sockPath, check: async () => { calls++; await gate; return { state: "held" }; } });
+  const { token } = await reg.register({ jobKey: "1" }, join(tmpdir(), `nf-${Date.now()}-${Math.random()}`));
+  const s = connect(sockPath);
+  await new Promise((r) => s.on("connect", r));
+  for (let i = 0; i < 50; i++) s.write(JSON.stringify({ token }) + "\n");
+  let out = "";
+  s.setEncoding("utf8");
+  s.on("data", (c) => { out += c; });
+  await new Promise((r) => setTimeout(r, 100));
+  release();
+  await new Promise((r) => s.on("close", r));
+  assert.equal(calls, 1);
+  assert.equal(out.trim().split("\n").length, 1);
+  reg.close();
 });

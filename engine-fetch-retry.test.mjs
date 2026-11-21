@@ -10,6 +10,7 @@ import {
   describeFetchError,
   fetchLinkedResourceContent,
   isTransientFetchError,
+  syncWorkerLogTimestamps,
   withLogTimestamps,
   withTransientFetchRetry,
 } from "./c8ctl-plugin.js";
@@ -195,4 +196,19 @@ test("withLogTimestamps prefixes ISO-8601 timestamps", () => {
   assert.deepEqual(cap.lines[1], ["info", { obj: 1 }]);
   assert.equal(l.mode, "text");
   assert.equal(withLogTimestamps(l), l, "idempotent");
+});
+
+test("syncWorkerLogTimestamps resets the flag for JSON output after text mode", () => {
+  const prev = globalThis.c8ctl;
+  try {
+    globalThis.c8ctl = { outputMode: "text" };
+    assert.equal(syncWorkerLogTimestamps(), true);
+    globalThis.c8ctl = { outputMode: "json" };
+    assert.equal(syncWorkerLogTimestamps(), false, "JSON mode must clear the flag");
+    globalThis.c8ctl = { getLogger: () => ({ mode: "json" }) };
+    assert.equal(syncWorkerLogTimestamps(), false);
+  } finally {
+    globalThis.c8ctl = prev;
+    syncWorkerLogTimestamps();
+  }
 });

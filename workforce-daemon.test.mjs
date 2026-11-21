@@ -6,6 +6,7 @@
 // workers, a second start with an unchanged manifest is a NO-OP (no churn), a
 // scale-down stops the surplus, and `stop` removes the manifest's workers and
 // stops the now-empty daemon.
+import './test-support/hermetic-service.mjs'; // issue #325: no real LaunchAgents/units
 import { test } from 'node:test';
 import assert from 'node:assert/strict';
 import { mkdtempSync, writeFileSync, rmSync } from 'node:fs';

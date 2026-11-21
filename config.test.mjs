@@ -2,6 +2,7 @@
 // real config read/write helpers against an isolated C8CTL_NANO_HOME temp dir,
 // so they exercise the on-disk config.json round-trip without touching the
 // operator's real state.
+import './test-support/hermetic-service.mjs'; // issue #325: no real LaunchAgents/units
 import { test } from 'node:test';
 import assert from 'node:assert/strict';
 import { mkdtempSync, writeFileSync, rmSync, chmodSync } from 'node:fs';

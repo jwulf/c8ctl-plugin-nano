@@ -4,6 +4,7 @@
 // shim stands in for the CLI: for `nano supervisor __daemon` it runs the real
 // exported daemon; for `nano work <profile>` it is an idle worker stand-in
 // (so no createClient/broker is needed).
+import './test-support/hermetic-service.mjs'; // issue #325: no real LaunchAgents/units
 import { test } from 'node:test';
 import assert from 'node:assert/strict';
 import { mkdtempSync, writeFileSync, readFileSync, readdirSync, rmSync, statSync, existsSync } from 'node:fs';

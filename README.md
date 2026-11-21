@@ -1485,6 +1485,15 @@ it cannot (e.g. `launchctl` is unavailable, or you set `C8CTL_NANO_NO_LAUNCHD=1`
 it prints a prominent **warning** pointing at `supervisor install` instead of
 silently leaving a fleet that will wedge on logout.
 
+The auto-reparent is **skipped** when `C8CTL_NANO_HOME` points at a non-default
+state home (e.g. a test's temp dir): an auto-registered login item tied to a
+throwaway home would be respawned by launchd forever. Run `supervisor install`
+explicitly for a custom home. `C8CTL_NANO_SERVICE_DIR` overrides the directory
+the LaunchAgent plist / systemd user unit is written to (the test suite points it
+at a temp dir, clears `SSH_*` and sets `C8CTL_NANO_NO_LAUNCHD=1` via
+`test-support/hermetic-service.mjs`, and fails if a run leaks a service file or
+an orphaned temp-home daemon).
+
 > **macOS Local Network Privacy + a LAN engine (macOS 15 Sequoia / 26 Tahoe).**
 > The `gui/$UID` LaunchAgent that keeps the fleet alive across SSH logout is a
 > **distinct TCC identity** — and on macOS 15+ it is **not** granted **Local

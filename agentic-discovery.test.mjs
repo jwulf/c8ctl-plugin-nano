@@ -5,6 +5,7 @@
 // non-nano projects API (or a discovery timeout) degrades to a non-fatal
 // advisory. The projects-API read and the WS upgrade probe are both injected so
 // the tests never touch a real socket.
+import './test-support/hermetic-service.mjs'; // issue #325: no real LaunchAgents/units
 import { test } from 'node:test';
 import assert from 'node:assert/strict';
 import { mkdtempSync, rmSync } from 'node:fs';

@@ -15,6 +15,7 @@
 // exports below do not exist, so this file fails to import (red); with the fix it
 // passes (green).
 
+import './test-support/hermetic-service.mjs'; // issue #325: no real LaunchAgents/units
 import { test } from 'node:test';
 import assert from 'node:assert/strict';
 import { mkdtempSync, mkdirSync, writeFileSync, readFileSync, rmSync, existsSync, utimesSync, readdirSync, symlinkSync } from 'node:fs';

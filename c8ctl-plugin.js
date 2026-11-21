@@ -427,7 +427,11 @@ function expandHome(p) {
 function getStateHome() {
   const env = process.env.C8CTL_NANO_HOME;
   if (env) return expandHome(env);
+  return defaultStateHome();
+}
 
+/** The platform-default state home, ignoring any C8CTL_NANO_HOME override. */
+function defaultStateHome() {
   const home = homedir();
   switch (osPlatform()) {
     case 'darwin':
@@ -18986,7 +18990,29 @@ function supervisorServiceLabel() {
 
 /** Per-user LaunchAgent plist path (macOS). */
 function launchAgentPlistPath() {
-  return join(homedir(), 'Library', 'LaunchAgents', `${supervisorServiceLabel()}.plist`);
+  return join(serviceDirOverride() ?? join(homedir(), 'Library', 'LaunchAgents'), `${supervisorServiceLabel()}.plist`);
+}
+
+/**
+ * C8CTL_NANO_SERVICE_DIR overrides the directory the LaunchAgent plist / systemd
+ * user unit is written to (issue #325), so a test exercising install/uninstall
+ * never touches the real ~/Library/LaunchAgents or ~/.config/systemd/user.
+ */
+function serviceDirOverride(env = process.env) {
+  const v = env.C8CTL_NANO_SERVICE_DIR;
+  return v ? expandHome(v) : null;
+}
+
+/**
+ * True when C8CTL_NANO_HOME points somewhere other than the platform default
+ * state home (issue #325). Auto re-parenting a throwaway/custom state home into
+ * a login item is never what an operator wants — they must ask explicitly with
+ * `supervisor install`.
+ */
+function stateHomeOverridden(env = process.env) {
+  const v = env.C8CTL_NANO_HOME;
+  if (!v) return false;
+  return resolvePath(expandHome(v)) !== resolvePath(defaultStateHome());
 }
 
 /** systemd --user unit file name / path (Linux). */
@@ -18994,6 +19020,8 @@ function systemdUnitName() {
   return `c8ctl-nano-supervisor-${supervisorServiceHash()}.service`;
 }
 function systemdUserUnitPath() {
+  const override = serviceDirOverride();
+  if (override) return join(override, systemdUnitName());
   const base = process.env.XDG_CONFIG_HOME || join(homedir(), '.config');
   return join(base, 'systemd', 'user', systemdUnitName());
 }
@@ -19367,6 +19395,13 @@ async function maybeReparentOrWarnOnStart(logger) {
   if (!isSshSession()) return false;               // a local login session isn't torn down like SSH
   if (await liveSupervisor()) return false;        // adopting an existing daemon — nothing to re-parent
   if (coerceBool(process.env.C8CTL_NANO_NO_LAUNCHD, false)) { warnSshTeardown(logger); return false; }
+  if (stateHomeOverridden()) {
+    // Issue #325: never auto-register a login item for a non-default state home
+    // (e.g. a test's temp C8CTL_NANO_HOME) — launchd would respawn it forever.
+    logger.warn('C8CTL_NANO_HOME is overridden to a non-default state home — not auto-installing a LaunchAgent. Run `c8ctl nano supervisor install` explicitly if you want one.');
+    warnSshTeardown(logger);
+    return false;
+  }
   logger.info('macOS + SSH detected — re-parenting the supervisor into the gui launchd domain so it survives logout…');
   const ok = await installSupervisorServiceDarwin(logger);
   if (!ok) { warnSshTeardown(logger); return false; }
@@ -22484,6 +22519,9 @@ export {
   getSupervisorSocketPath,
   getSupervisorStateFile,
   isSshSession,
+  stateHomeOverridden,
+  serviceDirOverride,
+  defaultStateHome,
   xmlEscape,
   supervisorServiceLabel,
   launchAgentPlistPath,

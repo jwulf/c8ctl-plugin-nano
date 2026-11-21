@@ -6,6 +6,7 @@
 //   - `c8ctl nano start` prints a PLAIN `…/console` URL (no `?tour=`),
 //   - `c8ctl nano hire` (and `work`) print NO console link at all.
 // The port is non-default throughout, so a hardcoded 8080 would fail.
+import './test-support/hermetic-service.mjs'; // issue #325: no real LaunchAgents/units
 import { test } from 'node:test';
 import assert from 'node:assert/strict';
 

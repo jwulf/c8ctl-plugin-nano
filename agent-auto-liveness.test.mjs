@@ -12,6 +12,7 @@
 // the process alive with 0 pollers is the (now REF'd) `--auto` poll timer. The
 // engine read is pointed at a dead 127.0.0.1 port, so the initial read fails
 // deterministically and the worker takes the 0-poller path.
+import './test-support/hermetic-service.mjs'; // issue #325: no real LaunchAgents/units
 import { test } from 'node:test';
 import assert from 'node:assert/strict';
 import { spawn } from 'node:child_process';

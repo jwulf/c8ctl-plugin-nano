@@ -9,6 +9,7 @@
 // tests. This closes that gap: it drives the REAL exported `workAgent` in a
 // child process with a stubbed c8ctl runtime whose `createClient` records the
 // profile argument it was called with, and asserts the ctx override reached it.
+import './test-support/hermetic-service.mjs'; // issue #325: no real LaunchAgents/units
 import { test } from 'node:test';
 import assert from 'node:assert/strict';
 import { spawn } from 'node:child_process';

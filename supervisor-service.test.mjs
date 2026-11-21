@@ -6,6 +6,7 @@
 // systemctl IO itself is best-effort and exercised only on the target platform,
 // but the *decisions* around it (which verbs run, in what order, and when we
 // give up) are covered here through an injected runner.
+import { HERMETIC_SERVICE_DIR } from './test-support/hermetic-service.mjs'; // issue #325: no real LaunchAgents/units
 import { test } from 'node:test';
 import assert from 'node:assert/strict';
 import { readFileSync } from 'node:fs';
@@ -14,6 +15,8 @@ import { dirname, join } from 'node:path';
 
 import {
   isSshSession,
+  stateHomeOverridden,
+  defaultStateHome,
   xmlEscape,
   supervisorServiceLabel,
   launchAgentPlistPath,
@@ -66,9 +69,37 @@ test('service label / paths are deterministic and hash-suffixed', () => {
   assert.match(label, /^io\.nanobpm\.c8ctl-nano\.supervisor\.[0-9a-f]{8}$/);
   // Stable across calls for the same state home.
   assert.equal(supervisorServiceLabel(), label);
-  assert.ok(launchAgentPlistPath().endsWith(`Library/LaunchAgents/${label}.plist`));
+  // The hermetic helper points C8CTL_NANO_SERVICE_DIR at a temp dir (issue #325).
+  assert.equal(launchAgentPlistPath(), join(HERMETIC_SERVICE_DIR, `${label}.plist`));
   assert.match(systemdUnitName(), /^c8ctl-nano-supervisor-[0-9a-f]{8}\.service$/);
-  assert.ok(systemdUserUnitPath().endsWith(`systemd/user/${systemdUnitName()}`));
+  assert.equal(systemdUserUnitPath(), join(HERMETIC_SERVICE_DIR, systemdUnitName()));
+  const prev = process.env.C8CTL_NANO_SERVICE_DIR;
+  delete process.env.C8CTL_NANO_SERVICE_DIR;
+  try {
+    assert.ok(launchAgentPlistPath().endsWith(`Library/LaunchAgents/${label}.plist`));
+    assert.ok(systemdUserUnitPath().endsWith(`systemd/user/${systemdUnitName()}`));
+  } finally {
+    process.env.C8CTL_NANO_SERVICE_DIR = prev;
+  }
+});
+
+test('hermetic helper clears SSH_* and opts out of launchd (issue #325)', () => {
+  assert.equal(isSshSession(process.env), false);
+  assert.equal(process.env.C8CTL_NANO_NO_LAUNCHD, '1');
+  assert.ok(process.env.C8CTL_NANO_SERVICE_DIR);
+});
+
+test('stateHomeOverridden: only a non-default C8CTL_NANO_HOME counts (issue #325)', () => {
+  assert.equal(stateHomeOverridden({}), false);
+  assert.equal(stateHomeOverridden({ C8CTL_NANO_HOME: '/tmp/some-test-home' }), true);
+  const prev = process.env.C8CTL_NANO_HOME;
+  delete process.env.C8CTL_NANO_HOME;
+  try {
+    // getStateHome() with no override IS the default; naming it explicitly isn't an override.
+    assert.equal(stateHomeOverridden({ C8CTL_NANO_HOME: defaultStateHome() }), false);
+  } finally {
+    if (prev !== undefined) process.env.C8CTL_NANO_HOME = prev;
+  }
 });
 
 test('launchd targets compose gui/$UID[/label]', () => {

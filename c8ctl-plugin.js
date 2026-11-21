@@ -2595,13 +2595,16 @@ function parsePsTime(token) {
 
 /**
  * Sample the process subtree rooted at `rootPid` from Linux `/proc`.
- * Returns `{ descendants, cpu }` — the count of live descendant processes
- * (excluding the root) and the aggregate CPU time (utime+stime, in clock ticks)
- * summed across the WHOLE subtree including the root — or `null` when the tree
- * cannot be read (e.g. `/proc` unavailable). The descendant count is the
- * presence gate (a childless silent agent still ages out on silence); the CPU
- * aggregate is the progress signal (a present-but-hung `java` burning no CPU
- * still ages out).
+ * Returns `{ descendants, cpu, pids }` — the count of live descendant processes
+ * (excluding the root), the aggregate CPU time (utime+stime, in clock ticks)
+ * summed across the WHOLE subtree including the root, and the sorted array of
+ * live descendant PIDs — or `null` when the tree cannot be read (e.g. `/proc`
+ * unavailable). The descendant count is the presence gate (a childless silent
+ * agent still ages out on silence); the CPU aggregate and descendant PID-set
+ * turnover are the progress signals (a present-but-hung `java` burning no CPU
+ * with an unchanged PID set still ages out; a silent `cargo`/`rustc` tree
+ * cycling short-lived children registers progress even when aggregate CPU lands
+ * on the same value across samples, #308).
  */
 function sampleSubtreeCpuProc(rootPid) {
   let entries;
@@ -2635,6 +2638,7 @@ function sampleSubtreeCpuProc(rootPid) {
   if (!cpu.has(rootPid) && !children.has(rootPid)) return null; // root already gone
   let descendants = 0;
   let totalCpu = cpu.get(rootPid) || 0;
+  const descendantPids = [];
   const seen = new Set([rootPid]);
   const stack = [...(children.get(rootPid) || [])];
   while (stack.length) {
@@ -2642,28 +2646,38 @@ function sampleSubtreeCpuProc(rootPid) {
     if (seen.has(pid)) continue;
     seen.add(pid);
     descendants += 1;
+    descendantPids.push(pid);
     totalCpu += cpu.get(pid) || 0;
     const kids = children.get(pid);
     if (kids) for (const k of kids) if (!seen.has(k)) stack.push(k);
   }
-  return { descendants, cpu: totalCpu };
+  descendantPids.sort((a, b) => a - b);
+  return { descendants, cpu: totalCpu, pids: descendantPids };
 }
 
 /**
  * Non-Linux fallback: sample the subtree via a one-shot `ps`. Heavier than the
  * `/proc` read (it spawns a process) but only runs during an idle window, which
- * is rare by construction. Returns the same `{ descendants, cpu }` shape (cpu in
- * whole seconds here) plus `resolutionMs: 1000` to flag the coarse whole-second
- * CPU granularity — the monitor uses that so a probe window shorter than a
- * whole-second tick can't read flat CPU and false-kill a still-progressing but
- * low-churn subtree. Returns `null` when `ps` is unavailable/unparsable.
+ * is rare by construction. Returns `{ descendants, cpu, pids, resolutionMs }`
+ * (cpu in whole seconds here) plus `resolutionMs: 1000` to flag the coarse
+ * whole-second CPU granularity — the monitor uses that so a probe window shorter
+ * than a whole-second tick can't read flat CPU and false-kill a still-progressing
+ * but low-churn subtree. Also captures `pids` so short-lived child churn (e.g.
+ * `cargo` spawning/reaping `rustc` workers between samples) is detected as
+ * progress even if aggregate whole-second CPU happens to tie (#308). Returns
+ * `null` when `ps` is unavailable/unparsable.
  */
-function sampleSubtreeCpuPs(rootPid) {
+function sampleSubtreeCpuPs(rootPid, { runPs } = {}) {
   let out;
   try {
-    const r = spawnSync('ps', ['-A', '-o', 'pid=,ppid=,time='], { encoding: 'utf8', timeout: 5_000 });
-    if (r.status !== 0 || !r.stdout) return null;
-    out = r.stdout;
+    if (typeof runPs === 'function') {
+      out = runPs();
+    } else {
+      const r = spawnSync('ps', ['-A', '-o', 'pid=,ppid=,time='], { encoding: 'utf8', timeout: 5_000 });
+      if (r.status !== 0 || !r.stdout) return null;
+      out = r.stdout;
+    }
+    if (typeof out !== 'string' || !out) return null;
   } catch { return null; }
   const children = new Map();
   const cpu = new Map();
@@ -2679,6 +2693,7 @@ function sampleSubtreeCpuPs(rootPid) {
   if (!cpu.has(rootPid) && !children.has(rootPid)) return null;
   let descendants = 0;
   let totalCpu = cpu.get(rootPid) || 0;
+  const descendantPids = [];
   const seen = new Set([rootPid]);
   const stack = [...(children.get(rootPid) || [])];
   while (stack.length) {
@@ -2686,11 +2701,13 @@ function sampleSubtreeCpuPs(rootPid) {
     if (seen.has(pid)) continue;
     seen.add(pid);
     descendants += 1;
+    descendantPids.push(pid);
     totalCpu += cpu.get(pid) || 0;
     const kids = children.get(pid);
     if (kids) for (const k of kids) if (!seen.has(k)) stack.push(k);
   }
-  return { descendants, cpu: totalCpu, resolutionMs: 1000 };
+  descendantPids.sort((a, b) => a - b);
+  return { descendants, cpu: totalCpu, pids: descendantPids, resolutionMs: 1000 };
 }
 
 /**
@@ -2772,6 +2789,7 @@ function sampleWorkspaceCpuProc(workspaceDir, { readCwd, listPids, realpath, exc
   }
   let processes = 0;
   let totalCpu = 0;
+  const matchedPids = [];
   let scanned = 0;
   for (const name of entries) {
     if (scanned >= scanLimit) break;
@@ -2791,8 +2809,10 @@ function sampleWorkspaceCpuProc(workspaceDir, { readCwd, listPids, realpath, exc
     const stime = Number(tail[12]);
     totalCpu += (Number.isFinite(utime) ? utime : 0) + (Number.isFinite(stime) ? stime : 0);
     processes += 1;
+    matchedPids.push(pid);
   }
-  return { processes, cpu: totalCpu };
+  matchedPids.sort((a, b) => a - b);
+  return { processes, cpu: totalCpu, pids: matchedPids };
 }
 
 /**
@@ -2833,7 +2853,7 @@ function sampleWorkspaceCpuLsof(workspaceDir, { runLsof, runPs, realpath, exclud
       if (pids.length >= scanLimit) break;
     }
   }
-  if (pids.length === 0) return { processes: 0, cpu: 0, resolutionMs: 1000 };
+  if (pids.length === 0) return { processes: 0, cpu: 0, pids: [], resolutionMs: 1000 };
   const ps = typeof runPs === 'function' ? runPs : (list) => {
     const r = spawnSync('ps', ['-p', list.join(','), '-o', 'pid=,time='], { encoding: 'utf8', timeout: 5_000 });
     // ps exits 1 when some pids vanished between scans; partial stdout is valid.
@@ -2844,13 +2864,16 @@ function sampleWorkspaceCpuLsof(workspaceDir, { runLsof, runPs, realpath, exclud
   if (typeof psOut !== 'string') return null;
   let processes = 0;
   let totalCpu = 0;
+  const matchedPids = [];
   for (const line of psOut.split('\n')) {
     const m = line.trim().match(/^(\d+)\s+(\S+)$/);
     if (!m) continue;
+    matchedPids.push(Number(m[1]));
     totalCpu += parsePsTime(m[2]);
     processes += 1;
   }
-  return { processes, cpu: totalCpu, resolutionMs: 1000 };
+  matchedPids.sort((a, b) => a - b);
+  return { processes, cpu: totalCpu, pids: matchedPids, resolutionMs: 1000 };
 }
 
 /**
@@ -2918,6 +2941,24 @@ function sampleWorkspaceCpu(workspaceDir, { excludePids } = {}) {
  * show movement) and re-probes after the recovery window. The absolute
  * `--job-timeout` hard cap remains the ultimate backstop, untouched by this.
  */
+/**
+ * True when two samples both carry `pids` arrays and their live PID sets differ
+ * (a child exited or a new child spawned between samples). Used by the idle
+ * watchdog (#308) so a silent build spawning many short-lived children (e.g.
+ * `cargo` cycling `rustc` workers under macOS's coarse whole-second `ps`) is
+ * recognised as active even if the aggregate CPU happens to tie across samples.
+ * A hung process tree keeps the exact same PID set and flat CPU, so it still
+ * ages out and gets idle-killed.
+ */
+function pidSetChanged(prevPids, nextPids) {
+  if (!Array.isArray(prevPids) || !Array.isArray(nextPids)) return false;
+  if (prevPids.length !== nextPids.length) return true;
+  for (let i = 0; i < prevPids.length; i += 1) {
+    if (prevPids[i] !== nextPids[i]) return true;
+  }
+  return false;
+}
+
 function createIdleLivenessMonitor({ getPid, idleTimeoutMs, recoveryWindowMs, onIdleKill, isSettled, sampleCpu = sampleSubtreeCpu, extraSamplers = null, isActivityHold = null, maxActivityHoldMs, logger = null }) {
   const enabled = idleTimeoutMs && idleTimeoutMs > 0;
   const probeWindow = recoveryWindowMs && recoveryWindowMs > 0 ? recoveryWindowMs : idleTimeoutMs;
@@ -2976,6 +3017,7 @@ function createIdleLivenessMonitor({ getPid, idleTimeoutMs, recoveryWindowMs, on
         if (s.processes > 0 && Number.isFinite(s.resolutionMs)) extraResolutionMs = Math.max(extraResolutionMs, s.resolutionMs);
         const before = prevExtra && prevExtra[i];
         if (before != null && Number.isFinite(before.cpu) && s.cpu !== before.cpu) extraActive = true;
+        if (before != null && s.processes > 0 && pidSetChanged(before.pids, s.pids)) extraActive = true;
       }
       const hadBaseline = prevExtra != null;
       const prevReadings = prevExtra || [];
@@ -3005,13 +3047,27 @@ function createIdleLivenessMonitor({ getPid, idleTimeoutMs, recoveryWindowMs, on
     // only treat workspace CPU as idle once the flat time covers its resolution.
     const extraIdleConfirmed = extraFlatMs >= extraResolutionMs;
     // Childless / unsampleable / dead tree → silence is very likely a hang.
-    // But with extra (workspace) samplers wired we cannot yet distinguish "no
-    // workspace work" from "a workspace daemon whose baseline we have not
-    // taken" on a single reading — so take ONE baseline probe window before
-    // killing, exactly like the subtree first-elapse baseline below. Without
-    // extra samplers (or once a baseline shows no workspace activity) the
-    // legacy immediate kill applies.
+    // Two exceptions before declaring a kill:
+    //  1. If we previously saw live descendants (`prev != null`) and `sample`
+    //     shows the root is still alive (`sample != null`) with 0 descendants,
+    //     the probe may have landed in the brief gap between one short-lived
+    //     child exiting and the next spawning (e.g. `cargo` between `rustc`
+    //     invocations, #308). Don't kill on a single childless sample when we
+    //     just saw live children — re-baseline (`prev = null`) and re-check
+    //     after one probe window. A genuinely finished/childless silent agent
+    //     will read `descendants === 0` again on the next window and be killed.
+    //  2. With extra (workspace) samplers wired we cannot yet distinguish "no
+    //     workspace work" from "a workspace daemon whose baseline we have not
+    //     taken" on a single reading — so take ONE baseline probe window before
+    //     killing, exactly like the subtree first-elapse baseline below.
     if (!sample || sample.descendants <= 0) {
+      if (sample && prev != null && prev.descendants > 0) {
+        log(`silent for >= ${elapsed}ms with 0 descendants right after ${prev.descendants} live descendant(s) — child may have just exited between spawns; re-checking in ${probeWindow}ms`);
+        prev = null;
+        flatMs = 0;
+        schedule(probeWindow);
+        return;
+      }
       if (extras.length && !extraBaselined) {
         // Consume the baseline: the NEXT elapse compares against prevExtra and
         // either defers (workspace CPU moved) or kills (flat).
@@ -3042,6 +3098,14 @@ function createIdleLivenessMonitor({ getPid, idleTimeoutMs, recoveryWindowMs, on
       // than mis-killing a silent-but-busy job.
       if (sample.cpu < prev.cpu) {
         log(`silent for >= ${elapsed}ms but subtree CPU regressed (${prev.cpu} → ${sample.cpu}; a busy descendant exited) — progress, not a stall; deferring the idle-kill`);
+        prev = sample; flatMs = 0; schedule(probeWindow); return;
+      }
+      // Descendant PID set CHANGED → short-lived children exited/spawned (e.g.
+      // `cargo` cycling `rustc` invocations on macOS where coarse whole-second
+      // `ps` can read an equal aggregate CPU across samples, #308). Process
+      // turnover inside a live subtree is forward progress, not a hang.
+      if (pidSetChanged(prev.pids, sample.pids)) {
+        log(`silent for >= ${elapsed}ms but subtree descendant PID set changed (${prev.descendants} → ${sample.descendants}, cpu ${sample.cpu}) — short-lived child turnover is progress; deferring the idle-kill`);
         prev = sample; flatMs = 0; schedule(probeWindow); return;
       }
       // Live descendants but CPU exactly unchanged across a full window → a
@@ -21734,10 +21798,12 @@ export {
   spawnCapturePty,
   spawnCaptureAcp,
   sampleSubtreeCpu,
+  sampleSubtreeCpuPs,
   sampleWorkspaceCpu,
   sampleWorkspaceCpuProc,
   sampleWorkspaceCpuLsof,
   createIdleLivenessMonitor,
+  pidSetChanged,
   resolveLivenessOverrides,
   parsePsTime,
   ensureAcpFlag,

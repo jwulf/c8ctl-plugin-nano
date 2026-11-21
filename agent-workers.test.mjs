@@ -61,10 +61,12 @@ import {
   containerEngineAvailable,
   runAgentJob,
   sampleSubtreeCpu,
+  sampleSubtreeCpuPs,
   sampleWorkspaceCpu,
   sampleWorkspaceCpuProc,
   sampleWorkspaceCpuLsof,
   createIdleLivenessMonitor,
+  pidSetChanged,
   resolveLivenessOverrides,
   parsePsTime,
   provisionRepo,
@@ -6339,7 +6341,7 @@ test('sampleWorkspaceCpuLsof matches nested and physical (realpath) cwds', () =>
     runLsof: () => ['p10', 'n/phys/ws', 'p11', 'n/phys/ws/crates/a', 'p12', 'n/phys/wsx', 'p13', 'n/elsewhere', 'p14', 'n/link/ws/x'].join('\n'),
     runPs: (pids) => { assert.deepEqual(pids, [10, 11, 14]); return '10 0:01\n11 0:02\n14 0:00\n'; },
   });
-  assert.deepEqual(s, { processes: 3, cpu: 3, resolutionMs: 1000 });
+  assert.deepEqual(s, { processes: 3, cpu: 3, pids: [10, 11, 14], resolutionMs: 1000 });
   assert.equal(sampleWorkspaceCpuLsof('/link/ws', { runLsof: () => null }), null, 'lsof unavailable → null');
   const ex = sampleWorkspaceCpuLsof('/phys/ws', {
     excludePids: [10],
@@ -6357,4 +6359,111 @@ test('sampleWorkspaceCpuProc matches the physical cwd of a symlinked root', () =
   });
   if (process.platform === 'linux') assert.equal(s.processes, 1);
   else assert.equal(s.processes, 0, 'no /proc stat off-linux; but cwd matched (no throw)');
+});
+
+// #308: short-lived child turnover (cargo/rustc under coarse macOS ps) must
+// register as progress even when aggregate whole-second CPU ties across samples.
+test('pidSetChanged detects child exit/spawn turnover and ignores identical sets (#308)', () => {
+  assert.equal(pidSetChanged([10, 20], [10, 20]), false);
+  assert.equal(pidSetChanged([10, 20], [10, 21]), true);
+  assert.equal(pidSetChanged([10], [10, 20]), true);
+  assert.equal(pidSetChanged([10, 20], [10]), true);
+  assert.equal(pidSetChanged(undefined, [10]), false);
+  assert.equal(pidSetChanged([10], undefined), false);
+});
+
+test('sampleSubtreeCpuPs returns sorted descendant pids alongside cpu (#308)', () => {
+  const ps1 = [
+    '100 1 0:00.10',
+    '201 100 0:00.40',
+    '202 201 0:00.80',
+    '999 1 0:10.00',
+  ].join('\n');
+  const ps2 = [
+    '100 1 0:00.10',
+    '201 100 0:00.40',
+    '203 201 0:00.80',
+    '999 1 0:10.00',
+  ].join('\n');
+  const a = sampleSubtreeCpuPs(100, { runPs: () => ps1 });
+  const b = sampleSubtreeCpuPs(100, { runPs: () => ps2 });
+  assert.deepEqual(a, { descendants: 2, cpu: 0, pids: [201, 202], resolutionMs: 1000 });
+  assert.deepEqual(b, { descendants: 2, cpu: 0, pids: [201, 203], resolutionMs: 1000 });
+  assert.equal(pidSetChanged(a.pids, b.pids), true, 'cycled short-lived rustc pid is detected even when whole-second cpu ties at 0');
+});
+
+test('createIdleLivenessMonitor defers when short-lived descendants churn with equal aggregate CPU, kills once hung (#308)', async () => {
+  let killed = 0;
+  let churning = true;
+  let nextPid = 500;
+  const mon = createIdleLivenessMonitor({
+    getPid: () => 100,
+    idleTimeoutMs: 25,
+    recoveryWindowMs: 25,
+    isSettled: () => false,
+    // Aggregate CPU stays flat at 0 (simulating macOS ps whole-second floor on
+    // sub-second rustc children), but descendant pids keep rotating while churning.
+    sampleCpu: () => ({
+      descendants: 2,
+      cpu: 0,
+      pids: churning ? [201, ++nextPid] : [201, nextPid],
+      resolutionMs: 0,
+    }),
+    onIdleKill: () => { killed += 1; },
+  });
+  mon.arm();
+  await new Promise((r) => setTimeout(r, 140));
+  assert.equal(killed, 0, 'churning short-lived descendants must not be idle-killed even with flat aggregate CPU');
+  churning = false;
+  await new Promise((r) => setTimeout(r, 120));
+  mon.stop();
+  assert.equal(killed, 1, 'once pid set stops changing and CPU stays flat, the hung subtree is idle-killed');
+});
+
+test('createIdleLivenessMonitor survives a real silent subtree cycling short-lived CPU-busy children via ps sampler (#308)', { skip: process.platform === 'win32' }, async () => {
+  // Spawn a silent parent (like `cargo`) that keeps a persistent coordinator
+  // child (like a subshell / build wrapper) while continuously cycling
+  // short-lived CPU-busy children (like `rustc` workers) for longer than the
+  // idle+recovery window, using `sampleSubtreeCpuPs` directly (the macOS
+  // codepath) even on Linux.
+  const child = spawn(process.execPath, ['-e', `
+    const { spawn, spawnSync } = require('node:child_process');
+    // Keep a long-lived child so the coordinator subtree mirrors \`sh -c "cargo ..."\`
+    // while short-lived workers cycle underneath it.
+    const keeper = spawn(process.execPath, ['-e', 'setTimeout(() => {}, 5000)'], { stdio: 'ignore' });
+    const end = Date.now() + 4000;
+    try {
+      while (Date.now() < end) {
+        spawnSync(process.execPath, ['-e', 'const t=Date.now()+90; while(Date.now()<t){}'], { stdio: 'ignore' });
+      }
+    } finally {
+      try { keeper.kill('SIGKILL'); } catch {}
+    }
+  `], { stdio: 'ignore' });
+  let killed = 0;
+  const logs = [];
+  try {
+    // Wait briefly for the parent to enter its loop and spawn its children.
+    const waitUntil = Date.now() + 1000;
+    while (Date.now() < waitUntil) {
+      const s = sampleSubtreeCpuPs(child.pid);
+      if (s && s.descendants > 0) break;
+      await new Promise((r) => setTimeout(r, 25));
+    }
+    const mon = createIdleLivenessMonitor({
+      getPid: () => child.pid,
+      idleTimeoutMs: 120,
+      recoveryWindowMs: 120,
+      isSettled: () => false,
+      sampleCpu: sampleSubtreeCpuPs,
+      logger: { info: (m) => logs.push(m) },
+      onIdleKill: () => { killed += 1; },
+    });
+    mon.arm();
+    await new Promise((r) => setTimeout(r, 1400));
+    mon.stop();
+    assert.equal(killed, 0, `real silent subtree cycling short-lived children must not be idle-killed under sampleSubtreeCpuPs; logs:\n${logs.join('\n')}`);
+  } finally {
+    try { child.kill('SIGKILL'); } catch {}
+  }
 });

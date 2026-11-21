@@ -186,6 +186,71 @@ test("a hung engine renewal is bounded and cancelled (unknown, request aborted)"
   assert.equal(aborted, true, "the SDK request is cancelled on timeout");
 });
 
+test("a latched loss beats a pending transient (unknown) engine result", async () => {
+  // The engine check fails transiently, but the heartbeat confirms the loss
+  // while that check is still pending: the answer must be `lost`, not `unknown`.
+  let fences;
+  const fencePath = join(mkdtempSync(join(tmpdir(), "fence-test-")), "fence");
+  fences = createFenceRegistry({
+    check: async (j) => { await new Promise((r) => setTimeout(r, 30)); fences.leaseLost(j, "lease-lost: 409"); return { state: "unknown", error: "boom" }; },
+  });
+  try {
+    const { env } = await fences.register(job, fencePath);
+    assert.deepEqual(await runFenceCheck({ env }), { code: 1, message: "lease-lost: 409" });
+  } finally {
+    fences.close();
+  }
+});
+
+test("a latched loss beats a pending unknown even when the fence write cannot land (unwritable dir)", async () => {
+  const dir = mkdtempSync(join(tmpdir(), "fence-test-"));
+  const fencePath = join(dir, "fence");
+  let fences;
+  fences = createFenceRegistry({
+    // The heartbeat confirms the loss from INSIDE the pending check, so the loss
+    // is guaranteed to land while the engine call is in flight (not before the
+    // server's handler runs) — the answer must be `lost`, not `unknown`.
+    check: async (j) => { fences.leaseLost(j, "lease-lost: 409"); await new Promise((r) => setTimeout(r, 30)); return { state: "unknown", error: "boom" }; },
+  });
+  try {
+    const { env } = await fences.register(job, fencePath);
+    chmodSync(dir, 0o555); // unwritable: the fence write fails, only the latch survives
+    assert.deepEqual(await runFenceCheck({ env }), { code: 1, message: "lease-lost: 409" });
+    assert.equal(existsSync(fencePath), false, "no fence file could be written");
+  } finally {
+    chmodSync(dir, 0o755);
+    fences.close();
+  }
+});
+
+test("client: a fence written before an unknown reply is received wins over exit 75", async () => {
+  // The worker queues an `unknown` reply, then the heartbeat writes the fence
+  // before the client finishes reading: the client must report the known loss.
+  let fences;
+  const fencePath = join(mkdtempSync(join(tmpdir(), "fence-test-")), "fence");
+  fences = createFenceRegistry({
+    check: async (j) => { const r = { state: "unknown", error: "boom" }; fences.leaseLost(j, "lease-lost: 409"); return r; },
+  });
+  try {
+    const { env } = await fences.register(job, fencePath);
+    assert.deepEqual(await runFenceCheck({ env }), { code: 1, message: "lease-lost: 409" });
+  } finally {
+    fences.close();
+  }
+});
+
+test("client: a fence written after the connection errors wins over exit 75", async () => {
+  // Point the client at a dead socket; write the fence before the error
+  // completion is processed: the known loss must win over `worker unreachable`.
+  const dir = mkdtempSync(join(tmpdir(), "fence-test-"));
+  const fencePath = join(dir, "fence");
+  const deadSock = join(dir, "dead.sock");
+  const env = { NANO_FENCE: fencePath, NANO_FENCE_SOCKET: deadSock, NANO_FENCE_TOKEN: "x" };
+  const pending = runFenceCheck({ env });
+  writeFence(fencePath, "lease-lost: 409");
+  assert.deepEqual(await pending, { code: 1, message: "lease-lost: 409" });
+});
+
 test("an idle fence-check client is dropped and cannot pin the worker", async () => {
   const fences = createFenceRegistry({ check: async () => ({ state: "held" }), idleSocketMs: 100 });
   try {

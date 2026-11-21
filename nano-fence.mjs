@@ -115,6 +115,12 @@ export function createFenceRegistry({ check, socketPath = defaultSocketPath(), l
       if (byToken.get(req.token) !== entry) return { state: 'unknown', error: 'job ended while checking' };
       return { state: 'held' };
     }
+    // A transient engine failure (`unknown`) must not mask a loss the heartbeat
+    // confirmed while the check was pending — known loss beats a stale unknown,
+    // even when its fence write could not land on disk.
+    if (entry.lostReason) return { state: 'lost', reason: entry.lostReason };
+    const afterUnknown = readFence(entry.fencePath);
+    if (afterUnknown) return { state: 'lost', reason: latchLost(entry, afterUnknown) };
     return { state: 'unknown', error: (res && res.error) || 'unknown' };
   };
 
@@ -192,7 +198,18 @@ export function runFenceCheck({ env = process.env, timeoutMs = 30_000 } = {}) {
   return new Promise((resolve) => {
     let done = false;
     let buf = '';
-    const finish = (r) => { if (done) return; done = true; clearTimeout(timer); try { sock.destroy(); } catch { /* ignore */ } resolve(r); };
+    // A fence the worker wrote after queueing its reply (or after the connection
+    // errored/timed out) must win over any non-lost completion — re-read it
+    // before accepting `held` OR returning `unknown`, so a confirmed loss is
+    // never reported as a stale success or a retryable unknown.
+    const finish = (r) => {
+      if (done) return;
+      if (r.code !== FENCE_EXIT_LOST) {
+        const post = readFence(fencePath);
+        if (post) r = { code: FENCE_EXIT_LOST, message: post };
+      }
+      done = true; clearTimeout(timer); try { sock.destroy(); } catch { /* ignore */ } resolve(r);
+    };
     const sock = connect(socketPath);
     const timer = setTimeout(() => finish({ code: FENCE_EXIT_UNKNOWN, message: 'fence-check timed out' }), timeoutMs);
     sock.setEncoding('utf8');
@@ -203,10 +220,6 @@ export function runFenceCheck({ env = process.env, timeoutMs = 30_000 } = {}) {
       let res = null;
       try { res = JSON.parse(buf.trim()); } catch { /* fallthrough */ }
       if (res?.state === 'held') {
-        // Re-read immediately before accepting: a fence written after the worker
-        // queued its reply must win over the stale `held`.
-        const post = readFence(fencePath);
-        if (post) return finish({ code: FENCE_EXIT_LOST, message: post });
         return finish({ code: FENCE_EXIT_HELD, message: 'held' });
       }
       if (res?.state === 'lost') {

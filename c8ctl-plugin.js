@@ -19378,16 +19378,6 @@ function ensureLaunchAgentStarted(logger, { run = runLaunchctl, uid, label, plis
 }
 
 /**
- * On a macOS `supervisor start`/`attach` over SSH, re-parent the daemon into the
- * persistent `gui/$UID` launchd domain (via an installed LaunchAgent) so it
- * survives logout instead of dying with the SSH session. If we cannot (or the
- * operator opts out with C8CTL_NANO_NO_LAUNCHD), warn loudly and fall through to
- * the ordinary detached spawn. Returns `true` when a service owns the daemon
- * (already installed, or just reparented) so the caller adopts it instead of
- * spawning a competing session-bound daemon; `false` on every non-exposed path
- * (Linux, a local login, opt-out/failure, or a service that would not start).
- */
-/**
  * Pure policy for an uninstalled macOS+SSH start (issue #325): 'opt-out'
  * (C8CTL_NANO_NO_LAUNCHD), 'custom-home' (non-default C8CTL_NANO_HOME — never
  * auto-install), else 'install'.
@@ -19398,6 +19388,16 @@ function sshAutoInstallPolicy(env = process.env) {
   return 'install';
 }
 
+/**
+ * On a macOS `supervisor start`/`attach` over SSH, re-parent the daemon into the
+ * persistent `gui/$UID` launchd domain (via an installed LaunchAgent) so it
+ * survives logout instead of dying with the SSH session. If we cannot (or the
+ * operator opts out with C8CTL_NANO_NO_LAUNCHD), warn loudly and fall through to
+ * the ordinary detached spawn. Returns `true` when a service owns the daemon
+ * (already installed, or just reparented) so the caller adopts it instead of
+ * spawning a competing session-bound daemon; `false` on every non-exposed path
+ * (Linux, a local login, opt-out/failure, or a service that would not start).
+ */
 async function maybeReparentOrWarnOnStart(logger) {
   if (osPlatform() !== 'darwin') return false;     // Linux already survives logout
   if (supervisorServiceInstalled()) {

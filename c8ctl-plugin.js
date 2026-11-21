@@ -19308,7 +19308,11 @@ async function installSupervisorServiceLinux(logger) {
   catch { /* best effort */ }
 
   runSystemctlUser(['daemon-reload']);
-  const en = runSystemctlUser(['enable', '--now', systemdUnitName()]);
+  // A unit written to an overridden C8CTL_NANO_SERVICE_DIR is outside systemd's
+  // unit search path, so enable it by absolute path (systemd links it in);
+  // `disable <name>` on uninstall removes that link again.
+  const enableTarget = serviceDirOverride() ? unitPath : systemdUnitName();
+  const en = runSystemctlUser(['enable', '--now', enableTarget]);
   if (en.code !== 0) { logger.error(`systemctl --user enable failed: ${en.stderr || en.error?.message || 'unknown error'}`); return false; }
   logger.info(`Installed systemd --user unit ${systemdUnitName()} (enabled + started).`);
   logger.info(`  unit: ${unitPath}`);

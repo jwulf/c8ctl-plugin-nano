@@ -51,7 +51,8 @@ export function listRealServiceFiles() {
 /**
  * Live `supervisor __daemon` processes whose C8CTL_NANO_HOME is under the temp
  * dir but no longer exists — the "launchd respawns a torn-down test daemon"
- * signature. Best-effort: returns [] where `ps` cannot show environments.
+ * signature. Returns only `{ pid, home }` (never the raw ps line, which
+ * includes the process environment and thus credentials). Best-effort: returns [] where `ps` cannot show environments.
  */
 export function listOrphanTempDaemons() {
   if (platform() === 'win32') return [];
@@ -65,25 +66,28 @@ export function listOrphanTempDaemons() {
     if (!m) continue;
     const home = m[1];
     if ((home.startsWith(tmp) || home.startsWith('/tmp') || home.startsWith('/private/var/folders')) && !existsSync(home)) {
-      hits.push(line.trim());
+      // Never keep the raw `ps -e` line: it carries the daemon's whole
+      // environment (GITHUB_TOKEN, …) and would leak it into test/CI logs.
+      const pid = line.trim().split(/\s+/)[0];
+      hits.push({ pid, home });
     }
   }
   return hits;
 }
 
 const baselineFiles = new Set(listRealServiceFiles());
-const baselineDaemons = new Set(listOrphanTempDaemons().map((l) => l.split(/\s+/)[0]));
+const baselineDaemons = new Set(listOrphanTempDaemons().map((d) => d.pid));
 
 after(() => {
   try { rmSync(serviceDir, { recursive: true, force: true }); } catch {}
   const leakedFiles = listRealServiceFiles().filter((f) => !baselineFiles.has(f));
-  const leakedDaemons = listOrphanTempDaemons().filter((l) => !baselineDaemons.has(l.split(/\s+/)[0]));
+  const leakedDaemons = listOrphanTempDaemons().filter((d) => !baselineDaemons.has(d.pid));
   if (leakedFiles.length || leakedDaemons.length) {
     throw new Error(
       `Test run leaked supervisor services (issue #325):\n` +
       leakedFiles.map((f) => `  service file: ${f}`).join('\n') +
       (leakedFiles.length && leakedDaemons.length ? '\n' : '') +
-      leakedDaemons.map((l) => `  daemon: ${l}`).join('\n'),
+      leakedDaemons.map((d) => `  daemon: pid ${d.pid} (C8CTL_NANO_HOME=${d.home}, gone)`).join('\n'),
     );
   }
 });

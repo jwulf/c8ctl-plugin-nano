@@ -902,8 +902,14 @@ URL or credentials**:
     retry briefly, then decide. Transient errors never write the fence.
 
 ```sh
-node "$NANO_FENCE_CHECK" || { echo "lease lost: $(cat "$NANO_FENCE" 2>/dev/null)"; exit 1; }
-git push origin HEAD
+# Branch on the exit code: only 1 means lost; 75 is transient (retry, then decide).
+node "$NANO_FENCE_CHECK"; rc=$?
+if [ $rc -eq 75 ]; then sleep 2; node "$NANO_FENCE_CHECK"; rc=$?; fi
+case $rc in
+  0) git push origin HEAD ;;
+  1) echo "lease lost: $(cat "$NANO_FENCE" 2>/dev/null)"; exit 1 ;;
+  *) echo "lease state unknown (exit $rc); not pushing"; exit 75 ;;
+esac
 ```
 
 ### Task envelope, sandboxes & disk hygiene

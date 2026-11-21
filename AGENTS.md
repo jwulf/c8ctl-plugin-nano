@@ -112,6 +112,15 @@ SDK client (job workers) — do **not** add the SDK as a dependency or use raw
   (age-gated, in-flight skipped) and deleted per-job unless `--keep-runs`.
   Container-side cloning
   (strong isolation) is a later increment; container jobs don't clone yet.
+- **Engine fetch resilience (issue #323).** The reconcile loop only runs for
+  `--auto` workers (its result is applied solely via `autoWorkerId`). Hand-rolled
+  non-activation engine fetches (`withEngineAuthFetch` → reconcile reader, the
+  prompt-resource fetch) go through `withTransientFetchRetry`: ECONNRESET/
+  ECONNREFUSED/ETIMEDOUT/EPIPE/UND_ERR_SOCKET/TLS-handshake disconnects and HTTP
+  429/502/503/504 are retried (4 attempts, 250ms base, 4s cap, jittered); 4xx never;
+  the caller's abort signal stays the outer bound. Warnings include the
+  `cause.code`/`cause.message`, and `nano work` log lines carry an ISO-8601 prefix
+  (text output mode only).
 - **Resume on re-activation (issue #239, `agent-resume.mjs`).** A re-activated
   agent job **resumes from the prior agent's state** instead of cold-rerunning, so
   at-least-once re-delivery is a *continuation*, not a duplicate of external side

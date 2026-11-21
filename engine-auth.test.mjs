@@ -323,3 +323,43 @@ test("withEngineAuthFetch preserves tuple-array HeadersInit (PR #316 review)", a
   await authed("http://e/v2", { headers: new Headers({ "x-a": "1" }) });
   assert.equal(seen[1]["x-a"], "1");
 });
+
+test("withEngineAuthFetch races a stalled auth resolution against the caller abort signal (PR #316 review)", async () => {
+  // A hung SDK credential refresh (e.g. OAuth token endpoint never answers)
+  // must not keep the wrapped fetch pending past the caller's own abort: the
+  // request proceeds WITHOUT auth headers once the signal fires, so a
+  // time-boxed caller like hub discovery still honours its fetchTimeoutMs.
+  let authResolve;
+  const stalledAuth = new Promise((resolve) => { authResolve = resolve; });
+  const camunda = { getAuthHeaders: () => stalledAuth };
+  const seen = [];
+  const baseFetch = async (_u, init) => { seen.push(init && init.headers); return { ok: true, status: 200 }; };
+  const authed = withEngineAuthFetch(baseFetch, { camunda });
+
+  const controller = new AbortController();
+  const pending = authed("http://engine:8080/console/api/projects", { signal: controller.signal });
+  // Auth is still stalled; the fetch must not have run yet.
+  await new Promise((resolve) => setTimeout(resolve, 20));
+  assert.equal(seen.length, 0);
+  controller.abort();
+  const res = await pending; // settles promptly despite the never-resolving auth
+  assert.equal(res.ok, true);
+  assert.equal(seen.length, 1);
+  assert.equal(seen[0], undefined, "aborted-during-auth fetch proceeds without auth headers");
+  // A late-settling auth promise is swallowed without an unhandled rejection.
+  authResolve({ Authorization: "Bearer late" });
+  await new Promise((resolve) => setTimeout(resolve, 20));
+
+  // An already-aborted signal skips auth resolution entirely.
+  const pre = new AbortController();
+  pre.abort();
+  await authed("http://engine:8080/console/api/projects", { signal: pre.signal });
+  assert.equal(seen.length, 2);
+  assert.equal(seen[1], undefined);
+
+  // Fast auth with a live signal still merges headers (no regression).
+  const fast = withEngineAuthFetch(baseFetch, { token: "T" });
+  const c3 = new AbortController();
+  await fast("http://engine:8080/v2", { signal: c3.signal });
+  assert.deepEqual(seen[2], { Authorization: "Bearer T" });
+});

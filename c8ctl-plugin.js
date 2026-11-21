@@ -4374,7 +4374,31 @@ function withEngineAuthFetch(fetchImpl, authOpts) {
   const resolveAuth = createEngineAuthResolver(authOpts);
   if (!resolveAuth) return baseFetch;
   return async (input, init = {}) => {
-    const auth = await resolveAuth();
+    // Race auth resolution against the caller's abort signal (PR #316 review):
+    // a stalled SDK credential refresh (e.g. a hung OAuth token endpoint) must
+    // not outlive the fetch's own timeout — otherwise an optional, time-boxed
+    // caller like hub discovery (`fetchTimeoutMs`) stays pending on the auth
+    // promise even after its AbortController fires, wedging worker startup.
+    // On abort we proceed WITHOUT auth headers (matching the resolver's own
+    // fail-open catch) so the request still honours its deadline. The loser is
+    // listener-cleaned and .catch()-swallowed so a late-settling auth promise
+    // never leaks a listener or an unhandled rejection.
+    const signal = init && init.signal;
+    let auth;
+    if (signal) {
+      if (signal.aborted) return baseFetch(input, init);
+      let onAbort;
+      const aborted = new Promise((resolve) => {
+        onAbort = () => resolve(undefined);
+        signal.addEventListener('abort', onAbort, { once: true });
+      });
+      const settling = resolveAuth().catch(() => undefined);
+      auth = await Promise.race([settling, aborted]);
+      signal.removeEventListener('abort', onAbort);
+      settling.catch(() => {});
+    } else {
+      auth = await resolveAuth();
+    }
     if (!auth || Object.keys(auth).length === 0) return baseFetch(input, init);
     const merged = {};
     if (init.headers) {

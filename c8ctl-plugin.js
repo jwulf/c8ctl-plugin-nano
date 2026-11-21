@@ -5029,7 +5029,15 @@ function parseSecretsFileContent(raw) {
   const trimmed = raw.trim();
   if (!trimmed) return out;
   if (trimmed.startsWith('{')) {
-    const parsed = JSON.parse(trimmed);
+    let parsed;
+    try {
+      parsed = JSON.parse(trimmed);
+    } catch {
+      // Never forward the parser's message: JSON syntax errors can include
+      // excerpts of the input, which for a secrets file means credentials
+      // leaking into resolver warnings and `supervisor secret list` output.
+      throw new Error('secrets JSON file is not valid JSON');
+    }
     if (!parsed || typeof parsed !== 'object' || Array.isArray(parsed)) {
       throw new Error('secrets JSON file must contain a top-level object');
     }
@@ -5052,12 +5060,17 @@ function parseSecretsFileContent(raw) {
       const quote = val[0];
       val = val.slice(1, -1);
       if (quote === '"') {
-        val = val
-          .replace(/\\n/g, '\n')
-          .replace(/\\r/g, '\r')
-          .replace(/\\t/g, '\t')
-          .replace(/\\"/g, '"')
-          .replace(/\\\\/g, '\\');
+        // Decode escapes in ONE pass: successive replacements would decode the
+        // `n`/`r`/`t` of an escaped backslash's second char a second time
+        // (e.g. `C:\\new\\token` → `C:\<LF>ew\token`), corrupting the secret on
+        // a write/read round trip. A single regex pass consumes each escape
+        // pair atomically, so an escaped backslash is never re-decoded.
+        val = val.replace(/\\([nrt"\\])/g, (_m, c) => {
+          if (c === 'n') return '\n';
+          if (c === 'r') return '\r';
+          if (c === 't') return '\t';
+          return c; // `\"` → `"`, `\\` → `\`
+        });
       }
     }
     if (val !== '') out[key] = val;
@@ -5144,24 +5157,28 @@ function createFileSecretResolver(filePath, { logger = null } = {}) {
 // Host secret resolver: checks `process.env[name]` first, then falls back to
 // the durable operator secrets file (`<stateHome>/secrets.env`, issue #266)
 // when present — so headless launchd/systemd workers resolve secrets without
-// hand-editing the plist or relying on the macOS gh keyring.
-const hostEnvSecretResolver = {
-  kind: 'host',
-  resolve(name) {
-    const v = process.env[name];
-    if (v != null && v !== '') return v;
-    const p = defaultSecretsFilePath();
-    if (!existsSync(p)) return undefined;
-    const { secrets } = readSecretsFile(p);
-    const fv = secrets[name];
-    return fv == null || fv === '' ? undefined : fv;
-  },
-};
+// hand-editing the plist or relying on the macOS gh keyring. The fallback goes
+// through the FILE resolver so a group/world-readable secrets file (or an
+// unreadable one) surfaces the same once-only warning instead of being
+// silently consumed; an explicit process.env value still wins and never
+// touches the file.
+function createHostSecretResolver({ logger = null } = {}) {
+  const fileFallback = createFileSecretResolver(defaultSecretsFilePath(), { logger });
+  return {
+    kind: 'host',
+    filePath: fileFallback.filePath,
+    resolve(name) {
+      const v = process.env[name];
+      if (v != null && v !== '') return v;
+      return fileFallback.resolve(name);
+    },
+  };
+}
 
 function makeSecretResolver(kind, { logger = null } = {}) {
   const raw = (kind || 'host').trim();
   const lower = raw.toLowerCase();
-  if (lower === 'host' || lower === '') return hostEnvSecretResolver;
+  if (lower === 'host' || lower === '') return createHostSecretResolver({ logger });
   if (lower === 'file') return createFileSecretResolver(defaultSecretsFilePath(), { logger });
   if (lower.startsWith('file:')) {
     const target = raw.slice(5).trim();
@@ -16359,12 +16376,16 @@ async function runSupervisorDaemon() {
     // writes `<activityFile>.upgrade` (the successor pid) before it SIGUSR2s,
     // and the worker reads THAT as the authoritative retarget target; this env
     // forwarding covers only a worker spawned mid-upgrade.
-    // Inject operator-managed durable secrets (`<stateHome>/secrets.env`,
-    // issue #266) underneath `process.env` so headless launchd/systemd workers
-    // receive configured credentials (e.g. GITHUB_TOKEN) without touching the
-    // plist, while explicit process.env values still take precedence.
-    const { secrets: durableSecrets } = readSecretsFile(defaultSecretsFilePath());
-    const childEnv = { ...durableSecrets, ...process.env, NANO_SUPERVISOR_ACTIVITY_FILE: activityFile, NANO_SUPERVISOR_DAEMON_PID: String(process.pid) };
+    // Do NOT snapshot operator-managed durable secrets
+    // (`<stateHome>/secrets.env`, issue #266) into the child env: the worker's
+    // host resolver checks `process.env` FIRST, so an inherited copy would
+    // freeze the value for the worker's whole lifetime — after a rotation or
+    // unset, existing headless workers would keep serving the stale credential
+    // on every subsequent job. The worker's per-job host resolver already falls
+    // back to the secrets file and re-reads it on every resolve, so leaving
+    // file-backed secrets OUT of the env keeps rotation live while explicit
+    // process.env values (plist/launchd/systemd) still take precedence.
+    const childEnv = { ...process.env, NANO_SUPERVISOR_ACTIVITY_FILE: activityFile, NANO_SUPERVISOR_DAEMON_PID: String(process.pid) };
     const upgradeSuccessorPid = Number(process.env.NANO_SUPERVISOR_UPGRADE_PID ?? '', 10);
     if (Number.isInteger(upgradeSuccessorPid) && upgradeSuccessorPid > 0) childEnv.NANO_SUPERVISOR_UPGRADE_PID = String(upgradeSuccessorPid);
     const child = spawn(exec, [entry, 'nano', 'work', w.profile, '--name', w.id, ...w.args], {
@@ -21961,7 +21982,7 @@ export {
   deepMerge,
   resolveJobSecrets,
   makeSecretResolver,
-  hostEnvSecretResolver,
+  createHostSecretResolver,
   createFileSecretResolver,
   defaultSecretsFilePath,
   parseSecretsFileContent,

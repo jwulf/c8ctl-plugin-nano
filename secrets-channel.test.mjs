@@ -53,6 +53,49 @@ test('parseSecretsFileContent parses dotenv (comments, export, quotes, escapes) 
   assert.deepEqual(json, { GITHUB_TOKEN: 'ghp_json' });
 });
 
+test('parseSecretsFileContent decodes escapes in one pass — literal backslashes survive a write/read round trip', () => {
+  // Regression: sequential .replace passes decoded the `n`/`r`/`t` after an
+  // escaped backslash a second time, corrupting values like `C:\new\token`.
+  const roundTrip = parseSecretsFileContent([
+    'WIN_PATH="C:\\\\new\\\\token"',
+    'ESC_N="a\\\\nb"',
+    'ESC_R="a\\\\rb"',
+    'ESC_T="a\\\\tb"',
+    'ESC_QUOTE="say \\"hi\\""',
+    'REAL_N="a\\nb"',
+    'TRAILING="end\\\\"',
+  ].join('\n'));
+  assert.equal(roundTrip.WIN_PATH, 'C:\\new\\token');
+  assert.equal(roundTrip.ESC_N, 'a\\nb');
+  assert.equal(roundTrip.ESC_R, 'a\\rb');
+  assert.equal(roundTrip.ESC_T, 'a\\tb');
+  assert.equal(roundTrip.ESC_QUOTE, 'say "hi"');
+  assert.equal(roundTrip.REAL_N, 'a\nb');
+  assert.equal(roundTrip.TRAILING, 'end\\');
+
+  // Full write/read round trip through writeSecretsFile preserves the value.
+  return withTempHome((dir) => {
+    const filePath = join(dir, 'secrets.env');
+    writeSecretsFile(filePath, { WIN_PATH: 'C:\\new\\token', MULTI: 'a\nb\tc' });
+    const { secrets, error } = readSecretsFile(filePath);
+    assert.equal(error, null);
+    assert.equal(secrets.WIN_PATH, 'C:\\new\\token');
+    assert.equal(secrets.MULTI, 'a\nb\tc');
+  });
+});
+
+test('readSecretsFile never leaks file contents in JSON parse errors', () => {
+  return withTempHome((dir) => {
+    const filePath = join(dir, 'secrets.env');
+    writeFileSync(filePath, '{"GITHUB_TOKEN":"ghp_malformed_secret_value"', { mode: 0o600 });
+    const { secrets, error } = readSecretsFile(filePath);
+    assert.deepEqual(secrets, {});
+    assert.ok(error, 'a malformed JSON file reports an error');
+    assert.doesNotMatch(error, /ghp_malformed_secret_value/, 'parser excerpt must not leak the secret');
+    assert.match(error, /not valid JSON/);
+  });
+});
+
 test('makeSecretResolver supports host, file, file:<path> and rejects unknown/empty file:', async () => {
   await withTempHome((dir) => {
     assert.equal(makeSecretResolver('host').kind, 'host');
@@ -132,6 +175,35 @@ test('host secret resolver falls back to <stateHome>/secrets.env when process.en
   });
 });
 
+test('host secret resolver warns once on a group/world-readable secrets file (issue #266)', async () => {
+  if (process.platform === 'win32') return;
+  await withTempHome(() => {
+    const prevTok = process.env.GITHUB_TOKEN;
+    delete process.env.GITHUB_TOKEN;
+    try {
+      const secretsPath = defaultSecretsFilePath();
+      writeSecretsFile(secretsPath, { GITHUB_TOKEN: 'ghp_loose' });
+      chmodSync(secretsPath, 0o644);
+
+      const warnings = [];
+      const logger = { warn: (m) => warnings.push(m), info() {}, error() {} };
+      const resolver = makeSecretResolver('host', { logger });
+      assert.equal(resolver.resolve('GITHUB_TOKEN'), 'ghp_loose');
+      resolver.resolve('GITHUB_TOKEN');
+      assert.equal(warnings.filter((w) => w.includes('chmod 600')).length, 1, 'host fallback warns once on loose permissions');
+
+      // An explicit process.env value wins without touching (or warning on) the file.
+      warnings.length = 0;
+      process.env.GITHUB_TOKEN = 'ghp_env_wins';
+      assert.equal(resolver.resolve('GITHUB_TOKEN'), 'ghp_env_wins');
+      assert.equal(warnings.length, 0);
+    } finally {
+      if (prevTok === undefined) delete process.env.GITHUB_TOKEN;
+      else process.env.GITHUB_TOKEN = prevTok;
+    }
+  });
+});
+
 test('supervisorSecretCmd supports set (stdin & arg), list (no values leaked), unset, and path', async () => {
   await withTempHome(async (dir) => {
     const filePath = join(dir, 'secrets.env');
@@ -165,6 +237,25 @@ test('supervisorSecretCmd supports set (stdin & arg), list (no values leaked), u
     await supervisorSecretCmd(['unset', 'GITHUB_TOKEN'], { filePath, logger });
     assert.equal(readSecretsFile(filePath).secrets.GITHUB_TOKEN, undefined);
     assert.equal(readSecretsFile(filePath).secrets.ANOTHER_KEY, 'val_2');
+  });
+});
+
+test('supervisorSecretCmd list reports a malformed JSON file without leaking its contents', async () => {
+  await withTempHome(async (dir) => {
+    const filePath = join(dir, 'secrets.env');
+    writeFileSync(filePath, '{"GITHUB_TOKEN":"ghp_malformed_secret_value"', { mode: 0o600 });
+    const logs = [];
+    const logger = { info: (m) => logs.push(m), warn: (m) => logs.push(m), error: (m) => logs.push(m) };
+    const prevExit = process.exit;
+    process.exit = (code) => { throw new Error(`exit:${code}`); };
+    try {
+      await assert.rejects(() => supervisorSecretCmd(['list'], { filePath, logger }), /exit:1/);
+    } finally {
+      process.exit = prevExit;
+    }
+    const joined = logs.join('\n');
+    assert.match(joined, /not valid JSON/);
+    assert.doesNotMatch(joined, /ghp_malformed_secret_value/, 'list error output must not leak the secret');
   });
 });
 

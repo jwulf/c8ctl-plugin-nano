@@ -5203,18 +5203,267 @@ async function resolveLinkedPromptSource(camunda, env = process.env, { baseUrl: 
 // Secrets are referenced by NAME, never by value, in the model. A resolver maps
 // a name → value at run time. The wrapper injects them into the child ENV, so
 // values never appear in argv or `docker inspect`.
-const hostEnvSecretResolver = {
-  kind: 'host',
-  resolve(name) {
-    const v = process.env[name];
-    return v == null || v === '' ? undefined : v;
-  },
-};
+//
+// Default secrets file path (`<stateHome>/secrets.env`, chmod 600, issue #266):
+// gives headless launchd/systemd workers a durable, gh-keyring-independent
+// secret channel that survives plugin updates and plist regeneration.
+function defaultSecretsFilePath() {
+  return join(getStateHome(), 'secrets.env');
+}
 
-function makeSecretResolver(kind) {
-  const k = (kind || 'host').trim().toLowerCase();
-  if (k === 'host' || k === '') return hostEnvSecretResolver;
+// Parse a secrets file (JSON object `{ "NAME": "VALUE" }` or dotenv `NAME=VALUE`
+// lines with `#` comments, optional `export `, and single/double quotes).
+// Non-empty string values only. Pure for unit tests.
+function parseSecretsFileContent(raw) {
+  const out = {};
+  if (typeof raw !== 'string') return out;
+  const trimmed = raw.trim();
+  if (!trimmed) return out;
+  if (trimmed.startsWith('{')) {
+    let parsed;
+    try {
+      parsed = JSON.parse(trimmed);
+    } catch {
+      // Never forward the parser's message: JSON syntax errors can include
+      // excerpts of the input, which for a secrets file means credentials
+      // leaking into resolver warnings and `supervisor secret list` output.
+      throw new Error('secrets JSON file is not valid JSON');
+    }
+    if (!parsed || typeof parsed !== 'object' || Array.isArray(parsed)) {
+      throw new Error('secrets JSON file must contain a top-level object');
+    }
+    for (const [k, v] of Object.entries(parsed)) {
+      if (!k || typeof v !== 'string' || v === '') continue;
+      out[k] = v;
+    }
+    return out;
+  }
+  for (const rawLine of raw.split(/\r?\n/)) {
+    const line = rawLine.trim();
+    if (!line || line.startsWith('#')) continue;
+    const body = line.startsWith('export ') ? line.slice(7).trim() : line;
+    const eq = body.indexOf('=');
+    if (eq <= 0) continue;
+    const key = body.slice(0, eq).trim();
+    if (!/^[A-Za-z_][A-Za-z0-9_]*$/.test(key)) continue;
+    let val = body.slice(eq + 1).trim();
+    // Strip a trailing inline comment outside quotes: for a quoted value, cut
+    // at its (unescaped) closing quote when only whitespace/`# comment` follows;
+    // for an unquoted value, a `#` preceded by whitespace starts a comment.
+    if (val.startsWith('"') || val.startsWith("'")) {
+      const q = val[0];
+      let end = -1;
+      for (let i = 1; i < val.length; i++) {
+        if (q === '"' && val[i] === '\\') { i++; continue; }
+        if (val[i] === q) { end = i; break; }
+      }
+      if (end > 0 && /^\s*(#.*)?$/.test(val.slice(end + 1))) val = val.slice(0, end + 1);
+    } else {
+      const m = val.match(/\s#/);
+      if (m) val = val.slice(0, m.index).trim();
+    }
+    if (val.length >= 2 && ((val.startsWith('"') && val.endsWith('"')) || (val.startsWith("'") && val.endsWith("'")))) {
+      const quote = val[0];
+      val = val.slice(1, -1);
+      if (quote === '"') {
+        // Decode escapes in ONE pass: successive replacements would decode the
+        // `n`/`r`/`t` of an escaped backslash's second char a second time
+        // (e.g. `C:\\new\\token` → `C:\<LF>ew\token`), corrupting the secret on
+        // a write/read round trip. A single regex pass consumes each escape
+        // pair atomically, so an escaped backslash is never re-decoded.
+        val = val.replace(/\\([nrt"\\])/g, (_m, c) => {
+          if (c === 'n') return '\n';
+          if (c === 'r') return '\r';
+          if (c === 't') return '\t';
+          return c; // `\"` → `"`, `\\` → `\`
+        });
+      }
+    }
+    if (val !== '') out[key] = val;
+  }
+  return out;
+}
+
+// Read a secrets file from disk. Returns `{ secrets, exists, error, insecureMode }`.
+// Never throws; callers decide whether to warn on parse/permission issues.
+function readSecretsFile(filePath) {
+  try {
+    if (!existsSync(filePath)) return { secrets: {}, exists: false, error: null, insecureMode: false };
+    let insecureMode = false;
+    if (process.platform !== 'win32') {
+      try {
+        const mode = statSync(filePath).mode & 0o777;
+        if ((mode & 0o077) !== 0) insecureMode = true;
+      } catch { /* ignore stat error */ }
+    }
+    const raw = readFileSync(filePath, 'utf8');
+    const secrets = parseSecretsFileContent(raw);
+    return { secrets, exists: true, error: null, insecureMode };
+  } catch (err) {
+    return { secrets: {}, exists: existsSync(filePath), error: err?.message || String(err), insecureMode: false };
+  }
+}
+
+// Atomically write a secret map to `<filePath>` in dotenv format with mode 0600.
+function writeSecretsFile(filePath, secrets) {
+  const dir = dirname(filePath);
+  mkdirSync(dir, { recursive: true });
+  const keys = Object.keys(secrets).sort();
+  const lines = [
+    '# Managed by `c8ctl nano supervisor secret` (chmod 600).',
+    '# One KEY=VALUE per line; readable by headless launchd/systemd workers.',
+  ];
+  for (const k of keys) {
+    const v = String(secrets[k]);
+    const escaped = v
+      .replace(/\\/g, '\\\\')
+      .replace(/"/g, '\\"')
+      .replace(/\n/g, '\\n')
+      .replace(/\r/g, '\\r')
+      .replace(/\t/g, '\\t');
+    lines.push(`${k}="${escaped}"`);
+  }
+  const tmp = `${filePath}.tmp.${process.pid}.${Date.now()}`;
+  writeFileSync(tmp, `${lines.join('\n')}\n`, { encoding: 'utf8', mode: 0o600 });
+  if (process.platform !== 'win32') {
+    try { chmodSync(tmp, 0o600); } catch { /* best effort */ }
+  }
+  renameSync(tmp, filePath);
+  if (process.platform !== 'win32') {
+    try { chmodSync(filePath, 0o600); } catch { /* best effort */ }
+  }
+}
+
+// Memoize a resolver for ONE job activation: every name is read at most once,
+// so all consumers within the job see one consistent credential snapshot.
+// A fresh wrapper per job keeps rotation effective between jobs.
+function snapshotSecretResolver(resolver) {
+  if (!resolver || typeof resolver.resolve !== 'function') return resolver;
+  const cache = new Map();
+  const snap = Object.create(resolver);
+  snap.resolve = (name) => {
+    if (!cache.has(name)) cache.set(name, resolver.resolve(name));
+    return cache.get(name);
+  };
+  return snap;
+}
+
+// Serialize a read-modify-write of the secrets file across processes with an
+// exclusive lock file (O_EXCL). The map is re-read AFTER the lock is held so
+// concurrent `set`/`unset` invocations can't drop each other's updates. A lock
+// older than `staleMs` (crashed holder) is broken. `mutate(secrets)` returns
+// false to skip the write. Throws on a read error or lock timeout.
+function updateSecretsFile(filePath, mutate, { timeoutMs = 10_000, staleMs = 30_000 } = {}) {
+  mkdirSync(dirname(filePath), { recursive: true });
+  const lockPath = `${filePath}.lock`;
+  const deadline = Date.now() + timeoutMs;
+  const owner = `${process.pid}:${Date.now()}:${Math.random().toString(36).slice(2)}`;
+  let fd = null;
+  while (fd === null) {
+    try {
+      fd = openSync(lockPath, 'wx', 0o600);
+      writeFileSync(fd, owner);
+    } catch (err) {
+      if (err?.code !== 'EEXIST') throw err;
+      // Never auto-delete another holder's lock: two waiters could both judge
+      // the same lock stale and one would unlink the other's LIVE replacement.
+      // Fail closed with manual-recovery guidance instead.
+      let stale = false;
+      try { stale = Date.now() - statSync(lockPath).mtimeMs > staleMs; } catch { continue; }
+      if (stale) {
+        throw new Error(`secrets lock ${lockPath} looks stale (older than ${Math.round(staleMs / 1000)}s); if no other \`nano secret\` command is running, remove it manually and retry`);
+      }
+      if (Date.now() > deadline) throw new Error(`timed out waiting for secrets lock ${lockPath}`);
+      Atomics.wait(new Int32Array(new SharedArrayBuffer(4)), 0, 0, 50);
+    }
+  }
+  try {
+    const { secrets, exists, error } = readSecretsFile(filePath);
+    if (error) throw new Error(`Failed to read existing secrets file ${filePath}: ${error}`);
+    const changed = mutate(secrets, { exists });
+    if (changed !== false) writeSecretsFile(filePath, secrets);
+    return changed !== false;
+  } finally {
+    try { closeSync(fd); } catch { /* ignore */ }
+    // Release only our own lock (identified by the owner token we wrote).
+    try { if (readFileSync(lockPath, 'utf8') === owner) rmSync(lockPath, { force: true }); } catch { /* gone */ }
+  }
+}
+
+// File-based secret resolver (issue #266): reads secrets from a `chmod 600`
+// dotenv or JSON file on disk (freshly read per resolve so rotated secrets are
+// picked up immediately without restarting workers).
+function createFileSecretResolver(filePath, { logger = null } = {}) {
+  const resolvedPath = expandHome(filePath || defaultSecretsFilePath());
+  let warnedInsecure = false;
+  let warnedParse = false;
+  return {
+    kind: `file:${resolvedPath}`,
+    filePath: resolvedPath,
+    resolve(name) {
+      const { secrets, error, insecureMode } = readSecretsFile(resolvedPath);
+      if (insecureMode && !warnedInsecure) {
+        warnedInsecure = true;
+        logger?.warn?.(`Secrets file ${resolvedPath} is readable by group/other — run \`chmod 600 "${resolvedPath}"\`.`);
+      }
+      if (error && !warnedParse) {
+        warnedParse = true;
+        logger?.warn?.(`Failed to read secrets file ${resolvedPath}: ${error}`);
+      }
+      const v = secrets[name];
+      return v == null || v === '' ? undefined : v;
+    },
+  };
+}
+
+// Host secret resolver: checks `process.env[name]` first, then falls back to
+// the durable operator secrets file (`<stateHome>/secrets.env`, issue #266)
+// when present — so headless launchd/systemd workers resolve secrets without
+// hand-editing the plist or relying on the macOS gh keyring. The fallback goes
+// through the FILE resolver so a group/world-readable secrets file (or an
+// unreadable one) surfaces the same once-only warning instead of being
+// silently consumed; an explicit process.env value still wins and never
+// touches the file.
+function createHostSecretResolver({ logger = null } = {}) {
+  const fileFallback = createFileSecretResolver(defaultSecretsFilePath(), { logger });
+  return {
+    kind: 'host',
+    filePath: fileFallback.filePath,
+    resolve(name) {
+      const v = process.env[name];
+      if (v != null && v !== '') return v;
+      return fileFallback.resolve(name);
+    },
+  };
+}
+
+function makeSecretResolver(kind, { logger = null } = {}) {
+  const raw = (kind || 'host').trim();
+  const lower = raw.toLowerCase();
+  if (lower === 'host' || lower === '') return createHostSecretResolver({ logger });
+  if (lower === 'file') return createFileSecretResolver(defaultSecretsFilePath(), { logger });
+  if (lower.startsWith('file:')) {
+    const target = raw.slice(5).trim();
+    if (!target) return null;
+    return createFileSecretResolver(target, { logger });
+  }
   return null; // unknown → caller reports a clear error
+}
+
+// Build an actionable missing-secret diagnostic message (issue #266). When
+// GITHUB_TOKEN is missing, explains why (env empty, secrets file absent/missing
+// key, and gh CLI keyring unavailable/expired) and gives a one-line fix.
+function formatMissingSecretsMessage(missing, resolver) {
+  const base = `missing secret(s): ${missing.join(', ')} (resolver: ${resolver.kind})`;
+  if (!missing.includes('GITHUB_TOKEN')) return base;
+  const secretsPath = resolver.filePath || defaultSecretsFilePath();
+  const fileExists = existsSync(secretsPath);
+  const envEmpty = !process.env.GITHUB_TOKEN;
+  const causes = [];
+  if (resolver.kind === 'host' && envEmpty) causes.push('GITHUB_TOKEN env unset');
+  causes.push(fileExists ? `${secretsPath} has no GITHUB_TOKEN` : `${secretsPath} not found`);
+  causes.push('gh auth token unavailable/keyring locked');
+  return `${base} — ${causes.join('; ')}. Fix: \`c8ctl nano supervisor secret set GITHUB_TOKEN\` (or place GITHUB_TOKEN=<pat> in ${secretsPath}, chmod 600).`;
 }
 
 // Force a fresh `gh auth token` read, bypassing the TTL cache, and
@@ -12309,9 +12558,9 @@ async function workAgent(req, flags, ctx) {
     process.exit(1);
   }
 
-  const secretResolver = makeSecretResolver(flags?.['secret-resolver']);
+  const secretResolver = makeSecretResolver(flags?.['secret-resolver'], { logger });
   if (!secretResolver) {
-    logger.error(`Unknown --secret-resolver "${flags?.['secret-resolver']}". Only "host" is supported.`);
+    logger.error(`Unknown --secret-resolver "${flags?.['secret-resolver']}". Supported: "host", "file", or "file:<path>".`);
     process.exit(1);
   }
 
@@ -13337,7 +13586,12 @@ async function workAgent(req, flags, ctx) {
         // Assemble + normalize the task envelope from headers (defaults) and
         // variables (overrides), then resolve any secrets it references.
         const envelope = normalizeTaskEnvelope(job.customHeaders ?? {}, job.variables ?? {}, { basePromptOverride });
-        const { resolved, missing, names } = await resolveJobSecrets(secretResolver, envelope);
+        // One credential snapshot per activation (Copilot review on #319): the
+        // secrets file is re-read fresh between jobs, but within a job the
+        // harness-forwarded secrets and provisioning's clone token must come
+        // from the SAME read, so a mid-setup rotation can't split them.
+        const jobSecretResolver = snapshotSecretResolver(secretResolver);
+        const { resolved, missing, names } = await resolveJobSecrets(jobSecretResolver, envelope);
         // #222: recheck after the awaited secret resolution (stage: secrets) —
         // resolveJobSecrets AWAITS the gh-cache-miss forced refresh, so a
         // force-stop / lease loss can win DURING that await. Gate BEFORE the
@@ -13347,7 +13601,7 @@ async function workAgent(req, flags, ctx) {
         if (checkSetupAbort(abortSignal, { jobType, jobKey: job.jobKey, stage: 'secrets', logger })) return;
         if (missing.length > 0) {
           const retries = Math.max(0, (Number(job.retries) || 1) - 1);
-          const msg = `missing secret(s): ${missing.join(', ')} (resolver: ${secretResolver.kind})`;
+          const msg = formatMissingSecretsMessage(missing, secretResolver);
           logger.warn(`[${jobType}] job ${job.jobKey} not provisioned — ${msg}; retries left ${retries}`);
           return settleJob.fail({ errorMessage: msg, retries });
         }
@@ -13609,7 +13863,7 @@ async function workAgent(req, flags, ctx) {
           // a later auth failure may fall back to the operator's `gh auth token`
           // (only a 'gh-cache' token may — never an explicit GITHUB_TOKEN or a
           // custom authRef; Copilot review on #293).
-          const cred = githubCloneTokenWithSource({ provider, authRef, secretResolver });
+          const cred = githubCloneTokenWithSource({ provider, authRef, secretResolver: jobSecretResolver });
           repoToken = cred.token; // absent → anonymous clone
           repoCredentialSource = cred.source;
           try {
@@ -16404,6 +16658,15 @@ async function runSupervisorDaemon() {
     // writes `<activityFile>.upgrade` (the successor pid) before it SIGUSR2s,
     // and the worker reads THAT as the authoritative retarget target; this env
     // forwarding covers only a worker spawned mid-upgrade.
+    // Do NOT snapshot operator-managed durable secrets
+    // (`<stateHome>/secrets.env`, issue #266) into the child env: the worker's
+    // host resolver checks `process.env` FIRST, so an inherited copy would
+    // freeze the value for the worker's whole lifetime — after a rotation or
+    // unset, existing headless workers would keep serving the stale credential
+    // on every subsequent job. The worker's per-job host resolver already falls
+    // back to the secrets file and re-reads it on every resolve, so leaving
+    // file-backed secrets OUT of the env keeps rotation live while explicit
+    // process.env values (plist/launchd/systemd) still take precedence.
     const childEnv = { ...process.env, NANO_SUPERVISOR_ACTIVITY_FILE: activityFile, NANO_SUPERVISOR_DAEMON_PID: String(process.pid) };
     const upgradeSuccessorPid = Number(process.env.NANO_SUPERVISOR_UPGRADE_PID ?? '', 10);
     if (Number.isInteger(upgradeSuccessorPid) && upgradeSuccessorPid > 0) childEnv.NANO_SUPERVISOR_UPGRADE_PID = String(upgradeSuccessorPid);
@@ -19110,6 +19373,98 @@ async function maybeReparentOrWarnOnStart(logger) {
   return true; // the launchd service now owns the daemon — adopt it, don't spawn
 }
 
+/**
+ * Manage durable operator secrets stored in `<stateHome>/secrets.env` (chmod 600,
+ * issue #266). Readable by headless launchd/systemd workers and `host` / `file`
+ * secret resolvers without touching the launchd plist or the macOS gh keyring.
+ *
+ * Subcommands:
+ *   c8ctl nano supervisor secret set <NAME> [VALUE]   (reads stdin if VALUE omitted)
+ *   c8ctl nano supervisor secret unset|rm <NAME>
+ *   c8ctl nano supervisor secret list|ls              (names + path only, never values)
+ *   c8ctl nano supervisor secret path
+ */
+async function supervisorSecretCmd(args, { filePath = defaultSecretsFilePath(), stdin = process.stdin, logger = getLogger() } = {}) {
+  const op = (args[0] || 'list').toLowerCase();
+  if (op === 'path') {
+    logger.info(filePath);
+    return;
+  }
+  if (op === 'list' || op === 'ls') {
+    const { secrets, exists, error, insecureMode } = readSecretsFile(filePath);
+    if (error) {
+      logger.error(`Failed to read secrets file ${filePath}: ${error}`);
+      process.exit(1);
+    }
+    const keys = Object.keys(secrets).sort();
+    if (!exists || keys.length === 0) {
+      logger.info(`No supervisor secrets configured (${filePath}).`);
+      return;
+    }
+    logger.info(`Supervisor secrets (${filePath}):`);
+    for (const k of keys) logger.info(`  ${k}`);
+    if (insecureMode) {
+      logger.warn(`Secrets file ${filePath} is readable by group/other — run \`chmod 600 "${filePath}"\`.`);
+    }
+    return;
+  }
+  if (op === 'set') {
+    const name = args[1];
+    if (!name || !/^[A-Za-z_][A-Za-z0-9_]*$/.test(name)) {
+      logger.error('Usage: c8ctl nano supervisor secret set <NAME> [VALUE]  (or pipe VALUE on stdin)');
+      process.exit(1);
+    }
+    let value = args[2];
+    if (value === undefined) {
+      if (stdin.isTTY) {
+        logger.error(`Provide the value via stdin (recommended, avoids shell history): printf '%s' "$TOKEN" | c8ctl nano supervisor secret set ${name}`);
+        process.exit(1);
+      }
+      const chunks = [];
+      for await (const chunk of stdin) chunks.push(chunk);
+      value = Buffer.concat(chunks.map((c) => (Buffer.isBuffer(c) ? c : Buffer.from(String(c))))).toString('utf8').replace(/\r?\n$/, '');
+    }
+    if (!value) {
+      logger.error(`Refusing to store an empty value for ${name}.`);
+      process.exit(1);
+    }
+    try {
+      updateSecretsFile(filePath, (secrets) => { secrets[name] = value; });
+    } catch (err) {
+      logger.error(err?.message || String(err));
+      process.exit(1);
+    }
+    logger.info(`Stored secret ${name} in ${filePath} (chmod 600).`);
+    return;
+  }
+  if (op === 'unset' || op === 'rm' || op === 'remove' || op === 'delete') {
+    const name = args[1];
+    if (!name) {
+      logger.error('Usage: c8ctl nano supervisor secret unset <NAME>');
+      process.exit(1);
+    }
+    let removed;
+    try {
+      removed = updateSecretsFile(filePath, (secrets, { exists }) => {
+        if (!exists || !(name in secrets)) return false;
+        delete secrets[name];
+        return true;
+      });
+    } catch (err) {
+      logger.error(err?.message || String(err));
+      process.exit(1);
+    }
+    if (!removed) {
+      logger.info(`Secret ${name} is not set in ${filePath}.`);
+      return;
+    }
+    logger.info(`Removed secret ${name} from ${filePath}.`);
+    return;
+  }
+  logger.error(`Unknown secret action "${op}". Use: set|unset|list|path`);
+  process.exit(1);
+}
+
 /** Dispatch the `supervisor` subcommand's action. */
 async function supervisorCommand(req, flags, ctx) {
   const action = (req.positional[0] || '').toLowerCase();
@@ -19161,6 +19516,10 @@ async function supervisorCommand(req, flags, ctx) {
     case 'reload-credentials':
       await supervisorReloadCredentialsCmd(req);
       return;
+    case 'secret':
+    case 'secrets':
+      await supervisorSecretCmd(req.positional.slice(1));
+      return;
     case 'stop':
       await supervisorStopCmd(coerceBool(flags?.force, false));
       return;
@@ -19169,7 +19528,7 @@ async function supervisorCommand(req, flags, ctx) {
       supervisorLogsCmd(req);
       return;
     default:
-      getLogger().error(`Unknown supervisor action "${action}". Use: start|install|uninstall|status|add|remove|restart|reload|upgrade|reload-credentials|stop|logs|attach`);
+      getLogger().error(`Unknown supervisor action "${action}". Use: start|install|uninstall|status|add|remove|restart|reload|upgrade|reload-credentials|secret|stop|logs|attach`);
       process.exit(1);
   }
 }
@@ -21908,7 +22267,16 @@ export {
   deepMerge,
   resolveJobSecrets,
   makeSecretResolver,
-  hostEnvSecretResolver,
+  createHostSecretResolver,
+  createFileSecretResolver,
+  defaultSecretsFilePath,
+  parseSecretsFileContent,
+  readSecretsFile,
+  updateSecretsFile,
+  snapshotSecretResolver,
+  writeSecretsFile,
+  formatMissingSecretsMessage,
+  supervisorSecretCmd,
   buildAgentPayload,
   buildAgentStdin,
   buildResultEnvelope,
@@ -22280,7 +22648,7 @@ export const commands = {
       protocol: { type: 'string', description: 'hire: harness protocol pipe|acp (default pipe). acp drives the harness over ACP (JSON-RPC 2.0 over stdio) on the host executor (sandbox=none); container sandboxes (docker/podman) do NOT yet run ACP and are pipe-only today (--terminal pty is host-only; container ACP lands downstream). NANO_AGENTIC_PROTOCOL overrides at work time.' },
       permission: { type: 'string', description: 'hire: ACP permission policy (default yolo). yolo auto-allows all permission requests. escalate|filter are RESERVED/not-yet-active in this build (pending nano-workforce#559): they are persisted but not enforced and effectively behave like yolo (auto-allow). NANO_AGENTIC_PERMISSION overrides at work time.' },
       env: { type: 'string', multiple: true, description: 'hire/work: static env var for the harness as NAME=VALUE (repeatable); persisted on hire, work extends/overrides. E.g. permission toggles.' },
-      'secret-resolver': { type: 'string', description: 'work: secret resolver for task secretRefs (host = process env; default host)' },
+      'secret-resolver': { type: 'string', description: 'work: secret resolver for task secretRefs (host = process env + <stateHome>/secrets.env; file or file:<path> = dotenv/JSON file; default host)' },
       'reap-age': { type: 'string', description: 'work: age in ms before a finished agent container or job workspace is reaped (default 3600000)' },
       'reap-interval': { type: 'string', description: 'work: how often to sweep finished agent containers and job workspaces in ms (default 300000)' },
       'min-free-mb': { type: 'string', description: 'work: shed jobs when the engine data root has less than this many MB free (default 1024)' },
@@ -22459,8 +22827,8 @@ function printUsage() {
   console.log('  c8ctl nano update [--check]');
   console.log('  c8ctl nano hire [--name <n>] [--rank <r>] [--command <c>] [--arg <switch> ...] [--model <m>] [--capabilities <a,b>] [--sandbox none|docker|podman] [--image <ref>] [--terminal pty|pipe] [--protocol pipe|acp] [--permission yolo|escalate|filter] [--env NAME=VALUE ...] [--list]');
   console.log('  c8ctl nano assign <profileName> <cap[,cap...]> [--name <n>] [--capabilities <a,b>]');
-  console.log('  c8ctl nano work <profileName> [--auto [--auto-scope <p>]] [--arg <switch> ...] [--recovery-window <ms>] [--idle-timeout <ms>] [--job-timeout <ms>] [--poll-timeout <ms>] [--job-type <token> ...] [--sandbox none|docker|podman] [--image <ref>] [--env NAME=VALUE ...] [--secret-resolver host] [--min-free-mb <n>] [--clone-timeout <ms>] [--keep-runs] [--stream]');
-  console.log('  c8ctl nano supervisor [start|install|uninstall|status|add|remove|restart|reload|reload-credentials|stop|logs|attach] ... (manage many workers from one terminal)');
+  console.log('  c8ctl nano work <profileName> [--auto [--auto-scope <p>]] [--arg <switch> ...] [--recovery-window <ms>] [--idle-timeout <ms>] [--job-timeout <ms>] [--poll-timeout <ms>] [--job-type <token> ...] [--sandbox none|docker|podman] [--image <ref>] [--env NAME=VALUE ...] [--secret-resolver host|file|file:<path>] [--min-free-mb <n>] [--clone-timeout <ms>] [--keep-runs] [--stream]');
+  console.log('  c8ctl nano supervisor [start|install|uninstall|status|add|remove|restart|reload|reload-credentials|secret|stop|logs|attach] ... (manage many workers from one terminal)');
   console.log('  c8ctl nano workforce [add|remove|list|start|status|stop|reload] ... [--manifest <manifest>] (declarative, reusable fleet manifests)');
   console.log('');
   console.log('Subcommands:');
@@ -22516,7 +22884,7 @@ function printUsage() {
   console.log('  --job-timeout <ms>   work: OPTIONAL absolute hard cap on total harness runtime; killed past this (default 0 = unlimited)');
   console.log('  --lock-grace <ms>    work: DEPRECATED, ignored — the broker lock is now auto-managed via --recovery-window');
   console.log('  --poll-timeout <ms>  work: broker long-poll window per activateJobs request (default 30000; 0 = broker default, negative = immediate)');
-  console.log('  --secret-resolver <r> work: secret resolver for task secretRefs (host; default host)');
+  console.log('  --secret-resolver <r> work: secret resolver for task secretRefs (host, file, or file:<path>; default host)');
   console.log('  --reap-age <ms>      work: age before a finished agent container/workspace is reaped (default 3600000)');
   console.log('  --reap-interval <ms> work: how often to sweep finished agent containers/workspaces (default 300000)');
   console.log('  --min-free-mb <n>    work: shed jobs when the engine data root has < this many MB free (default 1024)');

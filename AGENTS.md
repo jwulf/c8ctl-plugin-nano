@@ -118,7 +118,7 @@ SDK client (job workers) — do **not** add the SDK as a dependency or use raw
   prompt-resource fetch) go through `withTransientFetchRetry`: ECONNRESET/
   ECONNREFUSED/ETIMEDOUT/EPIPE/UND_ERR_SOCKET/TLS-handshake disconnects and HTTP
   429/502/503/504 are retried (4 attempts, 250ms base, 4s cap, jittered); 4xx never;
-  the caller's abort signal stays the outer bound. Warnings include the
+  the caller's abort signal stays the outer bound. The `--auto` startup read (`resolveAutoJobTypes`) aborts its signal on timeout and the reconcile reader forwards the Effect interruption signal, so no retry starts after the deadline. Warnings include the
   `cause.code`/`cause.message`, and `nano work` log lines carry an ISO-8601 prefix
   (text output mode only).
 - **Resume on re-activation (issue #239, `agent-resume.mjs`).** A re-activated

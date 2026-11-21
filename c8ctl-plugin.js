@@ -61,6 +61,7 @@ import { randomUUID, createHash, randomBytes } from 'node:crypto';
 import { homedir, platform as osPlatform, devNull, tmpdir, hostname } from 'node:os';
 import { join, isAbsolute, resolve as resolvePath, dirname, basename, sep, delimiter } from 'node:path';
 import { createRequire } from 'node:module';
+import { AsyncLocalStorage } from 'node:async_hooks';
 import { fileURLToPath } from 'node:url';
 import { createInterface } from 'node:readline/promises';
 import { StringDecoder } from 'node:string_decoder';
@@ -4537,6 +4538,11 @@ function withTransientFetchRetry(fetchImpl, opts = {}) {
   return async (input, init = {}) => {
     const signal = init && init.signal;
     for (let attempt = 0; ; attempt++) {
+      // Never start a RETRY once the caller has aborted (e.g. the `--auto` read
+      // deadline fired during a backoff sleep) — no orphan background attempts.
+      // The first attempt still goes to the underlying fetch, which owns its
+      // own aborted-signal semantics.
+      if (attempt > 0 && signal && signal.aborted) throw signal.reason instanceof Error ? signal.reason : new Error('engine fetch aborted');
       const last = attempt >= cfg.attempts - 1;
       let res;
       try {
@@ -4645,7 +4651,19 @@ function isEngineAuthError(err) {
 // bearer token, and unauthenticated local clusters, issue #315). The demand
 // module is imported lazily through the single agentic surface (`agentic.mjs`)
 // so the whole agentic module graph only loads when `--auto` is actually used.
-async function defaultC8RestReader(restConfig, { camunda, authHeaders, fetchImpl } = {}) {
+//
+// Cancellation: `httpC8RestReader` does not thread an AbortSignal, so the
+// reader's methods accept an optional trailing `signal` which is carried to the
+// (retrying) fetch through an AsyncLocalStorage scope — merged with any
+// reader-wide `signal` option. An aborted read therefore stops retrying instead
+// of running its backoff schedule in the background (PR #324 review).
+const readerSignalScope = new AsyncLocalStorage();
+function combineSignals(...signals) {
+  const live = signals.filter(Boolean);
+  if (live.length <= 1) return live[0];
+  return AbortSignal.any(live);
+}
+async function defaultC8RestReader(restConfig, { camunda, authHeaders, fetchImpl, signal } = {}) {
   const { demand } = await import('./agentic.mjs');
   const base = String(restConfig?.baseUrl || DEFAULT_NANO_URL).replace(/\/+$/, '');
   const authedFetch = withEngineAuthFetch(fetchImpl, {
@@ -4654,10 +4672,20 @@ async function defaultC8RestReader(restConfig, { camunda, authHeaders, fetchImpl
     authHeaders,
     targetUrl: base,
   });
-  return demand.httpC8RestReader({
+  const scopedFetch = (input, init = {}) => {
+    const s = combineSignals(init && init.signal, signal, readerSignalScope.getStore());
+    return authedFetch(input, s ? { ...init, signal: s } : init);
+  };
+  const inner = demand.httpC8RestReader({
     restAddress: `${base}/v2`,
-    fetch: authedFetch,
+    fetch: scopedFetch,
   });
+  return {
+    searchProcessDefinitionKeys: (callSignal) =>
+      readerSignalScope.run(callSignal, () => inner.searchProcessDefinitionKeys()),
+    getProcessDefinitionXml: (key, callSignal) =>
+      readerSignalScope.run(callSignal, () => inner.getProcessDefinitionXml(key)),
+  };
 }
 
 // Resolve the desired job-type set for `--auto`: all deployed agent job types
@@ -4668,16 +4696,25 @@ async function defaultC8RestReader(restConfig, { camunda, authHeaders, fetchImpl
 // (KEEP the running set) instead of wedging the reconcile — and, via shutdown's
 // `await inFlightReconcile`, wedging `Ctrl-C`/SIGTERM.
 async function resolveAutoJobTypes({ restConfig, camunda, authHeaders, fetchImpl, scope = '', readerFactory, timeoutMs = AUTO_ENGINE_READ_TIMEOUT_MS } = {}) {
+  // Abort the read itself on timeout (not just stop awaiting it), so the
+  // retrying fetch never keeps attempting in the background past the deadline
+  // and overlaps the next crawl (PR #324 review).
+  const controller = new AbortController();
   const read = (async () => {
     const reader = readerFactory
-      ? await readerFactory()
-      : await defaultC8RestReader(restConfig, { camunda, authHeaders, fetchImpl });
+      ? await readerFactory({ signal: controller.signal })
+      : await defaultC8RestReader(restConfig, { camunda, authHeaders, fetchImpl, signal: controller.signal });
     return readDeployedAgentJobTypes(reader, { scope });
   })();
   if (!(timeoutMs > 0)) return read;
+  read.catch(() => {}); // a post-timeout abort rejection is expected, not unhandled
   let timer;
   const timeout = new Promise((_resolve, reject) => {
-    timer = setTimeout(() => reject(new Error(`engine read timed out after ${timeoutMs}ms`)), timeoutMs);
+    timer = setTimeout(() => {
+      const err = new Error(`engine read timed out after ${timeoutMs}ms`);
+      controller.abort(err);
+      reject(err);
+    }, timeoutMs);
   });
   try {
     return await Promise.race([read, timeout]);

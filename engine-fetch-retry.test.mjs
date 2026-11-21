@@ -10,6 +10,7 @@ import {
   describeFetchError,
   fetchLinkedResourceContent,
   isTransientFetchError,
+  resolveAutoJobTypes,
   syncWorkerLogTimestamps,
   enableWorkerLogTimestamps,
   __getLoggerForTest as getLogger,
@@ -258,4 +259,37 @@ test("worker lifecycle restores the prior timestamp flag (text-to-text leak)", (
     globalThis.c8ctl = prev;
     syncWorkerLogTimestamps();
   }
+});
+
+test("resolveAutoJobTypes aborts the retrying read on timeout: no fetch attempt starts after the deadline", async () => {
+  let attempts = 0;
+  let timedOutAt = null;
+  const fetchImpl = async (_input, init = {}) => {
+    attempts++;
+    if (timedOutAt !== null) throw new Error("attempt started after the timeout");
+    return await new Promise((_resolve, reject) => {
+      const err = Object.assign(new Error("socket hang up"), { code: "ECONNRESET" });
+      setTimeout(() => reject(err), 5);
+      init.signal?.addEventListener("abort", () => reject(init.signal.reason), { once: true });
+    });
+  };
+  await assert.rejects(
+    resolveAutoJobTypes({ restConfig: { baseUrl: "http://127.0.0.1:1" }, fetchImpl, timeoutMs: 30 }),
+    /timed out after 30ms/,
+  );
+  timedOutAt = Date.now();
+  const before = attempts;
+  await new Promise((r) => setTimeout(r, 4500)); // > max backoff (4s cap)
+  assert.equal(attempts, before, "no retry attempt after the deadline");
+});
+
+test("withTransientFetchRetry starts no retry after the signal aborts during backoff", async () => {
+  let calls = 0;
+  const ac = new AbortController();
+  const f = withTransientFetchRetry(
+    async () => { calls++; throw Object.assign(new Error("reset"), { code: "ECONNRESET" }); },
+    { sleep: async () => { ac.abort(new Error("gone")); } },
+  );
+  await assert.rejects(f("http://x", { signal: ac.signal }), /gone/);
+  assert.equal(calls, 1);
 });

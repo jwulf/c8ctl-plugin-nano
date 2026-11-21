@@ -93,3 +93,37 @@ test("fence-check script: no socket → 75; worker gone → 75", async () => {
   });
   assert.equal(r2.status, 75);
 });
+
+test("a held answer is not accepted when the fence was written while the check was pending", async () => {
+  let fences;
+  const fencePath = join(mkdtempSync(join(tmpdir(), "fence-test-")), "fence");
+  fences = createFenceRegistry({
+    check: async (j) => { fences.leaseLost(j, "lease-lost: 409"); return { state: "held" }; },
+  });
+  try {
+    const { env } = await fences.register(job, fencePath);
+    assert.deepEqual(await runFenceCheck({ env }), { code: 1, message: "lease-lost: 409" });
+  } finally {
+    fences.close();
+  }
+});
+
+test("a hung engine renewal is bounded and cancelled (unknown, request aborted)", async () => {
+  let aborted = false;
+  const fetchImpl = (_url, init = {}) => new Promise((_res, rej) => {
+    init.signal?.addEventListener("abort", () => { aborted = true; rej(new Error("aborted")); });
+  });
+  const composed = await createSupervisorDeps({
+    runner: { run: async () => {} },
+    restConfig: { baseUrl: "https://merlin.example.com" },
+    camunda: { getConfig: () => ({ restAddress: "https://merlin.example.com/v2" }), getAuthHeaders: async () => ({ Authorization: BASIC }) },
+    worker: "w",
+    workers: [{ id: "w", types: [], capacity: 1 }],
+    fetchImpl,
+    fenceCheckTimeoutMs: 100,
+  });
+  const r = await composed.checkLease(job);
+  assert.equal(r.state, "unknown");
+  await new Promise((r2) => setTimeout(r2, 20));
+  assert.equal(aborted, true, "the SDK request is cancelled on timeout");
+});

@@ -5023,9 +5023,14 @@ async function createSupervisorDeps(opts = {}) {
   // Only a definitive loss (`isLeaseLostError`) is `lost`; anything else (429/5xx/
   // network/auth) is `unknown` so the agent retries rather than abandoning.
   const fenceRecoveryWindowMs = config?.dispatch?.recoveryWindowMs ?? rt.defaultDispatchConfig.recoveryWindowMs;
+  const FENCE_CHECK_ENGINE_TIMEOUT_MS = Number(opts.fenceCheckTimeoutMs) > 0 ? Number(opts.fenceCheckTimeoutMs) : 20_000; // < the fence-check client's 30s
   const checkLease = (job) =>
     rt.Effect.runPromise(
       engine.extendLock(job.jobKey, fenceRecoveryWindowMs, job.leaseToken).pipe(
+        // Bound the renewal so a hung SDK call can't outlive the agent's check
+        // (and pile up across retries): the timeout INTERRUPTS the effect, which
+        // aborts the adapter's AbortSignal and cancels the SDK request.
+        rt.Effect.timeout(FENCE_CHECK_ENGINE_TIMEOUT_MS),
         rt.Effect.match({
           onSuccess: () => ({ state: 'held' }),
           onFailure: (err) =>
@@ -14128,6 +14133,15 @@ async function workAgent(req, flags, ctx) {
               fenceToken = reg.token;
               fenceEnv = reg.env;
             } catch { fenceEnv = null; }
+          }
+          // #320: `fences.register` awaits the socket listen, so a lease-loss /
+          // force-stop may have won the race. Stop BEFORE the job marker and the
+          // harness spawn (executors spawn before observing an already-aborted
+          // signal); the finally below unregisters the fence and reaps the run dirs.
+          if (checkSetupAbort(abortSignal, { jobType, jobKey: job.jobKey, stage: 'fence-register', logger })) {
+            checkpointFinalized = true;
+            await discardAgentInstanceProducer();
+            return;
           }
 
           // Record an in-flight job marker in this worker's namespace BEFORE the

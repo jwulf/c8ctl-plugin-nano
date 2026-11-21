@@ -90,7 +90,13 @@ export function createFenceRegistry({ check, socketPath = defaultSocketPath(), l
       writeFence(entry.fencePath, reason);
       return { state: 'lost', reason: readFence(entry.fencePath) || reason };
     }
-    if (res && res.state === 'held') return { state: 'held' };
+    if (res && res.state === 'held') {
+      // The heartbeat (or a concurrent check) may have written the fence while the
+      // engine call was pending — known loss beats a stale success.
+      const after = readFence(entry.fencePath);
+      if (after) return { state: 'lost', reason: after };
+      return { state: 'held' };
+    }
     return { state: 'unknown', error: (res && res.error) || 'unknown' };
   };
 
@@ -172,7 +178,13 @@ export function runFenceCheck({ env = process.env, timeoutMs = 30_000 } = {}) {
     sock.on('close', () => {
       let res = null;
       try { res = JSON.parse(buf.trim()); } catch { /* fallthrough */ }
-      if (res?.state === 'held') return finish({ code: FENCE_EXIT_HELD, message: 'held' });
+      if (res?.state === 'held') {
+        // Re-read immediately before accepting: a fence written after the worker
+        // queued its reply must win over the stale `held`.
+        const post = readFence(fencePath);
+        if (post) return finish({ code: FENCE_EXIT_LOST, message: post });
+        return finish({ code: FENCE_EXIT_HELD, message: 'held' });
+      }
       if (res?.state === 'lost') {
         // The worker wrote the fence; make sure it exists from our side too.
         writeFence(fencePath, res.reason || 'lease-lost');

@@ -38,7 +38,7 @@ import { withOwnedJob } from "./ownership.ts";
  * are the fallback for when NO status is available.
  */
 export const isLeaseLostError = (err: SupervisorError): boolean => {
-  const status = statusFromMessage(err.message) ?? httpStatusOf(err.cause);
+  const status = renewalStatusOf(err);
   if (status !== undefined) return isLostStatus(status);
   return LEASE_LOST_RE.test(err.message);
 };
@@ -58,10 +58,19 @@ const LEASE_LOST_RE =
  */
 export const leaseLostReason = (err: SupervisorError): string => {
   if (!isLeaseLostError(err)) return "lease-lost: unrenewable";
-  const status = statusFromMessage(err.message) ?? httpStatusOf(err.cause);
+  const status = renewalStatusOf(err);
   if (status === 404) return "job-gone";
   return `lease-lost: ${status ?? "not-activated"}`;
 };
+
+/**
+ * The ONE authoritative status for a renewal error: a STRUCTURED status on the
+ * cause chain wins over a status parsed from message text (a message may be a
+ * generic wrapper that contradicts the real response); message text is the
+ * fallback. Shared by every renewal classifier so none can disagree.
+ */
+export const renewalStatusOf = (err: SupervisorError): number | undefined =>
+  httpStatusOf(err.cause) ?? statusFromMessage(err.message);
 
 const isLostStatus = (status: number | undefined): boolean => status === 409 || status === 404;
 
@@ -106,8 +115,14 @@ const httpStatusOf = (err: unknown, depth = 0): number | undefined => {
  * (the server is asking us to back off / is briefly unhealthy), so they are
  * excluded — only a definitively permanent 4xx counts.
  */
-export const isPermanentRenewalError = (err: SupervisorError): boolean =>
-  /HTTP 4(?:00|01|03|22)\b|\bunauthori[sz]ed\b|\bforbidden\b/i.test(err.message);
+export const isPermanentRenewalError = (err: SupervisorError): boolean => {
+  const status = renewalStatusOf(err);
+  // An explicit status is authoritative: a 503/429 whose body says
+  // "Unauthorized"/"Forbidden" is still transient.
+  if (status !== undefined) return PERMANENT_RENEWAL_STATUSES.has(status);
+  return /\bunauthori[sz]ed\b|\bforbidden\b/i.test(err.message);
+};
+const PERMANENT_RENEWAL_STATUSES = new Set([400, 401, 403, 422]);
 
 /**
  * A heartbeat beat must END the renewal loop (and so interrupt the run) when the

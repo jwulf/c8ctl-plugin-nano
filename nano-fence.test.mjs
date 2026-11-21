@@ -1,12 +1,12 @@
 // Issue #320: NANO_FENCE + fence-check.
 import assert from "node:assert/strict";
 import { test } from "node:test";
-import { mkdtempSync, existsSync, readFileSync } from "node:fs";
+import { mkdtempSync, existsSync, readFileSync, symlinkSync, lstatSync } from "node:fs";
 import { tmpdir } from "node:os";
 import { join } from "node:path";
 import { spawnSync } from "node:child_process";
 import { connect } from "node:net";
-import { createFenceRegistry, runFenceCheck, FENCE_CHECK_SCRIPT } from "./nano-fence.mjs";
+import { createFenceRegistry, runFenceCheck, writeFence, FENCE_CHECK_SCRIPT } from "./nano-fence.mjs";
 import { createSupervisorDeps } from "./c8ctl-plugin.js";
 
 const BASIC = `Basic ${Buffer.from("u:p").toString("base64")}`;
@@ -144,4 +144,18 @@ test("an idle fence-check client is dropped and cannot pin the worker", async ()
   } finally {
     fences.close();
   }
+});
+
+test("writeFence never follows a planted (dangling) symlink and keeps the first reason", { skip: process.platform === "win32" }, () => {
+  const dir = mkdtempSync(join(tmpdir(), "nano-fence-sym-"));
+  const outside = join(mkdtempSync(join(tmpdir(), "nano-fence-out-")), "escaped");
+  const fence = join(dir, "fence");
+  symlinkSync(outside, fence);
+  writeFence(fence, "lease-lost: 409");
+  assert.equal(existsSync(outside), false, "write must not escape through the symlink");
+  assert.ok(lstatSync(fence).isSymbolicLink());
+  const plain = join(dir, "fence2");
+  assert.equal(writeFence(plain, "job-gone"), true);
+  assert.equal(writeFence(plain, "other"), true);
+  assert.equal(readFileSync(plain, "utf8"), "job-gone\n");
 });

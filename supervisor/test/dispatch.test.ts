@@ -318,6 +318,28 @@ test("isLeaseLostError: an explicit transient HTTP status is authoritative over 
   assert.equal(leaseLostReason(new SupervisorError("x: HTTP 503 from u — not found")), "lease-lost: unrenewable");
 });
 
+test("#320: a STRUCTURED cause status beats a contradictory message status (lost + permanent classifiers)", () => {
+  const msg503cause404 = new SupervisorError("extendLock J1: Request failed with status code 503", { status: 404 });
+  assert.equal(isLeaseLostError(msg503cause404), true, "cause 404 wins over message 503");
+  assert.equal(leaseLostReason(msg503cause404), "job-gone");
+  const msg404cause503 = new SupervisorError("extendLock J1: HTTP 404 job not found", { response: { status: 503 } });
+  assert.equal(isLeaseLostError(msg404cause503), false, "cause 503 wins over message 404");
+  assert.equal(isTerminalRenewalError(msg404cause503), false);
+});
+
+test("#320: explicit transient status is authoritative for the permanent-renewal classifier", () => {
+  for (const m of ["extendLock J1: HTTP 503 from u — Unauthorized", "extendLock J1: HTTP 429 from u — Forbidden",
+    "x: Request failed with status code 502: forbidden"]) {
+    assert.equal(isPermanentRenewalError(new SupervisorError(m)), false, m);
+    assert.equal(isTerminalRenewalError(new SupervisorError(m)), false, m);
+  }
+  assert.equal(isPermanentRenewalError(new SupervisorError("x: upstream", { status: 503, message: "Forbidden" })), false);
+  assert.equal(isPermanentRenewalError(new SupervisorError("x: Forbidden", { status: 403 })), true);
+  // No status anywhere: textual auth signals remain the fallback.
+  assert.equal(isPermanentRenewalError(new SupervisorError("extendLock J1: unauthorized")), true);
+  assert.equal(isPermanentRenewalError(new SupervisorError("extendLock J1: HTTP 401 from u")), true);
+});
+
 test("HUNG extend mid-run: a wedged extend that never resolves is bounded by extendTimeoutMs, counts toward the window, and interrupts the agent (a stall is not silent forever)", async () => {
   await Effect.runPromise(
     Effect.gen(function* () {

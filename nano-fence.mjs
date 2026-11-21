@@ -16,7 +16,7 @@
 // 75 (EX_TEMPFAIL) = unknown — transient engine/network error or the worker is
 // unreachable; retry briefly, then decide.
 import { createServer, connect } from 'node:net';
-import { existsSync, readFileSync, writeFileSync, rmSync } from 'node:fs';
+import { readFileSync, writeFileSync, rmSync } from 'node:fs';
 import { randomBytes } from 'node:crypto';
 import { tmpdir } from 'node:os';
 import { join } from 'node:path';
@@ -38,10 +38,13 @@ export const FENCE_CHECK_SCRIPT = fileURLToPath(new URL('./fence-check.mjs', imp
 export function writeFence(path, reason) {
   if (!path) return false;
   try {
-    if (existsSync(path)) return true;
-    writeFileSync(path, `${String(reason || 'lease-lost').split('\n')[0]}\n`);
+    // Exclusive create ('wx' = O_CREAT|O_EXCL): never follows a (dangling)
+    // symlink an agent planted in a shared mount, and is race-free vs a
+    // check-then-write. An existing entry means a fence is already present.
+    writeFileSync(path, `${String(reason || 'lease-lost').split('\n')[0]}\n`, { flag: 'wx' });
     return true;
-  } catch {
+  } catch (err) {
+    if (err && err.code === 'EEXIST') return true;
     return false;
   }
 }

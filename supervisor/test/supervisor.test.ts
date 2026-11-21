@@ -5,7 +5,7 @@ import { TestClock } from "effect/testing";
 import { defaultActivationConfig } from "../src/activation.ts";
 import { makeSupervisor } from "../src/supervisor.ts";
 import { makeRegistry } from "../src/registry.ts";
-import { noopLogger } from "../src/ports.ts";
+import { SupervisorError, noopLogger } from "../src/ports.ts";
 import { activateAfter, activateBatchAfter, job, makeEngine, makeReader, makeRunner } from "./fakes.ts";
 
 const scan = (xml: string) =>
@@ -378,5 +378,84 @@ test("unplaceable extras go to the parking lot (not failed) and are promoted whe
 
       yield* Fiber.interrupt(fiber);
     }).pipe(Effect.provide(TestClock.layer())),
+  );
+});
+
+test("reconcile 401/403 emits a distinct loud auth warning instead of the generic transient skip (#315)", async () => {
+  await Effect.runPromise(
+    Effect.gen(function* () {
+      const warnings: string[] = [];
+      const logger = { info: () => {}, warn: (msg: string) => { warnings.push(msg); }, debug: () => {} };
+      const engine = makeEngine({ activate: activateAfter({}) });
+      const runner = makeRunner(100);
+      const reg = yield* makeRegistry();
+      yield* reg.add("auto-w", [], 1);
+
+      // 401 on reconcile → loud auth-failed warning naming --auto 0-job-types impact.
+      const reader401 = {
+        searchProcessDefinitionKeys: () =>
+          Effect.fail(new SupervisorError("C8 REST process-definitions/search failed: 401 Unauthorized")),
+        getProcessDefinitionXml: () => Effect.succeed(""),
+      };
+      const sup401 = yield* makeSupervisor({
+        engine,
+        runner,
+        registry: reg,
+        reconcileReader: reader401,
+        scan,
+        logger,
+        autoWorkerId: "auto-w",
+      });
+      yield* sup401.reconcileOnce;
+      assert.equal(warnings.length, 1);
+      const w401 = warnings[0] ?? "";
+      assert.match(w401, /RECONCILE AUTH FAILED/);
+      assert.match(w401, /401 Unauthorized/);
+      assert.match(w401, /--auto worker may be serving 0 job types/);
+      assert.doesNotMatch(w401, /reconcile skipped/);
+
+      // 403 on reconcile → same loud auth-failed warning.
+      warnings.length = 0;
+      const reader403 = {
+        searchProcessDefinitionKeys: () =>
+          Effect.fail(new SupervisorError("C8 REST process-definitions/search failed: 403 Forbidden")),
+        getProcessDefinitionXml: () => Effect.succeed(""),
+      };
+      const sup403 = yield* makeSupervisor({
+        engine,
+        runner,
+        registry: reg,
+        reconcileReader: reader403,
+        scan,
+        logger,
+      });
+      yield* sup403.reconcileOnce;
+      assert.equal(warnings.length, 1);
+      const w403 = warnings[0] ?? "";
+      assert.match(w403, /RECONCILE AUTH FAILED/);
+      assert.match(w403, /403 Forbidden/);
+      assert.doesNotMatch(w403, /--auto worker/);
+
+      // Transient 503 → still the routine transient skip warning.
+      warnings.length = 0;
+      const reader503 = {
+        searchProcessDefinitionKeys: () =>
+          Effect.fail(new SupervisorError("C8 REST process-definitions/search failed: 503 Service Unavailable")),
+        getProcessDefinitionXml: () => Effect.succeed(""),
+      };
+      const sup503 = yield* makeSupervisor({
+        engine,
+        runner,
+        registry: reg,
+        reconcileReader: reader503,
+        scan,
+        logger,
+      });
+      yield* sup503.reconcileOnce;
+      assert.equal(warnings.length, 1);
+      const w503 = warnings[0] ?? "";
+      assert.match(w503, /reconcile skipped — .*503/);
+      assert.doesNotMatch(w503, /RECONCILE AUTH FAILED/);
+    }),
   );
 });

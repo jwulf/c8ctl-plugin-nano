@@ -42,6 +42,19 @@ export const isLeaseLostError = (err: SupervisorError): boolean =>
 const LEASE_LOST_RE =
   /HTTP 4(?:09|04)\b|status\s*code\s*4(?:09|04)\b|\bnot activated\b|joblease\s*mismatch|lease\s*mismatch|\bnot found\b|\breclaim/i;
 
+/**
+ * Issue #320: the one-line reason written to the agent-visible fence file when a
+ * renewal error ends the heartbeat: `lease-lost: <status>` for a definitive loss
+ * (`job-gone` for a 404), `lease-lost: unrenewable` for a permanent 4xx.
+ */
+export const leaseLostReason = (err: SupervisorError): string => {
+  if (!isLeaseLostError(err)) return "lease-lost: unrenewable";
+  const m = /(?:HTTP|status\s*code)\s*(\d{3})\b/i.exec(err.message);
+  const status = httpStatusOf(err.cause) ?? (m ? Number(m[1]) : undefined);
+  if (status === 404) return "job-gone";
+  return `lease-lost: ${status ?? "not-activated"}`;
+};
+
 const isLostStatus = (status: number | undefined): boolean => status === 409 || status === 404;
 
 /**
@@ -144,6 +157,16 @@ export const dispatch = (
 ): Effect.Effect<DispatchOutcome, never> =>
   Effect.gen(function* () {
     const { engine, runner, registry, logger, config, ownership } = deps;
+    // Issue #320: tell the runner the lease is gone BEFORE the race interrupts the
+    // run, so the agent-visible fence file exists by the time the agent is killed.
+    const notifyLeaseLost = (reason: string) =>
+      Effect.sync(() => {
+        try {
+          runner.onLeaseLost?.(job, reason);
+        } catch {
+          /* best effort — a fence write must never break the heartbeat */
+        }
+      });
     // A single extend must never AWAIT unboundedly — a hung SDK/HTTP call would
     // otherwise stall both the winner extend (wedging the claimed slot forever) and
     // each heartbeat beat (freezing renewal). Bound every extend by this deadline.
@@ -212,11 +235,11 @@ export const dispatch = (
             // to be) lapsed — give up now, a beat BEFORE expiry, rather than run
             // the agent on unlocked.
             return sinceOk + config.extendIntervalMs >= config.recoveryWindowMs
-              ? Effect.fail(
+              ? notifyLeaseLost("lease-lost: lapsed").pipe(Effect.andThen(Effect.fail(
                   new SupervisorError(
                     `job ${job.jobKey}: lock lapsed — no successful extend in ${sinceOk}ms (recovery window ${config.recoveryWindowMs}ms); last error: ${reason}`,
                   ),
-                )
+                )))
               : Effect.sync(() =>
                   logger.warn(
                     `[${job.type}] job ${job.jobKey}: heartbeat extend failed (transient, retrying) — ${reason}`,
@@ -236,7 +259,7 @@ export const dispatch = (
             Effect.flatMap((now) => Ref.set(lastOkAtRef, now)),
             Effect.catch((err: SupervisorError | { message?: string }) =>
               err instanceof SupervisorError && isTerminalRenewalError(err)
-                ? Effect.fail(err)
+                ? notifyLeaseLost(leaseLostReason(err)).pipe(Effect.andThen(Effect.fail(err)))
                 : retryUnlessLapsed(err?.message ?? String(err)),
             ),
             Effect.catchDefect((defect) => retryUnlessLapsed(defectText(defect))),

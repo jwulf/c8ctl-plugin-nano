@@ -376,6 +376,17 @@ SDK client (job workers) — do **not** add the SDK as a dependency or use raw
   reports `ref@sha [why]`
   (the sweep's `deleted` entries now carry the `sha`). Tests: the `#295 …` cases in
   `agent-checkpoint.test.mjs`.
+- **Lease fence (issue #320, `nano-fence.mjs` + `fence-check.mjs`).** Harness
+  contract: every job gets `NANO_FENCE` (a file beside the result file; container
+  path `/nano-agent/fence`) and, on host, `NANO_FENCE_CHECK`/`NANO_FENCE_SOCKET`/
+  `NANO_FENCE_TOKEN`. The runtime heartbeat calls the runner's `onLeaseLost(job,
+  reason)` hook (`dispatch.ts`, reason from `leaseLostReason`) BEFORE the race
+  interrupts the run, which writes the fence. `fence-check` (`c8 nano fence-check`
+  or `node "$NANO_FENCE_CHECK"`) asks the worker over the local socket to run a
+  fresh lease-fenced `extendLock` (`createSupervisorDeps().checkLease`); exit 0
+  held, 1 lost (fence written — only on `isLeaseLostError`), 75 unknown/transient.
+  Frozen contract (nwf briefs rely on it) — extend, don't rename. Tests:
+  `nano-fence.test.mjs`, `#320` cases in `supervisor/test/dispatch.test.ts`.
 - **Agent outcomes (`acpOutcomeFrom` / `resultVarsFromAcpOutcome`).** A
   `session/prompt` result may carry `_meta.outcome` `{status:'completed'|'blocked',
   summary}` (rusty-harness's `report_outcome`). `spawnCaptureAcp` surfaces it as

@@ -154,6 +154,8 @@ export interface RawJobRunner {
    * in-flight long-poll on the same interruption.
    */
   run(job: ActivatedJob, signal?: AbortSignal): Promise<void>;
+  /** Issue #320: see {@link JobRunner.onLeaseLost}. */
+  onLeaseLost?(job: ActivatedJob, reason: string): void;
 }
 
 /** Lift a plain {@link RawJobRunner} into the Effect {@link JobRunner} port. */
@@ -166,6 +168,9 @@ export const makeJobRunner = (raw: RawJobRunner): JobRunner => ({
       try: (signal) => Promise.resolve(raw.run(job, signal)).then(() => undefined),
       catch: toSupervisorError(`run ${job.jobKey} failed`),
     }),
+  ...(typeof raw.onLeaseLost === "function"
+    ? { onLeaseLost: (job: ActivatedJob, reason: string) => raw.onLeaseLost!(job, reason) }
+    : {}),
 });
 
 /**

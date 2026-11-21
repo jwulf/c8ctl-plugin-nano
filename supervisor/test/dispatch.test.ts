@@ -2,7 +2,7 @@ import assert from "node:assert/strict";
 import { test } from "node:test";
 import { Duration, Effect, Fiber } from "effect";
 import { TestClock } from "effect/testing";
-import { defaultDispatchConfig, dispatch, isLeaseLostError, isPermanentRenewalError, isTerminalRenewalError } from "../src/dispatch.ts";
+import { defaultDispatchConfig, dispatch, isLeaseLostError, leaseLostReason, isPermanentRenewalError, isTerminalRenewalError } from "../src/dispatch.ts";
 import { makeRegistry } from "../src/registry.ts";
 import { noopLogger, SupervisorError } from "../src/ports.ts";
 import { failing, job, makeEngine, makeRunner } from "./fakes.ts";
@@ -516,4 +516,51 @@ test("ownership: the job is claimed for the child's whole run and released after
       assert.deepEqual(yield* ownership.jobKeysFor("w1"), [], "released after the child exits");
     }).pipe(Effect.provide(TestClock.layer())),
   );
+});
+
+for (const [status, expected] of [[409, "lease-lost: 409"], [404, "job-gone"]] as const) {
+  test(`#320 fence: a ${status} on a heartbeat notifies onLeaseLost ("${expected}") BEFORE the run is interrupted`, async () => {
+    await Effect.runPromise(
+      Effect.gen(function* () {
+        let extendCalls = 0;
+        const events: string[] = [];
+        const engine = makeEngine({
+          activate: () => Effect.succeed([]),
+          extend: () => {
+            extendCalls += 1;
+            return extendCalls === 1 ? Effect.void : failing(`extendLock J1: HTTP ${status} from http://engine/v2/jobs/J1`);
+          },
+        });
+        const runner = {
+          run: (_j: { jobKey: string }) =>
+            Effect.sleep(Duration.millis(10_000_000)).pipe(
+              Effect.onInterrupt(() => Effect.sync(() => events.push("interrupted"))),
+            ),
+          onLeaseLost: (j: { jobKey: string }, reason: string) => events.push(`fence:${j.jobKey}:${reason}`),
+        };
+        const reg = yield* makeRegistry();
+        yield* reg.add("w1", ["a"], 1);
+        const worker = yield* reg.claim("a");
+        const fiber = yield* Effect.forkChild(
+          dispatch(
+            { engine, runner, registry: reg, logger: noopLogger, config: { recoveryWindowMs: 300_000, extendIntervalMs: 60_000 } },
+            job("J1", "a", "lease-J1"),
+            worker!,
+          ),
+        );
+        yield* TestClock.adjust(Duration.millis(60_000));
+        const outcome = yield* Fiber.join(fiber);
+        assert.equal(outcome.reason, "lock-lost");
+        assert.deepEqual(events, [`fence:J1:${expected}`, "interrupted"]);
+      }).pipe(Effect.provide(TestClock.layer())),
+    );
+  });
+}
+
+test("#320 leaseLostReason: status/permanent classification", () => {
+  assert.equal(leaseLostReason(new SupervisorError("x: HTTP 409 from u")), "lease-lost: 409");
+  assert.equal(leaseLostReason(new SupervisorError("x: HTTP 404 from u")), "job-gone");
+  assert.equal(leaseLostReason(new SupervisorError("x failed", { status: 409 })), "lease-lost: 409");
+  assert.equal(leaseLostReason(new SupervisorError("x: Job 5 is not activated")), "lease-lost: not-activated");
+  assert.equal(leaseLostReason(new SupervisorError("x: HTTP 401 from u")), "lease-lost: unrenewable");
 });

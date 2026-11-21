@@ -881,6 +881,31 @@ the job with a decremented retry count. Profiles are stored in the plugin's
 > `$AGENT_RESULT_FILE` (or the `::nano:result::` sentinel) always wins, and agents
 > that send no outcome are handled exactly as before.
 
+### Lease fence: `NANO_FENCE` / `fence-check`
+
+An agent about to do something irreversible (`git push`, open a PR, re-request
+review) can check that its job is still owned by this worker **without any app
+URL or credentials**:
+
+- **`NANO_FENCE`** — a per-job file path. The worker creates it, holding a
+  one-line reason (`lease-lost: 409`, `job-gone`, `lease-lost: lapsed`,
+  `lease-lost: unrenewable`), the moment the heartbeat learns the lease is lost —
+  *before* it interrupts the run. No file = not known lost. Also set inside
+  container sandboxes (via the result-file mount).
+- **`c8 nano fence-check`** (or `node "$NANO_FENCE_CHECK"`) — asks the worker,
+  over a local socket (`NANO_FENCE_SOCKET` + `NANO_FENCE_TOKEN`, host sandbox
+  only), to do a fresh lease-fenced engine check through the worker's own
+  authenticated connection. Exit codes:
+  - `0` — job held;
+  - `1` — job lost; the fence file has been written;
+  - `75` — unknown (engine 429/5xx/network, auth error, or worker unreachable):
+    retry briefly, then decide. Transient errors never write the fence.
+
+```sh
+node "$NANO_FENCE_CHECK" || { echo "lease lost: $(cat "$NANO_FENCE" 2>/dev/null)"; exit 1; }
+git push origin HEAD
+```
+
 ### Task envelope, sandboxes & disk hygiene
 
 For **agentic** jobs (an agent that clones a repo, works a task, pushes a

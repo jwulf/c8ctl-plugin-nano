@@ -160,6 +160,13 @@ export type ScanAgentLeaves = (xml: string) => ReadonlyArray<{ taskType: string;
  */
 export interface JobRunner {
   run(job: ActivatedJob): Effect.Effect<void, SupervisorError>;
+  /**
+   * Issue #320: notified SYNCHRONOUSLY when the heartbeat concludes the lease on
+   * `job` is definitively lost (or unrenewable), BEFORE the run is interrupted —
+   * so the runner can write the agent-visible `NANO_FENCE` file first. Optional;
+   * must never throw (a throw is swallowed).
+   */
+  onLeaseLost?(job: ActivatedJob, reason: string): void;
 }
 
 /** Minimal logger, satisfied by the plugin's `getLogger()` or `console`. */

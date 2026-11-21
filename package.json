@@ -34,6 +34,8 @@
     "work-channel.mjs",
     "work-relay.mjs",
     "work-buffer.mjs",
+    "nano-fence.mjs",
+    "fence-check.mjs",
     "supervisor.dist.js",
     "nanobpmn-binary.json",
     "README.md"

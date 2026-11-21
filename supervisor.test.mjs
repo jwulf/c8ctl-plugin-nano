@@ -4,6 +4,7 @@
 // socket's newline-delimited JSON framing, the status summariser, and the
 // status table renderer. The daemon/socket/attach lifecycle is I/O-bound and is
 // exercised separately.
+import './test-support/hermetic-service.mjs'; // issue #325: no real LaunchAgents/units
 import { test } from 'node:test';
 import assert from 'node:assert/strict';
 import { EventEmitter } from 'node:events';

@@ -1447,6 +1447,14 @@ the fleet untouched, so a failed upgrade never strands the workers.
   `stop` + `start`) to bring the new-code daemon back under the service. A
   fully service-owned handoff (systemd `NOTIFY` / socket activation) is a
   possible future increment; today the upgrade is a session-level operation.
+  Because the successor starts in the **invoking session**, upgrading over SSH
+  on macOS also hands it your SSH session environment (`SSH_*`, any exported
+  tokens), which it then passes to every worker, agent job and test run it
+  spawns. So **right after upgrading a service-managed daemon, run
+  `c8ctl nano supervisor stop && c8ctl nano supervisor start`** (start
+  kickstarts the installed agent with its curated env), and verify with the
+  `ps eww` check under *Surviving SSH logout* below. (Making `upgrade` hand over
+  to the service itself — kickstarting the agent — is the better long-term fix.)
 - **Worker log piping across the swap.** With log capping on (the default),
   each worker's stdout/stderr is piped through the daemon that spawned it. A
   daemon upgrade adopts a worker by pid but cannot inherit that pipe, so output
@@ -1501,6 +1509,24 @@ c8ctl nano supervisor uninstall   # stop + remove it
 - `KeepAlive`/`Restart` are **crash-only**: a `supervisor stop` (clean exit) stays
   down; only a crash is restarted.
 
+> **Session-bound daemons leak the SSH environment.** A daemon that is *not*
+> started by the service — after `supervisor uninstall`, with
+> `C8CTL_NANO_NO_LAUNCHD=1`, or straight after `supervisor upgrade` (see above) —
+> runs in your SSH session and passes that session's environment (`SSH_*`,
+> exported tokens such as `GITHUB_TOKEN`) to **every worker, agent job and test
+> run** beneath it. Prefer the installed service; if you must run session-bound,
+> start from a clean shell.
+>
+> **Operator check.** On a correctly service-owned fleet this prints nothing for
+> each worker pid (from `supervisor status`):
+>
+> ```bash
+> ps eww <worker-pid> | tr ' ' '\n' | grep ^SSH_
+> ```
+>
+> Any output means the fleet inherited an SSH session — `supervisor stop` +
+> `start` to bring it back under the service.
+
 When the service **is installed**, every path that starts the daemon
 (`supervisor start`, and a bare `supervisor` / `supervisor attach`) brings it up
 **through the service**: it kickstarts the LaunchAgent when a clean `stop` left it
@@ -1515,6 +1541,15 @@ launchd domain (equivalent to `install`) so it survives logout, and tells you. I
 it cannot (e.g. `launchctl` is unavailable, or you set `C8CTL_NANO_NO_LAUNCHD=1`),
 it prints a prominent **warning** pointing at `supervisor install` instead of
 silently leaving a fleet that will wedge on logout.
+
+The auto-reparent is **skipped** when `C8CTL_NANO_HOME` points at a non-default
+state home (e.g. a test's temp dir): an auto-registered login item tied to a
+throwaway home would be respawned by launchd forever. Run `supervisor install`
+explicitly for a custom home. `C8CTL_NANO_SERVICE_DIR` overrides the directory
+the LaunchAgent plist / systemd user unit is written to (the test suite points it
+at a temp dir, clears `SSH_*` and sets `C8CTL_NANO_NO_LAUNCHD=1` via
+`test-support/hermetic-service.mjs`, and fails if a run leaks a service file or
+an orphaned temp-home daemon).
 
 > **macOS Local Network Privacy + a LAN engine (macOS 15 Sequoia / 26 Tahoe).**
 > The `gui/$UID` LaunchAgent that keeps the fleet alive across SSH logout is a
@@ -1549,6 +1584,9 @@ silently leaving a fleet that will wedge on logout.
 >   unless you set `C8CTL_NANO_NO_LAUNCHD=1` — without that opt-out you land in
 >   the same blocked identity. Start from a **local Terminal** session (or export
 >   `C8CTL_NANO_NO_LAUNCHD=1`) to keep the interactive grant.
+>   **Caveat:** a session-bound daemon passes the SSH session environment
+>   (`SSH_*`, tokens) to every worker, agent job and test run beneath it (see
+>   *Session-bound daemons leak the SSH environment* above).
 > - **Run the daemon as root** — root retains LAN access, but running agent
 >   harnesses as root is a poor trade; prefer the options above.
 

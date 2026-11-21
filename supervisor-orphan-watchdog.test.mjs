@@ -8,6 +8,7 @@
 // daemon, and assert the worker child exits on its own within a short window.
 // Before the fix the child idled forever and this timed out; after it, the
 // watchdog notices the reparent and exits.
+import './test-support/hermetic-service.mjs'; // issue #325: no real LaunchAgents/units
 import { test } from 'node:test';
 import assert from 'node:assert/strict';
 import { mkdtempSync, writeFileSync, rmSync } from 'node:fs';

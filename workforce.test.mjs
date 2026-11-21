@@ -1,6 +1,7 @@
 // Unit + integration tests for the declarative workforce manifest feature
 // (issue #117): the pure schema/mapping/reconcile helpers, plus the on-disk
 // manifest round-trip against an isolated C8CTL_NANO_HOME temp dir.
+import './test-support/hermetic-service.mjs'; // issue #325: no real LaunchAgents/units
 import { test } from 'node:test';
 import assert from 'node:assert/strict';
 import { mkdtempSync, writeFileSync, rmSync, mkdirSync } from 'node:fs';

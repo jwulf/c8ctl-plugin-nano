@@ -7,6 +7,7 @@
 // Each test runs against an isolated C8CTL_NANO_HOME temp dir and a scrubbed set
 // of NANO_AGENTIC* env vars, so it exercises the real config.json round-trip
 // without touching the operator's state or leaking env between cases.
+import './test-support/hermetic-service.mjs'; // issue #325: no real LaunchAgents/units
 import { test } from 'node:test';
 import assert from 'node:assert/strict';
 import { mkdtempSync, rmSync } from 'node:fs';

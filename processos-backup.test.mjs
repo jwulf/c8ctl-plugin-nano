@@ -3,6 +3,7 @@
 // before an upgrade swaps the binary the launcher snapshots each per-node read
 // model. These tests drive the real backup/prune helpers against an isolated
 // C8CTL_NANO_HOME temp dir so nothing touches the operator's real state.
+import './test-support/hermetic-service.mjs'; // issue #325: no real LaunchAgents/units
 import { test } from 'node:test';
 import assert from 'node:assert/strict';
 import { mkdtempSync, mkdirSync, writeFileSync, readdirSync, readFileSync, rmSync, existsSync, utimesSync } from 'node:fs';

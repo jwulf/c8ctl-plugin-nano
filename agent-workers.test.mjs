@@ -1,6 +1,7 @@
 // Unit tests for the sandboxed agent-worker plumbing (issue #8, increment 1):
 // task-envelope normalization, secret resolution, result envelope, profile
 // normalization, and (Docker-gated) container execution + disk hygiene.
+import './test-support/hermetic-service.mjs'; // issue #325: no real LaunchAgents/units
 import { test } from 'node:test';
 import assert from 'node:assert/strict';
 import { spawn, spawnSync } from 'node:child_process';

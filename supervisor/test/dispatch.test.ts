@@ -286,6 +286,38 @@ test("isLeaseLostError: definitive ownership-loss signals stop the heartbeat; tr
   assert.equal(isLeaseLostError(sdk500), false, "numeric 500 stays transient");
 });
 
+test("isLeaseLostError: an explicit transient HTTP status is authoritative over a lease-loss body", () => {
+  // A 503 whose BODY carries a textual lease-loss signal ("upstream not found")
+  // must NOT be classified as ownership loss: the explicit status wins, so the
+  // fence-check returns `unknown` (exit 75) and the agent retries rather than
+  // abandoning recoverable work. Regression for the fence-check 503 finding.
+  const transientWithLostBody = [
+    "extendLock J1: HTTP 503 from http://engine/v2/jobs/J1 — upstream not found",
+    "extendLock J1: SDK updateJob failed: Request failed with status code 503: job not found",
+    "extendLock J1: HTTP 429 from http://engine/v2/jobs/J1 — not activated",
+  ];
+  for (const m of transientWithLostBody) {
+    assert.equal(isLeaseLostError(new SupervisorError(m)), false, m);
+  }
+  // The status may live only on the cause chain while the message carries the
+  // misleading body text.
+  const sdk503 = new SupervisorError("extendLock J1 failed: upstream not found", {
+    message: "upstream not found",
+    status: 503,
+  });
+  assert.equal(isLeaseLostError(sdk503), false, "numeric 503 on cause beats 'not found' body");
+  // … while a definitive status with a lease-loss body is still lost.
+  assert.equal(
+    isLeaseLostError(new SupervisorError("extendLock J1: HTTP 404 from u — job not found")),
+    true,
+    "explicit 404 still lost",
+  );
+  // With NO status anywhere, the textual signals remain the fallback.
+  assert.equal(isLeaseLostError(new SupervisorError("extendLock J1: job not found")), true, "bare body, no status");
+  // leaseLostReason tracks the same authoritative status.
+  assert.equal(leaseLostReason(new SupervisorError("x: HTTP 503 from u — not found")), "lease-lost: unrenewable");
+});
+
 test("HUNG extend mid-run: a wedged extend that never resolves is bounded by extendTimeoutMs, counts toward the window, and interrupts the agent (a stall is not silent forever)", async () => {
   await Effect.runPromise(
     Effect.gen(function* () {

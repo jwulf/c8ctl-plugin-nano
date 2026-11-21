@@ -30,9 +30,18 @@ import { withOwnedJob } from "./ownership.ts";
  * a 404 (job gone), or the engine's "not activated" body — mean the lease is gone.
  * Everything TRANSIENT (a 5xx, a 429, a network blip, a timeout) is NOT ownership
  * loss and must not, on its own, stop lock renewal.
+ *
+ * An explicit HTTP status is AUTHORITATIVE: when one can be determined (from the
+ * message or the cause chain), only a definitive 409/404 means lost — a transient
+ * status (503/429/…) is NOT ownership loss even if its body happens to carry a
+ * textual lease-loss signal (e.g. a 503 "upstream not found"). The textual signals
+ * are the fallback for when NO status is available.
  */
-export const isLeaseLostError = (err: SupervisorError): boolean =>
-  LEASE_LOST_RE.test(err.message) || isLostStatus(httpStatusOf(err.cause));
+export const isLeaseLostError = (err: SupervisorError): boolean => {
+  const status = statusFromMessage(err.message) ?? httpStatusOf(err.cause);
+  if (status !== undefined) return isLostStatus(status);
+  return LEASE_LOST_RE.test(err.message);
+};
 
 /**
  * Match the textual lease-loss signals. Beyond the raw client's own `HTTP 409`/
@@ -49,13 +58,23 @@ const LEASE_LOST_RE =
  */
 export const leaseLostReason = (err: SupervisorError): string => {
   if (!isLeaseLostError(err)) return "lease-lost: unrenewable";
-  const m = /(?:HTTP|status\s*code)\s*(\d{3})\b/i.exec(err.message);
-  const status = httpStatusOf(err.cause) ?? (m ? Number(m[1]) : undefined);
+  const status = statusFromMessage(err.message) ?? httpStatusOf(err.cause);
   if (status === 404) return "job-gone";
   return `lease-lost: ${status ?? "not-activated"}`;
 };
 
 const isLostStatus = (status: number | undefined): boolean => status === 409 || status === 404;
+
+/**
+ * Pull an explicit HTTP status out of an error MESSAGE — the raw client's own
+ * `HTTP 409`/`HTTP 404` prefixes and an injected SDK rejection's generic
+ * `Request failed with status code 409` shape. Returns undefined when the message
+ * carries no status (a bare "not activated" / "lease mismatch" body).
+ */
+const statusFromMessage = (message: string): number | undefined => {
+  const m = /(?:HTTP|status\s*code)\s*(\d{3})\b/i.exec(message);
+  return m ? Number(m[1]) : undefined;
+};
 
 /**
  * Pull an HTTP status off an arbitrary (SDK/fetch) error, walking its `cause`

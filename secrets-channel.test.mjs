@@ -301,14 +301,18 @@ test('updateSecretsFile re-reads under the lock so interleaved updates are not l
   } finally { rmSync(dir, { recursive: true, force: true }); }
 });
 
-test('updateSecretsFile times out while another holder owns the lock, and breaks a stale lock', () => {
+test('updateSecretsFile times out on a held lock and fails closed (never deletes) on a stale lock', () => {
   const dir = mkdtempSync(join(tmpdir(), 'nano-sec-lock-'));
   try {
     const f = join(dir, 'secrets.env');
     writeFileSync(`${f}.lock`, '');
     assert.throws(() => updateSecretsFile(f, (s) => { s.X = '1'; }, { timeoutMs: 100, staleMs: 60_000 }), /timed out/);
     assert.equal(readSecretsFile(f).exists, false);
-    updateSecretsFile(f, (s) => { s.X = '1'; }, { timeoutMs: 100, staleMs: 0 });
+    // stale: a concurrent reclaimer could unlink a LIVE replacement, so refuse
+    assert.throws(() => updateSecretsFile(f, (s) => { s.X = '1'; }, { timeoutMs: 100, staleMs: -1 }), /looks stale.*remove it manually/);
+    statSync(`${f}.lock`); // still present
+    rmSync(`${f}.lock`);
+    updateSecretsFile(f, (s) => { s.X = '1'; }, { timeoutMs: 100 });
     assert.equal(readSecretsFile(f).secrets.X, '1');
   } finally { rmSync(dir, { recursive: true, force: true }); }
 });
@@ -322,4 +326,23 @@ test('snapshotSecretResolver yields one consistent value per activation', () => 
   assert.equal(snap.resolve('GITHUB_TOKEN'), 'old');
   assert.equal(snap.kind, 'host');
   assert.equal(snapshotSecretResolver(base).resolve('GITHUB_TOKEN'), 'new');
+});
+
+test('updateSecretsFile releases only its own lock (a foreign replacement lock survives)', () => {
+  const dir = mkdtempSync(join(tmpdir(), 'nano-sec-lock-'));
+  try {
+    const f = join(dir, 'secrets.env');
+    updateSecretsFile(f, () => { rmSync(`${f}.lock`); writeFileSync(`${f}.lock`, 'other-owner'); });
+    statSync(`${f}.lock`);
+  } finally { rmSync(dir, { recursive: true, force: true }); }
+});
+
+test('parseSecretsFileContent strips inline comments outside quotes only', () => {
+  const p = parseSecretsFileContent('A="ghp_abc" # rotated\nB=plain # note\nC="x # y"\nD=\'q\' #c\nE=a#b\nF="e\\"s" # c\n');
+  assert.equal(p.A, 'ghp_abc');
+  assert.equal(p.B, 'plain');
+  assert.equal(p.C, 'x # y');
+  assert.equal(p.D, 'q');
+  assert.equal(p.E, 'a#b');
+  assert.equal(p.F, 'e"s');
 });

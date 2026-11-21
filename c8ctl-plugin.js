@@ -5056,6 +5056,21 @@ function parseSecretsFileContent(raw) {
     const key = body.slice(0, eq).trim();
     if (!/^[A-Za-z_][A-Za-z0-9_]*$/.test(key)) continue;
     let val = body.slice(eq + 1).trim();
+    // Strip a trailing inline comment outside quotes: for a quoted value, cut
+    // at its (unescaped) closing quote when only whitespace/`# comment` follows;
+    // for an unquoted value, a `#` preceded by whitespace starts a comment.
+    if (val.startsWith('"') || val.startsWith("'")) {
+      const q = val[0];
+      let end = -1;
+      for (let i = 1; i < val.length; i++) {
+        if (q === '"' && val[i] === '\\') { i++; continue; }
+        if (val[i] === q) { end = i; break; }
+      }
+      if (end > 0 && /^\s*(#.*)?$/.test(val.slice(end + 1))) val = val.slice(0, end + 1);
+    } else {
+      const m = val.match(/\s#/);
+      if (m) val = val.slice(0, m.index).trim();
+    }
     if (val.length >= 2 && ((val.startsWith('"') && val.endsWith('"')) || (val.startsWith("'") && val.endsWith("'")))) {
       const quote = val[0];
       val = val.slice(1, -1);
@@ -5151,15 +5166,22 @@ function updateSecretsFile(filePath, mutate, { timeoutMs = 10_000, staleMs = 30_
   mkdirSync(dirname(filePath), { recursive: true });
   const lockPath = `${filePath}.lock`;
   const deadline = Date.now() + timeoutMs;
+  const owner = `${process.pid}:${Date.now()}:${Math.random().toString(36).slice(2)}`;
   let fd = null;
   while (fd === null) {
     try {
       fd = openSync(lockPath, 'wx', 0o600);
+      writeFileSync(fd, owner);
     } catch (err) {
       if (err?.code !== 'EEXIST') throw err;
-      try {
-        if (Date.now() - statSync(lockPath).mtimeMs > staleMs) { rmSync(lockPath, { force: true }); continue; }
-      } catch { continue; }
+      // Never auto-delete another holder's lock: two waiters could both judge
+      // the same lock stale and one would unlink the other's LIVE replacement.
+      // Fail closed with manual-recovery guidance instead.
+      let stale = false;
+      try { stale = Date.now() - statSync(lockPath).mtimeMs > staleMs; } catch { continue; }
+      if (stale) {
+        throw new Error(`secrets lock ${lockPath} looks stale (older than ${Math.round(staleMs / 1000)}s); if no other \`nano secret\` command is running, remove it manually and retry`);
+      }
       if (Date.now() > deadline) throw new Error(`timed out waiting for secrets lock ${lockPath}`);
       Atomics.wait(new Int32Array(new SharedArrayBuffer(4)), 0, 0, 50);
     }
@@ -5172,7 +5194,8 @@ function updateSecretsFile(filePath, mutate, { timeoutMs = 10_000, staleMs = 30_
     return changed !== false;
   } finally {
     try { closeSync(fd); } catch { /* ignore */ }
-    rmSync(lockPath, { force: true });
+    // Release only our own lock (identified by the owner token we wrote).
+    try { if (readFileSync(lockPath, 'utf8') === owner) rmSync(lockPath, { force: true }); } catch { /* gone */ }
   }
 }
 

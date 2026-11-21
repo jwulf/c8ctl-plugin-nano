@@ -6439,7 +6439,7 @@ test('createIdleLivenessMonitor survives a real silent subtree cycling short-liv
     } finally {
       try { keeper.kill('SIGKILL'); } catch {}
     }
-  `], { stdio: 'ignore' });
+  `], { detached: true, stdio: 'ignore' });
   let killed = 0;
   const logs = [];
   try {
@@ -6464,6 +6464,10 @@ test('createIdleLivenessMonitor survives a real silent subtree cycling short-liv
     mon.stop();
     assert.equal(killed, 0, `real silent subtree cycling short-lived children must not be idle-killed under sampleSubtreeCpuPs; logs:\n${logs.join('\n')}`);
   } finally {
-    try { child.kill('SIGKILL'); } catch {}
+    // Kill the whole process group (the fixture is spawned `detached`), so a
+    // cleanup that lands before the fixture's 4s loop finishes also reaps the
+    // keeper and any in-flight CPU worker — killing only the parent would
+    // bypass its `finally` and orphan them (matches the subtree test above).
+    try { process.kill(-child.pid, 'SIGKILL'); } catch { /* best effort */ }
   }
 });

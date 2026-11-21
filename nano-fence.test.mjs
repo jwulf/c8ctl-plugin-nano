@@ -369,11 +369,11 @@ test("#320 fence socket: extra requests on one connection are not handled", asyn
   let calls = 0;
   let release;
   const gate = new Promise((r) => { release = r; });
-  const sockPath = join(mkdtempSync(join(tmpdir(), "fence-sk-")), "s.sock");
-  const reg = createFenceRegistry({ socketPath: sockPath, check: async () => { calls++; await gate; return { state: "held" }; } });
+  const reg = createFenceRegistry({ check: async () => { calls++; await gate; return { state: "held" }; } });
   const { token } = await reg.register({ jobKey: "1" }, join(tmpdir(), `nf-${Date.now()}-${Math.random()}`));
-  const s = connect(sockPath);
-  await new Promise((r) => s.on("connect", r));
+  assert.ok(reg.socketPath, "registry exposes its platform-aware socket path");
+  const s = connect(reg.socketPath);
+  await new Promise((r, j) => { s.on("connect", r); s.on("error", j); });
   for (let i = 0; i < 50; i++) s.write(JSON.stringify({ token }) + "\n");
   let out = "";
   s.setEncoding("utf8");

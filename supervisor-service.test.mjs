@@ -16,6 +16,8 @@ import { dirname, join } from 'node:path';
 import {
   isSshSession,
   stateHomeOverridden,
+  sshAutoInstallPolicy,
+  serviceDirOverride,
   defaultStateHome,
   xmlEscape,
   supervisorServiceLabel,
@@ -267,4 +269,17 @@ test('every daemon-starting command path goes through the service-policy seam', 
   assert.ok(seam, 'startSupervisorWithServicePolicy must exist');
   assert.match(seam[1], /maybeReparentOrWarnOnStart\(logger\)/);
   assert.match(seam[1], /startSupervisorDaemon\(\{ adoptOnly: serviceOwned \}\)/);
+});
+
+test('sshAutoInstallPolicy: custom home skips auto-install, default home installs (issue #325)', () => {
+  assert.equal(sshAutoInstallPolicy({}), 'install');
+  assert.equal(sshAutoInstallPolicy({ C8CTL_NANO_HOME: defaultStateHome() }), 'install');
+  assert.equal(sshAutoInstallPolicy({ C8CTL_NANO_HOME: '/tmp/custom-home' }), 'custom-home');
+  assert.equal(sshAutoInstallPolicy({ C8CTL_NANO_NO_LAUNCHD: '1', C8CTL_NANO_HOME: '/tmp/x' }), 'opt-out');
+});
+
+test('serviceDirOverride resolves a relative override to an absolute path (issue #325)', () => {
+  const p = serviceDirOverride({ C8CTL_NANO_SERVICE_DIR: './services' });
+  assert.ok(p.startsWith('/') || /^[A-Za-z]:\\/.test(p), p);
+  assert.equal(serviceDirOverride({}), null);
 });

@@ -19000,7 +19000,8 @@ function launchAgentPlistPath() {
  */
 function serviceDirOverride(env = process.env) {
   const v = env.C8CTL_NANO_SERVICE_DIR;
-  return v ? expandHome(v) : null;
+  // Resolve to absolute: `systemctl --user enable <path>` rejects a relative unit path.
+  return v ? resolvePath(expandHome(v)) : null;
 }
 
 /**
@@ -19386,6 +19387,17 @@ function ensureLaunchAgentStarted(logger, { run = runLaunchctl, uid, label, plis
  * spawning a competing session-bound daemon; `false` on every non-exposed path
  * (Linux, a local login, opt-out/failure, or a service that would not start).
  */
+/**
+ * Pure policy for an uninstalled macOS+SSH start (issue #325): 'opt-out'
+ * (C8CTL_NANO_NO_LAUNCHD), 'custom-home' (non-default C8CTL_NANO_HOME — never
+ * auto-install), else 'install'.
+ */
+function sshAutoInstallPolicy(env = process.env) {
+  if (coerceBool(env.C8CTL_NANO_NO_LAUNCHD, false)) return 'opt-out';
+  if (stateHomeOverridden(env)) return 'custom-home';
+  return 'install';
+}
+
 async function maybeReparentOrWarnOnStart(logger) {
   if (osPlatform() !== 'darwin') return false;     // Linux already survives logout
   if (supervisorServiceInstalled()) {
@@ -19398,8 +19410,9 @@ async function maybeReparentOrWarnOnStart(logger) {
   }
   if (!isSshSession()) return false;               // a local login session isn't torn down like SSH
   if (await liveSupervisor()) return false;        // adopting an existing daemon — nothing to re-parent
-  if (coerceBool(process.env.C8CTL_NANO_NO_LAUNCHD, false)) { warnSshTeardown(logger); return false; }
-  if (stateHomeOverridden()) {
+  const policy = sshAutoInstallPolicy();
+  if (policy === 'opt-out') { warnSshTeardown(logger); return false; }
+  if (policy === 'custom-home') {
     // Issue #325: never auto-register a login item for a non-default state home
     // (e.g. a test's temp C8CTL_NANO_HOME) — launchd would respawn it forever.
     logger.warn('C8CTL_NANO_HOME is overridden to a non-default state home — not auto-installing a LaunchAgent. Run `c8ctl nano supervisor install` explicitly if you want one.');
@@ -22524,6 +22537,7 @@ export {
   getSupervisorStateFile,
   isSshSession,
   stateHomeOverridden,
+  sshAutoInstallPolicy,
   serviceDirOverride,
   defaultStateHome,
   xmlEscape,

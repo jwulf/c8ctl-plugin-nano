@@ -393,7 +393,9 @@ function withLogTimestamps(logger, now = () => new Date().toISOString()) {
 
 function getLogger() {
   const base = getBaseLogger();
-  return workerLogTimestamps ? withLogTimestamps(base) : base;
+  // Re-check the CURRENT output mode on every call: a stale flag from an earlier
+  // text-mode `work` must never timestamp a later JSON-mode command's logs.
+  return workerLogTimestamps && !hostOutputIsJson() ? withLogTimestamps(base) : base;
 }
 
 function getBaseLogger() {
@@ -22528,6 +22530,7 @@ export {
   withLogTimestamps,
   enableWorkerLogTimestamps,
   syncWorkerLogTimestamps,
+  getLogger as __getLoggerForTest,
   describeFetchError,
   isTransientFetchError,
   isEngineAuthError,

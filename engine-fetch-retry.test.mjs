@@ -11,6 +11,7 @@ import {
   fetchLinkedResourceContent,
   isTransientFetchError,
   syncWorkerLogTimestamps,
+  __getLoggerForTest as getLogger,
   withLogTimestamps,
   withTransientFetchRetry,
 } from "./c8ctl-plugin.js";
@@ -207,6 +208,25 @@ test("syncWorkerLogTimestamps resets the flag for JSON output after text mode", 
     assert.equal(syncWorkerLogTimestamps(), false, "JSON mode must clear the flag");
     globalThis.c8ctl = { getLogger: () => ({ mode: "json" }) };
     assert.equal(syncWorkerLogTimestamps(), false);
+  } finally {
+    globalThis.c8ctl = prev;
+    syncWorkerLogTimestamps();
+  }
+});
+
+test("getLogger never timestamps JSON-mode logs even with a stale text-mode flag", () => {
+  const prev = globalThis.c8ctl;
+  try {
+    globalThis.c8ctl = { outputMode: "text", getLogger: () => ({ info() {} }) };
+    assert.equal(syncWorkerLogTimestamps(), true);
+    assert.equal(getLogger().__nanoTimestamped, true);
+    const lines = [];
+    const jsonLogger = { mode: "json", info: (m) => lines.push(m) };
+    globalThis.c8ctl = { outputMode: "json", getLogger: () => jsonLogger };
+    const l = getLogger();
+    assert.equal(l, jsonLogger, "stale flag must not wrap a JSON-mode logger");
+    l.info("hi");
+    assert.deepEqual(lines, ["hi"]);
   } finally {
     globalThis.c8ctl = prev;
     syncWorkerLogTimestamps();

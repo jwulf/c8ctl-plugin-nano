@@ -22812,7 +22812,7 @@ export const commands = {
             // written), 75 unknown/transient — so it bypasses the generic failure path.
             const { runFenceCheck } = await import('./nano-fence.mjs');
             const { code, message } = await runFenceCheck();
-            (code === 0 ? process.stdout : process.stderr).write(`${message}\n`);
+            if (code === 0) logger.output(message); else logger.error(message);
             process.exit(code);
           }
         }

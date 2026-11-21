@@ -1,7 +1,7 @@
 // Issue #320: NANO_FENCE + fence-check.
 import assert from "node:assert/strict";
 import { test } from "node:test";
-import { mkdtempSync, existsSync, readFileSync, writeFileSync, symlinkSync, lstatSync, chmodSync } from "node:fs";
+import { mkdtempSync, existsSync, readFileSync, writeFileSync, symlinkSync, lstatSync } from "node:fs";
 import { tmpdir } from "node:os";
 import { join } from "node:path";
 import { spawnSync } from "node:child_process";
@@ -122,9 +122,9 @@ test("a held answer is not accepted when the job was unregistered while the chec
   }
 });
 
-test("a latched loss beats a delayed held even when the fence write cannot land (unwritable dir)", async () => {
+test("a latched loss beats a delayed held even when the fence write cannot land (missing parent dir)", async () => {
   const dir = mkdtempSync(join(tmpdir(), "fence-test-"));
-  const fencePath = join(dir, "fence");
+  const fencePath = join(dir, "missing-parent", "fence"); // write fails deterministically (no root/Windows chmod caveats)
   let fences;
   // Delayed successful check: the heartbeat confirms the loss while it is pending.
   fences = createFenceRegistry({
@@ -132,7 +132,6 @@ test("a latched loss beats a delayed held even when the fence write cannot land 
   });
   try {
     const { env } = await fences.register(job, fencePath);
-    chmodSync(dir, 0o555); // unwritable: the fence write fails
     const pending = runFenceCheck({ env });
     fences.leaseLost(job, "lease-lost: 409");
     assert.deepEqual(await pending, { code: 1, message: "lease-lost: 409" });
@@ -140,7 +139,6 @@ test("a latched loss beats a delayed held even when the fence write cannot land 
     // The latch also answers subsequent checks without touching the engine.
     assert.deepEqual(await runFenceCheck({ env }), { code: 1, message: "lease-lost: 409" });
   } finally {
-    chmodSync(dir, 0o755);
     fences.close();
   }
 });
@@ -202,9 +200,9 @@ test("a latched loss beats a pending transient (unknown) engine result", async (
   }
 });
 
-test("a latched loss beats a pending unknown even when the fence write cannot land (unwritable dir)", async () => {
+test("a latched loss beats a pending unknown even when the fence write cannot land (missing parent dir)", async () => {
   const dir = mkdtempSync(join(tmpdir(), "fence-test-"));
-  const fencePath = join(dir, "fence");
+  const fencePath = join(dir, "missing-parent", "fence");
   let fences;
   fences = createFenceRegistry({
     // The heartbeat confirms the loss from INSIDE the pending check, so the loss
@@ -214,11 +212,9 @@ test("a latched loss beats a pending unknown even when the fence write cannot la
   });
   try {
     const { env } = await fences.register(job, fencePath);
-    chmodSync(dir, 0o555); // unwritable: the fence write fails, only the latch survives
     assert.deepEqual(await runFenceCheck({ env }), { code: 1, message: "lease-lost: 409" });
     assert.equal(existsSync(fencePath), false, "no fence file could be written");
   } finally {
-    chmodSync(dir, 0o755);
     fences.close();
   }
 });

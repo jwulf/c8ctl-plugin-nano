@@ -12595,6 +12595,13 @@ function checkSetupAbort(abortSignal, { jobType, jobKey, stage, logger } = {}) {
  * Uses the c8ctl-provided SDK client (globalThis.c8ctl.createClient()).
  */
 async function workAgent(req, flags, ctx) {
+  // Issue #323 (review): the timestamp flag is module-global, so a worker that
+  // returns or throws would otherwise leave it enabled and leak timestamps into
+  // a LATER text-mode command in a reused host process (the JSON-mode guard in
+  // getLogger only covers text→JSON, not text→text). Save the prior flag and
+  // restore it in a `finally` around the whole worker lifecycle below.
+  const prevWorkerLogTimestamps = workerLogTimestamps;
+  try {
   syncWorkerLogTimestamps();
   const logger = getLogger();
   // The hire to run always comes from the positional profile. `--name` no longer
@@ -15461,6 +15468,12 @@ async function workAgent(req, flags, ctx) {
     process.once('SIGINT', () => { forceAbort('SIGINT'); });
     process.once('SIGTERM', () => { forceAbort('SIGTERM'); });
   });
+  } finally {
+    // Restore the caller's timestamp flag now the worker lifecycle has ended
+    // (normal return OR a setup throw), so a reused host process's next command
+    // does not inherit this worker's timestamping. Best-effort and synchronous.
+    enableWorkerLogTimestamps(prevWorkerLogTimestamps);
+  }
 }
 
 // ---------------------------------------------------------------------------

@@ -11,6 +11,7 @@ import {
   fetchLinkedResourceContent,
   isTransientFetchError,
   syncWorkerLogTimestamps,
+  enableWorkerLogTimestamps,
   __getLoggerForTest as getLogger,
   withLogTimestamps,
   withTransientFetchRetry,
@@ -227,6 +228,32 @@ test("getLogger never timestamps JSON-mode logs even with a stale text-mode flag
     assert.equal(l, jsonLogger, "stale flag must not wrap a JSON-mode logger");
     l.info("hi");
     assert.deepEqual(lines, ["hi"]);
+  } finally {
+    globalThis.c8ctl = prev;
+    syncWorkerLogTimestamps();
+  }
+});
+
+// Issue #323 (review): the timestamp flag is module-global, so a worker that
+// returns or throws must restore the PRIOR flag — otherwise a later text-mode
+// command in a reused host process inherits timestamped logs (a text→text leak
+// the JSON-mode guard cannot see). `workAgent` itself is not safely unit-testable
+// (its early config-error paths call `process.exit`), so this locks the primitive
+// invariant its `finally` relies on: capture prior → run lifecycle → restore prior.
+test("worker lifecycle restores the prior timestamp flag (text-to-text leak)", () => {
+  const prev = globalThis.c8ctl;
+  try {
+    // Host is in text mode with timestamping OFF (the common default before any
+    // worker runs). This is the "prior" state the worker must restore to.
+    globalThis.c8ctl = { outputMode: "text", getLogger: () => ({ info() {} }) };
+    const prior = false;
+    enableWorkerLogTimestamps(prior);
+    // Worker lifecycle: sync for THIS worker (text mode → flag on) ...
+    syncWorkerLogTimestamps();
+    assert.equal(getLogger().__nanoTimestamped, true, "worker text-mode logs are timestamped");
+    // ... then the finally restores the prior flag when the lifecycle ends.
+    enableWorkerLogTimestamps(prior);
+    assert.equal(getLogger().__nanoTimestamped, undefined, "after the lifecycle a later text-mode command is NOT timestamped");
   } finally {
     globalThis.c8ctl = prev;
     syncWorkerLogTimestamps();

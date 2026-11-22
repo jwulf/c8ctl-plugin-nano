@@ -284,6 +284,46 @@ const FORCE_STOP_DAEMON_GRACE_MS = STOP_GRACE_MS + FORCE_STOP_RECOVERY_MS + 2_00
 // `nano work` child to quiesce it — stop leasing new jobs, finish in-flight work,
 // then exit. SIGTERM/SIGINT remain the FORCE abort (kill harness, yield jobs).
 const SUPERVISOR_DRAIN_SIGNAL = 'SIGUSR2';
+
+/**
+ * Write a worker's `<activityFile>.upgrade` retarget sidecar (the successor
+ * pid its SIGUSR2 handler reads). Creates the parent dir first (#331). Returns
+ * `null` on success or the error message on failure — the caller must NOT
+ * SIGUSR2 the worker on failure, since a missing sidecar turns the retarget
+ * into a graceful drain (#331 review).
+ */
+export function writeRetargetSidecar(activityFile, successorPid, fs = { mkdirSync, writeFileSync }) {
+  try {
+    fs.mkdirSync(dirname(activityFile), { recursive: true });
+    fs.writeFileSync(`${activityFile}.upgrade`, String(successorPid), { mode: 0o600 });
+    return null;
+  } catch (err) {
+    return String(err?.message || err);
+  }
+}
+/**
+ * Advance one un-acked retarget entry by a poll step (#331 review). A worker
+ * whose sidecar write previously failed is kept `sidecarPending` (never
+ * signalled) and the write is RETRIED here every poll, so a transient
+ * EMFILE/ENOSPC/EACCES doesn't wedge the handoff forever. The worker is
+ * SIGUSR2'd only once the sidecar is on disk AND its handler is ready.
+ * Mutates `p`; returns true when it was signalled this step.
+ */
+export function advanceRetargetSignal(p, { ready, writeSidecar, signal, log = () => {} }) {
+  if (p.signalled) return false;
+  if (p.sidecarPending) {
+    const err = writeSidecar();
+    if (err) {
+      if (!p.sidecarLogged) { p.sidecarLogged = true; log(err); }
+      return false;
+    }
+    p.sidecarPending = false;
+  }
+  if (!ready) return false;
+  p.signalled = true;
+  signal();
+  return true;
+}
 // Hot-reload readiness gate: after a rolling `supervisor reload` respawns a
 // worker, the daemon waits (bounded) for the replacement to STAMP `readyAt` on
 // its activity marker — i.e. its activation loop is up and leasing jobs — before
@@ -549,13 +589,165 @@ function activityMarkerReadyFor(act, pid) {
  * Whether a worker's SIGUSR2 (drain/retarget) handler is provably installed
  * (#309 review): its marker belongs to `pid` AND carries a finite
  * `signalReadyAt` (stamped right after the handler is armed, independent of
- * leasing). Falls back to `readyAt` for a worker that predates the field (its
- * handler is armed before its first activation). Signalling earlier would hit
- * Node's DEFAULT SIGUSR2 action and terminate the worker. Pure for unit tests.
+ * leasing).
+ *
+ * #331: this MUST NOT fall back to `readyAt`. A worker stamps `readyAt` when its
+ * activation loop begins leasing — which is NOT the same moment its SIGUSR2
+ * handler is armed, and for a stand-in / older worker the `readyAt` write can
+ * precede the handler install. Signalling on `readyAt` alone can therefore
+ * deliver SIGUSR2 to a worker whose handler is not yet installed; Node's DEFAULT
+ * SIGUSR2 action then TERMINATES it mid-handoff (observed under CPU load: the
+ * successor read a stale `readyAt`, signalled, and killed the adopted worker,
+ * which was then respawned under a NEW pid — breaking the zero-downtime
+ * handover). Gate strictly on `signalReadyAt`, the dedicated "handler armed"
+ * stamp. Pure for unit tests.
  */
 function drainSignalReadyFor(act, pid) {
   if (!act || act.pid !== pid) return false;
-  return Number.isFinite(act.signalReadyAt) || Number.isFinite(act.readyAt);
+  return Number.isFinite(act.signalReadyAt);
+}
+
+/**
+ * #331 review: whether a live worker's activity marker proves it PREDATES the
+ * `signalReadyAt` stamp — a marker for this `pid` that carries no
+ * `signalReadyAt` key at all. A current worker always emits the key (null until
+ * its handler is armed), so a missing key identifies an older worker that can
+ * never satisfy drainSignalReadyFor; adopting it would wedge the daemon-upgrade
+ * handoff (and any stop/remove behind it) indefinitely. A booting worker with no
+ * marker yet is NOT incompatible (it will stamp the field). Pure for unit tests.
+ */
+function workerPredatesSignalReady(act, pid) {
+  return !!(act && typeof act === 'object' && act.pid === pid && !Object.prototype.hasOwnProperty.call(act, 'signalReadyAt'));
+}
+
+/**
+ * #331 review: successor-side compatibility gate over the predecessor's FINAL
+ * quiesce snapshot. An older predecessor that supports `prepare-upgrade` but
+ * predates its own pre-quiesce check would hand over workers lacking
+ * `signalReadyAt`; the successor validates with ITS code before binding, so a
+ * mixed-version handoff fails closed (successor exits → predecessor rolls back).
+ * Returns the ids of live snapshot workers that predate the handshake.
+ *
+ * Each worker's activity marker is read ONCE per call and shared across the
+ * classification: a caller that also runs `unknownSnapshotWorkers` must pass
+ * both classifiers the SAME per-worker reads (see `classifySnapshotCompat`) —
+ * two independent read passes can disagree when a marker lands between them
+ * (the first pass sees `null`, the second a legacy marker, and the worker is
+ * adopted even though it can never pass the retarget gate).
+ */
+function incompatibleSnapshotWorkers(state, { isAlive = isPidAlive, readActivity = readWorkerActivity, activityById } = {}) {
+  const out = [];
+  for (const rec of liveSnapshotWorkerRecords(state, isAlive)) {
+    const act = readSnapshotActivity(rec.id, activityById, readActivity);
+    if (workerPredatesSignalReady(act, Number(rec.pid))) out.push(rec.id);
+  }
+  return out;
+}
+
+/**
+ * #331 review: live snapshot workers whose signal-readiness compatibility is
+ * still UNKNOWN — no readable marker for their CURRENT pid (missing, unreadable,
+ * or a stale marker from a previous pid). Such a worker may be a legacy one that
+ * has not written its first marker yet, so adopting it would risk the same
+ * indefinite retarget wedge. Pure for unit tests.
+ */
+function unknownSnapshotWorkers(state, { isAlive = isPidAlive, readActivity = readWorkerActivity, activityById } = {}) {
+  const out = [];
+  for (const rec of liveSnapshotWorkerRecords(state, isAlive)) {
+    const act = readSnapshotActivity(rec.id, activityById, readActivity);
+    if (!act || typeof act !== 'object' || act.pid !== Number(rec.pid)) out.push(rec.id);
+  }
+  return out;
+}
+
+/** Live worker records of a snapshot, in order. Shared by both classifiers. */
+function liveSnapshotWorkerRecords(state, isAlive) {
+  const out = [];
+  for (const rec of (state && Array.isArray(state.workers) ? state.workers : [])) {
+    if (!rec || typeof rec.id !== 'string' || !rec.id) continue;
+    const pid = Number(rec.pid);
+    if (!Number.isInteger(pid) || pid <= 0 || !isAlive(pid)) continue;
+    out.push(rec);
+  }
+  return out;
+}
+
+/** One worker's marker: the caller-supplied read when given, else `readActivity`. */
+function readSnapshotActivity(id, activityById, readActivity) {
+  if (activityById && typeof activityById.get === 'function') return activityById.get(id) ?? null;
+  try { return readActivity(id); } catch { return null; }
+}
+
+/**
+ * #331 review: classify a snapshot's live workers with each marker read exactly
+ * ONCE. Returns null when the snapshot itself is unavailable (a missing or
+ * unparsable state file is NOT an empty fleet — the caller must retry or fail
+ * closed rather than adopt nothing). Otherwise `{ incompatible, unknown, state }`,
+ * where `state` is the validated snapshot so the caller never re-reads it
+ * unchecked. Pure for unit tests.
+ */
+function classifySnapshotCompat(state, { isAlive = isPidAlive, readActivity = readWorkerActivity } = {}) {
+  if (!state || typeof state !== 'object') return null;
+  const activityById = new Map();
+  for (const rec of liveSnapshotWorkerRecords(state, isAlive)) {
+    let act = null;
+    try { act = readActivity(rec.id); } catch { act = null; }
+    activityById.set(rec.id, act);
+  }
+  const deps = { isAlive, activityById };
+  return {
+    incompatible: incompatibleSnapshotWorkers(state, deps),
+    unknown: unknownSnapshotWorkers(state, deps),
+    state,
+  };
+}
+
+/** Bound on how long a successor waits for live workers' first markers. */
+const SUPERVISOR_UPGRADE_MARKER_WAIT_MS = 15_000;
+
+/**
+ * Total budget the `supervisor upgrade` CLI waits for the handoff: the
+ * successor's quiesce window, PLUS the bounded post-quiesce marker wait
+ * (`awaitSnapshotCompat`), PLUS the retarget-ack window, plus slack. Omitting
+ * any phase lets the CLI report a timeout while a normal handoff is still in
+ * progress.
+ */
+export function supervisorUpgradeCliWaitBudgetMs() {
+  return SUPERVISOR_UPGRADE_QUIESCE_TIMEOUT_MS + SUPERVISOR_UPGRADE_MARKER_WAIT_MS
+    + SUPERVISOR_UPGRADE_ACK_TIMEOUT_MS + 10_000;
+}
+
+/**
+ * #331 review: successor-side compatibility gate that waits BOUNDEDLY for every
+ * live snapshot worker to publish a marker for its current pid, then classifies
+ * it. Fails closed: any worker whose compatibility is still unknown at the
+ * deadline is reported in `unknown`, and the caller must refuse the handoff
+ * (never adopt on unknown). Returns `{ incompatible, unknown, state }`.
+ *
+ * An UNAVAILABLE snapshot (the state file is missing or unparsable) is never
+ * treated as an empty, compatible fleet: the read is retried until the
+ * deadline, and if it is still unavailable the gate reports `state: null` so
+ * the caller refuses the handoff instead of adopting zero (or unvalidated)
+ * workers. Each poll iteration reads every live worker's marker exactly ONCE
+ * (`classifySnapshotCompat`) and shares that read across both classifiers, so a
+ * marker landing mid-iteration can never split the verdict (a legacy marker
+ * seen by `unknown` but missed by `incompatible` would adopt a worker that can
+ * never pass the retarget gate). `state` is the validated snapshot, returned so
+ * the adoption path reuses THIS inventory instead of re-reading it unchecked.
+ */
+async function awaitSnapshotCompat(readState, {
+  timeoutMs = SUPERVISOR_UPGRADE_MARKER_WAIT_MS, pollMs = 150, isAlive = isPidAlive,
+  readActivity = readWorkerActivity, now = Date.now, sleep = (ms) => new Promise((r) => setTimeout(r, ms)),
+} = {}) {
+  const deadline = now() + Math.max(0, Number(timeoutMs) || 0);
+  for (;;) {
+    let raw = null;
+    try { raw = readState(); } catch { raw = null; }
+    const c = classifySnapshotCompat(raw, { isAlive, readActivity });
+    if (c && (c.incompatible.length > 0 || c.unknown.length === 0)) return c;
+    if (now() >= deadline) return c || { incompatible: [], unknown: [], state: null };
+    await sleep(pollMs);
+  }
 }
 
 /**
@@ -16695,6 +16887,10 @@ async function runSupervisorDaemon() {
   let predecessorPid = null;
   let upgradeFromVersion = null;
   let upgradeStartedMs = null;
+  // #331 review: the final quiesce snapshot the successor VALIDATED before
+  // binding (awaitSnapshotCompat). The adoption below reuses this inventory
+  // instead of re-reading the state file unchecked.
+  let validatedUpgradeSnapshot = null;
   if (upgradeMode) {
     const t0 = Date.now();
     dlogBoot(`upgrade mode: waiting for the current daemon to quiesce (pid from ${getSupervisorStateFile()})`);
@@ -16729,6 +16925,10 @@ async function runSupervisorDaemon() {
       // (a concurrent upgrade won the race). Never keep retrying — the binding
       // will never accept this pid, and two successors must not both wait to
       // adopt the same fleet. Exit and leave the bound successor to finish.
+      if (prep && prep.ok === false && (prep.code === 'UPGRADE_INCOMPATIBLE_WORKERS' || prep.code === 'UPGRADE_SNAPSHOT_FAILED')) {
+        dlogBoot(`upgrade mode: predecessor pid ${st.pid} refused the handoff: ${prep.error}`);
+        process.exit(1);
+      }
       if (prep && prep.ok === false && /already bound to successor pid/.test(String(prep.error || ''))) {
         dlogBoot(`upgrade mode: predecessor pid ${st.pid} is bound to a different successor — exiting so the bound successor completes the handoff`);
         process.exit(1);
@@ -16739,7 +16939,35 @@ async function runSupervisorDaemon() {
       }
       await new Promise((r) => setTimeout(r, 150));
     }
-    if (predecessorPid != null) upgradeStartedMs = Date.now();
+    if (predecessorPid != null) {
+      // #331 review: validate the final snapshot with THIS (successor) code —
+      // the predecessor's own check may be absent (older daemon). Exiting here,
+      // before binding, makes the quiesced predecessor roll back.
+      // Wait BOUNDEDLY for each live worker's marker: a missing/unreadable one
+      // means compatibility is unknown, and adopting on unknown could wedge the
+      // retarget gate forever if the late marker turns out legacy (fail closed).
+      const compat = await awaitSnapshotCompat(readSupervisorState);
+      if (!compat.state) {
+        // The snapshot itself never became readable — an absent/torn state file
+        // is NOT an empty fleet. Refuse the handoff rather than adopt zero (or
+        // unvalidated) workers and strand them when the predecessor exits.
+        dlogBoot(`upgrade mode: the predecessor's final snapshot stayed unavailable for ${SUPERVISOR_UPGRADE_MARKER_WAIT_MS}ms — exiting so predecessor pid ${predecessorPid} rolls back; retry the daemon upgrade`);
+        process.exit(1);
+      }
+      if (compat.incompatible.length > 0) {
+        dlogBoot(`upgrade mode: worker(s) ${compat.incompatible.join(', ')} predate the signal-readiness handshake and cannot be handed over — exiting so predecessor pid ${predecessorPid} rolls back; run \`supervisor reload\` first, then retry the daemon upgrade`);
+        process.exit(1);
+      }
+      if (compat.unknown.length > 0) {
+        dlogBoot(`upgrade mode: worker(s) ${compat.unknown.join(', ')} published no activity marker within ${SUPERVISOR_UPGRADE_MARKER_WAIT_MS}ms, so their signal-readiness compatibility is unknown — exiting so predecessor pid ${predecessorPid} rolls back; retry the daemon upgrade once workers are up`);
+        process.exit(1);
+      }
+      // Reuse THIS validated snapshot for the adoption below — never re-read it
+      // unchecked (a torn re-read would adopt an empty fleet and strand the
+      // workers the predecessor is about to stop supervising).
+      validatedUpgradeSnapshot = compat.state;
+      upgradeStartedMs = Date.now();
+    }
   }
 
   const workers = new Map();
@@ -16862,7 +17090,14 @@ async function runSupervisorDaemon() {
           removeOnExit: w.removeOnExit === true,
         })),
       });
-    } catch { /* best effort */ }
+      return true;
+    } catch (err) {
+      // Best effort for routine writes, but REPORTED: the forced quiesce
+      // snapshot must fail closed (#331 review) — a successor adopting a stale
+      // state file would leave a live replacement worker untracked.
+      if (force) dlog(`supervisor state write failed: ${err?.message || err}`);
+      return false;
+    }
   };
 
   const broadcast = (frame) => {
@@ -17683,7 +17918,15 @@ async function runSupervisorDaemon() {
       if (!upgrading) return; // rolled back while draining the queue
       upgradeInfo = { ...upgradeInfo, state: 'quiesced' };
       quiesceSnapshotIds = [...workers.keys()];
-      persist(true); // the deliberate quiesce snapshot the successor adopts from
+      // the deliberate quiesce snapshot the successor adopts from. #331 review:
+      // fail CLOSED when it cannot be written — never ack `quiesced` over a
+      // stale state file; roll back and refuse the handoff instead.
+      if (!persist(true)) {
+        rollbackFromUpgrade(successorPid, 'the quiesce snapshot could not be written');
+        const err = new Error('failed to write the quiesce snapshot — refusing the daemon upgrade (predecessor resumed normal operation)');
+        err.code = 'UPGRADE_SNAPSHOT_FAILED';
+        throw err;
+      }
     }
     quiesced = true;
   };
@@ -17712,10 +17955,10 @@ async function runSupervisorDaemon() {
   // unlatch `upgrading` so mutations/respawns resume. Best-effort — if the
   // re-listen fails the daemon stays quiesced and logs, but the common case
   // (successor crashed before binding) recovers cleanly.
-  const rollbackFromUpgrade = (deadSuccessorPid) => {
+  const rollbackFromUpgrade = (deadSuccessorPid, reason = null) => {
     if (!upgrading || handedOver) return;
     quiescePromise = null;
-    dlog(`daemon upgrade: successor pid ${deadSuccessorPid} died before handover — rolling back: re-opening the control socket and resuming normal operation`);
+    dlog(`daemon upgrade: ${reason ? `${reason} (successor pid ${deadSuccessorPid})` : `successor pid ${deadSuccessorPid} died before handover`} — rolling back: re-opening the control socket and resuming normal operation`);
     upgrading = false;
     quiesced = false;
     upgradeInfo = null;
@@ -17801,10 +18044,23 @@ async function runSupervisorDaemon() {
           // other) so two racing successors can never both win the fleet.
           if (shuttingDown) { sock.write(encodeFrame({ ok: false, error: 'supervisor is shutting down', final: true })); break; }
           if (reloading) { sock.write(encodeFrame({ ok: false, error: 'a worker reload is in progress — retry the daemon upgrade once it finishes', final: true })); break; }
+          // #331 review: reject BEFORE quiescing when a live worker predates the
+          // `signalReadyAt` stamp — the successor's retarget gate could never
+          // signal it, leaving the handoff (and stop/remove) blocked forever.
+          if (!upgrading) {
+            const incompatible = [...workers.values()]
+              .filter((w) => w && w.pid && isPidAlive(w.pid) && workerPredatesSignalReady(readWorkerActivity(w.id), w.pid))
+              .map((w) => w.id);
+            if (incompatible.length > 0) {
+              sock.write(encodeFrame({ ok: false, code: 'UPGRADE_INCOMPATIBLE_WORKERS', error: `worker(s) ${incompatible.join(', ')} predate the signal-readiness handshake and cannot be handed over — run \`supervisor reload\` first, then retry the daemon upgrade`, final: true }));
+              break;
+            }
+          }
           try {
             await quiesceForUpgrade(Number(req.pid) || null, typeof req.version === 'string' ? req.version : null);
           } catch (err) {
             if (err && err.code === 'UPGRADE_BOUND') { sock.write(encodeFrame({ ok: false, error: err.message, final: true })); break; }
+            if (err && err.code === 'UPGRADE_SNAPSHOT_FAILED') { sock.write(encodeFrame({ ok: false, code: err.code, error: err.message, final: true })); break; }
             throw err;
           }
           // Report quiesced only AFTER the mutation queue has drained and the
@@ -18101,7 +18357,12 @@ async function runSupervisorDaemon() {
   // never signaled, so in-flight jobs run undisturbed). Dead pids are dropped
   // with a log line — the fleet after the swap is exactly what survived it.
   if (upgradeMode && predecessorPid != null) {
-    const prior = readSupervisorState();
+    // #331 review: adopt from the snapshot the compatibility gate VALIDATED
+    // (awaitSnapshotCompat) — never a fresh unchecked read. The gate already
+    // refused the handoff when no readable snapshot was available, so
+    // `validatedUpgradeSnapshot` is non-null whenever `predecessorPid` is set;
+    // the `|| readSupervisorState()` fallback is unreachable defensive cover.
+    const prior = validatedUpgradeSnapshot || readSupervisorState();
     const adopted = [];
     for (const rec of (prior && Array.isArray(prior.workers) ? prior.workers : [])) {
       const w = adoptWorker(rec);
@@ -18187,7 +18448,25 @@ async function runSupervisorDaemon() {
           continue;
         }
         const actFile = w.activityFile || supervisorWorkerActivityFile(w.id);
-        try { writeFileSync(`${actFile}.upgrade`, String(myPid), { mode: 0o600 }); } catch { /* best effort */ }
+        // #331: create the activity dir BEFORE writing the sidecar. Under load a
+        // still-booting worker may not have written its first activity marker
+        // yet, so `supervisor-activity/` can be absent here — and `writeFileSync`
+        // does NOT create parent directories. The write then failed with ENOENT
+        // (silently swallowed), the sidecar was never written, and the worker's
+        // SIGUSR2 handler read a missing sidecar and treated the retarget as a
+        // graceful DRAIN — exiting mid-handoff instead of retargeting its
+        // watchdog. mkdir first so the retarget instruction actually lands.
+        // #331 review: fail CLOSED when the sidecar cannot be written. Without
+        // it the worker's SIGUSR2 handler reads no successor pid and DRAINS
+        // instead of retargeting, so never signal it: keep it pending (its
+        // watchdog still guards the predecessor, which is therefore retained)
+        // and report the handoff incomplete via the normal ack deadline.
+        const sidecarErr = writeRetargetSidecar(actFile, myPid);
+        if (sidecarErr) {
+          dlog(`upgrade: could not write retarget sidecar for worker '${id}' (${sidecarErr}) — NOT signalling it yet (a SIGUSR2 without the sidecar would drain it); retrying each poll, predecessor retained`);
+          pending.set(id, { pid: w.pid, signalled: false, sidecarPending: true, sidecarLogged: true, actFile });
+          continue;
+        }
         pending.set(id, { pid: w.pid, signalled: false });
       }
       // Bounded wait first; past the deadline report INCOMPLETE but KEEP
@@ -18219,10 +18498,12 @@ async function runSupervisorDaemon() {
             if (p.drainDeferred) { try { process.kill(p.pid, SUPERVISOR_DRAIN_SIGNAL); } catch { /* already gone */ } }
             continue;
           }
-          if (!p.signalled && drainSignalReadyFor(act, p.pid)) {
-            p.signalled = true;
-            try { process.kill(p.pid, SUPERVISOR_DRAIN_SIGNAL); } catch { /* already gone */ }
-          }
+          advanceRetargetSignal(p, {
+            ready: drainSignalReadyFor(act, p.pid),
+            writeSidecar: () => writeRetargetSidecar(p.actFile, myPid),
+            signal: () => { try { process.kill(p.pid, SUPERVISOR_DRAIN_SIGNAL); } catch { /* already gone */ } },
+            log: (err) => dlog(`upgrade: retarget sidecar retry for worker '${id}' failed (${err})`),
+          });
         }
         if (pending.size === 0) break;
         if (!reportedIncomplete && Date.now() >= ackDeadline) {
@@ -18264,6 +18545,9 @@ async function runSupervisorDaemon() {
       if (!isPidAlive(predecessorPid)) {
         try { clearInterval(clearTimer); } catch { /* ignore */ }
         predecessorPid = null;
+        // The roll is complete — drop the validated adoption inventory too, so
+        // no stale upgrade state outlives the handoff it belonged to.
+        validatedUpgradeSnapshot = null;
         // #309 review: a handoff reported INCOMPLETE that later completed (late
         // acks/drains released the predecessor) must not keep reporting
         // 'incomplete' forever — currentUpgradeBlock() returns upgradeInfo first.
@@ -18760,7 +19044,7 @@ async function supervisorUpgradeCmd() {
   let detached = false;
   const onSigint = () => { detached = true; };
   process.on('SIGINT', onSigint);
-  const deadline = Date.now() + SUPERVISOR_UPGRADE_QUIESCE_TIMEOUT_MS + SUPERVISOR_UPGRADE_ACK_TIMEOUT_MS + 10_000;
+  const deadline = Date.now() + supervisorUpgradeCliWaitBudgetMs();
   try {
     for (;;) {
       if (detached) {
@@ -22778,6 +23062,11 @@ export {
   buildActivityPayload,
   activityMarkerReadyFor,
   drainSignalReadyFor,
+  workerPredatesSignalReady,
+  incompatibleSnapshotWorkers,
+  unknownSnapshotWorkers,
+  classifySnapshotCompat,
+  awaitSnapshotCompat,
   reloadCredentialsReady,
   waitForChildExit,
   supervisorWorkerActivityFile,

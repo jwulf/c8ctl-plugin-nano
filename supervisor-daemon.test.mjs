@@ -12,6 +12,7 @@ import { tmpdir, platform as osPlatform } from 'node:os';
 import { join, dirname } from 'node:path';
 import { fileURLToPath } from 'node:url';
 import { createConnection } from 'node:net';
+import { spawnSync } from 'node:child_process';
 
 const here = dirname(fileURLToPath(import.meta.url));
 const pluginUrl = new URL('./c8ctl-plugin.js', import.meta.url).href;
@@ -131,9 +132,11 @@ function writeShim(shimPath, { recordArgv = false, workArgvDir = null, ignoreSig
     // A `notReady` stand-in stamps NO `readyAt`, modelling a replacement whose
     // activation loop never comes up — the supervisor's rolling-reload readiness
     // gate must then advance on its bounded timeout rather than wedge the roll.
+    // #331 review: `notReady` omits only LEASING readiness; the SIGUSR2 handler
+    // is still armed, so `signalReadyAt` is always published.
     const marker = notReady
-      ? `{ pid: process.pid, jobs: [{ key: 'J1', type: 'faker:senior', since: Date.now() }] }`
-      : `{ pid: process.pid, readyAt: Date.now(), jobs: [{ key: 'J1', type: 'faker:senior', since: Date.now() }] }`;
+      ? `{ pid: process.pid, signalReadyAt: Date.now(), jobs: [{ key: 'J1', type: 'faker:senior', since: Date.now() }] }`
+      : `{ pid: process.pid, readyAt: Date.now(), signalReadyAt: Date.now(), jobs: [{ key: 'J1', type: 'faker:senior', since: Date.now() }] }`;
     lines.push(
       `  const { writeFileSync: wf, rmSync: rm, mkdirSync: mk, existsSync: ex } = await import('node:fs');`,
       `  const { dirname } = await import('node:path');`,
@@ -155,7 +158,6 @@ function writeShim(shimPath, { recordArgv = false, workArgvDir = null, ignoreSig
       );
     }
     lines.push(
-      `  try { wf(actFile, JSON.stringify(${marker})); } catch {}`,
       `  let ending = false;`,
       `  const endWith = (how, delay) => {`,
       `    if (ending && how !== 'forced') return; ending = true;`,
@@ -164,6 +166,8 @@ function writeShim(shimPath, { recordArgv = false, workArgvDir = null, ignoreSig
       `  };`,
       `  process.on('SIGUSR2', () => endWith('drained', ${Number(drainMs)}));`,
       `  process.on('SIGTERM', () => endWith('forced', 0));`,
+      // #331 review: publish the marker (signalReadyAt) only AFTER the handler is armed.
+      `  try { wf(actFile, JSON.stringify(${marker})); } catch {}`,
       `  const { installParentDeathWatchdog } = await import(${JSON.stringify(pluginUrl)});`,
       `  const dp = Number.parseInt(process.env.NANO_SUPERVISOR_DAEMON_PID ?? '', 10);`,
       `  installParentDeathWatchdog({ intervalMs: 100, parentPid: Number.isInteger(dp) ? dp : undefined });`,
@@ -172,11 +176,6 @@ function writeShim(shimPath, { recordArgv = false, workArgvDir = null, ignoreSig
   } else {
     if (ignoreSigterm) lines.push(`  process.on('SIGTERM', () => {}); // force the SIGKILL path on restart`);
     lines.push(
-      // Stamp a ready activity marker so the supervisor's rolling-reload readiness
-      // gate (`waitForWorkerReady`) resolves at once for this idle stand-in instead
-      // of waiting out the bounded timeout — the real worker stamps `readyAt` once
-      // its activation loop is up.
-      `  try { const { writeFileSync: rwf, mkdirSync: rmk } = await import('node:fs'); const { dirname: rdn } = await import('node:path'); const raf = process.env.NANO_SUPERVISOR_ACTIVITY_FILE; if (raf) { rmk(rdn(raf), { recursive: true }); rwf(raf, JSON.stringify({ pid: process.pid, readyAt: Date.now(), jobs: [] })); } } catch {}`,
       `  const { installParentDeathWatchdog } = await import(${JSON.stringify(pluginUrl)});`,
       `  const dp = Number.parseInt(process.env.NANO_SUPERVISOR_DAEMON_PID ?? '', 10);`,
       `  const wd = installParentDeathWatchdog({ intervalMs: 100, parentPid: Number.isInteger(dp) ? dp : undefined });`,
@@ -184,12 +183,18 @@ function writeShim(shimPath, { recordArgv = false, workArgvDir = null, ignoreSig
       // NANO_SUPERVISOR_UPGRADE_PID set this is a watchdog RETARGET (not a
       // drain): re-arm at the successor and ack by stamping `watchdogPid` on
       // the activity marker (what the old daemon's handoff waits for).
+      // #331: install the handler BEFORE stamping the activity marker, and stamp
+      // `signalReadyAt` (the dedicated "handler armed" field the handoff gates
+      // on) — mirroring the real worker, which arms the handler then stamps
+      // `signalReadyAt`. Stamping `readyAt` first let the successor's retarget
+      // gate fire before this handler existed, so SIGUSR2 hit Node's default
+      // action and killed the stand-in mid-handoff.
       `  process.on('SIGUSR2', () => {`,
       `    (async () => {`,
       `    let up = Number.parseInt(process.env.NANO_SUPERVISOR_UPGRADE_PID ?? '', 10);`,
       `    try { const fs = await import('node:fs'); const aaf = process.env.NANO_SUPERVISOR_ACTIVITY_FILE; if (aaf) { const f = Number.parseInt(fs.readFileSync(aaf + '.upgrade', 'utf8').trim(), 10); if (Number.isInteger(f) && f > 0) up = f; } } catch {}`,
       `    if (Number.isInteger(up) && up > 0 && wd && typeof wd.retarget === 'function' && wd.retarget(up)) {`,
-      `      try { const { writeFileSync: awf } = await import('node:fs'); const aaf = process.env.NANO_SUPERVISOR_ACTIVITY_FILE; if (aaf) awf(aaf, JSON.stringify({ pid: process.pid, readyAt: Date.now(), jobs: [], watchdogPid: wd.watchedPid() })); } catch {}`,
+      `      try { const { writeFileSync: awf } = await import('node:fs'); const aaf = process.env.NANO_SUPERVISOR_ACTIVITY_FILE; if (aaf) awf(aaf, JSON.stringify({ pid: process.pid, readyAt: Date.now(), signalReadyAt: Date.now(), jobs: [], watchdogPid: wd.watchedPid() })); } catch {}`,
       `    } else {`,
       // No upgrade in flight → SIGUSR2 is a graceful DRAIN (the #202 contract):
       // the stand-in has no in-flight job, so it exits at once, exactly like the
@@ -198,6 +203,12 @@ function writeShim(shimPath, { recordArgv = false, workArgvDir = null, ignoreSig
       `    }`,
       `    })().catch(() => {});`,
       `  });`,
+      // Stamp the activity marker only AFTER the SIGUSR2 handler is armed, and
+      // carry `signalReadyAt` so the supervisor's rolling-reload readiness gate
+      // (`waitForWorkerReady`) and the upgrade handoff's retarget gate both
+      // resolve for this idle stand-in. The real worker stamps `readyAt` once its
+      // activation loop is up and `signalReadyAt` once the handler is armed.
+      `  try { const { writeFileSync: rwf, mkdirSync: rmk } = await import('node:fs'); const { dirname: rdn } = await import('node:path'); const raf = process.env.NANO_SUPERVISOR_ACTIVITY_FILE; if (raf) { rmk(rdn(raf), { recursive: true }); rwf(raf, JSON.stringify({ pid: process.pid, readyAt: Date.now(), signalReadyAt: Date.now(), jobs: [] })); } } catch {}`,
       `  setInterval(() => {}, 1 << 30); // idle keep-alive until the watchdog fires`,
     );
   }
@@ -749,6 +760,19 @@ async function stopStream(mod, { force = false, sendAfter = null } = {}) {
   });
 }
 
+function killDaemonsForHome(home) {
+  if (osPlatform() === 'win32') return;
+  const r = spawnSync('ps', ['-axeww', '-o', 'pid=,command='], { encoding: 'utf8' });
+  if (r.status !== 0 || !r.stdout) return;
+  for (const line of r.stdout.split('\n')) {
+    if (!line.includes('supervisor __daemon')) continue;
+    const m = line.match(/C8CTL_NANO_HOME=(\S+)/);
+    if (!m || m[1] !== home) continue;
+    const pid = Number(line.trim().split(/\s+/)[0]);
+    if (pid && pid !== process.pid) { try { process.kill(pid, 'SIGKILL'); } catch {} }
+  }
+}
+
 async function bootBusyDaemon(t, { drainMs = 300, notReady = false, readyTimeoutMs = null, crashOnRespawn = false } = {}) {
   const HOME = mkdtempSync(join(tmpdir(), 'c8ctl-sup-drain-'));
   const prevHome = process.env.C8CTL_NANO_HOME;
@@ -772,6 +796,10 @@ async function bootBusyDaemon(t, { drainMs = 300, notReady = false, readyTimeout
   t.after(async () => {
     const st = mod.runningSupervisor();
     if (st) { try { process.kill(st.pid, 'SIGKILL'); } catch {} }
+    // The state file only names the CURRENT daemon: a stop/handoff may have
+    // cleared or rewritten it while a daemon for this HOME is still alive, so
+    // also reap every daemon whose environment carries this HOME (issue #325).
+    killDaemonsForHome(HOME);
     mod.clearSupervisorState();
     restoreEnv('C8CTL_NANO_ENTRY', prevEntry);
     restoreEnv('C8CTL_NANO_HOME', prevHome);

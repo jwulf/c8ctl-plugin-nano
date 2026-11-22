@@ -11,6 +11,8 @@ import { EventEmitter } from 'node:events';
 
 import {
   reconstructWorkArgs,
+  writeRetargetSidecar,
+  advanceRetargetSignal,
   resolveConnectionProfile,
   explicitConnectionProfile,
   withConnectionProfileArg,
@@ -51,6 +53,11 @@ import {
   countSupervisorInFlight,
   activityMarkerReadyFor,
   drainSignalReadyFor,
+  workerPredatesSignalReady,
+  incompatibleSnapshotWorkers,
+  unknownSnapshotWorkers,
+  classifySnapshotCompat,
+  awaitSnapshotCompat,
   reloadCredentialsReady,
   waitForChildExit,
   supervisorWorkerActivityFile,
@@ -1192,12 +1199,18 @@ test('activityMarkerReadyFor: a marker is ready only with a finite readyAt AND a
   assert.equal(activityMarkerReadyFor(null, 4242), false);
 });
 
-test('drainSignalReadyFor: retarget gate uses the handler-installed stamp, not leasing readiness (#309 review)', () => {
+test('drainSignalReadyFor: retarget gate uses the handler-installed stamp, not leasing readiness (#309 review, #331)', () => {
   // A healthy --auto worker with no deployed types never stamps readyAt, but its
   // SIGUSR2 handler is installed — it must be retargetable.
   assert.equal(drainSignalReadyFor({ pid: 7, readyAt: null, signalReadyAt: 50 }, 7), true);
-  // Back-compat: a worker predating signalReadyAt is ready via readyAt.
-  assert.equal(drainSignalReadyFor({ pid: 7, readyAt: 50 }, 7), true);
+  // #331: NO readyAt fallback. `readyAt` marks leasing readiness, which is NOT
+  // the same moment the SIGUSR2 handler is armed — a stand-in / older worker can
+  // stamp `readyAt` before installing its handler. Signalling on `readyAt` alone
+  // delivered SIGUSR2 to a worker with no handler, so Node's DEFAULT action
+  // terminated it mid-handoff (observed under CPU load). The gate is strictly
+  // `signalReadyAt`, the dedicated "handler armed" stamp.
+  assert.equal(drainSignalReadyFor({ pid: 7, readyAt: 50 }, 7), false);
+  assert.equal(drainSignalReadyFor({ pid: 7, readyAt: 50, signalReadyAt: null }, 7), false);
   // Neither stamp: handler may not be installed (default SIGUSR2 = terminate).
   assert.equal(drainSignalReadyFor({ pid: 7, readyAt: null, signalReadyAt: null }, 7), false);
   // Foreign/stale marker or none at all never passes.
@@ -1879,4 +1892,127 @@ test('reageSupervisorStatus: a NaN base epoch does not poison uptime', () => {
   const status = { workers: [{ id: 'w', state: 'running', startedAtMs: NaN, uptimeMs: 42 }] };
   const out = reageSupervisorStatus(status, 9_999);
   assert.equal(out.workers[0].uptimeMs, 42, 'falls back to the snapshot uptime when the base is not finite');
+});
+
+test('workerPredatesSignalReady: only a marker for this pid WITHOUT the signalReadyAt key is incompatible (#331 review)', () => {
+  assert.equal(workerPredatesSignalReady({ pid: 7, readyAt: 1, jobs: [] }, 7), true);
+  assert.equal(workerPredatesSignalReady({ pid: 7, readyAt: 1, signalReadyAt: null }, 7), false);
+  assert.equal(workerPredatesSignalReady({ pid: 7, signalReadyAt: 5 }, 7), false);
+  assert.equal(workerPredatesSignalReady({ pid: 8, readyAt: 1 }, 7), false);
+  assert.equal(workerPredatesSignalReady(null, 7), false);
+});
+
+test('incompatibleSnapshotWorkers: successor gates a mixed-version snapshot on live pre-handshake workers (#331 review)', () => {
+  const acts = { old: { pid: 11, jobs: [] }, cur: { pid: 12, signalReadyAt: null }, booting: null, dead: { pid: 14 } };
+  const state = { workers: [{ id: 'old', pid: 11 }, { id: 'cur', pid: 12 }, { id: 'booting', pid: 13 }, { id: 'dead', pid: 14 }, { id: 'nopid' }, null] };
+  const deps = { isAlive: (p) => p !== 14, readActivity: (id) => acts[id] };
+  assert.deepEqual(incompatibleSnapshotWorkers(state, deps), ['old']);
+  assert.deepEqual(incompatibleSnapshotWorkers(null, deps), []);
+  assert.deepEqual(incompatibleSnapshotWorkers({ workers: [{ id: 'x', pid: 5 }] }, { isAlive: () => true, readActivity: () => { throw new Error('io'); } }), []);
+});
+
+test('unknownSnapshotWorkers: live workers with no marker for their current pid are unknown (#331 review)', () => {
+  const acts = { cur: { pid: 12, signalReadyAt: null }, stale: { pid: 99 }, none: null };
+  const state = { workers: [{ id: 'cur', pid: 12 }, { id: 'stale', pid: 13 }, { id: 'none', pid: 14 }, { id: 'dead', pid: 15 }, { id: 'io', pid: 16 }] };
+  const deps = { isAlive: (p) => p !== 15, readActivity: (id) => { if (id === 'io') throw new Error('io'); return acts[id]; } };
+  assert.deepEqual(unknownSnapshotWorkers(state, deps), ['stale', 'none', 'io']);
+});
+
+test('awaitSnapshotCompat: a DELAYED legacy marker is detected, not adopted (#331 review)', async () => {
+  let t = 0; let polls = 0;
+  const state = { workers: [{ id: 'w', pid: 7 }] };
+  const readActivity = () => (polls >= 2 ? { pid: 7, readyAt: 1, jobs: [] } : null);
+  const r = await awaitSnapshotCompat(() => state, { isAlive: () => true, readActivity, now: () => t, sleep: async (ms) => { polls++; t += ms; }, timeoutMs: 10_000, pollMs: 100 });
+  assert.deepEqual(r, { incompatible: ['w'], unknown: [], state });
+});
+
+test('awaitSnapshotCompat: a marker that never appears stays unknown at the deadline (fail closed, #331 review)', async () => {
+  let t = 0;
+  const state = { workers: [{ id: 'w', pid: 7 }] };
+  const r = await awaitSnapshotCompat(() => state, { isAlive: () => true, readActivity: () => null, now: () => t, sleep: async (ms) => { t += ms; }, timeoutMs: 1000, pollMs: 100 });
+  assert.deepEqual(r, { incompatible: [], unknown: ['w'], state });
+});
+
+test('awaitSnapshotCompat: a delayed CURRENT marker is accepted (#331 review)', async () => {
+  let t = 0; let polls = 0;
+  const state = { workers: [{ id: 'w', pid: 7 }] };
+  const r = await awaitSnapshotCompat(() => state, { isAlive: () => true, readActivity: () => (polls >= 1 ? { pid: 7, signalReadyAt: null } : null), now: () => t, sleep: async (ms) => { polls++; t += ms; }, timeoutMs: 1000, pollMs: 100 });
+  assert.deepEqual(r, { incompatible: [], unknown: [], state });
+});
+
+test('classifySnapshotCompat: an unavailable snapshot is NOT an empty fleet (#331 review)', () => {
+  const deps = { isAlive: () => true, readActivity: () => null };
+  assert.equal(classifySnapshotCompat(null, deps), null);
+  assert.equal(classifySnapshotCompat(undefined, deps), null);
+  assert.equal(classifySnapshotCompat(42, deps), null);
+  // A readable-but-workerless snapshot IS a valid empty fleet.
+  assert.deepEqual(classifySnapshotCompat({}, deps), { incompatible: [], unknown: [], state: {} });
+  assert.deepEqual(classifySnapshotCompat({ workers: [] }, deps), { incompatible: [], unknown: [], state: { workers: [] } });
+});
+
+test('classifySnapshotCompat: both classifiers share ONE marker read per worker (#331 review)', async () => {
+  // Regression for the split-read race: a legacy marker landing BETWEEN the
+  // incompatible pass and the unknown pass must still be classified
+  // incompatible — never adopted. With one shared read the verdict is atomic.
+  let reads = 0;
+  const state = { workers: [{ id: 'w', pid: 7 }] };
+  const readActivity = () => { reads += 1; return { pid: 7, readyAt: 1, jobs: [] }; }; // legacy marker (no signalReadyAt key)
+  const c = classifySnapshotCompat(state, { isAlive: () => true, readActivity });
+  assert.equal(reads, 1);
+  assert.deepEqual(c.incompatible, ['w']);
+  assert.deepEqual(c.unknown, []);
+  assert.equal(c.state, state);
+});
+
+test('awaitSnapshotCompat: an UNAVAILABLE snapshot is retried, then fails closed — never adopted as empty (#331 review)', async () => {
+  let t = 0;
+  // Unavailable for the whole window: reports state:null so the caller refuses
+  // the handoff instead of adopting zero workers.
+  const gone = await awaitSnapshotCompat(() => null, { isAlive: () => true, readActivity: () => null, now: () => t, sleep: async (ms) => { t += ms; }, timeoutMs: 1000, pollMs: 100 });
+  assert.deepEqual(gone, { incompatible: [], unknown: [], state: null });
+  // A throwing read is the same unavailable signal, and a LATER readable
+  // snapshot is adopted from (the retry recovers).
+  t = 0; let calls = 0;
+  const state = { workers: [{ id: 'w', pid: 7 }] };
+  const recovered = await awaitSnapshotCompat(() => { calls += 1; if (calls < 3) throw new Error('torn read'); return state; }, { isAlive: () => true, readActivity: () => ({ pid: 7, signalReadyAt: null }), now: () => t, sleep: async (ms) => { t += ms; }, timeoutMs: 1000, pollMs: 100 });
+  assert.deepEqual(recovered, { incompatible: [], unknown: [], state });
+});
+
+test('#331 upgrade CLI wait budget covers quiesce + marker wait + ack phases', async () => {
+  const m = await import('./c8ctl-plugin.js');
+  // defaults: 30s quiesce + 15s marker wait + 15s ack + 10s slack
+  assert.ok(m.supervisorUpgradeCliWaitBudgetMs() >= 30_000 + 15_000 + 15_000);
+});
+
+test('writeRetargetSidecar: creates the dir, writes the pid, reports failure so the caller does not SIGUSR2 (#331 review)', async () => {
+  const { mkdtempSync, readFileSync, rmSync } = await import('node:fs');
+  const { tmpdir } = await import('node:os');
+  const { join } = await import('node:path');
+  const home = mkdtempSync(join(tmpdir(), 'c8ctl-sidecar-'));
+  try {
+    const act = join(home, 'missing-dir', 'w1.json');
+    assert.equal(writeRetargetSidecar(act, 4242), null);
+    assert.equal(readFileSync(`${act}.upgrade`, 'utf8'), '4242');
+    const failing = { mkdirSync() {}, writeFileSync() { throw new Error('EACCES'); } };
+    assert.match(writeRetargetSidecar(act, 1, failing), /EACCES/);
+    const failingDir = { mkdirSync() { throw new Error('ENOSPC'); }, writeFileSync() { throw new Error('unreached'); } };
+    assert.match(writeRetargetSidecar(act, 1, failingDir), /ENOSPC/);
+  } finally { rmSync(home, { recursive: true, force: true }); }
+});
+
+test('advanceRetargetSignal: retries a failed sidecar write each poll and signals only after it lands (#331 review)', () => {
+  const p = { pid: 1, signalled: false, sidecarPending: true };
+  let writes = 0; let signals = 0;
+  const writeSidecar = () => (++writes === 1 ? 'EMFILE' : null);
+  const signal = () => { signals++; };
+  assert.equal(advanceRetargetSignal(p, { ready: true, writeSidecar, signal }), false);
+  assert.equal(signals, 0); assert.equal(p.sidecarPending, true);
+  assert.equal(advanceRetargetSignal(p, { ready: true, writeSidecar, signal }), true);
+  assert.equal(signals, 1); assert.equal(p.sidecarPending, false); assert.equal(p.signalled, true);
+  assert.equal(advanceRetargetSignal(p, { ready: true, writeSidecar, signal }), false);
+  assert.equal(writes, 2); assert.equal(signals, 1);
+  // written but handler not ready: no signal, no rewrite next time
+  const q = { pid: 2, signalled: false, sidecarPending: true };
+  assert.equal(advanceRetargetSignal(q, { ready: false, writeSidecar: () => null, signal }), false);
+  assert.equal(q.sidecarPending, false); assert.equal(signals, 1);
 });

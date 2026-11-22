@@ -625,6 +625,18 @@ function unknownSnapshotWorkers(state, { isAlive = isPidAlive, readActivity = re
 const SUPERVISOR_UPGRADE_MARKER_WAIT_MS = 15_000;
 
 /**
+ * Total budget the `supervisor upgrade` CLI waits for the handoff: the
+ * successor's quiesce window, PLUS the bounded post-quiesce marker wait
+ * (`awaitSnapshotCompat`), PLUS the retarget-ack window, plus slack. Omitting
+ * any phase lets the CLI report a timeout while a normal handoff is still in
+ * progress.
+ */
+export function supervisorUpgradeCliWaitBudgetMs() {
+  return SUPERVISOR_UPGRADE_QUIESCE_TIMEOUT_MS + SUPERVISOR_UPGRADE_MARKER_WAIT_MS
+    + SUPERVISOR_UPGRADE_ACK_TIMEOUT_MS + 10_000;
+}
+
+/**
  * #331 review: successor-side compatibility gate that waits BOUNDEDLY for every
  * live snapshot worker to publish a marker for its current pid, then classifies
  * it. Fails closed: any worker whose compatibility is still unknown at the
@@ -18891,7 +18903,7 @@ async function supervisorUpgradeCmd() {
   let detached = false;
   const onSigint = () => { detached = true; };
   process.on('SIGINT', onSigint);
-  const deadline = Date.now() + SUPERVISOR_UPGRADE_QUIESCE_TIMEOUT_MS + SUPERVISOR_UPGRADE_ACK_TIMEOUT_MS + 10_000;
+  const deadline = Date.now() + supervisorUpgradeCliWaitBudgetMs();
   try {
     for (;;) {
       if (detached) {

@@ -1934,3 +1934,9 @@ test('awaitSnapshotCompat: a delayed CURRENT marker is accepted (#331 review)', 
   const r = await awaitSnapshotCompat(() => ({ workers: [{ id: 'w', pid: 7 }] }), { isAlive: () => true, readActivity: () => (polls >= 1 ? { pid: 7, signalReadyAt: null } : null), now: () => t, sleep: async (ms) => { polls++; t += ms; }, timeoutMs: 1000, pollMs: 100 });
   assert.deepEqual(r, { incompatible: [], unknown: [] });
 });
+
+test('#331 upgrade CLI wait budget covers quiesce + marker wait + ack phases', async () => {
+  const m = await import('./c8ctl-plugin.js');
+  // defaults: 30s quiesce + 15s marker wait + 15s ack + 10s slack
+  assert.ok(m.supervisorUpgradeCliWaitBudgetMs() >= 30_000 + 15_000 + 15_000);
+});

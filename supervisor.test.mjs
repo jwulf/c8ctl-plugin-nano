@@ -1192,12 +1192,18 @@ test('activityMarkerReadyFor: a marker is ready only with a finite readyAt AND a
   assert.equal(activityMarkerReadyFor(null, 4242), false);
 });
 
-test('drainSignalReadyFor: retarget gate uses the handler-installed stamp, not leasing readiness (#309 review)', () => {
+test('drainSignalReadyFor: retarget gate uses the handler-installed stamp, not leasing readiness (#309 review, #331)', () => {
   // A healthy --auto worker with no deployed types never stamps readyAt, but its
   // SIGUSR2 handler is installed — it must be retargetable.
   assert.equal(drainSignalReadyFor({ pid: 7, readyAt: null, signalReadyAt: 50 }, 7), true);
-  // Back-compat: a worker predating signalReadyAt is ready via readyAt.
-  assert.equal(drainSignalReadyFor({ pid: 7, readyAt: 50 }, 7), true);
+  // #331: NO readyAt fallback. `readyAt` marks leasing readiness, which is NOT
+  // the same moment the SIGUSR2 handler is armed — a stand-in / older worker can
+  // stamp `readyAt` before installing its handler. Signalling on `readyAt` alone
+  // delivered SIGUSR2 to a worker with no handler, so Node's DEFAULT action
+  // terminated it mid-handoff (observed under CPU load). The gate is strictly
+  // `signalReadyAt`, the dedicated "handler armed" stamp.
+  assert.equal(drainSignalReadyFor({ pid: 7, readyAt: 50 }, 7), false);
+  assert.equal(drainSignalReadyFor({ pid: 7, readyAt: 50, signalReadyAt: null }, 7), false);
   // Neither stamp: handler may not be installed (default SIGUSR2 = terminate).
   assert.equal(drainSignalReadyFor({ pid: 7, readyAt: null, signalReadyAt: null }, 7), false);
   // Foreign/stale marker or none at all never passes.

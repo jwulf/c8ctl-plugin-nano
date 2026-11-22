@@ -549,13 +549,22 @@ function activityMarkerReadyFor(act, pid) {
  * Whether a worker's SIGUSR2 (drain/retarget) handler is provably installed
  * (#309 review): its marker belongs to `pid` AND carries a finite
  * `signalReadyAt` (stamped right after the handler is armed, independent of
- * leasing). Falls back to `readyAt` for a worker that predates the field (its
- * handler is armed before its first activation). Signalling earlier would hit
- * Node's DEFAULT SIGUSR2 action and terminate the worker. Pure for unit tests.
+ * leasing).
+ *
+ * #331: this MUST NOT fall back to `readyAt`. A worker stamps `readyAt` when its
+ * activation loop begins leasing — which is NOT the same moment its SIGUSR2
+ * handler is armed, and for a stand-in / older worker the `readyAt` write can
+ * precede the handler install. Signalling on `readyAt` alone can therefore
+ * deliver SIGUSR2 to a worker whose handler is not yet installed; Node's DEFAULT
+ * SIGUSR2 action then TERMINATES it mid-handoff (observed under CPU load: the
+ * successor read a stale `readyAt`, signalled, and killed the adopted worker,
+ * which was then respawned under a NEW pid — breaking the zero-downtime
+ * handover). Gate strictly on `signalReadyAt`, the dedicated "handler armed"
+ * stamp. Pure for unit tests.
  */
 function drainSignalReadyFor(act, pid) {
   if (!act || act.pid !== pid) return false;
-  return Number.isFinite(act.signalReadyAt) || Number.isFinite(act.readyAt);
+  return Number.isFinite(act.signalReadyAt);
 }
 
 /**
@@ -18187,6 +18196,15 @@ async function runSupervisorDaemon() {
           continue;
         }
         const actFile = w.activityFile || supervisorWorkerActivityFile(w.id);
+        // #331: create the activity dir BEFORE writing the sidecar. Under load a
+        // still-booting worker may not have written its first activity marker
+        // yet, so `supervisor-activity/` can be absent here — and `writeFileSync`
+        // does NOT create parent directories. The write then failed with ENOENT
+        // (silently swallowed), the sidecar was never written, and the worker's
+        // SIGUSR2 handler read a missing sidecar and treated the retarget as a
+        // graceful DRAIN — exiting mid-handoff instead of retargeting its
+        // watchdog. mkdir first so the retarget instruction actually lands.
+        try { mkdirSync(dirname(actFile), { recursive: true }); } catch { /* best effort */ }
         try { writeFileSync(`${actFile}.upgrade`, String(myPid), { mode: 0o600 }); } catch { /* best effort */ }
         pending.set(id, { pid: w.pid, signalled: false });
       }

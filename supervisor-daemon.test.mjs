@@ -12,6 +12,7 @@ import { tmpdir, platform as osPlatform } from 'node:os';
 import { join, dirname } from 'node:path';
 import { fileURLToPath } from 'node:url';
 import { createConnection } from 'node:net';
+import { spawnSync } from 'node:child_process';
 
 const here = dirname(fileURLToPath(import.meta.url));
 const pluginUrl = new URL('./c8ctl-plugin.js', import.meta.url).href;
@@ -759,6 +760,19 @@ async function stopStream(mod, { force = false, sendAfter = null } = {}) {
   });
 }
 
+function killDaemonsForHome(home) {
+  if (osPlatform() === 'win32') return;
+  const r = spawnSync('ps', ['-axeww', '-o', 'pid=,command='], { encoding: 'utf8' });
+  if (r.status !== 0 || !r.stdout) return;
+  for (const line of r.stdout.split('\n')) {
+    if (!line.includes('supervisor __daemon')) continue;
+    const m = line.match(/C8CTL_NANO_HOME=(\S+)/);
+    if (!m || m[1] !== home) continue;
+    const pid = Number(line.trim().split(/\s+/)[0]);
+    if (pid && pid !== process.pid) { try { process.kill(pid, 'SIGKILL'); } catch {} }
+  }
+}
+
 async function bootBusyDaemon(t, { drainMs = 300, notReady = false, readyTimeoutMs = null, crashOnRespawn = false } = {}) {
   const HOME = mkdtempSync(join(tmpdir(), 'c8ctl-sup-drain-'));
   const prevHome = process.env.C8CTL_NANO_HOME;
@@ -782,6 +796,10 @@ async function bootBusyDaemon(t, { drainMs = 300, notReady = false, readyTimeout
   t.after(async () => {
     const st = mod.runningSupervisor();
     if (st) { try { process.kill(st.pid, 'SIGKILL'); } catch {} }
+    // The state file only names the CURRENT daemon: a stop/handoff may have
+    // cleared or rewritten it while a daemon for this HOME is still alive, so
+    // also reap every daemon whose environment carries this HOME (issue #325).
+    killDaemonsForHome(HOME);
     mod.clearSupervisorState();
     restoreEnv('C8CTL_NANO_ENTRY', prevEntry);
     restoreEnv('C8CTL_NANO_HOME', prevHome);

@@ -587,16 +587,19 @@ function workerPredatesSignalReady(act, pid) {
  * `signalReadyAt`; the successor validates with ITS code before binding, so a
  * mixed-version handoff fails closed (successor exits → predecessor rolls back).
  * Returns the ids of live snapshot workers that predate the handshake.
+ *
+ * Each worker's activity marker is read ONCE per call and shared across the
+ * classification: a caller that also runs `unknownSnapshotWorkers` must pass
+ * both classifiers the SAME per-worker reads (see `classifySnapshotCompat`) —
+ * two independent read passes can disagree when a marker lands between them
+ * (the first pass sees `null`, the second a legacy marker, and the worker is
+ * adopted even though it can never pass the retarget gate).
  */
-function incompatibleSnapshotWorkers(state, { isAlive = isPidAlive, readActivity = readWorkerActivity } = {}) {
+function incompatibleSnapshotWorkers(state, { isAlive = isPidAlive, readActivity = readWorkerActivity, activityById } = {}) {
   const out = [];
-  for (const rec of (state && Array.isArray(state.workers) ? state.workers : [])) {
-    if (!rec || typeof rec.id !== 'string' || !rec.id) continue;
-    const pid = Number(rec.pid);
-    if (!Number.isInteger(pid) || pid <= 0 || !isAlive(pid)) continue;
-    let act = null;
-    try { act = readActivity(rec.id); } catch { act = null; }
-    if (workerPredatesSignalReady(act, pid)) out.push(rec.id);
+  for (const rec of liveSnapshotWorkerRecords(state, isAlive)) {
+    const act = readSnapshotActivity(rec.id, activityById, readActivity);
+    if (workerPredatesSignalReady(act, Number(rec.pid))) out.push(rec.id);
   }
   return out;
 }
@@ -608,17 +611,55 @@ function incompatibleSnapshotWorkers(state, { isAlive = isPidAlive, readActivity
  * has not written its first marker yet, so adopting it would risk the same
  * indefinite retarget wedge. Pure for unit tests.
  */
-function unknownSnapshotWorkers(state, { isAlive = isPidAlive, readActivity = readWorkerActivity } = {}) {
+function unknownSnapshotWorkers(state, { isAlive = isPidAlive, readActivity = readWorkerActivity, activityById } = {}) {
+  const out = [];
+  for (const rec of liveSnapshotWorkerRecords(state, isAlive)) {
+    const act = readSnapshotActivity(rec.id, activityById, readActivity);
+    if (!act || typeof act !== 'object' || act.pid !== Number(rec.pid)) out.push(rec.id);
+  }
+  return out;
+}
+
+/** Live worker records of a snapshot, in order. Shared by both classifiers. */
+function liveSnapshotWorkerRecords(state, isAlive) {
   const out = [];
   for (const rec of (state && Array.isArray(state.workers) ? state.workers : [])) {
     if (!rec || typeof rec.id !== 'string' || !rec.id) continue;
     const pid = Number(rec.pid);
     if (!Number.isInteger(pid) || pid <= 0 || !isAlive(pid)) continue;
-    let act = null;
-    try { act = readActivity(rec.id); } catch { act = null; }
-    if (!act || typeof act !== 'object' || act.pid !== pid) out.push(rec.id);
+    out.push(rec);
   }
   return out;
+}
+
+/** One worker's marker: the caller-supplied read when given, else `readActivity`. */
+function readSnapshotActivity(id, activityById, readActivity) {
+  if (activityById && typeof activityById.get === 'function') return activityById.get(id) ?? null;
+  try { return readActivity(id); } catch { return null; }
+}
+
+/**
+ * #331 review: classify a snapshot's live workers with each marker read exactly
+ * ONCE. Returns null when the snapshot itself is unavailable (a missing or
+ * unparsable state file is NOT an empty fleet — the caller must retry or fail
+ * closed rather than adopt nothing). Otherwise `{ incompatible, unknown, state }`,
+ * where `state` is the validated snapshot so the caller never re-reads it
+ * unchecked. Pure for unit tests.
+ */
+function classifySnapshotCompat(state, { isAlive = isPidAlive, readActivity = readWorkerActivity } = {}) {
+  if (!state || typeof state !== 'object') return null;
+  const activityById = new Map();
+  for (const rec of liveSnapshotWorkerRecords(state, isAlive)) {
+    let act = null;
+    try { act = readActivity(rec.id); } catch { act = null; }
+    activityById.set(rec.id, act);
+  }
+  const deps = { isAlive, activityById };
+  return {
+    incompatible: incompatibleSnapshotWorkers(state, deps),
+    unknown: unknownSnapshotWorkers(state, deps),
+    state,
+  };
 }
 
 /** Bound on how long a successor waits for live workers' first markers. */
@@ -641,7 +682,18 @@ export function supervisorUpgradeCliWaitBudgetMs() {
  * live snapshot worker to publish a marker for its current pid, then classifies
  * it. Fails closed: any worker whose compatibility is still unknown at the
  * deadline is reported in `unknown`, and the caller must refuse the handoff
- * (never adopt on unknown). Returns `{ incompatible, unknown }`.
+ * (never adopt on unknown). Returns `{ incompatible, unknown, state }`.
+ *
+ * An UNAVAILABLE snapshot (the state file is missing or unparsable) is never
+ * treated as an empty, compatible fleet: the read is retried until the
+ * deadline, and if it is still unavailable the gate reports `state: null` so
+ * the caller refuses the handoff instead of adopting zero (or unvalidated)
+ * workers. Each poll iteration reads every live worker's marker exactly ONCE
+ * (`classifySnapshotCompat`) and shares that read across both classifiers, so a
+ * marker landing mid-iteration can never split the verdict (a legacy marker
+ * seen by `unknown` but missed by `incompatible` would adopt a worker that can
+ * never pass the retarget gate). `state` is the validated snapshot, returned so
+ * the adoption path reuses THIS inventory instead of re-reading it unchecked.
  */
 async function awaitSnapshotCompat(readState, {
   timeoutMs = SUPERVISOR_UPGRADE_MARKER_WAIT_MS, pollMs = 150, isAlive = isPidAlive,
@@ -649,12 +701,11 @@ async function awaitSnapshotCompat(readState, {
 } = {}) {
   const deadline = now() + Math.max(0, Number(timeoutMs) || 0);
   for (;;) {
-    let state = null;
-    try { state = readState(); } catch { state = null; }
-    const deps = { isAlive, readActivity };
-    const incompatible = incompatibleSnapshotWorkers(state, deps);
-    const unknown = unknownSnapshotWorkers(state, deps);
-    if (incompatible.length > 0 || unknown.length === 0 || now() >= deadline) return { incompatible, unknown };
+    let raw = null;
+    try { raw = readState(); } catch { raw = null; }
+    const c = classifySnapshotCompat(raw, { isAlive, readActivity });
+    if (c && (c.incompatible.length > 0 || c.unknown.length === 0)) return c;
+    if (now() >= deadline) return c || { incompatible: [], unknown: [], state: null };
     await sleep(pollMs);
   }
 }
@@ -16796,6 +16847,10 @@ async function runSupervisorDaemon() {
   let predecessorPid = null;
   let upgradeFromVersion = null;
   let upgradeStartedMs = null;
+  // #331 review: the final quiesce snapshot the successor VALIDATED before
+  // binding (awaitSnapshotCompat). The adoption below reuses this inventory
+  // instead of re-reading the state file unchecked.
+  let validatedUpgradeSnapshot = null;
   if (upgradeMode) {
     const t0 = Date.now();
     dlogBoot(`upgrade mode: waiting for the current daemon to quiesce (pid from ${getSupervisorStateFile()})`);
@@ -16851,15 +16906,26 @@ async function runSupervisorDaemon() {
       // Wait BOUNDEDLY for each live worker's marker: a missing/unreadable one
       // means compatibility is unknown, and adopting on unknown could wedge the
       // retarget gate forever if the late marker turns out legacy (fail closed).
-      const { incompatible: bad, unknown } = await awaitSnapshotCompat(readSupervisorState);
-      if (bad.length > 0) {
-        dlogBoot(`upgrade mode: worker(s) ${bad.join(', ')} predate the signal-readiness handshake and cannot be handed over — exiting so predecessor pid ${predecessorPid} rolls back; run \`supervisor reload\` first, then retry the daemon upgrade`);
+      const compat = await awaitSnapshotCompat(readSupervisorState);
+      if (!compat.state) {
+        // The snapshot itself never became readable — an absent/torn state file
+        // is NOT an empty fleet. Refuse the handoff rather than adopt zero (or
+        // unvalidated) workers and strand them when the predecessor exits.
+        dlogBoot(`upgrade mode: the predecessor's final snapshot stayed unavailable for ${SUPERVISOR_UPGRADE_MARKER_WAIT_MS}ms — exiting so predecessor pid ${predecessorPid} rolls back; retry the daemon upgrade`);
         process.exit(1);
       }
-      if (unknown.length > 0) {
-        dlogBoot(`upgrade mode: worker(s) ${unknown.join(', ')} published no activity marker within ${SUPERVISOR_UPGRADE_MARKER_WAIT_MS}ms, so their signal-readiness compatibility is unknown — exiting so predecessor pid ${predecessorPid} rolls back; retry the daemon upgrade once workers are up`);
+      if (compat.incompatible.length > 0) {
+        dlogBoot(`upgrade mode: worker(s) ${compat.incompatible.join(', ')} predate the signal-readiness handshake and cannot be handed over — exiting so predecessor pid ${predecessorPid} rolls back; run \`supervisor reload\` first, then retry the daemon upgrade`);
         process.exit(1);
       }
+      if (compat.unknown.length > 0) {
+        dlogBoot(`upgrade mode: worker(s) ${compat.unknown.join(', ')} published no activity marker within ${SUPERVISOR_UPGRADE_MARKER_WAIT_MS}ms, so their signal-readiness compatibility is unknown — exiting so predecessor pid ${predecessorPid} rolls back; retry the daemon upgrade once workers are up`);
+        process.exit(1);
+      }
+      // Reuse THIS validated snapshot for the adoption below — never re-read it
+      // unchecked (a torn re-read would adopt an empty fleet and strand the
+      // workers the predecessor is about to stop supervising).
+      validatedUpgradeSnapshot = compat.state;
       upgradeStartedMs = Date.now();
     }
   }
@@ -18235,7 +18301,12 @@ async function runSupervisorDaemon() {
   // never signaled, so in-flight jobs run undisturbed). Dead pids are dropped
   // with a log line — the fleet after the swap is exactly what survived it.
   if (upgradeMode && predecessorPid != null) {
-    const prior = readSupervisorState();
+    // #331 review: adopt from the snapshot the compatibility gate VALIDATED
+    // (awaitSnapshotCompat) — never a fresh unchecked read. The gate already
+    // refused the handoff when no readable snapshot was available, so
+    // `validatedUpgradeSnapshot` is non-null whenever `predecessorPid` is set;
+    // the `|| readSupervisorState()` fallback is unreachable defensive cover.
+    const prior = validatedUpgradeSnapshot || readSupervisorState();
     const adopted = [];
     for (const rec of (prior && Array.isArray(prior.workers) ? prior.workers : [])) {
       const w = adoptWorker(rec);
@@ -18407,6 +18478,9 @@ async function runSupervisorDaemon() {
       if (!isPidAlive(predecessorPid)) {
         try { clearInterval(clearTimer); } catch { /* ignore */ }
         predecessorPid = null;
+        // The roll is complete — drop the validated adoption inventory too, so
+        // no stale upgrade state outlives the handoff it belonged to.
+        validatedUpgradeSnapshot = null;
         // #309 review: a handoff reported INCOMPLETE that later completed (late
         // acks/drains released the predecessor) must not keep reporting
         // 'incomplete' forever — currentUpgradeBlock() returns upgradeInfo first.
@@ -22924,6 +22998,7 @@ export {
   workerPredatesSignalReady,
   incompatibleSnapshotWorkers,
   unknownSnapshotWorkers,
+  classifySnapshotCompat,
   awaitSnapshotCompat,
   reloadCredentialsReady,
   waitForChildExit,

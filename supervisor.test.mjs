@@ -54,6 +54,7 @@ import {
   workerPredatesSignalReady,
   incompatibleSnapshotWorkers,
   unknownSnapshotWorkers,
+  classifySnapshotCompat,
   awaitSnapshotCompat,
   reloadCredentialsReady,
   waitForChildExit,
@@ -1920,19 +1921,59 @@ test('awaitSnapshotCompat: a DELAYED legacy marker is detected, not adopted (#33
   const state = { workers: [{ id: 'w', pid: 7 }] };
   const readActivity = () => (polls >= 2 ? { pid: 7, readyAt: 1, jobs: [] } : null);
   const r = await awaitSnapshotCompat(() => state, { isAlive: () => true, readActivity, now: () => t, sleep: async (ms) => { polls++; t += ms; }, timeoutMs: 10_000, pollMs: 100 });
-  assert.deepEqual(r, { incompatible: ['w'], unknown: [] });
+  assert.deepEqual(r, { incompatible: ['w'], unknown: [], state });
 });
 
 test('awaitSnapshotCompat: a marker that never appears stays unknown at the deadline (fail closed, #331 review)', async () => {
   let t = 0;
-  const r = await awaitSnapshotCompat(() => ({ workers: [{ id: 'w', pid: 7 }] }), { isAlive: () => true, readActivity: () => null, now: () => t, sleep: async (ms) => { t += ms; }, timeoutMs: 1000, pollMs: 100 });
-  assert.deepEqual(r, { incompatible: [], unknown: ['w'] });
+  const state = { workers: [{ id: 'w', pid: 7 }] };
+  const r = await awaitSnapshotCompat(() => state, { isAlive: () => true, readActivity: () => null, now: () => t, sleep: async (ms) => { t += ms; }, timeoutMs: 1000, pollMs: 100 });
+  assert.deepEqual(r, { incompatible: [], unknown: ['w'], state });
 });
 
 test('awaitSnapshotCompat: a delayed CURRENT marker is accepted (#331 review)', async () => {
   let t = 0; let polls = 0;
-  const r = await awaitSnapshotCompat(() => ({ workers: [{ id: 'w', pid: 7 }] }), { isAlive: () => true, readActivity: () => (polls >= 1 ? { pid: 7, signalReadyAt: null } : null), now: () => t, sleep: async (ms) => { polls++; t += ms; }, timeoutMs: 1000, pollMs: 100 });
-  assert.deepEqual(r, { incompatible: [], unknown: [] });
+  const state = { workers: [{ id: 'w', pid: 7 }] };
+  const r = await awaitSnapshotCompat(() => state, { isAlive: () => true, readActivity: () => (polls >= 1 ? { pid: 7, signalReadyAt: null } : null), now: () => t, sleep: async (ms) => { polls++; t += ms; }, timeoutMs: 1000, pollMs: 100 });
+  assert.deepEqual(r, { incompatible: [], unknown: [], state });
+});
+
+test('classifySnapshotCompat: an unavailable snapshot is NOT an empty fleet (#331 review)', () => {
+  const deps = { isAlive: () => true, readActivity: () => null };
+  assert.equal(classifySnapshotCompat(null, deps), null);
+  assert.equal(classifySnapshotCompat(undefined, deps), null);
+  assert.equal(classifySnapshotCompat(42, deps), null);
+  // A readable-but-workerless snapshot IS a valid empty fleet.
+  assert.deepEqual(classifySnapshotCompat({}, deps), { incompatible: [], unknown: [], state: {} });
+  assert.deepEqual(classifySnapshotCompat({ workers: [] }, deps), { incompatible: [], unknown: [], state: { workers: [] } });
+});
+
+test('classifySnapshotCompat: both classifiers share ONE marker read per worker (#331 review)', async () => {
+  // Regression for the split-read race: a legacy marker landing BETWEEN the
+  // incompatible pass and the unknown pass must still be classified
+  // incompatible — never adopted. With one shared read the verdict is atomic.
+  let reads = 0;
+  const state = { workers: [{ id: 'w', pid: 7 }] };
+  const readActivity = () => { reads += 1; return { pid: 7, readyAt: 1, jobs: [] }; }; // legacy marker (no signalReadyAt key)
+  const c = classifySnapshotCompat(state, { isAlive: () => true, readActivity });
+  assert.equal(reads, 1);
+  assert.deepEqual(c.incompatible, ['w']);
+  assert.deepEqual(c.unknown, []);
+  assert.equal(c.state, state);
+});
+
+test('awaitSnapshotCompat: an UNAVAILABLE snapshot is retried, then fails closed — never adopted as empty (#331 review)', async () => {
+  let t = 0;
+  // Unavailable for the whole window: reports state:null so the caller refuses
+  // the handoff instead of adopting zero workers.
+  const gone = await awaitSnapshotCompat(() => null, { isAlive: () => true, readActivity: () => null, now: () => t, sleep: async (ms) => { t += ms; }, timeoutMs: 1000, pollMs: 100 });
+  assert.deepEqual(gone, { incompatible: [], unknown: [], state: null });
+  // A throwing read is the same unavailable signal, and a LATER readable
+  // snapshot is adopted from (the retry recovers).
+  t = 0; let calls = 0;
+  const state = { workers: [{ id: 'w', pid: 7 }] };
+  const recovered = await awaitSnapshotCompat(() => { calls += 1; if (calls < 3) throw new Error('torn read'); return state; }, { isAlive: () => true, readActivity: () => ({ pid: 7, signalReadyAt: null }), now: () => t, sleep: async (ms) => { t += ms; }, timeoutMs: 1000, pollMs: 100 });
+  assert.deepEqual(recovered, { incompatible: [], unknown: [], state });
 });
 
 test('#331 upgrade CLI wait budget covers quiesce + marker wait + ack phases', async () => {

@@ -11,6 +11,7 @@ import { EventEmitter } from 'node:events';
 
 import {
   reconstructWorkArgs,
+  writeRetargetSidecar,
   resolveConnectionProfile,
   explicitConnectionProfile,
   withConnectionProfileArg,
@@ -1980,4 +1981,20 @@ test('#331 upgrade CLI wait budget covers quiesce + marker wait + ack phases', a
   const m = await import('./c8ctl-plugin.js');
   // defaults: 30s quiesce + 15s marker wait + 15s ack + 10s slack
   assert.ok(m.supervisorUpgradeCliWaitBudgetMs() >= 30_000 + 15_000 + 15_000);
+});
+
+test('writeRetargetSidecar: creates the dir, writes the pid, reports failure so the caller does not SIGUSR2 (#331 review)', async () => {
+  const { mkdtempSync, readFileSync, rmSync } = await import('node:fs');
+  const { tmpdir } = await import('node:os');
+  const { join } = await import('node:path');
+  const home = mkdtempSync(join(tmpdir(), 'c8ctl-sidecar-'));
+  try {
+    const act = join(home, 'missing-dir', 'w1.json');
+    assert.equal(writeRetargetSidecar(act, 4242), null);
+    assert.equal(readFileSync(`${act}.upgrade`, 'utf8'), '4242');
+    const failing = { mkdirSync() {}, writeFileSync() { throw new Error('EACCES'); } };
+    assert.match(writeRetargetSidecar(act, 1, failing), /EACCES/);
+    const failingDir = { mkdirSync() { throw new Error('ENOSPC'); }, writeFileSync() { throw new Error('unreached'); } };
+    assert.match(writeRetargetSidecar(act, 1, failingDir), /ENOSPC/);
+  } finally { rmSync(home, { recursive: true, force: true }); }
 });

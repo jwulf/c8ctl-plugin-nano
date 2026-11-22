@@ -284,6 +284,23 @@ const FORCE_STOP_DAEMON_GRACE_MS = STOP_GRACE_MS + FORCE_STOP_RECOVERY_MS + 2_00
 // `nano work` child to quiesce it — stop leasing new jobs, finish in-flight work,
 // then exit. SIGTERM/SIGINT remain the FORCE abort (kill harness, yield jobs).
 const SUPERVISOR_DRAIN_SIGNAL = 'SIGUSR2';
+
+/**
+ * Write a worker's `<activityFile>.upgrade` retarget sidecar (the successor
+ * pid its SIGUSR2 handler reads). Creates the parent dir first (#331). Returns
+ * `null` on success or the error message on failure — the caller must NOT
+ * SIGUSR2 the worker on failure, since a missing sidecar turns the retarget
+ * into a graceful drain (#331 review).
+ */
+export function writeRetargetSidecar(activityFile, successorPid, fs = { mkdirSync, writeFileSync }) {
+  try {
+    fs.mkdirSync(dirname(activityFile), { recursive: true });
+    fs.writeFileSync(`${activityFile}.upgrade`, String(successorPid), { mode: 0o600 });
+    return null;
+  } catch (err) {
+    return String(err?.message || err);
+  }
+}
 // Hot-reload readiness gate: after a rolling `supervisor reload` respawns a
 // worker, the daemon waits (bounded) for the replacement to STAMP `readyAt` on
 // its activity marker — i.e. its activation loop is up and leasing jobs — before
@@ -18416,8 +18433,17 @@ async function runSupervisorDaemon() {
         // SIGUSR2 handler read a missing sidecar and treated the retarget as a
         // graceful DRAIN — exiting mid-handoff instead of retargeting its
         // watchdog. mkdir first so the retarget instruction actually lands.
-        try { mkdirSync(dirname(actFile), { recursive: true }); } catch { /* best effort */ }
-        try { writeFileSync(`${actFile}.upgrade`, String(myPid), { mode: 0o600 }); } catch { /* best effort */ }
+        // #331 review: fail CLOSED when the sidecar cannot be written. Without
+        // it the worker's SIGUSR2 handler reads no successor pid and DRAINS
+        // instead of retargeting, so never signal it: keep it pending (its
+        // watchdog still guards the predecessor, which is therefore retained)
+        // and report the handoff incomplete via the normal ack deadline.
+        const sidecarErr = writeRetargetSidecar(actFile, myPid);
+        if (sidecarErr) {
+          dlog(`upgrade: could not write retarget sidecar for worker '${id}' (${sidecarErr}) — NOT signalling it (a SIGUSR2 without the sidecar would drain it); predecessor retained`);
+          pending.set(id, { pid: w.pid, signalled: true, sidecarFailed: true });
+          continue;
+        }
         pending.set(id, { pid: w.pid, signalled: false });
       }
       // Bounded wait first; past the deadline report INCOMPLETE but KEEP

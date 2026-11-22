@@ -16885,7 +16885,7 @@ async function runSupervisorDaemon() {
       // (a concurrent upgrade won the race). Never keep retrying — the binding
       // will never accept this pid, and two successors must not both wait to
       // adopt the same fleet. Exit and leave the bound successor to finish.
-      if (prep && prep.ok === false && prep.code === 'UPGRADE_INCOMPATIBLE_WORKERS') {
+      if (prep && prep.ok === false && (prep.code === 'UPGRADE_INCOMPATIBLE_WORKERS' || prep.code === 'UPGRADE_SNAPSHOT_FAILED')) {
         dlogBoot(`upgrade mode: predecessor pid ${st.pid} refused the handoff: ${prep.error}`);
         process.exit(1);
       }
@@ -17050,7 +17050,14 @@ async function runSupervisorDaemon() {
           removeOnExit: w.removeOnExit === true,
         })),
       });
-    } catch { /* best effort */ }
+      return true;
+    } catch (err) {
+      // Best effort for routine writes, but REPORTED: the forced quiesce
+      // snapshot must fail closed (#331 review) — a successor adopting a stale
+      // state file would leave a live replacement worker untracked.
+      if (force) dlog(`supervisor state write failed: ${err?.message || err}`);
+      return false;
+    }
   };
 
   const broadcast = (frame) => {
@@ -17871,7 +17878,15 @@ async function runSupervisorDaemon() {
       if (!upgrading) return; // rolled back while draining the queue
       upgradeInfo = { ...upgradeInfo, state: 'quiesced' };
       quiesceSnapshotIds = [...workers.keys()];
-      persist(true); // the deliberate quiesce snapshot the successor adopts from
+      // the deliberate quiesce snapshot the successor adopts from. #331 review:
+      // fail CLOSED when it cannot be written — never ack `quiesced` over a
+      // stale state file; roll back and refuse the handoff instead.
+      if (!persist(true)) {
+        rollbackFromUpgrade(successorPid, 'the quiesce snapshot could not be written');
+        const err = new Error('failed to write the quiesce snapshot — refusing the daemon upgrade (predecessor resumed normal operation)');
+        err.code = 'UPGRADE_SNAPSHOT_FAILED';
+        throw err;
+      }
     }
     quiesced = true;
   };
@@ -17900,10 +17915,10 @@ async function runSupervisorDaemon() {
   // unlatch `upgrading` so mutations/respawns resume. Best-effort — if the
   // re-listen fails the daemon stays quiesced and logs, but the common case
   // (successor crashed before binding) recovers cleanly.
-  const rollbackFromUpgrade = (deadSuccessorPid) => {
+  const rollbackFromUpgrade = (deadSuccessorPid, reason = null) => {
     if (!upgrading || handedOver) return;
     quiescePromise = null;
-    dlog(`daemon upgrade: successor pid ${deadSuccessorPid} died before handover — rolling back: re-opening the control socket and resuming normal operation`);
+    dlog(`daemon upgrade: ${reason ? `${reason} (successor pid ${deadSuccessorPid})` : `successor pid ${deadSuccessorPid} died before handover`} — rolling back: re-opening the control socket and resuming normal operation`);
     upgrading = false;
     quiesced = false;
     upgradeInfo = null;
@@ -18005,6 +18020,7 @@ async function runSupervisorDaemon() {
             await quiesceForUpgrade(Number(req.pid) || null, typeof req.version === 'string' ? req.version : null);
           } catch (err) {
             if (err && err.code === 'UPGRADE_BOUND') { sock.write(encodeFrame({ ok: false, error: err.message, final: true })); break; }
+            if (err && err.code === 'UPGRADE_SNAPSHOT_FAILED') { sock.write(encodeFrame({ ok: false, code: err.code, error: err.message, final: true })); break; }
             throw err;
           }
           // Report quiesced only AFTER the mutation queue has drained and the

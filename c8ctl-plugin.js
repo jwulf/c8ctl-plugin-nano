@@ -568,6 +568,19 @@ function drainSignalReadyFor(act, pid) {
 }
 
 /**
+ * #331 review: whether a live worker's activity marker proves it PREDATES the
+ * `signalReadyAt` stamp — a marker for this `pid` that carries no
+ * `signalReadyAt` key at all. A current worker always emits the key (null until
+ * its handler is armed), so a missing key identifies an older worker that can
+ * never satisfy drainSignalReadyFor; adopting it would wedge the daemon-upgrade
+ * handoff (and any stop/remove behind it) indefinitely. A booting worker with no
+ * marker yet is NOT incompatible (it will stamp the field). Pure for unit tests.
+ */
+function workerPredatesSignalReady(act, pid) {
+  return !!(act && typeof act === 'object' && act.pid === pid && !Object.prototype.hasOwnProperty.call(act, 'signalReadyAt'));
+}
+
+/**
  * Whether a worker should receive a `reload-credentials` SIGUSR1 this round.
  * All three must hold (#293): the worker exists, its PID is alive, AND its
  * activity marker proves its SIGUSR1 reload listener is installed (a finite
@@ -16738,6 +16751,10 @@ async function runSupervisorDaemon() {
       // (a concurrent upgrade won the race). Never keep retrying — the binding
       // will never accept this pid, and two successors must not both wait to
       // adopt the same fleet. Exit and leave the bound successor to finish.
+      if (prep && prep.ok === false && prep.code === 'UPGRADE_INCOMPATIBLE_WORKERS') {
+        dlogBoot(`upgrade mode: predecessor pid ${st.pid} refused the handoff: ${prep.error}`);
+        process.exit(1);
+      }
       if (prep && prep.ok === false && /already bound to successor pid/.test(String(prep.error || ''))) {
         dlogBoot(`upgrade mode: predecessor pid ${st.pid} is bound to a different successor — exiting so the bound successor completes the handoff`);
         process.exit(1);
@@ -17810,6 +17827,18 @@ async function runSupervisorDaemon() {
           // other) so two racing successors can never both win the fleet.
           if (shuttingDown) { sock.write(encodeFrame({ ok: false, error: 'supervisor is shutting down', final: true })); break; }
           if (reloading) { sock.write(encodeFrame({ ok: false, error: 'a worker reload is in progress — retry the daemon upgrade once it finishes', final: true })); break; }
+          // #331 review: reject BEFORE quiescing when a live worker predates the
+          // `signalReadyAt` stamp — the successor's retarget gate could never
+          // signal it, leaving the handoff (and stop/remove) blocked forever.
+          if (!upgrading) {
+            const incompatible = [...workers.values()]
+              .filter((w) => w && w.pid && isPidAlive(w.pid) && workerPredatesSignalReady(readWorkerActivity(w.id), w.pid))
+              .map((w) => w.id);
+            if (incompatible.length > 0) {
+              sock.write(encodeFrame({ ok: false, code: 'UPGRADE_INCOMPATIBLE_WORKERS', error: `worker(s) ${incompatible.join(', ')} predate the signal-readiness handshake and cannot be handed over — run \`supervisor reload\` first, then retry the daemon upgrade`, final: true }));
+              break;
+            }
+          }
           try {
             await quiesceForUpgrade(Number(req.pid) || null, typeof req.version === 'string' ? req.version : null);
           } catch (err) {
@@ -22796,6 +22825,7 @@ export {
   buildActivityPayload,
   activityMarkerReadyFor,
   drainSignalReadyFor,
+  workerPredatesSignalReady,
   reloadCredentialsReady,
   waitForChildExit,
   supervisorWorkerActivityFile,

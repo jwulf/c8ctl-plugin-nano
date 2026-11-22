@@ -131,8 +131,10 @@ function writeShim(shimPath, { recordArgv = false, workArgvDir = null, ignoreSig
     // A `notReady` stand-in stamps NO `readyAt`, modelling a replacement whose
     // activation loop never comes up — the supervisor's rolling-reload readiness
     // gate must then advance on its bounded timeout rather than wedge the roll.
+    // #331 review: `notReady` omits only LEASING readiness; the SIGUSR2 handler
+    // is still armed, so `signalReadyAt` is always published.
     const marker = notReady
-      ? `{ pid: process.pid, jobs: [{ key: 'J1', type: 'faker:senior', since: Date.now() }] }`
+      ? `{ pid: process.pid, signalReadyAt: Date.now(), jobs: [{ key: 'J1', type: 'faker:senior', since: Date.now() }] }`
       : `{ pid: process.pid, readyAt: Date.now(), signalReadyAt: Date.now(), jobs: [{ key: 'J1', type: 'faker:senior', since: Date.now() }] }`;
     lines.push(
       `  const { writeFileSync: wf, rmSync: rm, mkdirSync: mk, existsSync: ex } = await import('node:fs');`,
@@ -155,7 +157,6 @@ function writeShim(shimPath, { recordArgv = false, workArgvDir = null, ignoreSig
       );
     }
     lines.push(
-      `  try { wf(actFile, JSON.stringify(${marker})); } catch {}`,
       `  let ending = false;`,
       `  const endWith = (how, delay) => {`,
       `    if (ending && how !== 'forced') return; ending = true;`,
@@ -164,6 +165,8 @@ function writeShim(shimPath, { recordArgv = false, workArgvDir = null, ignoreSig
       `  };`,
       `  process.on('SIGUSR2', () => endWith('drained', ${Number(drainMs)}));`,
       `  process.on('SIGTERM', () => endWith('forced', 0));`,
+      // #331 review: publish the marker (signalReadyAt) only AFTER the handler is armed.
+      `  try { wf(actFile, JSON.stringify(${marker})); } catch {}`,
       `  const { installParentDeathWatchdog } = await import(${JSON.stringify(pluginUrl)});`,
       `  const dp = Number.parseInt(process.env.NANO_SUPERVISOR_DAEMON_PID ?? '', 10);`,
       `  installParentDeathWatchdog({ intervalMs: 100, parentPid: Number.isInteger(dp) ? dp : undefined });`,

@@ -51,6 +51,7 @@ import {
   countSupervisorInFlight,
   activityMarkerReadyFor,
   drainSignalReadyFor,
+  workerPredatesSignalReady,
   reloadCredentialsReady,
   waitForChildExit,
   supervisorWorkerActivityFile,
@@ -1885,4 +1886,12 @@ test('reageSupervisorStatus: a NaN base epoch does not poison uptime', () => {
   const status = { workers: [{ id: 'w', state: 'running', startedAtMs: NaN, uptimeMs: 42 }] };
   const out = reageSupervisorStatus(status, 9_999);
   assert.equal(out.workers[0].uptimeMs, 42, 'falls back to the snapshot uptime when the base is not finite');
+});
+
+test('workerPredatesSignalReady: only a marker for this pid WITHOUT the signalReadyAt key is incompatible (#331 review)', () => {
+  assert.equal(workerPredatesSignalReady({ pid: 7, readyAt: 1, jobs: [] }, 7), true);
+  assert.equal(workerPredatesSignalReady({ pid: 7, readyAt: 1, signalReadyAt: null }, 7), false);
+  assert.equal(workerPredatesSignalReady({ pid: 7, signalReadyAt: 5 }, 7), false);
+  assert.equal(workerPredatesSignalReady({ pid: 8, readyAt: 1 }, 7), false);
+  assert.equal(workerPredatesSignalReady(null, 7), false);
 });

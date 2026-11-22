@@ -301,6 +301,29 @@ export function writeRetargetSidecar(activityFile, successorPid, fs = { mkdirSyn
     return String(err?.message || err);
   }
 }
+/**
+ * Advance one un-acked retarget entry by a poll step (#331 review). A worker
+ * whose sidecar write previously failed is kept `sidecarPending` (never
+ * signalled) and the write is RETRIED here every poll, so a transient
+ * EMFILE/ENOSPC/EACCES doesn't wedge the handoff forever. The worker is
+ * SIGUSR2'd only once the sidecar is on disk AND its handler is ready.
+ * Mutates `p`; returns true when it was signalled this step.
+ */
+export function advanceRetargetSignal(p, { ready, writeSidecar, signal, log = () => {} }) {
+  if (p.signalled) return false;
+  if (p.sidecarPending) {
+    const err = writeSidecar();
+    if (err) {
+      if (!p.sidecarLogged) { p.sidecarLogged = true; log(err); }
+      return false;
+    }
+    p.sidecarPending = false;
+  }
+  if (!ready) return false;
+  p.signalled = true;
+  signal();
+  return true;
+}
 // Hot-reload readiness gate: after a rolling `supervisor reload` respawns a
 // worker, the daemon waits (bounded) for the replacement to STAMP `readyAt` on
 // its activity marker — i.e. its activation loop is up and leasing jobs — before
@@ -18440,8 +18463,8 @@ async function runSupervisorDaemon() {
         // and report the handoff incomplete via the normal ack deadline.
         const sidecarErr = writeRetargetSidecar(actFile, myPid);
         if (sidecarErr) {
-          dlog(`upgrade: could not write retarget sidecar for worker '${id}' (${sidecarErr}) — NOT signalling it (a SIGUSR2 without the sidecar would drain it); predecessor retained`);
-          pending.set(id, { pid: w.pid, signalled: true, sidecarFailed: true });
+          dlog(`upgrade: could not write retarget sidecar for worker '${id}' (${sidecarErr}) — NOT signalling it yet (a SIGUSR2 without the sidecar would drain it); retrying each poll, predecessor retained`);
+          pending.set(id, { pid: w.pid, signalled: false, sidecarPending: true, sidecarLogged: true, actFile });
           continue;
         }
         pending.set(id, { pid: w.pid, signalled: false });
@@ -18475,10 +18498,12 @@ async function runSupervisorDaemon() {
             if (p.drainDeferred) { try { process.kill(p.pid, SUPERVISOR_DRAIN_SIGNAL); } catch { /* already gone */ } }
             continue;
           }
-          if (!p.signalled && drainSignalReadyFor(act, p.pid)) {
-            p.signalled = true;
-            try { process.kill(p.pid, SUPERVISOR_DRAIN_SIGNAL); } catch { /* already gone */ }
-          }
+          advanceRetargetSignal(p, {
+            ready: drainSignalReadyFor(act, p.pid),
+            writeSidecar: () => writeRetargetSidecar(p.actFile, myPid),
+            signal: () => { try { process.kill(p.pid, SUPERVISOR_DRAIN_SIGNAL); } catch { /* already gone */ } },
+            log: (err) => dlog(`upgrade: retarget sidecar retry for worker '${id}' failed (${err})`),
+          });
         }
         if (pending.size === 0) break;
         if (!reportedIncomplete && Date.now() >= ackDeadline) {

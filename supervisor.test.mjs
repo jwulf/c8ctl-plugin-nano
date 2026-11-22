@@ -12,6 +12,7 @@ import { EventEmitter } from 'node:events';
 import {
   reconstructWorkArgs,
   writeRetargetSidecar,
+  advanceRetargetSignal,
   resolveConnectionProfile,
   explicitConnectionProfile,
   withConnectionProfileArg,
@@ -1997,4 +1998,21 @@ test('writeRetargetSidecar: creates the dir, writes the pid, reports failure so 
     const failingDir = { mkdirSync() { throw new Error('ENOSPC'); }, writeFileSync() { throw new Error('unreached'); } };
     assert.match(writeRetargetSidecar(act, 1, failingDir), /ENOSPC/);
   } finally { rmSync(home, { recursive: true, force: true }); }
+});
+
+test('advanceRetargetSignal: retries a failed sidecar write each poll and signals only after it lands (#331 review)', () => {
+  const p = { pid: 1, signalled: false, sidecarPending: true };
+  let writes = 0; let signals = 0;
+  const writeSidecar = () => (++writes === 1 ? 'EMFILE' : null);
+  const signal = () => { signals++; };
+  assert.equal(advanceRetargetSignal(p, { ready: true, writeSidecar, signal }), false);
+  assert.equal(signals, 0); assert.equal(p.sidecarPending, true);
+  assert.equal(advanceRetargetSignal(p, { ready: true, writeSidecar, signal }), true);
+  assert.equal(signals, 1); assert.equal(p.sidecarPending, false); assert.equal(p.signalled, true);
+  assert.equal(advanceRetargetSignal(p, { ready: true, writeSidecar, signal }), false);
+  assert.equal(writes, 2); assert.equal(signals, 1);
+  // written but handler not ready: no signal, no rewrite next time
+  const q = { pid: 2, signalled: false, sidecarPending: true };
+  assert.equal(advanceRetargetSignal(q, { ready: false, writeSidecar: () => null, signal }), false);
+  assert.equal(q.sidecarPending, false); assert.equal(signals, 1);
 });

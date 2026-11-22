@@ -16951,8 +16951,16 @@ async function runSupervisorDaemon() {
     // restart) racing an in-progress drain (e.g. a reload) must JOIN that drain,
     // never re-signal: a worker whose one-shot drain handler already fired would
     // otherwise take SIGUSR2's default action (terminate) and lose its job.
-    if (w.child && w.drainSignalledChild === w.child) return;
-    if (w.child) w.drainSignalledChild = w.child;
+    deliverDrainOnce(w, pid);
+  };
+  // #322: the ONE place a drain SIGUSR2 is delivered (direct and deferred
+  // paths alike), deduplicated per worker PROCESS. Keyed on pid, not the
+  // ChildProcess handle, because an adopted worker (post-upgrade) has no
+  // handle — keying on w.child would let a later stop re-signal it.
+  const deliverDrainOnce = (w, pid) => {
+    if (!w || !pid) return;
+    if (w.drainSignalledPid === pid) return;
+    w.drainSignalledPid = pid;
     try { process.kill(pid, SUPERVISOR_DRAIN_SIGNAL); } catch { /* already gone */ }
   };
 
@@ -17962,7 +17970,7 @@ async function runSupervisorDaemon() {
             // for the exit.
             if (p.drainDeferred && drainSignalReadyFor(act, p.pid)) {
               p.drainDeferred = false;
-              try { process.kill(p.pid, SUPERVISOR_DRAIN_SIGNAL); } catch { /* already gone */ }
+              deliverDrainOnce(w, p.pid);
             }
             continue;
           }
@@ -17970,7 +17978,7 @@ async function runSupervisorDaemon() {
             pending.delete(id);
             // Retarget landed and the handler re-armed — now deliver any drain
             // that was requested while the retarget was outstanding.
-            if (p.drainDeferred) { try { process.kill(p.pid, SUPERVISOR_DRAIN_SIGNAL); } catch { /* already gone */ } }
+            if (p.drainDeferred) deliverDrainOnce(w, p.pid);
             continue;
           }
           if (!p.signalled && drainSignalReadyFor(act, p.pid)) {
@@ -17995,7 +18003,7 @@ async function runSupervisorDaemon() {
       for (const [id, p] of pending) {
         if (!p.drainDeferred || !isPidAlive(p.pid)) continue;
         if (p.drainOnly && drainSignalReadyFor(readWorkerActivity(id), p.pid)) {
-          try { process.kill(p.pid, SUPERVISOR_DRAIN_SIGNAL); } catch { /* already gone */ }
+          deliverDrainOnce(workers.get(id), p.pid);
         } else {
           dlog(`upgrade: deferred drain for worker '${id}' not delivered (retarget unacknowledged or handler not ready) — re-issue stop/remove once it settles`);
         }

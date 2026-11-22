@@ -1696,3 +1696,17 @@ test('#309 review: stateFromStatus carries the upgrade block so a stop client se
   const quiet = mod.stateFromStatus({ ...res, upgrade: undefined }, '/tmp/x.sock');
   assert.ok(!('upgrade' in quiet), 'no upgrade key when the daemon is not mid-upgrade');
 });
+
+test('#322 review: every daemon drain SIGUSR2 delivery goes through the per-pid dedup helper', async () => {
+  const { readFileSync } = await import('node:fs');
+  const src = readFileSync(new URL('./c8ctl-plugin.js', import.meta.url), 'utf8');
+  const start = src.indexOf('async function runSupervisorDaemon(');
+  assert.ok(start > 0);
+  const body = src.slice(start);
+  const kills = [...body.matchAll(/process\.kill\(([^,]+), SUPERVISOR_DRAIN_SIGNAL\)/g)].map((m) => m[1].trim());
+  // Only the dedup helper (pid) and the upgrade watchdog-RETARGET (p.pid, guarded by p.signalled) may signal directly;
+  // deferred drain deliveries (retarget-ack, drainOnly, handoff cleanup) must use deliverDrainOnce.
+  assert.deepEqual(kills.sort(), ['p.pid', 'pid']);
+  assert.match(body, /if \(w\.drainSignalledPid === pid\) return;/);
+  assert.equal((body.match(/deliverDrainOnce\(/g) || []).length >= 4, true);
+});

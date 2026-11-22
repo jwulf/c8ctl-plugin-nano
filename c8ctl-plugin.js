@@ -581,6 +581,27 @@ function workerPredatesSignalReady(act, pid) {
 }
 
 /**
+ * #331 review: successor-side compatibility gate over the predecessor's FINAL
+ * quiesce snapshot. An older predecessor that supports `prepare-upgrade` but
+ * predates its own pre-quiesce check would hand over workers lacking
+ * `signalReadyAt`; the successor validates with ITS code before binding, so a
+ * mixed-version handoff fails closed (successor exits → predecessor rolls back).
+ * Returns the ids of live snapshot workers that predate the handshake.
+ */
+function incompatibleSnapshotWorkers(state, { isAlive = isPidAlive, readActivity = readWorkerActivity } = {}) {
+  const out = [];
+  for (const rec of (state && Array.isArray(state.workers) ? state.workers : [])) {
+    if (!rec || typeof rec.id !== 'string' || !rec.id) continue;
+    const pid = Number(rec.pid);
+    if (!Number.isInteger(pid) || pid <= 0 || !isAlive(pid)) continue;
+    let act = null;
+    try { act = readActivity(rec.id); } catch { act = null; }
+    if (workerPredatesSignalReady(act, pid)) out.push(rec.id);
+  }
+  return out;
+}
+
+/**
  * Whether a worker should receive a `reload-credentials` SIGUSR1 this round.
  * All three must hold (#293): the worker exists, its PID is alive, AND its
  * activity marker proves its SIGUSR1 reload listener is installed (a finite
@@ -16765,7 +16786,17 @@ async function runSupervisorDaemon() {
       }
       await new Promise((r) => setTimeout(r, 150));
     }
-    if (predecessorPid != null) upgradeStartedMs = Date.now();
+    if (predecessorPid != null) {
+      // #331 review: validate the final snapshot with THIS (successor) code —
+      // the predecessor's own check may be absent (older daemon). Exiting here,
+      // before binding, makes the quiesced predecessor roll back.
+      const bad = incompatibleSnapshotWorkers(readSupervisorState());
+      if (bad.length > 0) {
+        dlogBoot(`upgrade mode: worker(s) ${bad.join(', ')} predate the signal-readiness handshake and cannot be handed over — exiting so predecessor pid ${predecessorPid} rolls back; run \`supervisor reload\` first, then retry the daemon upgrade`);
+        process.exit(1);
+      }
+      upgradeStartedMs = Date.now();
+    }
   }
 
   const workers = new Map();
@@ -22826,6 +22857,7 @@ export {
   activityMarkerReadyFor,
   drainSignalReadyFor,
   workerPredatesSignalReady,
+  incompatibleSnapshotWorkers,
   reloadCredentialsReady,
   waitForChildExit,
   supervisorWorkerActivityFile,

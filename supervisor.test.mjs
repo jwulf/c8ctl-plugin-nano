@@ -52,6 +52,7 @@ import {
   activityMarkerReadyFor,
   drainSignalReadyFor,
   workerPredatesSignalReady,
+  incompatibleSnapshotWorkers,
   reloadCredentialsReady,
   waitForChildExit,
   supervisorWorkerActivityFile,
@@ -1894,4 +1895,13 @@ test('workerPredatesSignalReady: only a marker for this pid WITHOUT the signalRe
   assert.equal(workerPredatesSignalReady({ pid: 7, signalReadyAt: 5 }, 7), false);
   assert.equal(workerPredatesSignalReady({ pid: 8, readyAt: 1 }, 7), false);
   assert.equal(workerPredatesSignalReady(null, 7), false);
+});
+
+test('incompatibleSnapshotWorkers: successor gates a mixed-version snapshot on live pre-handshake workers (#331 review)', () => {
+  const acts = { old: { pid: 11, jobs: [] }, cur: { pid: 12, signalReadyAt: null }, booting: null, dead: { pid: 14 } };
+  const state = { workers: [{ id: 'old', pid: 11 }, { id: 'cur', pid: 12 }, { id: 'booting', pid: 13 }, { id: 'dead', pid: 14 }, { id: 'nopid' }, null] };
+  const deps = { isAlive: (p) => p !== 14, readActivity: (id) => acts[id] };
+  assert.deepEqual(incompatibleSnapshotWorkers(state, deps), ['old']);
+  assert.deepEqual(incompatibleSnapshotWorkers(null, deps), []);
+  assert.deepEqual(incompatibleSnapshotWorkers({ workers: [{ id: 'x', pid: 5 }] }, { isAlive: () => true, readActivity: () => { throw new Error('io'); } }), []);
 });

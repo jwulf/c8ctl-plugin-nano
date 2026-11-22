@@ -53,6 +53,8 @@ import {
   drainSignalReadyFor,
   workerPredatesSignalReady,
   incompatibleSnapshotWorkers,
+  unknownSnapshotWorkers,
+  awaitSnapshotCompat,
   reloadCredentialsReady,
   waitForChildExit,
   supervisorWorkerActivityFile,
@@ -1904,4 +1906,31 @@ test('incompatibleSnapshotWorkers: successor gates a mixed-version snapshot on l
   assert.deepEqual(incompatibleSnapshotWorkers(state, deps), ['old']);
   assert.deepEqual(incompatibleSnapshotWorkers(null, deps), []);
   assert.deepEqual(incompatibleSnapshotWorkers({ workers: [{ id: 'x', pid: 5 }] }, { isAlive: () => true, readActivity: () => { throw new Error('io'); } }), []);
+});
+
+test('unknownSnapshotWorkers: live workers with no marker for their current pid are unknown (#331 review)', () => {
+  const acts = { cur: { pid: 12, signalReadyAt: null }, stale: { pid: 99 }, none: null };
+  const state = { workers: [{ id: 'cur', pid: 12 }, { id: 'stale', pid: 13 }, { id: 'none', pid: 14 }, { id: 'dead', pid: 15 }, { id: 'io', pid: 16 }] };
+  const deps = { isAlive: (p) => p !== 15, readActivity: (id) => { if (id === 'io') throw new Error('io'); return acts[id]; } };
+  assert.deepEqual(unknownSnapshotWorkers(state, deps), ['stale', 'none', 'io']);
+});
+
+test('awaitSnapshotCompat: a DELAYED legacy marker is detected, not adopted (#331 review)', async () => {
+  let t = 0; let polls = 0;
+  const state = { workers: [{ id: 'w', pid: 7 }] };
+  const readActivity = () => (polls >= 2 ? { pid: 7, readyAt: 1, jobs: [] } : null);
+  const r = await awaitSnapshotCompat(() => state, { isAlive: () => true, readActivity, now: () => t, sleep: async (ms) => { polls++; t += ms; }, timeoutMs: 10_000, pollMs: 100 });
+  assert.deepEqual(r, { incompatible: ['w'], unknown: [] });
+});
+
+test('awaitSnapshotCompat: a marker that never appears stays unknown at the deadline (fail closed, #331 review)', async () => {
+  let t = 0;
+  const r = await awaitSnapshotCompat(() => ({ workers: [{ id: 'w', pid: 7 }] }), { isAlive: () => true, readActivity: () => null, now: () => t, sleep: async (ms) => { t += ms; }, timeoutMs: 1000, pollMs: 100 });
+  assert.deepEqual(r, { incompatible: [], unknown: ['w'] });
+});
+
+test('awaitSnapshotCompat: a delayed CURRENT marker is accepted (#331 review)', async () => {
+  let t = 0; let polls = 0;
+  const r = await awaitSnapshotCompat(() => ({ workers: [{ id: 'w', pid: 7 }] }), { isAlive: () => true, readActivity: () => (polls >= 1 ? { pid: 7, signalReadyAt: null } : null), now: () => t, sleep: async (ms) => { polls++; t += ms; }, timeoutMs: 1000, pollMs: 100 });
+  assert.deepEqual(r, { incompatible: [], unknown: [] });
 });

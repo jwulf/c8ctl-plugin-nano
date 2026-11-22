@@ -602,6 +602,52 @@ function incompatibleSnapshotWorkers(state, { isAlive = isPidAlive, readActivity
 }
 
 /**
+ * #331 review: live snapshot workers whose signal-readiness compatibility is
+ * still UNKNOWN — no readable marker for their CURRENT pid (missing, unreadable,
+ * or a stale marker from a previous pid). Such a worker may be a legacy one that
+ * has not written its first marker yet, so adopting it would risk the same
+ * indefinite retarget wedge. Pure for unit tests.
+ */
+function unknownSnapshotWorkers(state, { isAlive = isPidAlive, readActivity = readWorkerActivity } = {}) {
+  const out = [];
+  for (const rec of (state && Array.isArray(state.workers) ? state.workers : [])) {
+    if (!rec || typeof rec.id !== 'string' || !rec.id) continue;
+    const pid = Number(rec.pid);
+    if (!Number.isInteger(pid) || pid <= 0 || !isAlive(pid)) continue;
+    let act = null;
+    try { act = readActivity(rec.id); } catch { act = null; }
+    if (!act || typeof act !== 'object' || act.pid !== pid) out.push(rec.id);
+  }
+  return out;
+}
+
+/** Bound on how long a successor waits for live workers' first markers. */
+const SUPERVISOR_UPGRADE_MARKER_WAIT_MS = 15_000;
+
+/**
+ * #331 review: successor-side compatibility gate that waits BOUNDEDLY for every
+ * live snapshot worker to publish a marker for its current pid, then classifies
+ * it. Fails closed: any worker whose compatibility is still unknown at the
+ * deadline is reported in `unknown`, and the caller must refuse the handoff
+ * (never adopt on unknown). Returns `{ incompatible, unknown }`.
+ */
+async function awaitSnapshotCompat(readState, {
+  timeoutMs = SUPERVISOR_UPGRADE_MARKER_WAIT_MS, pollMs = 150, isAlive = isPidAlive,
+  readActivity = readWorkerActivity, now = Date.now, sleep = (ms) => new Promise((r) => setTimeout(r, ms)),
+} = {}) {
+  const deadline = now() + Math.max(0, Number(timeoutMs) || 0);
+  for (;;) {
+    let state = null;
+    try { state = readState(); } catch { state = null; }
+    const deps = { isAlive, readActivity };
+    const incompatible = incompatibleSnapshotWorkers(state, deps);
+    const unknown = unknownSnapshotWorkers(state, deps);
+    if (incompatible.length > 0 || unknown.length === 0 || now() >= deadline) return { incompatible, unknown };
+    await sleep(pollMs);
+  }
+}
+
+/**
  * Whether a worker should receive a `reload-credentials` SIGUSR1 this round.
  * All three must hold (#293): the worker exists, its PID is alive, AND its
  * activity marker proves its SIGUSR1 reload listener is installed (a finite
@@ -16790,9 +16836,16 @@ async function runSupervisorDaemon() {
       // #331 review: validate the final snapshot with THIS (successor) code —
       // the predecessor's own check may be absent (older daemon). Exiting here,
       // before binding, makes the quiesced predecessor roll back.
-      const bad = incompatibleSnapshotWorkers(readSupervisorState());
+      // Wait BOUNDEDLY for each live worker's marker: a missing/unreadable one
+      // means compatibility is unknown, and adopting on unknown could wedge the
+      // retarget gate forever if the late marker turns out legacy (fail closed).
+      const { incompatible: bad, unknown } = await awaitSnapshotCompat(readSupervisorState);
       if (bad.length > 0) {
         dlogBoot(`upgrade mode: worker(s) ${bad.join(', ')} predate the signal-readiness handshake and cannot be handed over — exiting so predecessor pid ${predecessorPid} rolls back; run \`supervisor reload\` first, then retry the daemon upgrade`);
+        process.exit(1);
+      }
+      if (unknown.length > 0) {
+        dlogBoot(`upgrade mode: worker(s) ${unknown.join(', ')} published no activity marker within ${SUPERVISOR_UPGRADE_MARKER_WAIT_MS}ms, so their signal-readiness compatibility is unknown — exiting so predecessor pid ${predecessorPid} rolls back; retry the daemon upgrade once workers are up`);
         process.exit(1);
       }
       upgradeStartedMs = Date.now();
@@ -22858,6 +22911,8 @@ export {
   drainSignalReadyFor,
   workerPredatesSignalReady,
   incompatibleSnapshotWorkers,
+  unknownSnapshotWorkers,
+  awaitSnapshotCompat,
   reloadCredentialsReady,
   waitForChildExit,
   supervisorWorkerActivityFile,

@@ -18545,13 +18545,29 @@ async function runSupervisorDaemon() {
     if (osPlatform() === 'win32') return;
     try { const st = lstatSync(socketPath); socketIdentity = { dev: st.dev, ino: st.ino }; } catch { socketIdentity = null; }
   };
-  const relistenControlSocket = (why) => {
+  // `expected` is the dev/ino the caller proved dead (null = expected absent).
+  const closeIsSafe = (expected) => {
+    if (osPlatform() === 'win32') return true;
+    let st;
+    try { st = lstatSync(socketPath); } catch (err) { return !!(err && err.code === 'ENOENT'); }
+    const same = (id) => id && st.dev === id.dev && st.ino === id.ino;
+    return same(expected) || same(socketIdentity);
+  };
+  const relistenControlSocket = (why, expected = null) => {
     if (relistening) return relistening;
     relistening = (async () => {
       const win = osPlatform() === 'win32';
       // Close the old (orphaned) handle first. libuv unlinks the bound path
       // NAME on close, so only do it while the path is absent (or already ours
       // and about to be replaced) — never under someone else's socket.
+      // #338 review: a replacement listener may have bound the path while the
+      // caller's probe was pending, so re-check SYNCHRONOUSLY in the same tick
+      // as close(): the path must be absent, ours, or the exact inode the
+      // caller proved dead. Otherwise leave the orphaned handle open.
+      if (server.listening && !closeIsSafe(expected)) {
+        dlog(`${why}: control socket path changed while probing — not closing the old handle under it`);
+        return false;
+      }
       if (server.listening) {
         await new Promise((resolve) => { try { server.close(() => resolve()); } catch { resolve(); } setTimeout(resolve, 200).unref?.(); });
       }
@@ -18623,7 +18639,7 @@ async function runSupervisorDaemon() {
     }
     if (upgrading || handedOver || shuttingDown || shutdownStarted) return; // state changed while probing
     dlog(`control socket ${socketPath} ${st ? 'was replaced by a dead socket' : 'vanished from disk'} — re-binding so the daemon stays manageable (#338)`);
-    const ok = await relistenControlSocket('socket ownership check');
+    const ok = await relistenControlSocket('socket ownership check', st ? { dev: st.dev, ino: st.ino } : null);
     if (ok) { checkSocketOwnership.warned = false; dlog(`control socket re-bound at ${socketPath}`); }
   };
   const armSocketOwnershipCheck = () => {

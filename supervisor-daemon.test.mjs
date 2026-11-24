@@ -1875,3 +1875,16 @@ test('#338 review: socket reclaim only on definitive death and revalidates after
   const recheck = relisten.indexOf("(await probeSocketAlive()) !== 'dead'");
   assert.ok(recheck > 0 && recheck < relisten.indexOf('rmSync(socketPath'));
 });
+
+test('#338 review: orphaned handle is never closed under a replacement listener bound during the probe', async () => {
+  const { readFileSync } = await import('node:fs');
+  const src = readFileSync(new URL('./c8ctl-plugin.js', import.meta.url), 'utf8');
+  const body = src.slice(src.indexOf('async function runSupervisorDaemon('));
+  const relisten = body.slice(body.indexOf('const relistenControlSocket'), body.indexOf('const probeSocketAlive'));
+  const guard = relisten.indexOf('!closeIsSafe(expected)');
+  assert.ok(guard > 0 && guard < relisten.indexOf('server.close('), 'sync guard precedes close()');
+  const safe = body.slice(body.indexOf('const closeIsSafe'), body.indexOf('const relistenControlSocket'));
+  assert.match(safe, /lstatSync\(socketPath\)/);
+  assert.doesNotMatch(safe, /await/, 'guard is synchronous (same tick as close)');
+  assert.match(body, /relistenControlSocket\('socket ownership check', st \? \{ dev: st\.dev, ino: st\.ino \} : null\)/);
+});

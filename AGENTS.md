@@ -112,6 +112,16 @@ SDK client (job workers) — do **not** add the SDK as a dependency or use raw
   (age-gated, in-flight skipped) and deleted per-job unless `--keep-runs`.
   Container-side cloning
   (strong isolation) is a later increment; container jobs don't clone yet.
+- **Per-job TMPDIR + temp-space shed (issue #336).** Every HOST job's harness gets
+  `TMPDIR`/`TMP`/`TEMP` (`jobTmpEnv`) pointing at a private dir inside its run dir
+  (`jobTmpDirFor`: `<clone>/.git/nano-tmp` — inside the sandbox-writable workspace
+  but never in the worktree — else `<cwd>/.nano-tmp`, else `<res-*>/tmp`), layered
+  under profile/setup env (operator override wins) and deleted when the job is reaped
+  (even when the run dir is preserved for recovery). Containers keep their own `/tmp`.
+  Before a host job starts, `hostTempBudget` checks free space on `os.tmpdir()` and
+  the agent-runs dir against `--min-free-mb` (default 1024); below it the job is shed
+  (retryable fail, 30s backoff) with a log line naming the short path. Fail-open on
+  stat errors.
 - **Engine fetch resilience (issue #323).** The reconcile loop only runs for
   `--auto` workers (its result is applied solely via `autoWorkerId`). Hand-rolled
   non-activation engine fetches (`withEngineAuthFetch` → reconcile reader, the

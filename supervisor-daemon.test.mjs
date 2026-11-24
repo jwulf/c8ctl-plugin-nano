@@ -14,6 +14,8 @@ import { fileURLToPath } from 'node:url';
 import { createConnection } from 'node:net';
 import { spawnSync } from 'node:child_process';
 
+process.env.NANO_TEST_RUNNER_PID = String(process.pid); // #338: shim daemons self-reap
+
 const here = dirname(fileURLToPath(import.meta.url));
 const pluginUrl = new URL('./c8ctl-plugin.js', import.meta.url).href;
 
@@ -103,6 +105,11 @@ function writeShim(shimPath, { recordArgv = false, workArgvDir = null, ignoreSig
   lines.push(
     `const argv = process.argv.slice(2);`,
     `if (argv[0] === 'nano' && argv[1] === 'supervisor' && argv[2] === '__daemon') {`,
+    // #338 hygiene: a test daemon must not outlive the test runner (a killed
+    // `node --test` skips t.after). SIGTERM runs the daemon's graceful
+    // shutdown, which also removes its control socket from tmpdir.
+    `  const rp = Number.parseInt(process.env.NANO_TEST_RUNNER_PID ?? '', 10);`,
+    `  if (Number.isInteger(rp) && rp > 0) { const t = setInterval(() => { try { process.kill(rp, 0); } catch { clearInterval(t); process.kill(process.pid, 'SIGTERM'); } }, 1000); t.unref(); }`,
     `  const mod = await import(${JSON.stringify(pluginUrl)});`,
     `  await mod.runSupervisorDaemon();`,
     `} else if (argv[0] === 'nano' && argv[1] === 'work') {`,
@@ -246,6 +253,7 @@ test('supervisor daemon: start → add → status → remove → stop', async (t
     try { await mod.supervisorRequest({ op: 'stop' }); } catch { /* ignore */ }
     const st = mod.runningSupervisor();
     if (st) { try { process.kill(st.pid, 'SIGKILL'); } catch { /* ignore */ } }
+    try { rmSync(mod.getSupervisorSocketPath(), { force: true }); } catch { /* #338: no stray sockets in tmpdir */ }
     mod.clearSupervisorState();
     restoreEnv('C8CTL_NANO_ENTRY', prevEntry);
     restoreEnv('C8CTL_NANO_HOME', prevHome);
@@ -384,6 +392,7 @@ test('supervisor start forwards c8ctl --profile <conn> to spawned workers', asyn
     try { await mod.supervisorRequest({ op: 'stop' }); } catch { /* ignore */ }
     const st = mod.runningSupervisor();
     if (st) { try { process.kill(st.pid, 'SIGKILL'); } catch { /* ignore */ } }
+    try { rmSync(mod.getSupervisorSocketPath(), { force: true }); } catch { /* #338: no stray sockets in tmpdir */ }
     mod.clearSupervisorState();
     if (prevC8ctl === undefined) delete globalThis.c8ctl; else globalThis.c8ctl = prevC8ctl;
     restoreEnv('C8CTL_NANO_ENTRY', prevEntry);
@@ -456,6 +465,7 @@ test('supervisor add forwards c8ctl --profile <conn> to spawned workers', async 
     try { await mod.supervisorRequest({ op: 'stop' }); } catch { /* ignore */ }
     const st = mod.runningSupervisor();
     if (st) { try { process.kill(st.pid, 'SIGKILL'); } catch { /* ignore */ } }
+    try { rmSync(mod.getSupervisorSocketPath(), { force: true }); } catch { /* #338: no stray sockets in tmpdir */ }
     mod.clearSupervisorState();
     if (prevC8ctl === undefined) delete globalThis.c8ctl; else globalThis.c8ctl = prevC8ctl;
     restoreEnv('C8CTL_NANO_ENTRY', prevEntry);
@@ -512,6 +522,7 @@ test('supervisor daemon: restarts a crashing worker', async (t) => {
     try { await mod.supervisorRequest({ op: 'stop' }); } catch { /* ignore */ }
     const st = mod.runningSupervisor();
     if (st) { try { process.kill(st.pid, 'SIGKILL'); } catch { /* ignore */ } }
+    try { rmSync(mod.getSupervisorSocketPath(), { force: true }); } catch { /* #338: no stray sockets in tmpdir */ }
     mod.clearSupervisorState();
     restoreEnv('C8CTL_NANO_ENTRY', prevEntry);
     restoreEnv('C8CTL_NANO_HOME', prevHome);
@@ -555,6 +566,7 @@ test('supervisor daemon: does NOT restart a worker that exits on a config failur
     try { await mod.supervisorRequest({ op: 'stop' }); } catch { /* ignore */ }
     const st = mod.runningSupervisor();
     if (st) { try { process.kill(st.pid, 'SIGKILL'); } catch { /* ignore */ } }
+    try { rmSync(mod.getSupervisorSocketPath(), { force: true }); } catch { /* #338: no stray sockets in tmpdir */ }
     mod.clearSupervisorState();
     restoreEnv('C8CTL_NANO_ENTRY', prevEntry);
     restoreEnv('C8CTL_NANO_HOME', prevHome);
@@ -602,6 +614,7 @@ test('supervisor daemon: restart swaps the child without a spurious restart bump
     try { await mod.supervisorRequest({ op: 'stop' }); } catch { /* ignore */ }
     const st = mod.runningSupervisor();
     if (st) { try { process.kill(st.pid, 'SIGKILL'); } catch { /* ignore */ } }
+    try { rmSync(mod.getSupervisorSocketPath(), { force: true }); } catch { /* #338: no stray sockets in tmpdir */ }
     mod.clearSupervisorState();
     restoreEnv('C8CTL_NANO_ENTRY', prevEntry);
     restoreEnv('C8CTL_NANO_HOME', prevHome);
@@ -648,6 +661,7 @@ test('supervisor daemon: adopts a live daemon when the state file is missing', a
     try { await mod.supervisorRequest({ op: 'stop' }); } catch { /* ignore */ }
     const st = mod.runningSupervisor();
     if (st) { try { process.kill(st.pid, 'SIGKILL'); } catch { /* ignore */ } }
+    try { rmSync(mod.getSupervisorSocketPath(), { force: true }); } catch { /* #338: no stray sockets in tmpdir */ }
     mod.clearSupervisorState();
     restoreEnv('C8CTL_NANO_ENTRY', prevEntry);
     restoreEnv('C8CTL_NANO_HOME', prevHome);
@@ -690,6 +704,7 @@ test('supervisor add --instances N: spawns N distinct auto-named workers, forwar
     try { await mod.supervisorRequest({ op: 'stop' }); } catch { /* ignore */ }
     const st = mod.runningSupervisor();
     if (st) { try { process.kill(st.pid, 'SIGKILL'); } catch { /* ignore */ } }
+    try { rmSync(mod.getSupervisorSocketPath(), { force: true }); } catch { /* #338: no stray sockets in tmpdir */ }
     mod.clearSupervisorState();
     restoreEnv('C8CTL_NANO_ENTRY', prevEntry);
     restoreEnv('C8CTL_NANO_HOME', prevHome);
@@ -803,6 +818,7 @@ async function bootBusyDaemon(t, { drainMs = 300, notReady = false, readyTimeout
     // cleared or rewritten it while a daemon for this HOME is still alive, so
     // also reap every daemon whose environment carries this HOME (issue #325).
     killDaemonsForHome(HOME);
+    try { rmSync(mod.getSupervisorSocketPath(), { force: true }); } catch { /* #338: no stray sockets in tmpdir */ }
     mod.clearSupervisorState();
     restoreEnv('C8CTL_NANO_ENTRY', prevEntry);
     restoreEnv('C8CTL_NANO_HOME', prevHome);
@@ -1214,6 +1230,7 @@ test('supervisor upgrade: successor adopts the fleet and the old daemon hands ov
     const st = mod.runningSupervisor();
     if (st) { try { process.kill(st.pid, 'SIGKILL'); } catch { /* ignore */ } }
     if (successorPid) { try { process.kill(successorPid, 'SIGKILL'); } catch { /* ignore */ } }
+    try { rmSync(mod.getSupervisorSocketPath(), { force: true }); } catch { /* #338: no stray sockets in tmpdir */ }
     mod.clearSupervisorState();
     restoreEnv('C8CTL_NANO_ENTRY', prevEntry);
     restoreEnv('C8CTL_NANO_HOME', prevHome);
@@ -1343,6 +1360,7 @@ test('supervisor upgrade: a successor with no live predecessor starts as a plain
   t.after(async () => {
     try { await mod.supervisorRequest({ op: 'stop', force: true }, { timeoutMs: 500, responseTimeoutMs: 2000 }); } catch { /* ignore */ }
     if (successorPid) { try { process.kill(successorPid, 'SIGKILL'); } catch { /* ignore */ } }
+    try { rmSync(mod.getSupervisorSocketPath(), { force: true }); } catch { /* #338: no stray sockets in tmpdir */ }
     mod.clearSupervisorState();
     restoreEnv('C8CTL_NANO_ENTRY', prevEntry);
     restoreEnv('C8CTL_NANO_HOME', prevHome);
@@ -1469,6 +1487,7 @@ test('#309 review: prepare-upgrade binds to one successor and rejects a concurre
     try { await mod.supervisorRequest({ op: 'stop', force: true }, { timeoutMs: 500, responseTimeoutMs: 2000 }); } catch { /* ignore */ }
     const st = mod.runningSupervisor();
     if (st) { try { process.kill(st.pid, 'SIGKILL'); } catch { /* ignore */ } }
+    try { rmSync(mod.getSupervisorSocketPath(), { force: true }); } catch { /* #338: no stray sockets in tmpdir */ }
     mod.clearSupervisorState();
     restoreEnv('C8CTL_NANO_ENTRY', prevEntry);
     restoreEnv('C8CTL_NANO_HOME', prevHome);
@@ -1545,6 +1564,7 @@ test('#309 review: a stop accepted before/during quiesce cannot overtake the han
     try { await mod.supervisorRequest({ op: 'stop', force: true }, { timeoutMs: 500, responseTimeoutMs: 2000 }); } catch { /* ignore */ }
     const st = mod.runningSupervisor();
     if (st) { try { process.kill(st.pid, 'SIGKILL'); } catch { /* ignore */ } }
+    try { rmSync(mod.getSupervisorSocketPath(), { force: true }); } catch { /* #338: no stray sockets in tmpdir */ }
     mod.clearSupervisorState();
     restoreEnv('C8CTL_NANO_ENTRY', prevEntry);
     restoreEnv('C8CTL_NANO_HOME', prevHome);
@@ -1639,6 +1659,7 @@ test('#309 review: rollback after a failed handoff does not resurrect a worker r
     const st = mod.runningSupervisor();
     if (st) { try { process.kill(st.pid, 'SIGKILL'); } catch { /* ignore */ } }
     if (fakeSuccessor) { try { process.kill(fakeSuccessor.pid, 'SIGKILL'); } catch { /* ignore */ } }
+    try { rmSync(mod.getSupervisorSocketPath(), { force: true }); } catch { /* #338: no stray sockets in tmpdir */ }
     mod.clearSupervisorState();
     restoreEnv('C8CTL_NANO_ENTRY', prevEntry);
     restoreEnv('C8CTL_NANO_HOME', prevHome);
@@ -1738,4 +1759,97 @@ test('#322 review: every daemon drain SIGUSR2 delivery goes through the per-pid 
   assert.deepEqual(kills.sort(), ['p.pid', 'pid']);
   assert.match(body, /if \(w\.drainSignalledPid === pid\) return;/);
   assert.equal((body.match(/deliverDrainOnce\(/g) || []).length >= 4, true);
+});
+
+// #338 class guard: when the upgrade successor fails mid-handoff, the
+// predecessor's control socket PATH must still exist and answer status/reload.
+async function bootDaemon338(t, label, extraEnv = {}) {
+  const HOME = mkdtempSync(join(tmpdir(), `c8ctl-sup-338-${label}-`));
+  const prev = { C8CTL_NANO_HOME: process.env.C8CTL_NANO_HOME, C8CTL_NANO_ENTRY: process.env.C8CTL_NANO_ENTRY };
+  for (const k of Object.keys(extraEnv)) prev[k] = process.env[k];
+  process.env.C8CTL_NANO_HOME = HOME;
+  Object.assign(process.env, extraEnv);
+  writeFileSync(join(HOME, 'config.json'), JSON.stringify({ hires: {} }));
+  const shim = join(HOME, 'fake-entry.mjs');
+  writeShim(shim);
+  process.env.C8CTL_NANO_ENTRY = shim;
+  const mod = await import(pluginUrl);
+  const cleanup = [];
+  t.after(async () => {
+    for (const fn of cleanup) { try { fn(); } catch { /* ignore */ } }
+    try { await mod.supervisorRequest({ op: 'stop', force: true }, { timeoutMs: 500, responseTimeoutMs: 2000 }); } catch { /* ignore */ }
+    const st = mod.readSupervisorState();
+    if (st && st.pid) { try { process.kill(st.pid, 'SIGKILL'); } catch { /* ignore */ } }
+    try { rmSync(mod.getSupervisorSocketPath(), { force: true }); } catch { /* ignore */ }
+    mod.clearSupervisorState();
+    for (const [k, v] of Object.entries(prev)) restoreEnv(k, v);
+    try { rmSync(HOME, { recursive: true, force: true }); } catch { /* ignore */ }
+  });
+  const state = await mod.startSupervisorDaemon();
+  return { mod, state, sockPath: mod.getSupervisorSocketPath(), cleanup };
+}
+
+async function assertManageable338(mod, sockPath, pid) {
+  let s = null;
+  for (let i = 0; i < 60; i++) {
+    try {
+      if (existsSync(sockPath)) {
+        s = await mod.supervisorRequest({ op: 'status' }, { timeoutMs: 400, responseTimeoutMs: 1500 });
+        if (s && s.ok) break;
+      }
+    } catch { /* not yet */ }
+    await sleep(100);
+  }
+  assert.ok(existsSync(sockPath), 'the predecessor control socket path still exists');
+  assert.equal(s && s.ok, true, 'status answers');
+  assert.equal(s.daemon.pid, pid, 'the predecessor still serves');
+  const r = await mod.supervisorRequest({ op: 'reload', target: 'all' }, { timeoutMs: 500, responseTimeoutMs: 3000 });
+  assert.ok(r && r.ok !== undefined, 'reload is reachable');
+  assert.doesNotMatch(String(r.error || ''), /upgrade in progress|unreachable/);
+}
+
+test('supervisor upgrade: a successor that dies mid-handoff leaves the predecessor socket reachable (issue #338)', async (t) => {
+  if (process.platform === 'win32') { t.skip('Unix-only'); return; }
+  const { mod, state, sockPath, cleanup } = await bootDaemon338(t, 'die', { NANO_SUPERVISOR_ADOPT_POLL_MS: '200' });
+  const { spawn } = await import('node:child_process');
+  // A stand-in successor: quiesce the predecessor (holding the prepare-upgrade
+  // connection open, as a real successor does), then die before handover.
+  const fake = spawn(process.execPath, ['-e', 'setTimeout(()=>{}, 60000)'], { stdio: 'ignore' });
+  cleanup.push(() => fake.kill('SIGKILL'));
+  const raw = createConnection(sockPath);
+  cleanup.push(() => raw.destroy());
+  raw.on('error', () => {});
+  await new Promise((r) => raw.once('connect', r));
+  raw.write(JSON.stringify({ op: 'prepare-upgrade', pid: fake.pid }) + '\n');
+  await sleep(400);
+  fake.kill('SIGKILL');
+  await sleep(300);
+  raw.destroy();
+  await assertManageable338(mod, sockPath, state.pid);
+});
+
+test('supervisor daemon: re-binds its control socket when the path vanishes (issue #338)', async (t) => {
+  if (process.platform === 'win32') { t.skip('Unix-only'); return; }
+  const { mod, state, sockPath } = await bootDaemon338(t, 'vanish', { NANO_SUPERVISOR_SOCKET_CHECK_MS: '200' });
+  // Model a failed successor that unlinked the canonical path while the old
+  // daemon still listens on the orphaned inode.
+  rmSync(sockPath, { force: true });
+  assert.equal(existsSync(sockPath), false);
+  await assertManageable338(mod, sockPath, state.pid);
+  const mode = statSync(sockPath).mode & 0o777;
+  assert.equal(mode, 0o600, 're-bound socket stays owner-only');
+});
+
+test('supervisor upgrade: a successor that times out quiescing leaves the predecessor reachable (issue #338)', async (t) => {
+  if (process.platform === 'win32') { t.skip('Unix-only'); return; }
+  const { mod, state, sockPath } = await bootDaemon338(t, 'timeout', { NANO_SUPERVISOR_ADOPT_POLL_MS: '200' });
+  const { spawn } = await import('node:child_process');
+  // A successor pointed at a state file naming the live predecessor but with a
+  // 1ms quiesce budget: it must give up and exit without stealing the socket.
+  const succ = spawn(process.execPath, [process.env.C8CTL_NANO_ENTRY, 'nano', 'supervisor', '__daemon'], {
+    env: { ...process.env, NANO_SUPERVISOR_UPGRADE: '1', NANO_SUPERVISOR_UPGRADE_QUIESCE_TIMEOUT_MS: '1' },
+    stdio: 'ignore',
+  });
+  await new Promise((r) => succ.once('exit', r));
+  await assertManageable338(mod, sockPath, state.pid);
 });

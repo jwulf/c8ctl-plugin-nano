@@ -532,6 +532,16 @@ SDK client (job workers) — do **not** add the SDK as a dependency or use raw
   call) alongside the daemon's running `version`, and the render flags "update
   available — run `supervisor reload` … and `supervisor upgrade`" when they
   diverge.
+  **Control-socket ownership (issue #338):** a unix listener whose path is
+  unlinked keeps LISTENing on the orphaned inode while every client gets ENOENT,
+  so a failed handoff could leave a live-but-unmanageable daemon. A serving daemon
+  records the dev/ino of the path it bound and re-checks it every
+  `NANO_SUPERVISOR_SOCKET_CHECK_MS` (default 5s, `0` disables; skipped while
+  quiesced/handed-over/shutting down): a VANISHED (or dead-replaced) path is
+  re-bound owner-only; a path held by another LIVE listener is never stolen. The
+  upgrade rollback re-binds through the same helper. Test daemons self-reap when
+  the test runner dies (`NANO_TEST_RUNNER_PID` in the shim) and teardown removes
+  their sockets.
 - **Graceful drain on stop (issue #202).** `supervisor stop` (and `workforce
   stop`) **drain by default**: the daemon quiesces each `nano work` child with a
   `SIGUSR2` (registry `quiesce()` latches the activation loop so it leases NO new

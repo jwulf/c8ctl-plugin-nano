@@ -1860,3 +1860,18 @@ test('supervisor upgrade: a successor that times out quiescing leaves the predec
   assert.equal(timedOut, false, 'the successor exits within its (tiny) quiesce budget');
   await assertManageable338(mod, sockPath, state.pid);
 });
+
+test('#338 review: socket reclaim only on definitive death and revalidates after the close wait', async () => {
+  const { readFileSync } = await import('node:fs');
+  const src = readFileSync(new URL('./c8ctl-plugin.js', import.meta.url), 'utf8');
+  const body = src.slice(src.indexOf('async function runSupervisorDaemon('));
+  const probe = body.slice(body.indexOf('const probeSocketAlive'), body.indexOf('const checkSocketOwnership'));
+  // Only ENOENT/ECONNREFUSED map to 'dead'; other errors and timeouts are 'unknown'.
+  assert.match(probe, /err\.code === 'ENOENT' \|\| err\.code === 'ECONNREFUSED'\) \? 'dead' : 'unknown'/);
+  assert.match(probe, /setTimeout\(\(\) => finish\('unknown'\)/);
+  assert.doesNotMatch(probe, /finish\(false\)/);
+  // After the close wait, a present path is unlinked only if the probe proves it dead.
+  const relisten = body.slice(body.indexOf('const relistenControlSocket'), body.indexOf('const probeSocketAlive'));
+  const recheck = relisten.indexOf("(await probeSocketAlive()) !== 'dead'");
+  assert.ok(recheck > 0 && recheck < relisten.indexOf('rmSync(socketPath'));
+});

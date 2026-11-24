@@ -18562,7 +18562,19 @@ async function runSupervisorDaemon() {
         dlog(`${why}: upgrade/shutdown began while re-binding — leaving the control socket path alone`);
         return false;
       }
-      if (!win) { try { rmSync(socketPath, { force: true }); } catch { /* ignore */ } }
+      // #338 review: another listener may have bound the path during the
+      // close wait. Revalidate: only unlink an ABSENT path or one that is
+      // DEFINITIVELY dead; a live or uncertain replacement is left untouched.
+      if (!win) {
+        let present = false;
+        try { lstatSync(socketPath); present = true; } catch (err) { if (err && err.code !== 'ENOENT') return false; }
+        if (present && (await probeSocketAlive()) !== 'dead') {
+          dlog(`${why}: control socket path was re-bound by another listener during the close wait — leaving it alone`);
+          return false;
+        }
+        if (upgrading || handedOver || shuttingDown || shutdownStarted) return false;
+        try { rmSync(socketPath, { force: true }); } catch { /* ignore */ }
+      }
       const prev = win ? null : process.umask(0o177);
       try {
         await new Promise((resolve, reject) => {
@@ -18582,13 +18594,16 @@ async function runSupervisorDaemon() {
     })().finally(() => { relistening = null; });
     return relistening;
   };
+  // Tri-state probe (#338 review): only ENOENT/ECONNREFUSED prove the path is
+  // dead. Any other error (e.g. EAGAIN on a full accept queue) or a timeout is
+  // 'unknown' — never grounds for unlinking someone else's socket.
   const probeSocketAlive = () => new Promise((resolve) => {
     let done = false;
     const finish = (v) => { if (!done) { done = true; try { c.destroy(); } catch { /* ignore */ } resolve(v); } };
     const c = createConnection(socketPath);
-    c.once('connect', () => finish(true));
-    c.once('error', () => finish(false));
-    setTimeout(() => finish(false), 1000).unref?.();
+    c.once('connect', () => finish('alive'));
+    c.once('error', (err) => finish(err && (err.code === 'ENOENT' || err.code === 'ECONNREFUSED') ? 'dead' : 'unknown'));
+    setTimeout(() => finish('unknown'), 1000).unref?.();
   });
   const checkSocketOwnership = async () => {
     if (osPlatform() === 'win32') return;
@@ -18599,7 +18614,9 @@ async function runSupervisorDaemon() {
     if (st) {
       // Someone replaced the path. A LIVE listener there is another owner —
       // leave it. A dead/stale file is reclaimed.
-      if (await probeSocketAlive()) {
+      const probe = await probeSocketAlive();
+      if (probe !== 'dead') {
+        if (probe === 'unknown') return; // uncertain — retry next tick
         if (!checkSocketOwnership.warned) { checkSocketOwnership.warned = true; dlog(`control socket ${socketPath} is now owned by another listener — not reclaiming it`); }
         return;
       }

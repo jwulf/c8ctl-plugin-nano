@@ -114,3 +114,12 @@ test('lifecycle: clean drain does not arm the backstop', async () => {
   assert.equal(calls.processExit.length, 0);
   assert.equal(lc.state.backstopArmed, false);
 });
+
+test('raceTeardown deadline is cancellable via AbortSignal', async () => {
+  const ac = new AbortController();
+  const p = raceTeardown(new Promise(() => {}), 60_000, ac.signal);
+  ac.abort();
+  assert.deepEqual(await p, { timedOut: false, cancelled: true });
+  const ac2 = new AbortController(); ac2.abort();
+  assert.deepEqual(await raceTeardown(new Promise(() => {}), 60_000, ac2.signal), { timedOut: false, cancelled: true });
+});

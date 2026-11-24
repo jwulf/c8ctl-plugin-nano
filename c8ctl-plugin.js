@@ -11200,10 +11200,15 @@ export function workerTeardownTimeoutMs(env = process.env) {
 // Race `promise` against `ms`. Resolves `{ timedOut:false, error? }` when the
 // promise settles (rejections are captured, never thrown) or `{ timedOut:true }`
 // at the deadline. The timer is cleared on settle so it never holds the loop.
-export function raceTeardown(promise, ms) {
+// An optional AbortSignal cancels the deadline early (resolves
+// `{ timedOut:false, cancelled:true }` and clears the timer) so an abandoned
+// race never keeps the event loop alive.
+export function raceTeardown(promise, ms, signal) {
   return new Promise((resolve) => {
     let done = false;
     const timer = setTimeout(() => { if (!done) { done = true; resolve({ timedOut: true }); } }, ms);
+    const cancel = () => { if (!done) { done = true; clearTimeout(timer); resolve({ timedOut: false, cancelled: true }); } };
+    if (signal) { if (signal.aborted) cancel(); else signal.addEventListener('abort', cancel, { once: true }); }
     Promise.resolve(promise).then(
       () => { if (!done) { done = true; clearTimeout(timer); resolve({ timedOut: false }); } },
       (error) => { if (!done) { done = true; clearTimeout(timer); resolve({ timedOut: false, error }); } },
@@ -11228,9 +11233,13 @@ export function createWorkerStopLifecycle({
   let finished = false; // a teardown STARTED
   let exited = false;   // onExit actually ran
   let backstopArmed = false;
+  // Cancels any pending teardown deadline once we exit, so an abandoned
+  // interrupt's timer can't hold the event loop open.
+  const raceAbort = new AbortController();
   const exitNow = () => {
     if (exited) return;
     exited = true;
+    raceAbort.abort();
     onExit();
   };
   // After a timed-out/abandoned interrupt the stuck fiber (and its sockets) can
@@ -11242,7 +11251,7 @@ export function createWorkerStopLifecycle({
     try { setTimeout(() => exitProcess(process.exitCode ?? 0), backstopMs).unref(); } catch { /* best effort */ }
   };
   const interruptRuntime = async (what) => {
-    const r = await raceTeardown(Promise.resolve().then(() => interrupt()), teardownMs);
+    const r = await raceTeardown(Promise.resolve().then(() => interrupt()), teardownMs, raceAbort.signal);
     if (r.timedOut) {
       logger.warn(`${what}: runtime interrupt did not complete within ${teardownMs}ms (a stuck in-flight call?) — exiting anyway (issue #328; tune ${WORKER_TEARDOWN_TIMEOUT_ENV}).`);
       forceProcessExitSoon();

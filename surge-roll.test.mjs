@@ -257,3 +257,25 @@ test('#340 review: a worker with a pending upgrade retarget is never surged (rep
   assert.deepEqual(res.skipped, ['a']);
   assert.deepEqual(res.failed, []);
 });
+
+test('#347: surge rollback clears the retirement poll and detaches the exit listener', async () => {
+  const { readFileSync } = await import('node:fs');
+  const src = readFileSync(new URL('./c8ctl-plugin.js', import.meta.url), 'utf8');
+  const surge = src.slice(src.indexOf('const surgeWorker ='), src.indexOf('const waitSurgeReady ='));
+  assert.match(surge, /old\.poll = setInterval\(/);
+  assert.match(surge, /old\.onExit = done;/);
+  const body = src.slice(src.indexOf('const abandonSurge ='), src.indexOf('const drainRetiring ='));
+  assert.match(body, /clearInterval\(old\.poll\)/);
+  assert.match(body, /old\.child\.removeListener\('exit', old\.onExit\)/);
+  // the restored child becomes current again, so its own death handler (auto-restart) is live
+  assert.ok(body.indexOf('w.child = old.child') >= 0);
+});
+
+test('#347: in-flight count (draining frame) includes retiring children\'s jobs', () => {
+  const { countSupervisorInFlight } = mod;
+  const workers = [
+    { id: 'a', activity: { jobs: [] }, retiring: [{ pid: 1, jobs: ['k1', 'k2'] }] },
+    { id: 'b', activity: { jobs: [{ key: 'x' }] }, retiring: [] },
+  ];
+  assert.equal(countSupervisorInFlight(workers), 3);
+});

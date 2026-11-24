@@ -18384,21 +18384,23 @@ async function runSupervisorDaemon() {
       const oldPid = w.pid;
       old = { child: oldChild, pid: oldPid, activityFile: w.activityFile || supervisorWorkerActivityFile(w.id), sinceMs: Date.now(), exited: false, drainSignalledAt: null, stoppingIdle: null, adoptTimer: w.adoptTimer || null };
       old.exitPromise = new Promise((resolve) => {
-        let poll = null;
         const done = () => {
           if (old.exited) return;
           old.exited = true;
-          if (poll) { try { clearInterval(poll); } catch { /* ignore */ } }
+          if (old.poll) { try { clearInterval(old.poll); } catch { /* ignore */ } old.poll = null; }
           if (old.adoptTimer) { try { clearInterval(old.adoptTimer); } catch { /* ignore */ } }
           if (typeof oldChild.markExited === 'function') { try { oldChild.markExited(1, null); } catch { /* ignore */ } }
           retiringExited(w, old);
           resolve();
         };
+        // #347: keep the exit listener + poll handle on the record so a surge
+        // rollback (abandonSurge) can detach them instead of leaking the interval.
+        old.onExit = done;
         try { oldChild.once('exit', done); } catch { /* adopted handle */ }
         // An ADOPTED child has no real exit event once it is no longer current
         // (its liveness poll feeds the now-stale death handler) — poll the pid.
-        poll = setInterval(() => { if (!isPidAlive(oldPid)) done(); }, SUPERVISOR_ADOPT_POLL_MS);
-        if (typeof poll.unref === 'function') poll.unref();
+        old.poll = setInterval(() => { if (!isPidAlive(oldPid)) done(); }, SUPERVISOR_ADOPT_POLL_MS);
+        if (typeof old.poll.unref === 'function') old.poll.unref();
       });
       if (old.adoptTimer) w.adoptTimer = null;
       w.retiring = [...(Array.isArray(w.retiring) ? w.retiring : []), old];
@@ -18450,6 +18452,13 @@ async function runSupervisorDaemon() {
     w.activityFile = old.activityFile;
     if (old.adoptTimer) { w.adoptTimer = old.adoptTimer; old.adoptTimer = null; }
     old.exited = true; // detach the retiring watcher
+    // #347: clear the retirement pid poll and drop the retiring exit listener —
+    // `done` would early-return forever, leaking one interval per failed reload.
+    if (old.poll) { try { clearInterval(old.poll); } catch { /* ignore */ } old.poll = null; }
+    if (old.onExit && old.child && typeof old.child.removeListener === 'function') {
+      try { old.child.removeListener('exit', old.onExit); } catch { /* adopted handle */ }
+    }
+    old.onExit = null;
     const pid = child.pid;
     if (pid) {
       try { process.kill(pid, 'SIGTERM'); } catch { /* gone */ }
@@ -20051,6 +20060,11 @@ function countSupervisorInFlight(workers) {
     // #254: a settlement-pending ghost is no longer running here (its worker
     // released it), so it must not inflate the in-flight count an operator drains.
     if (w && w.activity && Array.isArray(w.activity.jobs)) n += w.activity.jobs.filter((j) => !j.settlementPending).length;
+    // #347: jobs still running on retiring (old-code) children after a surge
+    // reload are in flight too (their keys are already settlement-filtered).
+    if (w && Array.isArray(w.retiring)) {
+      for (const r of w.retiring) if (r && Array.isArray(r.jobs)) n += r.jobs.length;
+    }
   }
   return n;
 }

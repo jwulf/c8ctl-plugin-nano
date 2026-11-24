@@ -364,6 +364,17 @@ const SUPERVISOR_UPGRADE_QUIESCE_TIMEOUT_MS = Math.max(
   0,
   Number.parseInt(process.env.NANO_SUPERVISOR_UPGRADE_QUIESCE_TIMEOUT_MS ?? '', 10) || 30_000,
 );
+// Issue #338: how often a serving daemon verifies it still owns its control
+// socket PATH. A unix listen socket whose path was unlinked keeps LISTENing on
+// the orphaned inode, but no client can reach it — the daemon becomes
+// unmanageable (no reload/drain/stop). The check re-binds a vanished path.
+// 0 disables it.
+const SUPERVISOR_SOCKET_CHECK_MS = (() => {
+  const raw = process.env.NANO_SUPERVISOR_SOCKET_CHECK_MS;
+  if (raw == null || raw === '') return 5_000;
+  const n = Number.parseInt(raw, 10);
+  return Number.isFinite(n) && n >= 0 ? n : 5_000;
+})();
 // How often the successor polls an adopted worker's pid for liveness. An
 // adopted worker has no ChildProcess handle (the successor never spawned it),
 // so there is no 'exit' event — this poll is the death detector that feeds the
@@ -17051,6 +17062,37 @@ function installParentDeathWatchdog({ intervalMs = 2000, parentPid, onOrphan, re
   return cancel;
 }
 
+/**
+ * #338 review: unlink `socketPath` only if it is absent or DEFINITIVELY dead,
+ * and only if — re-checked synchronously in the same tick as the unlink — it
+ * still names the exact file identity (dev/ino + ctime/birthtime + type) that was probed. A successor that unlinks the
+ * dead file and binds a fresh live listener while `probe()` is pending is
+ * never deleted. Returns 'absent' | 'unlinked' | 'alive' | 'replaced' |
+ * 'aborted' | 'error'.
+ */
+// #338 review: a path identity that a RE-CREATED file cannot share. dev/ino
+// alone is defeated by inode reuse (the successor unlinks the dead file and
+// binds; ext4/tmpfs often hand back the just-freed ino), so also compare the
+// change/birth times (nanosecond precision) and the file type.
+export function socketPathIdentity(st) {
+  return { dev: st.dev, ino: st.ino, ctimeNs: String(st.ctimeNs), birthtimeNs: String(st.birthtimeNs), sock: st.isSocket() };
+}
+export function sameSocketPathIdentity(a, b) {
+  return !!(a && b && a.dev === b.dev && a.ino === b.ino && a.ctimeNs === b.ctimeNs && a.birthtimeNs === b.birthtimeNs && a.sock === b.sock);
+}
+export async function reclaimDeadSocketPath(socketPath, probe, aborted = () => false) {
+  let probed = null;
+  try { const st0 = lstatSync(socketPath, { bigint: true }); probed = socketPathIdentity(st0); } catch (err) { if (err && err.code !== 'ENOENT') return 'error'; }
+  if (probed && (await probe()) !== 'dead') return 'alive';
+  if (aborted()) return 'aborted';
+  let now = null;
+  try { const st1 = lstatSync(socketPath, { bigint: true }); now = socketPathIdentity(st1); } catch (err) { if (err && err.code !== 'ENOENT') return 'error'; }
+  if (!now) return 'absent';
+  if (!sameSocketPathIdentity(now, probed)) return 'replaced';
+  try { rmSync(socketPath, { force: true }); } catch { /* ignore */ }
+  return 'unlinked';
+}
+
 // --- Daemon ----------------------------------------------------------------
 
 /**
@@ -17126,7 +17168,15 @@ async function runSupervisorDaemon() {
         const remainingMs = SUPERVISOR_UPGRADE_QUIESCE_TIMEOUT_MS - (Date.now() - t0);
         prep = await supervisorRequest({ op: 'prepare-upgrade', pid: process.pid }, { socketPath, timeoutMs: 750, responseTimeoutMs: Math.max(SUPERVISOR_PROBE_RESPONSE_TIMEOUT_MS, remainingMs) });
       } catch { /* socket briefly unreachable — retry until the deadline */ }
-      if (prep && prep.ok) break; // quiesced — the accept loop is closed
+      if (prep && prep.ok) {
+        // #338 review: honour the quiesce budget even when the ack arrives
+        // late — exiting here (before binding) makes the predecessor roll back.
+        if (Date.now() - t0 > SUPERVISOR_UPGRADE_QUIESCE_TIMEOUT_MS) {
+          dlogBoot(`upgrade mode: predecessor pid ${st.pid} quiesced only after the ${SUPERVISOR_UPGRADE_QUIESCE_TIMEOUT_MS}ms budget — exiting so it rolls back`);
+          process.exit(1);
+        }
+        break; // quiesced — the accept loop is closed
+      }
       if (prep && prep.ok === false && /unknown op/.test(String(prep.error || ''))) {
         dlogBoot(`upgrade mode: predecessor pid ${st.pid} does not understand prepare-upgrade (too old) — refusing to upgrade`);
         process.exit(1);
@@ -18199,17 +18249,12 @@ async function runSupervisorDaemon() {
     if (osPlatform() !== 'win32') { try { rmSync(socketPath, { force: true }); } catch { /* ignore */ } }
     // Same owner-only umask as the initial bind, so the socket is private from
     // creation (no listen()→chmod window for another local user to connect).
-    const rbWin = osPlatform() === 'win32';
-    const rbPrevUmask = rbWin ? null : process.umask(0o177);
-    try {
-      server.listen(socketPath);
-      if (!rbWin) { try { chmodSync(socketPath, 0o600); } catch { /* ignore */ } }
-      dlog('daemon upgrade rollback: control socket re-opened — fleet serving normally');
-    } catch (err) {
-      dlog(`daemon upgrade rollback: failed to re-open the control socket: ${err?.message || err}`);
-    } finally {
-      if (!rbWin) { try { process.umask(rbPrevUmask); } catch { /* ignore */ } }
-    }
+    // #338: bind through the shared helper so the re-opened socket's inode is
+    // recorded for the ownership check and a bind error is logged, not thrown
+    // as an unhandled 'error' event.
+    relistenControlSocket('daemon upgrade rollback').then((ok) => {
+      if (ok) dlog('daemon upgrade rollback: control socket re-opened — fleet serving normally');
+    });
     // #309 review: reconcile the inventory. Respawns were suppressed while
     // quiesced (expired restart timers and death handlers bailed), so reschedule
     // every eligible down worker now — preserving stop/config-failure/removal
@@ -18517,6 +18562,121 @@ async function runSupervisorDaemon() {
     sock.on('error', () => { attachClients.delete(sock); stopClients.delete(sock); });
   });
 
+  // #338: control-socket ownership. `socketIdentity` is the file identity (socketPathIdentity) of the path
+  // as THIS daemon bound it. A unix listener whose path is unlinked keeps
+  // LISTENing on the orphaned inode while every client gets ENOENT — the fleet
+  // keeps running but can no longer be reloaded, drained or stopped. A timer
+  // (outside an upgrade handoff / shutdown) re-binds a VANISHED path. A path
+  // that now names a DIFFERENT live socket belongs to someone else (never
+  // stolen); one that names a dead socket is reclaimed.
+  let socketIdentity = null;
+  let socketCheckTimer = null;
+  let relistening = null;
+  const recordSocketIdentity = () => {
+    if (osPlatform() === 'win32') return;
+    try { socketIdentity = socketPathIdentity(lstatSync(socketPath, { bigint: true })); } catch { socketIdentity = null; }
+  };
+  // `expected` is the dev/ino the caller proved dead (null = expected absent).
+  const closeIsSafe = (expected) => {
+    if (osPlatform() === 'win32') return true;
+    let st;
+    try { st = socketPathIdentity(lstatSync(socketPath, { bigint: true })); } catch (err) { return !!(err && err.code === 'ENOENT'); }
+    return sameSocketPathIdentity(st, expected) || sameSocketPathIdentity(st, socketIdentity);
+  };
+  const relistenControlSocket = (why, expected = null) => {
+    if (relistening) return relistening;
+    relistening = (async () => {
+      const win = osPlatform() === 'win32';
+      // Close the old (orphaned) handle first. libuv unlinks the bound path
+      // NAME on close, so only do it while the path is absent (or already ours
+      // and about to be replaced) — never under someone else's socket.
+      // #338 review: a replacement listener may have bound the path while the
+      // caller's probe was pending, so re-check SYNCHRONOUSLY in the same tick
+      // as close(): the path must be absent, ours, or the exact inode the
+      // caller proved dead. Otherwise leave the orphaned handle open.
+      if (server.listening && !closeIsSafe(expected)) {
+        dlog(`${why}: control socket path changed while probing — not closing the old handle under it`);
+        return false;
+      }
+      if (server.listening) {
+        await new Promise((resolve) => { try { server.close(() => resolve()); } catch { resolve(); } setTimeout(resolve, 200).unref?.(); });
+      }
+      // #338 review: an in-flight control connection can complete
+      // prepare-upgrade (or a stop) while we awaited close(); the successor
+      // may now own the canonical path. Never unlink/rebind after that.
+      if (upgrading || handedOver || shuttingDown || shutdownStarted) {
+        dlog(`${why}: upgrade/shutdown began while re-binding — leaving the control socket path alone`);
+        return false;
+      }
+      // #338 review: another listener may have bound the path during the
+      // close wait. Revalidate: only unlink an ABSENT path or one that is
+      // DEFINITIVELY dead; a live or uncertain replacement is left untouched.
+      if (!win) {
+        // #338 review: capture the probed inode and re-check it SYNCHRONOUSLY
+        // in the same tick as rmSync — a successor may unlink the dead file
+        // and bind a fresh live listener while the probe is pending.
+        const verdict = await reclaimDeadSocketPath(socketPath, probeSocketAlive, () => (upgrading || handedOver || shuttingDown || shutdownStarted));
+        if (verdict === 'alive') dlog(`${why}: control socket path was re-bound by another listener during the close wait — leaving it alone`);
+        else if (verdict === 'replaced') dlog(`${why}: control socket path was replaced while probing — not unlinking the new socket`);
+        if (verdict !== 'absent' && verdict !== 'unlinked') return false;
+      }
+      const prev = win ? null : process.umask(0o177);
+      try {
+        await new Promise((resolve, reject) => {
+          const onErr = (err) => reject(err);
+          server.once('error', onErr);
+          server.listen(socketPath, () => { server.removeListener('error', onErr); resolve(); });
+        });
+        if (!win) { try { chmodSync(socketPath, 0o600); } catch { /* ignore */ } }
+        recordSocketIdentity();
+        return true;
+      } catch (err) {
+        dlog(`${why}: failed to re-bind the control socket ${socketPath}: ${err?.message || err}`);
+        return false;
+      } finally {
+        if (!win) { try { process.umask(prev); } catch { /* ignore */ } }
+      }
+    })().finally(() => { relistening = null; });
+    return relistening;
+  };
+  // Tri-state probe (#338 review): only ENOENT/ECONNREFUSED prove the path is
+  // dead. Any other error (e.g. EAGAIN on a full accept queue) or a timeout is
+  // 'unknown' — never grounds for unlinking someone else's socket.
+  const probeSocketAlive = () => new Promise((resolve) => {
+    let done = false;
+    const finish = (v) => { if (!done) { done = true; try { c.destroy(); } catch { /* ignore */ } resolve(v); } };
+    const c = createConnection(socketPath);
+    c.once('connect', () => finish('alive'));
+    c.once('error', (err) => finish(err && (err.code === 'ENOENT' || err.code === 'ECONNREFUSED') ? 'dead' : 'unknown'));
+    setTimeout(() => finish('unknown'), 1000).unref?.();
+  });
+  const checkSocketOwnership = async () => {
+    if (osPlatform() === 'win32') return;
+    if (upgrading || handedOver || shuttingDown || shutdownStarted || relistening) return;
+    let st = null;
+    try { st = socketPathIdentity(lstatSync(socketPath, { bigint: true })); } catch (err) { if (err && err.code !== 'ENOENT') return; }
+    if (sameSocketPathIdentity(st, socketIdentity)) return; // still ours
+    if (st) {
+      // Someone replaced the path. A LIVE listener there is another owner —
+      // leave it. A dead/stale file is reclaimed.
+      const probe = await probeSocketAlive();
+      if (probe !== 'dead') {
+        if (probe === 'unknown') return; // uncertain — retry next tick
+        if (!checkSocketOwnership.warned) { checkSocketOwnership.warned = true; dlog(`control socket ${socketPath} is now owned by another listener — not reclaiming it`); }
+        return;
+      }
+    }
+    if (upgrading || handedOver || shuttingDown || shutdownStarted) return; // state changed while probing
+    dlog(`control socket ${socketPath} ${st ? 'was replaced by a dead socket' : 'vanished from disk'} — re-binding so the daemon stays manageable (#338)`);
+    const ok = await relistenControlSocket('socket ownership check', st);
+    if (ok) { checkSocketOwnership.warned = false; dlog(`control socket re-bound at ${socketPath}`); }
+  };
+  const armSocketOwnershipCheck = () => {
+    if (osPlatform() === 'win32' || SUPERVISOR_SOCKET_CHECK_MS <= 0 || socketCheckTimer) return;
+    socketCheckTimer = setInterval(() => { checkSocketOwnership().catch(() => {}); }, SUPERVISOR_SOCKET_CHECK_MS);
+    if (typeof socketCheckTimer.unref === 'function') socketCheckTimer.unref();
+  };
+
   // Create the control socket owner-only from the start. The socket file lives
   // in shared tmpdir(); libuv binds it synchronously inside listen(), so a
   // restrictive umask around that call closes the TOCTOU window where another
@@ -18544,6 +18704,8 @@ async function runSupervisorDaemon() {
   if (!isWin) {
     try { chmodSync(socketPath, 0o600); } catch (err) { dlog(`could not chmod control socket: ${err.message}`); }
   }
+  recordSocketIdentity();
+  armSocketOwnershipCheck();
 
   process.once('SIGTERM', () => shutdown('SIGTERM'));
   process.once('SIGINT', () => shutdown('SIGINT'));

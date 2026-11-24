@@ -565,6 +565,37 @@ function supervisorWorkerActivityFile(id) {
  * file is absent (worker not reporting yet, or a standalone/older worker) or
  * unreadable. Pure enough for status rendering (best-effort IO).
  */
+// #339: how long a drained (SIGUSR2'd) worker may sit in `stopping` with NO
+// in-flight job before the daemon escalates SIGTERM → SIGKILL. Longer than the
+// worker's own guards (drain-stuck + teardown + exit backstop) so it only fires
+// when those failed too.
+export const SUPERVISOR_STOPPING_IDLE_ENV = 'NANO_SUPERVISOR_STOPPING_IDLE_MS';
+export const DEFAULT_SUPERVISOR_STOPPING_IDLE_MS = 180_000;
+export function supervisorStoppingIdleMs(env = process.env) {
+  const n = Number.parseInt(env?.[SUPERVISOR_STOPPING_IDLE_ENV] ?? '', 10);
+  return Number.isFinite(n) && n > 0 ? n : DEFAULT_SUPERVISOR_STOPPING_IDLE_MS;
+}
+/**
+ * #339: pure escalation step for a draining worker. `worker.stoppingIdle` is the
+ * previous state `{ since, termAt }` (or null). A marker that belongs to this pid
+ * and lists a running (non-settlementPending) job resets the idle clock; a missing
+ * or foreign marker counts as idle (the worker has no job to lose — the drain only
+ * ever waits on jobs it reported). Returns `{ action: 'none'|'term'|'kill', state }`.
+ */
+export function stoppingWorkerEscalation({ worker, activity, now, idleMs, killGraceMs }) {
+  const prev = worker?.stoppingIdle || null;
+  const own = activity && activity.pid === worker?.pid;
+  const busy = own && Array.isArray(activity.jobs) && activity.jobs.some((j) => j && !j.settlementPending);
+  if (busy) return { action: 'none', state: null };
+  const since = prev?.since ?? now;
+  if (prev?.termAt != null) {
+    if (now - prev.termAt >= killGraceMs && !prev.killed) return { action: 'kill', state: { ...prev, killed: true } };
+    return { action: 'none', state: prev };
+  }
+  if (now - since >= idleMs) return { action: 'term', state: { since, termAt: now } };
+  return { action: 'none', state: { since } };
+}
+
 function readWorkerActivity(id) {
   try {
     return JSON.parse(readFileSync(supervisorWorkerActivityFile(id), 'utf-8'));
@@ -11277,6 +11308,47 @@ export function workerTeardownTimeoutMs(env = process.env) {
 // An optional AbortSignal cancels the deadline early (resolves
 // `{ timedOut:false, cancelled:true }` and clears the timer) so an abandoned
 // race never keeps the event loop alive.
+// #339: bound how long a drain may wait on an in-flight count the worker itself
+// no longer backs with a running job (a leaked registry counter).
+export const WORKER_DRAIN_STUCK_ENV = 'NANO_WORKER_DRAIN_STUCK_MS';
+export const DEFAULT_WORKER_DRAIN_STUCK_MS = 60_000;
+export function workerDrainStuckMs(env = process.env) {
+  const n = Number.parseInt(env?.[WORKER_DRAIN_STUCK_ENV] ?? '', 10);
+  return Number.isFinite(n) && n > 0 ? n : DEFAULT_WORKER_DRAIN_STUCK_MS;
+}
+// #339: after the worker lifecycle has ended, a leftover handle (a socket, an
+// un-cleared interval, a producer flush timer) can keep the event loop alive so
+// a drained worker never exits. Arm an UNREF'D timer: a process whose loop
+// empties naturally exits first and never sees it; one that is still alive
+// after `ms` logs what is holding the loop open and force-exits.
+export const WORKER_EXIT_BACKSTOP_ENV = 'NANO_WORKER_EXIT_BACKSTOP_MS';
+export const DEFAULT_WORKER_EXIT_BACKSTOP_MS = 10_000;
+export function workerExitBackstopMs(env = process.env) {
+  const n = Number.parseInt(env?.[WORKER_EXIT_BACKSTOP_ENV] ?? '', 10);
+  return Number.isFinite(n) && n > 0 ? n : DEFAULT_WORKER_EXIT_BACKSTOP_MS;
+}
+export function describeOpenHandles(proc = process) {
+  try {
+    if (typeof proc.getActiveResourcesInfo !== 'function') return 'unknown';
+    const counts = {};
+    for (const r of proc.getActiveResourcesInfo()) counts[r] = (counts[r] || 0) + 1;
+    const parts = Object.entries(counts).map(([k, v]) => `${k}×${v}`);
+    return parts.length ? parts.join(', ') : 'none';
+  } catch { return 'unknown'; }
+}
+export function armWorkerExitBackstop({
+  ms = DEFAULT_WORKER_EXIT_BACKSTOP_MS, logger = console,
+  exitProcess = (code) => process.exit(code), describe = () => describeOpenHandles(),
+  setTimer = (fn, t) => setTimeout(fn, t),
+} = {}) {
+  const t = setTimer(() => {
+    logger.warn(`worker lifecycle ended ${ms}ms ago but the process is still alive — open handles: ${describe()}; forcing exit (issue #339; tune ${WORKER_EXIT_BACKSTOP_ENV}).`);
+    exitProcess(process.exitCode ?? 0);
+  }, ms);
+  try { t?.unref?.(); } catch { /* best effort */ }
+  return t;
+}
+
 export function raceTeardown(promise, ms, signal) {
   return new Promise((resolve) => {
     let done = false;
@@ -11301,6 +11373,13 @@ export function createWorkerStopLifecycle({
   onCleanTeardown = () => {}, onAbortStart = () => [], yieldInflight = async () => {},
   onExit = () => {}, pollMs = 200, backstopMs = 2_000,
   exitProcess = (code) => process.exit(code),
+  // #339: the worker-LOCAL in-flight count (the jobs this process is actually
+  // running). `inFlightCount` reads the runtime registry; if that counter leaks
+  // (never decremented for a settled job) a drain would wait forever. When the
+  // registry still reports work but the local set has been EMPTY for
+  // `drainStuckMs`, the drain proceeds to teardown (logged). null = no guard.
+  localInFlightCount = null, drainStuckMs = DEFAULT_WORKER_DRAIN_STUCK_MS,
+  now = () => Date.now(),
 } = {}) {
   let quiescing = false;
   let aborting = false;
@@ -11374,9 +11453,23 @@ export function createWorkerStopLifecycle({
     try { onDrainStart(signal); } catch { /* best effort */ }
     logger.info(`Received ${signal} — draining: polling stopped; waiting on ${inFlightCount()} in-flight job(s) to finish (send SIGTERM to abort).`);
     // Wait INDEFINITELY for in-flight work — a force abort is the only escape.
+    let localIdleSince = null;
     const tick = async () => {
       if (aborting || finished || exited) return;
-      if (inFlightCount() <= 0) { await teardownAndExit(signal); return; }
+      const n = inFlightCount();
+      if (n <= 0) { await teardownAndExit(signal); return; }
+      if (typeof localInFlightCount === 'function' && drainStuckMs > 0) {
+        let local = 1;
+        try { local = Number(localInFlightCount()); } catch { local = 1; }
+        if (local <= 0) {
+          if (localIdleSince == null) localIdleSince = now();
+          else if (now() - localIdleSince >= drainStuckMs) {
+            logger.warn(`drain: runtime still reports ${n} in-flight job(s) but this worker has run none for ${drainStuckMs}ms — treating the count as leaked and stopping (issue #339; tune ${WORKER_DRAIN_STUCK_ENV}).`);
+            await teardownAndExit(signal);
+            return;
+          }
+        } else localIdleSince = null;
+      }
       setTimeout(tick, pollMs);
     };
     setTimeout(tick, pollMs);
@@ -15777,6 +15870,8 @@ async function workAgent(req, flags, ctx) {
         try { return SupervisorEffect.runSync(workerRegistry.activeCount); }
         catch { return activeJobs.size; }
       },
+      localInFlightCount: () => activeJobs.size,
+      drainStuckMs: workerDrainStuckMs(),
       onDrainStart: () => {
         draining = true;
         // Authoritative quiesce: the activation loop leases no new job even if the
@@ -15830,6 +15925,9 @@ async function workAgent(req, flags, ctx) {
       onExit: () => {
         process.removeListener('SIGINT', onSigint);
         process.removeListener('SIGTERM', onSigterm);
+        // #339: a supervised worker must actually EXIT once stopped — a leftover
+        // handle would otherwise leave it in `stopping` forever.
+        if (activityFile) armWorkerExitBackstop({ ms: workerExitBackstopMs(), logger });
         resolve();
       },
     });
@@ -17658,8 +17756,30 @@ async function runSupervisorDaemon() {
     if (!w || !pid) return;
     if (w.drainSignalledPid === pid) return;
     w.drainSignalledPid = pid;
+    w.drainSignalledAt = Date.now();
+    w.stoppingIdle = null;
     try { process.kill(pid, SUPERVISOR_DRAIN_SIGNAL); } catch { /* already gone */ }
   };
+
+  // #339: escalate a drained worker that is wedged in `stopping` with NO job.
+  const stoppingIdleMs = supervisorStoppingIdleMs();
+  const wedgeTimer = setInterval(() => {
+    for (const w of workers.values()) {
+      if (!w.stopping || !w.pid || w.drainSignalledPid !== w.pid || !isPidAlive(w.pid)) continue;
+      let act = null;
+      try { act = readWorkerActivity(w.id); } catch { act = null; }
+      const step = stoppingWorkerEscalation({ worker: w, activity: act, now: Date.now(), idleMs: stoppingIdleMs, killGraceMs: STOP_GRACE_MS });
+      w.stoppingIdle = step.state;
+      if (step.action === 'term') {
+        dlog(`worker '${w.id}' (pid ${w.pid}) has been stopping with no in-flight job for ${stoppingIdleMs}ms — sending SIGTERM (issue #339)`);
+        try { process.kill(w.pid, 'SIGTERM'); } catch { /* gone */ }
+      } else if (step.action === 'kill') {
+        dlog(`worker '${w.id}' (pid ${w.pid}) still alive ${STOP_GRACE_MS}ms after the wedge SIGTERM — sending SIGKILL (issue #339)`);
+        try { process.kill(w.pid, 'SIGKILL'); } catch { /* gone */ }
+      }
+    }
+  }, Math.min(15_000, Math.max(1_000, Math.floor(stoppingIdleMs / 4))));
+  try { wedgeTimer.unref(); } catch { /* best effort */ }
 
   const forceStopWorker = async (w) => {
     const pid = w.pid;

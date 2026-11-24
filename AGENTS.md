@@ -420,6 +420,16 @@ SDK client (job workers) — do **not** add the SDK as a dependency or use raw
   arm) and skip the re-emit nudge. `completed` implies no vars (job-specific status
   values can't be guessed), so the normal result / nudge path is unchanged.
 
+- **Drained worker always exits (issue #339).** While draining, if the runtime
+  registry still reports in-flight work but the worker's own `activeJobs` has been
+  empty for `NANO_WORKER_DRAIN_STUCK_MS` (default 60s) the count is treated as
+  leaked and teardown proceeds (logged). After the lifecycle ends a supervised
+  worker arms an unref'd exit backstop (`NANO_WORKER_EXIT_BACKSTOP_MS`, default 10s)
+  that logs `process.getActiveResourcesInfo()` and force-exits. The daemon also
+  escalates SIGTERM → SIGKILL (after `STOP_GRACE_MS`) for a SIGUSR2'd worker whose
+  activity marker shows no running job for `NANO_SUPERVISOR_STOPPING_IDLE_MS`
+  (default 180s; `stoppingWorkerEscalation`). Tests: `worker-drain-exit.test.mjs`.
+
 ## Worker supervisor (`supervisor`)
 
 - Runs/manages a fleet of `nano work` children from one terminal. `nano work`

@@ -17062,6 +17062,37 @@ function installParentDeathWatchdog({ intervalMs = 2000, parentPid, onOrphan, re
   return cancel;
 }
 
+/**
+ * #338 review: unlink `socketPath` only if it is absent or DEFINITIVELY dead,
+ * and only if — re-checked synchronously in the same tick as the unlink — it
+ * still names the exact file identity (dev/ino + ctime/birthtime + type) that was probed. A successor that unlinks the
+ * dead file and binds a fresh live listener while `probe()` is pending is
+ * never deleted. Returns 'absent' | 'unlinked' | 'alive' | 'replaced' |
+ * 'aborted' | 'error'.
+ */
+// #338 review: a path identity that a RE-CREATED file cannot share. dev/ino
+// alone is defeated by inode reuse (the successor unlinks the dead file and
+// binds; ext4/tmpfs often hand back the just-freed ino), so also compare the
+// change/birth times (nanosecond precision) and the file type.
+export function socketPathIdentity(st) {
+  return { dev: st.dev, ino: st.ino, ctimeNs: String(st.ctimeNs), birthtimeNs: String(st.birthtimeNs), sock: st.isSocket() };
+}
+export function sameSocketPathIdentity(a, b) {
+  return !!(a && b && a.dev === b.dev && a.ino === b.ino && a.ctimeNs === b.ctimeNs && a.birthtimeNs === b.birthtimeNs && a.sock === b.sock);
+}
+export async function reclaimDeadSocketPath(socketPath, probe, aborted = () => false) {
+  let probed = null;
+  try { const st0 = lstatSync(socketPath, { bigint: true }); probed = socketPathIdentity(st0); } catch (err) { if (err && err.code !== 'ENOENT') return 'error'; }
+  if (probed && (await probe()) !== 'dead') return 'alive';
+  if (aborted()) return 'aborted';
+  let now = null;
+  try { const st1 = lstatSync(socketPath, { bigint: true }); now = socketPathIdentity(st1); } catch (err) { if (err && err.code !== 'ENOENT') return 'error'; }
+  if (!now) return 'absent';
+  if (!sameSocketPathIdentity(now, probed)) return 'replaced';
+  try { rmSync(socketPath, { force: true }); } catch { /* ignore */ }
+  return 'unlinked';
+}
+
 // --- Daemon ----------------------------------------------------------------
 
 /**
@@ -17081,27 +17112,6 @@ function installParentDeathWatchdog({ intervalMs = 2000, parentPid, onOrphan, re
  * cannot reach a quiesced old daemon in time exits 1 and leaves the old fleet
  * untouched.
  */
-/**
- * #338 review: unlink `socketPath` only if it is absent or DEFINITIVELY dead,
- * and only if — re-checked synchronously in the same tick as the unlink — it
- * still names the exact dev/ino that was probed. A successor that unlinks the
- * dead file and binds a fresh live listener while `probe()` is pending is
- * never deleted. Returns 'absent' | 'unlinked' | 'alive' | 'replaced' |
- * 'aborted' | 'error'.
- */
-export async function reclaimDeadSocketPath(socketPath, probe, aborted = () => false) {
-  let probed = null;
-  try { const st0 = lstatSync(socketPath); probed = { dev: st0.dev, ino: st0.ino }; } catch (err) { if (err && err.code !== 'ENOENT') return 'error'; }
-  if (probed && (await probe()) !== 'dead') return 'alive';
-  if (aborted()) return 'aborted';
-  let now = null;
-  try { const st1 = lstatSync(socketPath); now = { dev: st1.dev, ino: st1.ino }; } catch (err) { if (err && err.code !== 'ENOENT') return 'error'; }
-  if (!now) return 'absent';
-  if (!probed || now.dev !== probed.dev || now.ino !== probed.ino) return 'replaced';
-  try { rmSync(socketPath, { force: true }); } catch { /* ignore */ }
-  return 'unlinked';
-}
-
 async function runSupervisorDaemon() {
   const startedAt = new Date().toISOString();
   // The plugin version of THIS daemon process (read from its own pluginDir), so
@@ -18552,7 +18562,7 @@ async function runSupervisorDaemon() {
     sock.on('error', () => { attachClients.delete(sock); stopClients.delete(sock); });
   });
 
-  // #338: control-socket ownership. `socketIdentity` is the dev/ino of the path
+  // #338: control-socket ownership. `socketIdentity` is the file identity (socketPathIdentity) of the path
   // as THIS daemon bound it. A unix listener whose path is unlinked keeps
   // LISTENing on the orphaned inode while every client gets ENOENT — the fleet
   // keeps running but can no longer be reloaded, drained or stopped. A timer
@@ -18564,15 +18574,14 @@ async function runSupervisorDaemon() {
   let relistening = null;
   const recordSocketIdentity = () => {
     if (osPlatform() === 'win32') return;
-    try { const st = lstatSync(socketPath); socketIdentity = { dev: st.dev, ino: st.ino }; } catch { socketIdentity = null; }
+    try { socketIdentity = socketPathIdentity(lstatSync(socketPath, { bigint: true })); } catch { socketIdentity = null; }
   };
   // `expected` is the dev/ino the caller proved dead (null = expected absent).
   const closeIsSafe = (expected) => {
     if (osPlatform() === 'win32') return true;
     let st;
-    try { st = lstatSync(socketPath); } catch (err) { return !!(err && err.code === 'ENOENT'); }
-    const same = (id) => id && st.dev === id.dev && st.ino === id.ino;
-    return same(expected) || same(socketIdentity);
+    try { st = socketPathIdentity(lstatSync(socketPath, { bigint: true })); } catch (err) { return !!(err && err.code === 'ENOENT'); }
+    return sameSocketPathIdentity(st, expected) || sameSocketPathIdentity(st, socketIdentity);
   };
   const relistenControlSocket = (why, expected = null) => {
     if (relistening) return relistening;
@@ -18645,8 +18654,8 @@ async function runSupervisorDaemon() {
     if (osPlatform() === 'win32') return;
     if (upgrading || handedOver || shuttingDown || shutdownStarted || relistening) return;
     let st = null;
-    try { st = lstatSync(socketPath); } catch (err) { if (err && err.code !== 'ENOENT') return; }
-    if (st && socketIdentity && st.dev === socketIdentity.dev && st.ino === socketIdentity.ino) return; // still ours
+    try { st = socketPathIdentity(lstatSync(socketPath, { bigint: true })); } catch (err) { if (err && err.code !== 'ENOENT') return; }
+    if (sameSocketPathIdentity(st, socketIdentity)) return; // still ours
     if (st) {
       // Someone replaced the path. A LIVE listener there is another owner —
       // leave it. A dead/stale file is reclaimed.
@@ -18659,7 +18668,7 @@ async function runSupervisorDaemon() {
     }
     if (upgrading || handedOver || shuttingDown || shutdownStarted) return; // state changed while probing
     dlog(`control socket ${socketPath} ${st ? 'was replaced by a dead socket' : 'vanished from disk'} — re-binding so the daemon stays manageable (#338)`);
-    const ok = await relistenControlSocket('socket ownership check', st ? { dev: st.dev, ino: st.ino } : null);
+    const ok = await relistenControlSocket('socket ownership check', st);
     if (ok) { checkSocketOwnership.warned = false; dlog(`control socket re-bound at ${socketPath}`); }
   };
   const armSocketOwnershipCheck = () => {

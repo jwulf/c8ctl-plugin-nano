@@ -1873,7 +1873,7 @@ test('#338 review: socket reclaim only on definitive death and revalidates after
   // After the close wait, a present path is unlinked only if the probe proves it dead.
   const relisten = body.slice(body.indexOf('const relistenControlSocket'), body.indexOf('const probeSocketAlive'));
   assert.match(relisten, /await reclaimDeadSocketPath\(socketPath, probeSocketAlive,/);
-  const helper = src.slice(src.indexOf('export async function reclaimDeadSocketPath'), src.indexOf('async function runSupervisorDaemon('));
+  const helper = src.slice(src.indexOf('export async function reclaimDeadSocketPath'), src.indexOf('// --- Daemon ---'));
   const recheck = helper.indexOf("(await probe()) !== 'dead'");
   assert.ok(recheck > 0 && recheck < helper.indexOf('rmSync(socketPath'));
 });
@@ -1886,9 +1886,12 @@ test('#338 review: orphaned handle is never closed under a replacement listener 
   const guard = relisten.indexOf('!closeIsSafe(expected)');
   assert.ok(guard > 0 && guard < relisten.indexOf('server.close('), 'sync guard precedes close()');
   const safe = body.slice(body.indexOf('const closeIsSafe'), body.indexOf('const relistenControlSocket'));
-  assert.match(safe, /lstatSync\(socketPath\)/);
+  assert.match(safe, /lstatSync\(socketPath, \{ bigint: true \}\)/);
+  assert.match(safe, /sameSocketPathIdentity/);
   assert.doesNotMatch(safe, /await/, 'guard is synchronous (same tick as close)');
-  assert.match(body, /relistenControlSocket\('socket ownership check', st \? \{ dev: st\.dev, ino: st\.ino \} : null\)/);
+  assert.match(body, /relistenControlSocket\('socket ownership check', st\)/);
+  // The daemon doc block stays attached to runSupervisorDaemon.
+  assert.match(src, /untouched\.\n \*\/\nasync function runSupervisorDaemon\(/);
 });
 
 test('#338 review: a live listener bound while the dead-probe is pending is never unlinked', async (t) => {
@@ -1899,7 +1902,6 @@ test('#338 review: a live listener bound while the dead-probe is pending is neve
   const sock = join(dir, 's.sock');
   // A stale (dead) file at the socket path.
   writeFileSync(sock, '');
-  const staleIno = statSync(sock).ino;
   let live = null;
   t.after(() => { try { live?.close(); } catch { /* ignore */ } rmSync(dir, { recursive: true, force: true }); });
   // Probe resolves 'dead' — but while it is pending a successor unlinks the
@@ -1913,7 +1915,7 @@ test('#338 review: a live listener bound while the dead-probe is pending is neve
   const verdict = await reclaimDeadSocketPath(sock, probe);
   assert.equal(verdict, 'replaced');
   assert.ok(existsSync(sock), 'the new listener path still exists');
-  assert.notEqual(statSync(sock).ino, staleIno);
+  assert.ok(statSync(sock).isSocket(), 'path is the new live socket');
   await new Promise((resolve, reject) => {
     const c = createConnection(sock);
     c.once('connect', () => { c.destroy(); resolve(); });
@@ -1925,4 +1927,15 @@ test('#338 review: a live listener bound while the dead-probe is pending is neve
   assert.equal(await reclaimDeadSocketPath(sock, async () => 'dead'), 'unlinked');
   assert.equal(existsSync(sock), false);
   assert.equal(await reclaimDeadSocketPath(sock, async () => 'dead'), 'absent');
+});
+
+test('#338 review: socket identity distinguishes a re-created file even on inode reuse', async () => {
+  const { sameSocketPathIdentity } = await import(pluginUrl);
+  const a = { dev: 1n, ino: 7n, ctimeNs: '100', birthtimeNs: '100', sock: false };
+  assert.ok(sameSocketPathIdentity(a, { ...a }));
+  assert.equal(sameSocketPathIdentity(a, { ...a, sock: true }), false, 'stale file vs socket on reused ino');
+  assert.equal(sameSocketPathIdentity(a, { ...a, ctimeNs: '101' }), false, 'reused ino, newer ctime');
+  assert.equal(sameSocketPathIdentity(a, { ...a, birthtimeNs: '101' }), false, 'reused ino, newer birthtime');
+  assert.equal(sameSocketPathIdentity(a, null), false);
+  assert.equal(sameSocketPathIdentity(null, null), false);
 });

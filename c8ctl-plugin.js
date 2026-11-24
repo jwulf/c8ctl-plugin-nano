@@ -11382,7 +11382,7 @@ export function raceTeardown(promise, ms, signal) {
 // exit backstop, instead of being ignored until the teardown timeout.
 export function createWorkerStopLifecycle({
   logger = console, teardownMs = DEFAULT_WORKER_TEARDOWN_TIMEOUT_MS, interrupt,
-  inFlightCount = () => 0, onDrainStart = () => {}, onTeardownStart = () => {},
+  inFlightCount = () => 0, onDrainStart = () => {}, onDrainIdle = () => {}, onTeardownStart = () => {},
   onCleanTeardown = () => {}, onAbortStart = () => [], yieldInflight = async () => {},
   onExit = () => {}, pollMs = 200, backstopMs = 2_000,
   exitProcess = (code) => process.exit(code),
@@ -11470,7 +11470,9 @@ export function createWorkerStopLifecycle({
     const tick = async () => {
       if (aborting || finished || exited) return;
       const n = inFlightCount();
-      if (n <= 0) { await teardownAndExit(signal); return; }
+      // #339 review: republish the idle ack once the drain observes zero claims —
+      // a job that ended mid-drain published BEFORE its registry slot was freed.
+      if (n <= 0) { try { onDrainIdle(signal); } catch { /* best effort */ } await teardownAndExit(signal); return; }
       if (typeof localInFlightCount === 'function' && drainStuckMs > 0) {
         let local = 1;
         try { local = Number(localInFlightCount()); } catch { local = 1; }
@@ -15911,6 +15913,7 @@ async function workAgent(req, flags, ctx) {
         // drain — clear it so it can't keep the process alive after the drain.
         if (ghRefreshTimer) clearInterval(ghRefreshTimer);
       },
+      onDrainIdle: () => { try { writeActivity(); } catch { /* best effort */ } },
       onTeardownStart: (signal) => {
         if (!autoMode) { try { unwatchFile(configFile); } catch { /* best effort */ } }
         if (ghRefreshTimer) clearInterval(ghRefreshTimer);

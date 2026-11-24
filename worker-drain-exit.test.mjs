@@ -41,6 +41,23 @@ test('drain: a running local job keeps the drain waiting', async () => {
   lc.forceAbort('SIGTERM');
 });
 
+test('drain: republishes the idle ack (onDrainIdle) after observing zero claims, before teardown', async () => {
+  const order = []; let n = 1; let exited = false;
+  const lc = createWorkerStopLifecycle({
+    logger: silent, interrupt: async () => { order.push('interrupt'); }, pollMs: 5,
+    inFlightCount: () => n, onDrainStart: () => order.push('drainStart'),
+    onDrainIdle: () => order.push('drainIdle'), onTeardownStart: () => order.push('teardown'),
+    onExit: () => { exited = true; },
+  });
+  lc.gracefulDrain('SIGUSR2');
+  await new Promise((r) => setTimeout(r, 20));
+  assert.ok(!order.includes('drainIdle'));
+  n = 0; // job ended mid-drain; its slot is now released
+  for (let i = 0; i < 100 && !exited; i++) await new Promise((r) => setTimeout(r, 5));
+  assert.equal(exited, true);
+  assert.ok(order.indexOf('drainIdle') > 0 && order.indexOf('drainIdle') < order.indexOf('teardown'));
+});
+
 test('workerDrainStuckMs / supervisorStoppingIdleMs defaults and overrides', () => {
   assert.equal(workerDrainStuckMs({}), DEFAULT_WORKER_DRAIN_STUCK_MS);
   assert.equal(workerDrainStuckMs({ [WORKER_DRAIN_STUCK_ENV]: '900' }), 900);

@@ -92,6 +92,7 @@ const activateType = (
   maxJobs: number,
   cfg: ActivationConfig,
   onPollError: PollErrorHandler,
+  onPollSuccess: Effect.Effect<void>,
 ): Effect.Effect<ReadonlyArray<ActivatedJob>> =>
   // A poll ERROR must never end this loop. `raceAll` only fails once EVERY branch
   // has failed, so a branch that exits on error silently drops its type from the
@@ -121,6 +122,9 @@ const activateType = (
         continue;
       }
       consecutiveFailures = 0;
+      // #340 review: a SUCCESSFUL activation response (empty included) is the
+      // only proof this worker can actually lease — fire the readiness hook here.
+      yield* onPollSuccess;
       const jobs = result.success;
       if (jobs.length > 0) {
         return jobs;
@@ -149,11 +153,12 @@ export const activateWinner = (
   targets: ReadonlyArray<PollTarget>,
   cfg: ActivationConfig,
   onPollError: PollErrorHandler = () => {},
+  onPollSuccess: Effect.Effect<void> = Effect.void,
 ): Effect.Effect<ReadonlyArray<ActivatedJob>, SupervisorError> => {
   if (targets.length === 0) {
     return Effect.die(new Error("activateWinner: no serviceable-with-capacity types to poll"));
   }
   return Effect.raceAll(
-    targets.map((t) => activateType(engine, t.type, batchSizeFor(t.freeSlots, cfg), cfg, onPollError)),
+    targets.map((t) => activateType(engine, t.type, batchSizeFor(t.freeSlots, cfg), cfg, onPollError, onPollSuccess)),
   );
 };

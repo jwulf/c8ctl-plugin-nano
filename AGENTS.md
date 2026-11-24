@@ -463,7 +463,18 @@ SDK client (job workers) — do **not** add the SDK as a dependency or use raw
 - **Hot code reload (rolling drain+respawn).** `supervisor reload [target]` (and
   `workforce reload`) adopt updated on-disk plugin code into the running fleet
   with **zero fleet downtime**: the daemon rolls through the target workers (default
-  `all`) **one at a time**, gracefully draining each (the same `SIGUSR2` quiesce
+  `all`) **surge-then-drain** (issue #340: `runSurgeRoll`): the new-code
+  replacement is spawned FIRST beside the old child (per-spawn activity file;
+  the old child moves to `w.retiring`), and the old child is drained only once
+  the replacement is ready — `readyAt` AND `jobTypeCount > 0` (polling ≥1 job
+  type), bounded by `NANO_SUPERVISOR_RELOAD_READY_TIMEOUT_MS` (default 120s). A
+  never-ready replacement is killed, its old child is NOT drained, and the roll
+  reports it in `reloaded.failed` (`ok:false`). Idle workers swap at once; busy
+  workers' old children drain in PARALLEL, with at most `surge` replacements
+  booting at once (`--surge N|all`, `NANO_SUPERVISOR_RELOAD_SURGE`, default 1).
+  Status rows carry `version`, `drainingMs`, `stoppingIdleMs` (wedge) and
+  `retiring[]`; the wedge escalation also covers retiring children. The
+  original per-worker shape was: gracefully draining (the same `SIGUSR2` quiesce
   as stop — finish in-flight jobs, then exit) and respawning it so the new
   `nano work` child re-reads the updated `c8ctl-plugin.js` + sidecars +
   `supervisor.dist.js` from disk. Because each worker is a separate process,
@@ -478,23 +489,13 @@ SDK client (job workers) — do **not** add the SDK as a dependency or use raw
   drained child is still the worker's current child) so a concurrent
   force-stop/restart/remove never leaks a duplicate or revives a removed worker;
   a reload is refused while another is in progress, respects `shuttingDown`, and
-  **never clears `supervisor.json`** (it is not a stop). To keep the roll
-  genuinely **one-at-a-time**, after respawning a worker the daemon waits for the
-  replacement to report **ready** — the worker stamps `readyAt` on its activity
-  marker once its activation loop is up and leasing (a bare spawn/PID is not
-  readiness), so a slow replacement can't leave two workers down at once. That
-  wait is **bounded** (`NANO_SUPERVISOR_RELOAD_READY_TIMEOUT_MS`, default 30s): a
-  never-ready replacement (e.g. a wedged engine) can't stall the roll — the daemon
-  advances anyway on timeout. This "zero downtime" is a **fleet-level, normal-readiness**
-  guarantee, NOT unqualified: because a worker is drained **before** its replacement
-  spawns, a **single-worker fleet** (or a job type served by only one worker) does lose
-  that capacity for the drain+boot window, and on the bounded-timeout fallback path the
-  daemon advances while a slow replacement is still unready, so two or more workers can
-  be temporarily unavailable (see `README.md` "Hot code reload"). Run more than one
-  worker per type for continuous service across a reload. While a rolling reload
+  **never clears `supervisor.json`** (it is not a stop). (#340 supersedes the old one-at-a-time drain-first shape: the replacement is
+  surged and must be READY before the old child drains, so capacity never dips
+  — even for a single-worker fleet — and a never-ready replacement fails the
+  roll instead of advancing anyway.) While a rolling reload
   is in progress the `status` frame also carries `reload: { inProgress, current,
   targets, reloaded, total }` and the render prints
-  `reload: rolling N/M adopted — draining <id> — do not restart the daemon`
+  `reload: rolling N/M adopted — surging <id> — do not restart the daemon`
   so a detached operator (or anyone who only polls `status`) can see the roll
   is live.
 - **Rolling daemon hot-upgrade (issue #309).** `supervisor upgrade` (alias

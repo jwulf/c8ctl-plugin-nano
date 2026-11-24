@@ -336,8 +336,28 @@ export function advanceRetargetSignal(p, { ready, writeSidecar, signal, log = ()
 const SUPERVISOR_RELOAD_READY_POLL_MS = 100;
 const SUPERVISOR_RELOAD_READY_TIMEOUT_MS = Math.max(
   0,
-  Number.parseInt(process.env.NANO_SUPERVISOR_RELOAD_READY_TIMEOUT_MS ?? '', 10) || 30_000,
+  Number.parseInt(process.env.NANO_SUPERVISOR_RELOAD_READY_TIMEOUT_MS ?? '', 10) || 120_000,
 );
+/**
+ * #340 review: the readiness deadline for one replacement. Readiness requires a
+ * SUCCESSFUL activation response, which on a quiet queue only returns after the
+ * worker's full long-poll window — so the deadline must cover that window plus
+ * startup time, or a healthy `--poll-timeout 180000` worker is killed. Pure.
+ */
+const SUPERVISOR_RELOAD_READY_STARTUP_SLACK_MS = 60_000;
+const SUPERVISOR_RELOAD_READY_TIMEOUT_EXPLICIT = Number.parseInt(process.env.NANO_SUPERVISOR_RELOAD_READY_TIMEOUT_MS ?? '', 10) > 0;
+function reloadReadyTimeoutMsFor(args, base = SUPERVISOR_RELOAD_READY_TIMEOUT_MS, explicit = SUPERVISOR_RELOAD_READY_TIMEOUT_EXPLICIT) {
+  // An explicit operator override (NANO_SUPERVISOR_RELOAD_READY_TIMEOUT_MS) is honoured verbatim.
+  if (explicit) return base;
+  const list = Array.isArray(args) ? args.map(String) : [];
+  let flag;
+  for (let i = 0; i < list.length; i++) {
+    if (list[i] === '--poll-timeout') flag = list[i + 1];
+    else if (list[i].startsWith('--poll-timeout=')) flag = list[i].slice('--poll-timeout='.length);
+  }
+  const poll = derivePollTimeoutMs(flag);
+  return Math.max(base, (poll > 0 ? poll : 0) + SUPERVISOR_RELOAD_READY_STARTUP_SLACK_MS);
+}
 // Rolling daemon hot-upgrade (issue #309). A `supervisor upgrade` hands the
 // fleet to a SUCCESSOR daemon process running the on-disk (new) plugin code:
 // the old daemon quiesces (stops accepting control connections + stops
@@ -616,13 +636,104 @@ export function stoppingWorkerEscalation({ worker, activity, now, idleMs, killGr
 }
 
 /**
+ * #340: surge size for a rolling `supervisor reload` — how many BUSY workers may
+ * have a not-yet-ready replacement booting at once. `all` (or 0) = unbounded.
+ * Idle workers are never limited (they swap at once). Default 1.
+ */
+export const SUPERVISOR_RELOAD_SURGE_ENV = 'NANO_SUPERVISOR_RELOAD_SURGE';
+export function parseReloadSurge(value, fallback = 1) {
+  if (value == null || value === '') return fallback;
+  const s = String(value).trim().toLowerCase();
+  if (s === 'all' || s === '0') return Infinity;
+  const n = Number.parseInt(s, 10);
+  return Number.isFinite(n) && n > 0 && String(n) === s ? n : fallback;
+}
+
+/**
+ * #340: zero-capacity-loss rolling reload — surge, then drain. Pure orchestration
+ * over injected seams so the capacity invariant is unit-testable:
+ *
+ *   ops.isIdle(id)            → boolean: no job in flight on the CURRENT child
+ *   ops.surge(id)             → Promise<handle|null>: start the new-code replacement
+ *                               ALONGSIDE the current child (null = could not start)
+ *   ops.waitReady(id, h)      → Promise<boolean>: replacement is polling ≥1 job type
+ *   ops.abandon(id, h, why)   → Promise: kill a replacement that never became ready
+ *                               (the old child stays the live, serving worker)
+ *   ops.drainOld(id, h)       → Promise: drain the OLD child; resolves when it exited
+ *   ops.shouldAbort(id)       → boolean (daemon shutting down / target vanished)
+ *   ops.onAdopted(id)         → called once the replacement is ready + old drain sent
+ *
+ * The old child is drained ONLY after its replacement is ready, so serving
+ * capacity never drops below the target. Idle workers are processed first and
+ * without a concurrency cap; busy workers are surged at most `surge` at a time.
+ * Drains are NOT awaited serially — they run in parallel and the roll finishes
+ * when the longest in-flight job does. A replacement that never becomes ready is
+ * a canary failure: its old worker is kept (never drained), no NEW surge starts,
+ * and the result reports it as failed (already-started drains still complete).
+ */
+export async function runSurgeRoll(ids, ops, { surge = 1 } = {}) {
+  const limit = Number.isFinite(surge) && surge > 0 ? Math.floor(surge) : Infinity;
+  const idle = [];
+  const busy = [];
+  for (const id of ids) {
+    let isIdle = false;
+    try { isIdle = !!ops.isIdle(id); } catch { isIdle = false; }
+    (isIdle ? idle : busy).push(id);
+  }
+  const adopted = [];
+  const failed = [];
+  const skipped = [];
+  const drains = [];
+  let stop = false;
+  const one = async (id) => {
+    if (stop || (ops.shouldAbort && ops.shouldAbort(id))) { stop = true; skipped.push(id); return; }
+    let h = null;
+    try { h = await ops.surge(id); } catch { h = null; }
+    if (!h) {
+      stop = true;
+      // A worker that started stopping (or an upgrade/shutdown that raced the
+      // roll) is not a canary failure — report it skipped, not "failed to boot".
+      let aborted = false;
+      try { aborted = !!(ops.shouldAbort && ops.shouldAbort(id)); } catch { aborted = false; }
+      if (aborted) skipped.push(id); else failed.push({ id, reason: 'replacement could not be started' });
+      return;
+    }
+    let ready = false;
+    try { ready = await ops.waitReady(id, h); } catch { ready = false; }
+    if (!ready) {
+      stop = true;
+      failed.push({ id, reason: 'replacement never became ready (polling at least one job type)' });
+      try { await ops.abandon(id, h, 'not ready'); } catch { /* best effort */ }
+      return;
+    }
+    // Replacement serving → now (and only now) drain the old child, in parallel.
+    drains.push(Promise.resolve().then(() => ops.drainOld(id, h)).catch(() => {}));
+    adopted.push(id);
+    try { if (ops.onAdopted) ops.onAdopted(id); } catch { /* best effort */ }
+  };
+  const pool = async (list, n) => {
+    let i = 0;
+    const lane = async () => { while (i < list.length) { const id = list[i++]; await one(id); } };
+    const lanes = [];
+    for (let k = 0; k < Math.min(n, list.length); k++) lanes.push(lane());
+    await Promise.all(lanes);
+  };
+  await pool(idle, Infinity);
+  await pool(busy, limit);
+  await Promise.all(drains);
+  return { adopted, failed, skipped, interrupted: stop };
+}
+
+/**
  * Read a worker's activity marker. Returns the parsed object, or `null` when the
  * file is absent (worker not reporting yet, or a standalone/older worker) or
  * unreadable. Pure enough for status rendering (best-effort IO).
+ * #340: `file` overrides the default path — a surged replacement reports to a
+ * per-spawn marker (`w.activityFile`) while its draining predecessor keeps its own.
  */
-function readWorkerActivity(id) {
+function readWorkerActivity(id, file) {
   try {
-    return JSON.parse(readFileSync(supervisorWorkerActivityFile(id), 'utf-8'));
+    return JSON.parse(readFileSync(file || supervisorWorkerActivityFile(id), 'utf-8'));
   } catch {
     return null;
   }
@@ -638,7 +749,12 @@ function readWorkerActivity(id) {
  * unit-tested directly.
  */
 function activityMarkerReadyFor(act, pid) {
-  return !!(act && act.pid === pid && Number.isFinite(act.readyAt));
+  // #340: "ready" means really polling — a marker that reports its poll-set size
+  // must report at least one job type (a worker leasing 0 types serves nothing).
+  // Older markers without the field fall back to `readyAt` alone.
+  if (!(act && act.pid === pid && Number.isFinite(act.readyAt))) return false;
+  if (Object.prototype.hasOwnProperty.call(act, 'jobTypeCount') && !(Number(act.jobTypeCount) > 0)) return false;
+  return true;
 }
 
 /**
@@ -694,7 +810,7 @@ function workerPredatesSignalReady(act, pid) {
 function incompatibleSnapshotWorkers(state, { isAlive = isPidAlive, readActivity = readWorkerActivity, activityById } = {}) {
   const out = [];
   for (const rec of liveSnapshotWorkerRecords(state, isAlive)) {
-    const act = readSnapshotActivity(rec.id, activityById, readActivity);
+    const act = readSnapshotActivity(rec, activityById, readActivity);
     if (workerPredatesSignalReady(act, Number(rec.pid))) out.push(rec.id);
   }
   return out;
@@ -710,7 +826,7 @@ function incompatibleSnapshotWorkers(state, { isAlive = isPidAlive, readActivity
 function unknownSnapshotWorkers(state, { isAlive = isPidAlive, readActivity = readWorkerActivity, activityById } = {}) {
   const out = [];
   for (const rec of liveSnapshotWorkerRecords(state, isAlive)) {
-    const act = readSnapshotActivity(rec.id, activityById, readActivity);
+    const act = readSnapshotActivity(rec, activityById, readActivity);
     if (!act || typeof act !== 'object' || act.pid !== Number(rec.pid)) out.push(rec.id);
   }
   return out;
@@ -728,10 +844,21 @@ function liveSnapshotWorkerRecords(state, isAlive) {
   return out;
 }
 
+/**
+ * #340 review: the marker path a snapshot record reports to — its persisted
+ * per-spawn `activityFile` when that lies directly in the activity dir (never an
+ * arbitrary path from the state file), else the default per-id marker.
+ */
+function snapshotRecActivityFile(rec, dir = getSupervisorActivityDir()) {
+  const f = rec && rec.activityFile;
+  return (typeof f === 'string' && f && dirname(f) === dir) ? f : supervisorWorkerActivityFile(rec.id);
+}
+
 /** One worker's marker: the caller-supplied read when given, else `readActivity`. */
-function readSnapshotActivity(id, activityById, readActivity) {
+function readSnapshotActivity(rec, activityById, readActivity) {
+  const id = rec.id;
   if (activityById && typeof activityById.get === 'function') return activityById.get(id) ?? null;
-  try { return readActivity(id); } catch { return null; }
+  try { return readActivity(id, snapshotRecActivityFile(rec)); } catch { return null; }
 }
 
 /**
@@ -747,7 +874,10 @@ function classifySnapshotCompat(state, { isAlive = isPidAlive, readActivity = re
   const activityById = new Map();
   for (const rec of liveSnapshotWorkerRecords(state, isAlive)) {
     let act = null;
-    try { act = readActivity(rec.id); } catch { act = null; }
+    // #340 review: a reloaded worker reports to its PERSISTED per-spawn marker
+    // (`rec.activityFile`), not the default path — read that (validated to the
+    // activity dir, exactly as adoptWorker does) or the handoff times out.
+    try { act = readActivity(rec.id, snapshotRecActivityFile(rec)); } catch { act = null; }
     activityById.set(rec.id, act);
   }
   const deps = { isAlive, activityById };
@@ -2343,6 +2473,18 @@ function parseJobTypeFlags(input) {
     jobTypes.push(token);
   }
   return { jobTypes, errors };
+}
+
+/**
+ * The in-process registry / agentic instance name for a worker (#340 review):
+ * `<name>` normally, `<name>~<incarnation>` for an overlapping surge
+ * incarnation so two live processes never share an agentic identity. The
+ * incarnation is sanitised to `[A-Za-z0-9._-]` (≤32 chars); anything else
+ * (absent, blank, all-invalid) yields the bare name.
+ */
+export function agenticInstanceName(workerName, incarnation) {
+  const inc = typeof incarnation === 'string' ? incarnation.replace(/[^A-Za-z0-9._-]/g, '').slice(0, 32) : '';
+  return inc ? `${workerName}~${inc}` : workerName;
 }
 
 /**
@@ -12836,7 +12978,7 @@ function agenticStateForTarget(target, safeUrl = (u) => u) {
  * without making an idle worker look busy or inflating the drain's in-flight count.
  * @param {{ pid:number, updatedAt:number, jobs:Array<{key:string,type:string,since:number,settlementPending?:boolean}>, engine:(string|null), agentic:object, readyAt:(number|null), ghAuth:(object|null), watchdogPid:(number|null|undefined), signalReadyAt?:(number|null) }} fields
  */
-function buildActivityPayload({ pid, updatedAt, jobs, engine, agentic, readyAt, ghAuth, watchdogPid, signalReadyAt, drainIdleAt }) {
+function buildActivityPayload({ pid, updatedAt, jobs, engine, agentic, readyAt, ghAuth, watchdogPid, signalReadyAt, drainIdleAt, jobTypeCount, version, drainStartedAt }) {
   const jobList = Array.isArray(jobs) ? jobs : [];
   return {
     pid,
@@ -12869,6 +13011,15 @@ function buildActivityPayload({ pid, updatedAt, jobs, engine, agentic, readyAt, 
     // survives the handoff — so it never exits while a worker would still read
     // the (expected) reparent-to-init as an orphan event and self-reap.
     watchdogPid: Number.isInteger(watchdogPid) ? watchdogPid : null,
+    // #340: how many job types this worker is actually polling — the rolling
+    // reload counts a replacement ready only when it polls at least one.
+    // Omitted (key absent) when unknown, so older readers fall back to readyAt.
+    ...(Number.isInteger(jobTypeCount) && jobTypeCount >= 0 ? { jobTypeCount } : {}),
+    // #340: the plugin code version this worker process loaded, so `status` can
+    // show old-code vs new-code workers during a roll.
+    version: typeof version === 'string' && version ? version : null,
+    // #340: when this worker began a graceful drain (null while serving).
+    drainStartedAt: Number.isFinite(drainStartedAt) ? drainStartedAt : null,
   };
 }
 
@@ -13190,6 +13341,13 @@ async function workAgent(req, flags, ctx) {
     exitConfigError(logger, `Invalid --name "${flags.name}": use only letters, digits, and . _ -`);
   }
   const workerName = explicitName !== '' ? explicitName : autoWorkerName(name);
+  // #340 review: the in-process registry + agentic identity (ownership/presence/
+  // transcript/steer instance). A rolling-reload SURGE runs a replacement
+  // alongside the old child under the SAME `--name`, so the daemon hands an
+  // overlapping incarnation a distinct NANO_WORKER_INCARNATION; without it the
+  // old child's teardown deregister would remove the replacement's cockpit
+  // presence. The stable supervisor row id (`workerName`) is unchanged.
+  const agenticInstance = agenticInstanceName(workerName, process.env.NANO_WORKER_INCARNATION);
 
   if (!globalThis.c8ctl || typeof globalThis.c8ctl.createClient !== 'function') {
     logger.error('work requires the c8ctl runtime (createClient). Run it via the c8ctl CLI.');
@@ -13861,6 +14019,12 @@ async function workAgent(req, flags, ctx) {
   // extendLock is claimed but not yet in activeJobs). Fails closed: any probe
   // error counts as busy, so no idle ack is published.
   let registryInFlight = () => 0;
+  // #340: size of the registry's poll set (union of this worker's job types);
+  // late-bound once the registry exists. Throws → field omitted.
+  let pollTypeCount = () => { throw new Error('registry not ready'); };
+  // #340: this process's plugin code version (status shows old vs new code).
+  const workerCodeVersion = (() => { try { return pluginPackage().version; } catch { return null; } })();
+  let drainStartedAt = null;
   const writeActivity = () => {
     if (!activityFile) return;
     let claimed;
@@ -13888,7 +14052,7 @@ async function workAgent(req, flags, ctx) {
     // #293: publish the cached gh token's identity (fingerprint/scopes/age —
     // never the value) so `supervisor status` can answer "is this worker holding
     // a stale token?" in one line.
-    const payload = buildActivityPayload({ pid: process.pid, updatedAt: Date.now(), jobs, engine: workerEngine, agentic: agenticState, readyAt, signalReadyAt, drainIdleAt, ghAuth: ghAuthTokenInfo(), watchdogPid: parentWatchdog && typeof parentWatchdog.watchedPid === 'function' ? parentWatchdog.watchedPid() : null });
+    const payload = buildActivityPayload({ pid: process.pid, updatedAt: Date.now(), jobs, engine: workerEngine, agentic: agenticState, readyAt, signalReadyAt, drainIdleAt, jobTypeCount: (() => { try { return pollTypeCount(); } catch { return undefined; } })(), version: workerCodeVersion, drainStartedAt, ghAuth: ghAuthTokenInfo(), watchdogPid: parentWatchdog && typeof parentWatchdog.watchedPid === 'function' ? parentWatchdog.watchedPid() : null });
     const tmp = `${activityFile}.${process.pid}.tmp`;
     try {
       mkdirSync(dirname(activityFile), { recursive: true });
@@ -15705,8 +15869,8 @@ async function workAgent(req, flags, ctx) {
     camunda,
     restConfig,
     worker: workerName,
-    workers: [{ id: workerName, types: jobTypes, capacity: 1 }],
-    autoWorkerId: autoMode ? workerName : undefined,
+    workers: [{ id: agenticInstance, types: jobTypes, capacity: 1 }],
+    autoWorkerId: autoMode ? agenticInstance : undefined,
     // Explicit `--job-type` extras must outlive the first reconcile: the runtime's
     // reconcile rewrites the --auto worker's set from the engine scan, so pass the
     // extras through to be unioned into every reconcile write (else an explicit
@@ -15749,6 +15913,12 @@ async function workAgent(req, flags, ctx) {
     Fiber: SupervisorFiber,
   } = composed;
   registryInFlight = () => SupervisorEffect.runSync(workerRegistry.activeCount);
+  pollTypeCount = () => {
+    const st = SupervisorEffect.runSync(workerRegistry.get);
+    const all = new Set();
+    for (const ws of st.workers.values()) for (const t of ws.types) all.add(t);
+    return all.size;
+  };
 
   // Run the single per-host owner. `Effect.runFork` keeps the process alive on the
   // runtime's own Schedule cadences (reconcile + activation/idle loop), so even an
@@ -15774,7 +15944,7 @@ async function workAgent(req, flags, ctx) {
     const agenticEncoder = new TextEncoder();
     const seedPresence = () => {
       try {
-        SupervisorEffect.runSync(supervisor.ownership.register(workerName, agenticCapability));
+        SupervisorEffect.runSync(supervisor.ownership.register(agenticInstance, agenticCapability));
       } catch (err) {
         logger.warn(`  agentic presence seed failed (${err?.message || err}); continuing.`);
       }
@@ -15786,8 +15956,8 @@ async function workAgent(req, flags, ctx) {
       // live connection, then drop it from the registry so the projection stops
       // heartbeating it. Best-effort — teardown must never hang or throw.
       deregister: (reason) => {
-        try { SupervisorEffect.runSync(supervisor.presence.deregister(workerName, reason)); } catch { /* best effort */ }
-        try { SupervisorEffect.runSync(supervisor.ownership.deregister(workerName)); } catch { /* best effort */ }
+        try { SupervisorEffect.runSync(supervisor.presence.deregister(agenticInstance, reason)); } catch { /* best effort */ }
+        try { SupervisorEffect.runSync(supervisor.ownership.deregister(agenticInstance)); } catch { /* best effort */ }
       },
       // Build a per-job relay session over the supervisor's transcript + steer
       // seams (issue #173), shape-compatible with the retired createWorkChannel
@@ -15797,7 +15967,7 @@ async function workAgent(req, flags, ctx) {
       relaySessionFor: (jobKey, extra = {}) => {
         try {
           return createHostRelaySession({
-            instance: workerName,
+            instance: agenticInstance,
             jobKey,
             // #229: correlation join keys + lazy AgentInstance-key resolver.
             elementInstanceKey: extra.elementInstanceKey,
@@ -15806,7 +15976,7 @@ async function workAgent(req, flags, ctx) {
             publish: (text) => {
               // Fire-and-forget over the live handle; a frame between a drop and
               // the next reconnect is a harmless no-op (best-effort semantics).
-              try { SupervisorEffect.runSync(supervisor.transcript(workerName, String(jobKey), agenticEncoder.encode(text))); } catch { /* best effort */ }
+              try { SupervisorEffect.runSync(supervisor.transcript(agenticInstance, String(jobKey), agenticEncoder.encode(text))); } catch { /* best effort */ }
             },
             subscribeSteer: (onChunk) => {
               // The router keys sinks by instance, not jobKey, so it hands every
@@ -15817,8 +15987,8 @@ async function workAgent(req, flags, ctx) {
               const sink = (jk, chunk) => SupervisorEffect.sync(() => {
                 if (String(jk) === String(jobKey)) onChunk(chunk);
               });
-              try { SupervisorEffect.runSync(supervisor.steerRouter.register(workerName, sink)); } catch { /* best effort */ }
-              return () => { try { SupervisorEffect.runSync(supervisor.steerRouter.unregister(workerName)); } catch { /* best effort */ } };
+              try { SupervisorEffect.runSync(supervisor.steerRouter.register(agenticInstance, sink)); } catch { /* best effort */ }
+              return () => { try { SupervisorEffect.runSync(supervisor.steerRouter.unregister(agenticInstance)); } catch { /* best effort */ } };
             },
             logger,
           });
@@ -15886,7 +16056,7 @@ async function workAgent(req, flags, ctx) {
         const desired = [...new Set([...m, ...extraJobTypes])];
         if (draining) return; // teardown began while we were reading — don't write
         if (mySeq !== reloadSeq) return; // superseded during the async read — skip
-        await SupervisorEffect.runPromise(workerRegistry.setTypes(workerName, desired));
+        await SupervisorEffect.runPromise(workerRegistry.setTypes(agenticInstance, desired));
         logger.info(`Profile "${name}" changed — now servicing ${desired.length} job type(s): ${desired.join('  ')}`);
       }).catch((err) => logger.warn(`profile reload failed: ${err?.message || err}`));
     });
@@ -15915,6 +16085,7 @@ async function workAgent(req, flags, ctx) {
       onDrainStart: () => {
         draining = true;
         drainQuiesced = true;
+        if (drainStartedAt == null) drainStartedAt = Date.now();
         try { writeActivity(); } catch { /* best effort */ }
         // Authoritative quiesce: the activation loop leases no new job even if the
         // --auto reconcile rewrites this worker's job types (registry.quiesce wins).
@@ -16452,9 +16623,11 @@ function summarizeSupervisorWorker(w, now = Date.now(), { readActivity = readWor
   let activity = null; // { state: 'busy'|'idle', jobs: [{ key, type, sinceMs, sinceEpochMs }] }
   let engine = null; // job-polling engine base URL this worker reported (#99)
   let agentic = null; // { status, mode, url, discovered } agentic-channel state (#99)
+  let version = null; // #340: plugin code version this worker process loaded
+  let drainStartedAtMs = null; // #340: when the worker began draining
   let ghAuth = null; // #293: { present, fingerprint, scopes, since, ageMs, lastCheckAgoMs } — never the token
   if (alive) {
-    const act = readActivity(w.id);
+    const act = readActivity(w.id, w.activityFile);
     if (act && act.pid === w.pid) {
       const jobs = Array.isArray(act.jobs)
         ? act.jobs
@@ -16485,6 +16658,8 @@ function summarizeSupervisorWorker(w, now = Date.now(), { readActivity = readWor
       // Engine + agentic-channel status ride the same pid-guarded marker, so a
       // stale incarnation can't show a dead worker as connected to a hub.
       engine = typeof act.engine === 'string' && act.engine ? act.engine : null;
+      version = typeof act.version === 'string' && act.version ? act.version : null;
+      drainStartedAtMs = Number.isFinite(act.drainStartedAt) ? act.drainStartedAt : null;
       agentic = act.agentic && typeof act.agentic === 'object' ? act.agentic : null;
       // #293: the gh token identity rides the same marker. Re-age the ticking
       // durations from the stamped `since`/marker `updatedAt` so a console that
@@ -16529,6 +16704,38 @@ function summarizeSupervisorWorker(w, now = Date.now(), { readActivity = readWor
     engine,
     agentic,
     ghAuth,
+    // #340: code version + drain visibility. `drainingMs` is how long this
+    // worker has been draining; `stoppingIdleMs` how long it has sat in
+    // `stopping` with NO job (the #339 wedge clock) — flagged by the renderer.
+    version,
+    // `*SinceMs` are the ABSOLUTE epochs behind the two clocks (#340 review), so
+    // an attached console can re-age them locally (reageSupervisorStatus).
+    ...(() => {
+      const since = drainStartedAtMs ?? (w.stopping && Number.isFinite(w.drainSignalledAt) ? w.drainSignalledAt : null);
+      const drainingSinceMs = alive && Number.isFinite(since) ? since : null;
+      const stoppingIdleSinceMs = alive && w.stoppingIdle && Number.isFinite(w.stoppingIdle.since) ? w.stoppingIdle.since : null;
+      return {
+        drainingSinceMs,
+        drainingMs: drainingSinceMs != null ? Math.max(0, now - drainingSinceMs) : null,
+        stoppingIdleSinceMs,
+        stoppingIdleMs: stoppingIdleSinceMs != null ? Math.max(0, now - stoppingIdleSinceMs) : null,
+      };
+    })(),
+    // #340: old-code children still draining after a surge-then-drain reload.
+    retiring: (Array.isArray(w.retiring) ? w.retiring : []).filter((r) => r && !r.exited && isPidAlive(r.pid)).map((r) => {
+      const ract = readActivity(w.id, r.activityFile);
+      const own = ract && ract.pid === r.pid;
+      const jobs = own && Array.isArray(ract.jobs) ? ract.jobs.filter((j) => j && !j.settlementPending).map((j) => String(j.key)) : [];
+      return {
+        pid: r.pid,
+        version: own && typeof ract.version === 'string' ? ract.version : null,
+        drainingSinceMs: Number.isFinite(r.drainSignalledAt) ? r.drainSignalledAt : null,
+        drainingMs: Number.isFinite(r.drainSignalledAt) ? Math.max(0, now - r.drainSignalledAt) : null,
+        stoppingIdleSinceMs: r.stoppingIdle && Number.isFinite(r.stoppingIdle.since) ? r.stoppingIdle.since : null,
+        stoppingIdleMs: r.stoppingIdle && Number.isFinite(r.stoppingIdle.since) ? Math.max(0, now - r.stoppingIdle.since) : null,
+        jobs,
+      };
+    }),
   };
 }
 
@@ -16573,6 +16780,14 @@ function supervisorStatusSignature(workers) {
       w.ghAuth
         ? `${w.ghAuth.present ? 1 : 0}\u0000${w.ghAuth.fingerprint ?? ''}\u0000${w.ghAuth.scopes ?? ''}\u0000${w.ghAuth.since ?? ''}`
         : null,
+      // #340 review: drain/wedge TRANSITIONS (stable epochs, never the ticking
+      // durations) for the worker and each retiring old-code child, so a drain
+      // starting/ending, a child going idle (wedge clock arming) or exiting
+      // repaints an otherwise-quiet console. Durations re-age locally.
+      w.version ?? '',
+      `${w.drainingSinceMs ?? ''}\u0000${w.stoppingIdleSinceMs ?? ''}`,
+      (Array.isArray(w.retiring) ? w.retiring : []).map((r) =>
+        `${r.pid}\u0000${r.version ?? ''}\u0000${r.drainingSinceMs ?? ''}\u0000${r.stoppingIdleSinceMs ?? ''}\u0000${(Array.isArray(r.jobs) ? [...r.jobs].sort() : []).join(',')}`),
     ]),
   );
 }
@@ -16713,7 +16928,19 @@ function reageSupervisorStatus(status, now = Date.now()) {
       if (ghAuth && typeof ghAuth === 'object' && Number.isFinite(ghAuth.since)) {
         ghAuth = { ...ghAuth, ageMs: Math.max(0, now - ghAuth.since) };
       }
-      return { ...w, uptimeMs, activity, ghAuth };
+      // #340 review: re-age the drain / stopping-idle (wedge) clocks of the worker
+      // and of each retiring old-code child from their absolute epochs, so a
+      // quiet console's drain durations advance and the wedge warning appears.
+      const reage = (o) => {
+        if (!o || typeof o !== 'object') return o;
+        const out = { ...o };
+        if (Number.isFinite(o.drainingSinceMs)) out.drainingMs = Math.max(0, now - o.drainingSinceMs);
+        if (Number.isFinite(o.stoppingIdleSinceMs)) out.stoppingIdleMs = Math.max(0, now - o.stoppingIdleSinceMs);
+        return out;
+      };
+      const drain = reage(w);
+      const retiring = Array.isArray(w.retiring) ? w.retiring.map(reage) : w.retiring;
+      return { ...w, uptimeMs, activity, ghAuth, drainingMs: drain.drainingMs, stoppingIdleMs: drain.stoppingIdleMs, retiring };
     }),
   };
 }
@@ -16815,6 +17042,37 @@ function createSupervisorLiveView({
  * existing tailer. Returns an empty array (no section) when no log path is
  * known — an older persisted state, or a dead daemon whose frame carried none.
  */
+/**
+ * #340: per-worker code version + drain visibility under the status table:
+ * each worker's version (when known), how long a draining worker — or an
+ * old-code child retiring after a surge reload — has been draining, and a
+ * warning for one stuck in `stopping` with no job (pure).
+ */
+function formatSupervisorDrainLines(workers, { wedgeWarnMs = 60_000 } = {}) {
+  const out = [];
+  for (const w of Array.isArray(workers) ? workers : []) {
+    const id = String(w.id);
+    if (w.state === 'stopping' && Number.isFinite(w.drainingMs)) {
+      const busy = w.activity && w.activity.state === 'busy';
+      let line = `  draining:   ${id}${w.version ? ` (code ${w.version})` : ''} for ${formatDuration(w.drainingMs)}${busy ? ' — finishing its job' : ''}`;
+      if (Number.isFinite(w.stoppingIdleMs) && w.stoppingIdleMs >= wedgeWarnMs) line += ` — ⚠ stopping with no job for ${formatDuration(w.stoppingIdleMs)}`;
+      out.push(line);
+    }
+    for (const r of Array.isArray(w.retiring) ? w.retiring : []) {
+      let line = `  retiring:   ${id} old pid ${r.pid}${r.version ? ` (code ${r.version})` : ''}${w.version ? ` → new ${w.version}` : ''}`;
+      line += Number.isFinite(r.drainingMs) ? ` draining for ${formatDuration(r.drainingMs)}` : ' (replacement booting)';
+      if (Array.isArray(r.jobs) && r.jobs.length) line += ` — finishing job ${r.jobs.join(', ')}`;
+      if (Number.isFinite(r.stoppingIdleMs) && r.stoppingIdleMs >= wedgeWarnMs) line += ` — ⚠ stopping with no job for ${formatDuration(r.stoppingIdleMs)}`;
+      out.push(line);
+    }
+  }
+  const versions = new Set((Array.isArray(workers) ? workers : []).map((w) => w.version).filter(Boolean));
+  if (versions.size > 1) {
+    out.push(`  versions:   ${(Array.isArray(workers) ? workers : []).filter((w) => w.version).map((w) => `${w.id}=${w.version}`).join('  ')}`);
+  }
+  return out.length ? ['', ...out] : [];
+}
+
 function formatSupervisorLogsLines(status) {
   const daemonLog = status?.daemon?.logFile || null;
   const workers = Array.isArray(status?.workers) ? status.workers : [];
@@ -16875,7 +17133,7 @@ function formatSupervisorStatus(status) {
     const total = Number(roll.total) || 0;
     const current = roll.current ? String(roll.current) : null;
     const parts = [`rolling ${done}/${total} adopted`];
-    if (current) parts.push(`draining ${current}`);
+    if (current) parts.push(`surging ${current}`);
     if (onDiskVersion && d.version && onDiskVersion !== d.version) {
       parts.push(`${d.version} → ${onDiskVersion}`);
     }
@@ -16919,6 +17177,7 @@ function formatSupervisorStatus(status) {
   const fmt = (r) => '  ' + cols.map((c) => r[c].padEnd(width[c])).join('  ');
   lines.push(fmt(head));
   for (const r of rows) lines.push(fmt(r));
+  lines.push(...formatSupervisorDrainLines(workers));
   lines.push(...formatSupervisorLogsLines(status));
   return lines.join('\n');
 }
@@ -17318,7 +17577,7 @@ async function runSupervisorDaemon() {
       // (a concurrent upgrade won the race). Never keep retrying — the binding
       // will never accept this pid, and two successors must not both wait to
       // adopt the same fleet. Exit and leave the bound successor to finish.
-      if (prep && prep.ok === false && (prep.code === 'UPGRADE_INCOMPATIBLE_WORKERS' || prep.code === 'UPGRADE_SNAPSHOT_FAILED')) {
+      if (prep && prep.ok === false && (prep.code === 'UPGRADE_INCOMPATIBLE_WORKERS' || prep.code === 'UPGRADE_SNAPSHOT_FAILED' || prep.code === 'UPGRADE_RETIRING_BUSY')) {
         dlogBoot(`upgrade mode: predecessor pid ${st.pid} refused the handoff: ${prep.error}`);
         process.exit(1);
       }
@@ -17481,6 +17740,9 @@ async function runSupervisorDaemon() {
           // mid-drain is still REMOVED by the successor (not retained forever,
           // which would block name reuse and hang `workforce stop`).
           removeOnExit: w.removeOnExit === true,
+          // #340: the per-spawn activity marker (a surged replacement's differs
+          // from the default) so a successor daemon reads the right file.
+          activityFile: w.activityFile || null,
         })),
       });
       return true;
@@ -17507,8 +17769,29 @@ async function runSupervisorDaemon() {
   // that keeps the newest output and bounds on-disk usage to ~2x the cap. Set
   // `NANO_SUPERVISOR_LOG_MAX_BYTES=0` to opt out (legacy raw-fd append).
   const workerLogMaxBytes = resolveLogMaxBytes(process.env.NANO_SUPERVISOR_LOG_MAX_BYTES);
+  // #340 review: ONE daemon-owned, ref-counted log ring per log path. A surge
+  // reload runs two incarnations of a worker at once against the same
+  // `w.logFile`; independent rings would each keep their own fd + byte count,
+  // so one's rotation would strand (or later unlink) the other's open file.
+  const logRings = new Map();
+  const acquireLogRing = (file) => {
+    let e = logRings.get(file);
+    if (!e) { e = { ring: createLogRing(file, workerLogMaxBytes), refs: 0 }; logRings.set(file, e); }
+    e.refs += 1;
+    let released = false;
+    return {
+      write: (chunk) => e.ring.write(chunk),
+      close: () => {
+        if (released) return;
+        released = true;
+        e.refs -= 1;
+        if (e.refs <= 0 && logRings.get(file) === e) { logRings.delete(file); try { e.ring.close(); } catch { /* best effort */ } }
+      },
+    };
+  };
 
-  const startWorker = (w) => {
+  let surgeIncarnationSeq = 0;
+  const startWorker = (w, { fresh = false } = {}) => {
     // A fresh (re)start attempts the profile again, so clear any prior
     // non-restartable config-failure latch — the operator may have fixed the
     // profile since (thread 4118560521).
@@ -17521,7 +17804,11 @@ async function runSupervisorDaemon() {
     if (!ringed) { try { fd = openSync(w.logFile, 'a'); } catch { fd = 'ignore'; } }
     // Clear any stale activity marker from a previous incarnation so a freshly
     // (re)started worker never briefly shows a dead job as in-flight.
-    const activityFile = supervisorWorkerActivityFile(w.id);
+    // #340: a SURGED replacement (`fresh`) gets its own per-spawn marker so it
+    // never clobbers the draining predecessor's; otherwise reuse the current one.
+    const activityFile = fresh
+      ? join(getSupervisorActivityDir(), `${w.id}.${Date.now().toString(36)}${Math.random().toString(36).slice(2, 6)}.json`)
+      : (w.activityFile || supervisorWorkerActivityFile(w.id));
     w.activityFile = activityFile;
     try { rmSync(activityFile, { force: true }); } catch { /* best effort */ }
     // #309 review: also clear a stale `.upgrade` retarget sidecar. A worker
@@ -17558,6 +17845,13 @@ async function runSupervisorDaemon() {
     const childEnv = { ...process.env, NANO_SUPERVISOR_ACTIVITY_FILE: activityFile, NANO_SUPERVISOR_DAEMON_PID: String(process.pid) };
     const upgradeSuccessorPid = Number(process.env.NANO_SUPERVISOR_UPGRADE_PID ?? '', 10);
     if (Number.isInteger(upgradeSuccessorPid) && upgradeSuccessorPid > 0) childEnv.NANO_SUPERVISOR_UPGRADE_PID = String(upgradeSuccessorPid);
+    // #340 review: a child spawned while an older child of this worker is still
+    // draining (surge, or a replacement restart during the drain) gets a distinct
+    // agentic incarnation so the old child's teardown can't deregister it.
+    delete childEnv.NANO_WORKER_INCARNATION;
+    if (Array.isArray(w.retiring) && w.retiring.length > 0) {
+      childEnv.NANO_WORKER_INCARNATION = `r${Date.now().toString(36)}${(++surgeIncarnationSeq).toString(36)}`;
+    }
     const child = spawn(exec, [entry, 'nano', 'work', w.profile, '--name', w.id, ...w.args], {
       env: childEnv,
       stdio: ['ignore', ringed ? 'pipe' : fd, ringed ? 'pipe' : fd],
@@ -17570,7 +17864,7 @@ async function runSupervisorDaemon() {
     if (ringed) {
       let ring = null;
       try {
-        ring = createLogRing(w.logFile, workerLogMaxBytes);
+        ring = acquireLogRing(w.logFile);
         const feed = (chunk) => { try { ring.write(chunk); } catch { /* never crash the daemon */ } };
         if (child.stdout) { child.stdout.on('data', feed); child.stdout.on('error', () => {}); }
         if (child.stderr) { child.stderr.on('data', feed); child.stderr.on('error', () => {}); }
@@ -17620,12 +17914,7 @@ async function runSupervisorDaemon() {
         // #202 drain-remove: a worker flagged for removal has now drained and
         // exited — delete it and announce its removal (mirrors the synchronous
         // force-remove path). Do this before persist() so the state reflects it.
-        if (w.removeOnExit && workers.get(w.id) === w) {
-          workers.delete(w.id);
-          try { rmSync(w.activityFile || supervisorWorkerActivityFile(w.id), { force: true }); } catch { /* best effort */ }
-          dlog(`worker '${w.id}' removed (drained)`);
-          broadcast({ type: 'event', event: 'worker-remove', id: w.id });
-        }
+        if (w.removeOnExit && workers.get(w.id) === w) finishDrainRemove(w);
         persist();
         // #202: during a graceful drain, push a fresh status so an attached
         // `stop` client sees the in-flight count shrink as each worker finishes
@@ -17644,6 +17933,15 @@ async function runSupervisorDaemon() {
         w.configFailed = true;
         dlog(`worker '${w.id}' refused to start (configuration failure, exit ${NANO_EXIT_CONFIG}); NOT restarting — fix the profile and restart it`);
         broadcast({ type: 'event', event: 'worker-config-error', worker: workerPublic(w) });
+        persist();
+        return;
+      }
+      // #340 review: a surged replacement that dies before it is adopted must
+      // NOT arm an automatic restart — the roll's rollback (abandonSurge) owns
+      // its fate and restores the old child; a stray timer could later clobber
+      // the restored child/pid and leave the original untracked.
+      if (w.surgeChild === child) {
+        dlog(`worker '${w.id}' surged replacement down (${reason}) before readiness; not restarting (the reload rolls back)`);
         persist();
         return;
       }
@@ -17726,7 +18024,10 @@ async function runSupervisorDaemon() {
       configFailed: rec.configFailed === true,
       adopted: true,
     };
-    w.activityFile = supervisorWorkerActivityFile(w.id);
+    // #340: honour a persisted per-spawn marker, but only inside the activity dir.
+    w.activityFile = (typeof rec.activityFile === 'string' && dirname(rec.activityFile) === getSupervisorActivityDir())
+      ? rec.activityFile
+      : supervisorWorkerActivityFile(w.id);
     // Clear any stale `.upgrade` sidecar the handoff left: the worker consumed
     // it to retarget its watchdog here, and a leftover would make a LATER
     // SIGUSR2 (a genuine drain) misread as another upgrade retarget.
@@ -17852,7 +18153,7 @@ async function runSupervisorDaemon() {
     for (const w of workers.values()) {
       if (!w.stopping || !w.pid || w.drainSignalledPid !== w.pid || !isPidAlive(w.pid)) continue;
       let act = null;
-      try { act = readWorkerActivity(w.id); } catch { act = null; }
+      try { act = readWorkerActivity(w.id, w.activityFile); } catch { act = null; }
       const step = stoppingWorkerEscalation({ worker: w, activity: act, now: Date.now(), idleMs: stoppingIdleMs, killGraceMs: STOP_GRACE_MS });
       w.stoppingIdle = step.state;
       if (step.action === 'term') {
@@ -17863,8 +18164,50 @@ async function runSupervisorDaemon() {
         try { process.kill(w.pid, 'SIGKILL'); } catch { /* gone */ }
       }
     }
+    // #340: the same escalation covers old-code children retiring after a surge.
+    for (const w of workers.values()) {
+      for (const old of Array.isArray(w.retiring) ? w.retiring : []) {
+        if (old.exited || !old.drainSignalledAt || !isPidAlive(old.pid)) continue;
+        let act = null;
+        try { act = readWorkerActivity(w.id, old.activityFile); } catch { act = null; }
+        const step = stoppingWorkerEscalation({ worker: { pid: old.pid, drainSignalledAt: old.drainSignalledAt, stoppingIdle: old.stoppingIdle }, activity: act, now: Date.now(), idleMs: stoppingIdleMs, killGraceMs: STOP_GRACE_MS });
+        old.stoppingIdle = step.state;
+        if (step.action === 'term') {
+          dlog(`worker '${w.id}' old-code child pid ${old.pid} has been stopping with no in-flight job for ${stoppingIdleMs}ms — sending SIGTERM (issue #340)`);
+          try { process.kill(old.pid, 'SIGTERM'); } catch { /* gone */ }
+        } else if (step.action === 'kill') {
+          try { process.kill(old.pid, 'SIGKILL'); } catch { /* gone */ }
+        }
+      }
+    }
   }, Math.min(15_000, Math.max(1_000, Math.floor(stoppingIdleMs / 4))));
   try { wedgeTimer.unref(); } catch { /* best effort */ }
+
+  // #340 review: live old-code children of a worker (surge reload).
+  const liveRetiring = (w) => (Array.isArray(w.retiring) ? w.retiring : []).filter((r) => r && !r.exited && isPidAlive(r.pid));
+  // Complete a drain-remove ONLY once the current child AND every retiring
+  // child have exited — otherwise a still-draining old child would vanish from
+  // status/shutdown accounting. Called from the death handler and when a
+  // retiring child exits.
+  const finishDrainRemove = (w) => {
+    if (!w.removeOnExit || workers.get(w.id) !== w) return;
+    if (w.pid && isPidAlive(w.pid)) return;
+    if (liveRetiring(w).length > 0) return;
+    workers.delete(w.id);
+    try { rmSync(w.activityFile || supervisorWorkerActivityFile(w.id), { force: true }); } catch { /* best effort */ }
+    dlog(`worker '${w.id}' removed (drained)`);
+    broadcast({ type: 'event', event: 'worker-remove', id: w.id });
+    persist();
+  };
+  // Stop a worker's retiring (old-code) children: graceful → drain + wait;
+  // force → SIGTERM, bounded wait, SIGKILL. Shared by stop/remove/shutdown.
+  const stopRetiringOf = (w, force) => liveRetiring(w).map((old) => (force
+    ? (async () => {
+      try { process.kill(old.pid, 'SIGTERM'); } catch { /* gone */ }
+      await Promise.race([old.exitPromise, new Promise((r) => { const t = setTimeout(r, STOP_GRACE_MS + FORCE_STOP_RECOVERY_MS); t.unref?.(); })]);
+      if (isPidAlive(old.pid)) { try { process.kill(old.pid, 'SIGKILL'); } catch { /* gone */ } }
+    })()
+    : drainRetiring(w, old)));
 
   const forceStopWorker = async (w) => {
     const pid = w.pid;
@@ -17891,13 +18234,13 @@ async function runSupervisorDaemon() {
       // loop, lets in-flight jobs finish, and exits on its own. Wait INDEFINITELY
       // — a `stop --force` escalation (forceStopWorker) is the only way to cut a
       // stuck drain short, and it resolves this same wait when the child dies.
-      if (w.child && pid) {
-        sendDrainSignal(w, pid);
-        await waitForChildExit(w.child, null);
-      }
+      await Promise.all([
+        (w.child && pid) ? (sendDrainSignal(w, pid), waitForChildExit(w.child, null)) : null,
+        ...stopRetiringOf(w, false),
+      ]);
       return true;
     }
-    await forceStopWorker(w);
+    await Promise.all([forceStopWorker(w), ...stopRetiringOf(w, true)]);
     return true;
   };
 
@@ -17915,13 +18258,16 @@ async function runSupervisorDaemon() {
       if (w.restartTimer) { clearTimeout(w.restartTimer); w.restartTimer = null; }
       const pid = w.pid;
       if (w.child && pid) { sendDrainSignal(w, pid); }
-      else { workers.delete(id); try { rmSync(supervisorWorkerActivityFile(id), { force: true }); } catch { /* best effort */ } broadcast({ type: 'event', event: 'worker-remove', id }); persist(); }
+      // #340 review: drain every retiring old-code child too; the record is
+      // kept until ALL of them have exited (finishDrainRemove).
+      for (const p of stopRetiringOf(w, false)) p.catch(() => {});
+      finishDrainRemove(w);
       dlog(`worker '${id}' draining for removal`);
       return true;
     }
     await stopWorker(id, { force: true });
     workers.delete(id);
-    try { rmSync(supervisorWorkerActivityFile(id), { force: true }); } catch { /* best effort */ }
+    try { rmSync(w.activityFile || supervisorWorkerActivityFile(id), { force: true }); } catch { /* best effort */ }
     dlog(`worker '${id}' removed`);
     broadcast({ type: 'event', event: 'worker-remove', id });
     persist();
@@ -17987,14 +18333,14 @@ async function runSupervisorDaemon() {
       // spawn has no `child.pid` to begin with), so a null `w.pid` for THIS still
       // -current child means the replacement is dead — stop waiting immediately.
       if (w.pid == null) return false;
-      const act = readWorkerActivity(w.id);
+      const act = readWorkerActivity(w.id, w.activityFile);
       // Require the marker to be from THIS replacement child (`act.pid === child.pid`)
       // AND carry a finite `readyAt` (#253): a stale marker left by a previous
       // incarnation must not pass this gate before the freshly spawned child has
       // reported ready — see activityMarkerReadyFor.
       if (activityMarkerReadyFor(act, child.pid)) return true;
       if (shuttingDown || Date.now() >= deadline) {
-        dlog(`worker '${w.id}' not ready within ${timeoutMs}ms after reload — advancing anyway`);
+        dlog(`worker '${w.id}' replacement not ready (polling ≥1 job type) within ${timeoutMs}ms`);
         return false;
       }
       // waitForChildExit doubles as a poll sleep: it resolves early if the child
@@ -18003,176 +18349,192 @@ async function runSupervisorDaemon() {
     }
   };
 
-  const reloadWorker = async (id) => {
-    const w = workers.get(id);
-    if (!w) return false;
-    const child = w.child;
-    w.stopping = true;
-    if (w.restartTimer) { clearTimeout(w.restartTimer); w.restartTimer = null; }
-    const pid = w.pid;
-    if (child && pid) {
-      sendDrainSignal(w, pid);
-      await waitForChildExit(child, null);
+  // #340: zero-capacity-loss rolling reload — SURGE, then DRAIN. For each target
+  // the daemon first starts a new-code replacement ALONGSIDE the current child
+  // (same worker id, its own per-spawn activity marker), waits until that
+  // replacement is genuinely polling (readyAt + ≥1 job type), and only THEN
+  // drains the old child. The old child is tracked in `w.retiring` until it
+  // exits (its jobs finish), so serving capacity never drops below the target.
+  // Idle workers swap at once; busy workers drain in PARALLEL (the roll ends when
+  // the longest in-flight job does). A replacement that never becomes ready is
+  // killed, its old worker is KEPT serving (never drained), and the roll stops
+  // and reports the failure. See `runSurgeRoll` for the pure orchestration.
+  const retiringExited = (w, old) => {
+    if (!Array.isArray(w.retiring) || !w.retiring.includes(old)) return;
+    w.retiring = w.retiring.filter((r) => r !== old);
+    if (old.activityFile && old.activityFile !== w.activityFile) {
+      try { rmSync(old.activityFile, { force: true }); } catch { /* best effort */ }
     }
-    // Only respawn if nobody else acted on this worker while we drained: it must
-    // still exist, we must not be shutting down, and its child handle must still
-    // be the one we drained (a concurrent restart/force-stop would have swapped
-    // it). The startWorker+guard runs under the op lock so it can't interleave
-    // with add/remove.
-    const started = await serializeOp(async () => {
-      const cur = workers.get(id);
-      if (!cur || cur !== w || shuttingDown || w.child !== child) return null;
-      w.stopping = false;
-      w.restarts = 0;
-      startWorker(w);
-      dlog(`worker '${id}' respawned (awaiting readiness before adopting new code)`);
-      return w.child;
-    });
-    if (!started) return false;
-    // `startWorker` returns the instant the child is forked — but the replacement
-    // still has to import the plugin, build its SDK client, and start its
-    // activation loop before it serves jobs. Signalling "reloaded" here lets
-    // `runReload` advance to drain the NEXT worker, so returning on the bare spawn
-    // could leave the just-respawned worker AND the next (draining) worker down at
-    // once, breaking the one-at-a-time guarantee (Copilot review on #253). Gate on
-    // the replacement stamping `readyAt` on its activity marker (it is up and
-    // leasing) before we return. Bounded so a slow/never-ready replacement can't
-    // wedge the roll — on timeout we advance anyway (degrading to spawn-and-advance).
-    await waitForWorkerReady(w, started, SUPERVISOR_RELOAD_READY_TIMEOUT_MS);
-    // Report reloaded only when the child we spawned is STILL this worker's live
-    // current child. `waitForWorkerReady` returns even when the replacement exited
-    // (crash/spawn-fail) or was swapped by a concurrent restart/remove — in those
-    // cases no replacement is actually running, so counting it as reloaded would
-    // let the terminal frame claim success and let the roll drain the next worker
-    // with this one down (#253 review). A readiness *timeout* on a still-live
-    // current child still counts as success — readiness is best-effort.
-    //
-    // Gate on the LIVE PID, not just object identity + null exit/signal: a spawn
-    // failure (ENOENT/EMFILE/…) emits only 'error' with NO 'exit', so
-    // `exitCode`/`signalCode` stay null and `w.child` keeps pointing at the failed
-    // ChildProcess until its backoff retry — the identity+exit check alone would
-    // count that as reloaded (#253 review). `handleDeath` nulls `w.pid` on every
-    // death (error OR exit), and a failed spawn has no `child.pid`, so requiring
-    // `w.pid` to be non-null AND still equal to this child's pid rejects both a
-    // failed spawn and a dead/retrying child while accepting a live replacement
-    // (readiness timeout included).
-    //
-    // Also reject `w.stopping`: a concurrent `remove`/`restart`/`stop` sets that
-    // flag (and clears the restart timer) BEFORE its kill signal lands, so for a
-    // brief window `w.child`/`w.pid` still point at the live replacement we just
-    // spawned. Counting that as reloaded would let the roll drain the NEXT worker
-    // while this one is being torn down — a partial-fleet outage. A worker being
-    // stopped has no confirmed serving replacement, so treat it as a failed
-    // reload (the `runReload` else-branch then aborts the roll, #253 review).
-    //
-    // Also reject `shuttingDown`: a `stop` can begin DURING this replacement's
-    // readiness wait, after which `waitForWorkerReady` still returns and (for a
-    // last target) `w.stopping` may not be latched yet — so without this the gate
-    // would report a clean reload while shutdown is already tearing the fleet
-    // down. A daemon that is shutting down has no serving future for this worker,
-    // so treat a shutdown observed before the gate as a failed/interrupted reload
-    // (the `runReload` else-branch aborts the roll, #253 review).
-    return w.child === started && !w.stopping && !shuttingDown && w.pid != null && w.pid === started.pid
-      && started.exitCode === null && started.signalCode === null;
+    dlog(`worker '${w.id}' old-code child pid ${old.pid} exited (drained)`);
+    finishDrainRemove(w);
+    persist();
+    if (!shuttingDown) { try { broadcast(statusFrame(false)); } catch { /* best effort */ } }
+  };
+  const surgeWorker = (id) => serializeOp(async () => {
+    const w = workers.get(id);
+    if (!w || w.stopping || shuttingDown || upgrading) return null;
+    // #340 review: refuse to surge a worker whose upgrade watchdog-retarget is
+    // still outstanding. Surging swaps `w.pid`, so the successor's handoff loop
+    // would drop the still-live original from `retargetPending` and could
+    // release the predecessor (its watchdog target) mid-job → self-reap.
+    if (retargetPending.has(id)) return null;
+    let old = null;
+    if (w.child && w.pid && isPidAlive(w.pid)) {
+      const oldChild = w.child;
+      const oldPid = w.pid;
+      old = { child: oldChild, pid: oldPid, activityFile: w.activityFile || supervisorWorkerActivityFile(w.id), sinceMs: Date.now(), exited: false, drainSignalledAt: null, stoppingIdle: null, adoptTimer: w.adoptTimer || null };
+      old.exitPromise = new Promise((resolve) => {
+        let poll = null;
+        const done = () => {
+          if (old.exited) return;
+          old.exited = true;
+          if (poll) { try { clearInterval(poll); } catch { /* ignore */ } }
+          if (old.adoptTimer) { try { clearInterval(old.adoptTimer); } catch { /* ignore */ } }
+          if (typeof oldChild.markExited === 'function') { try { oldChild.markExited(1, null); } catch { /* ignore */ } }
+          retiringExited(w, old);
+          resolve();
+        };
+        try { oldChild.once('exit', done); } catch { /* adopted handle */ }
+        // An ADOPTED child has no real exit event once it is no longer current
+        // (its liveness poll feeds the now-stale death handler) — poll the pid.
+        poll = setInterval(() => { if (!isPidAlive(oldPid)) done(); }, SUPERVISOR_ADOPT_POLL_MS);
+        if (typeof poll.unref === 'function') poll.unref();
+      });
+      if (old.adoptTimer) w.adoptTimer = null;
+      w.retiring = [...(Array.isArray(w.retiring) ? w.retiring : []), old];
+    }
+    if (w.restartTimer) { clearTimeout(w.restartTimer); w.restartTimer = null; }
+    w.restarts = 0;
+    w.adopted = false;
+    startWorker(w, { fresh: true });
+    w.surgeChild = w.child; // suppress auto-restart until adopted (see handleDeath)
+    dlog(`worker '${id}' surged: new-code replacement pid ${w.pid}${old ? ` alongside old pid ${old.pid}` : ''} (awaiting readiness before draining the old child)`);
+    return { w, child: w.child, old };
+  });
+  const waitSurgeReady = async (id, h) => {
+    const { w, child } = h;
+    await waitForWorkerReady(w, child, reloadReadyTimeoutMsFor(w.args));
+    // Ready only when the replacement is STILL this worker's live current child,
+    // nobody is stopping it, and its marker proves it polls ≥1 job type.
+    const ready = workers.get(id) === w && w.child === child && !w.stopping && !shuttingDown
+      && w.pid != null && w.pid === child.pid && child.exitCode === null && child.signalCode === null
+      && activityMarkerReadyFor(readWorkerActivity(w.id, w.activityFile), child.pid);
+    // Adopted: normal restart-on-death applies from here on.
+    if (ready && w.surgeChild === child) w.surgeChild = null;
+    return ready;
+  };
+  const abandonSurge = (id, h, why) => serializeOp(async () => {
+    const { w, child, old } = h;
+    dlog(`worker '${id}' replacement pid ${child.pid ?? '?'} ${why} within ${reloadReadyTimeoutMsFor(w.args)}ms — keeping the old child serving and aborting the roll`);
+    if (w.surgeChild === child) w.surgeChild = null;
+    // #340 review: cancel any pending replacement retry BEFORE restoring, so a
+    // stale timer can never overwrite the restored child/pid.
+    if (w.restartTimer) { clearTimeout(w.restartTimer); w.restartTimer = null; }
+    // If a stop/remove/shutdown already owns this worker, do NOT roll back:
+    // that operation awaits the old child's retirement (exitPromise) and
+    // bookkeeping, which a rollback would detach and hang.
+    if (w.stopping || w.removeOnExit || shuttingDown || upgrading || workers.get(id) !== w) return;
+    if (!old || old.exited || !isPidAlive(old.pid) || w.child !== child) {
+      // No old child to restore: if the replacement is dead and still current,
+      // fall back to the ordinary restart so the worker is not left down.
+      if (w.child === child && !(w.pid && isPidAlive(w.pid))) startWorker(w);
+      return;
+    }
+    // Revert: the old child becomes current again (its own death handler is
+    // live again because `w.child === oldChild`), then kill the replacement —
+    // its death handler is now stale and ignores the exit.
+    const newFile = w.activityFile;
+    w.retiring = (w.retiring || []).filter((r) => r !== old);
+    w.child = old.child;
+    w.pid = old.pid;
+    w.activityFile = old.activityFile;
+    if (old.adoptTimer) { w.adoptTimer = old.adoptTimer; old.adoptTimer = null; }
+    old.exited = true; // detach the retiring watcher
+    const pid = child.pid;
+    if (pid) {
+      try { process.kill(pid, 'SIGTERM'); } catch { /* gone */ }
+      await waitForChildExit(child, STOP_GRACE_MS);
+      if (isPidAlive(pid)) { try { process.kill(pid, 'SIGKILL'); } catch { /* gone */ } }
+    }
+    try { rmSync(newFile, { force: true }); } catch { /* best effort */ }
+    persist();
+  });
+  const drainRetiring = async (w, old) => {
+    if (!old || old.exited) return;
+    if (!old.drainSignalledAt) {
+      old.drainSignalledAt = Date.now();
+      dlog(`worker '${w.id}' draining old-code child pid ${old.pid} (replacement pid ${w.pid} is serving)`);
+      sendDrainSignal(w, old.pid);
+    }
+    await old.exitPromise;
+  };
+  const workerIsIdle = (id) => {
+    const w = workers.get(id);
+    if (!w || !w.pid || !isPidAlive(w.pid)) return true;
+    const act = readWorkerActivity(w.id, w.activityFile);
+    if (!act || act.pid !== w.pid) return false; // unknown → treat as busy (bounded surge)
+    return !(Array.isArray(act.jobs) && act.jobs.some((j) => j && !j.settlementPending));
+  };
+  // #340 review: ids of workers with a live old-code child still draining.
+  const liveRetiringIds = () => [...workers.values()]
+    .filter((w) => (Array.isArray(w.retiring) ? w.retiring : []).some((r) => r && !r.exited && isPidAlive(r.pid)))
+    .map((w) => w.id);
+  // Stop every retiring (old-code) child — used by shutdown. Graceful: make sure
+  // each has been asked to drain and wait for it; force: SIGTERM → SIGKILL.
+  const stopRetiring = async (force) => {
+    await Promise.all([...workers.values()].flatMap((w) => stopRetiringOf(w, force)));
   };
 
-  // Rolling hot reload across a set of worker ids: drain+respawn each in turn
-  // (one at a time, so the rest of the fleet keeps serving). Streams progress to
-  // `sock` (registered as an attach consumer for the interleaved worker events)
-  // and ends with a terminal `reloaded` frame. Aborts early if the daemon starts
-  // shutting down. Never clears `supervisor.json` — a reload is not a stop.
-  const runReload = async (ids, sock) => {
+  // Rolling hot reload across a set of worker ids (#340 surge-then-drain).
+  // Streams progress to `sock` (registered as an attach consumer for the
+  // interleaved worker events) and ends with a terminal `reloaded` frame.
+  // Never clears `supervisor.json` — a reload is not a stop.
+  const runReload = async (ids, sock, { surge = 1 } = {}) => {
     reloading = true;
     reloadTargets = [...ids];
     reloadDone = [];
     reloadCurrent = null;
-    const reloaded = [];
-    const skipped = [];
-    let interrupted = false;
+    let res = { adopted: [], failed: [], skipped: [], interrupted: false };
+    let crashed = false;
     try {
-      for (let i = 0; i < ids.length; i++) {
-        const id = ids[i];
-        reloadCurrent = id;
-        // Broadcast (not just to the initiating socket) on every target
-        // transition so every attached console sees the drain progress and the
-        // "do not restart the daemon" warning even with periodic monitoring
-        // disabled (NANO_SUPERVISOR_MONITOR_MS=0). The initiator is itself an
-        // attach client, so it is covered too.
-        if (!shuttingDown) {
-          try { broadcast(statusFrame(false)); } catch { /* best effort */ }
-        }
-        // If the daemon starts shutting down mid-roll, the remaining workers
-        // never adopt the new code — record them as skipped (and flag the roll
-        // interrupted) so the terminal frame can't report a clean success for a
-        // pass that stopped early.
-        if (shuttingDown) {
-          interrupted = true;
-          for (let j = i; j < ids.length; j++) skipped.push(ids[j]);
-          break;
-        }
-        // A target that has vanished mid-roll (only `remove`/drain-remove deletes
-        // the entry — `restart` keeps it) has NO confirmed serving replacement,
-        // exactly like the reload-failure branch below. Continuing to drain the
-        // NEXT worker on top of that gap is the same partial-fleet risk the canary
-        // exists to prevent, so treat a removed-mid-roll target uniformly: mark it
-        // and every remaining id skipped and abort the roll (#253 review).
-        if (!workers.has(id)) {
-          interrupted = true;
-          for (let j = i; j < ids.length; j++) skipped.push(ids[j]);
-          break;
-        }
-        const ok = await reloadWorker(id);
-        if (ok) {
-          reloaded.push(id);
+      if (!shuttingDown) { try { broadcast(statusFrame(false)); } catch { /* best effort */ } }
+      res = await runSurgeRoll(ids, {
+        isIdle: workerIsIdle,
+        surge: async (id) => { reloadCurrent = id; return surgeWorker(id); },
+        waitReady: waitSurgeReady,
+        abandon: abandonSurge,
+        drainOld: (id, h) => drainRetiring(h.w, h.old),
+        // A pending upgrade retarget (#340 review) also aborts: the worker is
+        // reported SKIPPED (retry the reload once the handoff completes).
+        shouldAbort: (id) => shuttingDown || upgrading || retargetPending.has(id) || !workers.has(id) || workers.get(id).stopping === true,
+        onAdopted: (id) => {
           reloadDone.push(id);
-          reloadCurrent = null;
-          // Emit the per-worker "reloaded" progress signal ONLY after the final
-          // success gate above confirmed a live, still-current replacement — not
-          // at spawn time. A crash/spawn-fail makes `reloadWorker` return false
-          // and the worker is skipped, so broadcasting at spawn time would let the
-          // streaming client print `reloaded "…" (adopted new code)` for a reload
-          // that actually failed (#253 review).
+          if (reloadCurrent === id) reloadCurrent = null;
           broadcast({ type: 'event', event: 'worker-reload', id });
-        }
-        else {
-          // A reload FAILURE (not a mere readiness timeout — that returns true on
-          // a still-live child) means this worker has NO confirmed serving
-          // replacement: it crashed, failed to spawn, or was concurrently swapped.
-          // Draining the NEXT worker on top of that gap breaks the one-at-a-time
-          // guarantee AND could roll a broken replacement across the whole fleet.
-          // Stop the roll here (a canary), marking this + every remaining id
-          // skipped so the terminal frame reports a partial failure (#253 review).
-          interrupted = true;
-          for (let j = i; j < ids.length; j++) skipped.push(ids[j]);
-          break;
-        }
-        try { broadcast(statusFrame(false)); } catch { /* best effort */ }
-      }
+          try { broadcast(statusFrame(false)); } catch { /* best effort */ }
+        },
+      }, { surge });
     } catch (err) {
-      interrupted = true;
+      crashed = true;
       dlog(`reload error: ${err?.message || err}`);
     } finally {
       reloading = false;
       reloadCurrent = null;
       reloadTargets = [];
       reloadDone = [];
-      // Clearing the progress flags may not change the monitor signature (it may
-      // already have sampled the final replacement mid-readiness-wait), and the
-      // terminal `reloaded` frame goes only to the initiating socket — so push a
-      // fresh status to every attached console now, or they could keep showing
-      // the "rolling … do not restart the daemon" line after completion.
       if (!shuttingDown && attachClients.size > 0) {
         try { broadcast(statusFrame(false)); } catch { /* best effort */ }
       }
-      // Terminal success requires BOTH a clean pass (not interrupted) AND nothing
-      // skipped: a skipped worker (failed reload, or removed/absent mid-roll) is a
-      // partial reload, so `ok: true` would let the streaming client exit zero and
-      // hide it from automation (#253 review). Propagate the partial failure.
+      const failedIds = res.failed.map((f) => f.id);
+      const skipped = [...failedIds, ...res.skipped];
+      const reloaded = res.adopted;
+      // Anything neither adopted nor reported (a crash mid-roll) is skipped too.
+      for (const id of ids) if (!reloaded.includes(id) && !skipped.includes(id)) skipped.push(id);
+      const interrupted = crashed || res.interrupted || shuttingDown;
       const ok = !interrupted && skipped.length === 0;
-      try { sock.write(encodeFrame({ ok, type: 'reloaded', reloaded, skipped, interrupted, final: true })); } catch { /* client gone */ }
+      try { sock.write(encodeFrame({ ok, type: 'reloaded', reloaded, skipped, failed: res.failed, interrupted, final: true })); } catch { /* client gone */ }
     }
   };
-
 
   // Resolve a target token to worker ids: exact id, else all with that profile.
   const resolveTargets = (target) => {
@@ -18237,7 +18599,7 @@ async function runSupervisorDaemon() {
         forcing = true;
         dlog('stop --force received during drain — escalating to hard abort');
         broadcast({ type: 'event', event: 'draining-escalated' });
-        await Promise.all([...workers.values()].map((w) => forceStopWorker(w)));
+        await Promise.all([...[...workers.values()].map((w) => forceStopWorker(w)), stopRetiring(true)]);
       }
       return;
     }
@@ -18249,7 +18611,7 @@ async function runSupervisorDaemon() {
     try { await opQueue; } catch { /* mutation already logged */ }
     dlog(`received ${signal || 'stop'} — ${force ? 'stopping' : 'draining'} ${workers.size} worker(s)`);
     if (!force) broadcast({ type: 'event', event: 'draining', workers: [...workers.values()].map(workerPublic) });
-    await Promise.all([...workers.keys()].map((id) => stopWorker(id, { force })));
+    await Promise.all([...[...workers.keys()].map((id) => stopWorker(id, { force })), stopRetiring(force)]);
     if (monitorTimer) { try { clearInterval(monitorTimer); } catch { /* ignore */ } monitorTimer = null; }
     if (quiesceKeepalive) { try { clearInterval(quiesceKeepalive); } catch { /* ignore */ } quiesceKeepalive = null; }
     broadcast({ type: 'event', event: 'daemon-stop' });
@@ -18345,6 +18707,12 @@ async function runSupervisorDaemon() {
       // settle before snapshotting, so the successor adopts its replacement.
       try { await opQueue; } catch { /* mutation already logged */ }
       if (!upgrading) return; // rolled back while draining the queue
+      if (liveRetiringIds().length > 0) {
+        rollbackFromUpgrade(successorPid, 'old-code children are still draining after a reload');
+        const err = new Error(`worker(s) ${liveRetiringIds().join(', ')} still have old-code children draining after a reload — retry the daemon upgrade once they exit`);
+        err.code = 'UPGRADE_RETIRING_BUSY';
+        throw err;
+      }
       upgradeInfo = { ...upgradeInfo, state: 'quiesced' };
       quiesceSnapshotIds = [...workers.keys()];
       // the deliberate quiesce snapshot the successor adopts from. #331 review:
@@ -18468,12 +18836,19 @@ async function runSupervisorDaemon() {
           // other) so two racing successors can never both win the fleet.
           if (shuttingDown) { sock.write(encodeFrame({ ok: false, error: 'supervisor is shutting down', final: true })); break; }
           if (reloading) { sock.write(encodeFrame({ ok: false, error: 'a worker reload is in progress — retry the daemon upgrade once it finishes', final: true })); break; }
+          // #340 review: old-code children still draining after a surge are not
+          // part of the persisted inventory, so a successor could neither adopt
+          // nor stop them. Refuse the handoff until every retiring child exits.
+          if (!upgrading && liveRetiringIds().length > 0) {
+            sock.write(encodeFrame({ ok: false, code: 'UPGRADE_RETIRING_BUSY', error: `worker(s) ${liveRetiringIds().join(', ')} still have old-code children draining after a reload — retry the daemon upgrade once they exit`, final: true }));
+            break;
+          }
           // #331 review: reject BEFORE quiescing when a live worker predates the
           // `signalReadyAt` stamp — the successor's retarget gate could never
           // signal it, leaving the handoff (and stop/remove) blocked forever.
           if (!upgrading) {
             const incompatible = [...workers.values()]
-              .filter((w) => w && w.pid && isPidAlive(w.pid) && workerPredatesSignalReady(readWorkerActivity(w.id), w.pid))
+              .filter((w) => w && w.pid && isPidAlive(w.pid) && workerPredatesSignalReady(readWorkerActivity(w.id, w.activityFile), w.pid))
               .map((w) => w.id);
             if (incompatible.length > 0) {
               sock.write(encodeFrame({ ok: false, code: 'UPGRADE_INCOMPATIBLE_WORKERS', error: `worker(s) ${incompatible.join(', ')} predate the signal-readiness handshake and cannot be handed over — run \`supervisor reload\` first, then retry the daemon upgrade`, final: true }));
@@ -18484,6 +18859,7 @@ async function runSupervisorDaemon() {
             await quiesceForUpgrade(Number(req.pid) || null, typeof req.version === 'string' ? req.version : null);
           } catch (err) {
             if (err && err.code === 'UPGRADE_BOUND') { sock.write(encodeFrame({ ok: false, error: err.message, final: true })); break; }
+            if (err && err.code === 'UPGRADE_RETIRING_BUSY') { sock.write(encodeFrame({ ok: false, code: err.code, error: err.message, final: true })); break; }
             if (err && err.code === 'UPGRADE_SNAPSHOT_FAILED') { sock.write(encodeFrame({ ok: false, code: err.code, error: err.message, final: true })); break; }
             throw err;
           }
@@ -18587,7 +18963,9 @@ async function runSupervisorDaemon() {
           attachClients.add(sock);
           sock.write(encodeFrame({ ok: true, type: 'reloading', targets: ids }));
           sock.write(encodeFrame(statusFrame(false)));
-          setTimeout(() => { runReload(ids, sock); }, 0);
+          // #340: surge size — request field (`--surge N|all`), else env, else 1.
+          const surge = parseReloadSurge(req.surge, parseReloadSurge(process.env[SUPERVISOR_RELOAD_SURGE_ENV], 1));
+          setTimeout(() => { runReload(ids, sock, { surge }); }, 0);
           break;
         }
         case 'attach':
@@ -18621,7 +18999,7 @@ async function runSupervisorDaemon() {
             // would wrongly record "reloaded". Skipped workers land in `failed`
             // so `ok` stays honest; they pick up the fresh token at their own
             // startup prime.
-            if (!reloadCredentialsReady(w, alive ? readWorkerActivity(id) : null, alive)) { failed.push(id); continue; }
+            if (!reloadCredentialsReady(w, alive ? readWorkerActivity(id, w.activityFile) : null, alive)) { failed.push(id); continue; }
             try { process.kill(w.pid, 'SIGUSR1'); signaled.push(id); }
             catch { failed.push(id); }
           }
@@ -18933,7 +19311,7 @@ async function runSupervisorDaemon() {
         // Draining for stop/remove: the process is already gone, so the removal
         // completes here — delete the record rather than resurrect it.
         dlog(`upgrade: worker '${rec.id}' was draining for removal and is gone — record dropped`);
-        try { rmSync(supervisorWorkerActivityFile(rec.id), { force: true }); } catch { /* best effort */ }
+        try { rmSync((typeof rec.activityFile === 'string' && dirname(rec.activityFile) === getSupervisorActivityDir()) ? rec.activityFile : supervisorWorkerActivityFile(rec.id), { force: true }); } catch { /* best effort */ }
         continue;
       }
       // Down but eligible (a crash/backoff the predecessor had not yet
@@ -19025,7 +19403,7 @@ async function runSupervisorDaemon() {
         for (const [id, p] of [...pending]) {
           const w = workers.get(id);
           if (!w || w.pid !== p.pid || !isPidAlive(p.pid)) { pending.delete(id); continue; }
-          const act = readWorkerActivity(id);
+          const act = readWorkerActivity(id, w.activityFile);
           if (p.drainOnly) {
             // Draining, not retargeting: a deferred drain request (below) is
             // delivered once the handler is provably installed; then just wait
@@ -19066,7 +19444,7 @@ async function runSupervisorDaemon() {
       // one-shot handler and kill in-flight work.
       for (const [id, p] of pending) {
         if (!p.drainDeferred || !isPidAlive(p.pid)) continue;
-        if (p.drainOnly && drainSignalReadyFor(readWorkerActivity(id), p.pid)) {
+        if (p.drainOnly && drainSignalReadyFor(readWorkerActivity(id, workers.get(id)?.activityFile), p.pid)) {
           deliverDrainOnce(workers.get(id), p.pid);
         } else {
           dlog(`upgrade: deferred drain for worker '${id}' not delivered (retarget unacknowledged or handler not ready) — re-issue stop/remove once it settles`);
@@ -19472,13 +19850,14 @@ async function streamSupervisorReload(socketPath, req, logger, { label = 'fleet'
             if (reloaded.length > 0) logger.info(`Reloaded ${reloaded.length} worker(s): ${reloaded.join(', ')}.`);
             else logger.warn('No workers were reloaded.');
             if (skipped.length > 0) logger.warn(`Skipped (gone/changed, or roll aborted after a failed reload): ${skipped.join(', ')}.`);
+            for (const f of Array.isArray(frame.failed) ? frame.failed : []) { if (f && f.id) logger.warn(`  ${f.id}: ${f.reason || 'reload failed'} — its old worker was kept serving.`); }
             finish(frame.ok === false ? 'error' : 'reloaded');
             return;
           }
           if (frame.ok === false) { logger.error(frame.error || 'reload failed'); finish('error'); return; }
           if (frame.type === 'reloading') {
             const n = Array.isArray(frame.targets) ? frame.targets.length : 0;
-            logger.info(`Reloading ${n} worker(s) in ${label} one at a time (draining in-flight jobs first). Press Ctrl-C to detach.`);
+            logger.info(`Reloading ${n} worker(s) in ${label}: surge-then-drain — each new-code replacement must be polling before its old worker drains; idle workers swap at once, busy ones drain in parallel. Press Ctrl-C to detach.`);
           } else if (frame.event === 'worker-reload' && frame.id) {
             logger.info(`  reloaded "${frame.id}" (adopted new code).`);
           }
@@ -19499,14 +19878,14 @@ async function streamSupervisorReload(socketPath, req, logger, { label = 'fleet'
  * the supervisor daemon itself is rolled separately, without stopping the
  * fleet, by `supervisor upgrade` (issue #309).
  */
-async function supervisorReloadCmd(req) {
+async function supervisorReloadCmd(req, flags) {
   const logger = getLogger();
   // Default to the whole fleet: "adopt new code" naturally means every worker.
   const target = req.positional[1] || 'all';
   const running = await liveSupervisor();
   if (!running) { logger.error('Supervisor is not running.'); process.exit(1); }
   const socketPath = running.socket || getSupervisorSocketPath();
-  const outcome = await streamSupervisorReload(socketPath, { op: 'reload', target }, logger, { label: 'the fleet' });
+  const outcome = await streamSupervisorReload(socketPath, { op: 'reload', target, ...(flags?.surge != null && flags.surge !== '' ? { surge: String(flags.surge) } : {}) }, logger, { label: 'the fleet' });
   if (outcome === 'unreachable') { logger.error('Could not reach the supervisor control socket to reload it.'); process.exit(1); }
   if (outcome === 'closed') { logger.error('The supervisor closed the connection before the reload finished (daemon crash or concurrent stop?) — the roll may be incomplete. Rerun `nano supervisor status` to check the fleet.'); process.exit(1); }
   if (outcome === 'error') process.exit(1);
@@ -20645,7 +21024,7 @@ async function supervisorCommand(req, flags, ctx) {
       // `reload --daemon` is the daemon-upgrade alias (issue #309): the plain
       // op rolls WORKER code; this rolls the daemon process itself.
       if (flags?.daemon) { await supervisorUpgradeCmd(); return; }
-      await supervisorReloadCmd(req);
+      await supervisorReloadCmd(req, flags);
       return;
     case 'upgrade':
       await supervisorUpgradeCmd();
@@ -21643,7 +22022,7 @@ async function workforceReloadCmd(req, flags, manifestName) {
     .map((w) => w.id);
   if (owned.length === 0) { logger.info(`No workers from workforce "${manifestName}" are running.`); return; }
   const socketPath = running.socket || getSupervisorSocketPath();
-  const outcome = await streamSupervisorReload(socketPath, { op: 'reload', targets: owned }, logger, { label: `workforce "${manifestName}"` });
+  const outcome = await streamSupervisorReload(socketPath, { op: 'reload', targets: owned, ...(flags?.surge != null && flags.surge !== '' ? { surge: String(flags.surge) } : {}) }, logger, { label: `workforce "${manifestName}"` });
   if (outcome === 'unreachable') { logger.error('Could not reach the supervisor control socket to reload it.'); process.exit(1); }
   if (outcome === 'closed') { logger.error('The supervisor closed the connection before the reload finished (daemon crash or concurrent stop?) — the roll may be incomplete. Rerun `nano supervisor status` to check the fleet.'); process.exit(1); }
   if (outcome === 'error') process.exit(1);
@@ -23587,6 +23966,7 @@ export {
   decodeFrames,
   formatDuration,
   summarizeSupervisorWorker,
+  formatSupervisorDrainLines,
   formatSupervisorStatus,
   statusFromState,
   stateFromStatus,
@@ -23611,6 +23991,8 @@ export {
   incompatibleSnapshotWorkers,
   unknownSnapshotWorkers,
   classifySnapshotCompat,
+  snapshotRecActivityFile,
+  reloadReadyTimeoutMsFor,
   awaitSnapshotCompat,
   reloadCredentialsReady,
   waitForChildExit,
@@ -23820,6 +24202,7 @@ export const commands = {
       worker: { type: 'string', multiple: true, description: 'supervisor start: profile to launch as a supervised worker (repeatable)' },
       instances: { type: 'string', description: `supervisor add / workforce add: spawn/compose N distinct instances of the profile in one call (default 1, max ${MAX_ADD_INSTANCES}; for supervisor add cannot combine with --name)` },
       attach: { type: 'boolean', description: 'supervisor start: attach the interactive console after starting the daemon' },
+      surge: { type: 'string', description: 'supervisor/workforce reload: how many BUSY workers may have a new-code replacement booting at once (surge-then-drain; default 1, or `all`). Idle workers always swap at once (issue #340)' },
       daemon: { type: 'boolean', description: 'supervisor reload: roll the DAEMON process itself onto the on-disk code (alias of `supervisor upgrade`) instead of rolling worker code' },
       manifest: { type: 'string', description: `workforce: manifest name to operate on (default ${DEFAULT_WORKFORCE_MANIFEST}); each subcommand reads/writes <stateHome>/workforce/<name>.json. Renamed from --profile (which now collides with c8ctl's global connection-profile flag).` },
       roles: { type: 'string', description: 'workforce add: comma-separated role list for the entry (→ --job-type <rank>:<role> at start); mutually exclusive with --auto' },

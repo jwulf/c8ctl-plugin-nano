@@ -432,6 +432,10 @@ SDK client (job workers) — do **not** add the SDK as a dependency or use raw
   fiber's sockets can keep the loop alive). `finished` (teardown started) is distinct
   from `exited` (resolved), so a SIGTERM/SIGINT during a stuck graceful teardown exits
   immediately instead of being ignored; signal handlers use `on`, not `once`.
+  Root cause: `superviseAgentic`/`acquireAgentic` retried the agentic `connect`
+  forever inside an `acquireRelease` ACQUIRE, which Effect runs uninterruptibly, so
+  an unreachable hub made the runtime interrupt wait forever. The acquire is now
+  wrapped in `Effect.interruptible` (`supervisor/test/teardown-328.test.ts`).
 - **Hot code reload (rolling drain+respawn).** `supervisor reload [target]` (and
   `workforce reload`) adopt updated on-disk plugin code into the running fleet
   with **zero fleet downtime**: the daemon rolls through the target workers (default

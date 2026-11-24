@@ -152,6 +152,11 @@ export function typesWithSlots(state: RegistryState): ReadonlyArray<{ type: stri
 
 /** Pick an idle worker able to service `type`, or `null` if none is free. */
 export function pickWorkerFor(state: RegistryState, type: string): string | null {
+  // #339 review: a quiescing (draining) registry refuses every NEW claim — an
+  // activation already in flight when the drain latched (or a parked job) can no
+  // longer start a job after the worker has acknowledged idleness; the job is
+  // parked/lapses and is redelivered elsewhere.
+  if (state.quiescing) return null;
   for (const w of state.workers.values()) {
     if (w.types.has(type) && w.active < w.capacity) return w.id;
   }

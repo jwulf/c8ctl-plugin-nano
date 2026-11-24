@@ -8,6 +8,7 @@ import {
   makeRegistry,
   pickWorkerFor,
   serviceableTypes,
+  setQuiesce,
   typesWithCapacity,
   typesWithSlots,
 } from "../src/registry.ts";
@@ -126,4 +127,24 @@ test("activeCount tracks in-flight claims so a drain can await zero (issue #202)
       assert.equal(yield* reg.activeCount, 0);
     }),
   );
+});
+
+test("#339 review: a quiescing registry refuses late claims (no job starts after the idle ack)", async () => {
+
+  await Effect.runPromise(
+    Effect.gen(function* () {
+      const reg = yield* makeRegistry();
+      yield* reg.add("w1", ["a"], 2);
+      yield* reg.quiesce();
+      assert.equal(yield* reg.claim("a"), null);
+      assert.equal(yield* reg.activeCount, 0);
+      yield* reg.quiesce(false);
+      assert.equal(yield* reg.claim("a"), "w1");
+    }),
+  );
+});
+
+test("#339 review: pickWorkerFor returns null while quiescing", () => {
+  const s = setQuiesce(addWorker(emptyRegistry, "w1", ["a"]), true);
+  assert.equal(pickWorkerFor(s, "a"), null);
 });

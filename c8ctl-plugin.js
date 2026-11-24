@@ -571,6 +571,50 @@ function supervisorWorkerActivityFile(id) {
   return join(getSupervisorActivityDir(), `${id}.json`);
 }
 
+// #339: how long a drained (SIGUSR2'd) worker may sit in `stopping` with NO
+// in-flight job before the daemon escalates SIGTERM → SIGKILL. Longer than the
+// worker's own guards (drain-stuck + teardown + exit backstop) so it only fires
+// when those failed too.
+export const SUPERVISOR_STOPPING_IDLE_ENV = 'NANO_SUPERVISOR_STOPPING_IDLE_MS';
+export const DEFAULT_SUPERVISOR_STOPPING_IDLE_MS = 180_000;
+export function supervisorStoppingIdleMs(env = process.env) {
+  const n = Number.parseInt(env?.[SUPERVISOR_STOPPING_IDLE_ENV] ?? '', 10);
+  return Number.isFinite(n) && n > 0 ? n : DEFAULT_SUPERVISOR_STOPPING_IDLE_MS;
+}
+/**
+ * #339: pure escalation step for a draining worker. `worker.stoppingIdle` is the
+ * previous state `{ since, termAt }` (or null). FAIL CLOSED: time only counts as
+ * idle when the marker is TRUSTED — it belongs to this pid AND was written at or
+ * after the drain signal (`worker.drainSignalledAt`; the worker republishes its
+ * marker on receipt). A missing/unreadable, foreign-pid or stale marker (e.g. a
+ * best-effort write that failed on a full disk) resets the clock, as does a
+ * trusted marker listing a running (non-settlementPending) job — a draining worker
+ * that may be mid-job is never force-aborted. Returns `{ action, state }`.
+ */
+export function stoppingWorkerEscalation({ worker, activity, now, idleMs, killGraceMs }) {
+  const prev = worker?.stoppingIdle || null;
+  const own = !!activity && worker?.pid != null && activity.pid === worker.pid;
+  const signalledAt = worker?.drainSignalledAt;
+  // Review on #341: activity writes are best-effort, so a merely fresh own-pid
+  // marker with no jobs is NOT proof of idleness (a failed publish during a job
+  // leaves an old empty marker). Require the worker's explicit post-quiesce idle
+  // acknowledgement (`drainIdleAt`, stamped only while draining with no local
+  // job), at or after the drain signal. Missing/foreign/malformed/pre-drain → none.
+  const idleAt = own ? activity.drainIdleAt : undefined;
+  const fresh = own && Number.isFinite(activity.updatedAt) && Number.isFinite(idleAt)
+    && (!Number.isFinite(signalledAt) || (activity.updatedAt >= signalledAt && idleAt >= signalledAt));
+  if (!fresh) return { action: 'none', state: null };
+  const busy = Array.isArray(activity.jobs) && activity.jobs.some((j) => j && !j.settlementPending);
+  if (busy) return { action: 'none', state: null };
+  const since = prev?.since ?? now;
+  if (prev?.termAt != null) {
+    if (now - prev.termAt >= killGraceMs && !prev.killed) return { action: 'kill', state: { ...prev, killed: true } };
+    return { action: 'none', state: prev };
+  }
+  if (now - since >= idleMs) return { action: 'term', state: { since, termAt: now } };
+  return { action: 'none', state: { since } };
+}
+
 /**
  * Read a worker's activity marker. Returns the parsed object, or `null` when the
  * file is absent (worker not reporting yet, or a standalone/older worker) or
@@ -11282,6 +11326,47 @@ export function workerTeardownTimeoutMs(env = process.env) {
   const n = Number.parseInt(env?.[WORKER_TEARDOWN_TIMEOUT_ENV] ?? '', 10);
   return Number.isFinite(n) && n > 0 ? n : DEFAULT_WORKER_TEARDOWN_TIMEOUT_MS;
 }
+// #339: bound how long a drain may wait on an in-flight count the worker itself
+// no longer backs with a running job (a leaked registry counter).
+export const WORKER_DRAIN_STUCK_ENV = 'NANO_WORKER_DRAIN_STUCK_MS';
+export const DEFAULT_WORKER_DRAIN_STUCK_MS = 60_000;
+export function workerDrainStuckMs(env = process.env) {
+  const n = Number.parseInt(env?.[WORKER_DRAIN_STUCK_ENV] ?? '', 10);
+  return Number.isFinite(n) && n > 0 ? n : DEFAULT_WORKER_DRAIN_STUCK_MS;
+}
+// #339: after the worker lifecycle has ended, a leftover handle (a socket, an
+// un-cleared interval, a producer flush timer) can keep the event loop alive so
+// a drained worker never exits. Arm an UNREF'D timer: a process whose loop
+// empties naturally exits first and never sees it; one that is still alive
+// after `ms` logs what is holding the loop open and force-exits.
+export const WORKER_EXIT_BACKSTOP_ENV = 'NANO_WORKER_EXIT_BACKSTOP_MS';
+export const DEFAULT_WORKER_EXIT_BACKSTOP_MS = 10_000;
+export function workerExitBackstopMs(env = process.env) {
+  const n = Number.parseInt(env?.[WORKER_EXIT_BACKSTOP_ENV] ?? '', 10);
+  return Number.isFinite(n) && n > 0 ? n : DEFAULT_WORKER_EXIT_BACKSTOP_MS;
+}
+export function describeOpenHandles(proc = process) {
+  try {
+    if (typeof proc.getActiveResourcesInfo !== 'function') return 'unknown';
+    const counts = {};
+    for (const r of proc.getActiveResourcesInfo()) counts[r] = (counts[r] || 0) + 1;
+    const parts = Object.entries(counts).map(([k, v]) => `${k}×${v}`);
+    return parts.length ? parts.join(', ') : 'none';
+  } catch { return 'unknown'; }
+}
+export function armWorkerExitBackstop({
+  ms = DEFAULT_WORKER_EXIT_BACKSTOP_MS, logger = console,
+  exitProcess = (code) => process.exit(code), describe = () => describeOpenHandles(),
+  setTimer = (fn, t) => setTimeout(fn, t),
+} = {}) {
+  const t = setTimer(() => {
+    logger.warn(`worker lifecycle ended ${ms}ms ago but the process is still alive — open handles: ${describe()}; forcing exit (issue #339; tune ${WORKER_EXIT_BACKSTOP_ENV}).`);
+    exitProcess(process.exitCode ?? 0);
+  }, ms);
+  try { t?.unref?.(); } catch { /* best effort */ }
+  return t;
+}
+
 // Race `promise` against `ms`. Resolves `{ timedOut:false, error? }` when the
 // promise settles (rejections are captured, never thrown) or `{ timedOut:true }`
 // at the deadline. The timer is cleared on settle so it never holds the loop.
@@ -11308,10 +11393,17 @@ export function raceTeardown(promise, ms, signal) {
 // exit backstop, instead of being ignored until the teardown timeout.
 export function createWorkerStopLifecycle({
   logger = console, teardownMs = DEFAULT_WORKER_TEARDOWN_TIMEOUT_MS, interrupt,
-  inFlightCount = () => 0, onDrainStart = () => {}, onTeardownStart = () => {},
+  inFlightCount = () => 0, onDrainStart = () => {}, onDrainIdle = () => {}, onTeardownStart = () => {},
   onCleanTeardown = () => {}, onAbortStart = () => [], yieldInflight = async () => {},
   onExit = () => {}, pollMs = 200, backstopMs = 2_000,
   exitProcess = (code) => process.exit(code),
+  // #339: the worker-LOCAL in-flight count (the jobs this process is actually
+  // running). `inFlightCount` reads the runtime registry; if that counter leaks
+  // (never decremented for a settled job) a drain would wait forever. When the
+  // registry still reports work but the local set has been EMPTY for
+  // `drainStuckMs`, the drain proceeds to teardown (logged). null = no guard.
+  localInFlightCount = null, drainStuckMs = DEFAULT_WORKER_DRAIN_STUCK_MS,
+  now = () => Date.now(),
 } = {}) {
   let quiescing = false;
   let aborting = false;
@@ -11385,9 +11477,25 @@ export function createWorkerStopLifecycle({
     try { onDrainStart(signal); } catch { /* best effort */ }
     logger.info(`Received ${signal} — draining: polling stopped; waiting on ${inFlightCount()} in-flight job(s) to finish (send SIGTERM to abort).`);
     // Wait INDEFINITELY for in-flight work — a force abort is the only escape.
+    let localIdleSince = null;
     const tick = async () => {
       if (aborting || finished || exited) return;
-      if (inFlightCount() <= 0) { await teardownAndExit(signal); return; }
+      const n = inFlightCount();
+      // #339 review: republish the idle ack once the drain observes zero claims —
+      // a job that ended mid-drain published BEFORE its registry slot was freed.
+      if (n <= 0) { try { onDrainIdle(signal); } catch { /* best effort */ } await teardownAndExit(signal); return; }
+      if (typeof localInFlightCount === 'function' && drainStuckMs > 0) {
+        let local = 1;
+        try { local = Number(localInFlightCount()); } catch { local = 1; }
+        if (local <= 0) {
+          if (localIdleSince == null) localIdleSince = now();
+          else if (now() - localIdleSince >= drainStuckMs) {
+            logger.warn(`drain: runtime still reports ${n} in-flight job(s) but this worker has run none for ${drainStuckMs}ms — treating the count as leaked and stopping (issue #339; tune ${WORKER_DRAIN_STUCK_ENV}).`);
+            await teardownAndExit(signal);
+            return;
+          }
+        } else localIdleSince = null;
+      }
       setTimeout(tick, pollMs);
     };
     setTimeout(tick, pollMs);
@@ -12728,7 +12836,7 @@ function agenticStateForTarget(target, safeUrl = (u) => u) {
  * without making an idle worker look busy or inflating the drain's in-flight count.
  * @param {{ pid:number, updatedAt:number, jobs:Array<{key:string,type:string,since:number,settlementPending?:boolean}>, engine:(string|null), agentic:object, readyAt:(number|null), ghAuth:(object|null), watchdogPid:(number|null|undefined), signalReadyAt?:(number|null) }} fields
  */
-function buildActivityPayload({ pid, updatedAt, jobs, engine, agentic, readyAt, ghAuth, watchdogPid, signalReadyAt }) {
+function buildActivityPayload({ pid, updatedAt, jobs, engine, agentic, readyAt, ghAuth, watchdogPid, signalReadyAt, drainIdleAt }) {
   const jobList = Array.isArray(jobs) ? jobs : [];
   return {
     pid,
@@ -12746,6 +12854,9 @@ function buildActivityPayload({ pid, updatedAt, jobs, engine, agentic, readyAt, 
     // a healthy `--auto` worker with no deployed types never stamps it). The
     // daemon-upgrade handoff gates its retarget SIGUSR2 on THIS, not readyAt.
     signalReadyAt: signalReadyAt ?? null,
+    // #339 review: stamped only while DRAINING with no local in-flight job — the
+    // worker's explicit idle acknowledgement the daemon's wedge escalation requires.
+    drainIdleAt: drainIdleAt ?? null,
     // #293: the cached gh auth token's observable identity — { present,
     // fingerprint, scopes, since, ageMs, lastCheckAgoMs }, NEVER the value — so
     // `supervisor status` can show the credential's age/scopes per worker. Null
@@ -13743,8 +13854,18 @@ async function workAgent(req, flags, ctx) {
   // #309 review: set once the SIGUSR2 (drain/retarget) handler is installed.
   let signalReadyAt = null;
   const markSignalReady = () => { signalReadyAt = Date.now(); };
+  // #339 review: set when a graceful drain starts; drainIdleAt is the explicit
+  // post-quiesce idle ack (re-stamped each write while draining and job-free).
+  let drainQuiesced = false;
+  // #339 review: registry-claimed slots (a dispatch still awaiting its initial
+  // extendLock is claimed but not yet in activeJobs). Fails closed: any probe
+  // error counts as busy, so no idle ack is published.
+  let registryInFlight = () => 0;
   const writeActivity = () => {
     if (!activityFile) return;
+    let claimed;
+    try { claimed = registryInFlight(); } catch { claimed = 1; }
+    const drainIdleAt = drainQuiesced && activeJobs.size === 0 && claimed === 0 ? Date.now() : null;
     const jobs = [...activeJobs.entries()].map(([key, v]) => ({ key, type: v.type, since: v.since }));
     // #254: append settlement-pending ghosts as flagged, observational entries. A
     // ghost whose key was re-activated (now live in `activeJobs`) is superseded —
@@ -13767,7 +13888,7 @@ async function workAgent(req, flags, ctx) {
     // #293: publish the cached gh token's identity (fingerprint/scopes/age —
     // never the value) so `supervisor status` can answer "is this worker holding
     // a stale token?" in one line.
-    const payload = buildActivityPayload({ pid: process.pid, updatedAt: Date.now(), jobs, engine: workerEngine, agentic: agenticState, readyAt, signalReadyAt, ghAuth: ghAuthTokenInfo(), watchdogPid: parentWatchdog && typeof parentWatchdog.watchedPid === 'function' ? parentWatchdog.watchedPid() : null });
+    const payload = buildActivityPayload({ pid: process.pid, updatedAt: Date.now(), jobs, engine: workerEngine, agentic: agenticState, readyAt, signalReadyAt, drainIdleAt, ghAuth: ghAuthTokenInfo(), watchdogPid: parentWatchdog && typeof parentWatchdog.watchedPid === 'function' ? parentWatchdog.watchedPid() : null });
     const tmp = `${activityFile}.${process.pid}.tmp`;
     try {
       mkdirSync(dirname(activityFile), { recursive: true });
@@ -15627,6 +15748,7 @@ async function workAgent(req, flags, ctx) {
     Effect: SupervisorEffect,
     Fiber: SupervisorFiber,
   } = composed;
+  registryInFlight = () => SupervisorEffect.runSync(workerRegistry.activeCount);
 
   // Run the single per-host owner. `Effect.runFork` keeps the process alive on the
   // runtime's own Schedule cadences (reconcile + activation/idle loop), so even an
@@ -15788,8 +15910,12 @@ async function workAgent(req, flags, ctx) {
         try { return SupervisorEffect.runSync(workerRegistry.activeCount); }
         catch { return activeJobs.size; }
       },
+      localInFlightCount: () => activeJobs.size,
+      drainStuckMs: workerDrainStuckMs(),
       onDrainStart: () => {
         draining = true;
+        drainQuiesced = true;
+        try { writeActivity(); } catch { /* best effort */ }
         // Authoritative quiesce: the activation loop leases no new job even if the
         // --auto reconcile rewrites this worker's job types (registry.quiesce wins).
         try { SupervisorEffect.runSync(workerRegistry.quiesce()); } catch { /* best effort */ }
@@ -15798,6 +15924,7 @@ async function workAgent(req, flags, ctx) {
         // drain — clear it so it can't keep the process alive after the drain.
         if (ghRefreshTimer) clearInterval(ghRefreshTimer);
       },
+      onDrainIdle: () => { try { writeActivity(); } catch { /* best effort */ } },
       onTeardownStart: (signal) => {
         if (!autoMode) { try { unwatchFile(configFile); } catch { /* best effort */ } }
         if (ghRefreshTimer) clearInterval(ghRefreshTimer);
@@ -15841,6 +15968,9 @@ async function workAgent(req, flags, ctx) {
       onExit: () => {
         process.removeListener('SIGINT', onSigint);
         process.removeListener('SIGTERM', onSigterm);
+        // #339: a supervised worker must actually EXIT once stopped — a leftover
+        // handle would otherwise leave it in `stopping` forever.
+        if (activityFile) armWorkerExitBackstop({ ms: workerExitBackstopMs(), logger });
         resolve();
       },
     });
@@ -15904,6 +16034,9 @@ async function workAgent(req, flags, ctx) {
       // arriving while a `reload` is already draining this worker) takes the
       // signal's DEFAULT action — terminate — killing the in-flight job.
       process.on(SUPERVISOR_DRAIN_SIGNAL, onRepeatDrainSignal);
+      // #339: republish the marker so the daemon's wedge escalation sees a marker
+      // fresher than the drain signal (it fails closed on a stale one).
+      try { writeActivityRef?.(); } catch { /* best effort */ }
       gracefulDrain(SUPERVISOR_DRAIN_SIGNAL);
     };
     const onRepeatDrainSignal = () => {
@@ -17708,8 +17841,30 @@ async function runSupervisorDaemon() {
     if (!w || !pid) return;
     if (w.drainSignalledPid === pid) return;
     w.drainSignalledPid = pid;
+    w.drainSignalledAt = Date.now();
+    w.stoppingIdle = null;
     try { process.kill(pid, SUPERVISOR_DRAIN_SIGNAL); } catch { /* already gone */ }
   };
+
+  // #339: escalate a drained worker that is wedged in `stopping` with NO job.
+  const stoppingIdleMs = supervisorStoppingIdleMs();
+  const wedgeTimer = setInterval(() => {
+    for (const w of workers.values()) {
+      if (!w.stopping || !w.pid || w.drainSignalledPid !== w.pid || !isPidAlive(w.pid)) continue;
+      let act = null;
+      try { act = readWorkerActivity(w.id); } catch { act = null; }
+      const step = stoppingWorkerEscalation({ worker: w, activity: act, now: Date.now(), idleMs: stoppingIdleMs, killGraceMs: STOP_GRACE_MS });
+      w.stoppingIdle = step.state;
+      if (step.action === 'term') {
+        dlog(`worker '${w.id}' (pid ${w.pid}) has been stopping with no in-flight job for ${stoppingIdleMs}ms — sending SIGTERM (issue #339)`);
+        try { process.kill(w.pid, 'SIGTERM'); } catch { /* gone */ }
+      } else if (step.action === 'kill') {
+        dlog(`worker '${w.id}' (pid ${w.pid}) still alive ${STOP_GRACE_MS}ms after the wedge SIGTERM — sending SIGKILL (issue #339)`);
+        try { process.kill(w.pid, 'SIGKILL'); } catch { /* gone */ }
+      }
+    }
+  }, Math.min(15_000, Math.max(1_000, Math.floor(stoppingIdleMs / 4))));
+  try { wedgeTimer.unref(); } catch { /* best effort */ }
 
   const forceStopWorker = async (w) => {
     const pid = w.pid;
@@ -18831,6 +18986,10 @@ async function runSupervisorDaemon() {
           // Never write a sidecar or signal it — just keep it pending (its
           // watchdog still guards the predecessor) until it exits.
           pending.set(id, { pid: w.pid, signalled: true, drainOnly: true });
+          // #339 review: restore the delivered-drain identity (WITHOUT re-signalling)
+          // so the wedge escalation also covers an adopted, already-draining worker.
+          // drainSignalledAt stays unset: the worker's drainIdleAt ack alone gates it.
+          w.drainSignalledPid = w.pid;
           continue;
         }
         const actFile = w.activityFile || supervisorWorkerActivityFile(w.id);

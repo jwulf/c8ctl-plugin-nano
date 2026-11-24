@@ -560,11 +560,6 @@ function supervisorWorkerActivityFile(id) {
   return join(getSupervisorActivityDir(), `${id}.json`);
 }
 
-/**
- * Read a worker's activity marker. Returns the parsed object, or `null` when the
- * file is absent (worker not reporting yet, or a standalone/older worker) or
- * unreadable. Pure enough for status rendering (best-effort IO).
- */
 // #339: how long a drained (SIGUSR2'd) worker may sit in `stopping` with NO
 // in-flight job before the daemon escalates SIGTERM → SIGKILL. Longer than the
 // worker's own guards (drain-stuck + teardown + exit backstop) so it only fires
@@ -577,15 +572,22 @@ export function supervisorStoppingIdleMs(env = process.env) {
 }
 /**
  * #339: pure escalation step for a draining worker. `worker.stoppingIdle` is the
- * previous state `{ since, termAt }` (or null). A marker that belongs to this pid
- * and lists a running (non-settlementPending) job resets the idle clock; a missing
- * or foreign marker counts as idle (the worker has no job to lose — the drain only
- * ever waits on jobs it reported). Returns `{ action: 'none'|'term'|'kill', state }`.
+ * previous state `{ since, termAt }` (or null). FAIL CLOSED: time only counts as
+ * idle when the marker is TRUSTED — it belongs to this pid AND was written at or
+ * after the drain signal (`worker.drainSignalledAt`; the worker republishes its
+ * marker on receipt). A missing/unreadable, foreign-pid or stale marker (e.g. a
+ * best-effort write that failed on a full disk) resets the clock, as does a
+ * trusted marker listing a running (non-settlementPending) job — a draining worker
+ * that may be mid-job is never force-aborted. Returns `{ action, state }`.
  */
 export function stoppingWorkerEscalation({ worker, activity, now, idleMs, killGraceMs }) {
   const prev = worker?.stoppingIdle || null;
-  const own = activity && activity.pid === worker?.pid;
-  const busy = own && Array.isArray(activity.jobs) && activity.jobs.some((j) => j && !j.settlementPending);
+  const own = !!activity && worker?.pid != null && activity.pid === worker.pid;
+  const signalledAt = worker?.drainSignalledAt;
+  const fresh = own && Number.isFinite(activity.updatedAt)
+    && (!Number.isFinite(signalledAt) || activity.updatedAt >= signalledAt);
+  if (!fresh) return { action: 'none', state: null };
+  const busy = Array.isArray(activity.jobs) && activity.jobs.some((j) => j && !j.settlementPending);
   if (busy) return { action: 'none', state: null };
   const since = prev?.since ?? now;
   if (prev?.termAt != null) {
@@ -596,6 +598,11 @@ export function stoppingWorkerEscalation({ worker, activity, now, idleMs, killGr
   return { action: 'none', state: { since } };
 }
 
+/**
+ * Read a worker's activity marker. Returns the parsed object, or `null` when the
+ * file is absent (worker not reporting yet, or a standalone/older worker) or
+ * unreadable. Pure enough for status rendering (best-effort IO).
+ */
 function readWorkerActivity(id) {
   try {
     return JSON.parse(readFileSync(supervisorWorkerActivityFile(id), 'utf-8'));
@@ -11302,12 +11309,6 @@ export function workerTeardownTimeoutMs(env = process.env) {
   const n = Number.parseInt(env?.[WORKER_TEARDOWN_TIMEOUT_ENV] ?? '', 10);
   return Number.isFinite(n) && n > 0 ? n : DEFAULT_WORKER_TEARDOWN_TIMEOUT_MS;
 }
-// Race `promise` against `ms`. Resolves `{ timedOut:false, error? }` when the
-// promise settles (rejections are captured, never thrown) or `{ timedOut:true }`
-// at the deadline. The timer is cleared on settle so it never holds the loop.
-// An optional AbortSignal cancels the deadline early (resolves
-// `{ timedOut:false, cancelled:true }` and clears the timer) so an abandoned
-// race never keeps the event loop alive.
 // #339: bound how long a drain may wait on an in-flight count the worker itself
 // no longer backs with a running job (a leaked registry counter).
 export const WORKER_DRAIN_STUCK_ENV = 'NANO_WORKER_DRAIN_STUCK_MS';
@@ -11349,6 +11350,12 @@ export function armWorkerExitBackstop({
   return t;
 }
 
+// Race `promise` against `ms`. Resolves `{ timedOut:false, error? }` when the
+// promise settles (rejections are captured, never thrown) or `{ timedOut:true }`
+// at the deadline. The timer is cleared on settle so it never holds the loop.
+// An optional AbortSignal cancels the deadline early (resolves
+// `{ timedOut:false, cancelled:true }` and clears the timer) so an abandoned
+// race never keeps the event loop alive.
 export function raceTeardown(promise, ms, signal) {
   return new Promise((resolve) => {
     let done = false;
@@ -15991,6 +15998,9 @@ async function workAgent(req, flags, ctx) {
       // arriving while a `reload` is already draining this worker) takes the
       // signal's DEFAULT action — terminate — killing the in-flight job.
       process.on(SUPERVISOR_DRAIN_SIGNAL, onRepeatDrainSignal);
+      // #339: republish the marker so the daemon's wedge escalation sees a marker
+      // fresher than the drain signal (it fails closed on a stale one).
+      try { writeActivityRef?.(); } catch { /* best effort */ }
       gracefulDrain(SUPERVISOR_DRAIN_SIGNAL);
     };
     const onRepeatDrainSignal = () => {

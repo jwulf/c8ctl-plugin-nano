@@ -425,6 +425,17 @@ SDK client (job workers) — do **not** add the SDK as a dependency or use raw
   reload|stop|logs`) are thin socket clients (`supervisorRequest`) needing no
   interactive surface; the interactive `attach` console streams events and can
   **detach** (Ctrl-D / `detach`, leaving the daemon running) or `stop` the fleet.
+- **Bounded worker teardown (issue #328).** A worker's runtime interrupt
+  (`SupervisorFiber.interrupt`) is raced against `NANO_WORKER_TEARDOWN_TIMEOUT_MS`
+  (default 30s, `raceTeardown`) on both graceful drain and force abort; on expiry it
+  warns and exits anyway (plus an unref'd `process.exit` backstop, since the stuck
+  fiber's sockets can keep the loop alive). `finished` (teardown started) is distinct
+  from `exited` (resolved), so a SIGTERM/SIGINT during a stuck graceful teardown exits
+  immediately instead of being ignored; signal handlers use `on`, not `once`.
+  Root cause: `superviseAgentic`/`acquireAgentic` retried the agentic `connect`
+  forever inside an `acquireRelease` ACQUIRE, which Effect runs uninterruptibly, so
+  an unreachable hub made the runtime interrupt wait forever. The acquire is now
+  wrapped in `Effect.interruptible` (`supervisor/test/teardown-328.test.ts`).
 - **Hot code reload (rolling drain+respawn).** `supervisor reload [target]` (and
   `workforce reload`) adopt updated on-disk plugin code into the running fleet
   with **zero fleet downtime**: the daemon rolls through the target workers (default

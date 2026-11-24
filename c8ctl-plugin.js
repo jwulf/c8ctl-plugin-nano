@@ -11187,6 +11187,132 @@ function baseAgentEnv(profile, job) {
 // null when there is no idle kill (<= 0 / non-finite) or the budget is too small
 // to express a whole-second timeout strictly below it. Invariant (tested):
 // `secs * 1000 < idleTimeoutMs` whenever non-null.
+// Issue #328: the worker's runtime interrupt (`SupervisorFiber.interrupt`) can
+// hang forever when an uninterruptible region is stuck (e.g. a fetch with no
+// timeout to an unreachable ingress). Bound every teardown so a graceful drain
+// (or a force abort) always exits instead of sitting in `stopping` for hours.
+export const WORKER_TEARDOWN_TIMEOUT_ENV = 'NANO_WORKER_TEARDOWN_TIMEOUT_MS';
+export const DEFAULT_WORKER_TEARDOWN_TIMEOUT_MS = 30_000;
+export function workerTeardownTimeoutMs(env = process.env) {
+  const n = Number.parseInt(env?.[WORKER_TEARDOWN_TIMEOUT_ENV] ?? '', 10);
+  return Number.isFinite(n) && n > 0 ? n : DEFAULT_WORKER_TEARDOWN_TIMEOUT_MS;
+}
+// Race `promise` against `ms`. Resolves `{ timedOut:false, error? }` when the
+// promise settles (rejections are captured, never thrown) or `{ timedOut:true }`
+// at the deadline. The timer is cleared on settle so it never holds the loop.
+// An optional AbortSignal cancels the deadline early (resolves
+// `{ timedOut:false, cancelled:true }` and clears the timer) so an abandoned
+// race never keeps the event loop alive.
+export function raceTeardown(promise, ms, signal) {
+  return new Promise((resolve) => {
+    let done = false;
+    const timer = setTimeout(() => { if (!done) { done = true; resolve({ timedOut: true }); } }, ms);
+    const cancel = () => { if (!done) { done = true; clearTimeout(timer); resolve({ timedOut: false, cancelled: true }); } };
+    if (signal) { if (signal.aborted) cancel(); else signal.addEventListener('abort', cancel, { once: true }); }
+    Promise.resolve(promise).then(
+      () => { if (!done) { done = true; clearTimeout(timer); resolve({ timedOut: false }); } },
+      (error) => { if (!done) { done = true; clearTimeout(timer); resolve({ timedOut: false, error }); } },
+    );
+  });
+}
+
+// #328: the worker's stop-signal state machine, extracted so its escalation
+// rules are testable. SIGUSR2 → gracefulDrain; SIGTERM/SIGINT → forceAbort. A
+// stop signal arriving while ANY teardown (graceful OR a force abort) is stuck
+// on a non-settling runtime interrupt exits immediately and arms the process
+// exit backstop, instead of being ignored until the teardown timeout.
+export function createWorkerStopLifecycle({
+  logger = console, teardownMs = DEFAULT_WORKER_TEARDOWN_TIMEOUT_MS, interrupt,
+  inFlightCount = () => 0, onDrainStart = () => {}, onTeardownStart = () => {},
+  onCleanTeardown = () => {}, onAbortStart = () => [], yieldInflight = async () => {},
+  onExit = () => {}, pollMs = 200, backstopMs = 2_000,
+  exitProcess = (code) => process.exit(code),
+} = {}) {
+  let quiescing = false;
+  let aborting = false;
+  let finished = false; // a teardown STARTED
+  let exited = false;   // onExit actually ran
+  let backstopArmed = false;
+  // Cancels any pending teardown deadline once we exit, so an abandoned
+  // interrupt's timer can't hold the event loop open.
+  const raceAbort = new AbortController();
+  const exitNow = () => {
+    if (exited) return;
+    exited = true;
+    raceAbort.abort();
+    onExit();
+  };
+  // After a timed-out/abandoned interrupt the stuck fiber (and its sockets) can
+  // keep the event loop alive. Force the process out shortly after, unref'd so a
+  // loop that drains naturally wins.
+  const forceProcessExitSoon = () => {
+    if (backstopArmed) return;
+    backstopArmed = true;
+    try { setTimeout(() => exitProcess(process.exitCode ?? 0), backstopMs).unref(); } catch { /* best effort */ }
+  };
+  const interruptRuntime = async (what) => {
+    const r = await raceTeardown(Promise.resolve().then(() => interrupt()), teardownMs, raceAbort.signal);
+    if (r.timedOut) {
+      logger.warn(`${what}: runtime interrupt did not complete within ${teardownMs}ms (a stuck in-flight call?) — exiting anyway (issue #328; tune ${WORKER_TEARDOWN_TIMEOUT_ENV}).`);
+      forceProcessExitSoon();
+    }
+    return r;
+  };
+  const teardownAndExit = async (signal) => {
+    if (finished) return;
+    finished = true;
+    try { onTeardownStart(signal); } catch { /* best effort */ }
+    const r = await interruptRuntime('graceful stop');
+    if (exited) return; // a stop signal escalated the stuck teardown and already exited
+    if (r.error) logger.warn(`supervisor shutdown error — runtime loop may not have shut down cleanly: ${r.error?.message || r.error}`);
+    else if (!r.timedOut) logger.info('Worker stopped.');
+    try { onCleanTeardown(); } catch { /* best effort */ }
+    if (r.timedOut) logger.info('Worker stopped (teardown timed out).');
+    exitNow();
+  };
+  const forceAbort = async (signal) => {
+    if (exited) return;
+    if (aborting || finished) {
+      // A teardown is already under way but its interrupt is stuck — honour the
+      // repeated signal instead of ignoring it (persistent handlers mean the
+      // signal's default terminate action no longer applies).
+      logger.warn(`Received ${signal} during a stuck ${aborting ? 'force abort' : 'graceful teardown'} — exiting now.`);
+      forceProcessExitSoon();
+      exitNow();
+      return;
+    }
+    aborting = true;
+    logger.info(`Received ${signal} — aborting in-flight work and stopping worker...`);
+    let inflight = [];
+    try { inflight = onAbortStart(signal) || []; } catch { /* best effort */ }
+    const r = await interruptRuntime('force abort');
+    if (exited) return;
+    if (r.error) logger.warn(`supervisor abort error — runtime loop may not have shut down cleanly: ${r.error?.message || r.error}`);
+    try { await yieldInflight(inflight, signal); } catch { /* best effort */ }
+    finished = true;
+    if (exited) return;
+    logger.info('Worker stopped.');
+    exitNow();
+  };
+  const gracefulDrain = async (signal) => {
+    if (quiescing || aborting || finished) return;
+    quiescing = true;
+    try { onDrainStart(signal); } catch { /* best effort */ }
+    logger.info(`Received ${signal} — draining: polling stopped; waiting on ${inFlightCount()} in-flight job(s) to finish (send SIGTERM to abort).`);
+    // Wait INDEFINITELY for in-flight work — a force abort is the only escape.
+    const tick = async () => {
+      if (aborting || finished || exited) return;
+      if (inFlightCount() <= 0) { await teardownAndExit(signal); return; }
+      setTimeout(tick, pollMs);
+    };
+    setTimeout(tick, pollMs);
+  };
+  return {
+    forceAbort, gracefulDrain, inFlightCount,
+    get state() { return { quiescing, aborting, finished, exited, backstopArmed }; },
+  };
+}
+
 export const PROVIDER_TIMEOUT_ENV = 'NANO_CODER_PROVIDER_TIMEOUT_SECS';
 export function deriveProviderTimeoutSecs(idleTimeoutMs) {
   const ms = Number(idleTimeoutMs);
@@ -15533,110 +15659,74 @@ async function workAgent(req, flags, ctx) {
   //    is immediately retryable, then exit.
   // A SIGTERM arriving mid-drain ESCALATES the drain to a force abort.
   await new Promise((resolve) => {
-    let quiescing = false;
-    let aborting = false;
-    let finished = false;
-
-    // Shared teardown: stop timers, deregister presence over the still-live
-    // connection, interrupt the runtime fiber (bracketed teardown: release slots,
-    // stop heartbeats, tear down the agentic scope), then resolve.
-    const teardownAndExit = async (signal) => {
-      if (finished) return;
-      finished = true;
-      if (!autoMode) { try { unwatchFile(configFile); } catch { /* best effort */ } }
-      if (ghRefreshTimer) clearInterval(ghRefreshTimer);
-      if (reaperTimer) clearInterval(reaperTimer);
-      if (runDirTimer) clearInterval(runDirTimer);
-      if (agenticPlane) {
-        try { agenticPlane.deregister(`worker stopped (${signal})`); } catch { /* best effort */ }
-      }
-      try {
-        await SupervisorEffect.runPromise(SupervisorFiber.interrupt(supervisorFiber));
-        logger.info('Worker stopped.');
-      } catch (err) {
-        logger.warn(`supervisor shutdown error — runtime loop may not have shut down cleanly: ${err?.message || err}`);
-      }
-      // #205: tear down this worker's own namespace on a clean exit. All in-flight
-      // jobs' finallys have run by now (markers cleared, run/res dirs removed), so
-      // nothing here is in use. Skipped under --keep-runs so kept workspaces stay
-      // for debugging and age out via cross-process reclamation, exactly like the
-      // pre-fix age-gated behavior.
-      if (workerNsDir && !keepRuns) { try { rmSync(workerNsDir, { recursive: true, force: true }); } catch { /* best effort */ } }
-      resolve();
-    };
-
-    const inFlightCount = () => {
-      try { return SupervisorEffect.runSync(workerRegistry.activeCount); }
-      catch { return activeJobs.size; }
-    };
-
-    const forceAbort = async (signal) => {
-      if (aborting || finished) return;
-      aborting = true;
-      draining = true;
-      if (!autoMode) { try { unwatchFile(configFile); } catch { /* best effort */ } }
-      if (ghRefreshTimer) clearInterval(ghRefreshTimer);
-      logger.info(`Received ${signal} — aborting in-flight work and stopping worker...`);
-      // Snapshot in-flight jobs (with their retry budget) BEFORE the interrupt
-      // clears the ownership registry, so we can yield each one afterwards.
-      const inflight = [...activeJobs.entries()].map(([jobKey, info]) => ({ jobKey, retries: info?.retries, leaseToken: info?.leaseToken }));
-      // Interrupt the runtime: this aborts each running job's AbortSignal (the
-      // makeJobRunner seam) so runAgentJob killTree's the harness process group,
-      // and runs dispatch's bracketed teardown (release ownership + slot). The
-      // runner sees the aborted result and, by contract, does NOT settle — we do.
-      if (agenticPlane) { try { agenticPlane.deregister(`worker aborted (${signal})`); } catch { /* best effort */ } }
-      try {
-        await SupervisorEffect.runPromise(SupervisorFiber.interrupt(supervisorFiber));
-      } catch (err) {
-        logger.warn(`supervisor abort error — runtime loop may not have shut down cleanly: ${err?.message || err}`);
-      }
-      // Yield each in-flight job so the broker re-activates it at once (retries
-      // preserved — a force-stop doesn't consume an attempt). Best-effort: a
-      // failed yield just lets the lock lapse (the honest fallback).
-      for (const { jobKey, retries, leaseToken } of inflight) {
-        try {
-          await SupervisorEffect.runPromise(settle.fail(jobKey, {
-            errorMessage: `worker force-stopped (${signal}); job yielded for retry`,
-            retries: Number.isFinite(retries) && retries > 0 ? retries : 1,
-            retryBackOff: 0,
-            leaseToken,
-          }));
-          logger.info(`  yielded job ${jobKey} for immediate retry.`);
-        } catch (err) {
-          logger.warn(`  could not yield job ${jobKey} (${err?.message || err}); its lock will lapse and the broker will reclaim it.`);
+    const lifecycle = createWorkerStopLifecycle({
+      logger,
+      teardownMs: workerTeardownTimeoutMs(),
+      interrupt: () => SupervisorEffect.runPromise(SupervisorFiber.interrupt(supervisorFiber)),
+      inFlightCount: () => {
+        try { return SupervisorEffect.runSync(workerRegistry.activeCount); }
+        catch { return activeJobs.size; }
+      },
+      onDrainStart: () => {
+        draining = true;
+        // Authoritative quiesce: the activation loop leases no new job even if the
+        // --auto reconcile rewrites this worker's job types (registry.quiesce wins).
+        try { SupervisorEffect.runSync(workerRegistry.quiesce()); } catch { /* best effort */ }
+        if (!autoMode) { try { unwatchFile(configFile); } catch { /* best effort */ } }
+        // The refresh timer is ref'd and there may be NO in-flight job during a
+        // drain — clear it so it can't keep the process alive after the drain.
+        if (ghRefreshTimer) clearInterval(ghRefreshTimer);
+      },
+      onTeardownStart: (signal) => {
+        if (!autoMode) { try { unwatchFile(configFile); } catch { /* best effort */ } }
+        if (ghRefreshTimer) clearInterval(ghRefreshTimer);
+        if (reaperTimer) clearInterval(reaperTimer);
+        if (runDirTimer) clearInterval(runDirTimer);
+        if (agenticPlane) {
+          try { agenticPlane.deregister(`worker stopped (${signal})`); } catch { /* best effort */ }
         }
-      }
-      finished = true; // teardown already interrupted the fiber; just resolve.
-      logger.info('Worker stopped.');
-      resolve();
-    };
-
-    const gracefulDrain = async (signal) => {
-      if (quiescing || aborting || finished) return;
-      quiescing = true;
-      draining = true;
-      // Authoritative quiesce: the activation loop leases no new job even if the
-      // --auto reconcile rewrites this worker's job types (registry.quiesce wins).
-      try { SupervisorEffect.runSync(workerRegistry.quiesce()); } catch { /* best effort */ }
-      if (!autoMode) { try { unwatchFile(configFile); } catch { /* best effort */ } }
-      const n0 = inFlightCount();
-      logger.info(`Received ${signal} — draining: polling stopped; waiting on ${n0} in-flight job(s) to finish (send SIGTERM to abort).`);
-      // The refresh timer is ref'd (so it fires on cadence even under a busy
-      // loop) and there may be NO in-flight job during a drain — clear it now
-      // so it can't keep the process alive once the drain completes and the
-      // runtime is interrupted.
-      if (ghRefreshTimer) clearInterval(ghRefreshTimer);
-      // Poll until every in-flight job has settled and released its slot, then
-      // interrupt the now-idle runtime and exit. Wait INDEFINITELY — a force
-      // abort (SIGTERM) is the only escape hatch.
-      const tick = async () => {
-        if (aborting || finished) return; // escalated to a force abort — let it own exit
-        const n = inFlightCount();
-        if (n <= 0) { await teardownAndExit(signal); return; }
-        setTimeout(tick, 200);
-      };
-      setTimeout(tick, 200);
-    };
+      },
+      onCleanTeardown: () => {
+        // #205: tear down this worker's own namespace on a clean exit (skipped
+        // under --keep-runs so kept workspaces age out via reclamation).
+        if (workerNsDir && !keepRuns) { try { rmSync(workerNsDir, { recursive: true, force: true }); } catch { /* best effort */ } }
+      },
+      onAbortStart: (signal) => {
+        draining = true;
+        if (!autoMode) { try { unwatchFile(configFile); } catch { /* best effort */ } }
+        if (ghRefreshTimer) clearInterval(ghRefreshTimer);
+        if (agenticPlane) { try { agenticPlane.deregister(`worker aborted (${signal})`); } catch { /* best effort */ } }
+        // Snapshot in-flight jobs (with their retry budget) BEFORE the interrupt
+        // clears the ownership registry, so we can yield each one afterwards.
+        return [...activeJobs.entries()].map(([jobKey, info]) => ({ jobKey, retries: info?.retries, leaseToken: info?.leaseToken }));
+      },
+      yieldInflight: async (inflight, signal) => {
+        // Yield each in-flight job so the broker re-activates it at once (retries
+        // preserved). Best-effort: a failed yield just lets the lock lapse.
+        for (const { jobKey, retries, leaseToken } of inflight) {
+          try {
+            await SupervisorEffect.runPromise(settle.fail(jobKey, {
+              errorMessage: `worker force-stopped (${signal}); job yielded for retry`,
+              retries: Number.isFinite(retries) && retries > 0 ? retries : 1,
+              retryBackOff: 0,
+              leaseToken,
+            }));
+            logger.info(`  yielded job ${jobKey} for immediate retry.`);
+          } catch (err) {
+            logger.warn(`  could not yield job ${jobKey} (${err?.message || err}); its lock will lapse and the broker will reclaim it.`);
+          }
+        }
+      },
+      onExit: () => {
+        process.removeListener('SIGINT', onSigint);
+        process.removeListener('SIGTERM', onSigterm);
+        resolve();
+      },
+    });
+    const onSigint = () => { lifecycle.forceAbort('SIGINT'); };
+    const onSigterm = () => { lifecycle.forceAbort('SIGTERM'); };
+    const gracefulDrain = (signal) => lifecycle.gracefulDrain(signal);
+    const inFlightCount = () => lifecycle.inFlightCount();
 
     // #309: the SIGUSR2 handler is a named, re-armable function. The legacy path
     // (graceful drain) fires once and the worker exits, so `once` semantics
@@ -15702,8 +15792,10 @@ async function workAgent(req, flags, ctx) {
     // #309 review: publish that the handler is installed, so an upgrade handoff
     // can retarget this worker even before (or without ever) leasing.
     try { markSignalReady(); writeActivityRef?.(); } catch { /* best effort */ }
-    process.once('SIGINT', () => { forceAbort('SIGINT'); });
-    process.once('SIGTERM', () => { forceAbort('SIGTERM'); });
+    // #328: `on`, not `once` — a second SIGTERM/SIGINT must still reach
+    // forceAbort (which escalates a stuck teardown) rather than being dropped.
+    process.on('SIGINT', onSigint);
+    process.on('SIGTERM', onSigterm);
   });
   } finally {
     // Restore the caller's timestamp flag now the worker lifecycle has ended

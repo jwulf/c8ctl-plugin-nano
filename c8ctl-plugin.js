@@ -14001,7 +14001,10 @@ async function workAgent(req, flags, ctx) {
           const tmpBudget = hostTempBudget({ paths: [tmpdir(), agentRunsRoot()], minFreeBytes });
           if (!tmpBudget.ok) {
             const freeMb = Math.round(tmpBudget.free / 1_048_576);
-            const retries = Math.max(0, (Number(job.retries) || 1) - 1);
+            // Infrastructure-only shed: the harness never ran, so do NOT consume a
+            // retry (a last-retry job would otherwise raise an incident instead of
+            // resuming once space is freed).
+            const retries = Math.max(1, Number(job.retries) || 1);
             if (checkSetupAbort(abortSignal, { jobType, jobKey: job.jobKey, stage: 'prompt', logger })) return;
             logger.warn(`[${jobType}] job ${job.jobKey} shed — low disk on ${tmpBudget.path} (${freeMb}MB free, floor ${Math.round(minFreeBytes / 1_048_576)}MB); not taking work until space is freed; retries left ${retries}`);
             return settleJob.fail({ errorMessage: `host temp space exhausted: ${tmpBudget.path} has only ${freeMb}MB free`, retries, retryBackOff: 30_000 });
@@ -15122,6 +15125,9 @@ async function workAgent(req, flags, ctx) {
           runCompleted = !gitFinalizeFailed;
         } finally {
           if (fenceToken) fences.unregister(fenceToken);
+          // #336: always release the per-job TMPDIR — aborted returns and exceptions
+          // skip the success-path cleanup, and --keep-runs retains the workspace.
+          if (jobTmpDir) { try { rmSync(jobTmpDir, { recursive: true, force: true }); } catch { /* best effort */ } jobTmpDir = null; }
           if (checkpointing) {
             // #264: exception path — if the run threw before any terminal checkpoint
             // decision was taken (abort/failed flush or the success-path stop), take a

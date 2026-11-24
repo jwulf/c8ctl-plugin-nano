@@ -50,6 +50,7 @@ import {
   mkdtempSync,
   closeSync,
   readlinkSync,
+  symlinkSync,
   watchFile,
   unwatchFile,
 } from 'node:fs';
@@ -5984,6 +5985,79 @@ function diskBudgetOk(engine, minFreeBytes) {
   }
 }
 
+// Issue #336: per-job temp directory + host temp-filesystem admission check.
+// Agent jobs (and the test suites they run) leak temp files into the shared
+// `/tmp`; on a quota'd tmpfs that eventually breaks EVERY shell on the host. Each
+// host job gets its own TMPDIR inside its run directory, deleted with the job.
+//
+// Placement: a provisioned clone gets `<workspace>/.git/nano-tmp` — inside the
+// workspace the harness sandbox (nano-coder >= 1.30 `--sandbox workspace`) already
+// lets the agent write (issue #335), yet outside the git worktree, so nothing
+// leaked there can be `git add`ed. A repo-less job (cwd = its empty run dir) gets
+// `<cwd>/.nano-tmp`; with no cwd it falls back to `<resultDir>/tmp`.
+export const JOB_TMP_ENV_KEYS = Object.freeze(['TMPDIR', 'TMP', 'TEMP']);
+
+export function jobTmpDirFor({ cwd = null, resultDir = null } = {}) {
+  if (cwd) {
+    try {
+      if (statSync(join(cwd, '.git')).isDirectory()) return join(cwd, '.git', 'nano-tmp');
+    } catch { /* not a clone */ }
+    return join(cwd, '.nano-tmp');
+  }
+  if (resultDir) return join(resultDir, 'tmp');
+  return null;
+}
+
+// AF_UNIX socket paths are capped (~104 bytes on macOS, 108 on Linux); tools that
+// bind sockets under TMPDIR (test runners, our own fence/supervisor helpers) fail
+// with "path too long" when the run dir is deep. When the real dir is longer than
+// JOB_TMP_MAX_PATH, expose a short private symlink under the OS temp dir instead —
+// the bytes still land in the run dir (so a quota'd /tmp is not filled), only the
+// alias inode lives in /tmp. Returns { path, alias } (alias = symlink to remove).
+export const JOB_TMP_MAX_PATH = 48;
+// The alias itself must fit maxLen (in BYTES — socket limits are bytes): a long
+// inherited tmpdir() is skipped in favour of /tmp, and any candidate that would
+// still exceed the bound is rejected rather than handed out.
+export function boundJobTmpPath(dir, { maxLen = JOB_TMP_MAX_PATH, base = tmpdir(), fallbackBases = process.platform === 'win32' ? [] : ['/tmp'], rand = () => randomBytes(6).toString('hex') } = {}) {
+  if (!dir || Buffer.byteLength(dir) <= maxLen) return { path: dir, alias: null };
+  const bases = [...new Set([base, ...fallbackBases].filter(Boolean))];
+  for (const b of bases) {
+    for (let i = 0; i < 3; i++) {
+      const alias = join(b, `nj-${rand()}`);
+      if (Buffer.byteLength(alias) > maxLen) break; // this base is too long: try the next
+      try { symlinkSync(dir, alias, 'dir'); return { path: alias, alias }; } catch (e) { if (e?.code !== 'EEXIST') break; }
+    }
+  }
+  return { path: dir, alias: null }; // fail open: long path beats no TMPDIR
+}
+
+export function jobTmpEnv(dir) {
+  if (!dir) return {};
+  return Object.fromEntries(JOB_TMP_ENV_KEYS.map((k) => [k, dir]));
+}
+
+// Fail-open free-space check over the host paths a host job writes to (the OS
+// temp dir and the agent-runs dir). Returns the FIRST path below the floor so the
+// shed message can say exactly why the worker stopped taking work.
+export function hostTempBudget({ paths = [], minFreeBytes = 0, statfs = statfsSync } = {}) {
+  if (!minFreeBytes || minFreeBytes <= 0 || typeof statfs !== 'function') return { ok: true, path: null, free: null };
+  const seen = new Set();
+  for (const raw of paths) {
+    if (!raw || seen.has(raw)) continue;
+    seen.add(raw);
+    let free;
+    try {
+      // The agent-runs dir may not exist yet: stat its nearest existing ancestor.
+      let probe = raw;
+      while (!existsSync(probe) && dirname(probe) !== probe) probe = dirname(probe);
+      const st = statfs(probe);
+      free = Number(st.bavail) * Number(st.bsize);
+    } catch { continue; } // never block work on a stat failure
+    if (Number.isFinite(free) && free < minFreeBytes) return { ok: false, path: raw, free };
+  }
+  return { ok: true, path: null, free: null };
+}
+
 // Reap our own leaked/finished containers. Label-scoped (never touches anything
 // we didn't create — safe on shared hosts, NEVER `system prune -a`), age-gated,
 // and skips any run id still in flight.
@@ -11338,7 +11412,7 @@ export function providerTimeoutWarning(env, idleTimeoutMs) {
 }
 
 function runAgentJob(profile, job, opts = {}) {
-  const { timeoutMs, idleTimeoutMs, recoveryWindowMs, envelope, sandbox = 'none', image, runId, secretEnv = {}, passThroughSecretNames = [], cwd, extraEnv = {}, fenceEnv = null, profileEnv = {}, gitEnv = null, resultFile, stream = false, streamPrefix = '', onStreamOut, onStreamErr, args: commandArgs, terminal = 'pipe', protocol = 'pipe', permission = 'yolo', relaySession = null, ptyFactory, nudgePayload = null, onAcpUpdate = null, abortSignal = null, onSpawn = null, resumePlan = null } = opts;
+  const { timeoutMs, idleTimeoutMs, recoveryWindowMs, envelope, sandbox = 'none', image, runId, secretEnv = {}, passThroughSecretNames = [], cwd, extraEnv = {}, fenceEnv = null, tmpEnv = {}, profileEnv = {}, gitEnv = null, resultFile, stream = false, streamPrefix = '', onStreamOut, onStreamErr, args: commandArgs, terminal = 'pipe', protocol = 'pipe', permission = 'yolo', relaySession = null, ptyFactory, nudgePayload = null, onAcpUpdate = null, abortSignal = null, onSpawn = null, resumePlan = null } = opts;
   // #110: `protocol`/`permission` drive the ACP executor branch below. The
   // pipe/PTY paths are unchanged, so `protocol === 'pipe'` behaviour is identical.
   // A `nudgePayload` (#678) carries the bespoke "re-emit your result" prompt for a
@@ -11422,7 +11496,7 @@ function runAgentJob(profile, job, opts = {}) {
     // (jwulf/c8ctl-plugin-nano#151): the parent's process-wide setDefaultResultOrder
     // can't reach the child, so its own Node runtime must read the flag at startup.
     // Merges (never clobbers) any inherited/operator NODE_OPTIONS.
-    const harnessEnv = withIpv4FirstNodeOptions({ ...process.env, ...gitBaseEnv, ...staticEnv, ...secretEnv, ...agentEnv, ...extraEnv, ...resultEnv });
+    const harnessEnv = withIpv4FirstNodeOptions({ ...process.env, ...gitBaseEnv, ...(tmpEnv || {}), ...staticEnv, ...secretEnv, ...agentEnv, ...extraEnv, ...resultEnv });
 
     // A role opted into ACP (`protocol: acp`) drives its harness over the Agent
     // Client Protocol (JSON-RPC 2.0 over stdio) instead of the stdin/scrape pipe
@@ -14069,6 +14143,23 @@ async function workAgent(req, flags, ctx) {
         // Disk-budget admission shed: if the engine data root is below the free
         // floor, don't start a container — fail (retryable) so work sheds until
         // the reaper/host frees space.
+        if (!isContainer) {
+          // #336: a host job writes to the OS temp dir and the agent-runs dir. When
+          // either filesystem is nearly full every shell in the job fails, so stop
+          // taking work (retryable shed) and say which path is short instead of
+          // handing the job to a broken shell.
+          const tmpBudget = hostTempBudget({ paths: [tmpdir(), agentRunsRoot()], minFreeBytes });
+          if (!tmpBudget.ok) {
+            const freeMb = Math.round(tmpBudget.free / 1_048_576);
+            // Infrastructure-only shed: the harness never ran, so do NOT consume a
+            // retry (a last-retry job would otherwise raise an incident instead of
+            // resuming once space is freed).
+            const retries = Math.max(1, Number(job.retries) || 1);
+            if (checkSetupAbort(abortSignal, { jobType, jobKey: job.jobKey, stage: 'prompt', logger })) return;
+            logger.warn(`[${jobType}] job ${job.jobKey} shed — low disk on ${tmpBudget.path} (${freeMb}MB free, floor ${Math.round(minFreeBytes / 1_048_576)}MB); not taking work until space is freed; retries left ${retries}`);
+            return settleJob.fail({ errorMessage: `host temp space exhausted: ${tmpBudget.path} has only ${freeMb}MB free`, retries, retryBackOff: 30_000 });
+          }
+        }
         if (isContainer) {
           const budget = diskBudgetOk(sandbox, minFreeBytes);
           if (!budget.ok) {
@@ -14620,6 +14711,9 @@ async function workAgent(req, flags, ctx) {
         let resultFile = null;
         let fenceToken = null;
         let fenceEnv = null;
+        let jobTmpDir = null;
+        let jobTmpPath = null;
+        let jobTmpAlias = null;
         try {
           try {
             mkdirSync(workerNsDir, { recursive: true });
@@ -14637,6 +14731,15 @@ async function workAgent(req, flags, ctx) {
               fenceToken = reg.token;
               fenceEnv = reg.env;
             } catch { fenceEnv = null; }
+          }
+          // #336: per-job TMPDIR (host only; a container has its own /tmp), deleted
+          // with the job in the finally below.
+          if (!isContainer) {
+            const dir = jobTmpDirFor({ cwd, resultDir });
+            if (dir) {
+              try { mkdirSync(dir, { recursive: true, mode: 0o700 }); jobTmpDir = dir; } catch { jobTmpDir = null; }
+              if (jobTmpDir) ({ path: jobTmpPath, alias: jobTmpAlias } = boundJobTmpPath(jobTmpDir));
+            }
           }
           // #320: `fences.register` awaits the socket listen, so a lease-loss /
           // force-stop may have won the race. Stop BEFORE the job marker and the
@@ -14683,6 +14786,7 @@ async function workAgent(req, flags, ctx) {
             cwd,
             extraEnv,
             fenceEnv,
+            tmpEnv: jobTmpEnv(jobTmpPath),
             profileEnv,
             // #283: the provisioning git env — runAgentJob layers it UNDER
             // profile/setup env (minus the credential keys) so the harness's
@@ -15174,6 +15278,10 @@ async function workAgent(req, flags, ctx) {
           runCompleted = !gitFinalizeFailed;
         } finally {
           if (fenceToken) fences.unregister(fenceToken);
+          // #336: always release the per-job TMPDIR — aborted returns and exceptions
+          // skip the success-path cleanup, and --keep-runs retains the workspace.
+          if (jobTmpDir) { try { rmSync(jobTmpDir, { recursive: true, force: true }); } catch { /* best effort */ } jobTmpDir = null; }
+          if (jobTmpAlias) { try { rmSync(jobTmpAlias, { force: true }); } catch { /* best effort */ } jobTmpAlias = null; }
           if (checkpointing) {
             // #264: exception path — if the run threw before any terminal checkpoint
             // decision was taken (abort/failed flush or the success-path stop), take a
@@ -15283,6 +15391,8 @@ async function workAgent(req, flags, ctx) {
           }
         }
         if (resultDir) { try { rmSync(resultDir, { recursive: true, force: true }); } catch { /* best effort */ } liveRunDirs.delete(resultDir); }
+        // #336: drop the per-job TMPDIR even when the run dir is preserved for recovery.
+        if (jobTmpDir) { try { rmSync(jobTmpDir, { recursive: true, force: true }); } catch { /* best effort */ } }
         const resultVars = sanitizeResultVars(rawResult);
 
         const resultEnvelope = buildResultEnvelope(result, { sandbox, image, git: gitResult, result: rawResult, promptResourceKey });
@@ -23373,7 +23483,7 @@ export const commands = {
       'secret-resolver': { type: 'string', description: 'work: secret resolver for task secretRefs (host = process env + <stateHome>/secrets.env; file or file:<path> = dotenv/JSON file; default host)' },
       'reap-age': { type: 'string', description: 'work: age in ms before a finished agent container or job workspace is reaped (default 3600000)' },
       'reap-interval': { type: 'string', description: 'work: how often to sweep finished agent containers and job workspaces in ms (default 300000)' },
-      'min-free-mb': { type: 'string', description: 'work: shed jobs when the engine data root has less than this many MB free (default 1024)' },
+      'min-free-mb': { type: 'string', description: 'work: shed jobs when the engine data root (container) or the host temp/agent-runs filesystem (host) has less than this many MB free (default 1024)' },
       'clone-timeout': { type: 'string', description: 'work: max time in ms for cloning a task repository on the host (default 120000)' },
       'keep-runs': { type: 'boolean', description: 'work: keep per-job workspaces under <state>/agent-runs instead of deleting them after each job (debug)' },
       stream: { type: 'boolean', description: 'work: tee each agent job\'s live stdout/stderr to this console, prefixed with the job type + key (spy/debug)' },
@@ -23617,7 +23727,7 @@ function printUsage() {
   console.log('  --secret-resolver <r> work: secret resolver for task secretRefs (host, file, or file:<path>; default host)');
   console.log('  --reap-age <ms>      work: age before a finished agent container/workspace is reaped (default 3600000)');
   console.log('  --reap-interval <ms> work: how often to sweep finished agent containers/workspaces (default 300000)');
-  console.log('  --min-free-mb <n>    work: shed jobs when the engine data root has < this many MB free (default 1024)');
+  console.log('  --min-free-mb <n>    work: shed jobs when the engine data root / host temp dir has < this many MB free (default 1024)');
   console.log('  --clone-timeout <ms> work: max time to clone a task repository on the host (default 120000)');
   console.log('  --keep-runs          work: keep per-job workspaces instead of deleting them (debug)');
   console.log('');

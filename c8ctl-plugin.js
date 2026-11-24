@@ -17686,6 +17686,26 @@ async function runSupervisorDaemon() {
   // that keeps the newest output and bounds on-disk usage to ~2x the cap. Set
   // `NANO_SUPERVISOR_LOG_MAX_BYTES=0` to opt out (legacy raw-fd append).
   const workerLogMaxBytes = resolveLogMaxBytes(process.env.NANO_SUPERVISOR_LOG_MAX_BYTES);
+  // #340 review: ONE daemon-owned, ref-counted log ring per log path. A surge
+  // reload runs two incarnations of a worker at once against the same
+  // `w.logFile`; independent rings would each keep their own fd + byte count,
+  // so one's rotation would strand (or later unlink) the other's open file.
+  const logRings = new Map();
+  const acquireLogRing = (file) => {
+    let e = logRings.get(file);
+    if (!e) { e = { ring: createLogRing(file, workerLogMaxBytes), refs: 0 }; logRings.set(file, e); }
+    e.refs += 1;
+    let released = false;
+    return {
+      write: (chunk) => e.ring.write(chunk),
+      close: () => {
+        if (released) return;
+        released = true;
+        e.refs -= 1;
+        if (e.refs <= 0 && logRings.get(file) === e) { logRings.delete(file); try { e.ring.close(); } catch { /* best effort */ } }
+      },
+    };
+  };
 
   const startWorker = (w, { fresh = false } = {}) => {
     // A fresh (re)start attempts the profile again, so clear any prior
@@ -17753,7 +17773,7 @@ async function runSupervisorDaemon() {
     if (ringed) {
       let ring = null;
       try {
-        ring = createLogRing(w.logFile, workerLogMaxBytes);
+        ring = acquireLogRing(w.logFile);
         const feed = (chunk) => { try { ring.write(chunk); } catch { /* never crash the daemon */ } };
         if (child.stdout) { child.stdout.on('data', feed); child.stdout.on('error', () => {}); }
         if (child.stderr) { child.stderr.on('data', feed); child.stderr.on('error', () => {}); }
@@ -17803,12 +17823,7 @@ async function runSupervisorDaemon() {
         // #202 drain-remove: a worker flagged for removal has now drained and
         // exited — delete it and announce its removal (mirrors the synchronous
         // force-remove path). Do this before persist() so the state reflects it.
-        if (w.removeOnExit && workers.get(w.id) === w) {
-          workers.delete(w.id);
-          try { rmSync(w.activityFile || supervisorWorkerActivityFile(w.id), { force: true }); } catch { /* best effort */ }
-          dlog(`worker '${w.id}' removed (drained)`);
-          broadcast({ type: 'event', event: 'worker-remove', id: w.id });
-        }
+        if (w.removeOnExit && workers.get(w.id) === w) finishDrainRemove(w);
         persist();
         // #202: during a graceful drain, push a fresh status so an attached
         // `stop` client sees the in-flight count shrink as each worker finishes
@@ -17827,6 +17842,15 @@ async function runSupervisorDaemon() {
         w.configFailed = true;
         dlog(`worker '${w.id}' refused to start (configuration failure, exit ${NANO_EXIT_CONFIG}); NOT restarting — fix the profile and restart it`);
         broadcast({ type: 'event', event: 'worker-config-error', worker: workerPublic(w) });
+        persist();
+        return;
+      }
+      // #340 review: a surged replacement that dies before it is adopted must
+      // NOT arm an automatic restart — the roll's rollback (abandonSurge) owns
+      // its fate and restores the old child; a stray timer could later clobber
+      // the restored child/pid and leave the original untracked.
+      if (w.surgeChild === child) {
+        dlog(`worker '${w.id}' surged replacement down (${reason}) before readiness; not restarting (the reload rolls back)`);
         persist();
         return;
       }
@@ -18068,6 +18092,32 @@ async function runSupervisorDaemon() {
   }, Math.min(15_000, Math.max(1_000, Math.floor(stoppingIdleMs / 4))));
   try { wedgeTimer.unref(); } catch { /* best effort */ }
 
+  // #340 review: live old-code children of a worker (surge reload).
+  const liveRetiring = (w) => (Array.isArray(w.retiring) ? w.retiring : []).filter((r) => r && !r.exited && isPidAlive(r.pid));
+  // Complete a drain-remove ONLY once the current child AND every retiring
+  // child have exited — otherwise a still-draining old child would vanish from
+  // status/shutdown accounting. Called from the death handler and when a
+  // retiring child exits.
+  const finishDrainRemove = (w) => {
+    if (!w.removeOnExit || workers.get(w.id) !== w) return;
+    if (w.pid && isPidAlive(w.pid)) return;
+    if (liveRetiring(w).length > 0) return;
+    workers.delete(w.id);
+    try { rmSync(w.activityFile || supervisorWorkerActivityFile(w.id), { force: true }); } catch { /* best effort */ }
+    dlog(`worker '${w.id}' removed (drained)`);
+    broadcast({ type: 'event', event: 'worker-remove', id: w.id });
+    persist();
+  };
+  // Stop a worker's retiring (old-code) children: graceful → drain + wait;
+  // force → SIGTERM, bounded wait, SIGKILL. Shared by stop/remove/shutdown.
+  const stopRetiringOf = (w, force) => liveRetiring(w).map((old) => (force
+    ? (async () => {
+      try { process.kill(old.pid, 'SIGTERM'); } catch { /* gone */ }
+      await Promise.race([old.exitPromise, new Promise((r) => { const t = setTimeout(r, STOP_GRACE_MS + FORCE_STOP_RECOVERY_MS); t.unref?.(); })]);
+      if (isPidAlive(old.pid)) { try { process.kill(old.pid, 'SIGKILL'); } catch { /* gone */ } }
+    })()
+    : drainRetiring(w, old)));
+
   const forceStopWorker = async (w) => {
     const pid = w.pid;
     if (w.child && pid) {
@@ -18093,13 +18143,13 @@ async function runSupervisorDaemon() {
       // loop, lets in-flight jobs finish, and exits on its own. Wait INDEFINITELY
       // — a `stop --force` escalation (forceStopWorker) is the only way to cut a
       // stuck drain short, and it resolves this same wait when the child dies.
-      if (w.child && pid) {
-        sendDrainSignal(w, pid);
-        await waitForChildExit(w.child, null);
-      }
+      await Promise.all([
+        (w.child && pid) ? (sendDrainSignal(w, pid), waitForChildExit(w.child, null)) : null,
+        ...stopRetiringOf(w, false),
+      ]);
       return true;
     }
-    await forceStopWorker(w);
+    await Promise.all([forceStopWorker(w), ...stopRetiringOf(w, true)]);
     return true;
   };
 
@@ -18117,7 +18167,10 @@ async function runSupervisorDaemon() {
       if (w.restartTimer) { clearTimeout(w.restartTimer); w.restartTimer = null; }
       const pid = w.pid;
       if (w.child && pid) { sendDrainSignal(w, pid); }
-      else { workers.delete(id); try { rmSync(w.activityFile || supervisorWorkerActivityFile(id), { force: true }); } catch { /* best effort */ } broadcast({ type: 'event', event: 'worker-remove', id }); persist(); }
+      // #340 review: drain every retiring old-code child too; the record is
+      // kept until ALL of them have exited (finishDrainRemove).
+      for (const p of stopRetiringOf(w, false)) p.catch(() => {});
+      finishDrainRemove(w);
       dlog(`worker '${id}' draining for removal`);
       return true;
     }
@@ -18222,6 +18275,8 @@ async function runSupervisorDaemon() {
       try { rmSync(old.activityFile, { force: true }); } catch { /* best effort */ }
     }
     dlog(`worker '${w.id}' old-code child pid ${old.pid} exited (drained)`);
+    finishDrainRemove(w);
+    persist();
     if (!shuttingDown) { try { broadcast(statusFrame(false)); } catch { /* best effort */ } }
   };
   const surgeWorker = (id) => serializeOp(async () => {
@@ -18256,6 +18311,7 @@ async function runSupervisorDaemon() {
     w.restarts = 0;
     w.adopted = false;
     startWorker(w, { fresh: true });
+    w.surgeChild = w.child; // suppress auto-restart until adopted (see handleDeath)
     dlog(`worker '${id}' surged: new-code replacement pid ${w.pid}${old ? ` alongside old pid ${old.pid}` : ''} (awaiting readiness before draining the old child)`);
     return { w, child: w.child, old };
   });
@@ -18264,14 +18320,30 @@ async function runSupervisorDaemon() {
     await waitForWorkerReady(w, child, SUPERVISOR_RELOAD_READY_TIMEOUT_MS);
     // Ready only when the replacement is STILL this worker's live current child,
     // nobody is stopping it, and its marker proves it polls ≥1 job type.
-    return workers.get(id) === w && w.child === child && !w.stopping && !shuttingDown
+    const ready = workers.get(id) === w && w.child === child && !w.stopping && !shuttingDown
       && w.pid != null && w.pid === child.pid && child.exitCode === null && child.signalCode === null
       && activityMarkerReadyFor(readWorkerActivity(w.id, w.activityFile), child.pid);
+    // Adopted: normal restart-on-death applies from here on.
+    if (ready && w.surgeChild === child) w.surgeChild = null;
+    return ready;
   };
   const abandonSurge = (id, h, why) => serializeOp(async () => {
     const { w, child, old } = h;
     dlog(`worker '${id}' replacement pid ${child.pid ?? '?'} ${why} within ${SUPERVISOR_RELOAD_READY_TIMEOUT_MS}ms — keeping the old child serving and aborting the roll`);
-    if (!old || old.exited || !isPidAlive(old.pid) || w.child !== child || workers.get(id) !== w) return;
+    if (w.surgeChild === child) w.surgeChild = null;
+    // #340 review: cancel any pending replacement retry BEFORE restoring, so a
+    // stale timer can never overwrite the restored child/pid.
+    if (w.restartTimer) { clearTimeout(w.restartTimer); w.restartTimer = null; }
+    // If a stop/remove/shutdown already owns this worker, do NOT roll back:
+    // that operation awaits the old child's retirement (exitPromise) and
+    // bookkeeping, which a rollback would detach and hang.
+    if (w.stopping || w.removeOnExit || shuttingDown || upgrading || workers.get(id) !== w) return;
+    if (!old || old.exited || !isPidAlive(old.pid) || w.child !== child) {
+      // No old child to restore: if the replacement is dead and still current,
+      // fall back to the ordinary restart so the worker is not left down.
+      if (w.child === child && !(w.pid && isPidAlive(w.pid))) startWorker(w);
+      return;
+    }
     // Revert: the old child becomes current again (its own death handler is
     // live again because `w.child === oldChild`), then kill the replacement —
     // its death handler is now stale and ignores the exit.
@@ -18314,22 +18386,7 @@ async function runSupervisorDaemon() {
   // Stop every retiring (old-code) child — used by shutdown. Graceful: make sure
   // each has been asked to drain and wait for it; force: SIGTERM → SIGKILL.
   const stopRetiring = async (force) => {
-    const all = [];
-    for (const w of workers.values()) {
-      for (const old of Array.isArray(w.retiring) ? w.retiring : []) {
-        if (old.exited) continue;
-        if (force) {
-          all.push((async () => {
-            try { process.kill(old.pid, 'SIGTERM'); } catch { /* gone */ }
-            await Promise.race([old.exitPromise, new Promise((r) => { const t = setTimeout(r, STOP_GRACE_MS + FORCE_STOP_RECOVERY_MS); t.unref?.(); })]);
-            if (isPidAlive(old.pid)) { try { process.kill(old.pid, 'SIGKILL'); } catch { /* gone */ } }
-          })());
-        } else {
-          all.push(drainRetiring(w, old));
-        }
-      }
-    }
-    await Promise.all(all);
+    await Promise.all([...workers.values()].flatMap((w) => stopRetiringOf(w, force)));
   };
 
   // Rolling hot reload across a set of worker ids (#340 surge-then-drain).

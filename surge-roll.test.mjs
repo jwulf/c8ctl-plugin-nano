@@ -172,3 +172,30 @@ test('#340 review: daemon upgrade is refused while old-code children are still d
   assert.match(src, /if \(liveRetiringIds\(\)\.length > 0\) \{\s*rollbackFromUpgrade\(/);
   assert.match(src, /prep\.code === 'UPGRADE_RETIRING_BUSY'/);
 });
+
+test('#340 review: removing/stopping a reloading worker covers its retiring children', async () => {
+  const { readFileSync } = await import('node:fs');
+  const src = readFileSync(new URL('./c8ctl-plugin.js', import.meta.url), 'utf8');
+  // drain-remove keeps the record until current AND retiring children exit
+  assert.match(src, /const finishDrainRemove = \(w\) => \{[\s\S]*?if \(liveRetiring\(w\)\.length > 0\) return;/);
+  assert.match(src, /for \(const p of stopRetiringOf\(w, false\)\) p\.catch/);
+  assert.match(src, /await Promise\.all\(\[forceStopWorker\(w\), \.\.\.stopRetiringOf\(w, true\)\]\)/);
+  assert.match(src, /dlog\(`worker '\$\{w\.id\}' old-code child pid \$\{old\.pid\} exited \(drained\)`\);\s*finishDrainRemove\(w\);/);
+});
+
+test('#340 review: rollback is skipped when stop/shutdown owns the worker, and cancels replacement retries', async () => {
+  const { readFileSync } = await import('node:fs');
+  const src = readFileSync(new URL('./c8ctl-plugin.js', import.meta.url), 'utf8');
+  const body = src.slice(src.indexOf('const abandonSurge ='), src.indexOf('const drainRetiring ='));
+  assert.ok(body.indexOf('clearTimeout(w.restartTimer)') < body.indexOf('w.child = old.child'));
+  assert.match(body, /if \(w\.stopping \|\| w\.removeOnExit \|\| shuttingDown \|\| upgrading \|\| workers\.get\(id\) !== w\) return;/);
+  // an un-adopted surged replacement never arms an automatic restart
+  assert.match(src, /if \(w\.surgeChild === child\) \{\s*dlog\(/);
+});
+
+test('#340 review: concurrent incarnations share one ref-counted log ring per path', async () => {
+  const { readFileSync } = await import('node:fs');
+  const src = readFileSync(new URL('./c8ctl-plugin.js', import.meta.url), 'utf8');
+  assert.match(src, /ring = acquireLogRing\(w\.logFile\);/);
+  assert.doesNotMatch(src, /ring = createLogRing\(w\.logFile/);
+});

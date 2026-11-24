@@ -17137,7 +17137,15 @@ async function runSupervisorDaemon() {
         const remainingMs = SUPERVISOR_UPGRADE_QUIESCE_TIMEOUT_MS - (Date.now() - t0);
         prep = await supervisorRequest({ op: 'prepare-upgrade', pid: process.pid }, { socketPath, timeoutMs: 750, responseTimeoutMs: Math.max(SUPERVISOR_PROBE_RESPONSE_TIMEOUT_MS, remainingMs) });
       } catch { /* socket briefly unreachable — retry until the deadline */ }
-      if (prep && prep.ok) break; // quiesced — the accept loop is closed
+      if (prep && prep.ok) {
+        // #338 review: honour the quiesce budget even when the ack arrives
+        // late — exiting here (before binding) makes the predecessor roll back.
+        if (Date.now() - t0 > SUPERVISOR_UPGRADE_QUIESCE_TIMEOUT_MS) {
+          dlogBoot(`upgrade mode: predecessor pid ${st.pid} quiesced only after the ${SUPERVISOR_UPGRADE_QUIESCE_TIMEOUT_MS}ms budget — exiting so it rolls back`);
+          process.exit(1);
+        }
+        break; // quiesced — the accept loop is closed
+      }
       if (prep && prep.ok === false && /unknown op/.test(String(prep.error || ''))) {
         dlogBoot(`upgrade mode: predecessor pid ${st.pid} does not understand prepare-upgrade (too old) — refusing to upgrade`);
         process.exit(1);
@@ -18546,6 +18554,13 @@ async function runSupervisorDaemon() {
       // and about to be replaced) — never under someone else's socket.
       if (server.listening) {
         await new Promise((resolve) => { try { server.close(() => resolve()); } catch { resolve(); } setTimeout(resolve, 200).unref?.(); });
+      }
+      // #338 review: an in-flight control connection can complete
+      // prepare-upgrade (or a stop) while we awaited close(); the successor
+      // may now own the canonical path. Never unlink/rebind after that.
+      if (upgrading || handedOver || shuttingDown || shutdownStarted) {
+        dlog(`${why}: upgrade/shutdown began while re-binding — leaving the control socket path alone`);
+        return false;
       }
       if (!win) { try { rmSync(socketPath, { force: true }); } catch { /* ignore */ } }
       const prev = win ? null : process.umask(0o177);

@@ -109,8 +109,12 @@ function writeShim(shimPath, { recordArgv = false, workArgvDir = null, ignoreSig
     // `node --test` skips t.after). SIGTERM runs the daemon's graceful
     // shutdown, which also removes its control socket from tmpdir.
     `  const rp = Number.parseInt(process.env.NANO_TEST_RUNNER_PID ?? '', 10);`,
-    `  if (Number.isInteger(rp) && rp > 0) { const t = setInterval(() => { try { process.kill(rp, 0); } catch { clearInterval(t); process.kill(process.pid, 'SIGTERM'); } }, 1000); t.unref(); }`,
-    `  const mod = await import(${JSON.stringify(pluginUrl)});`,
+    // SIGTERM is ignored mid-upgrade, so keep a bounded hard-exit fallback
+    // (removing the socket only if this daemon still owns its inode).
+    `  let mod = null; let sockId = null;`,
+    `  if (Number.isInteger(rp) && rp > 0) { const t = setInterval(() => { try { process.kill(rp, 0); } catch { clearInterval(t); setTimeout(async () => { try { const fs = await import('node:fs'); const p = mod && mod.getSupervisorSocketPath(); if (p && sockId) { const st = fs.lstatSync(p); if (st.ino === sockId) fs.rmSync(p, { force: true }); } } catch {} process.exit(1); }, 15000).unref(); process.kill(process.pid, 'SIGTERM'); } }, 1000); t.unref(); }`,
+    `  mod = await import(${JSON.stringify(pluginUrl)});`,
+    `  setTimeout(async () => { try { const fs = await import('node:fs'); sockId = fs.lstatSync(mod.getSupervisorSocketPath()).ino; } catch {} }, 2000).unref();`,
     `  await mod.runSupervisorDaemon();`,
     `} else if (argv[0] === 'nano' && argv[1] === 'work') {`,
   );
@@ -1850,6 +1854,9 @@ test('supervisor upgrade: a successor that times out quiescing leaves the predec
     env: { ...process.env, NANO_SUPERVISOR_UPGRADE: '1', NANO_SUPERVISOR_UPGRADE_QUIESCE_TIMEOUT_MS: '1' },
     stdio: 'ignore',
   });
-  await new Promise((r) => succ.once('exit', r));
+  const exited = new Promise((r) => { if (succ.exitCode !== null) r(); else succ.once('exit', r); });
+  t.after(() => { try { succ.kill('SIGKILL'); } catch { /* ignore */ } });
+  const timedOut = await Promise.race([exited.then(() => false), new Promise((r) => setTimeout(r, 20000, true).unref())]);
+  assert.equal(timedOut, false, 'the successor exits within its (tiny) quiesce budget');
   await assertManageable338(mod, sockPath, state.pid);
 });

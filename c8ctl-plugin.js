@@ -584,8 +584,14 @@ export function stoppingWorkerEscalation({ worker, activity, now, idleMs, killGr
   const prev = worker?.stoppingIdle || null;
   const own = !!activity && worker?.pid != null && activity.pid === worker.pid;
   const signalledAt = worker?.drainSignalledAt;
-  const fresh = own && Number.isFinite(activity.updatedAt)
-    && (!Number.isFinite(signalledAt) || activity.updatedAt >= signalledAt);
+  // Review on #341: activity writes are best-effort, so a merely fresh own-pid
+  // marker with no jobs is NOT proof of idleness (a failed publish during a job
+  // leaves an old empty marker). Require the worker's explicit post-quiesce idle
+  // acknowledgement (`drainIdleAt`, stamped only while draining with no local
+  // job), at or after the drain signal. Missing/foreign/malformed/pre-drain → none.
+  const idleAt = own ? activity.drainIdleAt : undefined;
+  const fresh = own && Number.isFinite(activity.updatedAt) && Number.isFinite(idleAt)
+    && (!Number.isFinite(signalledAt) || (activity.updatedAt >= signalledAt && idleAt >= signalledAt));
   if (!fresh) return { action: 'none', state: null };
   const busy = Array.isArray(activity.jobs) && activity.jobs.some((j) => j && !j.settlementPending);
   if (busy) return { action: 'none', state: null };
@@ -12817,7 +12823,7 @@ function agenticStateForTarget(target, safeUrl = (u) => u) {
  * without making an idle worker look busy or inflating the drain's in-flight count.
  * @param {{ pid:number, updatedAt:number, jobs:Array<{key:string,type:string,since:number,settlementPending?:boolean}>, engine:(string|null), agentic:object, readyAt:(number|null), ghAuth:(object|null), watchdogPid:(number|null|undefined), signalReadyAt?:(number|null) }} fields
  */
-function buildActivityPayload({ pid, updatedAt, jobs, engine, agentic, readyAt, ghAuth, watchdogPid, signalReadyAt }) {
+function buildActivityPayload({ pid, updatedAt, jobs, engine, agentic, readyAt, ghAuth, watchdogPid, signalReadyAt, drainIdleAt }) {
   const jobList = Array.isArray(jobs) ? jobs : [];
   return {
     pid,
@@ -12835,6 +12841,9 @@ function buildActivityPayload({ pid, updatedAt, jobs, engine, agentic, readyAt, 
     // a healthy `--auto` worker with no deployed types never stamps it). The
     // daemon-upgrade handoff gates its retarget SIGUSR2 on THIS, not readyAt.
     signalReadyAt: signalReadyAt ?? null,
+    // #339 review: stamped only while DRAINING with no local in-flight job — the
+    // worker's explicit idle acknowledgement the daemon's wedge escalation requires.
+    drainIdleAt: drainIdleAt ?? null,
     // #293: the cached gh auth token's observable identity — { present,
     // fingerprint, scopes, since, ageMs, lastCheckAgoMs }, NEVER the value — so
     // `supervisor status` can show the credential's age/scopes per worker. Null
@@ -13832,8 +13841,12 @@ async function workAgent(req, flags, ctx) {
   // #309 review: set once the SIGUSR2 (drain/retarget) handler is installed.
   let signalReadyAt = null;
   const markSignalReady = () => { signalReadyAt = Date.now(); };
+  // #339 review: set when a graceful drain starts; drainIdleAt is the explicit
+  // post-quiesce idle ack (re-stamped each write while draining and job-free).
+  let drainQuiesced = false;
   const writeActivity = () => {
     if (!activityFile) return;
+    const drainIdleAt = drainQuiesced && activeJobs.size === 0 ? Date.now() : null;
     const jobs = [...activeJobs.entries()].map(([key, v]) => ({ key, type: v.type, since: v.since }));
     // #254: append settlement-pending ghosts as flagged, observational entries. A
     // ghost whose key was re-activated (now live in `activeJobs`) is superseded —
@@ -13856,7 +13869,7 @@ async function workAgent(req, flags, ctx) {
     // #293: publish the cached gh token's identity (fingerprint/scopes/age —
     // never the value) so `supervisor status` can answer "is this worker holding
     // a stale token?" in one line.
-    const payload = buildActivityPayload({ pid: process.pid, updatedAt: Date.now(), jobs, engine: workerEngine, agentic: agenticState, readyAt, signalReadyAt, ghAuth: ghAuthTokenInfo(), watchdogPid: parentWatchdog && typeof parentWatchdog.watchedPid === 'function' ? parentWatchdog.watchedPid() : null });
+    const payload = buildActivityPayload({ pid: process.pid, updatedAt: Date.now(), jobs, engine: workerEngine, agentic: agenticState, readyAt, signalReadyAt, drainIdleAt, ghAuth: ghAuthTokenInfo(), watchdogPid: parentWatchdog && typeof parentWatchdog.watchedPid === 'function' ? parentWatchdog.watchedPid() : null });
     const tmp = `${activityFile}.${process.pid}.tmp`;
     try {
       mkdirSync(dirname(activityFile), { recursive: true });
@@ -15881,6 +15894,8 @@ async function workAgent(req, flags, ctx) {
       drainStuckMs: workerDrainStuckMs(),
       onDrainStart: () => {
         draining = true;
+        drainQuiesced = true;
+        try { writeActivity(); } catch { /* best effort */ }
         // Authoritative quiesce: the activation loop leases no new job even if the
         // --auto reconcile rewrites this worker's job types (registry.quiesce wins).
         try { SupervisorEffect.runSync(workerRegistry.quiesce()); } catch { /* best effort */ }
@@ -18799,6 +18814,10 @@ async function runSupervisorDaemon() {
           // Never write a sidecar or signal it — just keep it pending (its
           // watchdog still guards the predecessor) until it exits.
           pending.set(id, { pid: w.pid, signalled: true, drainOnly: true });
+          // #339 review: restore the delivered-drain identity (WITHOUT re-signalling)
+          // so the wedge escalation also covers an adopted, already-draining worker.
+          // drainSignalledAt stays unset: the worker's drainIdleAt ack alone gates it.
+          w.drainSignalledPid = w.pid;
           continue;
         }
         const actFile = w.activityFile || supervisorWorkerActivityFile(w.id);

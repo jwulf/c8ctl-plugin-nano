@@ -56,7 +56,7 @@ test('armWorkerExitBackstop logs open handles and force-exits', () => {
   assert.equal(typeof describeOpenHandles(), 'string');
 });
 
-test('end to end: SIGUSR2 drain with an in-flight agent job exits after the job completes, despite a leaked handle', async () => {
+test('end to end: SIGUSR2 drain with an in-flight agent job exits after the job completes, despite a leaked handle', { skip: process.platform === 'win32' && 'POSIX SIGUSR2 cannot be delivered gracefully on Windows' }, async () => {
   // The child holds a REF'D interval (a leaked producer flush timer) that would
   // keep the loop alive forever after the lifecycle resolves.
   const script = `
@@ -93,7 +93,7 @@ test('end to end: SIGUSR2 drain with an in-flight agent job exits after the job 
 
 test('supervisor escalation: a wedged stopping worker gets SIGTERM then SIGKILL', () => {
   const w = { pid: 42, stoppingIdle: null };
-  const idle = { pid: 42, updatedAt: 0, jobs: [] };
+  const idle = { pid: 42, updatedAt: 0, drainIdleAt: 0, jobs: [] };
   let s = stoppingWorkerEscalation({ worker: w, activity: idle, now: 0, idleMs: 100, killGraceMs: 50 });
   assert.equal(s.action, 'none'); w.stoppingIdle = s.state;
   s = stoppingWorkerEscalation({ worker: w, activity: idle, now: 100, idleMs: 100, killGraceMs: 50 });
@@ -112,7 +112,7 @@ test('supervisor escalation: a stopping worker with a running job is never escal
   const s = stoppingWorkerEscalation({ worker: w, activity: busy, now: 10_000_000, idleMs: 100, killGraceMs: 50 });
   assert.deepEqual(s, { action: 'none', state: null });
   // a settlementPending ghost does not count as running
-  const ghost = { pid: 42, updatedAt: 0, jobs: [{ key: '1', settlementPending: true }] };
+  const ghost = { pid: 42, updatedAt: 0, drainIdleAt: 0, jobs: [{ key: '1', settlementPending: true }] };
   assert.equal(stoppingWorkerEscalation({ worker: { pid: 42, stoppingIdle: { since: 0 } }, activity: ghost, now: 200, idleMs: 100, killGraceMs: 50 }).action, 'term');
 });
 
@@ -122,5 +122,21 @@ test('supervisor escalation fails closed on a missing, foreign-pid or stale mark
     assert.deepEqual(stoppingWorkerEscalation({ worker: { ...base }, activity, now: 10_000, idleMs: 100, killGraceMs: 50 }), { action: 'none', state: null });
   }
   // a fresh own-pid idle marker (written after the drain signal) does escalate
-  assert.equal(stoppingWorkerEscalation({ worker: { ...base }, activity: { pid: 42, updatedAt: 100, jobs: [] }, now: 10_000, idleMs: 100, killGraceMs: 50 }).action, 'term');
+  assert.equal(stoppingWorkerEscalation({ worker: { ...base }, activity: { pid: 42, updatedAt: 100, drainIdleAt: 100, jobs: [] }, now: 10_000, idleMs: 100, killGraceMs: 50 }).action, 'term');
+});
+
+test('supervisor escalation requires the worker idle ack (drainIdleAt): a fresh empty marker without it, or a pre-drain ack, never escalates', () => {
+  const base = { pid: 42, drainSignalledAt: 100, stoppingIdle: { since: 0 } };
+  for (const activity of [
+    { pid: 42, updatedAt: 500, jobs: [] }, // failed/old publish: no ack
+    { pid: 42, updatedAt: 500, drainIdleAt: null, jobs: [] },
+    { pid: 42, updatedAt: 500, drainIdleAt: 'x', jobs: [] }, // malformed
+    { pid: 42, updatedAt: 500, drainIdleAt: 50, jobs: [] }, // ack predates the drain
+    { pid: 7, updatedAt: 500, drainIdleAt: 500, jobs: [] }, // foreign
+  ]) {
+    assert.deepEqual(stoppingWorkerEscalation({ worker: { ...base }, activity, now: 10_000, idleMs: 100, killGraceMs: 50 }), { action: 'none', state: null });
+  }
+  // adopted worker (no drainSignalledAt): the ack alone gates escalation
+  assert.equal(stoppingWorkerEscalation({ worker: { pid: 42, stoppingIdle: { since: 0 } }, activity: { pid: 42, updatedAt: 5, drainIdleAt: 5, jobs: [] }, now: 10_000, idleMs: 100, killGraceMs: 50 }).action, 'term');
+  assert.equal(stoppingWorkerEscalation({ worker: { pid: 42, stoppingIdle: { since: 0 } }, activity: { pid: 42, updatedAt: 5, jobs: [] }, now: 10_000, idleMs: 100, killGraceMs: 50 }).action, 'none');
 });

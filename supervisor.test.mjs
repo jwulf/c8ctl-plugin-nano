@@ -1152,6 +1152,7 @@ test('buildActivityPayload carries engine + agentic and derives busy from jobs',
     agentic: { status: 'connected', mode: 'local' },
     readyAt: null,
     signalReadyAt: null,
+    drainIdleAt: null,
     // #293: the cached gh token's identity (fingerprint/scopes/age — never the
     // value) rides the marker so `supervisor status` can show it; null when the
     // producer did not stamp it (an un-primed cache / older worker).

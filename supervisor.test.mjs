@@ -1161,6 +1161,10 @@ test('buildActivityPayload carries engine + agentic and derives busy from jobs',
     // until the producer stamps it (a standalone `nano work` has no watchdog).
     // The daemon-upgrade handoff reads it as the retarget ack.
     watchdogPid: null,
+    // #340: code version + drain start (null when not stamped). `jobTypeCount`
+    // is omitted entirely when unknown so older readers fall back to readyAt.
+    version: null,
+    drainStartedAt: null,
   });
 
   // Busy: jobs present → busy:true; the live job list rides through untouched.

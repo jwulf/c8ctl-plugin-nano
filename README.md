@@ -1342,27 +1342,32 @@ c8ctl nano supervisor reload # roll it into the running fleet, zero downtime
 ```
 
 - Each supervised worker is a **separate `nano work` process** that reads the
-  plugin from disk when it starts, so the daemon adopts new code by **rolling
-  through the workers one at a time** — gracefully draining each (the same
-  `SIGUSR2` quiesce as `stop`: it stops leasing new jobs, finishes the ones in
-  flight, and exits) and respawning it, which re-reads the updated
-  `c8ctl-plugin.js`, its sidecars, and `supervisor.dist.js`. Because only one
-  worker is down at a time, the rest of the fleet keeps serving — **zero fleet
-  downtime**. To keep it genuinely one-at-a-time, after respawning a worker the
-  daemon **waits for the replacement to report ready** (its activation loop is up
-  and leasing) before draining the next one — a bare spawn/PID is not readiness,
-  so on the normal readiness path a slow replacement can never leave two workers
-  down at once. That wait is
-  **bounded** (`NANO_SUPERVISOR_RELOAD_READY_TIMEOUT_MS`, default 30s): a
-  never-ready replacement can't wedge the roll — the daemon advances anyway. That
-  timeout fallback is the one exception to the guarantee above: when a
-  replacement never reports ready the daemon drains the next worker while the
-  previous one is still unready, so **two (or more) workers can be temporarily
-  unavailable** until the slow replacement catches up. This
-  is a *fleet-level* guarantee: a worker is drained **before** its replacement
-  spawns, so a **single-worker fleet** (or a job type served by only one worker)
-  does lose that capacity for the drain+boot window. Run more than
-  one worker for a type if you need it served continuously across a reload.
+  plugin from disk when it starts, so the daemon adopts new code by replacing
+  each worker process — which re-reads the updated `c8ctl-plugin.js`, its
+  sidecars, and `supervisor.dist.js`. A reload is **surge-then-drain** (issue
+  #340), so capacity **never drops below its pre-reload level**:
+  1. the daemon **starts the new-code replacement first**, alongside the old
+     worker (each spawn has its own activity marker);
+  2. it waits until the replacement is **actually polling** — its activation
+     loop is up and it reports **≥1 job type** — bounded by
+     `NANO_SUPERVISOR_RELOAD_READY_TIMEOUT_MS` (default 120s);
+  3. only then does it **drain the old worker** (the same `SIGUSR2` quiesce as
+     `stop`: stop leasing, finish in-flight jobs, exit).
+
+  **Idle workers swap immediately** (all of them at once — their drain is
+  instant), and **busy workers drain in parallel**: each old child keeps
+  finishing its job in the background while the roll moves on, so the roll
+  takes as long as the *longest* in-flight job, not the sum of them. How many
+  busy workers may have a replacement booting at once is the **surge** size —
+  `supervisor reload --surge N|all` (or `NANO_SUPERVISOR_RELOAD_SURGE`), default
+  `1`. A replacement that **never becomes ready** is killed, its **old worker
+  is NOT drained** (it keeps serving), and the roll stops and reports the
+  failure — no more "advancing anyway". Even a **single-worker fleet** keeps
+  serving through a reload.
+- `supervisor status` shows each worker's **code version**, how long a
+  draining worker (or a `retiring` old-code child still finishing its job after
+  a surge) has been draining, and flags a worker stuck in `stopping` with **no**
+  job (wedged).
 - It **never kills in-flight work**: a reload waits indefinitely for each
   worker's jobs to finish (adopting new code is never worth losing a running
   job). The command **streams progress** and **Ctrl-C detaches** — the daemon
@@ -1393,7 +1398,7 @@ c8ctl nano supervisor reload # roll it into the running fleet, zero downtime
   "update available" whenever the code on disk has advanced past the running
   daemon, so you know when a reload (or upgrade) is worthwhile. While a reload
   is in progress, `supervisor status` also prints a `reload:` line (`rolling N/M
-  adopted — draining <id> — do not restart the daemon`) so a detached operator
+  adopted — surging <id> — do not restart the daemon`) so a detached operator
   can see the roll without staying attached to the streaming `reload` command.
 
 ### Rolling daemon hot-upgrade: `supervisor upgrade`

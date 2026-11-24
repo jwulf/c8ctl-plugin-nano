@@ -91,7 +91,7 @@ function restoreEnv(key, prev) {
 // SIGKILL path on restart; `crash` exits immediately (code 1) with no watchdog;
 // `crashCode` exits immediately with a SPECIFIC code (e.g. 78 = EX_CONFIG) so a
 // test can model a non-restartable configuration failure.
-function writeShim(shimPath, { recordArgv = false, workArgvDir = null, ignoreSigterm = false, crash = false, crashCode = null, busy = null } = {}) {
+function writeShim(shimPath, { recordArgv = false, workArgvDir = null, ignoreSigterm = false, crash = false, crashCode = null, busy = null, fakeJob = false } = {}) {
   if (recordArgv && typeof workArgvDir !== 'string') {
     throw new Error('writeShim: recordArgv requires a string workArgvDir path');
   }
@@ -163,7 +163,10 @@ function writeShim(shimPath, { recordArgv = false, workArgvDir = null, ignoreSig
       // created ABOVE first so the very first worker's sentinel write can't fail
       // with ENOENT (which would let its respawn run healthy instead of crashing).
       lines.push(
-        `  const sentinel = actFile + '.spawned';`,
+        // #340: a surged replacement gets its own per-spawn activity file, so
+        // key the sentinel on the stable worker name (\`--name <id>\`) instead.
+        `  const nameIdx = argv.indexOf('--name');`,
+        `  const sentinel = dirname(actFile) + '/' + (nameIdx >= 0 ? argv[nameIdx + 1] : 'w') + '.spawned';`,
         `  if (ex(sentinel)) { process.exit(1); }`,
         `  try { wf(sentinel, '1'); } catch {}`,
       );
@@ -178,7 +181,7 @@ function writeShim(shimPath, { recordArgv = false, workArgvDir = null, ignoreSig
       // #322: mirror the real worker's ONE-SHOT drain handler (`process.once`) so
       // a second SIGUSR2 would take the default action (terminate) and kill the
       // job — and count drain signals so a test can prove the daemon sent one.
-      `  process.once('SIGUSR2', () => { try { appendFileSync(${JSON.stringify(sigFile + '.usr2')}, 'x'); } catch {} endWith('drained', ${Number(drainMs)}); });`,
+      `  process.once('SIGUSR2', () => { try { appendFileSync(${JSON.stringify(sigFile + '.usr2')}, 'x'); appendFileSync(${JSON.stringify(sigFile + '.usr2.')} + process.pid, 'x'); } catch {} endWith('drained', ${Number(drainMs)}); });`,
       `  process.on('SIGTERM', () => endWith('forced', 0));`,
       // #331 review: publish the marker (signalReadyAt) only AFTER the handler is armed.
       `  try { wf(actFile, JSON.stringify(${marker})); } catch {}`,
@@ -203,12 +206,15 @@ function writeShim(shimPath, { recordArgv = false, workArgvDir = null, ignoreSig
       // `signalReadyAt`. Stamping `readyAt` first let the successor's retarget
       // gate fire before this handler existed, so SIGUSR2 hit Node's default
       // action and killed the stand-in mid-handoff.
+      // #340: `fakeJob` makes the idle stand-in report an in-flight job, so a
+      // daemon upgrade is proven to adopt a BUSY worker without touching it.
+      `  const JOBS = ${JSON.stringify(fakeJob ? '"jobs":[{"key":"J1","type":"faker:senior","since":1}]' : '"jobs":[]')};`,
       `  process.on('SIGUSR2', () => {`,
       `    (async () => {`,
       `    let up = Number.parseInt(process.env.NANO_SUPERVISOR_UPGRADE_PID ?? '', 10);`,
       `    try { const fs = await import('node:fs'); const aaf = process.env.NANO_SUPERVISOR_ACTIVITY_FILE; if (aaf) { const f = Number.parseInt(fs.readFileSync(aaf + '.upgrade', 'utf8').trim(), 10); if (Number.isInteger(f) && f > 0) up = f; } } catch {}`,
       `    if (Number.isInteger(up) && up > 0 && wd && typeof wd.retarget === 'function' && wd.retarget(up)) {`,
-      `      try { const { writeFileSync: awf } = await import('node:fs'); const aaf = process.env.NANO_SUPERVISOR_ACTIVITY_FILE; if (aaf) awf(aaf, JSON.stringify({ pid: process.pid, readyAt: Date.now(), signalReadyAt: Date.now(), jobs: [], watchdogPid: wd.watchedPid() })); } catch {}`,
+      `      try { const { writeFileSync: awf } = await import('node:fs'); const aaf = process.env.NANO_SUPERVISOR_ACTIVITY_FILE; if (aaf) awf(aaf, JSON.stringify({ pid: process.pid, readyAt: Date.now(), signalReadyAt: Date.now(), jobs: [], watchdogPid: wd.watchedPid() }).replace('"jobs":[]', JOBS)); } catch {}`,
       `    } else {`,
       // No upgrade in flight → SIGUSR2 is a graceful DRAIN (the #202 contract):
       // the stand-in has no in-flight job, so it exits at once, exactly like the
@@ -222,7 +228,7 @@ function writeShim(shimPath, { recordArgv = false, workArgvDir = null, ignoreSig
       // (`waitForWorkerReady`) and the upgrade handoff's retarget gate both
       // resolve for this idle stand-in. The real worker stamps `readyAt` once its
       // activation loop is up and `signalReadyAt` once the handler is armed.
-      `  try { const { writeFileSync: rwf, mkdirSync: rmk } = await import('node:fs'); const { dirname: rdn } = await import('node:path'); const raf = process.env.NANO_SUPERVISOR_ACTIVITY_FILE; if (raf) { rmk(rdn(raf), { recursive: true }); rwf(raf, JSON.stringify({ pid: process.pid, readyAt: Date.now(), signalReadyAt: Date.now(), jobs: [] })); } } catch {}`,
+      `  try { const { writeFileSync: rwf, mkdirSync: rmk } = await import('node:fs'); const { dirname: rdn } = await import('node:path'); const raf = process.env.NANO_SUPERVISOR_ACTIVITY_FILE; if (raf) { rmk(rdn(raf), { recursive: true }); rwf(raf, JSON.stringify({ pid: process.pid, readyAt: Date.now(), signalReadyAt: Date.now(), jobs: [] }).replace('"jobs":[]', JOBS)); } } catch {}`,
       `  setInterval(() => {}, 1 << 30); // idle keep-alive until the watchdog fires`,
     );
   }
@@ -979,14 +985,17 @@ test('supervisor stop during an in-progress reload drain does not kill the in-fl
   const oldPid = before.workers[0].pid;
   // Start a reload (drains the busy worker), then a graceful stop mid-drain.
   const reloadP = reloadStream(mod, { target: 'all' }).catch(() => []);
-  for (let i = 0; i < 40 && !existsSync(sigFile); i++) await sleep(25);
+  for (let i = 0; i < 400 && !existsSync(sigFile); i++) await sleep(25);
   assert.ok(existsSync(sigFile), 'the reload should have started draining the worker');
   const frames = await stopStream(mod, { force: false });
   await reloadP;
   assert.ok(frames.some((f) => f && f.type === 'stopped' && f.final), 'the stop completed');
   // The daemon joined the reload's drain: exactly ONE drain signal reached the
   // worker (a second SIGUSR2 would terminate it mid-job), and it finished its job.
-  assert.equal(readFileSync(`${sigFile}.usr2`, 'utf8'), 'x', 'exactly one drain signal must reach the worker');
+  // #340: the reload surges a replacement first, so the stop drains BOTH the
+  // old child (joined the reload's drain) and the replacement — but each
+  // process must receive exactly ONE drain signal.
+  assert.equal(readFileSync(`${sigFile}.usr2.${oldPid}`, 'utf8'), 'x', 'exactly one drain signal must reach the old worker');
   assert.equal(readFileSync(sigFile, 'utf8'), 'drained', 'the worker drained, not force-killed');
   assert.ok(existsSync(`${sigFile}.done`), 'the worker must finish its in-flight job (not be terminated mid-drain)');
   assert.equal(readFileSync(`${sigFile}.done`, 'utf8'), 'drained');
@@ -1030,11 +1039,12 @@ test('supervisor reload: rolls the whole fleet, giving every worker a fresh pid'
   await mod.supervisorRequest({ op: 'stop', force: true });
 });
 
-test('supervisor reload: a never-ready replacement does not wedge the roll (bounded readiness gate)', async (t) => {
-  // The replacement never stamps `readyAt`, so the readiness gate can only clear
-  // on its bounded timeout — set short here. The roll must still finish, listing
-  // the worker as reloaded (it advanced anyway), not hang forever.
-  const { mod } = await bootBusyDaemon(t, { drainMs: 100, notReady: true, readyTimeoutMs: 300 });
+test('supervisor reload: a never-ready replacement keeps the old worker and fails the roll (#340)', async (t) => {
+  // The replacement never stamps `readyAt`, so the readiness gate times out
+  // (short here). Surge-then-drain must NOT drain the old worker: it stays the
+  // live, serving child (same pid), the replacement is killed, and the terminal
+  // frame reports the failure instead of advancing anyway.
+  const { mod, sigFile } = await bootBusyDaemon(t, { drainMs: 100, notReady: true, readyTimeoutMs: 300 });
   const before = await mod.supervisorRequest({ op: 'status' });
   assert.equal(before.workers.length, 1);
   const id = before.workers[0].id;
@@ -1045,20 +1055,19 @@ test('supervisor reload: a never-ready replacement does not wedge the roll (boun
   const elapsed = Date.now() - started;
   const term = frames.find((f) => f && f.type === 'reloaded' && f.final);
   assert.ok(term, 'expected a terminal reloaded frame even when the replacement never reports ready');
-  assert.deepEqual(term.reloaded, [id], 'the never-ready worker still counts as reloaded (advanced on timeout)');
-  // The bounded gate means the roll completes near the readiness timeout, not
-  // indefinitely — generously bounded to stay robust on a slow CI box.
-  assert.ok(elapsed < 8000, `reload should complete on the bounded timeout, took ${elapsed}ms`);
+  assert.equal(term.ok, false, 'a never-ready replacement fails the roll');
+  assert.deepEqual(term.reloaded, [], 'the never-ready worker is not counted as reloaded');
+  assert.deepEqual(term.skipped, [id]);
+  assert.ok(Array.isArray(term.failed) && term.failed.some((f) => f.id === id && /never became ready/.test(f.reason)), `failure reported: ${JSON.stringify(term.failed)}`);
+  assert.ok(elapsed < 15000, `reload should fail on the bounded timeout, took ${elapsed}ms`);
+  // (sigFile may say 'forced' — that is the abandoned REPLACEMENT being killed.)
+  assert.ok(!existsSync(`${sigFile}.usr2.${oldPid}`), 'the old worker must NOT have been drained');
 
-  // The worker was genuinely respawned (new pid), just never signalled ready.
-  let after = null;
-  for (let i = 0; i < 40; i++) {
-    const s = await mod.supervisorRequest({ op: 'status' });
-    if (s.workers.length === 1 && s.workers[0].state === 'running' && s.workers[0].pid && s.workers[0].pid !== oldPid) { after = s.workers[0]; break; }
-    await sleep(50);
-  }
-  assert.ok(after, 'the worker should be respawned under a new pid even without a readiness signal');
-  assert.ok(mod.runningSupervisor(), 'the daemon should keep running after a bounded-timeout reload');
+  const after = await mod.supervisorRequest({ op: 'status' });
+  assert.equal(after.workers.length, 1);
+  assert.equal(after.workers[0].pid, oldPid, 'the old worker keeps serving under its original pid');
+  assert.equal(after.workers[0].state, 'running');
+  assert.ok(mod.runningSupervisor(), 'the daemon should keep running after a failed reload');
   await mod.supervisorRequest({ op: 'stop', force: true });
 });
 
@@ -1104,7 +1113,9 @@ test('supervisor reload: a failed replacement aborts the roll (canary) and is re
     'a failed reload must not broadcast a per-worker worker-reload progress event',
   );
 
-  // Exactly one worker was drained (the first, which then crashed on respawn);
+  // #340: surge-then-drain never drains a worker whose replacement failed, so
+  // no worker was drained at all.
+  // (Legacy note) Exactly one worker was drained (the first, which then crashed on respawn);
   // the other must be UNTOUCHED — still on its original pid — proving the roll
   // aborted instead of draining it too.
   const after = await mod.supervisorRequest({ op: 'status' });
@@ -1164,7 +1175,7 @@ test('formatSupervisorStatus: renders a rolling-reload progress line while a rel
     workers: [],
   });
   assert.match(rolling, /reload:\s+rolling 1\/3 adopted/, 'N/M adopted is visible');
-  assert.match(rolling, /draining omarchy-nano-coder-00ea3c71/, 'the worker currently draining is named');
+  assert.match(rolling, /surging omarchy-nano-coder-00ea3c71/, 'the worker currently being surged is named');
   assert.match(rolling, /1\.0\.0 → 1\.1\.0/, 'the version hop is shown when disk and daemon differ');
   assert.match(rolling, /do not restart the daemon/, 'operators are told not to bounce the daemon mid-roll');
 
@@ -1221,7 +1232,9 @@ test('supervisor upgrade: successor adopts the fleet and the old daemon hands ov
     hires: { faker: { name: 'faker', rank: 'senior', command: 'true', model: '', capabilities: [] } },
   }));
   const shim = join(HOME, 'fake-entry.mjs');
-  writeShim(shim);
+  // #340: the worker is BUSY (reports an in-flight job) — an upgrade must still
+  // succeed and must never drain/interrupt it.
+  writeShim(shim, { fakeJob: true });
   process.env.C8CTL_NANO_ENTRY = shim;
   const mod = await import(pluginUrl);
   const { spawn } = await import('node:child_process');

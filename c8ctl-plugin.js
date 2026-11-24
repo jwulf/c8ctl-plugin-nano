@@ -669,7 +669,15 @@ export async function runSurgeRoll(ids, ops, { surge = 1 } = {}) {
     if (stop || (ops.shouldAbort && ops.shouldAbort(id))) { stop = true; skipped.push(id); return; }
     let h = null;
     try { h = await ops.surge(id); } catch { h = null; }
-    if (!h) { stop = true; failed.push({ id, reason: 'replacement could not be started' }); return; }
+    if (!h) {
+      stop = true;
+      // A worker that started stopping (or an upgrade/shutdown that raced the
+      // roll) is not a canary failure — report it skipped, not "failed to boot".
+      let aborted = false;
+      try { aborted = !!(ops.shouldAbort && ops.shouldAbort(id)); } catch { aborted = false; }
+      if (aborted) skipped.push(id); else failed.push({ id, reason: 'replacement could not be started' });
+      return;
+    }
     let ready = false;
     try { ready = await ops.waitReady(id, h); } catch { ready = false; }
     if (!ready) {
@@ -17486,7 +17494,7 @@ async function runSupervisorDaemon() {
       // (a concurrent upgrade won the race). Never keep retrying — the binding
       // will never accept this pid, and two successors must not both wait to
       // adopt the same fleet. Exit and leave the bound successor to finish.
-      if (prep && prep.ok === false && (prep.code === 'UPGRADE_INCOMPATIBLE_WORKERS' || prep.code === 'UPGRADE_SNAPSHOT_FAILED')) {
+      if (prep && prep.ok === false && (prep.code === 'UPGRADE_INCOMPATIBLE_WORKERS' || prep.code === 'UPGRADE_SNAPSHOT_FAILED' || prep.code === 'UPGRADE_RETIRING_BUSY')) {
         dlogBoot(`upgrade mode: predecessor pid ${st.pid} refused the handoff: ${prep.error}`);
         process.exit(1);
       }
@@ -18299,6 +18307,10 @@ async function runSupervisorDaemon() {
     if (!act || act.pid !== w.pid) return false; // unknown → treat as busy (bounded surge)
     return !(Array.isArray(act.jobs) && act.jobs.some((j) => j && !j.settlementPending));
   };
+  // #340 review: ids of workers with a live old-code child still draining.
+  const liveRetiringIds = () => [...workers.values()]
+    .filter((w) => (Array.isArray(w.retiring) ? w.retiring : []).some((r) => r && !r.exited && isPidAlive(r.pid)))
+    .map((w) => w.id);
   // Stop every retiring (old-code) child — used by shutdown. Graceful: make sure
   // each has been asked to drain and wait for it; force: SIGTERM → SIGKILL.
   const stopRetiring = async (force) => {
@@ -18339,7 +18351,7 @@ async function runSupervisorDaemon() {
         waitReady: waitSurgeReady,
         abandon: abandonSurge,
         drainOld: (id, h) => drainRetiring(h.w, h.old),
-        shouldAbort: (id) => shuttingDown || upgrading || !workers.has(id),
+        shouldAbort: (id) => shuttingDown || upgrading || !workers.has(id) || workers.get(id).stopping === true,
         onAdopted: (id) => {
           reloadDone.push(id);
           if (reloadCurrent === id) reloadCurrent = null;
@@ -18540,6 +18552,12 @@ async function runSupervisorDaemon() {
       // settle before snapshotting, so the successor adopts its replacement.
       try { await opQueue; } catch { /* mutation already logged */ }
       if (!upgrading) return; // rolled back while draining the queue
+      if (liveRetiringIds().length > 0) {
+        rollbackFromUpgrade(successorPid, 'old-code children are still draining after a reload');
+        const err = new Error(`worker(s) ${liveRetiringIds().join(', ')} still have old-code children draining after a reload — retry the daemon upgrade once they exit`);
+        err.code = 'UPGRADE_RETIRING_BUSY';
+        throw err;
+      }
       upgradeInfo = { ...upgradeInfo, state: 'quiesced' };
       quiesceSnapshotIds = [...workers.keys()];
       // the deliberate quiesce snapshot the successor adopts from. #331 review:
@@ -18663,6 +18681,13 @@ async function runSupervisorDaemon() {
           // other) so two racing successors can never both win the fleet.
           if (shuttingDown) { sock.write(encodeFrame({ ok: false, error: 'supervisor is shutting down', final: true })); break; }
           if (reloading) { sock.write(encodeFrame({ ok: false, error: 'a worker reload is in progress — retry the daemon upgrade once it finishes', final: true })); break; }
+          // #340 review: old-code children still draining after a surge are not
+          // part of the persisted inventory, so a successor could neither adopt
+          // nor stop them. Refuse the handoff until every retiring child exits.
+          if (!upgrading && liveRetiringIds().length > 0) {
+            sock.write(encodeFrame({ ok: false, code: 'UPGRADE_RETIRING_BUSY', error: `worker(s) ${liveRetiringIds().join(', ')} still have old-code children draining after a reload — retry the daemon upgrade once they exit`, final: true }));
+            break;
+          }
           // #331 review: reject BEFORE quiescing when a live worker predates the
           // `signalReadyAt` stamp — the successor's retarget gate could never
           // signal it, leaving the handoff (and stop/remove) blocked forever.
@@ -18679,6 +18704,7 @@ async function runSupervisorDaemon() {
             await quiesceForUpgrade(Number(req.pid) || null, typeof req.version === 'string' ? req.version : null);
           } catch (err) {
             if (err && err.code === 'UPGRADE_BOUND') { sock.write(encodeFrame({ ok: false, error: err.message, final: true })); break; }
+            if (err && err.code === 'UPGRADE_RETIRING_BUSY') { sock.write(encodeFrame({ ok: false, code: err.code, error: err.message, final: true })); break; }
             if (err && err.code === 'UPGRADE_SNAPSHOT_FAILED') { sock.write(encodeFrame({ ok: false, code: err.code, error: err.message, final: true })); break; }
             throw err;
           }

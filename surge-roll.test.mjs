@@ -143,3 +143,32 @@ test('#340: readiness means really polling — a marker reporting 0 job types is
   assert.equal(activityMarkerReadyFor({ pid: 5, readyAt: null, jobTypeCount: 2 }, 5), false);
   assert.equal(activityMarkerReadyFor({ pid: 6, readyAt: 1, jobTypeCount: 2 }, 5), false);
 });
+
+test('#340 review: a surge refused because the worker is stopping is skipped, not failed', async () => {
+  const res = await runSurgeRoll(['a', 'b'], {
+    isIdle: () => true,
+    surge: async () => null,
+    waitReady: async () => true,
+    abandon: async () => {},
+    drainOld: async () => {},
+    shouldAbort: (() => { let n = 0; return () => n++ > 0; })(),
+  });
+  assert.deepEqual(res.failed, []);
+  assert.ok(res.skipped.includes('a'));
+});
+
+test('#340 review: a surge that cannot start (not aborting) is still a failure', async () => {
+  const res = await runSurgeRoll(['a'], {
+    isIdle: () => true, surge: async () => null, waitReady: async () => true,
+    abandon: async () => {}, drainOld: async () => {}, shouldAbort: () => false,
+  });
+  assert.equal(res.failed.length, 1);
+});
+
+test('#340 review: daemon upgrade is refused while old-code children are still draining', async () => {
+  const { readFileSync } = await import('node:fs');
+  const src = readFileSync(new URL('./c8ctl-plugin.js', import.meta.url), 'utf8');
+  assert.match(src, /!upgrading && liveRetiringIds\(\)\.length > 0\) \{\s*sock\.write\(encodeFrame\(\{ ok: false, code: 'UPGRADE_RETIRING_BUSY'/);
+  assert.match(src, /if \(liveRetiringIds\(\)\.length > 0\) \{\s*rollbackFromUpgrade\(/);
+  assert.match(src, /prep\.code === 'UPGRADE_RETIRING_BUSY'/);
+});

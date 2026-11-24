@@ -121,8 +121,10 @@ SDK client (job workers) — do **not** add the SDK as a dependency or use raw
   Before a host job starts, `hostTempBudget` checks free space on `os.tmpdir()` and
   the agent-runs dir against `--min-free-mb` (default 1024); below it the job is shed
   (retryable fail, 30s backoff) with a log line naming the short path. Fail-open on
-  stat errors. A per-job TMPDIR longer than `JOB_TMP_MAX_PATH` is exposed via a short
-  `<os.tmpdir()>/nj-<hex>` symlink (`boundJobTmpPath`) so AF_UNIX socket binds fit; the
+  stat errors. A per-job TMPDIR longer than `JOB_TMP_MAX_PATH` (measured in bytes) is
+  exposed via a short `nj-<hex>` symlink (`boundJobTmpPath`) so AF_UNIX socket binds fit:
+  under `<os.tmpdir()>`, falling back to `/tmp` (non-Windows) when that base is itself too
+  long; if no candidate alias fits in bytes it fails open and keeps the long path. The
   alias is removed in the job finally.
 - **Engine fetch resilience (issue #323).** The reconcile loop only runs for
   `--auto` workers (its result is applied solely via `autoWorkerId`). Hand-rolled

@@ -6015,11 +6015,18 @@ export function jobTmpDirFor({ cwd = null, resultDir = null } = {}) {
 // the bytes still land in the run dir (so a quota'd /tmp is not filled), only the
 // alias inode lives in /tmp. Returns { path, alias } (alias = symlink to remove).
 export const JOB_TMP_MAX_PATH = 48;
-export function boundJobTmpPath(dir, { maxLen = JOB_TMP_MAX_PATH, base = tmpdir(), rand = () => randomBytes(6).toString('hex') } = {}) {
-  if (!dir || dir.length <= maxLen) return { path: dir, alias: null };
-  for (let i = 0; i < 3; i++) {
-    const alias = join(base, `nj-${rand()}`);
-    try { symlinkSync(dir, alias, 'dir'); return { path: alias, alias }; } catch (e) { if (e?.code !== 'EEXIST') break; }
+// The alias itself must fit maxLen (in BYTES — socket limits are bytes): a long
+// inherited tmpdir() is skipped in favour of /tmp, and any candidate that would
+// still exceed the bound is rejected rather than handed out.
+export function boundJobTmpPath(dir, { maxLen = JOB_TMP_MAX_PATH, base = tmpdir(), fallbackBases = process.platform === 'win32' ? [] : ['/tmp'], rand = () => randomBytes(6).toString('hex') } = {}) {
+  if (!dir || Buffer.byteLength(dir) <= maxLen) return { path: dir, alias: null };
+  const bases = [...new Set([base, ...fallbackBases].filter(Boolean))];
+  for (const b of bases) {
+    for (let i = 0; i < 3; i++) {
+      const alias = join(b, `nj-${rand()}`);
+      if (Buffer.byteLength(alias) > maxLen) break; // this base is too long: try the next
+      try { symlinkSync(dir, alias, 'dir'); return { path: alias, alias }; } catch (e) { if (e?.code !== 'EEXIST') break; }
+    }
   }
   return { path: dir, alias: null }; // fail open: long path beats no TMPDIR
 }

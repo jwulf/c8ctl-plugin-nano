@@ -44,7 +44,7 @@ test('runAgentJob (host) hands the harness the per-job TMPDIR', { skip: process.
   assert.equal(r.stdout, '/job/tmp|/job/tmp|/job/tmp');
 });
 
-test('boundJobTmpPath aliases a long TMPDIR so AF_UNIX sockets can bind under it', async () => {
+test('boundJobTmpPath aliases a long TMPDIR so AF_UNIX sockets can bind under it', { skip: process.platform === 'win32' }, async () => {
   const { boundJobTmpPath } = await import('./c8ctl-plugin.js');
   const { rmSync: rm, realpathSync } = await import('node:fs');
   const { createServer } = await import('node:net');
@@ -54,7 +54,7 @@ test('boundJobTmpPath aliases a long TMPDIR so AF_UNIX sockets can bind under it
   const { path, alias } = boundJobTmpPath(deep);
   try {
     assert.ok(alias, 'long path gets an alias');
-    assert.ok(path.length <= 64);
+    assert.ok(Buffer.byteLength(path) <= 48);
     assert.equal(realpathSync(path), realpathSync(deep));
     const sock = join(path, 'x'.repeat(30) + '.sock');
     await new Promise((res, rej) => { const s = createServer(); s.once('error', rej); s.listen(sock, () => s.close(res)); });
@@ -63,4 +63,23 @@ test('boundJobTmpPath aliases a long TMPDIR so AF_UNIX sockets can bind under it
     if (alias) rm(alias, { force: true });
     rm(root, { recursive: true, force: true });
   }
+});
+
+test('boundJobTmpPath never returns an alias longer than maxLen (long tmp root)', { skip: process.platform === 'win32' }, async () => {
+  const { boundJobTmpPath } = await import('./c8ctl-plugin.js');
+  const { rmSync: rm, realpathSync } = await import('node:fs');
+  const longBase = mkdtempSync(join(tmpdir(), 'nano-long-base-' + 'y'.repeat(40) + '-'));
+  const deep = join(longBase, 'z'.repeat(60));
+  mkdirSync(deep, { recursive: true });
+  try {
+    // only the too-long base: refuse to alias (fail open to the real dir)
+    assert.deepEqual(boundJobTmpPath(deep, { base: longBase, fallbackBases: [] }), { path: deep, alias: null });
+    // long base + short fallback: alias lands under the fallback, within bound
+    const { path, alias } = boundJobTmpPath(deep, { base: longBase, fallbackBases: ['/tmp'] });
+    try {
+      assert.ok(alias && alias.startsWith('/tmp/'));
+      assert.ok(Buffer.byteLength(path) <= 48);
+      assert.equal(realpathSync(path), realpathSync(deep));
+    } finally { if (alias) rm(alias, { force: true }); }
+  } finally { rm(longBase, { recursive: true, force: true }); }
 });

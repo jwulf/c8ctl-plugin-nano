@@ -11187,6 +11187,30 @@ function baseAgentEnv(profile, job) {
 // null when there is no idle kill (<= 0 / non-finite) or the budget is too small
 // to express a whole-second timeout strictly below it. Invariant (tested):
 // `secs * 1000 < idleTimeoutMs` whenever non-null.
+// Issue #328: the worker's runtime interrupt (`SupervisorFiber.interrupt`) can
+// hang forever when an uninterruptible region is stuck (e.g. a fetch with no
+// timeout to an unreachable ingress). Bound every teardown so a graceful drain
+// (or a force abort) always exits instead of sitting in `stopping` for hours.
+export const WORKER_TEARDOWN_TIMEOUT_ENV = 'NANO_WORKER_TEARDOWN_TIMEOUT_MS';
+export const DEFAULT_WORKER_TEARDOWN_TIMEOUT_MS = 30_000;
+export function workerTeardownTimeoutMs(env = process.env) {
+  const n = Number.parseInt(env?.[WORKER_TEARDOWN_TIMEOUT_ENV] ?? '', 10);
+  return Number.isFinite(n) && n > 0 ? n : DEFAULT_WORKER_TEARDOWN_TIMEOUT_MS;
+}
+// Race `promise` against `ms`. Resolves `{ timedOut:false, error? }` when the
+// promise settles (rejections are captured, never thrown) or `{ timedOut:true }`
+// at the deadline. The timer is cleared on settle so it never holds the loop.
+export function raceTeardown(promise, ms) {
+  return new Promise((resolve) => {
+    let done = false;
+    const timer = setTimeout(() => { if (!done) { done = true; resolve({ timedOut: true }); } }, ms);
+    Promise.resolve(promise).then(
+      () => { if (!done) { done = true; clearTimeout(timer); resolve({ timedOut: false }); } },
+      (error) => { if (!done) { done = true; clearTimeout(timer); resolve({ timedOut: false, error }); } },
+    );
+  });
+}
+
 export const PROVIDER_TIMEOUT_ENV = 'NANO_CODER_PROVIDER_TIMEOUT_SECS';
 export function deriveProviderTimeoutSecs(idleTimeoutMs) {
   const ms = Number(idleTimeoutMs);
@@ -15536,6 +15560,34 @@ async function workAgent(req, flags, ctx) {
     let quiescing = false;
     let aborting = false;
     let finished = false;
+    // #328: `finished` = teardown STARTED; `exited` = resolve() actually ran. A
+    // signal arriving while a teardown is stuck must still be able to end us.
+    let exited = false;
+    const teardownMs = workerTeardownTimeoutMs();
+    const onSigint = () => { forceAbort('SIGINT'); };
+    const onSigterm = () => { forceAbort('SIGTERM'); };
+    const exitNow = () => {
+      if (exited) return;
+      exited = true;
+      process.removeListener('SIGINT', onSigint);
+      process.removeListener('SIGTERM', onSigterm);
+      resolve();
+    };
+    // After a timed-out interrupt the stuck fiber (and its sockets) can keep the
+    // event loop alive even though the worker lifecycle has returned. Force the
+    // process out shortly after, unref'd so a loop that drains naturally wins.
+    const forceProcessExitSoon = () => {
+      try { setTimeout(() => process.exit(process.exitCode ?? 0), 2_000).unref(); } catch { /* best effort */ }
+    };
+    const interruptRuntime = async (what) => {
+      const r = await raceTeardown(
+        SupervisorEffect.runPromise(SupervisorFiber.interrupt(supervisorFiber)), teardownMs);
+      if (r.timedOut) {
+        logger.warn(`${what}: runtime interrupt did not complete within ${teardownMs}ms (a stuck in-flight call?) — exiting anyway (issue #328; tune ${WORKER_TEARDOWN_TIMEOUT_ENV}).`);
+        forceProcessExitSoon();
+      }
+      return r;
+    };
 
     // Shared teardown: stop timers, deregister presence over the still-live
     // connection, interrupt the runtime fiber (bracketed teardown: release slots,
@@ -15550,19 +15602,18 @@ async function workAgent(req, flags, ctx) {
       if (agenticPlane) {
         try { agenticPlane.deregister(`worker stopped (${signal})`); } catch { /* best effort */ }
       }
-      try {
-        await SupervisorEffect.runPromise(SupervisorFiber.interrupt(supervisorFiber));
-        logger.info('Worker stopped.');
-      } catch (err) {
-        logger.warn(`supervisor shutdown error — runtime loop may not have shut down cleanly: ${err?.message || err}`);
-      }
+      const r = await interruptRuntime('graceful stop');
+      if (exited) return; // a SIGTERM escalated the stuck teardown and already exited
+      if (r.error) logger.warn(`supervisor shutdown error — runtime loop may not have shut down cleanly: ${r.error?.message || r.error}`);
+      else if (!r.timedOut) logger.info('Worker stopped.');
       // #205: tear down this worker's own namespace on a clean exit. All in-flight
       // jobs' finallys have run by now (markers cleared, run/res dirs removed), so
       // nothing here is in use. Skipped under --keep-runs so kept workspaces stay
       // for debugging and age out via cross-process reclamation, exactly like the
       // pre-fix age-gated behavior.
       if (workerNsDir && !keepRuns) { try { rmSync(workerNsDir, { recursive: true, force: true }); } catch { /* best effort */ } }
-      resolve();
+      if (r.timedOut) logger.info('Worker stopped (teardown timed out).');
+      exitNow();
     };
 
     const inFlightCount = () => {
@@ -15571,7 +15622,17 @@ async function workAgent(req, flags, ctx) {
     };
 
     const forceAbort = async (signal) => {
-      if (aborting || finished) return;
+      if (exited) return;
+      if (aborting) return;
+      if (finished) {
+        // #328: a graceful teardown is already under way but its interrupt is
+        // stuck — honour the signal instead of ignoring it. No job is in flight
+        // (a drain only tears down at zero), so there is nothing to yield.
+        logger.warn(`Received ${signal} during a stuck graceful teardown — exiting now.`);
+        forceProcessExitSoon();
+        exitNow();
+        return;
+      }
       aborting = true;
       draining = true;
       if (!autoMode) { try { unwatchFile(configFile); } catch { /* best effort */ } }
@@ -15585,11 +15646,8 @@ async function workAgent(req, flags, ctx) {
       // and runs dispatch's bracketed teardown (release ownership + slot). The
       // runner sees the aborted result and, by contract, does NOT settle — we do.
       if (agenticPlane) { try { agenticPlane.deregister(`worker aborted (${signal})`); } catch { /* best effort */ } }
-      try {
-        await SupervisorEffect.runPromise(SupervisorFiber.interrupt(supervisorFiber));
-      } catch (err) {
-        logger.warn(`supervisor abort error — runtime loop may not have shut down cleanly: ${err?.message || err}`);
-      }
+      const r = await interruptRuntime('force abort');
+      if (r.error) logger.warn(`supervisor abort error — runtime loop may not have shut down cleanly: ${r.error?.message || r.error}`);
       // Yield each in-flight job so the broker re-activates it at once (retries
       // preserved — a force-stop doesn't consume an attempt). Best-effort: a
       // failed yield just lets the lock lapse (the honest fallback).
@@ -15608,7 +15666,7 @@ async function workAgent(req, flags, ctx) {
       }
       finished = true; // teardown already interrupted the fiber; just resolve.
       logger.info('Worker stopped.');
-      resolve();
+      exitNow();
     };
 
     const gracefulDrain = async (signal) => {
@@ -15702,8 +15760,10 @@ async function workAgent(req, flags, ctx) {
     // #309 review: publish that the handler is installed, so an upgrade handoff
     // can retarget this worker even before (or without ever) leasing.
     try { markSignalReady(); writeActivityRef?.(); } catch { /* best effort */ }
-    process.once('SIGINT', () => { forceAbort('SIGINT'); });
-    process.once('SIGTERM', () => { forceAbort('SIGTERM'); });
+    // #328: `on`, not `once` — a second SIGTERM/SIGINT must still reach
+    // forceAbort (which escalates a stuck teardown) rather than being dropped.
+    process.on('SIGINT', onSigint);
+    process.on('SIGTERM', onSigterm);
   });
   } finally {
     // Restore the caller's timestamp flag now the worker lifecycle has ended

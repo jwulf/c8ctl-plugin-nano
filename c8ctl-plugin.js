@@ -17081,6 +17081,27 @@ function installParentDeathWatchdog({ intervalMs = 2000, parentPid, onOrphan, re
  * cannot reach a quiesced old daemon in time exits 1 and leaves the old fleet
  * untouched.
  */
+/**
+ * #338 review: unlink `socketPath` only if it is absent or DEFINITIVELY dead,
+ * and only if — re-checked synchronously in the same tick as the unlink — it
+ * still names the exact dev/ino that was probed. A successor that unlinks the
+ * dead file and binds a fresh live listener while `probe()` is pending is
+ * never deleted. Returns 'absent' | 'unlinked' | 'alive' | 'replaced' |
+ * 'aborted' | 'error'.
+ */
+export async function reclaimDeadSocketPath(socketPath, probe, aborted = () => false) {
+  let probed = null;
+  try { const st0 = lstatSync(socketPath); probed = { dev: st0.dev, ino: st0.ino }; } catch (err) { if (err && err.code !== 'ENOENT') return 'error'; }
+  if (probed && (await probe()) !== 'dead') return 'alive';
+  if (aborted()) return 'aborted';
+  let now = null;
+  try { const st1 = lstatSync(socketPath); now = { dev: st1.dev, ino: st1.ino }; } catch (err) { if (err && err.code !== 'ENOENT') return 'error'; }
+  if (!now) return 'absent';
+  if (!probed || now.dev !== probed.dev || now.ino !== probed.ino) return 'replaced';
+  try { rmSync(socketPath, { force: true }); } catch { /* ignore */ }
+  return 'unlinked';
+}
+
 async function runSupervisorDaemon() {
   const startedAt = new Date().toISOString();
   // The plugin version of THIS daemon process (read from its own pluginDir), so
@@ -18582,14 +18603,13 @@ async function runSupervisorDaemon() {
       // close wait. Revalidate: only unlink an ABSENT path or one that is
       // DEFINITIVELY dead; a live or uncertain replacement is left untouched.
       if (!win) {
-        let present = false;
-        try { lstatSync(socketPath); present = true; } catch (err) { if (err && err.code !== 'ENOENT') return false; }
-        if (present && (await probeSocketAlive()) !== 'dead') {
-          dlog(`${why}: control socket path was re-bound by another listener during the close wait — leaving it alone`);
-          return false;
-        }
-        if (upgrading || handedOver || shuttingDown || shutdownStarted) return false;
-        try { rmSync(socketPath, { force: true }); } catch { /* ignore */ }
+        // #338 review: capture the probed inode and re-check it SYNCHRONOUSLY
+        // in the same tick as rmSync — a successor may unlink the dead file
+        // and bind a fresh live listener while the probe is pending.
+        const verdict = await reclaimDeadSocketPath(socketPath, probeSocketAlive, () => (upgrading || handedOver || shuttingDown || shutdownStarted));
+        if (verdict === 'alive') dlog(`${why}: control socket path was re-bound by another listener during the close wait — leaving it alone`);
+        else if (verdict === 'replaced') dlog(`${why}: control socket path was replaced while probing — not unlinking the new socket`);
+        if (verdict !== 'absent' && verdict !== 'unlinked') return false;
       }
       const prev = win ? null : process.umask(0o177);
       try {

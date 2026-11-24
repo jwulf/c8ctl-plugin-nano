@@ -54,13 +54,12 @@ test("end-to-end: a job is activated, its worker claimed, winner extended, agent
   );
 });
 
-test("onFirstActivation fires exactly once on the first non-empty poll set (leasing), before the activation poll resolves (#253 readiness handshake)", async () => {
+test("onFirstActivation fires exactly once, only after the first SUCCESSFUL activation response (#253 / #340 review readiness handshake)", async () => {
   await Effect.runPromise(
     Effect.gen(function* () {
-      // A very slow long-poll: if readiness were tied to the first tick COMPLETING,
-      // it would be delayed for the whole poll window. The handshake must fire the
-      // moment the worker has a serviceable poll set — BEFORE the poll blocks — so
-      // a real replacement reports ready promptly.
+      // Readiness must be proven by the engine answering an activation request —
+      // NOT by the poll set merely being non-empty, otherwise a replacement whose
+      // polls all fail would read ready and the reload would drain the old worker.
       const engine = makeEngine({
         activate: activateAfter({ x: { job: job("Jx", "x"), delayMs: 50_000 } }),
       });
@@ -82,15 +81,47 @@ test("onFirstActivation fires exactly once on the first non-empty poll set (leas
       });
 
       const fiber = yield* Effect.forkChild(sup.run);
-      // Let the fiber reach its first tick (which sees w1's type x with a free
-      // slot) but NOT let the 50s long-poll resolve — readiness must already be
-      // stamped by now.
       yield* TestClock.adjust(Duration.millis(1));
-      assert.equal(fired, 1, "readiness fired on the first non-empty poll set, before the long-poll resolved");
+      assert.equal(fired, 0, "not ready while the first activation request is still outstanding");
+      yield* TestClock.adjust(Duration.millis(50_000));
+      assert.equal(fired, 1, "readiness fired once the engine answered an activation request");
 
       // Drive many further ticks: it is a one-shot handshake, never re-fired.
       yield* TestClock.adjust(Duration.millis(120_000));
       assert.equal(fired, 1, "onFirstActivation is a one-shot handshake");
+
+      yield* Fiber.interrupt(fiber);
+    }).pipe(Effect.provide(TestClock.layer())),
+  );
+});
+
+test("onFirstActivation never fires while every activation request FAILS (#340 review: readiness requires a successful response)", async () => {
+  await Effect.runPromise(
+    Effect.gen(function* () {
+      const engine = makeEngine({
+        activate: () => Effect.fail(new SupervisorError("fetch failed")),
+      });
+      const runner = makeRunner(1_000);
+      const reg = yield* makeRegistry();
+      yield* reg.add("w1", ["x", "y"], 1);
+      const reader = makeReader([[]], {});
+
+      let fired = 0;
+      const sup = yield* makeSupervisor({
+        engine,
+        runner,
+        registry: reg,
+        reconcileReader: reader,
+        scan,
+        logger: noopLogger,
+        onFirstActivation: Effect.sync(() => { fired += 1; }),
+        config: { idleSpacingMs: 1_000, activation: { ...defaultActivationConfig, requestTimeoutMs: 10_000, initialLockMs: 15_000, emptyPollBackoffMs: 0, maxBatchPerType: 10 } },
+      });
+
+      const fiber = yield* Effect.forkChild(sup.run);
+      yield* TestClock.adjust(Duration.millis(300_000));
+      assert.ok(engine.activateCalls.length > 2, "the loop kept polling");
+      assert.equal(fired, 0, "a worker whose polls all fail is never reported ready");
 
       yield* Fiber.interrupt(fiber);
     }).pipe(Effect.provide(TestClock.layer())),
@@ -107,13 +138,14 @@ test("onFirstActivation does NOT fire while the worker has zero serviceable type
       // while this replacement has no pollers. It becomes ready only once reconcile
       // fills in a serviceable type and the loop begins leasing.
       const engine = makeEngine({
-        activate: activateAfter({ x: { job: job("Jx", "x"), delayMs: 50_000 } }),
+        activate: activateAfter({ x: { job: job("Jx", "x"), delayMs: 10 } }),
       });
       const runner = makeRunner(1_000);
       const reg = yield* makeRegistry();
       yield* reg.add("w1", [], 1); // zero serviceable types at loop entry
       // Reconcile reads empty first, then discovers type "x" on a later crawl.
       const reader = makeReader([[], ["x"]], { "x": "x" });
+
 
       let fired = 0;
       const sup = yield* makeSupervisor({

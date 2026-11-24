@@ -2442,6 +2442,18 @@ function parseJobTypeFlags(input) {
 }
 
 /**
+ * The in-process registry / agentic instance name for a worker (#340 review):
+ * `<name>` normally, `<name>~<incarnation>` for an overlapping surge
+ * incarnation so two live processes never share an agentic identity. The
+ * incarnation is sanitised to `[A-Za-z0-9._-]` (≤32 chars); anything else
+ * (absent, blank, all-invalid) yields the bare name.
+ */
+export function agenticInstanceName(workerName, incarnation) {
+  const inc = typeof incarnation === 'string' ? incarnation.replace(/[^A-Za-z0-9._-]/g, '').slice(0, 32) : '';
+  return inc ? `${workerName}~${inc}` : workerName;
+}
+
+/**
  * Resolve the broker long-poll window (ms) each `activateJobs` request is held
  * open before returning empty. A longer window keeps an idle worker on ONE open
  * connection for that whole window instead of reconnecting every few seconds,
@@ -13295,6 +13307,13 @@ async function workAgent(req, flags, ctx) {
     exitConfigError(logger, `Invalid --name "${flags.name}": use only letters, digits, and . _ -`);
   }
   const workerName = explicitName !== '' ? explicitName : autoWorkerName(name);
+  // #340 review: the in-process registry + agentic identity (ownership/presence/
+  // transcript/steer instance). A rolling-reload SURGE runs a replacement
+  // alongside the old child under the SAME `--name`, so the daemon hands an
+  // overlapping incarnation a distinct NANO_WORKER_INCARNATION; without it the
+  // old child's teardown deregister would remove the replacement's cockpit
+  // presence. The stable supervisor row id (`workerName`) is unchanged.
+  const agenticInstance = agenticInstanceName(workerName, process.env.NANO_WORKER_INCARNATION);
 
   if (!globalThis.c8ctl || typeof globalThis.c8ctl.createClient !== 'function') {
     logger.error('work requires the c8ctl runtime (createClient). Run it via the c8ctl CLI.');
@@ -15816,8 +15835,8 @@ async function workAgent(req, flags, ctx) {
     camunda,
     restConfig,
     worker: workerName,
-    workers: [{ id: workerName, types: jobTypes, capacity: 1 }],
-    autoWorkerId: autoMode ? workerName : undefined,
+    workers: [{ id: agenticInstance, types: jobTypes, capacity: 1 }],
+    autoWorkerId: autoMode ? agenticInstance : undefined,
     // Explicit `--job-type` extras must outlive the first reconcile: the runtime's
     // reconcile rewrites the --auto worker's set from the engine scan, so pass the
     // extras through to be unioned into every reconcile write (else an explicit
@@ -15891,7 +15910,7 @@ async function workAgent(req, flags, ctx) {
     const agenticEncoder = new TextEncoder();
     const seedPresence = () => {
       try {
-        SupervisorEffect.runSync(supervisor.ownership.register(workerName, agenticCapability));
+        SupervisorEffect.runSync(supervisor.ownership.register(agenticInstance, agenticCapability));
       } catch (err) {
         logger.warn(`  agentic presence seed failed (${err?.message || err}); continuing.`);
       }
@@ -15903,8 +15922,8 @@ async function workAgent(req, flags, ctx) {
       // live connection, then drop it from the registry so the projection stops
       // heartbeating it. Best-effort — teardown must never hang or throw.
       deregister: (reason) => {
-        try { SupervisorEffect.runSync(supervisor.presence.deregister(workerName, reason)); } catch { /* best effort */ }
-        try { SupervisorEffect.runSync(supervisor.ownership.deregister(workerName)); } catch { /* best effort */ }
+        try { SupervisorEffect.runSync(supervisor.presence.deregister(agenticInstance, reason)); } catch { /* best effort */ }
+        try { SupervisorEffect.runSync(supervisor.ownership.deregister(agenticInstance)); } catch { /* best effort */ }
       },
       // Build a per-job relay session over the supervisor's transcript + steer
       // seams (issue #173), shape-compatible with the retired createWorkChannel
@@ -15914,7 +15933,7 @@ async function workAgent(req, flags, ctx) {
       relaySessionFor: (jobKey, extra = {}) => {
         try {
           return createHostRelaySession({
-            instance: workerName,
+            instance: agenticInstance,
             jobKey,
             // #229: correlation join keys + lazy AgentInstance-key resolver.
             elementInstanceKey: extra.elementInstanceKey,
@@ -15923,7 +15942,7 @@ async function workAgent(req, flags, ctx) {
             publish: (text) => {
               // Fire-and-forget over the live handle; a frame between a drop and
               // the next reconnect is a harmless no-op (best-effort semantics).
-              try { SupervisorEffect.runSync(supervisor.transcript(workerName, String(jobKey), agenticEncoder.encode(text))); } catch { /* best effort */ }
+              try { SupervisorEffect.runSync(supervisor.transcript(agenticInstance, String(jobKey), agenticEncoder.encode(text))); } catch { /* best effort */ }
             },
             subscribeSteer: (onChunk) => {
               // The router keys sinks by instance, not jobKey, so it hands every
@@ -15934,8 +15953,8 @@ async function workAgent(req, flags, ctx) {
               const sink = (jk, chunk) => SupervisorEffect.sync(() => {
                 if (String(jk) === String(jobKey)) onChunk(chunk);
               });
-              try { SupervisorEffect.runSync(supervisor.steerRouter.register(workerName, sink)); } catch { /* best effort */ }
-              return () => { try { SupervisorEffect.runSync(supervisor.steerRouter.unregister(workerName)); } catch { /* best effort */ } };
+              try { SupervisorEffect.runSync(supervisor.steerRouter.register(agenticInstance, sink)); } catch { /* best effort */ }
+              return () => { try { SupervisorEffect.runSync(supervisor.steerRouter.unregister(agenticInstance)); } catch { /* best effort */ } };
             },
             logger,
           });
@@ -16003,7 +16022,7 @@ async function workAgent(req, flags, ctx) {
         const desired = [...new Set([...m, ...extraJobTypes])];
         if (draining) return; // teardown began while we were reading — don't write
         if (mySeq !== reloadSeq) return; // superseded during the async read — skip
-        await SupervisorEffect.runPromise(workerRegistry.setTypes(workerName, desired));
+        await SupervisorEffect.runPromise(workerRegistry.setTypes(agenticInstance, desired));
         logger.info(`Profile "${name}" changed — now servicing ${desired.length} job type(s): ${desired.join('  ')}`);
       }).catch((err) => logger.warn(`profile reload failed: ${err?.message || err}`));
     });
@@ -16655,11 +16674,19 @@ function summarizeSupervisorWorker(w, now = Date.now(), { readActivity = readWor
     // worker has been draining; `stoppingIdleMs` how long it has sat in
     // `stopping` with NO job (the #339 wedge clock) — flagged by the renderer.
     version,
-    drainingMs: (() => {
+    // `*SinceMs` are the ABSOLUTE epochs behind the two clocks (#340 review), so
+    // an attached console can re-age them locally (reageSupervisorStatus).
+    ...(() => {
       const since = drainStartedAtMs ?? (w.stopping && Number.isFinite(w.drainSignalledAt) ? w.drainSignalledAt : null);
-      return alive && since != null ? Math.max(0, now - since) : null;
+      const drainingSinceMs = alive && Number.isFinite(since) ? since : null;
+      const stoppingIdleSinceMs = alive && w.stoppingIdle && Number.isFinite(w.stoppingIdle.since) ? w.stoppingIdle.since : null;
+      return {
+        drainingSinceMs,
+        drainingMs: drainingSinceMs != null ? Math.max(0, now - drainingSinceMs) : null,
+        stoppingIdleSinceMs,
+        stoppingIdleMs: stoppingIdleSinceMs != null ? Math.max(0, now - stoppingIdleSinceMs) : null,
+      };
     })(),
-    stoppingIdleMs: alive && w.stoppingIdle && Number.isFinite(w.stoppingIdle.since) ? Math.max(0, now - w.stoppingIdle.since) : null,
     // #340: old-code children still draining after a surge-then-drain reload.
     retiring: (Array.isArray(w.retiring) ? w.retiring : []).filter((r) => r && !r.exited && isPidAlive(r.pid)).map((r) => {
       const ract = readActivity(w.id, r.activityFile);
@@ -16668,7 +16695,9 @@ function summarizeSupervisorWorker(w, now = Date.now(), { readActivity = readWor
       return {
         pid: r.pid,
         version: own && typeof ract.version === 'string' ? ract.version : null,
+        drainingSinceMs: Number.isFinite(r.drainSignalledAt) ? r.drainSignalledAt : null,
         drainingMs: Number.isFinite(r.drainSignalledAt) ? Math.max(0, now - r.drainSignalledAt) : null,
+        stoppingIdleSinceMs: r.stoppingIdle && Number.isFinite(r.stoppingIdle.since) ? r.stoppingIdle.since : null,
         stoppingIdleMs: r.stoppingIdle && Number.isFinite(r.stoppingIdle.since) ? Math.max(0, now - r.stoppingIdle.since) : null,
         jobs,
       };
@@ -16717,6 +16746,14 @@ function supervisorStatusSignature(workers) {
       w.ghAuth
         ? `${w.ghAuth.present ? 1 : 0}\u0000${w.ghAuth.fingerprint ?? ''}\u0000${w.ghAuth.scopes ?? ''}\u0000${w.ghAuth.since ?? ''}`
         : null,
+      // #340 review: drain/wedge TRANSITIONS (stable epochs, never the ticking
+      // durations) for the worker and each retiring old-code child, so a drain
+      // starting/ending, a child going idle (wedge clock arming) or exiting
+      // repaints an otherwise-quiet console. Durations re-age locally.
+      w.version ?? '',
+      `${w.drainingSinceMs ?? ''}\u0000${w.stoppingIdleSinceMs ?? ''}`,
+      (Array.isArray(w.retiring) ? w.retiring : []).map((r) =>
+        `${r.pid}\u0000${r.version ?? ''}\u0000${r.drainingSinceMs ?? ''}\u0000${r.stoppingIdleSinceMs ?? ''}\u0000${(Array.isArray(r.jobs) ? [...r.jobs].sort() : []).join(',')}`),
     ]),
   );
 }
@@ -16857,7 +16894,19 @@ function reageSupervisorStatus(status, now = Date.now()) {
       if (ghAuth && typeof ghAuth === 'object' && Number.isFinite(ghAuth.since)) {
         ghAuth = { ...ghAuth, ageMs: Math.max(0, now - ghAuth.since) };
       }
-      return { ...w, uptimeMs, activity, ghAuth };
+      // #340 review: re-age the drain / stopping-idle (wedge) clocks of the worker
+      // and of each retiring old-code child from their absolute epochs, so a
+      // quiet console's drain durations advance and the wedge warning appears.
+      const reage = (o) => {
+        if (!o || typeof o !== 'object') return o;
+        const out = { ...o };
+        if (Number.isFinite(o.drainingSinceMs)) out.drainingMs = Math.max(0, now - o.drainingSinceMs);
+        if (Number.isFinite(o.stoppingIdleSinceMs)) out.stoppingIdleMs = Math.max(0, now - o.stoppingIdleSinceMs);
+        return out;
+      };
+      const drain = reage(w);
+      const retiring = Array.isArray(w.retiring) ? w.retiring.map(reage) : w.retiring;
+      return { ...w, uptimeMs, activity, ghAuth, drainingMs: drain.drainingMs, stoppingIdleMs: drain.stoppingIdleMs, retiring };
     }),
   };
 }
@@ -17707,6 +17756,7 @@ async function runSupervisorDaemon() {
     };
   };
 
+  let surgeIncarnationSeq = 0;
   const startWorker = (w, { fresh = false } = {}) => {
     // A fresh (re)start attempts the profile again, so clear any prior
     // non-restartable config-failure latch — the operator may have fixed the
@@ -17761,6 +17811,13 @@ async function runSupervisorDaemon() {
     const childEnv = { ...process.env, NANO_SUPERVISOR_ACTIVITY_FILE: activityFile, NANO_SUPERVISOR_DAEMON_PID: String(process.pid) };
     const upgradeSuccessorPid = Number(process.env.NANO_SUPERVISOR_UPGRADE_PID ?? '', 10);
     if (Number.isInteger(upgradeSuccessorPid) && upgradeSuccessorPid > 0) childEnv.NANO_SUPERVISOR_UPGRADE_PID = String(upgradeSuccessorPid);
+    // #340 review: a child spawned while an older child of this worker is still
+    // draining (surge, or a replacement restart during the drain) gets a distinct
+    // agentic incarnation so the old child's teardown can't deregister it.
+    delete childEnv.NANO_WORKER_INCARNATION;
+    if (Array.isArray(w.retiring) && w.retiring.length > 0) {
+      childEnv.NANO_WORKER_INCARNATION = `r${Date.now().toString(36)}${(++surgeIncarnationSeq).toString(36)}`;
+    }
     const child = spawn(exec, [entry, 'nano', 'work', w.profile, '--name', w.id, ...w.args], {
       env: childEnv,
       stdio: ['ignore', ringed ? 'pipe' : fd, ringed ? 'pipe' : fd],
@@ -18282,6 +18339,11 @@ async function runSupervisorDaemon() {
   const surgeWorker = (id) => serializeOp(async () => {
     const w = workers.get(id);
     if (!w || w.stopping || shuttingDown || upgrading) return null;
+    // #340 review: refuse to surge a worker whose upgrade watchdog-retarget is
+    // still outstanding. Surging swaps `w.pid`, so the successor's handoff loop
+    // would drop the still-live original from `retargetPending` and could
+    // release the predecessor (its watchdog target) mid-job → self-reap.
+    if (retargetPending.has(id)) return null;
     let old = null;
     if (w.child && w.pid && isPidAlive(w.pid)) {
       const oldChild = w.child;
@@ -18408,7 +18470,9 @@ async function runSupervisorDaemon() {
         waitReady: waitSurgeReady,
         abandon: abandonSurge,
         drainOld: (id, h) => drainRetiring(h.w, h.old),
-        shouldAbort: (id) => shuttingDown || upgrading || !workers.has(id) || workers.get(id).stopping === true,
+        // A pending upgrade retarget (#340 review) also aborts: the worker is
+        // reported SKIPPED (retry the reload once the handoff completes).
+        shouldAbort: (id) => shuttingDown || upgrading || retargetPending.has(id) || !workers.has(id) || workers.get(id).stopping === true,
         onAdopted: (id) => {
           reloadDone.push(id);
           if (reloadCurrent === id) reloadCurrent = null;

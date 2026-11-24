@@ -194,7 +194,7 @@ export const makeSupervisor = (deps: SupervisorDeps): Effect.Effect<Supervisor> 
     // replacement to stamp `readyAt` before draining the next worker, so readiness
     // must mean "this worker can actually lease" — NOT merely "the loop fiber is
     // scheduled". It fires exactly once, the first time the activation loop has a
-    // non-empty poll set (a serviceable-with-capacity type it is about to lease),
+    // successful activation response (#340 review; empty batch counts),
     // guarded by this one-shot latch. See `fireReadinessOnce`.
     const readinessFiredRef = yield* Ref.make(false);
     // Fire the readiness handshake at most once. Best-effort: a failure — or a
@@ -301,6 +301,7 @@ export const makeSupervisor = (deps: SupervisorDeps): Effect.Effect<Supervisor> 
             }
             return activateWinner(deps.engine, targets, cfg.activation, (type, err, retryInMs) =>
               logger.warn(`activation error — ${err.message} (type ${type} stays subscribed; retrying in ${retryInMs}ms)`),
+              fireReadinessOnce,
             ).pipe(
               Effect.flatMap((winners) => dispatchBatch(winners)),
               Effect.catch((err) =>
@@ -309,11 +310,12 @@ export const makeSupervisor = (deps: SupervisorDeps): Effect.Effect<Supervisor> 
             );
           }),
         );
-        // Readiness is LEASING-gated (#253): the first tick with a non-empty poll
-        // set is the moment this worker is genuinely serving, so fire the one-shot
-        // handshake here (before the promote/poll), NOT unconditionally at loop
-        // entry. Best-effort and one-shot — see `fireReadinessOnce`.
-        return Effect.flatMap(fireReadinessOnce, () => activate);
+        // Readiness is LEASING-gated (#253) AND activation-proven (#340 review):
+        // the one-shot handshake fires only after the engine answers an
+        // activation request successfully (an empty batch counts), via
+        // `activateWinner`'s onPollSuccess — NOT merely when the poll set is
+        // non-empty, so a replacement whose polls all fail never reads ready.
+        return activate;
       }),
     );
 

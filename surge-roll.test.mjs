@@ -199,3 +199,61 @@ test('#340 review: concurrent incarnations share one ref-counted log ring per pa
   assert.match(src, /ring = acquireLogRing\(w\.logFile\);/);
   assert.doesNotMatch(src, /ring = createLogRing\(w\.logFile/);
 });
+
+// ---- #340 review round 3 ----
+test('#340 review: overlapping surge incarnations get distinct agentic identities', () => {
+  const { agenticInstanceName } = mod;
+  assert.equal(agenticInstanceName('w1', undefined), 'w1');
+  assert.equal(agenticInstanceName('w1', ''), 'w1');
+  assert.equal(agenticInstanceName('w1', '$$$'), 'w1', 'an all-invalid incarnation falls back to the bare name');
+  assert.equal(agenticInstanceName('w1', 'rabc1'), 'w1~rabc1');
+  assert.notEqual(agenticInstanceName('w1', 'ra'), agenticInstanceName('w1', 'rb'));
+  assert.equal(agenticInstanceName('w1', 'r/../x y'), 'w1~r..xy', 'sanitised');
+  assert.ok(agenticInstanceName('w1', 'x'.repeat(100)).length <= 'w1~'.length + 32, 'bounded');
+});
+
+test('#340 review: retiring drain / wedge clocks re-age locally on an attached console', () => {
+  const { reageSupervisorStatus } = mod;
+  const t0 = 1_000_000;
+  const status = { workers: [{ id: 'w1', state: 'stopping', drainingSinceMs: t0, drainingMs: 0, stoppingIdleSinceMs: t0 + 10, stoppingIdleMs: 0,
+    retiring: [{ pid: 7, drainingSinceMs: t0, drainingMs: 5, stoppingIdleSinceMs: t0 + 100, stoppingIdleMs: 0, jobs: [] }] }] };
+  const r = reageSupervisorStatus(status, t0 + 3_600_000);
+  assert.equal(r.workers[0].drainingMs, 3_600_000);
+  assert.equal(r.workers[0].stoppingIdleMs, 3_600_000 - 10);
+  assert.equal(r.workers[0].retiring[0].drainingMs, 3_600_000);
+  assert.equal(r.workers[0].retiring[0].stoppingIdleMs, 3_600_000 - 100);
+  assert.equal(status.workers[0].retiring[0].drainingMs, 5, 'input not mutated');
+  const lines = mod.formatSupervisorDrainLines(r.workers).join('\n');
+  assert.match(lines, /⚠ stopping with no job/, 'wedge warning appears without a re-broadcast');
+});
+
+test('#340 review: retiring drain/wedge transitions change the monitor signature; ticking durations do not', () => {
+  const { supervisorStatusSignature } = mod;
+  const base = { id: 'w1', state: 'running', pid: 2, restarts: 0, retiring: [{ pid: 1, drainingSinceMs: 5, drainingMs: 10, stoppingIdleSinceMs: null, stoppingIdleMs: null, jobs: ['J1'] }] };
+  const sig = supervisorStatusSignature([base]);
+  const ticked = { ...base, retiring: [{ ...base.retiring[0], drainingMs: 99_999 }] };
+  assert.equal(supervisorStatusSignature([ticked]), sig, 'elapsing clock is not a change');
+  const idle = { ...base, retiring: [{ ...base.retiring[0], jobs: [], stoppingIdleSinceMs: 50 }] };
+  assert.notEqual(supervisorStatusSignature([idle]), sig, 'retiring child going idle (wedge clock armed) repaints');
+  const gone = { ...base, retiring: [] };
+  assert.notEqual(supervisorStatusSignature([gone]), sig, 'retiring child exit repaints');
+  const draining = { ...base, drainingSinceMs: 7 };
+  assert.notEqual(supervisorStatusSignature([draining]), sig, 'worker drain start repaints');
+});
+
+test('#340 review: a worker with a pending upgrade retarget is never surged (reported skipped)', async () => {
+  const src = (await import('node:fs')).readFileSync(new URL('./c8ctl-plugin.js', import.meta.url), 'utf8');
+  const surge = src.slice(src.indexOf('const surgeWorker = (id) =>'), src.indexOf('const waitSurgeReady ='));
+  assert.match(surge, /if \(retargetPending\.has\(id\)\) return null;/);
+  assert.match(src, /shouldAbort: \(id\) => [^\n]*retargetPending\.has\(id\)/);
+  // ...and the orchestration reports such a worker skipped, not failed.
+  const surged = [];
+  const res = await runSurgeRoll(['a'], {
+    isIdle: () => true, surge: async (id) => { surged.push(id); return null; },
+    waitReady: async () => true, abandon: async () => {}, drainOld: async () => {},
+    shouldAbort: () => true,
+  }, { surge: 1 });
+  assert.deepEqual(surged, []);
+  assert.deepEqual(res.skipped, ['a']);
+  assert.deepEqual(res.failed, []);
+});

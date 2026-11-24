@@ -50,6 +50,7 @@ import {
   mkdtempSync,
   closeSync,
   readlinkSync,
+  symlinkSync,
   watchFile,
   unwatchFile,
 } from 'node:fs';
@@ -6005,6 +6006,22 @@ export function jobTmpDirFor({ cwd = null, resultDir = null } = {}) {
   }
   if (resultDir) return join(resultDir, 'tmp');
   return null;
+}
+
+// AF_UNIX socket paths are capped (~104 bytes on macOS, 108 on Linux); tools that
+// bind sockets under TMPDIR (test runners, our own fence/supervisor helpers) fail
+// with "path too long" when the run dir is deep. When the real dir is longer than
+// JOB_TMP_MAX_PATH, expose a short private symlink under the OS temp dir instead —
+// the bytes still land in the run dir (so a quota'd /tmp is not filled), only the
+// alias inode lives in /tmp. Returns { path, alias } (alias = symlink to remove).
+export const JOB_TMP_MAX_PATH = 48;
+export function boundJobTmpPath(dir, { maxLen = JOB_TMP_MAX_PATH, base = tmpdir(), rand = () => randomBytes(6).toString('hex') } = {}) {
+  if (!dir || dir.length <= maxLen) return { path: dir, alias: null };
+  for (let i = 0; i < 3; i++) {
+    const alias = join(base, `nj-${rand()}`);
+    try { symlinkSync(dir, alias, 'dir'); return { path: alias, alias }; } catch (e) { if (e?.code !== 'EEXIST') break; }
+  }
+  return { path: dir, alias: null }; // fail open: long path beats no TMPDIR
 }
 
 export function jobTmpEnv(dir) {
@@ -14562,6 +14579,8 @@ async function workAgent(req, flags, ctx) {
         let fenceToken = null;
         let fenceEnv = null;
         let jobTmpDir = null;
+        let jobTmpPath = null;
+        let jobTmpAlias = null;
         try {
           try {
             mkdirSync(workerNsDir, { recursive: true });
@@ -14586,6 +14605,7 @@ async function workAgent(req, flags, ctx) {
             const dir = jobTmpDirFor({ cwd, resultDir });
             if (dir) {
               try { mkdirSync(dir, { recursive: true, mode: 0o700 }); jobTmpDir = dir; } catch { jobTmpDir = null; }
+              if (jobTmpDir) ({ path: jobTmpPath, alias: jobTmpAlias } = boundJobTmpPath(jobTmpDir));
             }
           }
           // #320: `fences.register` awaits the socket listen, so a lease-loss /
@@ -14633,7 +14653,7 @@ async function workAgent(req, flags, ctx) {
             cwd,
             extraEnv,
             fenceEnv,
-            tmpEnv: jobTmpEnv(jobTmpDir),
+            tmpEnv: jobTmpEnv(jobTmpPath),
             profileEnv,
             // #283: the provisioning git env — runAgentJob layers it UNDER
             // profile/setup env (minus the credential keys) so the harness's
@@ -15128,6 +15148,7 @@ async function workAgent(req, flags, ctx) {
           // #336: always release the per-job TMPDIR — aborted returns and exceptions
           // skip the success-path cleanup, and --keep-runs retains the workspace.
           if (jobTmpDir) { try { rmSync(jobTmpDir, { recursive: true, force: true }); } catch { /* best effort */ } jobTmpDir = null; }
+          if (jobTmpAlias) { try { rmSync(jobTmpAlias, { force: true }); } catch { /* best effort */ } jobTmpAlias = null; }
           if (checkpointing) {
             // #264: exception path — if the run threw before any terminal checkpoint
             // decision was taken (abort/failed flush or the success-path stop), take a

@@ -43,3 +43,24 @@ test('runAgentJob (host) hands the harness the per-job TMPDIR', { skip: process.
   assert.equal(r.ok, true, r.error || r.stderr);
   assert.equal(r.stdout, '/job/tmp|/job/tmp|/job/tmp');
 });
+
+test('boundJobTmpPath aliases a long TMPDIR so AF_UNIX sockets can bind under it', async () => {
+  const { boundJobTmpPath } = await import('./c8ctl-plugin.js');
+  const { rmSync: rm, realpathSync } = await import('node:fs');
+  const { createServer } = await import('node:net');
+  const root = mkdtempSync(join(tmpdir(), 'nano-tmpdir-sock-'));
+  const deep = join(root, 'agent-runs', 'worker-12345-miv2abcd-0123456789ab', 'run-ABCDEFGH', 'workspace', '.git', 'nano-tmp');
+  mkdirSync(deep, { recursive: true });
+  const { path, alias } = boundJobTmpPath(deep);
+  try {
+    assert.ok(alias, 'long path gets an alias');
+    assert.ok(path.length <= 64);
+    assert.equal(realpathSync(path), realpathSync(deep));
+    const sock = join(path, 'x'.repeat(30) + '.sock');
+    await new Promise((res, rej) => { const s = createServer(); s.once('error', rej); s.listen(sock, () => s.close(res)); });
+    assert.deepEqual(boundJobTmpPath('/short'), { path: '/short', alias: null });
+  } finally {
+    if (alias) rm(alias, { force: true });
+    rm(root, { recursive: true, force: true });
+  }
+});

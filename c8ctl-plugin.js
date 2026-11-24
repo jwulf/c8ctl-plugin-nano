@@ -338,6 +338,26 @@ const SUPERVISOR_RELOAD_READY_TIMEOUT_MS = Math.max(
   0,
   Number.parseInt(process.env.NANO_SUPERVISOR_RELOAD_READY_TIMEOUT_MS ?? '', 10) || 120_000,
 );
+/**
+ * #340 review: the readiness deadline for one replacement. Readiness requires a
+ * SUCCESSFUL activation response, which on a quiet queue only returns after the
+ * worker's full long-poll window — so the deadline must cover that window plus
+ * startup time, or a healthy `--poll-timeout 180000` worker is killed. Pure.
+ */
+const SUPERVISOR_RELOAD_READY_STARTUP_SLACK_MS = 60_000;
+const SUPERVISOR_RELOAD_READY_TIMEOUT_EXPLICIT = Number.parseInt(process.env.NANO_SUPERVISOR_RELOAD_READY_TIMEOUT_MS ?? '', 10) > 0;
+function reloadReadyTimeoutMsFor(args, base = SUPERVISOR_RELOAD_READY_TIMEOUT_MS, explicit = SUPERVISOR_RELOAD_READY_TIMEOUT_EXPLICIT) {
+  // An explicit operator override (NANO_SUPERVISOR_RELOAD_READY_TIMEOUT_MS) is honoured verbatim.
+  if (explicit) return base;
+  const list = Array.isArray(args) ? args.map(String) : [];
+  let flag;
+  for (let i = 0; i < list.length; i++) {
+    if (list[i] === '--poll-timeout') flag = list[i + 1];
+    else if (list[i].startsWith('--poll-timeout=')) flag = list[i].slice('--poll-timeout='.length);
+  }
+  const poll = derivePollTimeoutMs(flag);
+  return Math.max(base, (poll > 0 ? poll : 0) + SUPERVISOR_RELOAD_READY_STARTUP_SLACK_MS);
+}
 // Rolling daemon hot-upgrade (issue #309). A `supervisor upgrade` hands the
 // fleet to a SUCCESSOR daemon process running the on-disk (new) plugin code:
 // the old daemon quiesces (stops accepting control connections + stops
@@ -790,7 +810,7 @@ function workerPredatesSignalReady(act, pid) {
 function incompatibleSnapshotWorkers(state, { isAlive = isPidAlive, readActivity = readWorkerActivity, activityById } = {}) {
   const out = [];
   for (const rec of liveSnapshotWorkerRecords(state, isAlive)) {
-    const act = readSnapshotActivity(rec.id, activityById, readActivity);
+    const act = readSnapshotActivity(rec, activityById, readActivity);
     if (workerPredatesSignalReady(act, Number(rec.pid))) out.push(rec.id);
   }
   return out;
@@ -806,7 +826,7 @@ function incompatibleSnapshotWorkers(state, { isAlive = isPidAlive, readActivity
 function unknownSnapshotWorkers(state, { isAlive = isPidAlive, readActivity = readWorkerActivity, activityById } = {}) {
   const out = [];
   for (const rec of liveSnapshotWorkerRecords(state, isAlive)) {
-    const act = readSnapshotActivity(rec.id, activityById, readActivity);
+    const act = readSnapshotActivity(rec, activityById, readActivity);
     if (!act || typeof act !== 'object' || act.pid !== Number(rec.pid)) out.push(rec.id);
   }
   return out;
@@ -824,10 +844,21 @@ function liveSnapshotWorkerRecords(state, isAlive) {
   return out;
 }
 
+/**
+ * #340 review: the marker path a snapshot record reports to — its persisted
+ * per-spawn `activityFile` when that lies directly in the activity dir (never an
+ * arbitrary path from the state file), else the default per-id marker.
+ */
+function snapshotRecActivityFile(rec, dir = getSupervisorActivityDir()) {
+  const f = rec && rec.activityFile;
+  return (typeof f === 'string' && f && dirname(f) === dir) ? f : supervisorWorkerActivityFile(rec.id);
+}
+
 /** One worker's marker: the caller-supplied read when given, else `readActivity`. */
-function readSnapshotActivity(id, activityById, readActivity) {
+function readSnapshotActivity(rec, activityById, readActivity) {
+  const id = rec.id;
   if (activityById && typeof activityById.get === 'function') return activityById.get(id) ?? null;
-  try { return readActivity(id); } catch { return null; }
+  try { return readActivity(id, snapshotRecActivityFile(rec)); } catch { return null; }
 }
 
 /**
@@ -843,7 +874,10 @@ function classifySnapshotCompat(state, { isAlive = isPidAlive, readActivity = re
   const activityById = new Map();
   for (const rec of liveSnapshotWorkerRecords(state, isAlive)) {
     let act = null;
-    try { act = readActivity(rec.id); } catch { act = null; }
+    // #340 review: a reloaded worker reports to its PERSISTED per-spawn marker
+    // (`rec.activityFile`), not the default path — read that (validated to the
+    // activity dir, exactly as adoptWorker does) or the handoff times out.
+    try { act = readActivity(rec.id, snapshotRecActivityFile(rec)); } catch { act = null; }
     activityById.set(rec.id, act);
   }
   const deps = { isAlive, activityById };
@@ -18379,7 +18413,7 @@ async function runSupervisorDaemon() {
   });
   const waitSurgeReady = async (id, h) => {
     const { w, child } = h;
-    await waitForWorkerReady(w, child, SUPERVISOR_RELOAD_READY_TIMEOUT_MS);
+    await waitForWorkerReady(w, child, reloadReadyTimeoutMsFor(w.args));
     // Ready only when the replacement is STILL this worker's live current child,
     // nobody is stopping it, and its marker proves it polls ≥1 job type.
     const ready = workers.get(id) === w && w.child === child && !w.stopping && !shuttingDown
@@ -18391,7 +18425,7 @@ async function runSupervisorDaemon() {
   };
   const abandonSurge = (id, h, why) => serializeOp(async () => {
     const { w, child, old } = h;
-    dlog(`worker '${id}' replacement pid ${child.pid ?? '?'} ${why} within ${SUPERVISOR_RELOAD_READY_TIMEOUT_MS}ms — keeping the old child serving and aborting the roll`);
+    dlog(`worker '${id}' replacement pid ${child.pid ?? '?'} ${why} within ${reloadReadyTimeoutMsFor(w.args)}ms — keeping the old child serving and aborting the roll`);
     if (w.surgeChild === child) w.surgeChild = null;
     // #340 review: cancel any pending replacement retry BEFORE restoring, so a
     // stale timer can never overwrite the restored child/pid.
@@ -23957,6 +23991,8 @@ export {
   incompatibleSnapshotWorkers,
   unknownSnapshotWorkers,
   classifySnapshotCompat,
+  snapshotRecActivityFile,
+  reloadReadyTimeoutMsFor,
   awaitSnapshotCompat,
   reloadCredentialsReady,
   waitForChildExit,

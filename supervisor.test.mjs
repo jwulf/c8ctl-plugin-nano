@@ -57,6 +57,8 @@ import {
   incompatibleSnapshotWorkers,
   unknownSnapshotWorkers,
   classifySnapshotCompat,
+  snapshotRecActivityFile,
+  reloadReadyTimeoutMsFor,
   awaitSnapshotCompat,
   reloadCredentialsReady,
   waitForChildExit,
@@ -2020,4 +2022,26 @@ test('advanceRetargetSignal: retries a failed sidecar write each poll and signal
   const q = { pid: 2, signalled: false, sidecarPending: true };
   assert.equal(advanceRetargetSignal(q, { ready: false, writeSidecar: () => null, signal }), false);
   assert.equal(q.sidecarPending, false); assert.equal(signals, 1);
+});
+
+test('classifySnapshotCompat reads a reloaded worker\'s persisted per-spawn marker (#340 review)', () => {
+  const dir = '/tmp/acts';
+  const per = supervisorWorkerActivityFile('w1').replace(/[^/]+$/, 'w1-abc.json');
+  const state = { workers: [{ id: 'w1', pid: 4242, activityFile: per }] };
+  const seen = [];
+  const readActivity = (id, file) => { seen.push(file); return file === per ? { pid: 4242, signalReady: true, readyAt: 1 } : null; };
+  const c = classifySnapshotCompat(state, { isAlive: () => true, readActivity });
+  assert.deepEqual(seen, [per]);
+  assert.deepEqual(c.unknown, []);
+  // An out-of-dir path is never trusted: falls back to the default marker.
+  assert.equal(snapshotRecActivityFile({ id: 'w1', activityFile: `${dir}/evil.json` }), supervisorWorkerActivityFile('w1'));
+  assert.equal(snapshotRecActivityFile({ id: 'w1' }), supervisorWorkerActivityFile('w1'));
+});
+
+test('reloadReadyTimeoutMsFor covers a poll window longer than the default deadline (#340 review)', () => {
+  assert.ok(reloadReadyTimeoutMsFor(['--poll-timeout', '180000'], 120000) > 180000);
+  assert.ok(reloadReadyTimeoutMsFor(['--poll-timeout=180000'], 120000) > 180000);
+  assert.equal(reloadReadyTimeoutMsFor([], 120000), 120000);
+  assert.equal(reloadReadyTimeoutMsFor(['--poll-timeout', '-1'], 120000), 120000);
+  assert.equal(reloadReadyTimeoutMsFor(['--poll-timeout', '180000'], 300, true), 300, 'explicit override wins');
 });

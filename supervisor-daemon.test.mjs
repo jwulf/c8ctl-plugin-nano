@@ -1068,6 +1068,19 @@ test('supervisor reload: a never-ready replacement keeps the old worker and fail
   assert.equal(after.workers[0].pid, oldPid, 'the old worker keeps serving under its original pid');
   assert.equal(after.workers[0].state, 'running');
   assert.ok(mod.runningSupervisor(), 'the daemon should keep running after a failed reload');
+  // #347: the rollback must have detached the retirement watcher and re-armed
+  // the restored child's exit handler — killing it must trigger an auto-restart
+  // under a NEW pid (a leaked retirement listener would swallow the exit).
+  process.kill(oldPid, 'SIGKILL');
+  let restarted = null;
+  for (let i = 0; i < 200 && !restarted; i++) {
+    await sleep(50);
+    const s = await mod.supervisorRequest({ op: 'status' });
+    const w = s.workers.find((x) => x.id === id);
+    if (w && w.pid && w.pid !== oldPid && w.state === 'running') restarted = w;
+  }
+  assert.ok(restarted, 'the restored child must auto-restart after it dies');
+  assert.equal((await mod.supervisorRequest({ op: 'status' })).workers.length, 1, 'no leaked replacement/retiree entry');
   await mod.supervisorRequest({ op: 'stop', force: true });
 });
 

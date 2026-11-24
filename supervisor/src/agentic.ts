@@ -146,9 +146,12 @@ export const acquireAgentic = (
   config: AgenticConfig = defaultAgenticConfig,
 ): Effect.Effect<AgenticHandle, SupervisorError, import("effect").Scope.Scope> =>
   Effect.acquireRelease(
-    endpoint.connect().pipe(
-      Effect.tap(() => Effect.sync(() => logger.debug?.("agentic: connected"))),
-      Effect.retry(reconnectSchedule(config)),
+    // Issue #328: interruptible, see `superviseAgentic` — the acquire retries forever.
+    Effect.interruptible(
+      endpoint.connect().pipe(
+        Effect.tap(() => Effect.sync(() => logger.debug?.("agentic: connected"))),
+        Effect.retry(reconnectSchedule(config)),
+      ),
     ),
     (handle) =>
       handle.disconnect.pipe(
@@ -213,8 +216,15 @@ export const superviseAgentic = <A, E, R>(
 ): Effect.Effect<A, E | SupervisorError, R> =>
   Effect.gen(function* () {
     // One connect → establish (install steer route) → hold-until-permanently-closed → teardown cycle.
+    //
+    // Issue #328: `acquireUseRelease` runs its acquire UNINTERRUPTIBLY, and this
+    // acquire retries `connect` FOREVER — so with an unreachable hub, interrupting
+    // the worker (drain / abort) waited on the retry loop forever and the worker
+    // hung in `stopping`. Make the acquire explicitly interruptible: `connect`
+    // already closes its own half-open client on interruption (emit.ts), and an
+    // interrupted acquire yields no handle, so there is nothing to release.
     const cycle = Effect.acquireUseRelease(
-      endpoint.connect().pipe(Effect.retry(reconnectSchedule(config))),
+      Effect.interruptible(endpoint.connect().pipe(Effect.retry(reconnectSchedule(config)))),
       (handle) =>
         Ref.set(handleRef, handle).pipe(
           Effect.tap(() => Effect.sync(() => logger.debug?.("agentic: connected"))),

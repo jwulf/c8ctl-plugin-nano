@@ -13844,9 +13844,15 @@ async function workAgent(req, flags, ctx) {
   // #339 review: set when a graceful drain starts; drainIdleAt is the explicit
   // post-quiesce idle ack (re-stamped each write while draining and job-free).
   let drainQuiesced = false;
+  // #339 review: registry-claimed slots (a dispatch still awaiting its initial
+  // extendLock is claimed but not yet in activeJobs). Fails closed: any probe
+  // error counts as busy, so no idle ack is published.
+  let registryInFlight = () => 0;
   const writeActivity = () => {
     if (!activityFile) return;
-    const drainIdleAt = drainQuiesced && activeJobs.size === 0 ? Date.now() : null;
+    let claimed;
+    try { claimed = registryInFlight(); } catch { claimed = 1; }
+    const drainIdleAt = drainQuiesced && activeJobs.size === 0 && claimed === 0 ? Date.now() : null;
     const jobs = [...activeJobs.entries()].map(([key, v]) => ({ key, type: v.type, since: v.since }));
     // #254: append settlement-pending ghosts as flagged, observational entries. A
     // ghost whose key was re-activated (now live in `activeJobs`) is superseded —
@@ -15729,6 +15735,7 @@ async function workAgent(req, flags, ctx) {
     Effect: SupervisorEffect,
     Fiber: SupervisorFiber,
   } = composed;
+  registryInFlight = () => SupervisorEffect.runSync(workerRegistry.activeCount);
 
   // Run the single per-host owner. `Effect.runFork` keeps the process alive on the
   // runtime's own Schedule cadences (reconcile + activation/idle loop), so even an

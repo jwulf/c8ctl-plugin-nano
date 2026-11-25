@@ -21994,7 +21994,7 @@ async function workforceListCmd(req, flags, manifestName) {
   }
 }
 
-async function workforceStartCmd(req, flags, manifestName) {
+async function workforceStartCmd(req, flags, manifestName, ctx) {
   const logger = getLogger();
   const manifest = readWorkforceManifestStrict(manifestName);
   if (!manifest || !Array.isArray(manifest.workers) || manifest.workers.length === 0) {
@@ -22067,7 +22067,7 @@ async function workforceStartCmd(req, flags, manifestName) {
     else { logger.error(`  ! could not stop "${id}": ${(res && res.error) || 'unknown error'}`); hadError = true; }
   }
   for (const d of toStart) {
-    const res = await supervisorRequest({ op: 'add', profile: d.profile, name: d.name, args: withConnectionProfileArg(d.args) });
+    const res = await supervisorRequest({ op: 'add', profile: d.profile, name: d.name, args: withConnectionProfileArg(d.args, ctx) });
     if (res && res.ok) logger.info(`  + started "${d.name}" (profile ${d.profile})`);
     else { logger.error(`  ! could not start "${d.name}": ${(res && res.error) || 'unknown error'}`); hadError = true; }
   }
@@ -22231,7 +22231,7 @@ async function workforceReloadCmd(req, flags, manifestName) {
   if (outcome === 'error') process.exit(1);
 }
 
-async function workforceCommand(req, flags) {
+async function workforceCommand(req, flags, ctx) {
   const logger = getLogger();
   const action = (req.positional[0] || '').toLowerCase();
   // A bare `--manifest` (no value) is parsed as boolean `true`; reject it so we
@@ -22259,7 +22259,7 @@ async function workforceCommand(req, flags) {
       return;
     case 'start':
     case 'up':
-      await workforceStartCmd(req, flags, manifestName);
+      await workforceStartCmd(req, flags, manifestName, ctx);
       return;
     case 'status':
       await workforceStatusCmd(req, flags, manifestName);
@@ -24486,7 +24486,7 @@ export const commands = {
             await supervisorCommand(req, flags, ctx);
             break;
           case 'workforce':
-            await workforceCommand(req, flags);
+            await workforceCommand(req, flags, ctx);
             break;
           case 'fence-check': {
             // Issue #320: the agent-side lease check. Exit 0 held, 1 lost (fence

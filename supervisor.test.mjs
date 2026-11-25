@@ -2030,3 +2030,11 @@ test('reloadReadyTimeoutMsFor covers a poll window longer than the default deadl
   assert.equal(reloadReadyTimeoutMsFor(['--poll-timeout', '-1'], 120000), 120000);
   assert.equal(reloadReadyTimeoutMsFor(['--poll-timeout', '180000'], 300, true), 300, 'explicit override wins');
 });
+
+test('workforce start threads ctx so an explicit --profile override is pinned (#351 review)', async () => {
+  const { readFileSync } = await import('node:fs');
+  const src = readFileSync(new URL('./c8ctl-plugin.js', import.meta.url), 'utf8');
+  assert.match(src, /await workforceCommand\(req, flags, ctx\)/);
+  assert.match(src, /await workforceStartCmd\(req, flags, manifestName, ctx\)/);
+  assert.match(src, /args: withConnectionProfileArg\(d\.args, ctx\)/);
+});

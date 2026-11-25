@@ -177,3 +177,57 @@ test('#351: a hung pre-abort flush is bounded', async () => {
   await exited;
   assert.equal(interrupted, true);
 });
+
+test('#351 review: the yield snapshot is re-captured after the pre-abort wait', async () => {
+  const mod = await import(pluginUrl);
+  let yielded = null;
+  let done;
+  const exited = new Promise((r) => { done = r; });
+  const lc = mod.createWorkerStopLifecycle({
+    logger: { info() {}, warn() {}, error() {} }, teardownMs: 500,
+    interrupt: async () => {},
+    onAbortStart: () => [{ jobKey: 'old' }],
+    snapshotInflight: () => [{ jobKey: 'late', leaseToken: 't2' }],
+    yieldInflight: async (inflight) => { yielded = inflight; },
+    onExit: () => done(),
+    exitProcess: () => {},
+  });
+  lc.forceAbort('SIGTERM');
+  await exited;
+  assert.deepEqual(yielded, [{ jobKey: 'late', leaseToken: 't2' }]);
+});
+
+test('#351 review: install seeds fleet.json from a legacy daemon descriptor', async (t) => {
+  setup(t);
+  const mod = await import(pluginUrl);
+  assert.equal(mod.seedFleetFromLegacyDaemon({ workers: [
+    { id: 'w1', profile: 'faker', args: ['--auto'] },
+    { id: 'w2', profile: 'faker', removeOnExit: true },
+  ] }), true);
+  assert.deepEqual(mod.readFleetState(), [{ id: 'w1', profile: 'faker', args: ['--auto'] }]);
+  // An existing record is never overwritten.
+  assert.equal(mod.seedFleetFromLegacyDaemon({ workers: [{ id: 'x', profile: 'faker' }] }), false);
+  assert.deepEqual(mod.readFleetState().map((w) => w.id), ['w1']);
+});
+
+test('#351 review: an unreadable config keeps the saved fleet on restore', async (t) => {
+  const HOME = setup(t);
+  const mod = await import(pluginUrl);
+  mod.clearFleetState?.();
+  const { writeFileSync: wf } = await import('node:fs');
+  wf(mod.getSupervisorFleetFile(), JSON.stringify({ version: 1, workers: [{ id: 'w1', profile: 'faker', args: [] }, { id: 'w2', profile: 'faker', args: [] }] }));
+  wf(join(HOME, 'config.json'), '{ torn');
+  await mod.startSupervisorDaemon();
+  await sleep(500);
+  assert.deepEqual(mod.readFleetState().map((w) => w.id).sort(), ['w1', 'w2']);
+});
+
+test('#351 review: a drain-remove leaves fleet.json immediately', async (t) => {
+  setup(t);
+  const mod = await import(pluginUrl);
+  await mod.startSupervisorDaemon();
+  for (const name of ['w1', 'w2']) await mod.supervisorRequest({ op: 'add', profile: 'faker', name });
+  await waitFor(async () => (await runningIds(mod)).length === 2);
+  const r = await mod.supervisorRequest({ op: 'remove', target: 'w1', force: false });
+  assert.ok(await waitFor(() => { const ids = mod.readFleetState().map((w) => w.id); return ids.length === 1 && ids[0] === 'w2'; }), JSON.stringify(r));
+});

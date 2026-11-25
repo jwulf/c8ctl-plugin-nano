@@ -1283,8 +1283,22 @@ c8ctl nano supervisor upgrade                       # roll the DAEMON itself ont
 c8ctl nano supervisor reload-credentials            # after `gh auth login`/refresh: every worker re-reads its gh token now (async; old token served until the re-read lands; no drain)
 c8ctl nano supervisor remove coder                 # stop + drop a worker (also: `all`)
 c8ctl nano supervisor logs reviewer --follow       # tail a worker's log (or the daemon's)
-c8ctl nano supervisor stop                          # stop the daemon and every worker
+c8ctl nano supervisor stop                          # stop the daemon and every worker (clears the saved fleet)
+c8ctl nano supervisor stop --keep-fleet             # stop, but keep the saved fleet for the next start
 ```
+
+**The fleet survives a reboot or crash.** The daemon records the desired fleet
+(each worker's id, profile and work args) in `fleet.json` in the state home. A
+SIGTERM/SIGINT/SIGHUP — e.g. systemd/launchd stopping the service at host
+shutdown — or a crash leaves that record intact, and the next plain daemon start
+(boot, `Restart=on-failure`, or `supervisor start`) logs `restoring N worker(s)
+from fleet.json` and starts the same workers again. Only an explicit
+`supervisor stop` (or `uninstall`) clears it; `supervisor stop --keep-fleet`
+keeps it. In-flight jobs are yielded on shutdown (after a bounded pre-abort WIP
+checkpoint push) and resume from their checkpoints on re-activation. Each worker
+is pinned to the c8ctl connection profile it was added for — the `--profile`
+given on `supervisor add`/`start`, else the profile active at that moment — so a
+later `c8ctl use profile X` does not retarget the fleet.
 
 Each worker has a **name** — its supervisor id and the broker `workerName` it
 registers under. Pass `--name` on `supervisor add` (or `work`) to set it;
@@ -1513,6 +1527,11 @@ c8ctl nano supervisor uninstall   # stop + remove it
   short-lived tokens are not persisted into a plist/unit that outlives the session.
 - `KeepAlive`/`Restart` are **crash-only**: a `supervisor stop` (clean exit) stays
   down; only a crash is restarted.
+- The unit sets `KillMode=mixed` + `TimeoutStopSec=60` (the plist sets
+  `ExitTimeOut` 60): only the daemon gets SIGTERM, stops its workers in order
+  (including their recovery-ref flush), and stragglers are SIGKILLed at the
+  timeout. Re-run `supervisor install` to rewrite an existing unit/plist with
+  these settings; the running fleet is kept across the reinstall.
 
 > **Session-bound daemons leak the SSH environment.** A daemon that is *not*
 > started by the service — after `supervisor uninstall`, with

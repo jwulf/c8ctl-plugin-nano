@@ -174,7 +174,7 @@ test('explicitConnectionProfile returns only an override that differs from the a
   }
 });
 
-test('withConnectionProfileArg appends --profile only for an explicit override', () => {
+test('withConnectionProfileArg pins the explicit or active connection profile (#351)', () => {
   const prev = globalThis.c8ctl;
   try {
     globalThis.c8ctl = { activeProfile: 'local' };
@@ -184,8 +184,13 @@ test('withConnectionProfileArg appends --profile only for an explicit override',
       withConnectionProfileArg(['--auto'], { profile: 'nano-validate' }),
       ['--auto', '--profile', 'nano-validate'],
     );
-    // No override (or override == active) → the argv is returned untouched.
-    assert.deepEqual(withConnectionProfileArg(['--auto'], { profile: 'local' }), ['--auto']);
+    // #351: an override equal to the active profile, or no override at all,
+    // still PINS the profile active at add time — a later `c8ctl use profile X`
+    // must not retarget the fleet on its next restart.
+    assert.deepEqual(withConnectionProfileArg(['--auto'], { profile: 'local' }), ['--auto', '--profile', 'local']);
+    assert.deepEqual(withConnectionProfileArg(['--auto'], undefined), ['--auto', '--profile', 'local']);
+    globalThis.c8ctl = {};
+    // No active profile known and no override → argv untouched.
     assert.deepEqual(withConnectionProfileArg(['--auto'], undefined), ['--auto']);
     assert.deepEqual(withConnectionProfileArg(undefined, { profile: 'nano-validate' }), ['--profile', 'nano-validate']);
   } finally {

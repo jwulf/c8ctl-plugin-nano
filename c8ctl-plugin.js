@@ -16443,6 +16443,8 @@ function withConnectionProfileArg(workArgs, ctx) {
     : undefined;
   const conn = resolveConnectionProfile(ctx) || active;
   const base = Array.isArray(workArgs) ? workArgs : [];
+  // Idempotent: an explicit `--profile`/`--profile=` already in the argv wins.
+  if (base.some((t) => t === '--profile' || (typeof t === 'string' && t.startsWith('--profile=')))) return base;
   return conn ? [...base, '--profile', conn] : base;
 }
 
@@ -20378,6 +20380,9 @@ async function supervisorStopCmd(force = false, { keepFleet = false } = {}) {
       if (!killedGroup) { try { process.kill(daemonPid, 'SIGKILL'); } catch { /* ignore */ } }
       clearSupervisorState();
     }
+    // #351: the SIGTERM fallback lets the daemon's shutdown() re-snapshot the
+    // fleet; once it is gone, clear again so an explicit stop stays explicit.
+    if (outcome === 'unreachable' && !keepFleet && !isPidAlive(daemonPid)) clearFleetState();
   } else {
     while (isPidAlive(daemonPid)) {
       await new Promise((r) => setTimeout(r, 150));
@@ -20532,7 +20537,7 @@ async function attachSupervisorConsole(state) {
           if (error) { out(error); break; }
           if (name && count > 1) { out('--name cannot be combined with --instances > 1; omit --name to auto-name them.'); break; }
           for (let i = 0; i < count; i++) {
-            sock.write(encodeFrame({ op: 'add', profile, name, args: workArgs }));
+            sock.write(encodeFrame({ op: 'add', profile, name, args: withConnectionProfileArg(workArgs) }));
           }
           break;
         }
@@ -22062,7 +22067,7 @@ async function workforceStartCmd(req, flags, manifestName) {
     else { logger.error(`  ! could not stop "${id}": ${(res && res.error) || 'unknown error'}`); hadError = true; }
   }
   for (const d of toStart) {
-    const res = await supervisorRequest({ op: 'add', profile: d.profile, name: d.name, args: d.args });
+    const res = await supervisorRequest({ op: 'add', profile: d.profile, name: d.name, args: withConnectionProfileArg(d.args) });
     if (res && res.ok) logger.info(`  + started "${d.name}" (profile ${d.profile})`);
     else { logger.error(`  ! could not start "${d.name}": ${(res && res.error) || 'unknown error'}`); hadError = true; }
   }

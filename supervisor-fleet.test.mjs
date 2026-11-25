@@ -134,6 +134,12 @@ test('#351: stop with keepFleet keeps the record for the next start', async (t) 
 test('#351: the service stop timeout exceeds the daemon force-stop grace', async () => {
   const mod = await import(pluginUrl);
   assert.ok(mod.SUPERVISOR_SERVICE_STOP_TIMEOUT_SECS * 1000 > mod.FORCE_STOP_DAEMON_GRACE_MS);
+  // The pre-abort checkpoint hook runs before the #295 recovery budget is armed,
+  // so the worker SIGKILL backstop (and the daemon grace above it) must count it.
+  assert.equal(mod.WORKER_FORCE_STOP_BACKSTOP_MS,
+    mod.STOP_GRACE_MS + mod.PRE_ABORT_HOOK_MS + mod.FORCE_STOP_RECOVERY_MS);
+  assert.ok(mod.PRE_ABORT_HOOK_MS > mod.PRE_ABORT_CHECKPOINT_MS);
+  assert.ok(mod.FORCE_STOP_DAEMON_GRACE_MS > mod.WORKER_FORCE_STOP_BACKSTOP_MS);
 });
 
 test('#351: a force abort flushes WIP checkpoints BEFORE interrupting the runtime', async () => {

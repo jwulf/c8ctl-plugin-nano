@@ -392,7 +392,8 @@ test('supervisor start forwards c8ctl --profile <conn> to spawned workers', asyn
   // `reconstructWorkArgs`/`withConnectionProfileArg` into the child argv the
   // daemon spawns (jwulf/c8ctl-plugin-nano#189). A quiet logger keeps the suite
   // output clean; the active profile is set to something the override DIFFERS
-  // from, so the forward is a genuine per-invocation pin — not a spurious echo.
+  // from, so the forward is the explicit override — not the active profile that
+  // #351 pins when no override is given.
   const quiet = { info() {}, warn() {}, error() {}, debug() {}, output() {} };
   globalThis.c8ctl = { activeProfile: 'local', getLogger: () => quiet };
 

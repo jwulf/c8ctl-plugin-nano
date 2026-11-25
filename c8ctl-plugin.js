@@ -272,15 +272,25 @@ const STOP_GRACE_MS = 8_000;
 // (a child that exits sooner is reaped immediately — this only lengthens the
 // SIGKILL backstop for a worker that is actively preserving recovery).
 const FORCE_STOP_RECOVERY_MS = 20_000;
+// #351: bounded budget for the pre-abort WIP checkpoint push on a force abort.
+// It runs BEFORE the interrupt (and so before the #295 recovery deadline is
+// armed), so every SIGKILL backstop must add PRE_ABORT_HOOK_MS on top of
+// STOP_GRACE_MS + FORCE_STOP_RECOVERY_MS (see WORKER_FORCE_STOP_BACKSTOP_MS).
+const PRE_ABORT_CHECKPOINT_MS = 5_000;
+// The outer race bound on the pre-abort hook (`beforeAbortMs` default).
+const PRE_ABORT_HOOK_MS = PRE_ABORT_CHECKPOINT_MS + 1_000;
+// #351: how long the daemon waits for a force-stopped worker before SIGKILL:
+// the stop grace + the pre-abort checkpoint hook + the #295 recovery budget.
+const WORKER_FORCE_STOP_BACKSTOP_MS = STOP_GRACE_MS + PRE_ABORT_HOOK_MS + FORCE_STOP_RECOVERY_MS;
 // #296: the backstop deadline an OUTER daemon-stop path (the socket-unreachable
 // `stop --force` fallback and `stopSupervisorProcess`) waits for the DAEMON — and
 // its whole process group, which includes the workers — to exit before SIGKILLing
 // the group. It must exceed what the daemon itself allows a worker before ITS
-// SIGKILL backstop (`forceStopWorker` waits STOP_GRACE_MS + FORCE_STOP_RECOVERY_MS),
+// SIGKILL backstop (`forceStopWorker` waits WORKER_FORCE_STOP_BACKSTOP_MS),
 // plus a small margin for the daemon to observe the worker's exit and shut down.
 // Otherwise the outer path SIGKILLs the group ~18s early and kills a worker that is
 // still flushing + promoting its durable recovery ref (#295).
-const FORCE_STOP_DAEMON_GRACE_MS = STOP_GRACE_MS + FORCE_STOP_RECOVERY_MS + 2_000;
+const FORCE_STOP_DAEMON_GRACE_MS = WORKER_FORCE_STOP_BACKSTOP_MS + 2_000;
 // #351: how long systemd (`TimeoutStopSec`) / launchd (`ExitTimeOut`) wait for
 // the daemon's orderly worker shutdown before SIGKILL. Must exceed
 // FORCE_STOP_DAEMON_GRACE_MS so the recovery-ref flush finishes first.
@@ -11541,9 +11551,6 @@ export function raceTeardown(promise, ms, signal) {
   });
 }
 
-// #351: bounded budget for the pre-abort WIP checkpoint push on a force abort.
-// Kept well inside STOP_GRACE_MS so the post-abort recovery path keeps its time.
-const PRE_ABORT_CHECKPOINT_MS = 5_000;
 
 /**
  * Flush every given checkpointer in parallel ('pre-abort'), each bounded by
@@ -11564,7 +11571,7 @@ export function createWorkerStopLifecycle({
   logger = console, teardownMs = DEFAULT_WORKER_TEARDOWN_TIMEOUT_MS, interrupt,
   inFlightCount = () => 0, onDrainStart = () => {}, onDrainIdle = () => {}, onTeardownStart = () => {},
   onCleanTeardown = () => {}, onAbortStart = () => [], yieldInflight = async () => {},
-  beforeAbort = async () => {}, beforeAbortMs = PRE_ABORT_CHECKPOINT_MS + 1_000,
+  beforeAbort = async () => {}, beforeAbortMs = PRE_ABORT_HOOK_MS,
   onExit = () => {}, pollMs = 200, backstopMs = 2_000,
   exitProcess = (code) => process.exit(code),
   // #339: the worker-LOCAL in-flight count (the jobs this process is actually
@@ -15188,7 +15195,7 @@ async function workAgent(req, flags, ctx) {
               // #296: anchor the ONE shared force-stop deadline here. The recover race
               // below and the `finally`'s close() both bound against it, so the TOTAL
               // force-stop window is a single FORCE_STOP_RECOVERY_MS (not 2x), fitting
-              // inside the supervisor's STOP_GRACE_MS + FORCE_STOP_RECOVERY_MS backstop.
+              // inside the supervisor's WORKER_FORCE_STOP_BACKSTOP_MS backstop.
               forceStopDeadline = Date.now() + recoveryDeadline;
               // #296 (review): reserve a DRAIN window inside the deadline. abortRecovery()
               // only SIGTERMs the checkpoint git; createGitRunner then grants up to
@@ -16410,32 +16417,14 @@ function resolveConnectionProfile(ctx) {
   return p || undefined;
 }
 
-// The EXPLICIT `--profile <name>` override only (distinct from the active
-// session profile), for FORWARDING to spawned `nano work` children. When an
-// operator runs `supervisor start --worker <p> --profile <conn>` (or
-// `supervisor add … --profile <conn>`), each supervised worker is a fresh
-// `c8ctl nano work` process that must connect to <conn>, not the daemon's/
-// session's active profile. c8ctl strips the global `--profile` before the
-// plugin parser sees it, so it never lands in `flags`; we recover it from
-// `ctx.profile` and re-emit it as a `--profile` token in the child argv (c8ctl
-// core parses it position-independently as a global). Returns undefined when no
-// override was given — i.e. `ctx.profile` is absent or merely equals the active
-// session profile — so the child inherits the active profile exactly as before
-// (no spurious pin). Pure.
-function explicitConnectionProfile(ctx) {
-  const p = resolveConnectionProfile(ctx);
-  if (!p) return undefined;
-  const active = globalThis.c8ctl && typeof globalThis.c8ctl.activeProfile === 'string'
-    ? globalThis.c8ctl.activeProfile
-    : undefined;
-  return p === active ? undefined : p;
-}
-
-// Append the explicit connection-profile override (if any) to a reconstructed
-// `work` argv tail as a c8ctl global `--profile <conn>` token, so a supervised
-// worker connects to the profile named on the `supervisor start`/`add` command
-// line rather than the active session profile (jwulf/c8ctl-plugin-nano#189).
-// A no-op when no `--profile` override was passed. Pure.
+// c8ctl strips the global `--profile` before the plugin parser sees it, so it
+// never lands in `flags`; we recover it from `ctx.profile` and re-emit it as a
+// `--profile` token in each supervised `nano work` child's argv (c8ctl core
+// parses it position-independently as a global).
+// Append a c8ctl global `--profile <conn>` token to a reconstructed `work` argv
+// tail: the explicit `--profile` override (jwulf/c8ctl-plugin-nano#189) or,
+// absent one, the profile active at add time (#351) — so a supervised worker is
+// always pinned. Returns the argv unchanged only when no profile is known.
 function withConnectionProfileArg(workArgs, ctx) {
   // #351: pin the connection profile the worker was added for — the explicit
   // `--profile` or, absent one, the profile active at add time — so a later
@@ -18309,7 +18298,7 @@ async function runSupervisorDaemon() {
   const stopRetiringOf = (w, force) => liveRetiring(w).map((old) => (force
     ? (async () => {
       try { process.kill(old.pid, 'SIGTERM'); } catch { /* gone */ }
-      await Promise.race([old.exitPromise, new Promise((r) => { const t = setTimeout(r, STOP_GRACE_MS + FORCE_STOP_RECOVERY_MS); t.unref?.(); })]);
+      await Promise.race([old.exitPromise, new Promise((r) => { const t = setTimeout(r, WORKER_FORCE_STOP_BACKSTOP_MS); t.unref?.(); })]);
       if (isPidAlive(old.pid)) { try { process.kill(old.pid, 'SIGKILL'); } catch { /* gone */ } }
     })()
     : drainRetiring(w, old)));
@@ -18323,7 +18312,7 @@ async function runSupervisorDaemon() {
       // interrupted agent job can finish before the SIGKILL backstop. A worker that
       // exits sooner is reaped at once — this only lengthens the ceiling for one that
       // is actively preserving recovery.
-      await waitForChildExit(w.child, STOP_GRACE_MS + FORCE_STOP_RECOVERY_MS);
+      await waitForChildExit(w.child, WORKER_FORCE_STOP_BACKSTOP_MS);
       if (isPidAlive(pid)) { try { process.kill(pid, 'SIGKILL'); } catch { /* ignore */ } }
     }
   };
@@ -24110,7 +24099,6 @@ export {
 export {
   reconstructWorkArgs,
   resolveConnectionProfile,
-  explicitConnectionProfile,
   withConnectionProfileArg,
   supervisorWorkerId,
   autoWorkerName,
@@ -24180,6 +24168,11 @@ export {
   supervisorDaemonLogFile,
   SUPERVISOR_SERVICE_STOP_TIMEOUT_SECS,
   FORCE_STOP_DAEMON_GRACE_MS,
+  WORKER_FORCE_STOP_BACKSTOP_MS,
+  PRE_ABORT_HOOK_MS,
+  PRE_ABORT_CHECKPOINT_MS,
+  STOP_GRACE_MS,
+  FORCE_STOP_RECOVERY_MS,
   getSupervisorSocketPath,
   getSupervisorStateFile,
   isSshSession,

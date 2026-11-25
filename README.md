@@ -1528,7 +1528,7 @@ c8ctl nano supervisor uninstall   # stop + remove it
 - `KeepAlive`/`Restart` are **crash-only**: a `supervisor stop` (clean exit) stays
   down; only a crash is restarted.
 - The unit sets `KillMode=mixed` + `TimeoutStopSec=60` (the plist sets
-  `ExitTimeOut` 60): only the daemon gets SIGTERM, stops its workers in order
+  `ExitTimeOut` 60): only the daemon gets SIGTERM, stops all its workers in parallel
   (including their recovery-ref flush), and stragglers are SIGKILLed at the
   timeout. Re-run `supervisor install` to rewrite an existing unit/plist with
   these settings; the running fleet is kept across the reinstall.

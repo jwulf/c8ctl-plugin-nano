@@ -14,7 +14,6 @@ import {
   writeRetargetSidecar,
   advanceRetargetSignal,
   resolveConnectionProfile,
-  explicitConnectionProfile,
   withConnectionProfileArg,
   supervisorWorkerId,
   autoWorkerName,
@@ -153,25 +152,6 @@ test('resolveConnectionProfile is undefined when ctx carries no profile', () => 
   assert.equal(resolveConnectionProfile({ profile: '' }), undefined);
   assert.equal(resolveConnectionProfile({ profile: '   ' }), undefined);
   assert.equal(resolveConnectionProfile({ profile: 42 }), undefined);
-});
-
-test('explicitConnectionProfile returns only an override that differs from the active profile', () => {
-  const prev = globalThis.c8ctl;
-  try {
-    globalThis.c8ctl = { activeProfile: 'local' };
-    // A genuine per-invocation override is forwarded.
-    assert.equal(explicitConnectionProfile({ profile: 'nano-validate' }), 'nano-validate');
-    // ctx.profile merely echoing the active session profile is NOT an override —
-    // forwarding it would spuriously pin a supervised worker.
-    assert.equal(explicitConnectionProfile({ profile: 'local' }), undefined);
-    // No override present at all.
-    assert.equal(explicitConnectionProfile(undefined), undefined);
-    // No active session profile (CAMUNDA_* env user): any override is explicit.
-    globalThis.c8ctl = {};
-    assert.equal(explicitConnectionProfile({ profile: 'nano-validate' }), 'nano-validate');
-  } finally {
-    if (prev === undefined) delete globalThis.c8ctl; else globalThis.c8ctl = prev;
-  }
 });
 
 test('withConnectionProfileArg pins the explicit or active connection profile (#351)', () => {

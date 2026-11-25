@@ -17341,6 +17341,33 @@ function clearFleetState() {
   try { rmSync(getSupervisorFleetFile(), { force: true }); } catch { /* best effort */ }
 }
 
+/**
+ * #351 review: a SIGTERMed daemon may still run one routine persist() (or its
+ * shutdown snapshot) AFTER an explicit stop/uninstall cleared fleet.json. Wait
+ * (bounded) for the daemon pid to exit, then clear again. Returns true when the
+ * daemon is gone (fleet cleared), false when it is still alive at the deadline.
+ * Shared by the forced-stop fallback and both service uninstall paths.
+ */
+async function clearFleetAfterDaemonExit(daemonPid, opts = {}) {
+  const isAlive = opts.isAlive || isPidAlive;
+  const sleep = opts.sleep || ((ms) => new Promise((r) => setTimeout(r, ms)));
+  const now = opts.now || Date.now;
+  const timeoutMs = opts.timeoutMs ?? 30_000;
+  const pollMs = opts.pollMs ?? 150;
+  const pid = Number(daemonPid);
+  if (Number.isInteger(pid) && pid > 0) {
+    const deadline = now() + timeoutMs;
+    while (isAlive(pid) && now() < deadline) await sleep(pollMs);
+    if (isAlive(pid)) {
+      clearFleetState();
+      if (opts.logger) opts.logger.warn(`Supervisor daemon (pid ${pid}) is still running; it may rewrite the desired fleet (fleet.json). Run \`c8ctl nano supervisor stop\` to stop it and clear the fleet again.`);
+      return false;
+    }
+  }
+  clearFleetState();
+  return true;
+}
+
 /** Running daemon state (pid alive) or null. */
 function runningSupervisor() {
   const state = readSupervisorState();
@@ -20382,7 +20409,7 @@ async function supervisorStopCmd(force = false, { keepFleet = false } = {}) {
     }
     // #351: the SIGTERM fallback lets the daemon's shutdown() re-snapshot the
     // fleet; once it is gone, clear again so an explicit stop stays explicit.
-    if (outcome === 'unreachable' && !keepFleet && !isPidAlive(daemonPid)) clearFleetState();
+    if (outcome === 'unreachable' && !keepFleet && !isPidAlive(daemonPid)) await clearFleetAfterDaemonExit(daemonPid, { timeoutMs: 0 });
   } else {
     while (isPidAlive(daemonPid)) {
       await new Promise((r) => setTimeout(r, 150));
@@ -20934,15 +20961,18 @@ async function installSupervisorServiceDarwin(logger) {
   return true;
 }
 
-function uninstallSupervisorServiceDarwin(logger) {
+async function uninstallSupervisorServiceDarwin(logger, deps = {}) {
   const uid = process.getuid();
   const label = supervisorServiceLabel();
   const plistPath = launchAgentPlistPath();
   const existed = existsSync(plistPath);
-  runLaunchctl(['bootout', launchdServiceTarget(uid, label)]); // stops + unloads
+  const daemonPid = readSupervisorState()?.pid; // #351 review: capture BEFORE bootout
+  (deps.stopService || ((a) => runLaunchctl(a)))(['bootout', launchdServiceTarget(uid, label)]); // stops + unloads
   try { if (existed) rmSync(plistPath, { force: true }); } catch { /* best effort */ }
-  clearSupervisorState();
   clearFleetState(); // #351: uninstall is an explicit stop — bootout SIGTERMs, which keeps it
+  // A still-exiting daemon can persist() once more; clear again after it is gone.
+  await clearFleetAfterDaemonExit(daemonPid, { ...deps, logger });
+  clearSupervisorState();
   if (existed) logger.info(`Removed LaunchAgent ${label}.`);
   else logger.info('No LaunchAgent was installed for this state home.');
   return true;
@@ -20988,14 +21018,18 @@ async function installSupervisorServiceLinux(logger) {
   return true;
 }
 
-function uninstallSupervisorServiceLinux(logger) {
+async function uninstallSupervisorServiceLinux(logger, deps = {}) {
   const unitPath = systemdUserUnitPath();
   const existed = existsSync(unitPath);
-  if (systemdUserAvailable()) runSystemctlUser(['disable', '--now', systemdUnitName()]);
+  const daemonPid = readSupervisorState()?.pid; // #351 review: capture BEFORE disable --now
+  const systemctl = deps.stopService || ((a) => runSystemctlUser(a));
+  const available = deps.stopService ? true : systemdUserAvailable();
+  if (available) systemctl(['disable', '--now', systemdUnitName()]);
   try { if (existed) rmSync(unitPath, { force: true }); } catch { /* best effort */ }
-  if (systemdUserAvailable()) runSystemctlUser(['daemon-reload']);
-  clearSupervisorState();
+  if (available) systemctl(['daemon-reload']);
   clearFleetState(); // #351: uninstall is an explicit stop — `disable --now` SIGTERMs, which keeps it
+  await clearFleetAfterDaemonExit(daemonPid, { ...deps, logger });
+  clearSupervisorState();
   if (existed) logger.info(`Removed systemd --user unit ${systemdUnitName()}.`);
   else logger.info('No systemd --user unit was installed for this state home.');
   return true;
@@ -21012,8 +21046,8 @@ async function supervisorInstallCmd() {
 async function supervisorUninstallCmd() {
   const logger = getLogger();
   const plat = osPlatform();
-  if (plat === 'darwin') { uninstallSupervisorServiceDarwin(logger); return; }
-  if (plat === 'linux') { uninstallSupervisorServiceLinux(logger); return; }
+  if (plat === 'darwin') { await uninstallSupervisorServiceDarwin(logger); return; }
+  if (plat === 'linux') { await uninstallSupervisorServiceLinux(logger); return; }
   logger.error(`supervisor uninstall is not supported on ${plat}.`);
 }
 
@@ -24217,6 +24251,9 @@ export {
   readFleetState,
   writeFleetState,
   clearFleetState,
+  clearFleetAfterDaemonExit,
+  uninstallSupervisorServiceDarwin,
+  uninstallSupervisorServiceLinux,
   normalizeFleetRecords, seedFleetFromLegacyDaemon,
   getSupervisorFleetFile,
   supervisorDaemonLogFile,

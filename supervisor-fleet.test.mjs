@@ -231,3 +231,39 @@ test('#351 review: a drain-remove leaves fleet.json immediately', async (t) => {
   const r = await mod.supervisorRequest({ op: 'remove', target: 'w1', force: false });
   assert.ok(await waitFor(() => { const ids = mod.readFleetState().map((w) => w.id); return ids.length === 1 && ids[0] === 'w2'; }), JSON.stringify(r));
 });
+
+// #351 review: uninstall must re-clear fleet.json after the daemon exits — a
+// daemon still mid-SIGTERM can persist() once more after the first clear.
+function fakeDaemon(mod, { exitAfterPolls }) {
+  let polls = 0; let t = 0;
+  return {
+    isAlive: () => polls < exitAfterPolls,
+    sleep: async () => { polls++; t += 100; if (polls === 1) mod.writeFleetState([{ id: 'late', profile: 'faker', args: [] }]); },
+    now: () => t,
+  };
+}
+const quietLogger = () => { const warns = []; return { warns, info() {}, warn: (m) => warns.push(m), error() {} }; };
+
+for (const [name, fn] of [['darwin', 'uninstallSupervisorServiceDarwin'], ['linux', 'uninstallSupervisorServiceLinux']]) {
+  test(`${name} uninstall clears fleet.json again once a late-persisting daemon exits`, async (t) => {
+    const HOME = setup(t);
+    const mod = await import(pluginUrl);
+    writeFileSync(mod.getSupervisorStateFile(), JSON.stringify({ pid: 999999 }));
+    mod.writeFleetState([{ id: 'w', profile: 'faker', args: [] }]);
+    const log = quietLogger();
+    await mod[fn](log, { stopService: () => ({ code: 0 }), ...fakeDaemon(mod, { exitAfterPolls: 3 }), timeoutMs: 30_000, pollMs: 1 });
+    assert.equal(existsSync(mod.getSupervisorFleetFile()), false);
+    assert.equal(log.warns.length, 0);
+    assert.ok(HOME);
+  });
+
+  test(`${name} uninstall warns when the daemon is still alive at the deadline`, async (t) => {
+    setup(t);
+    const mod = await import(pluginUrl);
+    writeFileSync(mod.getSupervisorStateFile(), JSON.stringify({ pid: 999999 }));
+    const log = quietLogger();
+    await mod[fn](log, { stopService: () => ({ code: 0 }), ...fakeDaemon(mod, { exitAfterPolls: Infinity }), timeoutMs: 1_000, pollMs: 1 });
+    assert.equal(log.warns.length, 1);
+    assert.match(log.warns[0], /supervisor stop/);
+  });
+}

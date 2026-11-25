@@ -138,6 +138,8 @@ test('buildLaunchAgentPlist: runs __daemon, RunAtLoad, crash-only KeepAlive', ()
     assert.ok(plist.includes(`<string>${a}</string>`), `expected arg ${a}`);
   }
   assert.match(plist, /<key>RunAtLoad<\/key>\s*<true\/>/);
+  // #351: launchd waits long enough for the orderly worker shutdown.
+  assert.match(plist, /<key>ExitTimeOut<\/key>\s*<integer>60<\/integer>/);
   // KeepAlive must be crash-only ({SuccessfulExit:false}) so a clean stop stays down.
   assert.match(plist, /<key>KeepAlive<\/key>\s*<dict>\s*<key>SuccessfulExit<\/key>\s*<false\/>/);
   // Env values are XML-escaped.
@@ -154,6 +156,10 @@ test('buildSystemdUserUnit: __daemon ExecStart, crash-only restart, default.targ
   assert.match(unit, /ExecStart=\/usr\/bin\/node \/opt\/c8ctl\/index\.js nano supervisor __daemon/);
   assert.match(unit, /Restart=on-failure/);
   assert.match(unit, /WantedBy=default\.target/);
+  // #351: only the daemon gets SIGTERM (it stops its workers in order) and
+  // systemd waits longer than the daemon's force-stop grace before SIGKILL.
+  assert.match(unit, /^KillMode=mixed$/m);
+  assert.match(unit, /^TimeoutStopSec=60$/m);
   assert.match(unit, /Environment=PATH=\/usr\/bin/);
   assert.match(unit, /Environment=C8CTL_NANO_HOME=\/state/);
 });

@@ -272,15 +272,29 @@ const STOP_GRACE_MS = 8_000;
 // (a child that exits sooner is reaped immediately — this only lengthens the
 // SIGKILL backstop for a worker that is actively preserving recovery).
 const FORCE_STOP_RECOVERY_MS = 20_000;
+// #351: bounded budget for the pre-abort WIP checkpoint push on a force abort.
+// It runs BEFORE the interrupt (and so before the #295 recovery deadline is
+// armed), so every SIGKILL backstop must add PRE_ABORT_HOOK_MS on top of
+// STOP_GRACE_MS + FORCE_STOP_RECOVERY_MS (see WORKER_FORCE_STOP_BACKSTOP_MS).
+const PRE_ABORT_CHECKPOINT_MS = 5_000;
+// The outer race bound on the pre-abort hook (`beforeAbortMs` default).
+const PRE_ABORT_HOOK_MS = PRE_ABORT_CHECKPOINT_MS + 1_000;
+// #351: how long the daemon waits for a force-stopped worker before SIGKILL:
+// the stop grace + the pre-abort checkpoint hook + the #295 recovery budget.
+const WORKER_FORCE_STOP_BACKSTOP_MS = STOP_GRACE_MS + PRE_ABORT_HOOK_MS + FORCE_STOP_RECOVERY_MS;
 // #296: the backstop deadline an OUTER daemon-stop path (the socket-unreachable
 // `stop --force` fallback and `stopSupervisorProcess`) waits for the DAEMON — and
 // its whole process group, which includes the workers — to exit before SIGKILLing
 // the group. It must exceed what the daemon itself allows a worker before ITS
-// SIGKILL backstop (`forceStopWorker` waits STOP_GRACE_MS + FORCE_STOP_RECOVERY_MS),
+// SIGKILL backstop (`forceStopWorker` waits WORKER_FORCE_STOP_BACKSTOP_MS),
 // plus a small margin for the daemon to observe the worker's exit and shut down.
 // Otherwise the outer path SIGKILLs the group ~18s early and kills a worker that is
 // still flushing + promoting its durable recovery ref (#295).
-const FORCE_STOP_DAEMON_GRACE_MS = STOP_GRACE_MS + FORCE_STOP_RECOVERY_MS + 2_000;
+const FORCE_STOP_DAEMON_GRACE_MS = WORKER_FORCE_STOP_BACKSTOP_MS + 2_000;
+// #351: how long systemd (`TimeoutStopSec`) / launchd (`ExitTimeOut`) wait for
+// the daemon's orderly worker shutdown before SIGKILL. Must exceed
+// FORCE_STOP_DAEMON_GRACE_MS so the recovery-ref flush finishes first.
+const SUPERVISOR_SERVICE_STOP_TIMEOUT_SECS = 60;
 // #202: the signal a graceful `supervisor stop`/`workforce stop` sends each
 // `nano work` child to quiesce it — stop leasing new jobs, finish in-flight work,
 // then exit. SIGTERM/SIGINT remain the FORCE abort (kill harness, yield jobs).
@@ -410,6 +424,11 @@ const SUPERVISOR_ADOPT_POLL_MS = Math.max(
 const AUTO_ENGINE_READ_TIMEOUT_MS = 15_000;
 const PROCESSOS_STATE_FILE = 'processos.json';
 const SUPERVISOR_STATE_FILE = 'supervisor.json';
+// #351: the DESIRED fleet ({id, profile, args} per worker). Unlike
+// supervisor.json (the live daemon descriptor, cleared on every exit) it is
+// erased only by an explicit `supervisor stop`/`uninstall`, so a SIGTERM at host
+// shutdown or a crash restart brings the same fleet back on the next start.
+const SUPERVISOR_FLEET_FILE = 'fleet.json';
 const PROCESSOS_DEFAULT_PORT = 8090;
 const DEFAULT_NANO_URL = 'http://localhost:8080';
 
@@ -570,6 +589,10 @@ function getLogDir() {
 
 function getSupervisorStateFile() {
   return join(getStateHome(), SUPERVISOR_STATE_FILE);
+}
+
+function getSupervisorFleetFile() {
+  return join(getStateHome(), SUPERVISOR_FLEET_FILE);
 }
 
 function getSupervisorLogDir() {
@@ -11528,6 +11551,17 @@ export function raceTeardown(promise, ms, signal) {
   });
 }
 
+
+/**
+ * Flush every given checkpointer in parallel ('pre-abort'), each bounded by
+ * `timeoutMs`. Never throws. Returns the per-checkpointer results (#351).
+ */
+export async function flushCheckpointersBeforeAbort(checkpointers, { timeoutMs = PRE_ABORT_CHECKPOINT_MS } = {}) {
+  return Promise.all((Array.isArray(checkpointers) ? checkpointers : []).map(async (cp) => {
+    try { return await cp.flush('pre-abort', { timeoutMs }); } catch { return null; }
+  }));
+}
+
 // #328: the worker's stop-signal state machine, extracted so its escalation
 // rules are testable. SIGUSR2 → gracefulDrain; SIGTERM/SIGINT → forceAbort. A
 // stop signal arriving while ANY teardown (graceful OR a force abort) is stuck
@@ -11537,6 +11571,7 @@ export function createWorkerStopLifecycle({
   logger = console, teardownMs = DEFAULT_WORKER_TEARDOWN_TIMEOUT_MS, interrupt,
   inFlightCount = () => 0, onDrainStart = () => {}, onDrainIdle = () => {}, onTeardownStart = () => {},
   onCleanTeardown = () => {}, onAbortStart = () => [], yieldInflight = async () => {},
+  beforeAbort = async () => {}, beforeAbortMs = PRE_ABORT_HOOK_MS, snapshotInflight = null,
   onExit = () => {}, pollMs = 200, backstopMs = 2_000,
   exitProcess = (code) => process.exit(code),
   // #339: the worker-LOCAL in-flight count (the jobs this process is actually
@@ -11604,6 +11639,14 @@ export function createWorkerStopLifecycle({
     logger.info(`Received ${signal} — aborting in-flight work and stopping worker...`);
     let inflight = [];
     try { inflight = onAbortStart(signal) || []; } catch { /* best effort */ }
+    // #351: bounded pre-abort hook (WIP checkpoint push) before the interrupt.
+    try { await raceTeardown(Promise.resolve().then(() => beforeAbort(signal)), beforeAbortMs, raceAbort.signal); } catch { /* best effort */ }
+    if (exited) return;
+    // #351 review: re-capture the in-flight set (and lease tokens) right before
+    // the interrupt — a job admitted during the pre-abort wait must be yielded too.
+    if (typeof snapshotInflight === 'function') {
+      try { inflight = snapshotInflight(signal) || inflight; } catch { /* keep the first snapshot */ }
+    }
     const r = await interruptRuntime('force abort');
     if (exited) return;
     if (r.error) logger.warn(`supervisor abort error — runtime loop may not have shut down cleanly: ${r.error?.message || r.error}`);
@@ -13865,6 +13908,10 @@ async function workAgent(req, flags, ctx) {
     parentWatchdog = installParentDeathWatchdog({ parentPid: Number.isInteger(daemonPid) ? daemonPid : undefined });
   }
   const activeJobs = new Map(); // jobKey -> { type, since (ms epoch) }
+  // #351: live WIP checkpointers of in-flight agent jobs, so a force abort
+  // (SIGTERM — e.g. host shutdown) can push a checkpoint BEFORE it interrupts
+  // the harness instead of only inside the post-abort recovery budget.
+  const liveCheckpointers = new Set();
   // #254: settlement-pending ghosts — jobKey -> { type, since, phase, leaseToken }.
   // A job whose fenced settle FAILED (activation ownership lost around
   // `completeJob`/`failJob`, so the engine may still project it `CREATED`) is
@@ -14989,6 +15036,7 @@ async function workAgent(req, flags, ctx) {
         }
         if (checkpointing?.restored) effectiveEnvelope = withCheckpointNote(effectiveEnvelope, checkpointing.restored);
         const checkpointer = checkpointing?.checkpointer ?? null;
+        if (checkpointer) liveCheckpointers.add(checkpointer);
 
         let relaySession = null;
         if (agenticPlane) {
@@ -15152,7 +15200,7 @@ async function workAgent(req, flags, ctx) {
               // #296: anchor the ONE shared force-stop deadline here. The recover race
               // below and the `finally`'s close() both bound against it, so the TOTAL
               // force-stop window is a single FORCE_STOP_RECOVERY_MS (not 2x), fitting
-              // inside the supervisor's STOP_GRACE_MS + FORCE_STOP_RECOVERY_MS backstop.
+              // inside the supervisor's WORKER_FORCE_STOP_BACKSTOP_MS backstop.
               forceStopDeadline = Date.now() + recoveryDeadline;
               // #296 (review): reserve a DRAIN window inside the deadline. abortRecovery()
               // only SIGTERMs the checkpoint git; createGitRunner then grants up to
@@ -15604,6 +15652,7 @@ async function workAgent(req, flags, ctx) {
               : undefined;
             try { await checkpointing.close(closeOpts); } catch { /* best effort */ }
           }
+          if (checkpointing?.checkpointer) liveCheckpointers.delete(checkpointing.checkpointer);
           if (isContainer) liveRunIds.delete(runId);
           // #205: clear the in-flight job marker now the harness has stopped — the
           // owning lifecycle's finally is the authoritative "job finished" signal,
@@ -16112,12 +16161,24 @@ async function workAgent(req, flags, ctx) {
       },
       onAbortStart: (signal) => {
         draining = true;
+        // #351 review: quiesce admission FIRST so no job is leased during the
+        // bounded pre-abort checkpoint wait (it would escape the yield snapshot).
+        try { SupervisorEffect.runSync(workerRegistry.quiesce()); } catch { /* best effort */ }
         if (!autoMode) { try { unwatchFile(configFile); } catch { /* best effort */ } }
         if (ghRefreshTimer) clearInterval(ghRefreshTimer);
         if (agenticPlane) { try { agenticPlane.deregister(`worker aborted (${signal})`); } catch { /* best effort */ } }
         // Snapshot in-flight jobs (with their retry budget) BEFORE the interrupt
         // clears the ownership registry, so we can yield each one afterwards.
         return [...activeJobs.entries()].map(([jobKey, info]) => ({ jobKey, retries: info?.retries, leaseToken: info?.leaseToken }));
+      },
+      snapshotInflight: () => [...activeJobs.entries()].map(([jobKey, info]) => ({ jobKey, retries: info?.retries, leaseToken: info?.leaseToken })),
+      // #351: push a WIP checkpoint for every in-flight agent job BEFORE the
+      // harness is interrupted (bounded), so a reboot loses as little work as
+      // possible. The post-abort recovery flush still runs as before.
+      beforeAbort: async () => {
+        if (liveCheckpointers.size === 0) return;
+        logger.info(`  checkpointing ${liveCheckpointers.size} in-flight agent job(s) before abort...`);
+        await flushCheckpointersBeforeAbort([...liveCheckpointers], { timeoutMs: PRE_ABORT_CHECKPOINT_MS });
       },
       yieldInflight: async (inflight, signal) => {
         // Yield each in-flight job so the broker re-activates it at once (retries
@@ -16365,35 +16426,25 @@ function resolveConnectionProfile(ctx) {
   return p || undefined;
 }
 
-// The EXPLICIT `--profile <name>` override only (distinct from the active
-// session profile), for FORWARDING to spawned `nano work` children. When an
-// operator runs `supervisor start --worker <p> --profile <conn>` (or
-// `supervisor add … --profile <conn>`), each supervised worker is a fresh
-// `c8ctl nano work` process that must connect to <conn>, not the daemon's/
-// session's active profile. c8ctl strips the global `--profile` before the
-// plugin parser sees it, so it never lands in `flags`; we recover it from
-// `ctx.profile` and re-emit it as a `--profile` token in the child argv (c8ctl
-// core parses it position-independently as a global). Returns undefined when no
-// override was given — i.e. `ctx.profile` is absent or merely equals the active
-// session profile — so the child inherits the active profile exactly as before
-// (no spurious pin). Pure.
-function explicitConnectionProfile(ctx) {
-  const p = resolveConnectionProfile(ctx);
-  if (!p) return undefined;
-  const active = globalThis.c8ctl && typeof globalThis.c8ctl.activeProfile === 'string'
-    ? globalThis.c8ctl.activeProfile
-    : undefined;
-  return p === active ? undefined : p;
-}
-
-// Append the explicit connection-profile override (if any) to a reconstructed
-// `work` argv tail as a c8ctl global `--profile <conn>` token, so a supervised
-// worker connects to the profile named on the `supervisor start`/`add` command
-// line rather than the active session profile (jwulf/c8ctl-plugin-nano#189).
-// A no-op when no `--profile` override was passed. Pure.
+// c8ctl strips the global `--profile` before the plugin parser sees it, so it
+// never lands in `flags`; we recover it from `ctx.profile` and re-emit it as a
+// `--profile` token in each supervised `nano work` child's argv (c8ctl core
+// parses it position-independently as a global).
+// Append a c8ctl global `--profile <conn>` token to a reconstructed `work` argv
+// tail: the explicit `--profile` override (jwulf/c8ctl-plugin-nano#189) or,
+// absent one, the profile active at add time (#351) — so a supervised worker is
+// always pinned. Returns the argv unchanged only when no profile is known.
 function withConnectionProfileArg(workArgs, ctx) {
-  const conn = explicitConnectionProfile(ctx);
+  // #351: pin the connection profile the worker was added for — the explicit
+  // `--profile` or, absent one, the profile active at add time — so a later
+  // `c8ctl use profile X` cannot silently retarget the fleet on its next restart.
+  const active = globalThis.c8ctl && typeof globalThis.c8ctl.activeProfile === 'string' && globalThis.c8ctl.activeProfile.trim()
+    ? globalThis.c8ctl.activeProfile.trim()
+    : undefined;
+  const conn = resolveConnectionProfile(ctx) || active;
   const base = Array.isArray(workArgs) ? workArgs : [];
+  // Idempotent: an explicit `--profile`/`--profile=` already in the argv wins.
+  if (base.some((t) => t === '--profile' || (typeof t === 'string' && t.startsWith('--profile=')))) return base;
   return conn ? [...base, '--profile', conn] : base;
 }
 
@@ -17230,6 +17281,93 @@ function clearSupervisorState() {
   try { if (existsSync(file)) rmSync(file); } catch { /* best effort */ }
 }
 
+/**
+ * Normalize a desired-fleet record list (#351): keep only well-formed
+ * `{id, profile, args}` entries with a valid, unique id. Pure.
+ */
+function normalizeFleetRecords(list) {
+  const out = [];
+  const seen = new Set();
+  for (const r of Array.isArray(list) ? list : []) {
+    if (!r || typeof r.id !== 'string' || !isValidWorkerName(r.id) || seen.has(r.id)) continue;
+    if (typeof r.profile !== 'string' || !r.profile) continue;
+    seen.add(r.id);
+    out.push({ id: r.id, profile: r.profile, args: Array.isArray(r.args) ? r.args.filter((a) => typeof a === 'string') : [] });
+  }
+  return out;
+}
+
+/** The persisted desired fleet (#351) — [] when absent/unreadable. */
+function readFleetState() {
+  const file = getSupervisorFleetFile();
+  if (!existsSync(file)) return [];
+  try {
+    const doc = JSON.parse(readFileSync(file, 'utf-8'));
+    return normalizeFleetRecords(doc && doc.workers);
+  } catch {
+    return [];
+  }
+}
+
+/** Atomically write the desired fleet (#351), owner-only like supervisor.json. */
+function writeFleetState(workers) {
+  mkdirSync(getStateHome(), { recursive: true });
+  const target = getSupervisorFleetFile();
+  const tmp = `${target}.${process.pid}.${Date.now()}.tmp`;
+  writeFileSync(tmp, JSON.stringify({ version: 1, workers: normalizeFleetRecords(workers) }, null, 2), { mode: 0o600 });
+  try { renameSync(tmp, target); }
+  catch (err) { try { rmSync(tmp, { force: true }); } catch { /* best effort */ } throw err; }
+}
+
+/**
+ * #351 review: a daemon started before fleet.json existed never writes it and
+ * ignores `keepFleet`, so seed the desired fleet from its live descriptor
+ * before stopping it. No-op when a fleet record already exists.
+ */
+function seedFleetFromLegacyDaemon(running) {
+  try {
+    if (existsSync(getSupervisorFleetFile())) return false;
+    const list = (running && Array.isArray(running.workers) ? running.workers : [])
+      .filter((w) => w && w.removeOnExit !== true && w.stopping !== true);
+    const recs = normalizeFleetRecords(list);
+    if (recs.length === 0) return false;
+    writeFleetState(recs);
+    return true;
+  } catch { return false; }
+}
+
+/** Erase the desired fleet — ONLY on an explicit stop/uninstall (#351). */
+function clearFleetState() {
+  try { rmSync(getSupervisorFleetFile(), { force: true }); } catch { /* best effort */ }
+}
+
+/**
+ * #351 review: a SIGTERMed daemon may still run one routine persist() (or its
+ * shutdown snapshot) AFTER an explicit stop/uninstall cleared fleet.json. Wait
+ * (bounded) for the daemon pid to exit, then clear again. Returns true when the
+ * daemon is gone (fleet cleared), false when it is still alive at the deadline.
+ * Shared by the forced-stop fallback and both service uninstall paths.
+ */
+async function clearFleetAfterDaemonExit(daemonPid, opts = {}) {
+  const isAlive = opts.isAlive || isPidAlive;
+  const sleep = opts.sleep || ((ms) => new Promise((r) => setTimeout(r, ms)));
+  const now = opts.now || Date.now;
+  const timeoutMs = opts.timeoutMs ?? 30_000;
+  const pollMs = opts.pollMs ?? 150;
+  const pid = Number(daemonPid);
+  if (Number.isInteger(pid) && pid > 0) {
+    const deadline = now() + timeoutMs;
+    while (isAlive(pid) && now() < deadline) await sleep(pollMs);
+    if (isAlive(pid)) {
+      clearFleetState();
+      if (opts.logger) opts.logger.warn(`Supervisor daemon (pid ${pid}) is still running; it may rewrite the desired fleet (fleet.json). Run \`c8ctl nano supervisor stop\` to stop it and clear the fleet again.`);
+      return false;
+    }
+  }
+  clearFleetState();
+  return true;
+}
+
 /** Running daemon state (pid alive) or null. */
 function runningSupervisor() {
   const state = readSupervisorState();
@@ -17723,6 +17861,19 @@ async function runSupervisorDaemon() {
   // again. So persist() is suppressed while quiesced UNLESS forced (the quiesce
   // snapshot and the final handed-over snapshot are the two deliberate writes).
   let handedOver = false;
+  // #351 review: suppress desired-fleet writes while the inventory is being
+  // reconstructed (restore / upgrade adoption) so a crash mid-loop can't leave a
+  // partial fleet.json; an explicit stop sets `fleetCleared` so the final
+  // shutdown snapshot never recreates a record the operator erased.
+  let fleetRestoring = false;
+  let fleetCleared = false;
+  const writeDesiredFleet = () => {
+    try {
+      writeFleetState([...workers.values()]
+        .filter((w) => !w.removeOnExit)
+        .map((w) => ({ id: w.id, profile: w.profile, args: w.args })));
+    } catch (err) { dlog(`fleet record write failed: ${err?.message || err}`); }
+  };
   const persist = (force = false) => {
     if (handedOver) return; // the successor owns the state file now
     if (upgrading && !force) return; // quiesced — the successor owns the inventory
@@ -17745,6 +17896,11 @@ async function runSupervisorDaemon() {
           activityFile: w.activityFile || null,
         })),
       });
+      // #351: mirror the desired fleet, except while shutting down — the stop
+      // path removes workers one by one, and a SIGTERM (host shutdown) must
+      // leave the record intact so the next daemon start restores it. An
+      // explicit `stop` erases it itself (control-socket `stop` op).
+      if (!shuttingDown && !fleetRestoring) writeDesiredFleet();
       return true;
     } catch (err) {
       // Best effort for routine writes, but REPORTED: the forced quiesce
@@ -18204,7 +18360,7 @@ async function runSupervisorDaemon() {
   const stopRetiringOf = (w, force) => liveRetiring(w).map((old) => (force
     ? (async () => {
       try { process.kill(old.pid, 'SIGTERM'); } catch { /* gone */ }
-      await Promise.race([old.exitPromise, new Promise((r) => { const t = setTimeout(r, STOP_GRACE_MS + FORCE_STOP_RECOVERY_MS); t.unref?.(); })]);
+      await Promise.race([old.exitPromise, new Promise((r) => { const t = setTimeout(r, WORKER_FORCE_STOP_BACKSTOP_MS); t.unref?.(); })]);
       if (isPidAlive(old.pid)) { try { process.kill(old.pid, 'SIGKILL'); } catch { /* gone */ } }
     })()
     : drainRetiring(w, old)));
@@ -18218,7 +18374,7 @@ async function runSupervisorDaemon() {
       // interrupted agent job can finish before the SIGKILL backstop. A worker that
       // exits sooner is reaped at once — this only lengthens the ceiling for one that
       // is actively preserving recovery.
-      await waitForChildExit(w.child, STOP_GRACE_MS + FORCE_STOP_RECOVERY_MS);
+      await waitForChildExit(w.child, WORKER_FORCE_STOP_BACKSTOP_MS);
       if (isPidAlive(pid)) { try { process.kill(pid, 'SIGKILL'); } catch { /* ignore */ } }
     }
   };
@@ -18262,6 +18418,9 @@ async function runSupervisorDaemon() {
       // kept until ALL of them have exited (finishDrainRemove).
       for (const p of stopRetiringOf(w, false)) p.catch(() => {});
       finishDrainRemove(w);
+      // #351 review: persist the removal intent now (the record stays for drain
+      // tracking but leaves fleet.json) so a crash mid-drain doesn't restore it.
+      if (workers.get(id) === w) persist();
       dlog(`worker '${id}' draining for removal`);
       return true;
     }
@@ -18618,6 +18777,10 @@ async function runSupervisorDaemon() {
     // Let any in-flight mutation finish before we snapshot the worker set, so
     // an add/restart racing the shutdown can't leave an orphaned child behind.
     try { await opQueue; } catch { /* mutation already logged */ }
+    // #351 review: save the final desired inventory (queued add/remove included)
+    // before the stop loop starts removing workers — unless an explicit stop
+    // erased it, or an upgrade successor owns the state.
+    if (!fleetCleared && !upgrading && !handedOver) writeDesiredFleet();
     dlog(`received ${signal || 'stop'} — ${force ? 'stopping' : 'draining'} ${workers.size} worker(s)`);
     if (!force) broadcast({ type: 'event', event: 'draining', workers: [...workers.values()].map(workerPublic) });
     await Promise.all([...[...workers.keys()].map((id) => stopWorker(id, { force })), stopRetiring(force)]);
@@ -19043,6 +19206,12 @@ async function runSupervisorDaemon() {
             shuttingDown = true;
             draining = !force;
           }
+          // #351: an explicit stop stops the FLEET — erase the desired-fleet
+          // record so the next start comes up empty — unless the caller asked to
+          // keep it (`supervisor stop --keep-fleet`, `supervisor install`). A
+          // SIGTERM/SIGINT/SIGHUP never reaches here, so it keeps the record.
+          if (req.keepFleet !== true) { fleetCleared = true; clearFleetState(); dlog('explicit stop — desired fleet cleared'); }
+          else dlog('explicit stop (--keep-fleet) — desired fleet kept for the next start');
           attachClients.add(sock);
           stopClients.add(sock);
           sock.write(encodeFrame(force
@@ -19292,6 +19461,7 @@ async function runSupervisorDaemon() {
     // the `|| readSupervisorState()` fallback is unreachable defensive cover.
     const prior = validatedUpgradeSnapshot || readSupervisorState();
     const adopted = [];
+    fleetRestoring = true;
     for (const rec of (prior && Array.isArray(prior.workers) ? prior.workers : [])) {
       const w = adoptWorker(rec);
       if (w) { adopted.push(w.id); continue; }
@@ -19340,6 +19510,7 @@ async function runSupervisorDaemon() {
       rw.spawnedBySuccessor = true; // its watchdog already guards this daemon
       adopted.push(rw.id);
     }
+    fleetRestoring = false;
     dlog(`upgrade: adopted ${adopted.length} worker(s) from predecessor pid ${predecessorPid}: ${adopted.join(', ') || '(none)'}`);
     broadcast({ type: 'event', event: 'daemon-adopted', predecessorPid, workers: adopted });
 
@@ -19488,6 +19659,33 @@ async function runSupervisorDaemon() {
       }
     }, SUPERVISOR_ADOPT_POLL_MS);
     if (typeof clearTimer.unref === 'function') clearTimer.unref();
+  } else {
+    // #351: a plain (non-upgrade) start — boot, crash restart, or a service
+    // manager restart after SIGTERM — restores the desired fleet. Only an
+    // explicit `supervisor stop`/`uninstall` erases fleet.json, so this brings
+    // back exactly the workers the operator added (fresh processes; in-flight
+    // jobs were yielded on shutdown and resume from their WIP checkpoints).
+    const desired = readFleetState();
+    if (desired.length > 0) {
+      dlog(`restoring ${desired.length} worker(s) from ${SUPERVISOR_FLEET_FILE}`);
+      // #351 review: an unreadable/malformed config is NOT proof the hires were
+      // deleted — restore every record (a missing hire then surfaces as a
+      // configuration failure) instead of erasing the saved fleet.
+      let hires = null;
+      try { hires = readHiresStrict(); } catch (err) { dlog(`fleet restore: config unreadable (${err?.message || err}) — keeping every saved worker`); }
+      fleetRestoring = true;
+      for (const rec of desired) {
+        if (workers.has(rec.id)) continue;
+        if (hires && !hires[rec.profile]) { dlog(`fleet restore: skipping worker '${rec.id}' — no hire named "${rec.profile}"`); continue; }
+        const w = {
+          id: rec.id, profile: rec.profile, args: rec.args,
+          restarts: 0, stopping: false, lastExit: null, logFile: supervisorWorkerLogFile(rec.id),
+        };
+        workers.set(rec.id, w);
+        try { startWorker(w); } catch (err) { dlog(`fleet restore: worker '${rec.id}' failed to start: ${err?.message || err}`); }
+      }
+      fleetRestoring = false;
+    }
   }
 
   persist();
@@ -20078,10 +20276,13 @@ function countSupervisorInFlight(workers) {
  * yielded for immediate retry. A `force` request also escalates a drain that is
  * already in progress.
  */
-async function supervisorStopCmd(force = false) {
+async function supervisorStopCmd(force = false, { keepFleet = false } = {}) {
   const logger = getLogger();
   const running = await liveSupervisor();
   if (!running) {
+    // #351: an explicit stop clears the desired fleet even when the daemon is
+    // already down (e.g. it crashed), so the next start comes up empty.
+    if (!keepFleet) clearFleetState();
     if (readSupervisorState()) { clearSupervisorState(); logger.info('Cleared stale supervisor state.'); }
     else logger.warn('Supervisor is not running — nothing to stop.');
     return;
@@ -20150,7 +20351,7 @@ async function supervisorStopCmd(force = false) {
       });
       sock.on('error', () => finish('closed'));
       sock.on('close', () => finish('closed'));
-      sock.write(encodeFrame({ op: 'stop', force: !!force }));
+      sock.write(encodeFrame({ op: 'stop', force: !!force, ...(keepFleet ? { keepFleet: true } : {}) }));
     }).catch(() => finish('unreachable'));
   });
 
@@ -20168,6 +20369,8 @@ async function supervisorStopCmd(force = false) {
   if (outcome === 'unreachable') {
     if (force) {
       // Socket unreachable — fall back to signalling the daemon pid directly.
+      // A SIGTERM keeps fleet.json (#351), so clear it here for the explicit stop.
+      if (!keepFleet) clearFleetState();
       try { process.kill(daemonPid, 'SIGTERM'); } catch { /* already gone */ }
     } else {
       logger.warn('Could not reach the supervisor control socket to drain it. Rerun with --force to abort, or stop it manually.');
@@ -20204,6 +20407,9 @@ async function supervisorStopCmd(force = false) {
       if (!killedGroup) { try { process.kill(daemonPid, 'SIGKILL'); } catch { /* ignore */ } }
       clearSupervisorState();
     }
+    // #351: the SIGTERM fallback lets the daemon's shutdown() re-snapshot the
+    // fleet; once it is gone, clear again so an explicit stop stays explicit.
+    if (outcome === 'unreachable' && !keepFleet && !isPidAlive(daemonPid)) await clearFleetAfterDaemonExit(daemonPid, { timeoutMs: 0 });
   } else {
     while (isPidAlive(daemonPid)) {
       await new Promise((r) => setTimeout(r, 150));
@@ -20358,7 +20564,7 @@ async function attachSupervisorConsole(state) {
           if (error) { out(error); break; }
           if (name && count > 1) { out('--name cannot be combined with --instances > 1; omit --name to auto-name them.'); break; }
           for (let i = 0; i < count; i++) {
-            sock.write(encodeFrame({ op: 'add', profile, name, args: workArgs }));
+            sock.write(encodeFrame({ op: 'add', profile, name, args: withConnectionProfileArg(workArgs) }));
           }
           break;
         }
@@ -20563,6 +20769,8 @@ ${envXml}
     <key>SuccessfulExit</key>
     <false/>
   </dict>
+  <key>ExitTimeOut</key>
+  <integer>${SUPERVISOR_SERVICE_STOP_TIMEOUT_SECS}</integer>
   <key>ProcessType</key>
   <string>Background</string>
   <key>StandardOutPath</key>
@@ -20629,6 +20837,8 @@ ExecStart=${cmd}
 ${envLines}
 Restart=on-failure
 RestartSec=5
+KillMode=mixed
+TimeoutStopSec=${SUPERVISOR_SERVICE_STOP_TIMEOUT_SECS}
 
 [Install]
 WantedBy=default.target
@@ -20690,8 +20900,12 @@ function systemdUserAvailable() {
  * before installing a service so the launchd/systemd-owned daemon takes over
  * the deterministic control socket without a second instance fighting for it.
  */
-async function stopSupervisorProcess(running) {
-  try { await supervisorRequest({ op: 'stop' }); }
+async function stopSupervisorProcess(running, { keepFleet = false } = {}) {
+  // #351: `keepFleet` (used by `supervisor install`) hands the desired fleet to
+  // the service-managed daemon that starts next; otherwise the stop erases it.
+  if (!keepFleet) clearFleetState();
+  else seedFleetFromLegacyDaemon(running);
+  try { await supervisorRequest({ op: 'stop', ...(keepFleet ? { keepFleet: true } : {}) }); }
   catch { try { process.kill(running.pid, 'SIGTERM'); } catch { /* already gone */ } }
   // #296: cover the daemon's own worker force-stop grace so the group SIGKILL below
   // does not reap a worker mid-recovery (promoting its durable recovery ref, #295).
@@ -20722,7 +20936,7 @@ async function installSupervisorServiceDarwin(logger) {
   const running = await liveSupervisor();
   if (running) {
     logger.info('Stopping the current session-bound supervisor before installing the service…');
-    await stopSupervisorProcess(running);
+    await stopSupervisorProcess(running, { keepFleet: true });
   }
 
   mkdirSync(dirname(plistPath), { recursive: true });
@@ -20747,13 +20961,17 @@ async function installSupervisorServiceDarwin(logger) {
   return true;
 }
 
-function uninstallSupervisorServiceDarwin(logger) {
+async function uninstallSupervisorServiceDarwin(logger, deps = {}) {
   const uid = process.getuid();
   const label = supervisorServiceLabel();
   const plistPath = launchAgentPlistPath();
   const existed = existsSync(plistPath);
-  runLaunchctl(['bootout', launchdServiceTarget(uid, label)]); // stops + unloads
+  const daemonPid = readSupervisorState()?.pid; // #351 review: capture BEFORE bootout
+  (deps.stopService || ((a) => runLaunchctl(a)))(['bootout', launchdServiceTarget(uid, label)]); // stops + unloads
   try { if (existed) rmSync(plistPath, { force: true }); } catch { /* best effort */ }
+  clearFleetState(); // #351: uninstall is an explicit stop — bootout SIGTERMs, which keeps it
+  // A still-exiting daemon can persist() once more; clear again after it is gone.
+  await clearFleetAfterDaemonExit(daemonPid, { ...deps, logger });
   clearSupervisorState();
   if (existed) logger.info(`Removed LaunchAgent ${label}.`);
   else logger.info('No LaunchAgent was installed for this state home.');
@@ -20773,7 +20991,7 @@ async function installSupervisorServiceLinux(logger) {
   const running = await liveSupervisor();
   if (running) {
     logger.info('Stopping the current supervisor before installing the service…');
-    await stopSupervisorProcess(running);
+    await stopSupervisorProcess(running, { keepFleet: true });
   }
 
   const unitPath = systemdUserUnitPath();
@@ -20800,12 +21018,17 @@ async function installSupervisorServiceLinux(logger) {
   return true;
 }
 
-function uninstallSupervisorServiceLinux(logger) {
+async function uninstallSupervisorServiceLinux(logger, deps = {}) {
   const unitPath = systemdUserUnitPath();
   const existed = existsSync(unitPath);
-  if (systemdUserAvailable()) runSystemctlUser(['disable', '--now', systemdUnitName()]);
+  const daemonPid = readSupervisorState()?.pid; // #351 review: capture BEFORE disable --now
+  const systemctl = deps.stopService || ((a) => runSystemctlUser(a));
+  const available = deps.stopService ? true : systemdUserAvailable();
+  if (available) systemctl(['disable', '--now', systemdUnitName()]);
   try { if (existed) rmSync(unitPath, { force: true }); } catch { /* best effort */ }
-  if (systemdUserAvailable()) runSystemctlUser(['daemon-reload']);
+  if (available) systemctl(['daemon-reload']);
+  clearFleetState(); // #351: uninstall is an explicit stop — `disable --now` SIGTERMs, which keeps it
+  await clearFleetAfterDaemonExit(daemonPid, { ...deps, logger });
   clearSupervisorState();
   if (existed) logger.info(`Removed systemd --user unit ${systemdUnitName()}.`);
   else logger.info('No systemd --user unit was installed for this state home.');
@@ -20823,8 +21046,8 @@ async function supervisorInstallCmd() {
 async function supervisorUninstallCmd() {
   const logger = getLogger();
   const plat = osPlatform();
-  if (plat === 'darwin') { uninstallSupervisorServiceDarwin(logger); return; }
-  if (plat === 'linux') { uninstallSupervisorServiceLinux(logger); return; }
+  if (plat === 'darwin') { await uninstallSupervisorServiceDarwin(logger); return; }
+  if (plat === 'linux') { await uninstallSupervisorServiceLinux(logger); return; }
   logger.error(`supervisor uninstall is not supported on ${plat}.`);
 }
 
@@ -21051,7 +21274,7 @@ async function supervisorCommand(req, flags, ctx) {
       await supervisorSecretCmd(req.positional.slice(1));
       return;
     case 'stop':
-      await supervisorStopCmd(coerceBool(flags?.force, false));
+      await supervisorStopCmd(coerceBool(flags?.force, false), { keepFleet: coerceBool(flags?.['keep-fleet'], false) });
       return;
     case 'logs':
     case 'log':
@@ -21805,7 +22028,7 @@ async function workforceListCmd(req, flags, manifestName) {
   }
 }
 
-async function workforceStartCmd(req, flags, manifestName) {
+async function workforceStartCmd(req, flags, manifestName, ctx) {
   const logger = getLogger();
   const manifest = readWorkforceManifestStrict(manifestName);
   if (!manifest || !Array.isArray(manifest.workers) || manifest.workers.length === 0) {
@@ -21878,7 +22101,7 @@ async function workforceStartCmd(req, flags, manifestName) {
     else { logger.error(`  ! could not stop "${id}": ${(res && res.error) || 'unknown error'}`); hadError = true; }
   }
   for (const d of toStart) {
-    const res = await supervisorRequest({ op: 'add', profile: d.profile, name: d.name, args: d.args });
+    const res = await supervisorRequest({ op: 'add', profile: d.profile, name: d.name, args: withConnectionProfileArg(d.args, ctx) });
     if (res && res.ok) logger.info(`  + started "${d.name}" (profile ${d.profile})`);
     else { logger.error(`  ! could not start "${d.name}": ${(res && res.error) || 'unknown error'}`); hadError = true; }
   }
@@ -22042,7 +22265,7 @@ async function workforceReloadCmd(req, flags, manifestName) {
   if (outcome === 'error') process.exit(1);
 }
 
-async function workforceCommand(req, flags) {
+async function workforceCommand(req, flags, ctx) {
   const logger = getLogger();
   const action = (req.positional[0] || '').toLowerCase();
   // A bare `--manifest` (no value) is parsed as boolean `true`; reject it so we
@@ -22070,7 +22293,7 @@ async function workforceCommand(req, flags) {
       return;
     case 'start':
     case 'up':
-      await workforceStartCmd(req, flags, manifestName);
+      await workforceStartCmd(req, flags, manifestName, ctx);
       return;
     case 'status':
       await workforceStatusCmd(req, flags, manifestName);
@@ -23964,7 +24187,6 @@ export {
 export {
   reconstructWorkArgs,
   resolveConnectionProfile,
-  explicitConnectionProfile,
   withConnectionProfileArg,
   supervisorWorkerId,
   autoWorkerName,
@@ -24026,6 +24248,22 @@ export {
   runningSupervisor,
   readSupervisorState,
   clearSupervisorState,
+  readFleetState,
+  writeFleetState,
+  clearFleetState,
+  clearFleetAfterDaemonExit,
+  uninstallSupervisorServiceDarwin,
+  uninstallSupervisorServiceLinux,
+  normalizeFleetRecords, seedFleetFromLegacyDaemon,
+  getSupervisorFleetFile,
+  supervisorDaemonLogFile,
+  SUPERVISOR_SERVICE_STOP_TIMEOUT_SECS,
+  FORCE_STOP_DAEMON_GRACE_MS,
+  WORKER_FORCE_STOP_BACKSTOP_MS,
+  PRE_ABORT_HOOK_MS,
+  PRE_ABORT_CHECKPOINT_MS,
+  STOP_GRACE_MS,
+  FORCE_STOP_RECOVERY_MS,
   getSupervisorSocketPath,
   getSupervisorStateFile,
   isSshSession,
@@ -24181,6 +24419,7 @@ export const commands = {
       console: { type: 'string', description: 'start: runtime console profile off|observe|studio (NANOBPMN_CONSOLE; default studio)' },
       follow: { type: 'boolean', description: 'logs: stream output (tail -F)', short: 'f' },
       purge: { type: 'boolean', description: 'stop/restart: also delete per-node engine data' },
+      'keep-fleet': { type: 'boolean', description: 'supervisor stop: keep the desired-fleet record (fleet.json) so the next supervisor start restores the same workers' },
       force: { type: 'boolean', description: 'start: stop any existing cluster first; supervisor/workforce stop: abort in-flight work (kill harness, yield jobs for retry) instead of the default graceful drain' },
       workspace: { type: 'boolean', description: 'clean: also delete the workspace (models + workers)' },
       check: { type: 'boolean', description: 'update: report whether a new release is available (with the changelog since the installed version); do not install' },
@@ -24284,7 +24523,7 @@ export const commands = {
             await supervisorCommand(req, flags, ctx);
             break;
           case 'workforce':
-            await workforceCommand(req, flags);
+            await workforceCommand(req, flags, ctx);
             break;
           case 'fence-check': {
             // Issue #320: the agent-side lease check. Exit 0 held, 1 lost (fence

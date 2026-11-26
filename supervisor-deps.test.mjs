@@ -226,8 +226,10 @@ test("createSupervisorDeps: the settle seam FENCES complete/fail — the activat
   // As settleJob does: complete carries the token as the 3rd arg; fail carries it in opts.
   await settle.complete("job-c", { status: "opened" }, "lease-c");
   await settle.fail("job-f", { retries: 1, errorMessage: "boom", leaseToken: "lease-f" });
-  assert.deepEqual(completions, [{ variables: { status: "opened" }, leaseToken: "lease-c" }]);
-  assert.deepEqual(failures, [{ retries: 1, errorMessage: "boom", leaseToken: "lease-f" }]);
+  // Camunda 8.10 wire field is jobLeaseToken; the legacy leaseToken must be absent.
+  assert.deepEqual(completions, [{ variables: { status: "opened" }, jobLeaseToken: "lease-c" }]);
+  assert.deepEqual(failures, [{ retries: 1, errorMessage: "boom", jobLeaseToken: "lease-f" }]);
+  for (const body of [...completions, ...failures]) assert.equal("leaseToken" in body, false, "legacy leaseToken must not be sent");
 });
 
 test("bindJobSettle: each bound settler fences with ITS OWN activation's leaseToken — two same-jobKey activations never cross tokens", async () => {

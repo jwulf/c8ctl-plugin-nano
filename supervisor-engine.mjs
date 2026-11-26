@@ -174,7 +174,9 @@ function mapJob(raw) {
   if (eik !== undefined && eik !== null) job.elementInstanceKey = String(eik);
   const eid = raw.elementId;
   if (eid !== undefined && eid !== null) job.elementId = String(eid);
-  const lease = raw.leaseToken;
+  // Camunda 8.10 names it `jobLeaseToken`; nanobpmn still emits legacy `leaseToken`
+  // during its deprecation window (issue #277) — prefer the new name, fall back.
+  const lease = raw.jobLeaseToken ?? raw.leaseToken;
   if (lease !== undefined && lease !== null) job.leaseToken = String(lease);
   return job;
 }
@@ -340,7 +342,7 @@ export function createRawEngineClient(opts = {}) {
       // rather than renewing a lock it no longer owns, which is what let a reclaimed
       // agent job keep running and loop (empty transcript husks). Omitted when blank
       // so the unfenced operator/bulk path is unchanged.
-      const fence = isNonBlankString(leaseToken) ? { leaseToken } : {};
+      const fence = isNonBlankString(leaseToken) ? { jobLeaseToken: leaseToken } : {};
       if (camunda && typeof camunda.updateJob === "function") {
         // Mirror `activate`: wire the external abort `signal` (fired when the
         // dispatch-side `Effect.timeout`/interruption cancels a hung beat) onto the
@@ -402,7 +404,7 @@ export function createRawEngineClient(opts = {}) {
       // activation's result. A non-leased job carries no `job.leaseToken`, so the
       // field is omitted and no token is required.
       const vars = isPlainObjectMap(variables) ? { variables } : {};
-      const fence = isNonBlankString(leaseToken) ? { leaseToken } : {};
+      const fence = isNonBlankString(leaseToken) ? { jobLeaseToken: leaseToken } : {};
       if (camunda && typeof camunda.completeJob === "function") {
         try {
           await camunda.completeJob({ jobKey: String(jobKey), ...vars, ...fence });
@@ -438,7 +440,7 @@ export function createRawEngineClient(opts = {}) {
       // Same lease fencing as `complete` (engine validates `failJob` with
       // `required=true`): a leased job's failure must carry the matching token or a
       // superseded worker's fail is rejected; omitted for a non-leased job.
-      if (isNonBlankString(leaseToken)) extra.leaseToken = leaseToken;
+      if (isNonBlankString(leaseToken)) extra.jobLeaseToken = leaseToken; // Camunda 8.10 wire name (issue #277)
       // Prefer the SDK's typed `failJob` (operationId `failJob` →
       // `POST /v2/jobs/{jobKey}/failure`) when a `camunda` SDK client is injected,
       // else the SAME call issued raw via `fetchImpl`. C8 v2 answers 204.

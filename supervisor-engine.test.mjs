@@ -165,14 +165,14 @@ test("extendLock: threads the activation leaseToken as a TOP-LEVEL field on the 
   await engine.extendLock("job-key-9", 300_000, "lease-abc");
   // leaseToken is a sibling of changeset/jobKey, NOT nested in the changeset — the engine
   // reads it from the request root and 409s (JobLeaseMismatch) if it is stale.
-  assert.deepEqual(calls, [{ changeset: { timeout: 300_000 }, jobKey: "job-key-9", leaseToken: "lease-abc" }]);
+  assert.deepEqual(calls, [{ changeset: { timeout: 300_000 }, jobKey: "job-key-9", jobLeaseToken: "lease-abc" }]);
 });
 
 test("extendLock: threads the leaseToken as a TOP-LEVEL field in the raw PATCH body", async () => {
   const fetchImpl = makeFakeFetch([{ status: 204 }]);
   const engine = createRawEngineClient({ baseUrl: "http://engine:8080/v2", fetchImpl });
   await engine.extendLock("job-key-9", 300_000, "lease-xyz");
-  assert.deepEqual(JSON.parse(fetchImpl.calls[0].init.body), { changeset: { timeout: 300_000 }, leaseToken: "lease-xyz" });
+  assert.deepEqual(JSON.parse(fetchImpl.calls[0].init.body), { changeset: { timeout: 300_000 }, jobLeaseToken: "lease-xyz" });
 });
 
 test("extendLock: a blank/absent leaseToken is OMITTED (preserves the unfenced operator/bulk extend path)", async () => {
@@ -325,14 +325,14 @@ test("complete: threads the activation leaseToken as a TOP-LEVEL field on the SD
   await engine.complete("job-7", { status: "opened" }, "lease-abc");
   // leaseToken is a sibling of jobKey/variables — the engine validates the completion with
   // required=true, so the matching activation token must ride at the top level.
-  assert.deepEqual(calls, [{ jobKey: "job-7", variables: { status: "opened" }, leaseToken: "lease-abc" }]);
+  assert.deepEqual(calls, [{ jobKey: "job-7", variables: { status: "opened" }, jobLeaseToken: "lease-abc" }]);
 });
 
 test("complete: threads the leaseToken as a TOP-LEVEL field in the raw completion body", async () => {
   const fetchImpl = makeFakeFetch([{ status: 204 }]);
   const engine = createRawEngineClient({ baseUrl: "http://engine:8080", fetchImpl });
   await engine.complete("job-7", { status: "opened" }, "lease-xyz");
-  assert.deepEqual(JSON.parse(fetchImpl.calls[0].init.body), { variables: { status: "opened" }, leaseToken: "lease-xyz" });
+  assert.deepEqual(JSON.parse(fetchImpl.calls[0].init.body), { variables: { status: "opened" }, jobLeaseToken: "lease-xyz" });
 });
 
 test("complete: a blank/absent leaseToken is OMITTED (a non-leased job needs no fence)", async () => {
@@ -349,14 +349,14 @@ test("fail: threads the activation leaseToken as a TOP-LEVEL field on the SDK fa
   const camunda = { failJob: async (arg) => { calls.push(arg); } };
   const engine = createRawEngineClient({ baseUrl: "http://engine:8080", fetchImpl: makeFakeFetch([]), camunda });
   await engine.fail("job-3", { retries: 2, errorMessage: "boom", leaseToken: "lease-abc" });
-  assert.deepEqual(calls, [{ jobKey: "job-3", retries: 2, errorMessage: "boom", leaseToken: "lease-abc" }]);
+  assert.deepEqual(calls, [{ jobKey: "job-3", retries: 2, errorMessage: "boom", jobLeaseToken: "lease-abc" }]);
 });
 
 test("fail: threads the leaseToken as a TOP-LEVEL field in the raw failure body", async () => {
   const fetchImpl = makeFakeFetch([{ status: 204 }]);
   const engine = createRawEngineClient({ baseUrl: "http://engine:8080", fetchImpl });
   await engine.fail("job-3", { retries: 1, leaseToken: "lease-xyz" });
-  assert.deepEqual(JSON.parse(fetchImpl.calls[0].init.body), { retries: 1, leaseToken: "lease-xyz" });
+  assert.deepEqual(JSON.parse(fetchImpl.calls[0].init.body), { retries: 1, jobLeaseToken: "lease-xyz" });
 });
 
 test("fail: a blank/absent leaseToken is OMITTED (a non-leased job needs no fence)", async () => {
@@ -530,4 +530,31 @@ test("activate: a malformed job (missing jobKey/type) throws instead of coercing
     () => eng2.activate({ type: "t", maxJobsToActivate: 1, requestTimeoutMs: 0, lockMs: 1 }),
     /malformed activated job.*type/s,
   );
+});
+
+test("activate: reads the Camunda 8.10 activation lease field `jobLeaseToken` (issue #277)", async () => {
+  const mk = (job) => createRawEngineClient({ baseUrl: "http://engine:8080", fetchImpl: makeFakeFetch([]), camunda: { activateJobs: async () => ({ jobs: [job] }) } });
+  const req = { type: "senior:feature", maxJobsToActivate: 1, requestTimeoutMs: 0, lockMs: 1 };
+  let [job] = await mk({ jobKey: 1, type: "senior:feature", jobLeaseToken: "LEASE-new" }).activate(req);
+  assert.equal(job.leaseToken, "LEASE-new");
+  // jobLeaseToken wins over the legacy name when both are present.
+  [job] = await mk({ jobKey: 1, type: "senior:feature", jobLeaseToken: "LEASE-new", leaseToken: "LEASE-old" }).activate(req);
+  assert.equal(job.leaseToken, "LEASE-new");
+});
+
+test("complete/fail/extendLock: never send the legacy `leaseToken` wire field (issue #277)", async () => {
+  const bodies = [];
+  const camunda = {
+    updateJob: async (r) => bodies.push(r),
+    completeJob: async (r) => bodies.push(r),
+    failJob: async (r) => bodies.push(r),
+  };
+  const engine = createRawEngineClient({ baseUrl: "http://engine:8080", fetchImpl: makeFakeFetch([]), camunda });
+  await engine.extendLock("k", 1000, "L");
+  await engine.complete("k", {}, "L");
+  await engine.fail("k", { leaseToken: "L" });
+  for (const b of bodies) {
+    assert.equal(b.jobLeaseToken, "L");
+    assert.equal("leaseToken" in b, false);
+  }
 });

@@ -690,9 +690,9 @@ export function createAgentInstanceProducer(opts = {}) {
   const jobKey = job?.jobKey != null ? String(job.jobKey) : '';
   // The activation lease is carried on the job as `leaseToken` (Camunda v10
   // ActivatedJobResult). It is submitted BACK to createAgentInstance/updateAgentInstance
-  // as the request-body field `jobLease` (agent-instances.yaml) — the same opaque token,
+  // as the request-body field `jobLeaseToken` (Camunda 8.10 agent-instances.yaml; the older `jobLease` name is rejected with 400) — the same opaque token,
   // named differently on the two sides of the contract. One internal name here; the
-  // translation to `jobLease` happens only at each SDK call below.
+  // translation to `jobLeaseToken` happens only at each SDK call below.
   const leaseToken = job?.leaseToken != null ? String(job.leaseToken) : '';
   const elementInstanceKey = job?.elementInstanceKey != null ? String(job.elementInstanceKey) : '';
   const elementId = job?.elementId != null ? String(job.elementId) : null;
@@ -907,7 +907,7 @@ export function createAgentInstanceProducer(opts = {}) {
         agentInstanceKey,
         elementInstanceKey,
         jobKey,
-        jobLease: leaseToken,
+        jobLeaseToken: leaseToken,
         history: [turn],
       };
       if (status) req.status = status;
@@ -1178,7 +1178,7 @@ export function createAgentInstanceProducer(opts = {}) {
       const res = await camunda[SDK_CREATE]({
         elementInstanceKey,
         jobKey,
-        jobLease: leaseToken,
+        jobLeaseToken: leaseToken,
         history: [configTurn],
       });
       // Treat a blank/whitespace key as "no key". Updates need a usable
@@ -1990,7 +1990,7 @@ export function createAgentInstanceProducer(opts = {}) {
                 agentInstanceKey,
                 elementInstanceKey,
                 jobKey,
-                jobLease: leaseToken,
+                jobLeaseToken: leaseToken,
                 status: 'IDLE',
               }),
               finalizeTimeoutMs,
@@ -2051,7 +2051,7 @@ export function createAgentInstanceProducer(opts = {}) {
                 agentInstanceKey,
                 elementInstanceKey,
                 jobKey,
-                jobLease: leaseToken,
+                jobLeaseToken: leaseToken,
                 status: 'IDLE',
               }),
               finalizeTimeoutMs,

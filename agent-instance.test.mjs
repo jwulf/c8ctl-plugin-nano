@@ -193,7 +193,7 @@ test('activate mints exactly one AgentInstance, lease-gated, with an opening CON
   // Lease-gated on the activated job.
   assert.equal(req.elementInstanceKey, 'EIK-7');
   assert.equal(req.jobKey, '13954');
-  assert.equal(req.jobLease, 'FENCE99001');
+  assert.equal(req.jobLeaseToken, 'FENCE99001');
   // Opening CONFIGURATION turn carries the concrete runtime definition.
   assert.equal(req.history.length, 1);
   const cfg = req.history[0];
@@ -341,7 +341,7 @@ test('assistant message chunks coalesce into ONE ASSISTANT turn on flush', async
   assert.equal(turn.role, 'ASSISTANT');
   assert.deepEqual(turn.content, [{ contentType: 'TEXT', text: 'Hello world' }]);
   assert.equal(appends[0].jobKey, '13954');
-  assert.equal(appends[0].jobLease, 'FENCE99001');
+  assert.equal(appends[0].jobLeaseToken, 'FENCE99001');
   assert.equal(appends[0].elementInstanceKey, 'EIK-7');
   assert.equal(appends[0].agentInstanceKey, 'AGENT-1');
 });
@@ -533,7 +533,7 @@ test('complete(true) drives the instance status to IDLE and never sends COMPLETE
   assert.equal(idleUpdates.length, 1);
   assert.equal(idleUpdates[0].agentInstanceKey, 'AGENT-1');
   assert.equal(idleUpdates[0].jobKey, '13954');
-  assert.equal(idleUpdates[0].jobLease, 'FENCE99001');
+  assert.equal(idleUpdates[0].jobLeaseToken, 'FENCE99001');
   assert.equal(
     client.calls.update.filter((u) => u.status === 'COMPLETED').length,
     0,
@@ -2144,16 +2144,17 @@ test('leaseTokenLabel redacts short tokens to a fixed marker (no verbatim leak) 
 // ---------------------------------------------------------------------------
 // Lease plumbing (issue #230 ask 3): the job's leaseToken is submitted as jobLease
 // ---------------------------------------------------------------------------
-test('the activation leaseToken is submitted as jobLease on create AND every append', async () => {
+test('the activation leaseToken is submitted as jobLeaseToken (never the 8.10-rejected jobLease) on create AND every append', async () => {
   const client = fakeClient();
   const p = makeProducer(client);
   await p.activate();
   p.ingest({ sessionUpdate: 'agent_message_chunk', content: { type: 'text', text: 'x' } });
   await p.complete(true);
   assert.ok(client.calls.create.length >= 1);
-  for (const c of client.calls.create) assert.equal(c.jobLease, EXTERNAL_JOB.leaseToken);
+  for (const c of client.calls.create) assert.equal(c.jobLeaseToken, EXTERNAL_JOB.leaseToken);
   assert.ok(client.calls.update.length >= 1);
-  for (const u of client.calls.update) assert.equal(u.jobLease, EXTERNAL_JOB.leaseToken);
+  for (const u of client.calls.update) assert.equal(u.jobLeaseToken, EXTERNAL_JOB.leaseToken);
+  for (const c of [...client.calls.create, ...client.calls.update]) assert.ok(!("jobLease" in c), "legacy jobLease must not be sent");
 });
 
 // ---------------------------------------------------------------------------
